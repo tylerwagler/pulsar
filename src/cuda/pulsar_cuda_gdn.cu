@@ -1,3 +1,5 @@
+/** @file
+ *  Gated DeltaNet kernels (Qwen3.8-Flash-Next linear attention): conv, gates, delta-rule recurrence, gated norm. */
 /* Gated DeltaNet kernels (L251, Qwen3.8-Flash-Next) -- the contract, the
  * reference math and the state layout are in pulsar_cuda_gdn.h. */
 #include "pulsar_cuda_gdn.h"
@@ -12,24 +14,50 @@ namespace cg = cooperative_groups;
 
 namespace {
 
+/// Key / value head width (128 each): one 128-thread CTA per conv head, one state row / column per thread.
 constexpr int DK = PULSAR_GDN_DK, DV = PULSAR_GDN_DV;
+/** @var DV
+ *  Value head width (128): see DK. */
+/// Epsilon of the q / k L2 norms and the gated RMSNorm (config rms_norm_eps).
 constexpr float EPS = 1e-6f;                 /* l2norm and the gated norm (rms_norm_eps) */
 
 /* One rank's heads (L266 step 7): tensor parallelism splits the GDN by head, each of TP ranks owning
  * NK / TP key heads and the NV / TP value heads that read them (V head h reads K head h / GQA, so a
  * contiguous half of each keeps every group whole).  The rank's qkv / z / a / b rows, conv channels,
  * A_log and dt_bias are its own heads', in the full model's order; TP = 1 is the whole layer. */
+/** One tensor-parallel rank's GDN geometry at degree TP (TP = 1 is the whole layer): head counts, the
+ *  qkv row's sections, the per-slot state sizes and the verify update record, all in floats. */
 template <int TP> struct gdn_shape {
+    /// Key heads (NK) and value heads (NV) this rank owns.
     static constexpr int NK = PULSAR_GDN_NK / TP, NV = PULSAR_GDN_NV / TP;
+    /** @var NV
+     *  Value heads this rank owns (NV / TP of the model's 48). */
+    /// Floats per qkv row (q, k of NK heads, v of NV heads) and per V row (NV x DV).
     static constexpr int QKV = 2 * NK * DK + NV * DV, VDIM = NV * DV;
+    /** @var VDIM
+     *  Floats per row of the rank's GDN output (NV x DV). */
+    /// Offsets of the q, k and v sections within a qkv row, in floats.
     static constexpr int Q_OFF = 0, K_OFF = NK * DK, V_OFF = 2 * NK * DK;
+    /** @var K_OFF
+     *  Offset of the k section in a qkv row (NK x DK floats).
+     *  @var V_OFF
+     *  Offset of the v section in a qkv row (2 x NK x DK floats). */
+    /// V heads per K head (V head h reads K head h / GQA).
     static constexpr int GQA = NV / NK;                  /* 3 V heads per K head */
+    /// Floats per row of the gate scratch: decay[NV] then beta[NV].
     static constexpr int GB = 2 * NV;                    /* scratch per row: decay[NV], beta[NV] */
+    /// 128-channel conv heads in a qkv row: the conv kernels' grid.y.
     static constexpr int CONV_HEADS = QKV / 128;         /* 80 at TP 1 */
+    /// Conv-state floats per slot: the last KCONV - 1 qkv rows, [3][QKV].
     static constexpr size_t CONV_STATE = (size_t)(PULSAR_GDN_KCONV - 1) * QKV;
+    /// Recurrent-state floats per slot: [NV][DK][DV].
     static constexpr size_t REC_STATE = (size_t)NV * DK * DV;
     /* L288: a verify row's stored update (pulsar_gdn_call::rec_upd): deltas [NV][DV], k^ [NK][DK], decays [NV] */
+    /// Offsets in a verify update record of k^ [NK][DK] (U_K, after the deltas [NV][DV]) and of the decays [NV] (U_DEC).
     static constexpr int U_K = NV * DV, U_DEC = U_K + NK * DK;
+    /** @var U_DEC
+     *  Offset of the decays [NV] in a verify update record, after k^ [NK][DK]. */
+    /// Floats per verify update record, padded up to a multiple of 4 (float4 access).
     static constexpr size_t UPD = (size_t)(U_DEC + NV + 3) / 4 * 4;
     static_assert(PULSAR_GDN_NK % TP == 0 && PULSAR_GDN_NV % TP == 0, "whole heads per rank");
     static_assert(NV % NK == 0, "GQA");
@@ -47,8 +75,31 @@ static_assert(gdn_shape<1>::CONV_STATE == PULSAR_GDN_CONV_STATE_FLOATS &&
  * over the tile's tokens.  Every per-token value is computed the same way
  * whatever tile it lands in (the window comes from the rows before it, or the
  * conv state before row 0), so the result is independent of the tiling. */
+/// Tokens per kernel-1 (conv) tile.
 constexpr int T1 = 16;                       /* tokens per kernel-1 tile */
 
+/** Kernel 1: causal depthwise conv (4 taps) + SiLU over one tile of one sequence's tokens for one 128-channel head,
+ *  then the q / k L2 norms (q also scaled by DK^-0.5) and, from the v heads' CTAs, the per-row gates.  The tile-0
+ *  CTA also advances the sequence's conv state.
+ *
+ *  Launch: grid (n_seq x tiles_grid, Sh::CONV_HEADS), block 128 (thread = channel head * 128 + tid), 256 B static smem.
+ *  @tparam TP tensor-parallel degree (gdn_shape).
+ *  @param qkv        in_proj_qkv output, f32 [rows][ld_qkv] (the rank's QKV columns).
+ *  @param ld_qkv     qkv pitch in floats.
+ *  @param a          in_proj_a output, f32 [rows][ld_a] (softplus input of the decay).
+ *  @param ld_a       a pitch in floats.
+ *  @param b          in_proj_b output, f32 [rows][ld_b] (sigmoid input of beta).
+ *  @param ld_b       b pitch in floats.
+ *  @param conv_w     conv weights, bf16 [QKV][4] (tap 3 multiplies the current token); 8-byte aligned rows.
+ *  @param A_log      bf16 [NV].
+ *  @param dt_bias    bf16 [NV].
+ *  @param seq_rows   rows per sequence (uniform), or the longest sequence's with seq_first.
+ *  @param seq_first  [n_seq + 1] ragged row offsets, or NULL for uniform sequences.
+ *  @param row_slot   per-row state slot; a sequence uses the slot of its first row.
+ *  @param conv_state conv-state pool, Sh::CONV_STATE floats per slot; read and advanced in place.
+ *  @param qkvn       out: scratch f32 [rows][Sh::QKV], the normed q^, k^ and the activated v.
+ *  @param gb         out: scratch f32 [rows][Sh::GB], decay then beta per V head.
+ *  @param tiles_grid tiles per sequence in the grid, ceil(seq_rows / T1). */
 template <int TP>
 __global__ void __launch_bounds__(128)
 gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
@@ -166,6 +217,16 @@ gdn_conv_prep_kernel(const float *__restrict__ qkv, int ld_qkv,
  * The state after row r is the inputs at call-relative positions r - 2, r - 1, r, reaching into the
  * OLD state for negative positions -- the same rule the conv kernel's advance applies to the whole
  * call.  Launched before that kernel, so the old state is still in the pool.  grid (T - 1, 80). */
+/** The verify capture (see above): conv_rows[row] = the conv state after each row but the last of every sequence.
+ *  Launch: grid (n_seq x (seq_rows - 1), Sh::CONV_HEADS), block 128, before gdn_conv_prep_kernel (which advances the pool).
+ *  @tparam TP tensor-parallel degree.
+ *  @param qkv        in_proj_qkv output, f32 [rows][ld_qkv].
+ *  @param ld_qkv     qkv pitch in floats.
+ *  @param seq_rows   rows per sequence, or the longest's with seq_first.
+ *  @param seq_first  [n_seq + 1] ragged row offsets, or NULL.
+ *  @param row_slot   per-row state slot (a sequence's first row's is its slot).
+ *  @param conv_state conv-state pool (read only: the state before the call).
+ *  @param conv_rows  out: f32 [rows][Sh::CONV_STATE], indexed by the call's row; each sequence's last row is not written. */
 template <int TP>
 __global__ void __launch_bounds__(128)
 gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, int seq_rows, const int32_t *__restrict__ seq_first,
@@ -204,9 +265,13 @@ gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, int seq_rows, co
  * distributed shared memory and every CTA sums them in rank order.  The CTA's
  * 32 columns are one MX block, so the E4M3 emission is the canonical warp
  * encoder. */
+/// Tokens staged in shared memory per kernel-2 tile.
 constexpr int T2 = 8;                        /* tokens staged per tile */
+/// Warps per kernel-2 CTA (256 threads).
 constexpr int RW = 8;                        /* warps */
+/// State rows (k) each kernel-2 warp owns: DK / RW = 16 floats of S per thread.
 constexpr int RPW = DK / RW;                 /* 16 state rows per warp */
+/// CTAs per V head (the cluster size): each owns 32 of the head's DV columns.
 constexpr int VQ = 4;                        /* CTAs (column quarters) per V head */
 static_assert(DV == VQ * 32, "a CTA's columns are one warp wide");
 
@@ -216,13 +281,43 @@ static_assert(DV == VQ * 32, "a CTA's columns are one warp wide");
 #define GDN_CLUSTER_DIMS __cluster_dims__(1, 1, VQ)
 #else
 #define GDN_CLUSTER_DIMS
+/// Below sm_90: a stand-in for cg::cluster_group whose every call traps (the host refuses the lane before launch).
 struct gdn_no_cluster {
+    /// Traps; would be the CTA's rank in the cluster.
+    /// @return never returns (0 after the trap).
     __device__ unsigned block_rank() const { __trap(); return 0; }
+    /// Traps; would be the cluster barrier.
     __device__ void sync() const { __trap(); }
+    /// Traps; would map `p` into a peer CTA's shared memory.
+    /// @tparam T the pointee type.
+    /// @param p a pointer into this CTA's shared memory.
+    /// @return never returns (`p` after the trap).
     template <typename T> __device__ T *map_shared_rank(T *p, int) const { __trap(); return p; }
 };
 #endif
 
+/** Kernel 2: the gated delta-rule recurrence over one sequence for one V head, then the gated RMSNorm and the
+ *  out_proj activation (f32, bf16 and / or MX E4M3).  A verify (rec_upd set) leaves the pool's state unchanged and
+ *  stores each row's rank-1 update instead.
+ *
+ *  Launch: grid (n_seq, Sh::NV, VQ) with cluster (1, 1, VQ) (sm_90+), block 256; static smem only (~15 KB).
+ *  @tparam TP tensor-parallel degree.
+ *  @param qkvn       kernel 1's f32 [rows][Sh::QKV] (q^, k^, v).
+ *  @param gb         kernel 1's f32 [rows][Sh::GB] (decay, beta).
+ *  @param z          in_proj_z output, f32 [rows][ld_z]: the norm's gate (SiLU).
+ *  @param ld_z       z pitch in floats.
+ *  @param norm_w     gated-norm weight, bf16 [DV] (used as is).
+ *  @param seq_rows   rows per sequence, or the longest's with seq_first.
+ *  @param seq_first  [n_seq + 1] ragged row offsets, or NULL.
+ *  @param row_slot   per-row state slot (a sequence's first row's is its slot).
+ *  @param rec_state  recurrent-state pool, Sh::REC_STATE floats per slot, [NV][DK][DV].
+ *  @param rec_upd    verify only: out f32 [rows][Sh::UPD] update records, or NULL (then the state is written back).
+ *  @param out_f32    out f32 [rows][Sh::VDIM], or NULL.
+ *  @param out_bf16   out bf16 [rows][Sh::VDIM], or NULL.
+ *  @param out_q      out MX E4M3 data [rows][Sh::VDIM], or NULL.
+ *  @param out_s      out_q's ue8m0 block scales.
+ *  @param kbp        out_q's scale row pitch, pulsar_mx_kbp(Sh::VDIM).
+ *  @return nothing (a kernel; doxygen reads GDN_CLUSTER_DIMS as part of the return type). */
 template <int TP>
 __global__ void GDN_CLUSTER_DIMS __launch_bounds__(256)
 gdn_recur_norm_kernel(const float *__restrict__ qkvn,
@@ -370,9 +465,16 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
  * Thread = 4 adjacent columns of one state row k of one V head; per row r: S = fmaf(k^_k, delta_v, decay * S),
  * the recurrence's own operation (gdn_recur_norm_kernel: s[i] = fmaf(kr[i], d, dec * s[i])) on the same f32
  * values, in row order -- bit-identical to the forward that skipped the write. */
+/// Threads per commit CTA.
 constexpr int CT = 256;                                    /* threads per commit CTA */
 static_assert((DK * DV / 4) % CT == 0, "a head's float4s tile the commit's CTAs");
 
+/** The verify's commit (see above): advance one slot's recurrent state by the first `keep` update records.
+ *  Launch: grid (Sh::NV, DK * DV / 4 / CT), block CT; thread = 4 adjacent columns (one float4) of one state row.
+ *  @tparam TP tensor-parallel degree.
+ *  @param S    the slot's recurrent state, f32 [NV][DK][DV], 16-byte aligned; updated in place.
+ *  @param upd  the sequence's first update record, f32 [keep][Sh::UPD].
+ *  @param keep records to apply, in row order. */
 template <int TP>
 __global__ void __launch_bounds__(CT)
 gdn_commit_kernel(float *__restrict__ S, const float *__restrict__ upd, int keep) {
@@ -393,8 +495,14 @@ gdn_commit_kernel(float *__restrict__ S, const float *__restrict__ upd, int keep
     *p = s;
 }
 
+/// True when `p` is 16-byte aligned.
+/// @param p any pointer.
+/// @return whether its address is a multiple of 16.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
+/// Names a refused contract on stderr.
+/// @param what the broken condition, printed after "pulsar: gdn: refused -- ".
+/// @return -1, the refusal code.
 int refuse(const char *what) {
     fprintf(stderr, "pulsar: gdn: refused -- %s\n", what);
     return -1;
@@ -442,6 +550,13 @@ extern "C" int pulsar_gdn_commit(float *rec_state, int slot, const float *upd, i
 }
 
 namespace {
+/** pulsar_gdn_forward at a fixed tensor-parallel degree: the pitch / A8-slot checks that depend on it, then the
+ *  launches on `stream` (the verify capture, kernel 1, kernel 2).
+ *  @tparam TP tensor-parallel degree (1 or 2).
+ *  @param w      the layer's weights (checked by the caller).
+ *  @param c      the call (checked by the caller except for the rank-dependent pitches).
+ *  @param stream the stream to launch on.
+ *  @return 0, -1 on a refused contract, -3 on a launch failure. */
 template <int TP>
 int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaStream_t stream) {
     using Sh = gdn_shape<TP>;

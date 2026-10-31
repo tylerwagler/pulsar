@@ -1,3 +1,5 @@
+/** @file
+ *  Qwen3.8-Flash-Next token embedding into the four residual streams, and the family ops' lookups. */
 /* Qwen3.8-Flash-Next (L251 S4): the token embedding into the four residual
  * streams, and the two engine-facing lookups the family ops need -- a weight's
  * device pointer and an EXL3 expert stack's pointer table -- so the ops
@@ -13,6 +15,10 @@ namespace {
 
 /* one CTA per token: the embed row, copied into the 4 streams (bf16 -> bf16, exact:
  * the source's `inputs_embeds.repeat(1, 1, hc_count)`) */
+/** Token embedding into the HC residual streams.  Grid = T blocks (one per token), block = 256 threads, no smem.
+ *  @param table   embed_tokens, bf16 [n_vocab][PULSAR_QWEN_HIDDEN] viewed as uint4 (16 B, 8 bf16) chunks; 16-B aligned
+ *  @param tokens  device int32 [T] token ids (not range-checked here)
+ *  @param streams out, bf16 [T][PULSAR_QWEN_HC][PULSAR_QWEN_HIDDEN] as uint4 chunks; 16-B aligned */
 __global__ void __launch_bounds__(256)
 qwen_embed_kernel(const uint4 *__restrict__ table, const int32_t *__restrict__ tokens,
                   uint4 *__restrict__ streams) {

@@ -1,3 +1,5 @@
+/** @file
+ *  Qwen3.8-Flash-Next full attention + QSA (quantised sparse attention) kernels. */
 /* Qwen3.8-Flash-Next full attention + QSA (L251 stream S3).
  *
  * The contract, the cache layout and the geometry live in src/pulsar_gpu.h
@@ -38,13 +40,21 @@
 
 namespace {
 
+/// Listed tokens per attention split (one CTA's K/V tile).
 constexpr uint32_t QSA_SPLIT       = 64u;    /* listed tokens per attention split */
+/// Query heads per KV head (12).
 constexpr uint32_t QSA_GQA         = PULSAR_QSA_N_HEAD / PULSAR_QSA_N_KV;
+/// Tokens a selecting row attends through its selected blocks: top blocks x block size (2048).
 constexpr uint32_t QSA_BUDGET      = PULSAR_QSA_TOP_BLOCKS * PULSAR_QSA_BLOCK;   /* 2048 */
+/// Most tokens any row lists: the budget plus a partial open block (2051).
 constexpr uint32_t QSA_MAX_LISTED  = QSA_BUDGET + PULSAR_QSA_BLOCK - 1u;         /* 2051 */
+/// Most splits any row has (33): the split schedule's partials are carved per this.
 constexpr uint32_t QSA_MAX_SPLITS  = (QSA_MAX_LISTED + QSA_SPLIT - 1u) / QSA_SPLIT;  /* 33 */
+/// Bytes of block scores one selection pass may use; qsa_score_rows sizes the pass to it.
 constexpr uint64_t QSA_SCORE_BUDGET = 64ull << 20;   /* bytes of scores per selection pass */
+/// Block keys per score CTA (= its threads).
 constexpr uint32_t QSA_SCORE_BLK   = 128u;   /* blocks per score CTA */
+/// Shared-memory pitch of one staged block key, in u32 (bf16 pairs), padded by 4 words against bank conflicts.
 constexpr uint32_t QSA_BKS         = PULSAR_QSA_IDX_DIM / 2u + 4u;  /* bkey smem pitch (u32 of bf16x2) */
 
 static_assert(QSA_GQA == 12u, "GQA ratio");
@@ -62,11 +72,23 @@ static_assert(PULSAR_QSA_ROT_DIM == 64u, "the RoPE pairs (i, i+32) are one lane'
  * records and o_proj input are its own heads', in the full model's order.  The indexer (block keys,
  * scores, the top-k) is whole on every rank, so the ranks select the same blocks.  TP = 1 is the
  * whole layer. */
+/** @tparam TP tensor-parallel ranks (1 or 2) */
 template <uint32_t TP> struct qsa_shape {
+    /** @var N_HEAD
+     *  The rank's query heads.
+     *  @var N_KV
+     *  The rank's KV heads. */
     static constexpr uint32_t N_HEAD = PULSAR_QSA_N_HEAD / TP, N_KV = PULSAR_QSA_N_KV / TP;
+    /** @var Q_IN
+     *  Width of the rank's q + gate input row (f32), per head [q 256 | gate 256].
+     *  @var KV_IN
+     *  Width of the rank's k (or v) input row. */
     static constexpr uint32_t Q_IN = N_HEAD * 2u * PULSAR_QSA_HEAD_DIM, KV_IN = N_KV * PULSAR_QSA_HEAD_DIM;
+    /// Width of the rank's o_proj input row.
     static constexpr uint32_t OUT_DIM = N_HEAD * PULSAR_QSA_HEAD_DIM;
+    /// Bytes of one token's KV record on this rank: K then V E4M3 rows of every KV head, then their E8M0 scales.
     static constexpr uint32_t KV_TOKEN_BYTES = 2u * N_KV * (PULSAR_QSA_HEAD_DIM + PULSAR_QSA_HEAD_DIM / 32u);
+    /// Warps of the prep kernel: one per query head, K head, V head and indexer q head.
     static constexpr uint32_t PREP_WARPS = N_HEAD + 2u * N_KV + PULSAR_QSA_IDX_HEADS;
     static_assert(PULSAR_QSA_N_KV % TP == 0, "whole KV heads per rank");
     static_assert(N_HEAD / N_KV == QSA_GQA, "a rank keeps whole GQA groups");
@@ -76,13 +98,25 @@ static_assert(qsa_shape<1>::Q_IN == PULSAR_QSA_Q_IN && qsa_shape<1>::KV_IN == PU
               qsa_shape<1>::PREP_WARPS == 32u, "the header's whole-layer sizes");
 
 /* Byte offsets inside one token's record (1056 B at TP 1). */
+/** @tparam TP tensor-parallel ranks
+ *  @param g KV head
+ *  @return byte offset of head g's K data in a token record */
 template <uint32_t TP> __host__ __device__ constexpr uint32_t qsa_k_data(uint32_t g) { return g * PULSAR_QSA_HEAD_DIM; }
+/** @tparam TP tensor-parallel ranks
+ *  @param g KV head
+ *  @return byte offset of head g's V data */
 template <uint32_t TP> __host__ __device__ constexpr uint32_t qsa_v_data(uint32_t g) {
     return (qsa_shape<TP>::N_KV + g) * PULSAR_QSA_HEAD_DIM;
 }
+/** @tparam TP tensor-parallel ranks
+ *  @param g KV head
+ *  @return byte offset of head g's 8 K scale bytes */
 template <uint32_t TP> __host__ __device__ constexpr uint32_t qsa_k_scale(uint32_t g) {
     return 2u * qsa_shape<TP>::N_KV * PULSAR_QSA_HEAD_DIM + g * (PULSAR_QSA_HEAD_DIM / 32u);
 }
+/** @tparam TP tensor-parallel ranks
+ *  @param g KV head
+ *  @return byte offset of head g's 8 V scale bytes */
 template <uint32_t TP> __host__ __device__ constexpr uint32_t qsa_v_scale(uint32_t g) {
     return qsa_k_scale<TP>(qsa_shape<TP>::N_KV + g);
 }
@@ -93,27 +127,49 @@ enum : uint32_t {
     QSA_ROW_SELECT    = 4u,   /* nb > 512: the row attends to a selection */
 };
 
+/// One call row's descriptor, built on the host and uploaded to the workspace (the kernels' only per-row input).
 struct qsa_row {
+    /// The row's sequence KV cache: [ctx][KV_TOKEN_BYTES] token records.
     uint8_t       *kv;
+    /// The sequence's block keys, bf16 [ctx / 4][PULSAR_QSA_IDX_DIM].
     __nv_bfloat16 *bkey;
+    /// The sequence's raw indexer keys of its open block, f32 [4][PULSAR_QSA_IDX_DIM] (slot pos % 4).
     float         *stage;
+    /// The row's token position.
     uint32_t pos;
+    /// Rows of the same sequence before this one in the call.
     uint32_t run_off;   /* rows of the same sequence before this one in the call */
+    /// QSA_ROW_* bits.
     uint32_t flags;
+    /// Complete indexer blocks visible: (pos + 1) / 4.
     uint32_t nb;        /* complete blocks visible: (pos + 1) / 4 */
+    /// Tokens the row attends: pos + 1, or QSA_BUDGET + (pos + 1) % 4 when it selects.
     uint32_t n_list;    /* tokens attended: pos + 1, or 2048 + (pos + 1) % 4 */
+    /// Zero.
     uint32_t pad;
+    /// L268: the row's (T, H, W) rope positions ((pos, pos, pos) for text).
     uint32_t rope[3];   /* L268: the row's (T, H, W) rope positions -- (pos, pos, pos) for text */
+    /// The rope positions of the row's indexer block's first token (pos - 3 for text).
     uint32_t brope[3];  /* ... and its indexer block's first token's (pos - 3 for text) */
 };
 
+/// The rope table passed by value to the kernels.
 struct qsa_rope_tab { float inv[PULSAR_QSA_ROT_DIM / 2]; float mscale; };
 
+/** @var qsa_rope_tab::inv
+ *  Inverse frequency of each of the 32 rope pairs (f32, from pulsar_qsa_rope_init).
+ *  @var qsa_rope_tab::mscale
+ *  The rope's attention scaling (YaRN mscale; 1 natively). */
+
+/** @param v this lane's value
+ *  @return the warp's sum, __fadd_rn xor tree (the same value in every lane) */
 __device__ __forceinline__ float qsa_warp_sum(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+/** @param v this lane's value
+ *  @return the warp's maximum */
 __device__ __forceinline__ float qsa_warp_max(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -127,6 +183,11 @@ __device__ __forceinline__ float qsa_warp_max(float v) {
  * large angle is not the fast-math __sinf's, rounded to f32, then times the rope's mscale in f32 (transformers'
  * `freqs.cos() * attention_scaling`; L280 YaRN -- natively 1, and x * 1.0f is x, so the native rope's bytes are
  * the ones it had before the factor existed). */
+/** @param tab the rope table
+ *  @param p   the position triple (T, H, W)
+ *  @param i   the rope pair, 0..31
+ *  @param c   out: cos * mscale
+ *  @param s   out: sin * mscale */
 __device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, const uint32_t (&p)[3], uint32_t i,
                                             float *c, float *s) {
     const uint32_t pos = p[i % 3u == 1u ? 1 : i % 3u == 2u ? 2 : 0];
@@ -139,6 +200,11 @@ __device__ __forceinline__ void qsa_rope_cs(const qsa_rope_tab &tab, const uint3
 
 /* One warp, one head of NJ*32 elements: lane l holds x[l + 32 j].  RMSNorm with
  * weight (1 + w), then RoPE on the pair (x[l], x[l + 32]) -- lane l's j = 0, 1. */
+/** @tparam NJ elements per lane (head width / 32)
+ *  @param x the head row, lane l's x[j] = element l + 32 j; normed and roped in place
+ *  @param w bf16 [NJ * 32] norm weight, applied as (1 + w)
+ *  @param c this lane's pair cos (qsa_rope_cs)
+ *  @param s this lane's pair sin */
 template <int NJ>
 __device__ __forceinline__ void qsa_norm_rope(float (&x)[NJ], const uint16_t *w, float c, float s) {
     const int lane = threadIdx.x & 31;
@@ -156,6 +222,10 @@ __device__ __forceinline__ void qsa_norm_rope(float (&x)[NJ], const uint16_t *w,
 }
 
 /* 8 x 32-element MX blocks of one 256-wide head row: block j is every lane's x[j]. */
+/** One warp: encode a 256-wide head row as 8 MX32 E4M3 blocks.
+ *  @param x      lane l's x[j] = element l + 32 j
+ *  @param data   out: 256 E4M3 bytes
+ *  @param scales out: 8 E8M0 bytes (lane 0 writes) */
 __device__ __forceinline__ void qsa_emit_row(const float (&x)[8], uint8_t *data, uint8_t *scales) {
     const int lane = threadIdx.x & 31;
     #pragma unroll
@@ -168,6 +238,13 @@ __device__ __forceinline__ void qsa_emit_row(const float (&x)[8], uint8_t *data,
 }
 
 /* ---- block keys ------------------------------------------------------------- */
+/** One warp per row (8 rows a 256-thread block): rows that complete a block mean-pool its 4 raw keys, norm + rope at
+ *  the block start, and store the bf16 block key.  Grid = ceil(n_rows / 8), block = 256.
+ *  @param rows   the call's row descriptors
+ *  @param n_rows rows in the call
+ *  @param idx    f32 [n_rows][PULSAR_QSA_IDX_IN] indexer input (q heads then the raw key)
+ *  @param kw     bf16 [PULSAR_QSA_IDX_DIM] indexer key norm weight
+ *  @param tab    the rope table */
 __global__ void qsa_block_keys_kernel(const qsa_row *rows, uint32_t n_rows, const float *idx,
                                       const uint16_t *kw, qsa_rope_tab tab) {
     const uint32_t r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -197,6 +274,19 @@ __global__ void qsa_block_keys_kernel(const qsa_row *rows, uint32_t n_rows, cons
 /* ---- prep: 32 warps per row ------------------------------------------------- *
  * warps 0..23 query heads, 24..25 K heads, 26..27 V heads, 28..31 indexer q heads
  * (warp 28 also stages the raw indexer key). */
+/** One CTA per row, 32 * PREP_WARPS threads (one warp per head; see the comment above).
+ *  @tparam TP tensor-parallel ranks
+ *  @param rows   the call's row descriptors
+ *  @param qg     f32 [rows][Q_IN] q + gate projections
+ *  @param kin    f32 [rows][KV_IN] k projection
+ *  @param vin    f32 [rows][KV_IN] v projection
+ *  @param idx    f32 [rows][PULSAR_QSA_IDX_IN] indexer projection
+ *  @param qw     bf16 [256] q norm weight
+ *  @param kw     bf16 [256] k norm weight
+ *  @param iqw    bf16 [PULSAR_QSA_IDX_DIM] indexer q norm weight
+ *  @param tab    the rope table
+ *  @param q_out  out, f32 [rows][N_HEAD][256] normed, roped q
+ *  @param iq_out out, f32 [rows][PULSAR_QSA_IDX_HEADS][PULSAR_QSA_IDX_DIM] normed, roped indexer q */
 template <uint32_t TP>
 __global__ void __launch_bounds__(1024) qsa_prep_kernel(
         const qsa_row *rows, const float *qg, const float *kin, const float *vin, const float *idx,
@@ -256,8 +346,12 @@ __global__ void __launch_bounds__(1024) qsa_prep_kernel(
  * dot a sequential f32 FMA chain over the 128 dims -- per (row, block), whatever
  * the grouping.  Blocks past a row's nb score -inf, which the top-k never
  * prefers to a real (>= 0) score. */
+/// Most listed rows of one sequence a score CTA serves (a group).
 constexpr uint32_t QSA_SCORE_ROWS = 4u;
 
+/** @param qs the row's indexer q, f32 [PULSAR_QSA_IDX_HEADS][PULSAR_QSA_IDX_DIM] (shared)
+ *  @param kr one block key, bf16 pairs (shared)
+ *  @return sum over heads in order of relu(q_h . k), each dot a sequential fmaf chain */
 __device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t *kr) {
     float acc[PULSAR_QSA_IDX_HEADS] = {0.f, 0.f, 0.f, 0.f};
     for (uint32_t d2 = 0; d2 < PULSAR_QSA_IDX_DIM / 2u; d2 += 4u) {
@@ -282,6 +376,14 @@ __device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t
 
 /* groups[i] = (first listed row of the pass << 8) | rows; scores are indexed by
  * the row's place in the pass. */
+/** Grid = (ceil(nb_max / QSA_SCORE_BLK), groups), block = QSA_SCORE_BLK (one thread per block key); static smem
+ *  the group's q rows plus QSA_SCORE_BLK staged keys.
+ *  @param rows   the call's row descriptors
+ *  @param list   the pass's selecting rows (indices into rows)
+ *  @param groups per group: (first listed index << 8) | row count
+ *  @param iq     f32 [rows][PULSAR_QSA_IDX_HEADS][PULSAR_QSA_IDX_DIM] indexer q
+ *  @param scores out, f32 [pass rows][nb_max]; -inf past a row's nb
+ *  @param nb_max the pass's score row pitch (its widest nb) */
 __global__ void __launch_bounds__(QSA_SCORE_BLK) qsa_score_kernel(
         const qsa_row *rows, const uint32_t *list, const uint32_t *groups, const float *iq, float *scores,
         uint32_t nb_max) {
@@ -314,6 +416,10 @@ __global__ void __launch_bounds__(QSA_SCORE_BLK) qsa_score_kernel(
 }
 
 /* ---- the selection ascending (bitonic, 512 in smem) --------------------------- */
+/** One CTA (256 threads) per listed row: bitonic-sort its PULSAR_QSA_TOP_BLOCKS selected block indices ascending.
+ *  @param list the pass's selecting rows
+ *  @param topk uint32 [pass rows][PULSAR_QSA_TOP_BLOCKS] the top-k's picks
+ *  @param sel  out, uint32 [rows][PULSAR_QSA_TOP_BLOCKS] (indexed by the row) */
 __global__ void __launch_bounds__(256) qsa_sel_sort_kernel(const uint32_t *list, const uint32_t *topk,
                                                           uint32_t *sel) {
     __shared__ uint32_t v[PULSAR_QSA_TOP_BLOCKS];
@@ -341,6 +447,10 @@ __global__ void __launch_bounds__(256) qsa_sel_sort_kernel(const uint32_t *list,
 
 /* The token at listed position j of a row: every token for a row that attends
  * to all of them, else the selected blocks' tokens then the open tail. */
+/** @param row the row
+ *  @param sel the row's sorted selection
+ *  @param j   listed position, below row.n_list
+ *  @return the token position attended at j */
 __device__ __forceinline__ uint32_t qsa_listed_token(const qsa_row &row, const uint32_t *sel, uint32_t j) {
     if (!(row.flags & QSA_ROW_SELECT)) return j;
     if (j < QSA_BUDGET) return sel[j / PULSAR_QSA_BLOCK] * PULSAR_QSA_BLOCK + (j % PULSAR_QSA_BLOCK);
@@ -371,11 +481,22 @@ __device__ __forceinline__ uint32_t qsa_listed_token(const qsa_row &row, const u
  *                           prefill-sized calls.
  * Same device functions, same operations in the same order, so the bytes are
  * identical (tests/qsa_attn_gate G6: one row per call vs chunked prefill). */
+/// Bytes per staged K/V row in smem (256 + 16 padding).
 constexpr uint32_t QSA_TPITCH = PULSAR_QSA_HEAD_DIM + 16u;   /* bytes per smem K/V row */
+/// Floats per staged score row (64 + 4 padding).
 constexpr uint32_t QSA_SPITCH = QSA_SPLIT + 4u;              /* floats per score row */
+/// Calls of at least this many rows take the in-CTA fold schedule (no partials).
 constexpr uint32_t QSA_FOLD_ROWS = 64u;                      /* calls at least this wide fold in the CTA */
 static_assert(QSA_SPLIT == 64u, "the warp layout below tiles 64 tokens: 4 warps x 2 n-tiles (QK), 4 k-steps (PV)");
 
+/** One mma.sync m16n8k16 f16 x f16 -> f32, accumulating into d (sm_80+; traps on older arches).
+ *  @param d  the accumulator fragment (in/out)
+ *  @param a0 A fragment register 0
+ *  @param a1 A fragment register 1
+ *  @param a2 A fragment register 2
+ *  @param a3 A fragment register 3
+ *  @param b0 B fragment register 0
+ *  @param b1 B fragment register 1 */
 __device__ __forceinline__ void qsa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
 #if PULSAR_SM80
@@ -388,6 +509,10 @@ __device__ __forceinline__ void qsa_mma(float (&d)[4], uint32_t a0, uint32_t a1,
 #endif
 }
 /* f32 pair -> (hi, lo) packed f16x2 words: hi = f16(x), lo = f16(x - hi). */
+/** @param x0 first value
+ *  @param x1 second value
+ *  @param hi out: f16x2 (f16(x0), f16(x1))
+ *  @param lo out: f16x2 of the residuals x - hi */
 __device__ __forceinline__ void qsa_split2(float x0, float x1, uint32_t &hi, uint32_t &lo) {
     const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
     const __half l0 = __float2half_rn(__fsub_rn(x0, __half2float(h0)));
@@ -397,6 +522,8 @@ __device__ __forceinline__ void qsa_split2(float x0, float x1, uint32_t &hi, uin
     lo = *reinterpret_cast<const uint32_t *>(&L);
 }
 /* two E4M3 bytes (low byte = first element) -> packed f16x2, exact */
+/** @param two two E4M3 codes, the first in the low byte
+ *  @return the f16x2 of their values (exact) */
 __device__ __forceinline__ uint32_t qsa_e4m3x2(uint16_t two) {
     const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)two, __NV_E4M3);
     uint32_t u;
@@ -405,6 +532,12 @@ __device__ __forceinline__ uint32_t qsa_e4m3x2(uint16_t two) {
 }
 
 /* The fold of one split (m, l, a) into a row's running (M, L, A): THE recurrence. */
+/** @param M running max (log2 domain), in/out
+ *  @param L running denominator, in/out
+ *  @param A running numerator, in/out
+ *  @param m the split's max
+ *  @param l the split's denominator
+ *  @param a the split's numerator */
 __device__ __forceinline__ void qsa_fold(float &M, float &L, float &A, float m, float l, float a) {
     const float mn = fmaxf(M, m);
     const float c1 = exp2f(__fsub_rn(M, mn)), c2 = exp2f(__fsub_rn(m, mn));
@@ -413,12 +546,25 @@ __device__ __forceinline__ void qsa_fold(float &M, float &L, float &A, float m, 
     M = mn;
 }
 /* The epilogue: normalise, times the sigmoid output gate. */
+/** @param A the folded numerator
+ *  @param L the folded denominator
+ *  @param gate the head's gate logit
+ *  @return (A / L) * sigmoid(gate) */
 __device__ __forceinline__ float qsa_gated(float A, float L, float gate) {
     return __fmul_rn(__fdiv_rn(A, L), __fdiv_rn(1.0f, __fadd_rn(1.0f, __expf(-gate))));
 }
 
 /* One K or V tile (64 listed tokens, KV head g) into smem as raw E4M3 plus its
  * 8 scales per token; rows past n are zero (their scores are masked). */
+/** 128 threads, 2 per token.
+ *  @tparam TP tensor-parallel ranks
+ *  @param td        out, smem [64][QSA_TPITCH] E4M3 rows
+ *  @param tsc       out, smem [64][8] f32 block scales
+ *  @param kv        the sequence's KV records
+ *  @param toks      smem [64] token positions of the split
+ *  @param n         live tokens in the split
+ *  @param data_off  record offset of the head's data (qsa_k_data / qsa_v_data)
+ *  @param scale_off record offset of its scales */
 template <uint32_t TP>
 __device__ __forceinline__ void qsa_load_tile(uint8_t *td, float *tsc, const uint8_t *kv, const uint32_t *toks,
                                               uint32_t n, uint32_t data_off, uint32_t scale_off) {
@@ -438,6 +584,22 @@ __device__ __forceinline__ void qsa_load_tile(uint8_t *td, float *tsc, const uin
     if (!half) for (int b = 0; b < 8; b++) tsc[t * 8u + b] = exp2f((float)((int)rec[scale_off + b] - 127));
 }
 
+/** Block = 128 (4 warps), static smem (q, K/V tile, scales, scores).  Grid (split, KV head, row) without FOLD,
+ *  (1, KV head, row) with it; see the schedule comment above.
+ *  @tparam FOLD fold the row's splits in the CTA and write the output (true), or write the split's partial
+ *  @tparam TP   tensor-parallel ranks
+ *  @param rows      the call's row descriptors
+ *  @param row0      first row of this launch (blockIdx.z is relative to it)
+ *  @param sel       uint32 [rows][PULSAR_QSA_TOP_BLOCKS] sorted selections
+ *  @param q         f32 [rows][N_HEAD][256] prepped q
+ *  @param qg        f32 [rows][Q_IN] q + gate (the gate half read)
+ *  @param part      out (split schedule), f32 [rows][N_HEAD][QSA_MAX_SPLITS][256] unnormalised partials
+ *  @param ml        out (split schedule), [rows][N_HEAD][QSA_MAX_SPLITS] (max, denominator)
+ *  @param out_bf16  out (FOLD), bf16 [rows][OUT_DIM] o_proj input, or NULL
+ *  @param out       out (FOLD), E4M3 [rows][OUT_DIM] o_proj slot, or NULL
+ *  @param out_scale out (FOLD), its E8M0 slab, or NULL
+ *  @param kbp       pulsar_mx_kbp(OUT_DIM) of out_scale
+ *  @param tap       out (FOLD), f32 [rows][OUT_DIM] debug tap, or NULL */
 template <bool FOLD, uint32_t TP>
 __global__ void __launch_bounds__(128) qsa_attn_kernel(
         const qsa_row *rows, uint32_t row0, const uint32_t *sel, const float *q, const float *qg,
@@ -662,6 +824,18 @@ __global__ void __launch_bounds__(128) qsa_attn_kernel(
 
 /* ---- fold + gate + o_proj slot for the split schedule ------------------------ *
  * grid (row in group, query head); thread = dim. */
+/** Grid = (rows, N_HEAD), block = 256 (thread = dim).
+ *  @tparam TP tensor-parallel ranks
+ *  @param rows      the call's row descriptors
+ *  @param row0      first row of this launch
+ *  @param part      f32 split partials (qsa_attn_kernel without FOLD)
+ *  @param ml        the splits' (max, denominator)
+ *  @param qg        f32 [rows][Q_IN] q + gate
+ *  @param out_bf16  out, bf16 [rows][OUT_DIM], or NULL
+ *  @param out       out, E4M3 [rows][OUT_DIM], or NULL
+ *  @param out_scale out, its E8M0 slab
+ *  @param kbp       pulsar_mx_kbp(OUT_DIM)
+ *  @param tap       out, f32 [rows][OUT_DIM], or NULL */
 template <uint32_t TP>
 __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
         const qsa_row *rows, uint32_t row0, const float *part, const float2 *ml, const float *qg,
@@ -684,6 +858,11 @@ __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
     if (out_bf16) out_bf16[(uint64_t)r * Qs::OUT_DIM + col] = __float2bfloat16(y);
 }
 
+/** Copy each row's selection to the tap (all ones for a row that attends everything).  Grid = n_rows, any block.
+ *  @param rows   the call's row descriptors
+ *  @param sel    uint32 [rows][PULSAR_QSA_TOP_BLOCKS]
+ *  @param tap    out, uint32 [rows][PULSAR_QSA_TOP_BLOCKS]
+ *  @param n_rows rows */
 __global__ void qsa_sel_tap_kernel(const qsa_row *rows, const uint32_t *sel, uint32_t *tap, uint32_t n_rows) {
     const uint32_t r = blockIdx.x;
     if (r >= n_rows) return;
@@ -695,30 +874,54 @@ __global__ void qsa_sel_tap_kernel(const qsa_row *rows, const uint32_t *sel, uin
 }
 
 /* ---- workspace geometry: ONE function sizes it and carves it ------------------- */
+/// The call's carved workspace (qsa_ws_layout).
 struct qsa_ws {
+    /// [n_rows] row descriptors.
     qsa_row  *rows;
+    /// [n_rows] the selecting rows' indices.
     uint32_t *list;
+    /// [n_rows] score groups ((first << 8) | count).
     uint32_t *groups;
+    /// f32 [n_rows][N_HEAD][256] prepped q.
     float    *q;
+    /// f32 [n_rows][IDX_HEADS][IDX_DIM] prepped indexer q.
     float    *iq;
+    /// [n_rows][TOP_BLOCKS] sorted selections.
     uint32_t *sel;
+    /// f32 block scores of one pass (score_cap bytes).
     float    *scores;
+    /// [topk_rows][TOP_BLOCKS] the top-k's picks for one pass.
     uint32_t *topk;
+    /// f32 split partials (calls under QSA_FOLD_ROWS rows only).
     float    *part;
+    /// The partials' (max, denominator).
     float2   *ml;
+    /// Total bytes of the layout.
     uint64_t  bytes;
+    /// Bytes of the scores buffer.
     uint64_t  score_cap;    /* bytes of the scores buffer */
+    /// Rows the top-k buffer holds.
     uint32_t  topk_rows;    /* rows the top-k buffer holds */
 };
 
 /* Rows per selection pass for blocks-per-row nb: the scores stay inside the
  * budget, and one row always fits. */
+/** @param n_rows selecting rows
+ *  @param nb     blocks per row
+ *  @return rows per selection pass */
 static uint32_t qsa_score_rows(uint32_t n_rows, uint32_t nb) {
     return (uint32_t)std::min<uint64_t>(n_rows, std::max<uint64_t>(1u, QSA_SCORE_BUDGET / ((uint64_t)nb * sizeof(float))));
 }
 
+/** @param x bytes
+ *  @return x rounded up to 256 */
 static uint64_t qsa_up(uint64_t x) { return (x + 255u) & ~255ull; }
 
+/** Size (base NULL) or carve the workspace for any call of at most n_rows rows below max_ctx.
+ *  @param base    workspace start, or nullptr
+ *  @param n_rows  rows
+ *  @param max_ctx context bound
+ *  @return the layout (pointers null when sizing; bytes set) */
 static qsa_ws qsa_ws_layout(uint8_t *base, uint32_t n_rows, uint32_t max_ctx) {
     qsa_ws w{};
     /* Sized for EVERY call with positions < max_ctx: a pass at nb blocks takes
@@ -746,15 +949,20 @@ static qsa_ws qsa_ws_layout(uint8_t *base, uint32_t n_rows, uint32_t max_ctx) {
     return w;
 }
 
+/** @param why the reason printed
+ *  @return 0 (the API's failure value) */
 static int qsa_refuse(const char *why) {
     fprintf(stderr, "pulsar: qsa attention refused: %s\n", why);
     return 0;
 }
 
+/// Once-per-shape announcement state of the attention launch.
 static pulsar_shape_once g_qsa_announce;
 
 }  // namespace
 
+/// @param tp_ranks tensor-parallel degree (2 = one rank's heads, anything else = the whole layer)
+/// @return KV-cache bytes per token for one rank
 uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks) {
     return tp_ranks == 2 ? qsa_shape<2>::KV_TOKEN_BYTES : qsa_shape<1>::KV_TOKEN_BYTES;
 }
@@ -763,6 +971,9 @@ uint32_t pulsar_qsa_kv_token_bytes(int tp_ranks) {
  * pos_freqs = theta^(2i/64); extrapolation = 1 / pos_freqs; interpolation = 1 / (factor * pos_freqs); blended by
  * each pair's extrapolation weight; attention factor 1 + 0.1 ln(factor).  Host code of a .cu TU: IEEE (nvcc's
  * --use_fast_math is the device's), so pow and log are libm's double functions. */
+/// @param out  out: the rope table (inv_freq per pair, mscale)
+/// @param yarn the YaRN scaling, or NULL for the native rope
+/// @return 1 on success, 0 refused (said)
 int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn) {
     if (!out) return qsa_refuse("pulsar_qsa_rope_init: no output");
     constexpr uint32_t D = PULSAR_QSA_ROT_DIM;
@@ -787,6 +998,9 @@ int pulsar_qsa_rope_init(pulsar_qsa_rope *out, const pulsar_qsa_yarn *yarn) {
     return 1;
 }
 
+/// @param n_rows the most rows a call will carry
+/// @param max_ctx the longest context a call will attend
+/// @return workspace bytes for every call of at most n_rows rows
 uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
     /* Sized for EVERY call of at most n_rows rows, not only an n_rows one: a call of fewer than
      * QSA_FOLD_ROWS rows takes the split schedule and needs its partials, which an n_rows >=
@@ -798,6 +1012,15 @@ uint64_t pulsar_gpu_qsa_workspace_bytes(uint32_t n_rows, uint32_t max_ctx) {
     return at_max > split ? at_max : split;
 }
 
+/// @param layer     the layer's weights and caches
+/// @param seqs      [n_seqs] the call's sequences
+/// @param n_seqs    sequences
+/// @param row_seq   [n_rows] each row's sequence
+/// @param row_pos   [n_rows] each row's position
+/// @param n_rows    rows, 1 .. 65535
+/// @param io        the call's inputs, outputs and rope
+/// @param workspace >= pulsar_gpu_qsa_workspace_bytes
+/// @return 1 on success, 0 refused (said)
 int pulsar_gpu_qsa_forward(const pulsar_qsa_layer *layer,
                            const pulsar_qsa_seq *seqs, uint32_t n_seqs,
                            const uint32_t *row_seq, const uint32_t *row_pos, uint32_t n_rows,

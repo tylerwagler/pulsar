@@ -1,3 +1,5 @@
+/** @file
+ *  Tables for pulsar_cuda_libm.cuh, read out of the shipped glibc libm (data only). */
 /* pulsar_cuda_libm_tables.inc -- the data of the host libm routines pulsar_cuda_libm.cuh reproduces (L302).
  *
  * Read out of the shipped glibc 2.43 aarch64 libm.so.6 on the GB10 host (expf@@GLIBC_2.27, log@@GLIBC_2.29,

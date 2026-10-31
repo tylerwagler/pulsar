@@ -1,3 +1,5 @@
+/** @file
+ *  The device sampler: greedy, top-k / min-p / top-p nucleus and the keyed race draw, byte-identical to the host rule. */
 /* pulsar_cuda_sampler.cu -- THE sampler, on the device (L302 step 1).
  *
  * Every lane draws its tokens here: the plain decode, the batched decode, the speculative verify (its walk too,
@@ -42,17 +44,29 @@
 
 namespace {
 
+/// Threads per block of the row kernel (sample_rows_kernel; logprobs_rows_kernel too).
 constexpr uint32_t SMP_THREADS = 1024;   /* the row kernel's block */
+/// Threads per block of the slot kernel (sample_slots_kernel); its radix count matrix is 16 x SLOT_THREADS words.
 constexpr uint32_t SLOT_THREADS = 512;   /* the slot kernel's block (its radix count matrix is 16 x 512 words) */
+/// Candidates a row sorts in shared memory (row_smem::keys); a longer list leaves the row to a slot.
 constexpr uint32_t SMP_CAP = 2048;       /* candidates the row kernel sorts in shared memory */
+/// Global scratch slots (PULSAR_GPU_SAMPLE_SLOTS): the slot kernel's grid, and the full arm's rows a pass.
 constexpr uint32_t SMP_SLOTS = PULSAR_GPU_SAMPLE_SLOTS;
 
+/// Factor just under 1 on min_p for the min-p arm's candidate threshold (row_plan::prefilter): a superset of the cut.
 constexpr float MINP_PREFILTER_SLACK = 1.0f - 4e-6f;
+/// min_p above which a row without top-k takes the min-p arm (PATH_MINP); at or below it, the full arm (PATH_FULL).
 constexpr float MINP_PREFILTER_MIN = 1e-30f;
+/// The 0.02 floor of the sparse min-p predicate, minp_full_nucleus().
 constexpr float SPARSE_MINP_MIN = 0.02f;
 
 enum : uint32_t { PATH_TOPK = 0, PATH_MINP = 1, PATH_FULL = 2 };
 
+/**
+ * The IEEE-754 bits of v, on the host and the device.
+ * @param v the value
+ * @return its bits
+ */
 __host__ __device__ __forceinline__ uint32_t f32_bits(float v) {
 #ifdef __CUDA_ARCH__
     return __float_as_uint(v);
@@ -62,9 +76,19 @@ __host__ __device__ __forceinline__ uint32_t f32_bits(float v) {
     return u;
 #endif
 }
+/**
+ * Whether v is finite (its exponent field is not all ones).
+ * @param v the value
+ * @return true for a finite v
+ */
 __host__ __device__ __forceinline__ bool finite_bits(float v) { return (f32_bits(v) & 0x7f800000u) != 0x7f800000u; }
 
 /* descending value, -0 as +0: unsigned ascending order of the key is the candidates' order (ids break ties) */
+/**
+ * The candidate sort key of a value: ascending unsigned key order is descending value, -0 keyed as +0.
+ * @param f the value
+ * @return its key
+ */
 __device__ __forceinline__ uint32_t desc_key(float f) {
     uint32_t u = __float_as_uint(f);
     if (u == 0x80000000u) u = 0u;
@@ -72,6 +96,11 @@ __device__ __forceinline__ uint32_t desc_key(float f) {
     return ~asc;
 }
 
+/**
+ * The splitmix64 finalizer (a bijective 64-bit mix): the race's hash.
+ * @param z the input
+ * @return the mixed word
+ */
 __device__ __forceinline__ uint64_t mix64(uint64_t z) {
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
@@ -79,16 +108,32 @@ __device__ __forceinline__ uint64_t mix64(uint64_t z) {
 }
 
 /* the race score of candidate `id` at probability p (p > 0) */
+/**
+ * The exponential race score of a candidate, -log(u) / p in double, u = hash(key, id) mapped into (0, 1).
+ * @param key the row's draw key (pulsar_gpu_sample_req::key)
+ * @param id the candidate's token id (after the row's id map)
+ * @param p its emitted probability, > 0
+ * @return the score; the first strict minimum in emitted order wins
+ */
 __device__ __forceinline__ double race_score(uint64_t key, int32_t id, float p) {
     const uint64_t h = mix64(key ^ ((uint64_t)(uint32_t)id * 0xd1b54a32d192ed03ull));
     const double u = __dmul_rn(__dadd_rn((double)(h >> 11), 0.5), 1.0 / 9007199254740992.0);
     return __ddiv_rn(-plm_log(u), (double)p);
 }
 
+/// One row's logits seen through its token mask: rv(i) is the logit, or -inf where the mask clears bit i.
 struct row_view {
+    /// The row's logits, n floats (device).
     const float *x;
+    /// The row's mask words (bit i of word i / 32 set = id i allowed), or NULL for no mask.
     const uint32_t *mask;   /* the row's mask words, or NULL */
+    /// Values in the row.
     uint32_t n;
+    /**
+     * The value at id i: its logit, or -inf when masked out.
+     * @param i the id, < n
+     * @return the masked value
+     */
     __device__ __forceinline__ float operator()(uint32_t i) const {
         float v = x[i];
         if (mask && !((mask[i >> 5] >> (i & 31u)) & 1u)) v = __uint_as_float(0xff800000u);
@@ -97,6 +142,15 @@ struct row_view {
 };
 
 /* block-wide reductions over THREADS threads; `red` is THREADS-wide shared scratch */
+/**
+ * Block-wide first argmax over a row's finite values: the largest value, the lowest id among equals; id -1 when
+ * no value is finite.  Every thread of the THREADS-thread block (a power of two) takes part and receives the result.
+ * @param rv the row
+ * @param redv THREADS floats of shared scratch
+ * @param redi THREADS ints of shared scratch
+ * @param out_v receives the maximum
+ * @param out_i receives its id, or -1
+ */
 template <uint32_t THREADS>
 __device__ void block_argmax(const row_view &rv, float *redv, int32_t *redi, float *out_v, int32_t *out_i) {
     const uint32_t tid = threadIdx.x;
@@ -123,6 +177,12 @@ __device__ void block_argmax(const row_view &rv, float *redv, int32_t *redi, flo
     __syncthreads();
 }
 
+/**
+ * Block-wide sum of one u32 a thread (THREADS threads, a power of two).
+ * @param v this thread's value
+ * @param red THREADS words of shared scratch
+ * @return the sum, in every thread
+ */
 template <uint32_t THREADS>
 __device__ uint32_t block_sum_u32(uint32_t v, uint32_t *red) {
     const uint32_t tid = threadIdx.x;
@@ -138,6 +198,12 @@ __device__ uint32_t block_sum_u32(uint32_t v, uint32_t *red) {
 }
 
 /* inclusive scan of one value per thread (Hillis-Steele over shared) */
+/**
+ * Block-wide inclusive scan of one u32 a thread (Hillis-Steele over shared memory).
+ * @param v this thread's value
+ * @param red THREADS words of shared scratch
+ * @return the sum of the values of threads 0 .. this one
+ */
 template <uint32_t THREADS>
 __device__ uint32_t block_scan_incl(uint32_t v, uint32_t *red) {
     const uint32_t tid = threadIdx.x;
@@ -156,6 +222,13 @@ __device__ uint32_t block_scan_incl(uint32_t v, uint32_t *red) {
 
 /* block argmin over (score, index): the smallest score, the lowest index among equal scores -- the first strict
  * minimum of the host's in-order loop.  Every thread receives the winner. */
+/**
+ * Block-wide argmin of (score, index): the smallest score, the lowest index among equals.
+ * @param s in: this thread's score; out: the winner's, in every thread
+ * @param i in: this thread's index; out: the winner's
+ * @param wd 32 doubles of shared scratch (one a warp)
+ * @param wi 32 words of shared scratch
+ */
 template <uint32_t THREADS>
 __device__ void block_argmin(double *s, uint32_t *i, double *wd, uint32_t *wi) {
     double v = *s;
@@ -185,6 +258,11 @@ __device__ void block_argmin(double *s, uint32_t *i, double *wd, uint32_t *wi) {
 }
 
 /* bitonic sort of keys[0, m) ascending in shared memory (m <= SMP_CAP), padded to a power of two with ~0 */
+/**
+ * Ascending bitonic sort of keys[0, m) in shared memory, padded to a power of two with ~0.
+ * @param keys the keys; room for m rounded up to a power of two (<= SMP_CAP)
+ * @param m keys to sort
+ */
 template <uint32_t THREADS>
 __device__ void bitonic_sort(uint64_t *keys, uint32_t m) {
     uint32_t p2 = 1;
@@ -209,6 +287,16 @@ __device__ void bitonic_sort(uint64_t *keys, uint32_t m) {
 /* The k (1 <= k <= 1024, k <= the finite count) smallest (desc key, id) of the row, sorted, into keys[0, k): the
  * k-th key K* by an 8-bit radix select, every key below it, and the lowest ids of K*'s tie class -- exactly the k the
  * host's insertion (strict '>' / '<', earlier ids first) keeps, in its order. */
+/**
+ * The k smallest (desc key, id) pairs of a row, sorted ascending, into keys[0, k): K*, the k-th key, by a four-pass
+ * 8-bit radix select, then every key below K* and the lowest ids of K*'s tie class.  Needs THREADS >= 256.
+ * @param rv the row
+ * @param k pairs wanted, 1 <= k <= 1024 and at most the row's finite count
+ * @param keys shared output, room for k rounded up to a power of two (bitonic_sort pads it)
+ * @param hist 256 words of shared scratch (a pass's digit histogram)
+ * @param cnt one shared word (the decided digit and count, then the append counter)
+ * @param redu THREADS words of shared scratch
+ */
 template <uint32_t THREADS>
 __device__ void select_topk(const row_view &rv, uint32_t k, uint64_t *keys, uint32_t *hist, uint32_t *cnt,
                             uint32_t *redu) {
@@ -284,68 +372,123 @@ __device__ void select_topk(const row_view &rv, uint32_t k, uint64_t *keys, uint
 }
 
 /* What the row function writes per row (the host reads the token; the gate also the dist). */
+/// The per-row result the row function writes (pulsar_gpu_sample_out).
 typedef pulsar_gpu_sample_out row_out_t;
 
 /* Per-launch arguments (by value). */
+/// The sampler launch's arguments, passed by value (__grid_constant__) to its kernels.
 struct launch_args {
+    /// The logits rows on the device; request q reads row q.row at logits + q.row * row_stride.
     const float *logits;
+    /// Floats between logits rows.
     uint64_t row_stride;       /* floats */
+    /// Values a row (the width the row view reads).
     uint32_t n_vocab;
+    /// Draws in the launch, <= PULSAR_GPU_SAMPLE_ROWS_MAX.
     uint32_t n_rows;
+    /// The token masks, [mask rows][mask_words] u32, or NULL.
     const uint32_t *mask;      /* [mask rows][mask_words] or NULL */
+    /// u32 words a mask row, >= ceil(n_vocab / 32).
     uint32_t mask_words;
+    /// [n_vocab] row index -> token id (a drafter's draft vocabulary), or NULL for the identity.
     const int32_t *id_map;     /* [n_vocab]: row index -> token id (a drafter's draft vocabulary), or NULL */
+    /// The draws' requests: knobs, key, logits row, mask row, probe.
     pulsar_gpu_sample_req req[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    /// [n_rows] results.
     row_out_t *out;            /* [n_rows] */
+    /// [n_rows] flags: 1 = the row kernel left the row to a slot.
     uint32_t *pending;         /* [n_rows]: 1 = the row kernel left it to a slot */
+    /// Bit r set: draw r is on the full arm and takes that arm's own pipeline.
     uint64_t full_rows;        /* bit r: row r is on the full arm (its own pipeline, not the row kernel's) */
+    /// The vocabulary width the knobs' plan reads (the row's; a chain slot's sparse row's).
     uint32_t plan_vocab;       /* the vocabulary the knobs' plan reads (the row's width; a chain slot's sparse row's) */
+    /// [n_rows][n_vocab] the id-order sums' values (prep_collect_kernel), or NULL.
     float *pvals;              /* [n_rows][n_vocab]: the id-order sums' values (prep_collect_kernel), or NULL */
+    /// Bit r set: draw r's sum is idsums[r].
     uint64_t idsum_rows;       /* bit r: row r's id-order sum is idsums[r] (sr_sum_kernel's) */
+    /// [n_rows] the id-order serial sums (sr_sum_kernel's).
     const double *idsums;
     /* slot scratch: per slot keys [2][n_vocab] u32, ids [2][n_vocab] u32, probs [n_vocab] f32, then (aligned) the
      * slot kernel's radix counts or the full arm's state and sort scratch */
+    /// The SMP_SLOTS scratch slots, slot_bytes apart.
     uint8_t *slots;
+    /// Bytes a slot (sample_slot_bytes(), a multiple of 256).
     uint64_t slot_bytes;
     /* the gate's dist dump: per row [n, ids[dist_cap], probs[dist_cap]] (u32 words), or NULL */
+    /// The gate's distribution dump, per row [n, ids[dist_cap], probs[dist_cap]] u32 words, or NULL.
     uint32_t *dist;
+    /// Entries a row of the dist dump.
     uint32_t dist_cap;
 };
 
 /* block_serial_sum's shared state */
+/// The shared state of block_serial_sum() and tile_walk().
 template <typename T>
 struct serial_sum_smem {
+    /// Per-warp sums of the grid scan (block_scan_excl_u64).
     unsigned long long wsum[32];
+    /// Per-warp minima (block_min_u32).
     uint32_t wmin[32];
+    /// The running sum: before `start` while walking, the result on return.
     T s;
+    /// The next index the walk resumes from.
     uint32_t start, stop, nan;
+    /** @var stop
+     *  HAS_PRED: the first index whose prefix satisfies the predicate, else UINT32_MAX. */
+    /** @var nan
+     *  Set when the sum went NaN. */
 };
 
 /* The shared memory of a row: the THREADS-wide scratch and (row kernel) the candidate store. */
+/// The shared memory of one row's draw: THREADS-wide scratch and (row kernel) the candidate store.
 template <uint32_t THREADS>
 struct row_smem {
+    /// block_argmax's value scratch.
     float redv[THREADS];
+    /// block_argmax's id scratch.
     int32_t redi[THREADS];
+    /// u32 sum / scan scratch.
     uint32_t redu[THREADS];
+    /// The candidates as (desc_key << 32 | id), sorted in place.
     uint64_t keys[SMP_CAP];
+    /// The candidates' probabilities, in sorted order.
     float probs[SMP_CAP];
+    /// block_serial_sum's state.
     serial_sum_smem<float> ssum;
+    /// block_argmin's per-warp scores (the race).
     double redd[32];
+    /// block_argmin's per-warp indices.
     uint32_t redw[32];
+    /// select_topk's 256-bin histogram.
     uint32_t hist[256];
+    /// A shared counter: select_topk's digit word, the candidates' append index.
     uint32_t cnt;
+    /// The row's sum, then the cut's emitted prefix sum.
     float fsum;
+    /// Candidates the cut emits.
     uint32_t filtered;
+    /// Unused: nothing in this file reads or writes it.
     int32_t win;
 };
 
 /* A row's candidate list, wherever it lives: sorted (key, id) and its probabilities in sorted order. */
+/// A row's sorted candidate list, in shared memory (the row kernel) or in a global slot.
 struct cand_list {
+    /// Candidates in the list.
     uint32_t n;
+    /// Shared sorted (desc_key << 32 | id) keys, or NULL on the slot path.
     uint64_t *skeys;     /* shared: (desc_key << 32 | id) sorted */
+    /// Global ids in sorted order (the slot path), read when skeys is NULL.
     uint32_t *gids;      /* global: ids in sorted order (slot path) */
+    /// Probabilities in sorted order (shared or global).
     float *probs;        /* shared or global, sorted order */
+    /// The row's ids -> the draw's ids (a drafter's draft vocabulary), or NULL.
     const int32_t *map;  /* the row's ids -> the draw's ids (a drafter's draft vocabulary), or NULL */
+    /**
+     * The token id of sorted candidate i, through map.
+     * @param i the sorted position, < n
+     * @return the draw's token id
+     */
     __device__ __forceinline__ int32_t id(uint32_t i) const {
         const int32_t r = skeys ? (int32_t)(uint32_t)skeys[i] : (int32_t)gids[i];
         return map ? map[r] : r;
@@ -354,6 +497,16 @@ struct cand_list {
 
 /* Stable LSD radix sort of (key, id) pairs in global memory by key, 4-bit digits, one block: each thread owns a
  * contiguous chunk, so counting per (digit, thread) and scattering each chunk in order keeps the sort stable. */
+/**
+ * Stable LSD radix sort of n (key, id) u32 pairs in global memory by key: eight 4-bit passes, one block of THREADS
+ * threads, each owning a contiguous chunk.  The passes ping-pong the buffers and end in (k0, v0).
+ * @param k0 the keys, sorted on return
+ * @param v0 the ids, permuted with them
+ * @param k1 n words of key scratch
+ * @param v1 n words of id scratch
+ * @param n pairs
+ * @param cnt global count scratch, 16 x THREADS + 16 words
+ */
 template <uint32_t THREADS>
 __device__ void global_radix_sort(uint32_t *k0, uint32_t *v0, uint32_t *k1, uint32_t *v1, uint32_t n, uint32_t *cnt) {
     const uint32_t tid = threadIdx.x;
@@ -411,36 +564,86 @@ __device__ void global_radix_sort(uint32_t *k0, uint32_t *v0, uint32_t *k1, uint
  * past its shared store, and the arm that needs a serial sum over the whole row in id order, keep their own passes.
  * The arithmetic is the row kernel's own (the same is_cand, the same expf): the candidates are the same set. */
 
+/// Blocks a row of the prep stage's chunked passes.
 constexpr uint32_t PREP_CHUNKS = 32;
+/// Threads a prep block.
 constexpr uint32_t PREP_THREADS = 256;
+/// Bins of the top-k radix select's first level (desc key bits 31..21).
 constexpr uint32_t HIST1 = 2048, HIST2 = 2048, HIST3 = 1024;   /* desc key bits 31..21, 20..10, 9..0 */
+/** @var HIST2
+ *  Bins of the second level (desc key bits 20..10). */
+/** @var HIST3
+ *  Bins of the third level (desc key bits 9..0). */
 
 /* A row's prep record (scratch, zeroed through `zero_end` before every launch). */
+/// A row's prep record in global scratch; the fields before zero_end are zeroed before every launch.
 struct row_prep {
+    /// Candidates appended to cand; past SMP_CAP the list overflowed.
     uint32_t n_cand;            /* candidates appended (past SMP_CAP: the list overflowed) */
+    /// The top-k row's level-1 radix digit of K*, fixed by prep_decide_kernel<1>.
     uint32_t d1, d2, d3;        /* the top-k row's radix digits, fixed by the decide kernels */
+    /** @var d2
+     *  Its level-2 digit (prep_decide_kernel<2>). */
+    /** @var d3
+     *  Its level-3 digit (prep_decide_kernel<3>). */
+    /// Keys still wanted inside the level-1 digit's class (the k-th key's rank there).
     uint32_t want1, want2, want3;
+    /** @var want2
+     *  Keys still wanted inside the level-2 digit's class. */
+    /** @var want3
+     *  Keys of K*'s tie class kept (the lowest ids). */
+    /// The three levels' histograms: HIST1, then HIST2, then HIST3 bins.
     uint32_t hist[HIST1 + HIST2 + HIST3];
+    /// Marker: everything before it is zeroed per launch.
     uint32_t zero_end;          /* everything above is zeroed per launch */
+    /// The row's first maximum (prep_collect_kernel).
     float maxv;
+    /// Its id, or -1 with no finite value.
     int32_t maxi;
+    /// Finite values in the row.
     uint32_t n_fin;
+    /// Each chunk's first maximum (prep_scan_kernel).
     float pmax[PREP_CHUNKS];
+    /// Each chunk's maximum's id, -1 with none.
     int32_t pidx[PREP_CHUNKS];
+    /// Each chunk's finite count.
     uint32_t pfin[PREP_CHUNKS];
+    /// The candidates as (desc_key << 32 | id), unordered; the first SMP_CAP appended are kept.
     uint64_t cand[SMP_CAP];
 };
 
 /* A row's knobs as the sampler reads them, and its path. */
+/// A row's knobs as the sampler reads them (clamped), and its path.
 struct row_plan {
+    /// The row is refused: a non-finite knob on a row that is not greedy.
     bool refuse, greedy;
+    /** @var greedy
+     *  Greedy: the GREEDY flag, or temperature <= 0. */
+    /// PATH_TOPK, PATH_MINP or PATH_FULL.
     uint32_t path;
+    /// The temperature.
     float T, top_p, min_p, rcpT, prefilter;
+    /** @var top_p
+     *  The nucleus mass, in (0, 1] (out-of-range values read as 1). */
+    /** @var min_p
+     *  The min-p ratio, >= 0. */
+    /** @var rcpT
+     *  1 / T (0 for a refused or greedy row); set by plan_row(). */
+    /** @var prefilter
+     *  The min-p arm's candidate threshold on p, min_p * MINP_PREFILTER_SLACK; 0 otherwise.  Set by plan_row(). */
+    /// The top-k, 0 (off) to 1024.
     int top_k;
+    /// The min-p arm on its full nucleus (minp_full_nucleus()): the sum is dropped.  Set by plan_row().
     bool full;
 };
 
 /* the knobs clamped and the path -- comparisons only, so the launch (host) routes the full arm by the same rule */
+/**
+ * The knobs clamped and the path -- comparisons only, so the host routes the full arm by the same rule.  Leaves
+ * rcpT, prefilter and full unset (plan_row() sets them).
+ * @param q the draw's request
+ * @param pl receives the plan
+ */
 __host__ __device__ __forceinline__ void plan_knobs(const pulsar_gpu_sample_req &q, row_plan *pl) {
     row_plan &p = *pl;
     p.greedy = (q.flags & PULSAR_GPU_SAMPLE_GREEDY) != 0;
@@ -457,6 +660,11 @@ __host__ __device__ __forceinline__ void plan_knobs(const pulsar_gpu_sample_req 
 }
 
 /* a row the full arm's pipeline draws */
+/**
+ * Whether the draw takes the full arm's pipeline: not refused, not greedy, PATH_FULL.
+ * @param q the draw's request
+ * @return true for a full-arm draw
+ */
 __host__ __device__ __forceinline__ bool row_on_full_arm(const pulsar_gpu_sample_req &q) {
     row_plan p;
     plan_knobs(q, &p);
@@ -465,6 +673,12 @@ __host__ __device__ __forceinline__ bool row_on_full_arm(const pulsar_gpu_sample
 
 /* THE full-nucleus predicate of the min-p arm, min_p >= max(0.02, 2.5 * 2^-24 * n_vocab) with top_p == 1 (plan_row
  * has the argument); a product and comparisons, the same on the host (the launch routes by it) */
+/**
+ * The min-p arm's full-nucleus predicate: top_p == 1 and min_p >= max(0.02, 2.5 * 2^-24 * n_vocab).
+ * @param p the row's plan
+ * @param n_vocab the vocabulary width the plan reads
+ * @return true when the arm may drop its sum
+ */
 __host__ __device__ __forceinline__ bool minp_full_nucleus(const row_plan &p, uint32_t n_vocab) {
 #ifdef __CUDA_ARCH__
     const float band = __fmul_rn(1.4901161193847656e-7f, (float)n_vocab);
@@ -474,6 +688,12 @@ __host__ __device__ __forceinline__ bool minp_full_nucleus(const row_plan &p, ui
     return p.top_p == 1.0f && p.min_p >= (band > SPARSE_MINP_MIN ? band : SPARSE_MINP_MIN);
 }
 
+/**
+ * The row's plan: plan_knobs(), then rcpT, the min-p prefilter and the full-nucleus flag.
+ * @param q the draw's request
+ * @param n_vocab the vocabulary width the plan reads (launch_args::plan_vocab)
+ * @return the plan
+ */
 __device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uint32_t n_vocab) {
     row_plan p;
     plan_knobs(q, &p);
@@ -495,6 +715,12 @@ __device__ __forceinline__ row_plan plan_row(const pulsar_gpu_sample_req &q, uin
 
 /* a row whose sum is the id-order serial sum over its whole vocabulary (the min-p arm off its full nucleus): the
  * launch runs those sums over the GPU before the row kernel (sr_sum_kernel) */
+/**
+ * Whether the draw's sum is the id-order serial sum over its whole vocabulary (the min-p arm off its full nucleus).
+ * @param q the draw's request
+ * @param n_vocab the row's width
+ * @return true for an id-order-sum draw
+ */
 __host__ __device__ __forceinline__ bool row_idsum(const pulsar_gpu_sample_req &q, uint32_t n_vocab) {
     row_plan p;
     plan_knobs(q, &p);
@@ -504,6 +730,17 @@ __host__ __device__ __forceinline__ bool row_idsum(const pulsar_gpu_sample_req &
 /* THE candidate predicate of the min-p and full arms (a top-k row's is its key against K*) -- the row kernel's and
  * the prep's (the full arm's rows of a launch take their own pipeline; a chain's slot runs the arm in the block).  floor: the full-nucleus arm's bound (an entry under it has
  * p < prefilter however it rounds), else -inf; *pp receives p where it was computed. */
+/**
+ * The candidate predicate of the min-p and full arms.
+ * @param p the row's plan
+ * @param i the id
+ * @param v its (masked) value
+ * @param floor_logit row_floor()'s bound
+ * @param maxlogit the row's maximum
+ * @param max_id the maximum's id, always a candidate
+ * @param pp receives p = expf((v - maxlogit) / T) where it was computed (not on the full arm)
+ * @return whether id i is a candidate
+ */
 __device__ __forceinline__ bool row_is_cand(const row_plan &p, uint32_t i, float v, float floor_logit, float maxlogit,
                                             uint32_t max_id, float *pp) {
     if (!finite_bits(v)) return false;
@@ -514,11 +751,23 @@ __device__ __forceinline__ bool row_is_cand(const row_plan &p, uint32_t i, float
     return pr >= p.prefilter || i == max_id;
 }
 
+/**
+ * The full-nucleus min-p arm's logit floor: an entry under it has p under the prefilter however it rounds.
+ * @param p the row's plan
+ * @param maxv the row's maximum
+ * @return maxv + (log(min_p) - 1e-3) * T on that arm, else -inf
+ */
 __device__ __forceinline__ float row_floor(const row_plan &p, float maxv) {
     return p.path == PATH_MINP && p.full ? __fmaf_rn(__fsub_rn(logf(p.min_p), 1e-3f), p.T, maxv)
                                          : __uint_as_float(0xff800000u);
 }
 
+/**
+ * The row_view of a draw: its logits row and its mask row.
+ * @param a the launch
+ * @param q the draw's request
+ * @return the view, n_vocab wide
+ */
 __device__ __forceinline__ row_view prep_view(const launch_args &a, const pulsar_gpu_sample_req &q) {
     row_view rv;
     rv.x = a.logits + (size_t)q.row * a.row_stride;
@@ -528,6 +777,13 @@ __device__ __forceinline__ row_view prep_view(const launch_args &a, const pulsar
 }
 
 /* chunk c of a row: [lo, hi) */
+/**
+ * Chunk c of PREP_CHUNKS equal chunks over [0, n).
+ * @param n the length
+ * @param c the chunk
+ * @param lo receives its first index
+ * @param hi receives the index past it
+ */
 __device__ __forceinline__ void prep_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
     const uint32_t per = (n + PREP_CHUNKS - 1u) / PREP_CHUNKS;
     *lo = min(c * per, n);
@@ -535,14 +791,28 @@ __device__ __forceinline__ void prep_chunk(uint32_t n, uint32_t c, uint32_t *lo,
 }
 
 /* chunk c of gridDim.x (the passes that keep no per-chunk record run wider) */
+/**
+ * Chunk c of gridDim.x equal chunks over [0, n) (the passes that keep no per-chunk record run wider).
+ * @param n the length
+ * @param c the chunk
+ * @param lo receives its first index
+ * @param hi receives the index past it
+ */
 __device__ __forceinline__ void grid_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
     const uint32_t per = (n + gridDim.x - 1u) / gridDim.x;
     *lo = min(c * per, n);
     *hi = min(*lo + per, n);
 }
+/// Blocks a row of the wide passes (prep_collect_kernel at <= 4 rows, the full arm's per-element kernels).
 constexpr uint32_t WIDE_CHUNKS = 128;   /* the wide passes' blocks a row */
 
 /* scan: the chunk's first maximum and finite count; a top-k row's first histogram */
+/**
+ * Prep pass 1: each chunk's first maximum, its id and its finite count into the row's pmax / pidx / pfin; a top-k
+ * row's level-1 histogram.  Grid (PREP_CHUNKS, n_rows), block PREP_THREADS.
+ * @param a the launch
+ * @param prep [n_rows] prep records, zeroed through zero_end
+ */
 __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
     __shared__ float rv_[PREP_THREADS];
     __shared__ int32_t ri_[PREP_THREADS];
@@ -587,6 +857,14 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
 
 /* the row's first maximum and finite count from its chunks' (the block argmax's rule: a larger value, or an equal one
  * at a lower id) */
+/**
+ * The row's first maximum and finite count, reduced from its chunks' records (a larger value, or an equal one at a
+ * lower id).
+ * @param pr the row's prep record
+ * @param maxv receives the maximum
+ * @param maxi receives its id, or -1 with no finite value
+ * @param n_fin receives the finite count
+ */
 __device__ __forceinline__ void prep_reduce_max(const row_prep *pr, float *maxv, int32_t *maxi, uint32_t *n_fin) {
     float bv = 0.0f;
     int32_t bi = -1;
@@ -604,6 +882,13 @@ __device__ __forceinline__ void prep_reduce_max(const row_prep *pr, float *maxv,
 
 /* decide level L of a top-k row's radix select: the digit whose cumulative count reaches the keys still wanted
  * (the k-th smallest key's), and how many of the level's class sit below it */
+/**
+ * Decides level L (1..3) of a top-k row's radix select: the digit whose cumulative count reaches the keys still
+ * wanted, and how many are still wanted inside its class (d_L, want_L).  Rows not on the top-k path return.
+ * Grid n_rows, block PREP_THREADS.
+ * @param a the launch
+ * @param prep the rows' prep records
+ */
 template <uint32_t L>
 __global__ void __launch_bounds__(PREP_THREADS) prep_decide_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
     __shared__ uint32_t sc[PREP_THREADS];
@@ -647,6 +932,12 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_decide_kernel(const __grid_
 }
 
 /* level 2 / 3 histograms over the keys of the decided prefix */
+/**
+ * Level L (2 or 3) histogram of a top-k row's keys under the digits decided so far.
+ * Grid (PREP_CHUNKS, n_rows), block PREP_THREADS.
+ * @param a the launch
+ * @param prep the rows' prep records
+ */
 template <uint32_t L>
 __global__ void __launch_bounds__(PREP_THREADS) prep_hist_kernel(const __grid_constant__ launch_args a, row_prep *prep) {
     const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
@@ -670,6 +961,14 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_hist_kernel(const __grid_co
 }
 
 /* the row's maximum (block 0 records it) and its candidates appended to its list */
+/**
+ * Prep collection: block 0 records the row's maximum; every block appends its chunk's candidates (top-k: a key at
+ * or below K*; else row_is_cand()) to the row's list, and writes the id-order rows' p values to a.pvals.  Skips
+ * refused, greedy, empty and full-arm rows.  Grid (WIDE_CHUNKS at <= 4 rows, else PREP_CHUNKS; n_rows), block
+ * PREP_THREADS.
+ * @param a the launch
+ * @param prep the rows' prep records
+ */
 __global__ void __launch_bounds__(PREP_THREADS) prep_collect_kernel(const __grid_constant__ launch_args a,
                                                                     row_prep *prep) {
     const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
@@ -712,6 +1011,13 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_collect_kernel(const __grid
 
 /* Serially sum v[0, n) in order (one thread) -- the host's float accumulation, bit for bit; four at a time from
  * shared memory so the loads overlap the dependent adds. */
+/**
+ * The host's serial float accumulation, bit for bit, on one thread: four at a time when v is 16-byte aligned.
+ * @param s the starting sum
+ * @param v the values
+ * @param n their count
+ * @return s + v[0] + ... + v[n - 1], added in order
+ */
 __device__ __forceinline__ float serial_sum_from(float s, const float *v, uint32_t n) {
     uint32_t i = 0;
     if ((((uintptr_t)v) & 15u) == 0)
@@ -725,6 +1031,12 @@ __device__ __forceinline__ float serial_sum_from(float s, const float *v, uint32
     for (; i < n; i++) s = __fadd_rn(s, v[i]);
     return s;
 }
+/**
+ * The serial float sum of p[0, n) from 0 (serial_sum_from()).
+ * @param p the values
+ * @param n their count
+ * @return the sum
+ */
 __device__ __forceinline__ float serial_sum(const float *p, uint32_t n) { return serial_sum_from(0.0f, p, n); }
 
 /* ---- THE serial sum, in parallel and to the bit ----------------------------------------------------------------
@@ -738,28 +1050,83 @@ __device__ __forceinline__ float serial_sum(const float *p, uint32_t n) { return
  * and the scan restarts after them on the sum's new grid -- inside the tile, from the values each thread holds in
  * registers.  A sum crosses a binade a few dozen times, and an exact tie is rare, so a row costs about one pass. */
 
+/// Values a thread holds per tile of block_serial_sum().
 constexpr uint32_t SUM_E = 8;   /* values a thread holds a tile */
 
 template <typename T> struct sum_grid_traits;
+/// float's grid constants and operations.
 template <> struct sum_grid_traits<float> {
+    /// Mantissa bits.
     static constexpr uint32_t MANT = 23u, LSB = 150u, EMAX = 255u;   /* value = M * 2^(max(e, 1) - LSB) */
+    /** @var LSB
+     *  The ulp's exponent offset: a value is M * 2^(max(e, 1) - LSB). */
+    /** @var EMAX
+     *  The all-ones exponent field (inf / NaN). */
+    /**
+     * The value's bits.
+     * @param v the value
+     * @return its bits, widened to 64
+     */
     static __device__ __forceinline__ uint64_t bits(float v) { return __float_as_uint(v); }
+    /**
+     * a + b, round-to-nearest.
+     * @param a an addend
+     * @param b an addend
+     * @return the sum
+     */
     static __device__ __forceinline__ float add(float a, float b) { return __fadd_rn(a, b); }
+    /**
+     * m * 2^-k.
+     * @param m the grid point
+     * @param k the grid's exponent
+     * @return the value
+     */
     static __device__ __forceinline__ float scaled(uint64_t m, int k) { return ldexpf((float)(uint32_t)m, -k); }
 };
+/// double's grid constants and operations.
 template <> struct sum_grid_traits<double> {
+    /// Mantissa bits.
     static constexpr uint32_t MANT = 52u, LSB = 1075u, EMAX = 2047u;
+    /** @var LSB
+     *  The ulp's exponent offset: a value is M * 2^(max(e, 1) - LSB). */
+    /** @var EMAX
+     *  The all-ones exponent field (inf / NaN). */
+    /**
+     * The value's bits.
+     * @param v the value
+     * @return its bits
+     */
     static __device__ __forceinline__ uint64_t bits(double v) { return (uint64_t)__double_as_longlong(v); }
+    /**
+     * a + b, round-to-nearest.
+     * @param a an addend
+     * @param b an addend
+     * @return the sum
+     */
     static __device__ __forceinline__ double add(double a, double b) { return __dadd_rn(a, b); }
+    /**
+     * m * 2^-k.
+     * @param m the grid point
+     * @param k the grid's exponent
+     * @return the value
+     */
     static __device__ __forceinline__ double scaled(uint64_t m, int k) { return ldexp((double)m, -k); }
 };
 
 /* s's grid: s = m * 2^-k exactly, m < 2^(MANT + 1); finite false for a NaN or infinite s */
+/// The grid of a sum s: s = m * 2^-k exactly, m < 2^(MANT + 1).
 template <typename T>
 struct sum_grid {
+    /// False for a NaN or infinite s.
     bool finite;
+    /// The grid's exponent: one ulp is 2^-k.
     int k;
+    /// s in ulps.
     uint64_t m;
+    /**
+     * Decomposes s onto its grid.
+     * @param s the sum
+     */
     __device__ __forceinline__ explicit sum_grid(T s) {
         typedef sum_grid_traits<T> tr;
         const uint64_t b = tr::bits(s);
@@ -769,11 +1136,23 @@ struct sum_grid {
         m = e ? mant | (1ull << tr::MANT) : mant;
         k = (int)tr::LSB - (int)(e ? e : 1u);
     }
+    /**
+     * The value of grid point mm on this grid.
+     * @param mm the grid point
+     * @return mm * 2^-k
+     */
     __device__ __forceinline__ T value(uint64_t mm) const { return sum_grid_traits<T>::scaled(mm, k); }
 };
 
 /* rint(p * 2^k) from p's bits (integer ops: no FP64), clamped at `top` (any such value leaves the binade); *serial
  * set for an exact tie or a NaN p */
+/**
+ * rint(p * 2^k) from p's bits (integer ops only), clamped at 2^(MANT + 1) (any such value leaves the binade).
+ * @param p the value, >= 0
+ * @param k the grid's exponent (one ulp is 2^-k)
+ * @param serial set for an exact tie or a NaN p
+ * @return p in ulps, rounded to nearest
+ */
 template <typename T>
 __device__ __forceinline__ uint64_t grid_q(T p, int k, bool *serial) {
     typedef sum_grid_traits<T> tr;
@@ -795,6 +1174,12 @@ __device__ __forceinline__ uint64_t grid_q(T p, int k, bool *serial) {
 }
 
 /* Saturating at 2^62: a prefix that large has left any binade, and the saturating sum is still associative. */
+/**
+ * a + b saturated at 2^62 (a prefix that large has left any binade; the saturating sum stays associative).
+ * @param a an addend
+ * @param b an addend
+ * @return the saturated sum
+ */
 __device__ __forceinline__ uint64_t sat_add(uint64_t a, uint64_t b) {
     constexpr uint64_t CAP = 1ull << 62;
     const uint64_t s = a + b;
@@ -802,6 +1187,13 @@ __device__ __forceinline__ uint64_t sat_add(uint64_t a, uint64_t b) {
 }
 
 /* Block-wide exclusive (saturating) scan of v (THREADS threads); *total receives the sum. */
+/**
+ * Block-wide exclusive saturating scan of one u64 a thread (THREADS threads).
+ * @param v this thread's value
+ * @param wsum 32 words of shared scratch
+ * @param total receives the block's sum
+ * @return the sum of the values of the threads before this one
+ */
 template <uint32_t THREADS>
 __device__ __forceinline__ uint64_t block_scan_excl_u64(uint64_t v, unsigned long long *wsum, uint64_t *total) {
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -832,6 +1224,12 @@ __device__ __forceinline__ uint64_t block_scan_excl_u64(uint64_t v, unsigned lon
 }
 
 /* The block's least c. */
+/**
+ * The block's least c (THREADS threads).
+ * @param c this thread's value
+ * @param wmin 32 words of shared scratch
+ * @return the minimum, in every thread
+ */
 template <uint32_t THREADS>
 __device__ __forceinline__ uint32_t block_min_u32(uint32_t c, uint32_t *wmin) {
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
@@ -847,6 +1245,17 @@ __device__ __forceinline__ uint32_t block_min_u32(uint32_t c, uint32_t *wmin) {
 /* One tile of the serial sum: the values v (thread t holds [ib, ib + E)), from index `start` to t_end, onto sm.s (the
  * sum before `start`).  On return sm.s is the sum through t_end - 1 -- or, HAS_PRED, through the first index whose
  * prefix satisfies pred, which sm.stop then names; sm.nan is set when the sum went NaN.  Every thread takes part. */
+/**
+ * One tile of the serial sum, onto sm.s (the sum before `start`): on return sm.s is the sum through t_end - 1, or
+ * (HAS_PRED) through the first index whose prefix satisfies pred, which sm.stop names; sm.nan is set when the sum
+ * went NaN.  Every thread of the THREADS-thread block takes part.
+ * @param v this thread's E values, indices [ib, ib + E)
+ * @param ib this thread's first index
+ * @param start the first index to add
+ * @param t_end the index past the tile
+ * @param pred the predicate on a prefix sum (HAS_PRED)
+ * @param sm the shared state
+ */
 template <typename T, uint32_t THREADS, uint32_t E, bool HAS_PRED, typename P>
 __device__ void tile_walk(const T (&v)[E], uint32_t ib, uint32_t start, uint32_t t_end, P pred, serial_sum_smem<T> &sm) {
     typedef sum_grid_traits<T> tr;
@@ -920,6 +1329,16 @@ __device__ void tile_walk(const T (&v)[E], uint32_t ib, uint32_t start, uint32_t
 /* The serial round-to-nearest sum of value(0) .. value(n - 1) in one block, stopped after the first i whose prefix
  * satisfies pred (HAS_PRED; *stop_at = i, else UINT32_MAX) -- a row's few values (a chain's slot, a slot kernel's
  * row); a row's whole vocabulary takes the multi-block sum below.  Every thread returns the sum. */
+/**
+ * The serial round-to-nearest sum of value(0) .. value(n - 1) in one block (a row's few values), stopped after the
+ * first index whose prefix satisfies pred (HAS_PRED).
+ * @param n the values
+ * @param value value(i), the i-th value
+ * @param pred the predicate on a prefix sum (HAS_PRED)
+ * @param stop_at receives the stop index (UINT32_MAX for none), or NULL
+ * @param sm the shared state
+ * @return the sum, in every thread
+ */
 template <typename T, uint32_t THREADS, uint32_t E, bool HAS_PRED, typename V, typename P>
 __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, serial_sum_smem<T> &sm) {
     const uint32_t tid = threadIdx.x;
@@ -950,42 +1369,82 @@ __device__ T block_serial_sum(uint32_t n, V value, P pred, uint32_t *stop_at, se
  * nothing ties or crosses), which the tile publishes.  The few tiles where the sum leaves a binade chain; the rest
  * resolve from the look-back. */
 
+/// Threads a block of the GPU-wide serial sum's kernels.
 constexpr uint32_t SR_THREADS = 512, SR_E = 8, SR_TILE = SR_THREADS * SR_E;
+/** @var SR_E
+ *  Values a thread holds per tile. */
+/** @var SR_TILE
+ *  Values a tile (a block's): SR_THREADS * SR_E. */
+/// Rows one GPU-wide serial sum carries (PULSAR_GPU_SAMPLE_ROWS_MAX).
 constexpr uint32_t SR_ROWS = PULSAR_GPU_SAMPLE_ROWS_MAX;
+/// A row's first values, added serially by tile 0 (sr_sum_kernel).
 constexpr uint32_t SR_HEAD = 512;   /* a row's first values, added serially (sr_sum_kernel) */
 
+/// A tile's published state in the GPU-wide serial sum's look-back.
 struct sr_status {
+    /// 0 nothing yet, 1 the aggregate, 2 the exact end too.
     uint32_t flag;            /* 0 nothing, 1 the aggregate, 2 the exact end too */
+    /// The aggregate's grid: one ulp is 2^-k.
     int32_t k;                /* the aggregate's grid (u = 2^-k) */
+    /// Nonzero when the aggregate holds a tie or a NaN.
     uint32_t tie;             /* the aggregate holds a tie or a NaN */
+    /// HAS_PRED: the first index in this tile whose prefix satisfies pred, or UINT32_MAX.
     uint32_t stop;            /* HAS_PRED: the first index whose prefix satisfies pred, in this tile, or UINT32_MAX */
+    /// The aggregate: the sum of rint(p / u) over the tile.
     unsigned long long Q;     /* the aggregate */
+    /// The exact sum through the tile's end (or through stop).
     double end;               /* the exact sum through the tile's end (or through `stop`) */
 };
 
 /* A row's sum: its values (T at vals), their count (*n_ptr, or n when n_ptr is NULL); HAS_PRED's prefix test is
  * prefix * (1 / *sum_ptr) >= top_p (the cut, against the row's sum from a pass before). */
+/// One row of a GPU-wide serial sum: its values, their count and (HAS_PRED) the cut's test.
 struct sr_row {
+    /// The values, T each (float or double).
     const void *vals;
+    /// The count on the device, or NULL to read n.
     const uint32_t *n_ptr;
+    /// The count when n_ptr is NULL.
     uint32_t n;
+    /// HAS_PRED: the cut's mass threshold.
     float top_p;
+    /// HAS_PRED: the row's sum from a pass before (the test is prefix * (1 / *sum_ptr) >= top_p).
     const double *sum_ptr;
 };
 
+/// The GPU-wide serial sum's arguments, by value (sr_run() fills the scratch pointers).
 struct sr_args {
+    /// The rows.
     sr_row row[SR_ROWS];
+    /// Rows in use (the grid's y).
     uint32_t n_rows, tiles;   /* tiles: the launch's grid width (the widest row's) */
+    /** @var tiles
+     *  The grid's width in tiles (the widest row's). */
+    /// [n_rows][tiles] the tiles' status.
     sr_status *st;            /* [n_rows][tiles] */
+    /// [n_rows][tiles] the tiles' approximate (double) sums.
     double *approx;           /* [n_rows][tiles] */
+    /// [n_rows] the tile tickets.
     uint32_t *ticket;         /* [n_rows] */
+    /// [n_rows] the sums (HAS_PRED: through the stop).
     double *sum;              /* [n_rows]: the sum (HAS_PRED: through the stop) */
+    /// [n_rows] HAS_PRED's stop index, or UINT32_MAX.
     uint32_t *stop;           /* [n_rows]: HAS_PRED's first index, or UINT32_MAX */
 };
 
+/**
+ * A row's value count.
+ * @param r the row
+ * @return *r.n_ptr, or r.n when n_ptr is NULL
+ */
 __device__ __forceinline__ uint32_t sr_n(const sr_row &r) { return r.n_ptr ? *r.n_ptr : r.n; }
 
 /* each tile's double sum, any order: the approximate prefix the tiles' grid guesses read */
+/**
+ * Each tile's double sum into a.approx (any order: the guesses of the tiles' grids read it); resets the row's ticket
+ * and the tiles' flags.  Grid (tiles, n_rows), block SR_THREADS; runs before sr_sum_kernel.
+ * @param a the sum's arguments
+ */
 template <typename T>
 __global__ void __launch_bounds__(SR_THREADS) sr_approx_kernel(const __grid_constant__ sr_args a) {
     __shared__ double red[SR_THREADS / 32u];
@@ -1006,6 +1465,14 @@ __global__ void __launch_bounds__(SR_THREADS) sr_approx_kernel(const __grid_cons
     }
 }
 
+/**
+ * One tile of the GPU-wide serial sum (decoupled look-back on the ulp grid): the block takes a tile by ticket,
+ * publishes its aggregate on the grid of the approximate prefix, resolves its exact start from its predecessors'
+ * records, walks to its exact end (tile_walk(); tile 0 adds its first SR_HEAD values serially) and publishes it.
+ * Ticket order means every predecessor has started, so the spin-waits on their flags make progress.
+ * Grid (tiles, n_rows), block SR_THREADS; after sr_approx_kernel.
+ * @param a the sum's arguments
+ */
 template <typename T, bool HAS_PRED>
 __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constant__ sr_args a) {
     typedef sum_grid_traits<T> tr;
@@ -1152,6 +1619,12 @@ __global__ void __launch_bounds__(SR_THREADS) sr_sum_kernel(const __grid_constan
 }
 
 /* the row's result: the last tile's end, or (HAS_PRED) the first tile's stop and its prefix */
+/**
+ * Each row's result from its tiles: the last tile's end, or (has_pred) the first tile that stopped, its prefix and
+ * stop index.  One thread a row: launched <<<1, 64>>> (SR_ROWS <= 64).
+ * @param a the sum's arguments
+ * @param has_pred whether the pass ran with the cut's predicate
+ */
 __global__ void sr_final_kernel(const __grid_constant__ sr_args a, bool has_pred) {
     const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= a.n_rows) return;
@@ -1172,6 +1645,16 @@ __global__ void sr_final_kernel(const __grid_constant__ sr_args a, bool has_pred
 /* THE row: argmax, the path, the candidates, the cut, the race.  `pp` (the row kernel) is the row's prep -- its maximum
  * and candidate list (a list past the shared store leaves the row pending for a slot); `slot` (the slot kernel, pp
  * NULL) is a global scratch slot: the row's own passes, a stable radix sort in global memory. */
+/**
+ * THE row's draw: the argmax, the path, the candidates, the sum, the cut and the race; writes the row's result (and
+ * its dist dump), or leaves it pending for a slot when its candidates overflow the shared store.  Every thread of the
+ * THREADS-thread block calls it.
+ * @param a the launch
+ * @param row the draw's index into a.req / a.out
+ * @param sm the block's shared memory
+ * @param pp the row's prep record (the row kernel: its maximum and candidate list), or NULL
+ * @param slot the row's global scratch slot (the slot kernel: its own passes and a global radix sort), or NULL
+ */
 template <uint32_t THREADS>
 __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS> &sm, const row_prep *pp,
                            uint8_t *slot) {
@@ -1418,6 +1901,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
     finish(tok, PULSAR_GPU_SAMPLE_OK);
 }
 
+/**
+ * The row kernel: one block a draw, SMP_THREADS threads, row_smem in static shared memory.  Clears the row's
+ * pending flag, skips full-arm rows, and draws from the row's prep record.  Grid n_rows.
+ * @param a the launch
+ * @param prep [n_rows] prep records
+ */
 __global__ void __launch_bounds__(SMP_THREADS) sample_rows_kernel(const __grid_constant__ launch_args a,
                                                                    const row_prep *prep) {
     __shared__ row_smem<SMP_THREADS> sm;
@@ -1428,6 +1917,11 @@ __global__ void __launch_bounds__(SMP_THREADS) sample_rows_kernel(const __grid_c
 }
 
 /* The rows the row kernel left pending, round-robin over the slots in row order. */
+/**
+ * The slot kernel: block b finishes the pending rows whose rank among the pending is b mod SMP_SLOTS, in row order,
+ * on slot b's scratch.  Grid SMP_SLOTS, block SLOT_THREADS; after sample_rows_kernel.
+ * @param a the launch
+ */
 __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid_constant__ launch_args a) {
     __shared__ row_smem<SLOT_THREADS> sm;
     uint32_t rank = 0;
@@ -1448,35 +1942,71 @@ __global__ void __launch_bounds__(SLOT_THREADS) sample_slots_kernel(const __grid
  * first minimum of those).  Rows go FULL_GROUP at a time, one scratch
  * slot each. */
 
+/// Full-arm rows a pass takes, one scratch slot each.
 constexpr uint32_t FULL_GROUP = SMP_SLOTS;
 /* a full-arm row's state: the candidates, the cut and the sum it emits by, each race chunk's first minimum */
+/// A full-arm row's state, in its slot at full_state_off().
 struct full_state {
+    /// Candidates: the row's finite values.
     uint32_t n, f, status, ncut;   /* ncut: the cut's walk length (the floor), 0 for a refused row */
+    /** @var f
+     *  Emitted candidates: the floor search lowers it from n; full_cut_kernel sets the cut's. */
+    /** @var status
+     *  The row's PULSAR_GPU_SAMPLE_* status. */
+    /** @var ncut
+     *  The cut's walk length (the floor), 0 for a refused row. */
+    /// The emitted prefix sum (the emitted probabilities' divisor).
     float fs;
+    /// The race estimates' least upper bound, as float bits (atomicMin).
     uint32_t ub_bits;   /* the race estimates' least upper bound (float bits) */
+    /// Each race chunk's least exact score (its first strict minimum).
     double pbest[PREP_CHUNKS];
+    /// That minimum's sorted index, UINT32_MAX with none.
     uint32_t pidx[PREP_CHUNKS];
 };
 
+/**
+ * The byte offset of a slot's full_state: past the five n_vocab-word arrays, 256-aligned.
+ * @param n_vocab the row's width
+ * @return the offset
+ */
 __host__ __device__ __forceinline__ uint64_t full_state_off(uint32_t n_vocab) {
     return ((uint64_t)n_vocab * 5u * sizeof(uint32_t) + 255u) & ~255ull;
 }
 
 /* the rows of one pass, slot j for row[j]; the sort leaves its output in the alternate buffers or not */
+/// One full-arm pass: up to FULL_GROUP rows, slot j for row[j].
 struct full_group {
+    /// The draws' indices.
     uint32_t row[FULL_GROUP];
+    /// Rows in use.
     uint32_t n;
+    /// Nonzero when the device radix sort left its output in the alternate buffers (k1, v1).
     uint32_t sorted_in_alt;
 };
 
 /* a slot's arrays: keys and ids in (keygen), the sorted ids, the probabilities in sorted order, the row's state */
+/// A full-arm slot's arrays.
 struct full_slot {
+    /// The sort's input keys: desc keys, ~0 for a non-finite value.
     uint32_t *k_in, *v_in;
+    /** @var v_in
+     *  The sort's input ids, 0 .. n_vocab - 1. */
+    /// The sorted ids.
     const uint32_t *ids;
+    /// The probabilities in sorted order.
     float *p;
+    /// The row's state.
     full_state *st;
 };
 
+/**
+ * Slot j's arrays for a pass.
+ * @param a the launch
+ * @param g the pass
+ * @param j the slot (and index into g.row)
+ * @return the arrays
+ */
 __device__ __forceinline__ full_slot full_slot_of(const launch_args &a, const full_group &g, uint32_t j) {
     uint8_t *base = a.slots + (size_t)j * a.slot_bytes;
     uint32_t *k0 = (uint32_t *)base, *v0 = k0 + a.n_vocab, *k1 = v0 + a.n_vocab, *v1 = k1 + a.n_vocab;
@@ -1490,6 +2020,13 @@ __device__ __forceinline__ full_slot full_slot_of(const launch_args &a, const fu
 }
 
 /* the sort's input, and the row's state reset (the floor search lowers f from n) */
+/**
+ * The device sort's input (desc key, id) for every value, and the row's state reset (n = f = the finite count).
+ * Grid (WIDE_CHUNKS, g.n), block PREP_THREADS.
+ * @param a the launch
+ * @param g the pass
+ * @param prep the rows' prep records (their finite counts)
+ */
 __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_constant__ launch_args a,
                                                                    const full_group g, const row_prep *prep) {
     const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
@@ -1514,6 +2051,13 @@ __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_
     }
 }
 
+/**
+ * The sorted candidates' probabilities, expf((v - max) / T); the sorted head is the maximum.
+ * Grid (WIDE_CHUNKS, g.n), block PREP_THREADS.
+ * @param a the launch
+ * @param g the pass
+ * @param prep the rows' prep records (their finite counts)
+ */
 __global__ void __launch_bounds__(PREP_THREADS) full_probs_kernel(const __grid_constant__ launch_args a,
                                                                   const full_group g, const row_prep *prep) {
     const uint32_t j = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
@@ -1533,6 +2077,12 @@ __global__ void __launch_bounds__(PREP_THREADS) full_probs_kernel(const __grid_c
 
 /* the cut's floor: the host's loop stops before the first i > 0 with p under p0 * min_p (min_p <= 1e-30 here: only
  * a subnormal tail is under it) -- the least such i over the row lowers f */
+/**
+ * The cut's floor: lowers st->f to the least i > 0 with p[i] < p[0] * min_p.
+ * Grid (WIDE_CHUNKS, g.n), block PREP_THREADS.
+ * @param a the launch
+ * @param g the pass
+ */
 __global__ void __launch_bounds__(PREP_THREADS) full_floor_kernel(const __grid_constant__ launch_args a,
                                                                   const full_group g) {
     __shared__ uint32_t red[PREP_THREADS];
@@ -1559,6 +2109,13 @@ __global__ void __launch_bounds__(PREP_THREADS) full_floor_kernel(const __grid_c
 /* THE serial sum in sorted order (the host's float accumulation) runs over the GPU (sr_sum_kernel), then the cut:
  * the walk again up to the floor (f from the floor search), stopped after the first candidate whose prefix
  * * (1 / sum) reaches top_p.  Between the two: the mass test, and each row's walk length. */
+/**
+ * The mass test on each row's sorted-order sum (a non-positive or non-finite one refuses the row), and the cut's
+ * walk length ncut.  One thread a row: launched <<<1, 32>>>.
+ * @param a the launch
+ * @param g the pass
+ * @param sum [g.n] the rows' sums
+ */
 __global__ void full_mass_kernel(const __grid_constant__ launch_args a, const full_group g, const double *sum) {
     const uint32_t j = threadIdx.x;
     if (j >= g.n) return;
@@ -1571,6 +2128,13 @@ __global__ void full_mass_kernel(const __grid_constant__ launch_args a, const fu
 }
 
 /* the cut's result: the top-p stop, else the floor (or every candidate), and the prefix there */
+/**
+ * The cut's result: f = the top-p stop + 1, else ncut; fs = the prefix there.  One thread a row: <<<1, 32>>>.
+ * @param a the launch
+ * @param g the pass
+ * @param prefix [g.n] the predicate pass's prefix sums
+ * @param stop [g.n] its stop indices, UINT32_MAX for none
+ */
 __global__ void full_cut_kernel(const __grid_constant__ launch_args a, const full_group g, const double *prefix,
                                 const uint32_t *stop) {
     const uint32_t j = threadIdx.x;
@@ -1583,7 +2147,15 @@ __global__ void full_cut_kernel(const __grid_constant__ launch_args a, const ful
 
 /* A float estimate of race_score within a relative 1e-5 (the error is a few ulps): u = (m + 0.5) * 2^-53 is exact in
  * double; -log(u) from u itself under 1/2, from log1p(-(1 - u)) above (so a u near 1 keeps its digits). */
+/// race_score_est()'s relative error bound.
 constexpr float RACE_EST_TOL = 1e-5f;
+/**
+ * A float estimate of race_score() within RACE_EST_TOL relative.
+ * @param key the row's draw key
+ * @param id the candidate's token id
+ * @param p its emitted probability, > 0
+ * @return the estimate
+ */
 __device__ __forceinline__ float race_score_est(uint64_t key, int32_t id, float p) {
     const uint64_t h = mix64(key ^ ((uint64_t)(uint32_t)id * 0xd1b54a32d192ed03ull));
     const double u = __dmul_rn(__dadd_rn((double)(h >> 11), 0.5), 1.0 / 9007199254740992.0);
@@ -1594,6 +2166,12 @@ __device__ __forceinline__ float race_score_est(uint64_t key, int32_t id, float 
 /* the race over the emitted candidates in two passes: the estimates' least upper bound over the row, then the exact
  * score (double, the host's) only where the estimate's lower bound reaches it -- every other candidate's score is
  * provably above the minimum, so the first strict minimum is the same.  Pass 1 also writes the probe and the dump. */
+/**
+ * Race pass 1: the least upper bound of the score estimates over the emitted candidates into st->ub_bits; also
+ * writes the probe's probability and the dist dump.  Grid (PREP_CHUNKS, g.n), block PREP_THREADS.
+ * @param a the launch
+ * @param g the pass
+ */
 __global__ void __launch_bounds__(PREP_THREADS) full_race_bound_kernel(const __grid_constant__ launch_args a,
                                                                        const full_group g) {
     __shared__ float red[PREP_THREADS];
@@ -1630,6 +2208,12 @@ __global__ void __launch_bounds__(PREP_THREADS) full_race_bound_kernel(const __g
 }
 
 /* pass 2: each chunk's first strict minimum of the exact scores among the candidates that can reach the bound */
+/**
+ * Race pass 2: each chunk's first strict minimum of the exact scores among the candidates whose estimate can reach
+ * the bound, into st->pbest / st->pidx.  Grid (PREP_CHUNKS, g.n), block PREP_THREADS.
+ * @param a the launch
+ * @param g the pass
+ */
 __global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_constant__ launch_args a,
                                                                  const full_group g) {
     __shared__ double wd[32];
@@ -1661,6 +2245,12 @@ __global__ void __launch_bounds__(PREP_THREADS) full_race_kernel(const __grid_co
     }
 }
 
+/**
+ * Each row's token: the first strict minimum over the chunks in chunk order, or the row's refusal.  Grid g.n; thread
+ * 0 of each block works.
+ * @param a the launch
+ * @param g the pass
+ */
 __global__ void full_final_kernel(const __grid_constant__ launch_args a, const full_group g) {
     const uint32_t j = blockIdx.x;
     if (threadIdx.x != 0 || j >= g.n) return;
@@ -1686,36 +2276,69 @@ __global__ void full_final_kernel(const __grid_constant__ launch_args a, const f
 
 /* ---- logprobs (the host scorers' bytes: tests/sampler_host_ref.cpp pulsar_logits_top_logprobs / _token_logprob) --- */
 
+/// Rows a logprob pass takes (its scratch: LP_GROUP rows of doubles).
 constexpr uint32_t LP_GROUP = 8;   /* rows a logprob pass takes (its scratch: LP_GROUP rows of doubles) */
+/// Blocks a row of logprobs_topk_kernel.
 constexpr uint32_t LP_TK_CHUNKS = 128, LP_TK_THREADS = 256, LP_EXP_CHUNKS = 4u * 32u;
+/** @var LP_TK_THREADS
+ *  Threads a logprobs_topk_kernel block. */
+/** @var LP_EXP_CHUNKS
+ *  Blocks a row of logprobs_exp_kernel. */
+/// Chunks a lane of the top-k merge holds cursors for.
 constexpr uint32_t LP_TK_PER_LANE = LP_TK_CHUNKS / 32u;   /* the merge's chunks a lane */
 static_assert(LP_TK_CHUNKS % 32u == 0u, "the merge's lanes");
 
+/// The logprob kernels' arguments, by value.
 struct lp_args {
+    /// The logits rows on the device.
     const float *logits;
+    /// Floats between rows.
     uint64_t row_stride;
+    /// Values a row.
     uint32_t n_vocab;
+    /// The token masks, [mask rows][mask_words] u32, or NULL.
     const uint32_t *mask;
+    /// u32 words a mask row.
     uint32_t mask_words;
+    /// Each row's mask row, or PULSAR_GPU_SAMPLE_NO_MASK.
     uint32_t mask_row[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    /// The scored tokens: row r's at token[r * token_stride], or NULL.
     const int32_t *token;      /* the scored token of row r at token[r * token_stride], or NULL */
+    /// int32 entries between rows' scored tokens.
     uint32_t token_stride;
+    /// Top logprobs a row, <= PULSAR_GPU_LOGPROB_TOPK_MAX.
     uint32_t top_k;
+    /// [n_rows] results.
     pulsar_gpu_logprob_row *out;
+    /// This pass's first row.
     uint32_t row0;             /* this launch's first row (a launch takes LP_GROUP rows) */
+    /// [LP_GROUP][n_vocab] exp(v - max) of the finite values, 0 elsewhere.
     double *ex;                /* [LP_GROUP][n_vocab] exp(v - max) of the finite values, 0 elsewhere */
+    /// [LP_GROUP] their serial sums.
     const double *sums;        /* [LP_GROUP] their serial sums (sr_sum_kernel) */
+    /// [LP_GROUP][LP_TK_CHUNKS][PULSAR_GPU_LOGPROB_TOPK_MAX] each chunk's best keys.
     uint64_t *tk;              /* [LP_GROUP][LP_TK_CHUNKS][PULSAR_GPU_LOGPROB_TOPK_MAX] each chunk's best keys */
+    /// [LP_GROUP][LP_TK_CHUNKS][2] each chunk's kept and finite counts.
     uint32_t *tk_n;            /* [LP_GROUP][LP_TK_CHUNKS][2]: each chunk's kept count and finite count */
 };
 
+/// logprobs_rows_kernel's shared memory.
 struct lp_smem {
+    /// The row's best keys, merged from the chunks'.
     uint64_t keys[PULSAR_GPU_LOGPROB_TOPK_MAX];   /* the row's best keys, merged from the chunks' */
+    /// Keys merged.
     uint32_t cnt;
+    /// The row's first maximum's id, -1 with none.
     int32_t maxi;
 };
 
 
+/**
+ * The row_view of a logprob row.
+ * @param a the arguments
+ * @param row the row
+ * @return its view through its mask row
+ */
 __device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
     row_view rv;
     rv.x = a.logits + (size_t)row * a.row_stride;
@@ -1726,6 +2349,13 @@ __device__ __forceinline__ row_view lp_view(const lp_args &a, uint32_t row) {
 }
 
 /* a chunk of a row (32-aligned, so a mask view stays word-aligned) */
+/**
+ * Chunk c of LP_TK_CHUNKS over [0, n), 32-aligned so a mask view stays word-aligned.
+ * @param n the length
+ * @param c the chunk
+ * @param lo receives its first index
+ * @param hi receives the index past it
+ */
 __device__ __forceinline__ void lp_chunk(uint32_t n, uint32_t c, uint32_t *lo, uint32_t *hi) {
     const uint32_t per = ((n + LP_TK_CHUNKS - 1u) / LP_TK_CHUNKS + 31u) & ~31u;
     *lo = min(c * per, n);
@@ -1734,6 +2364,11 @@ __device__ __forceinline__ void lp_chunk(uint32_t n, uint32_t c, uint32_t *lo, u
 
 /* pass 2b, LP_TK_CHUNKS blocks a row: each chunk's best min(k, its finite count) keys (select_topk's), ids made the
  * row's -- the row's best k are among the chunks' best k, in the same total order */
+/**
+ * Pass 2b: each chunk's best min(max(min(top_k, n), 1), finite count) keys (select_topk()), ids made the row's,
+ * into a.tk / a.tk_n.  Grid (LP_TK_CHUNKS, rows), block LP_TK_THREADS.
+ * @param a the arguments
+ */
 __global__ void __launch_bounds__(LP_TK_THREADS) logprobs_topk_kernel(const __grid_constant__ lp_args a) {
     __shared__ uint64_t keys[1024];
     __shared__ uint32_t hist[256], redu[LP_TK_THREADS], cnt;
@@ -1760,6 +2395,12 @@ __global__ void __launch_bounds__(LP_TK_THREADS) logprobs_topk_kernel(const __gr
 
 /* warp 0: the row's first finite maximum -- the least of the chunks' best keys (descending value, ascending id: the
  * argmax's rule, +0 and -0 tied), its id; -1 with no finite value.  Every lane returns it. */
+/**
+ * Warp 0: the row's first finite maximum, the least of the chunks' best keys.
+ * @param a the arguments
+ * @param j the row within the pass
+ * @return its id, -1 with no finite value, in every lane
+ */
 __device__ __forceinline__ int32_t lp_row_max(const lp_args &a, uint32_t j) {
     const uint32_t lane = threadIdx.x & 31u;
     uint64_t best = UINT64_MAX;
@@ -1771,6 +2412,11 @@ __device__ __forceinline__ int32_t lp_row_max(const lp_args &a, uint32_t j) {
 }
 
 /* pass 2, LP_EXP_CHUNKS blocks a row: exp(v - max) in double, the host scorer's (plm_exp), for every finite value */
+/**
+ * Pass 2: exp(v - max) in double (plm_exp) for every finite value into a.ex, 0 elsewhere.
+ * Grid (LP_EXP_CHUNKS, rows), block PREP_THREADS.
+ * @param a the arguments
+ */
 __global__ void __launch_bounds__(PREP_THREADS) logprobs_exp_kernel(const __grid_constant__ lp_args a) {
     const uint32_t j = blockIdx.y, c = blockIdx.x;
     __shared__ int32_t maxi;
@@ -1795,6 +2441,11 @@ __global__ void __launch_bounds__(PREP_THREADS) logprobs_exp_kernel(const __grid
  * accumulation), one block a row: log(sum) once; the scored token as _token_logprob's compiled arithmetic has it
  * ((logit - max) - log(sum)), the top-k as _top_logprobs' does (logit - (log(sum) + max)) -- the host's -ffast-math
  * build reassociated one and not the other. */
+/**
+ * Pass 3: the scored token's logprob and the merged top-k, from the rows' serial sums.
+ * Grid rows, block SMP_THREADS.
+ * @param a the arguments
+ */
 __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid_constant__ lp_args a) {
     __shared__ lp_smem sm;
     const uint32_t tid = threadIdx.x, j = blockIdx.x, row = a.row0 + j;
@@ -1883,16 +2534,25 @@ __global__ void __launch_bounds__(SMP_THREADS) logprobs_rows_kernel(const __grid
 
 /* ---- the speculative walk (L288 sdet's rule): a draft is accepted iff the target drew it ------------------------ */
 
+/// spec_walk_kernel's arguments, by value.
 struct walk_args {
+    /// The sampler's rows of the verify.
     const row_out_t *rows;     /* the sampler's rows of the verify */
+    /// Runs to walk.
     uint32_t n_runs;
+    /// The runs: each a first row, a draft count k, the drafts and the greedy rows.
     pulsar_gpu_spec_run run[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    /// [n_runs] results.
     pulsar_gpu_spec_walk_out *out;
 };
 
 /* One thread a run: rows row0 .. row0 + k are the target's draws after the base and after each draft; the walk
  * keeps drafts while the row's draw IS the draft, and the first draw that is not -- or row k's on a full accept --
  * is the carry.  A refused row stops the walk with its status. */
+/**
+ * One thread a run walks its drafts against the target's draws.  Launched <<<1, 32>>>.
+ * @param a the arguments
+ */
 __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
     const uint32_t r = threadIdx.x;
     if (r >= a.n_runs) return;
@@ -1929,16 +2589,32 @@ __global__ void spec_walk_kernel(const __grid_constant__ walk_args a) {
  * predicate reads it).  The same function as every other draw (sample_row), so the same bytes as the full-width row;
  * the next slot's row follows from the pick, so the walk stays in the block -- one launch, one readback. */
 
+/// Threads a sample_chains_kernel block.
 constexpr uint32_t CHAIN_THREADS = 256;
 
+/// sample_chains_kernel's arguments, by value.
 struct chain_args {
+    /// [chain][slots][topk] the candidates' ids (negative or >= vocab: none).
     const int32_t *cand;
+    /// [chain][slots][topk][topk]: slot j's scores given the previous slot's pick.
     const float *scores;
+    /// Slots a chain.
     uint32_t slots, topk, vocab;
+    /** @var topk
+     *  Candidates a slot. */
+    /** @var vocab
+     *  The vocabulary's width (the knobs' plan reads it). */
+    /// The chains' requests, one a block.
     pulsar_gpu_chain_req req[PULSAR_GPU_CHAINS_MAX];
+    /// [n_chains][slots] the drawn tokens, -1 past the chain's stop.
     int32_t *out;
 };
 
+/**
+ * One block a chain: each slot's sparse row (its finite entries in ascending id) drawn by sample_row(), the next
+ * slot's scores picked by this draw.  Grid n_chains, block CHAIN_THREADS.
+ * @param c the arguments
+ */
 __global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __grid_constant__ chain_args c) {
     __shared__ row_smem<CHAIN_THREADS> sm;
     __shared__ launch_args la;
@@ -2014,6 +2690,8 @@ __global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __gr
 }  // namespace
 
 /* the full arm's sort scratch for a row of n_vocab (the double-buffer form: the slot's own arrays alternate) */
+/// @param n_vocab row width
+/// @return cub's radix-sort scratch bytes for one row, rounded up to 256 (a huge value when cub refuses)
 static uint64_t full_sort_bytes(uint32_t n_vocab) {
     size_t bytes = 0;
     cub::DoubleBuffer<uint32_t> k(nullptr, nullptr), v(nullptr, nullptr);
@@ -2022,11 +2700,15 @@ static uint64_t full_sort_bytes(uint32_t n_vocab) {
     return (bytes + 255u) & ~255ull;
 }
 
+/// @param n_vocab row width
+/// @return byte offset of the full arm's sort scratch within a slot (after its full_state)
 static uint64_t full_sort_off(uint32_t n_vocab) {
     return full_state_off(n_vocab) + ((sizeof(full_state) + 255u) & ~(uint64_t)255u);
 }
 
 /* a slot: the five row arrays, then the slot kernel's radix counts or the full arm's state and sort scratch */
+/// @param n_vocab row width
+/// @return bytes of one global scratch slot (the larger of the slot kernel's and the full arm's needs), 256-aligned
 static uint64_t sample_slot_bytes(uint32_t n_vocab) {
     const uint64_t counts = (uint64_t)n_vocab * 5u * sizeof(uint32_t) + 17ull * SLOT_THREADS * sizeof(uint32_t);
     const uint64_t full = full_sort_off(n_vocab) + full_sort_bytes(n_vocab);
@@ -2034,28 +2716,46 @@ static uint64_t sample_slot_bytes(uint32_t n_vocab) {
 }
 
 /* scratch: the slots, the pending flags, the rows' prep records */
+/// @param n_vocab row width
+/// @return byte offset of the rows' row_prep records in the sampler scratch
 static uint64_t sample_prep_off(uint32_t n_vocab) {
     return ((uint64_t)SMP_SLOTS * sample_slot_bytes(n_vocab) +
             (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(uint32_t) + 255u) & ~255ull;
 }
 
+/// @param n_vocab row width
+/// @return byte offset of the per-row probability planes in the sampler scratch
 static uint64_t sample_pvals_off(uint32_t n_vocab) {
     return (sample_prep_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(row_prep) + 255u) & ~255ull;
 }
 
 /* the GPU-wide serial sums' scratch: the tiles' status and approximate sums, the tickets, two passes' results */
+/// The GPU-wide serial sums' scratch, carved by sr_carve().
 struct sr_scratch {
+    /// [SR_ROWS][tiles] the tiles' status.
     sr_status *st;
+    /// [SR_ROWS][tiles] the tiles' approximate sums.
     double *approx;
+    /// [SR_ROWS] the tile tickets.
     uint32_t *ticket;
+    /// Two passes' [SR_ROWS] sums.
     double *sum[2];
+    /// Two passes' [SR_ROWS] stop indices.
     uint32_t *stop[2];
 };
+/// @param n_vocab row width
+/// @return SR_TILE-wide tiles a serial sum over the row spans
 static uint32_t sr_tiles(uint32_t n_vocab) { return (n_vocab + SR_TILE - 1u) / SR_TILE; }
+/// @param n_vocab row width
+/// @return bytes sr_carve() lays out (plus 256 of slack)
 static uint64_t sr_scratch_bytes(uint32_t n_vocab) {
     const uint64_t t = sr_tiles(n_vocab);
     return (uint64_t)SR_ROWS * t * (sizeof(sr_status) + sizeof(double)) + (uint64_t)SR_ROWS * 4u * 6u + 256u;
 }
+/// Lays the serial sums' scratch out at p: tile status, approximate sums, two passes' sums, tickets, two passes' stops.
+/// @param p       the scratch's first byte (256-aligned)
+/// @param n_vocab row width
+/// @return the carved pointers
 static sr_scratch sr_carve(uint8_t *p, uint32_t n_vocab) {
     const uint64_t t = sr_tiles(n_vocab);
     sr_scratch c;
@@ -2071,6 +2771,15 @@ static sr_scratch sr_carve(uint8_t *p, uint32_t n_vocab) {
 }
 
 /* one GPU-wide serial sum over sa's rows into pass k's results */
+/** Launches the three serial-sum kernels (approx, sum, final) over sa's rows into pass k's results.
+ *  Grid (tiles, n_rows) x SR_THREADS for the first two, one 64-thread block for the last.
+ *  @tparam T        the summed value type (float or double)
+ *  @tparam HAS_PRED the sum also finds the first index whose prefix satisfies the stop predicate
+ *  @param sa      the launch arguments (its scratch pointers are filled in here)
+ *  @param c       the carved scratch
+ *  @param k       pass index, 0 or 1
+ *  @param n_vocab row width
+ *  @return true on success (a launch failure is said) */
 template <typename T, bool HAS_PRED>
 static bool sr_run(sr_args &sa, const sr_scratch &c, int k, uint32_t n_vocab) {
     sa.tiles = sr_tiles(n_vocab);
@@ -2087,15 +2796,35 @@ static bool sr_run(sr_args &sa, const sr_scratch &c, int k, uint32_t n_vocab) {
     return cuda_ok(cudaGetLastError(), "device serial sum");
 }
 
+/// @param n_vocab row width
+/// @return byte offset of the serial sums' scratch in the sampler scratch
 static uint64_t sample_sr_off(uint32_t n_vocab) {
     return (sample_pvals_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * n_vocab * sizeof(float) + 255u) &
            ~255ull;
 }
 
+/// @param n_vocab row width
+/// @return sampler scratch bytes
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {
     return sample_sr_off(n_vocab) + sr_scratch_bytes(n_vocab);
 }
 
+/** @param logits              the logits tensor
+ *  @param logits_offset_bytes byte offset of row 0
+ *  @param row_stride          row pitch in floats (>= n_vocab)
+ *  @param n_vocab             row width
+ *  @param logits_rows         rows reqs may name
+ *  @param n_rows              draws, 1 .. PULSAR_GPU_SAMPLE_ROWS_MAX
+ *  @param reqs                [n_rows] host requests
+ *  @param mask                uint32 token mask rows, or NULL
+ *  @param mask_words          words per mask row (>= ceil(n_vocab / 32))
+ *  @param id_map              int32 [n_vocab] row index to token id, or NULL (identity)
+ *  @param scratch             >= pulsar_gpu_sample_scratch_bytes(n_vocab)
+ *  @param out                 receives n_rows pulsar_gpu_sample_out
+ *  @param out_offset_bytes    byte offset in out
+ *  @param dist                emitted distributions for the equality gate, or NULL
+ *  @param dist_cap            entries per row in dist
+ *  @return 1 enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                            uint32_t n_vocab, uint32_t logits_rows, uint32_t n_rows, const pulsar_gpu_sample_req *reqs,
                            const pulsar_gpu_tensor *mask, uint32_t mask_words, const pulsar_gpu_tensor *id_map,
@@ -2237,16 +2966,38 @@ int pulsar_gpu_sample_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offs
     return 1;
 }
 
+/// @param n_vocab row width
+/// @return byte offset of the serial sums' scratch in the logprob scratch (after the LP_GROUP double rows)
 static uint64_t lp_sr_off(uint32_t n_vocab) { return ((uint64_t)LP_GROUP * n_vocab * sizeof(double) + 255u) & ~255ull; }
 
+/// @param n_vocab row width
+/// @return byte offset of the top-k candidates' scratch in the logprob scratch
 static uint64_t lp_tk_off(uint32_t n_vocab) { return (lp_sr_off(n_vocab) + sr_scratch_bytes(n_vocab) + 255u) & ~255ull; }
+/// Bytes of the logprob top-k scratch: LP_GROUP rows x LP_TK_CHUNKS chunks of (TOPK_MAX keys + two counters).
 static constexpr uint64_t LP_TK_BYTES =
     (uint64_t)LP_GROUP * LP_TK_CHUNKS * (PULSAR_GPU_LOGPROB_TOPK_MAX * sizeof(uint64_t) + 2u * sizeof(uint32_t));
 
+/// @param n_vocab row width
+/// @return logprob scratch bytes (any row count)
 uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab) {
     return lp_tk_off(n_vocab) + LP_TK_BYTES;
 }
 
+/** @param logits              the logits tensor
+ *  @param logits_offset_bytes byte offset of row 0
+ *  @param row_stride          row pitch in floats
+ *  @param n_vocab             row width
+ *  @param n_rows              rows to score
+ *  @param mask                uint32 token mask rows, or NULL
+ *  @param mask_words          words per mask row
+ *  @param mask_rows           host [n_rows] mask row of each row, or NULL (unmasked)
+ *  @param tokens              int32 scored tokens, or NULL
+ *  @param tokens_offset_bytes byte offset of row 0's token
+ *  @param token_stride        int32s between rows' tokens
+ *  @param top_k               best entries reported, <= PULSAR_GPU_LOGPROB_TOPK_MAX
+ *  @param scratch             >= pulsar_gpu_logprobs_scratch_bytes(n_vocab)
+ *  @param out                 receives n_rows pulsar_gpu_logprob_row
+ *  @return 1 enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_offset_bytes, uint32_t row_stride,
                              uint32_t n_vocab, uint32_t n_rows, const pulsar_gpu_tensor *mask, uint32_t mask_words,
                              const uint32_t *mask_rows, const pulsar_gpu_tensor *tokens, uint64_t tokens_offset_bytes,
@@ -2298,6 +3049,14 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
     return 1;
 }
 
+/** @param rows              the sampler launch's out tensor
+ *  @param rows_offset_bytes byte offset of its first pulsar_gpu_sample_out
+ *  @param n_rows            sampler rows there
+ *  @param runs              [n_runs] host verify runs (k <= 16, rows inside n_rows)
+ *  @param n_runs            runs (1 .. PULSAR_GPU_SAMPLE_ROWS_MAX; the kernel walks one per thread of 32)
+ *  @param out               receives n_runs pulsar_gpu_spec_walk_out
+ *  @param out_offset_bytes  byte offset in out
+ *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_bytes, uint32_t n_rows,
                          const pulsar_gpu_spec_run *runs, uint32_t n_runs, pulsar_gpu_tensor *out,
                          uint64_t out_offset_bytes) {
@@ -2323,6 +3082,12 @@ int pulsar_gpu_spec_walk(const pulsar_gpu_tensor *rows, uint64_t rows_offset_byt
 
 /* One block: each thread folds a contiguous run of 64-bit words with a multiply-xor chain seeded by its position,
  * and the chains fold in thread order -- a deterministic function of the bytes, the row count and the width. */
+/** Grid 1; block 256; static smem 256 x u64.
+ *  @param w       the rows as 64-bit words
+ *  @param n_words words to fold
+ *  @param n_rows  rows (seeds the digest)
+ *  @param width   row width (seeds the digest)
+ *  @param out     device u64 digest out */
 __global__ static void __launch_bounds__(256) rows_digest_kernel(const uint64_t *w, uint64_t n_words, uint32_t n_rows,
                                                           uint32_t width, uint64_t *out) {
     __shared__ uint64_t part[256];
@@ -2340,6 +3105,13 @@ __global__ static void __launch_bounds__(256) rows_digest_kernel(const uint64_t 
     }
 }
 
+/** @param rows             the f32 rows tensor
+ *  @param offset_bytes     byte offset of row 0 (8-byte aligned)
+ *  @param n_rows           rows
+ *  @param width            floats per row (n_rows * width * 4 a multiple of 8)
+ *  @param out              receives the u64 digest
+ *  @param out_offset_bytes byte offset in out (8-byte aligned)
+ *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes, uint32_t n_rows, uint32_t width,
                            pulsar_gpu_tensor *out, uint64_t out_offset_bytes) {
     const uint64_t bytes = (uint64_t)n_rows * width * sizeof(float);
@@ -2353,6 +3125,18 @@ int pulsar_gpu_rows_digest(const pulsar_gpu_tensor *rows, uint64_t offset_bytes,
     return cuda_ok(cudaGetLastError(), "rows digest");
 }
 
+/** @param cand                int32 [chains][slots][topk] candidate ids
+ *  @param cand_offset_bytes   byte offset in cand
+ *  @param scores              f32 [chains][slots][topk][topk] candidate scores by previous pick
+ *  @param scores_offset_bytes byte offset in scores
+ *  @param slots               slots per chain, 1 .. PULSAR_GPU_CHAIN_SLOTS_MAX
+ *  @param topk                candidates per slot, 1 .. PULSAR_GPU_CHAIN_TOPK_MAX
+ *  @param vocab               the sparse rows' vocabulary
+ *  @param reqs                [n_chains] host chain requests
+ *  @param n_chains            chains, 1 .. PULSAR_GPU_CHAINS_MAX
+ *  @param out                 receives int32 [n_chains][slots] tokens
+ *  @param out_offset_bytes    byte offset in out
+ *  @return nonzero enqueued, 0 refused or a launch failed (said) */
 int pulsar_gpu_sample_chains(const pulsar_gpu_tensor *cand, uint64_t cand_offset_bytes, const pulsar_gpu_tensor *scores,
                              uint64_t scores_offset_bytes, uint32_t slots, uint32_t topk, uint32_t vocab,
                              const pulsar_gpu_chain_req *reqs, uint32_t n_chains, pulsar_gpu_tensor *out,

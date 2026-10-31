@@ -1,3 +1,5 @@
+/** @file
+ *  Producer-side MX (E4M3 data + E8M0 block scale) emission and the MX slab geometry helpers. */
 #ifndef PULSAR_CUDA_MX_CUH
 #define PULSAR_CUDA_MX_CUH
 
@@ -41,19 +43,32 @@
  * MX scale slab's geometry (blocks-per-row padded to 4, rows padded to 128) is
  * shared by the producers, the GEMV arms and the packers -- and a second copy
  * of a layout constant is how the swizzle/linear mix-up nearly shipped. */
+/// @param x the value (>= 0)
+/// @param n the multiple (> 0)
+/// @return x rounded up to a multiple of n
 __host__ __device__ __forceinline__ static int pulsar_mx_rup(int x, int n) {
     return (x + n - 1) / n * n;
 }
 
 /* The slab geometry as two functions, so no call site spells it (L159 inc 5):
  * blocks-per-row padded to 4, rows padded to 128, one E8M0 byte per (row, kb). */
+/// @param in_dim row width in elements (a multiple of 32)
+/// @return MX blocks per row, padded to a multiple of 4 (the scale slab's KBp)
 __host__ __device__ __forceinline__ static int pulsar_mx_kbp(int in_dim) {
     return pulsar_mx_rup(in_dim / 32, 4);
 }
+/// @param rows activation / weight rows
+/// @param KBp  blocks per row, padded (pulsar_mx_kbp)
+/// @return bytes of the E8M0 scale slab: rows padded to 128, one byte per (row, block)
 __host__ __device__ __forceinline__ static size_t pulsar_mx_sf_slab_bytes(int rows, int KBp) {
     return (size_t)pulsar_mx_rup(rows, 128) * (size_t)KBp;
 }
 
+/// Byte offset of (row, kb)'s E8M0 scale in the 128x4-tiled (cuBLASLt / CUTLASS) swizzled slab.
+/// @param row the row
+/// @param kb  the 32-element block within the row
+/// @param KBp blocks per row, padded to 4
+/// @return the scale's byte offset in the slab
 __host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
     return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
            + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
@@ -72,6 +87,8 @@ __host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, 
  * one head's 32 values live in four lanes, a half-warp in the rope tail -- but
  * the exponent arithmetic must stay identical to the standalone quantiser in
  * every one of them. */
+/// @param amax the block's reduced max |v| (>= 0)
+/// @return the shared exponent se = floor(log2(amax)) - 7 (E4M3's max exponent), clamped to [-127, 127]; -127 for amax 0
 __device__ __forceinline__ static int pulsar_mx_shared_exp(float amax) {
     int se = -127;
     if (amax > 0.f) {
@@ -93,14 +110,27 @@ __device__ __forceinline__ static int pulsar_mx_shared_exp(float amax) {
     return se;
 }
 
+/// @param v  the value
+/// @param se the block's shared exponent
+/// @return v * 2^-se as E4M3 (saturating cast)
 __device__ __forceinline__ static __nv_fp8_e4m3 pulsar_mx_encode(float v, int se) {
     return (__nv_fp8_e4m3)(v * exp2f((float)-se));
 }
 
+/// @param se the block's shared exponent
+/// @return its E8M0 byte (se + 127)
 __device__ __forceinline__ static unsigned char pulsar_mx_scale_byte(int se) {
     return (unsigned char)(se + 127);
 }
 
+/** Emits one 32-element MX block from a warp (contract above): all 32 lanes call, lanes past the row store nothing.
+ *  @param v      this lane's value (0 for a dead lane)
+ *  @param col    this lane's column (lane 0's is a multiple of 32)
+ *  @param row    the row
+ *  @param stride row pitch in elements (the GEMM's in_dim)
+ *  @param KBp    blocks per row, padded to 4
+ *  @param data   E4M3 rows [.][stride]
+ *  @param scale  the zeroed E8M0 scale slab (pulsar_mx_sfoff layout) */
 __device__ __forceinline__ static void pulsar_mx_emit_block(
         float v, uint32_t col, uint32_t row, uint32_t stride, int KBp,
         __nv_fp8_e4m3 *data, unsigned char *scale) {
@@ -138,6 +168,11 @@ __device__ __forceinline__ static void pulsar_mx_emit_block(
  * keeps the NaN).  Identical on every finite input to all five copies:
  * clamp g from above and u both ways, s = g / (1 + exp(-g)), s * u * w in that
  * order -- the multiply order is part of the definition. */
+/// @param g     gate value
+/// @param u     up value
+/// @param wv    the row's routing weight (1 for an unweighted path)
+/// @param clamp clamp bound (<= 1e-6: no clamp)
+/// @return silu(min(g, clamp)) * clamp(u, -clamp, clamp) * wv
 __device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, float wv, float clamp) {
     if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
     const float s = g / (1.0f + expf(-g));
@@ -147,6 +182,9 @@ __device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, flo
 /* ONE squared-ReLU element for every non-gated (up-only) path (L296 N4: Nemotron-H's experts and shared expert,
  * `relu2`): r = max(u, 0) -- written so a NaN u stays NaN (rule 9; fmaxf would return the 0) -- then r * r * w in
  * that order. */
+/// @param u  up value
+/// @param wv the row's routing weight
+/// @return max(u, 0)^2 * wv (NaN stays NaN)
 __device__ __forceinline__ static float pulsar_relu2_elem(float u, float wv) {
     const float r = u <= 0.0f ? 0.0f : u;
     return r * r * wv;

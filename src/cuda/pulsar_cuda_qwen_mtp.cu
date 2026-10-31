@@ -1,3 +1,5 @@
+/** @file
+ *  Qwen3.8-Flash-Next MTP: the input combine that starts the MTP layer's streams. */
 /* Qwen3.8-Flash-Next MTP (L251): the input combine that starts the MTP layer's streams.
  * The spec is the L251 MTP spec (2026-09-29, private notes), from vLLM's reference (vLLM v0.30.0 qwen4_exp/nvidia/mtp.py:293-313, which
  * TensorFold matches); contracts in pulsar_cuda_qwen.h.
@@ -20,13 +22,22 @@
 
 namespace {
 
+/// Hidden width of one residual stream (2560).
 constexpr int kH = PULSAR_QWEN_HIDDEN;
+/// Residual streams per token (4).
 constexpr int kS = PULSAR_QWEN_HC;
+/// Width of the whole pre-mixer stack, kS * kH (10240).
 constexpr int kHC = PULSAR_QWEN_HC_HIDDEN;
 constexpr float kEps = 1e-6f;                 ///< rms_norm_eps
+/// Block size of the two RMSNorm kernels.
 constexpr int kThreads = 256;
 constexpr int kMtpSlab = 256;                 ///< rows per combine pass
 
+/** Block-wide f32 sum: warp shuffle reduction, then every thread adds the per-warp partials in warp order (so all
+ *  threads return the same value).  Syncs the block; blockDim.x a multiple of 32.
+ *  @param v   this thread's partial
+ *  @param red shared scratch, blockDim.x / 32 floats
+ *  @return the block's sum */
 __device__ __forceinline__ float block_sum(float v, float *red) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -40,6 +51,11 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
 }
 
 /* hn [4 rows per token][2560] bf16: one CTA per token row, the rms over all 10240 values */
+/** Joint (1 + w) RMSNorm over a token's whole pre-mixer stack (kHC values), f32 math, bf16 out.
+ *  Grid = rows (tokens of the slab), block = kThreads, static smem kThreads / 32 floats.
+ *  @param h  bf16 [rows][kHC] pre-mixer streams
+ *  @param w  bf16 [kHC] mtp.pre_fc_norm_hidden weight
+ *  @param hn out, bf16 [rows][kHC] (read later as [rows * kS][kH]) */
 __global__ void __launch_bounds__(kThreads)
 mtp_norm_hidden_kernel(const __nv_bfloat16 *__restrict__ h, const __nv_bfloat16 *__restrict__ w,
                        __nv_bfloat16 *__restrict__ hn) {
@@ -57,6 +73,12 @@ mtp_norm_hidden_kernel(const __nv_bfloat16 *__restrict__ h, const __nv_bfloat16 
 }
 
 /* ein [T][2560] bf16: the token's embedding row, (1 + w) RMSNorm */
+/** (1 + w) RMSNorm of each next token's embedding row.  Grid = rows, block = kThreads, static smem kThreads / 32 floats.
+ *  @param table   bf16 [n_vocab][kH] embed_tokens
+ *  @param tokens  device int32 [rows] next-token ids; an id outside [0, n_vocab) reads row 0
+ *  @param n_vocab rows in `table`
+ *  @param w       bf16 [kH] mtp.pre_fc_norm_embedding weight
+ *  @param ein     out, bf16 [rows][kH] */
 __global__ void __launch_bounds__(kThreads)
 mtp_norm_embed_kernel(const __nv_bfloat16 *__restrict__ table, const int32_t *__restrict__ tokens, int n_vocab,
                       const __nv_bfloat16 *__restrict__ w, __nv_bfloat16 *__restrict__ ein) {
@@ -75,6 +97,12 @@ mtp_norm_embed_kernel(const __nv_bfloat16 *__restrict__ table, const int32_t *__
 }
 
 /* out streams [T][4][2560] = bf16(bf16(fh[t*4+s]) + bf16(fe[t])) */
+/** The combine's add: each stream's fc_hidden output plus the token's fc_embedding output, each rounded to bf16
+ *  first, the sum rounded once.  One thread per output element: grid = ceil(T * kHC / 256), block = 256.
+ *  @param fh  f32 [T * kS][kH] fc_hidden(hn)
+ *  @param fe  f32 [T][kH] fc_embedding(ein)
+ *  @param T   rows (tokens) in this slab
+ *  @param out bf16 [T][kS][kH] the MTP layer's starting streams */
 __global__ void mtp_add_kernel(const float *__restrict__ fh, const float *__restrict__ fe, int T,
                                __nv_bfloat16 *__restrict__ out) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,8 +114,22 @@ __global__ void mtp_add_kernel(const float *__restrict__ fh, const float *__rest
     out[i] = __float2bfloat16(a + b);
 }
 
+/// The combine's per-slab device scratch (kMtpSlab rows), carved by mtp_ws_layout.
 struct mtp_ws { __nv_bfloat16 *hn, *ein; float *fh, *fe; };
 
+/** @var mtp_ws::hn
+ *  bf16 [kMtpSlab][kHC] normed pre-mixer stack.
+ *  @var mtp_ws::ein
+ *  bf16 [kMtpSlab][kH] normed next-token embedding.
+ *  @var mtp_ws::fh
+ *  f32 [kMtpSlab * kS][kH] fc_hidden output.
+ *  @var mtp_ws::fe
+ *  f32 [kMtpSlab][kH] fc_embedding output. */
+
+/** Lay the combine's workspace out from `base`, each piece 256-B aligned.
+ *  @param base workspace start, or nullptr to only size it
+ *  @param o    out: the pieces' pointers (nullptr when base is nullptr), or nullptr
+ *  @return bytes the layout uses */
 size_t mtp_ws_layout(uint8_t *base, mtp_ws *o) {
     size_t used = 0;
     auto take = [&](size_t bytes) -> void * {
@@ -104,6 +146,9 @@ size_t mtp_ws_layout(uint8_t *base, mtp_ws *o) {
     return used;
 }
 
+/** Check the last launch; prints the failure with `what` and returns false on error.
+ *  @param what step name for the message
+ *  @return true when no launch error is pending */
 bool launch_ok(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -119,27 +164,50 @@ bool launch_ok(const char *what) {
  * both in block order.  The pick is order-free (max, ties to the lower index); the sum's order is fixed, so a
  * row's record is the same bytes run to run and whatever rows ride with it (L288: one launch for every bank's
  * draft row of a step). */
+/// Blocks (contiguous chunks) each draft-head row is split over (blockIdx.x).
 constexpr int kTopBlocks = 64;
+/// Block size of the max and sum kernels.
 constexpr int kTopThreads = 256;
 
 /* one row's scratch; the workspace is PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records, then as many of these */
+/// One row's per-block partials for the draft-top reduction.
 struct top_ws {
+    /// Each block's first maximum value.
     float best[kTopBlocks];
+    /// Each block's index of that maximum.
     int32_t idx[kTopBlocks];
+    /// Each block's NaN flag (nonzero: its chunk held a NaN).
     uint32_t nan[kTopBlocks];
+    /// Each block's double sum of exp(row[i] - m) over its chunk.
     double z[kTopBlocks];
 };
 
+/** Max order: a larger value wins, ties to the lower index.
+ *  @param v candidate value
+ *  @param i candidate index
+ *  @param bv current best value
+ *  @param bi current best index
+ *  @return true when (v, i) replaces (bv, bi) */
 __device__ __forceinline__ bool top_takes(float v, int32_t i, float bv, int32_t bi) {
     return v > bv || (v == bv && i < bi);
 }
 
+/** Chunk length each of the kTopBlocks blocks scans.
+ *  @param n row length
+ *  @return ceil(n / kTopBlocks) */
 __device__ __forceinline__ int top_chunk(int n) { return (n + kTopBlocks - 1) / kTopBlocks; }
 
+/** This block's row scratch: after the PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records, entry blockIdx.y.
+ *  @param ws the draft-top workspace
+ *  @return the row's top_ws */
 __device__ __forceinline__ top_ws *top_row_ws(void *ws) {
     return (top_ws *)((pulsar_qwen_draft_top *)ws + PULSAR_QWEN_DRAFT_TOP_ROWS_MAX) + blockIdx.y;
 }
 
+/** Pass 1: each block's first maximum and NaN flag over its chunk.  Grid = (kTopBlocks, n_rows), block = kTopThreads.
+ *  @param rows f32 [n_rows][n] draft-head logits
+ *  @param n    row length
+ *  @param wsv  the draft-top workspace (writes top_ws::best / idx / nan) */
 __global__ void __launch_bounds__(kTopThreads) draft_top_max_kernel(const float *rows, int n, void *wsv) {
     const float *row = rows + (size_t)blockIdx.y * n;
     top_ws *ws = top_row_ws(wsv);
@@ -177,6 +245,9 @@ __global__ void __launch_bounds__(kTopThreads) draft_top_max_kernel(const float 
 }
 
 /* The row's maximum from the blocks' -- every block folds the same kTopBlocks entries in the same order. */
+/** @param ws the row's partials
+ *  @param bv out: the row's maximum value
+ *  @param bi out: its (first) index */
 __device__ __forceinline__ void top_fold(const top_ws *ws, float *bv, int32_t *bi) {
     *bv = ws->best[0];
     *bi = ws->idx[0];
@@ -184,6 +255,11 @@ __device__ __forceinline__ void top_fold(const top_ws *ws, float *bv, int32_t *b
         if (top_takes(ws->best[b], ws->idx[b], *bv, *bi)) { *bv = ws->best[b]; *bi = ws->idx[b]; }
 }
 
+/** Pass 2: each block's double sum of exp((double)(row[i] - m)) at the row's maximum m, a fixed tree order.
+ *  Grid = (kTopBlocks, n_rows), block = kTopThreads, static smem kTopThreads doubles.
+ *  @param rows f32 [n_rows][n] draft-head logits
+ *  @param n    row length
+ *  @param wsv  the draft-top workspace (reads pass 1, writes top_ws::z) */
 __global__ void __launch_bounds__(kTopThreads) draft_top_sum_kernel(const float *rows, int n, void *wsv) {
     __shared__ double sz[kTopThreads];
     const float *row = rows + (size_t)blockIdx.y * n;
@@ -204,6 +280,8 @@ __global__ void __launch_bounds__(kTopThreads) draft_top_sum_kernel(const float 
     if (threadIdx.x == 0) top_row_ws(wsv)->z[blockIdx.x] = sz[0];
 }
 
+/** Pass 3: fold the partials in block order into the row's pulsar_qwen_draft_top record.  Grid = (1, n_rows), block = 1.
+ *  @param wsv the draft-top workspace (record blockIdx.y written at its start) */
 __global__ void draft_top_record_kernel(void *wsv) {
     const top_ws *ws = top_row_ws(wsv);
     pulsar_qwen_draft_top *rec = (pulsar_qwen_draft_top *)wsv + blockIdx.y;

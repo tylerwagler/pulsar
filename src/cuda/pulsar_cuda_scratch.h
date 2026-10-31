@@ -1,3 +1,5 @@
+/** @file
+ *  Device scratch: the reservations and the bump arena that slices them. */
 /* Device scratch: the reservations, and the bump arena that slices them.
  *
  * Split out of pulsar_cuda_internal.h so the vendored-adjacent MMQ sources can
@@ -38,6 +40,10 @@ enum {
 
 /* Single-buffer reservation on CUDA_SCRATCH_MAIN.  For more than one buffer,
  * use the arena below rather than slicing this by hand. */
+/** @param bytes bytes wanted (0 returns NULL)
+ *  @param what  caller label for the allocation-failure message
+ *  @return the CUDA_SCRATCH_MAIN reservation's base (at least `bytes`, valid until the next reservation on MAIN),
+ *          or NULL on failure */
 void *cuda_tmp_alloc(uint64_t bytes, const char *what);
 
 /* Bump arena over one scratch reservation.
@@ -68,8 +74,24 @@ typedef struct {
 } cuda_arena;
 
 /* begin() reserves on CUDA_SCRATCH_MAIN; begin_slot() names the slot. */
+/** Reserves `bytes` on CUDA_SCRATCH_MAIN and resets the arena.
+ *  @param a     the arena (overwritten)
+ *  @param bytes bytes to reserve (0: an empty arena, success)
+ *  @param what  caller label for the diagnostics
+ *  @return 1 on success, 0 on failure (the arena is latched failed) */
 int      cuda_arena_begin(cuda_arena *a, uint64_t bytes, const char *what);
+/** Reserves `bytes` on scratch slot `slot` and resets the arena.
+ *  @param a     the arena (overwritten)
+ *  @param slot  CUDA_SCRATCH_MAIN or CUDA_SCRATCH_MMQ
+ *  @param bytes bytes to reserve (0: an empty arena, success)
+ *  @param what  caller label for the diagnostics
+ *  @return 1 on success, 0 on a bad slot or a failed reservation (the arena is latched failed) */
 int      cuda_arena_begin_slot(cuda_arena *a, int slot, uint64_t bytes, const char *what);
+/** Bump-allocates one slice.
+ *  @param a     the arena
+ *  @param bytes slice size (0 returns NULL)
+ *  @param align alignment in bytes, a power of two (0 means 16)
+ *  @return the slice, or NULL when the arena is failed or would overflow (which latches it failed) */
 void    *cuda_arena_take(cuda_arena *a, uint64_t bytes, uint64_t align);
 
 #endif /* PULSAR_CUDA_SCRATCH_H */

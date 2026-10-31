@@ -1,3 +1,5 @@
+/** @file
+ *  The MoE router, one parameterized implementation for every family: logits and top-k selection kernels. */
 /* The MoE router, one parameterized implementation for every family (L295 F2): contracts in pulsar_cuda_router.h.
  *
  * It replaces the two per-family routers: Qwen's softmax + shared-gate kernels (pulsar_cuda_qwen_moe.cu) and
@@ -18,8 +20,14 @@ constexpr int kLogitsWarps = 4;  ///< logit rows (warps) per logits CTA
 constexpr int kLogitsUnroll = 2; ///< weight chunks a lane loads ahead of their fmas
 constexpr int kSelectWarps = 4;  ///< rows (warps) per select CTA
 
+/// Rounds an f32 to the nearest bf16 and back (round to nearest even).
+/// @param v the value
+/// @return v at bf16 precision, as f32
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
+/// Unpacks eight bf16 (one 16-byte chunk) into f32, in memory order.
+/// @param u the chunk
+/// @param f out: the eight values
 __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
     const __nv_bfloat162 *p = reinterpret_cast<const __nv_bfloat162 *>(&u);
 #pragma unroll
@@ -36,6 +44,14 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
  * issued kLogitsUnroll at a time ahead of their fmas, the fmas still in chunk order (L296 dec2, measured over 48
  * cold 512 x 4096 routers in turn: 1 row 19.6 -> 19.9 us, at bandwidth either way; 4 rows 21.6 -> 19.9; 16 rows
  * 33.0 -> 24.4 -- the x loads of more rows had serialised behind one weight load per lane). */
+/** One weight chunk's fmas into every token's partial: acc[tt] += dot(wv, x[t0 + tt] chunk i) for tt < nt.
+ *  @param wv  the logit row's 16-byte weight chunk i (8 bf16)
+ *  @param x   bf16 activations [T][H]
+ *  @param H   hidden width in elements (a multiple of 8)
+ *  @param t0  first token of this CTA row
+ *  @param nt  tokens present in this CTA row (<= kLogitsTB)
+ *  @param i   chunk index along the row (element 8 * i)
+ *  @param acc the lane's per-token partial sums, accumulated in chunk order */
 __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat16 *__restrict__ x, int H, int t0,
                                              int nt, int i, float (&acc)[kLogitsTB]) {
     float wf[8];
@@ -51,6 +67,16 @@ __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat1
     }
 }
 
+/** Router logits: logits[t][e] = dot(x[t], row e), row e < n_w from w, else w_tail[e - n_w].  Grid
+ *  (ceil(n_rows / kLogitsWarps), ceil(T / kLogitsTB)); block kLogitsWarps * 32 (one warp a logit row); no smem.
+ *  @param x      bf16 activations [T][H], 16-byte aligned rows
+ *  @param H      hidden width (a multiple of 8)
+ *  @param w      bf16 weight rows [n_w][H]
+ *  @param n_w    rows in w
+ *  @param w_tail bf16 trailing rows [n_rows - n_w][H] (shared-expert gate rows), or NULL when none
+ *  @param n_rows logit row width = n_w + tail rows
+ *  @param T      token rows
+ *  @param logits f32 output [T][n_rows] */
 __global__ void __launch_bounds__(kLogitsWarps * 32)
 router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bfloat16 *__restrict__ w, int n_w,
                      const __nv_bfloat16 *__restrict__ w_tail, int n_rows, int T, float *__restrict__ logits) {
@@ -82,6 +108,9 @@ router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bflo
     }
 }
 
+/// softplus(x) = log(1 + e^x), with the identity above 20 and e^x below -20.
+/// @param x the logit
+/// @return softplus(x)
 __device__ __forceinline__ float softplus_dev(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
@@ -91,6 +120,8 @@ __device__ __forceinline__ float softplus_dev(float x) {
 /* A finite selection score as an unsigned key whose integer order is the float order (the larger value, the larger
  * key).  +0, -0 and the subnormals map to one key: the kernels build with --use_fast_math, whose float compares
  * flush subnormal operands, so they are all equal there too -- the keys order exactly as the float compares do. */
+/// @param v a finite selection score
+/// @return its order-preserving unsigned key
 __device__ __forceinline__ uint32_t score_key(float v) {
     uint32_t u = __float_as_uint(v);
     if ((u & 0x7f800000u) == 0u) u = 0u;
@@ -98,11 +129,17 @@ __device__ __forceinline__ uint32_t score_key(float v) {
 }
 
 /* The bits an expert id below n + 1 takes. */
+/// Bits needed to hold the integer n (0 for n = 0).
+/// @param n the largest value (the expert count)
+/// @return its bit width
 __host__ __device__ constexpr int id_bits(int n) { return n > 0 ? 1 + id_bits(n >> 1) : 0; }
 
 /* The device copy of the cfg and the layer, by value. */
+/// The kernel's by-value argument block: the family cfg, the layer's tensors, and the logit row width.
 struct router_args {
+    /// the family's router declaration
     pulsar_router_cfg c;
+    /// the layer's router tensors (device pointers)
     pulsar_router_layer l;
     int n_rows;               ///< logit row width
 };
@@ -114,6 +151,19 @@ struct router_args {
  * it resolved by a second search over the expert id, the TOPK chosen compacted into shared memory and placed by
  * their rank among themselves -- the same set in the same order as a TOPK-round argmax, in a short loop (the
  * unrolled 22-round argmax was 415 KB of code, and a decode step's cold instruction fetches made it 33 us). */
+/** Top-k selection and weights from the logits.  Grid ceil(T / kSelectWarps); block kSelectWarps * 32 (one warp a
+ *  token row); static smem of kSelectWarps x (32 keys, ids, carries + TOPK picks).  A row with a non-finite score
+ *  or selection score writes experts 0..TOPK-1 with NaN weights (and NaN gammas).
+ *  @tparam NE   routed experts (a multiple of 32)
+ *  @tparam TOPK picks per row (<= 32)
+ *  @param a        cfg, layer and logit row width
+ *  @param logits   f32 [T][a.n_rows]
+ *  @param tokens   device token ids [T], or NULL (read for alt_bias and a table)
+ *  @param T        token rows
+ *  @param selected expert ids out [T][TOPK], in pick order
+ *  @param weights  routed weights out [T][TOPK]
+ *  @param gammas   shared-expert gates out [S][T], or NULL when S == 0
+ *  @param probs    unbiased scores out [T][NE], or NULL */
 template <int NE, int TOPK>
 __global__ void __launch_bounds__(kSelectWarps * 32)
 router_select_kernel(router_args a, const float *__restrict__ logits, const int32_t *__restrict__ tokens, int T,
@@ -373,6 +423,9 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
     }
 }
 
+/** Checks the last launch.
+ *  @param what the launch's name for the message
+ *  @return true on success; false after naming the CUDA error on stderr */
 bool launch_ok(const char *what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -452,3 +505,7 @@ extern "C" int pulsar_router_select_launch(const pulsar_router_cfg *c, const pul
     fprintf(stderr, "pulsar: router select: no instance for %d experts / top-%d -- refusing\n", E, K);
     return -1;
 }
+
+/** @def PULSAR_ROUTER_ARM(NE, TOPK)
+ *  Inside pulsar_router_select_launch: when the cfg is NE experts / top-TOPK, launches that compiled
+ *  router_select_kernel instance and returns its status. */

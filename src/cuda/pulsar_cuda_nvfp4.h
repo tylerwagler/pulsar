@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  NVFP4 W4A16 contract: the weight layout and the bf16-rows linear launches. */
 // L298: NVFP4 W4A16 -- an NVFP4 weight (ModelOpt W4A16_NVFP4: e2m1 values, an E4M3 scale per 16 inputs, one f32
 // global scale) against raw bf16 rows.  A FORMAT, not a family's: any family's dense Linear stored `nvfp4` takes it
 // (weight_format.cpp PULSAR_DENSE_ARM_NVFP4_ROWS).
@@ -31,6 +33,12 @@
 #include <stdint.h>
 
 /** Bytes of the planes of an [out][in] nvfp4 slice (in % 64 == 0, out > 0); false = not an nvfp4 shape. */
+/// @param in     input width (a multiple of 64)
+/// @param out    output rows
+/// @param values out: bytes of the e2m1 code plane (out * in / 2)
+/// @param scales out: bytes of the 128x4-tiled E4M3 scale plane
+/// @param stride out: bytes of the whole slice (codes + scales + the 32-byte global-scale block)
+/// @return false when (in, out) is not an nvfp4 shape
 static inline bool pulsar_nvfp4_layout(uint64_t in, uint64_t out, uint64_t *values, uint64_t *scales,
                                        uint64_t *stride) {
     if (in == 0 || out == 0 || in % 64 != 0) return false;
@@ -43,6 +51,9 @@ static inline bool pulsar_nvfp4_layout(uint64_t in, uint64_t out, uint64_t *valu
 /** The K split of an [out][in] nvfp4 Linear: the smallest S in 1, 2, 4, 8 giving >= the target CTA count (8 / S
  *  16-row groups each, 192: four a GB10 SM) with in % (256 S) == 0 (whole 256-input super-steps a slice).  A function of the shape alone: it fixes the
  *  summation order. */
+/// @param in  input width
+/// @param out output rows
+/// @return the K split S (1, 2, 4 or 8)
 int pulsar_nvfp4_ksplit(int in, int out);
 
 /** y [rows][out] f32 = W x (and, when y_bf16 is non-NULL, the same values rounded to nearest-even bf16 in
@@ -50,6 +61,15 @@ int pulsar_nvfp4_ksplit(int in, int out);
  *  aligned.  Every row kind takes the one kernel (up to 64 rows a launch: a prompt chunk reads the weight once a 64
  *  rows) and a row's bytes do not depend on the launch: a prompt row is the bytes a decode row is.
  *  Refuses (-1) on a contract violation. */
+/// @param w      device nvfp4 slice (16-byte aligned)
+/// @param x_bf16 device bf16 rows [rows][in] (16-byte aligned)
+/// @param rows   activation rows
+/// @param in     input width (a multiple of 64)
+/// @param out    output rows
+/// @param y      device f32 out [rows][out], or NULL (then y_bf16 is required)
+/// @param y_bf16 device bf16 out [rows][out], or NULL
+/// @param stream stream to launch on
+/// @return 0, -1 refused (named on stderr), -3 launch failure
 int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
                                     uint16_t *y_bf16, cudaStream_t stream);
 
@@ -58,5 +78,15 @@ int pulsar_nvfp4_rows_linear_launch(const void *w, const uint16_t *x_bf16, int r
 /** n (1..PULSAR_NVFP4_MULTI_MAX) nvfp4 Linears of one shape against the SAME bf16 rows, one launch (a gate and an up):
  *  Linear j's outputs y[j] / y_bf16[j] (either array or entry NULL = not written, at least one each), each bit for bit
  *  what pulsar_nvfp4_rows_linear_launch writes for it alone.  Refuses (-1) on a contract violation. */
+/// @param w      [n] device nvfp4 slices of one shape (16-byte aligned)
+/// @param n      Linears, 1 .. PULSAR_NVFP4_MULTI_MAX
+/// @param x_bf16 device bf16 rows [rows][in] shared by all of them
+/// @param rows   activation rows
+/// @param in     input width (a multiple of 64)
+/// @param out    output rows of each
+/// @param y      [n] f32 outputs, or NULL (entries may be NULL)
+/// @param y_bf16 [n] bf16 outputs, or NULL (entries may be NULL)
+/// @param stream stream to launch on
+/// @return 0, -1 refused (named on stderr), -3 launch failure
 int pulsar_nvfp4_rows_multi_launch(const void *const *w, int n, const uint16_t *x_bf16, int rows, int in, int out,
                                    float *const *y, uint16_t *const *y_bf16, cudaStream_t stream);

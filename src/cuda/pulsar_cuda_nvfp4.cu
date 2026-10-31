@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+/** @file
+ *  NVFP4 W4A16 tensor-core GEMV / skinny GEMM against raw bf16 rows. */
 // L298: NVFP4 W4A16 against raw bf16 rows (contract, layout and arithmetic in pulsar_cuda_nvfp4.h).
 //
 // The kernel is a memory-bound W4A16 GEMV / skinny GEMM: the weight is read once for all of the call's rows (up to
@@ -21,6 +23,7 @@
 
 namespace {
 
+/// Warps a CTA (R = kWarps / S row groups x S K slices); the block is 32 * kWarps threads.
 constexpr int kWarps = 8;
 /* Measured on GB10 at the LiLiCorr drafter's shapes (2026-10-16, tests/nvfp4_rows_gate --bench): at decode widths 4
  * super-steps in flight and a K split aiming at 192 CTAs beat 1 / 2 super-steps and 96 / 384 CTAs (a few % to ~10%).
@@ -29,6 +32,12 @@ constexpr int kWarps = 8;
 constexpr int kTargetCtas = 192;   ///< the K split's goal (pulsar_nvfp4_ksplit): four CTAs a GB10 SM
 constexpr int kBlockRows = 64;     ///< the widest launch: 8 n8 tiles (prompt chunks; the weight read once a 64 rows)
 
+/** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8); traps
+ *  below sm_80.
+ *  @param d  the thread's four f32 accumulators (in / out)
+ *  @param a  the thread's A fragment, four bf16x2 registers
+ *  @param b0 B fragment register 0 (bf16x2)
+ *  @param b1 B fragment register 1 (bf16x2) */
 __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
 #if PULSAR_SM80
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -51,6 +60,9 @@ __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const uint32_t (&a
 #endif
 
 /** One byte of the scale word as bf16x2 (both halves): `sel` the prmt selector b * 0x1111 replicating byte b. */
+/** @param w   the 32-bit scale word (four e4m3 block scales)
+ *  @param sel prmt selector b * 0x1111 picking byte b
+ *  @return that scale as bf16x2, both halves equal (traps without the sm_12x family conversions) */
 __device__ __forceinline__ uint32_t scale_bf16x2(uint32_t w, uint32_t sel) {
     uint32_t r = 0;
 #ifdef NVFP4_HAVE_CVT
@@ -64,6 +76,9 @@ __device__ __forceinline__ uint32_t scale_bf16x2(uint32_t w, uint32_t sel) {
 }
 
 /** The low byte of `q` (two e2m1 codes) times the scale pair, as bf16x2. */
+/** @param q  two e2m1 codes in the low byte (low nibble the low half)
+ *  @param sc the scale pair (bf16x2) from scale_bf16x2
+ *  @return the two decoded values times the scale, bf16x2 (traps without the sm_12x family conversions) */
 __device__ __forceinline__ uint32_t dq(uint32_t q, uint32_t sc) {
     uint32_t r = 0;
 #ifdef NVFP4_HAVE_CVT
@@ -79,6 +94,10 @@ __device__ __forceinline__ uint32_t dq(uint32_t q, uint32_t sc) {
 /* The rows a 16-row group owns: group G (of a 128-row tile T = G / 8, w = G % 8) is rows T 128 + q 32 + 4 w + j
  * (q, j < 4; logical row 4 q + j): the 16 rows whose scale words share two 32-byte sectors of the 128x4 tiling, so
  * a warp's scale loads use every byte they fetch. */
+/// Physical weight row of a 16-row group's logical row (see the comment above).
+/// @param G the group (8 a 128-row tile)
+/// @param i the logical row within the group, 0..15
+/// @return the weight row index
 __device__ __forceinline__ int group_row(int G, int i) { return (G >> 3) * 128 + (i >> 2) * 32 + 4 * (G & 7) + (i & 3); }
 
 /* One CTA: R = 8 / S row groups (blockIdx.x R + rg) of W for nr <= 8 NT activation rows, K split S ways across its
@@ -89,11 +108,26 @@ __device__ __forceinline__ int group_row(int G, int i) { return (G >> 3) * 128 +
 /** Up to kMaxSet Linears of one shape and one input, one launch (blockIdx.y picks one): each one's slice and its
  *  outputs (f32 and / or bf16, NULL = not written) for the launch's 16-row block. */
 struct nvfp4_set {
+    /// per Linear: its NVFP4 weight (codes, then the scale plane at scales_at, the global scale at global_at)
     const uint8_t *w[PULSAR_NVFP4_MULTI_MAX];
+    /// per Linear: f32 output rows [nr][out] for this block, or NULL
     float *y[PULSAR_NVFP4_MULTI_MAX];
+    /// per Linear: bf16 output rows [nr][out] for this block, or NULL
     __nv_bfloat16 *yb[PULSAR_NVFP4_MULTI_MAX];
 };
 
+/** NVFP4 W4A16 rows GEMM: Y[t][row] = gs * sum_k W[row][k] * X[t][k] for up to 8 * NT rows.  Grid
+ *  (ceil(out / 128) * 8 / R, n Linears); block 32 * kWarps; static smem part[S - 1][R][32][4 NT] f32 for the K slices.
+ *  @tparam NT n8 activation tiles (rows <= 8 * NT)
+ *  @tparam S  K slices across the CTA's warps (1, 2, 4, 8; in % (256 S) == 0, see pulsar_nvfp4_ksplit)
+ *  @tparam U  super-steps (256 inputs each) whose loads are in flight
+ *  @param set       the Linears' weights and outputs (blockIdx.y picks one)
+ *  @param scales_at byte offset of the 128x4-tiled e4m3 scale plane in each weight
+ *  @param global_at byte offset of the f32 global scale in each weight
+ *  @param out       output width (weight rows)
+ *  @param in        input width (a multiple of 64)
+ *  @param X         bf16 activation rows [nr][in], 16-byte aligned
+ *  @param nr        activation rows in this launch */
 template <int NT, int S, int U>
 __global__ void __launch_bounds__(32 * kWarps)
 nvfp4_rows_kernel(const __grid_constant__ nvfp4_set set, size_t scales_at, size_t global_at, int out, int in,
@@ -220,6 +254,19 @@ nvfp4_rows_kernel(const __grid_constant__ nvfp4_set set, size_t scales_at, size_
         }
 }
 
+/** Launches nvfp4_rows_kernel at the K split S (switch to the compiled instance).
+ *  @tparam NT n8 activation tiles
+ *  @tparam U  super-steps in flight
+ *  @param S    K slices (1, 2, 4; anything else runs 8)
+ *  @param grid the launch grid
+ *  @param set  the Linears' weights and outputs
+ *  @param vb   scale plane offset (the code bytes)
+ *  @param gat  global scale offset
+ *  @param out  output width
+ *  @param in   input width
+ *  @param X    bf16 activation rows
+ *  @param nr   rows this launch
+ *  @param st   stream */
 template <int NT, int U>
 void launch(int S, dim3 grid, const nvfp4_set &set, size_t vb, size_t gat, int out, int in, const __nv_bfloat16 *X,
             int nr, cudaStream_t st) {
@@ -231,6 +278,8 @@ void launch(int S, dim3 grid, const nvfp4_set &set, size_t vb, size_t gat, int o
     }
 }
 
+/// @param p a pointer
+/// @return true when p is 16-byte aligned
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
 } // namespace

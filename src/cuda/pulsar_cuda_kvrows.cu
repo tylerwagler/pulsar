@@ -1,3 +1,5 @@
+/** @file
+ *  The two V4.1 KV row formats: the packers for the sliding-window ring rows and the main pool rows. */
 /* The two V4.1 KV row formats (L218): the packers.
  *
  * Every layer keeps a sliding-window ring of WINDOW rows and every kv source a
@@ -25,9 +27,24 @@
 #include "pulsar_cuda_internal.h"
 #include <cuda_fp8.h>
 
+/// Rounds an f32 to bf16 precision (the reference quantises a bf16 tensor).
+/// @param v the value
+/// @return v rounded to bf16, as f32
 __device__ __forceinline__ static float kvrow_bf16r(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
 /* One block of 512 threads per row: thread d owns dim d. */
+/** WINDOW-row packer (E4M3 codes + one E8M0 scale per 32 dims).  Grid n_rows; block head_dim (512) threads, one per
+ *  dim; no smem.  The destination row comes from pulsar_kv_ring_slot (ring placement), a dead row stores nothing.
+ *  @param x        device f32 [n_rows][head_dim] dequantised values out, or NULL (observer only)
+ *  @param src      device f32 [n_rows][head_dim] rows to pack
+ *  @param out      device WINDOW rows, PULSAR_WINKV_ROWBYTES(head_dim) bytes each
+ *  @param out_row0 first destination row without a ring (raw_cap 0)
+ *  @param n_rows   rows to pack
+ *  @param head_dim dims per row (512)
+ *  @param positions device [n_rows] token positions, or NULL
+ *  @param seq_id   device [n_rows] bank ids, or NULL
+ *  @param n_banks  banks in the ring pool
+ *  @param raw_cap  ring rows per bank, or 0: rows land at out_row0 + r */
 __global__ static void winkv_pack_kernel(float *x, const float *src, uint8_t *out,
                                          uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
                                          const int32_t * __restrict__ positions,
@@ -58,6 +75,14 @@ __global__ static void winkv_pack_kernel(float *x, const float *src, uint8_t *ou
 }
 
 /* One block of 512 threads per row: thread d owns dim d; lane pairs pack nibbles. */
+/** MAIN-row packer (E2M1 nibbles + one E4M3 scale per 16 dims).  Grid n_rows; block head_dim (512) threads, one per
+ *  dim (lane pairs pack a byte); no smem.
+ *  @param x        device f32 [n_rows][head_dim] dequantised values out, or NULL (observer only)
+ *  @param src      device f32 [n_rows][head_dim] rows to pack
+ *  @param out      device MAIN rows, PULSAR_MAINKV_ROWBYTES(head_dim) bytes each
+ *  @param out_row0 first destination row
+ *  @param n_rows   rows to pack
+ *  @param head_dim dims per row (512) */
 __global__ static void mainkv_pack_kernel(float *x, const float *src, uint8_t *out,
                                           uint32_t out_row0, uint32_t n_rows, uint32_t head_dim) {
     const uint32_t row = blockIdx.x, d = threadIdx.x;
@@ -81,10 +106,23 @@ __global__ static void mainkv_pack_kernel(float *x, const float *src, uint8_t *o
 }
 
 
+/// @param head_dim dims per row
+/// @return true for the one built shape (512: one 512-thread block a row)
 static bool kvrow_shape_ok(uint32_t head_dim) {
     return head_dim == 512u;   /* one block of 512 threads per row; the graph alloc refuses other shapes */
 }
 
+/// @param x         dequantised f32 rows out, or NULL
+/// @param src       f32 [n_rows][head_dim] rows to pack
+/// @param packed    the WINDOW row buffer
+/// @param out_row0  first destination row without a ring
+/// @param n_rows    rows to pack
+/// @param head_dim  dims per row (512)
+/// @param positions [n_rows] token positions, or NULL
+/// @param seq_id    [n_rows] bank ids, or NULL
+/// @param n_banks   banks in the ring pool
+/// @param raw_cap   ring rows per bank, or 0
+/// @return nonzero on success, 0 on a bad shape or a failed launch
 int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                  uint32_t out_row0, uint32_t n_rows, uint32_t head_dim,
                                  const pulsar_gpu_tensor *positions, const pulsar_gpu_tensor *seq_id,
@@ -111,6 +149,13 @@ int pulsar_gpu_winkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *
     return cuda_ok(cudaGetLastError(), "window KV pack launch");
 }
 
+/// @param x        dequantised f32 rows out, or NULL
+/// @param src      f32 [n_rows][head_dim] rows to pack
+/// @param packed   the MAIN row buffer
+/// @param out_row0 first destination row
+/// @param n_rows   rows to pack
+/// @param head_dim dims per row (512)
+/// @return nonzero on success, 0 on a bad shape or a failed launch
 int pulsar_gpu_mainkv_pack_tensor(pulsar_gpu_tensor *x, const pulsar_gpu_tensor *src, pulsar_gpu_tensor *packed,
                                   uint32_t out_row0, uint32_t n_rows, uint32_t head_dim) {
     if (!src || !packed || n_rows == 0 || !kvrow_shape_ok(head_dim) ||

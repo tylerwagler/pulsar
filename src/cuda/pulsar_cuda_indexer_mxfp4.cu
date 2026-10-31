@@ -1,3 +1,5 @@
+/** @file
+ *  Indexer scorer on the SM120 block-scaled tensor cores (MXFP4 q x k). */
 /* Indexer scorer on the SM120 block-scaled tensor cores.
  *
  * Replaces indexer_scores_wmma128_kernel's 64 serial head iterations (two
@@ -57,13 +59,18 @@
     (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) ||                               \
      defined(__CUDA_ARCH_SPECIFIC__) ||                                      \
      defined(__CUDA_ARCH_FEAT_SM120_ALL))
+/// 1 in a device pass that has the sm_12x block-scaled e2m1 MMA, else 0 (that arm traps).
 #define PULSAR_IDX_MXFP4_MMA 1
 #else
+/// 0: this pass lacks the block-scaled MMA (idx_mma_m16n8k32 traps).
 #define PULSAR_IDX_MXFP4_MMA 0
 #endif
 
+/// Indexer head width in elements (the only one built).
 #define IDX_HEAD_DIM  128u
+/// Compressed rows per scorer block.
 #define IDX_NTILE     128u         /* compressed rows per block */
+/// 32-wide K slabs (MMA k32 steps, one ue8m0 scale each) per head row.
 #define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
 /* Shared rows are PADDED off the bank period.  A 128-byte row stride is exactly
  * 32 words = the bank count, so every row starts in bank 0: the eight lanes of
@@ -71,6 +78,7 @@
  * same bank -- an 8-way conflict on every A fetch, and 4-way on B at 64 B.
  * Padding by one word breaks the period without changing any addressing math
  * beyond the stride constant. */
+/// Shared Q (A) row stride in bytes: 128 e2m1-in-byte values padded by one word.
 #define IDX_ASTRIDE   (IDX_HEAD_DIM + 4u)        /* 132 B */
 /* Shared B is stored LANE-MAJOR, not row-major: 64 B per compressed row, laid
  * out as [tig][slab][half] halfwords.  The MMA's B fragment wants, for lane
@@ -79,12 +87,14 @@
  * at staging time makes those eight halfwords contiguous, so the whole k loop's
  * B operand arrives in ONE 16-byte LDS.  No padding: the warp's 32 lanes read
  * 32 consecutive 16 B chunks, which is already conflict-free. */
+/// Shared compressed (B) row stride in bytes, lane-major (see above).
 #define IDX_BPSTRIDE  64u
 /* ONE token staged at a time.  With K resident across the group there is no
  * reuse argument left for staging two, and sA is the biggest smem consumer:
  * dropping it 16.9 KB -> 8.5 KB takes the block from ~31 KB to ~20 KB, i.e.
  * from 3 blocks/SM (50% occupancy) to 5 (83%).  Occupancy is the one limit the
  * device numbers actually confirmed. */
+/// Tokens staged in shared memory at a time.
 #define IDX_TOKTILE   1u
 /* Tokens PER BLOCK.  The compressed tile is identical for every token, so it is
  * staged once and every token in the group is swept through it: B staging and
@@ -92,8 +102,11 @@
  * grid=4x256 block=512 for a whole 4096-token chunk, i.e. one launch per layer
  * against our eight -- amortising the tile setup over far more math is the
  * structural difference their geometry points at. */
+/// Tokens a scorer block sweeps through its staged compressed tile.
 #define IDX_TOKGROUP  8u
+/// Scorer block size.
 #define IDX_THREADS   256u         /* 8 warps per token group */
+/// Warps in a scorer block.
 #define IDX_WARPS     (IDX_THREADS / 32u)
 /* The M/N split is DERIVED PER INSTANTIATION, not fixed here: the scorer is
  * templated on the head count, so MTILES/NSPLITS/NT_PER_SPLIT live inside
@@ -107,6 +120,20 @@
 
 /* ---- the MMA ------------------------------------------------------------ */
 
+/** One mma.sync m16n8k32 e2m1 x e2m1 -> f32 with ue8m0 block scales (scale_vec 1X), accumulating into d0..d3;
+ *  traps where PULSAR_IDX_MXFP4_MMA is 0.
+ *  @param d0  accumulator 0 (in / out)
+ *  @param d1  accumulator 1 (in / out)
+ *  @param d2  accumulator 2 (in / out)
+ *  @param d3  accumulator 3 (in / out)
+ *  @param a0  A fragment register 0 (four e2m1-in-byte values)
+ *  @param a1  A fragment register 1
+ *  @param a2  A fragment register 2
+ *  @param a3  A fragment register 3
+ *  @param b0  B fragment register 0
+ *  @param b1  B fragment register 1
+ *  @param sfa A's ue8m0 scale for this lane's row
+ *  @param sfb B's ue8m0 scale for this lane's column */
 __device__ __forceinline__ static void idx_mma_m16n8k32(
         float &d0, float &d1, float &d2, float &d3,
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -150,6 +177,8 @@ __device__ __forceinline__ static void idx_mma_m16n8k32(
 
 /* Two packed bytes (four e2m1 nibbles) -> four byte containers with each nibble
  * at bits [5:2], which is where the measured contract says the MMA reads them. */
+/// @param x two packed bytes (four e2m1 nibbles, low nibble first)
+/// @return the four nibbles in four byte containers, each at bits [5:2]
 __device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
     return (((x & 0x000Fu)) | ((x & 0x00F0u) << 4) |
             ((x & 0x0F00u) << 8) | ((x & 0xF000u) << 12)) << 2;
@@ -168,6 +197,12 @@ __device__ __forceinline__ static uint32_t idx_spread4(uint32_t x) {
  * measured in tests/idx_quant_fidelity.cc against UNQUANTISED Q, a premise the
  * producer's FP4 crush has since made moot -- on-grid values encode exactly
  * either way, so this change is value-identical and strictly simpler.) */
+/** Q staging: spreads each packed 68-byte Q row into e2m1-in-byte form plus its four scale bytes.  Grid
+ *  ceil(n_rows / 8); block 256 (one warp a row, 8 rows a block); no smem.
+ *  @param qa     out: [n_tokens][heads][128] e2m1-in-byte
+ *  @param qsf    out: [n_tokens][heads][4] ue8m0 scales (passed through)
+ *  @param q      packed MXKV-FP4 Q rows (68 B each)
+ *  @param n_rows rows = n_tokens * heads */
 __global__ __launch_bounds__(256, 4)
 static void idx_expand_q_kernel(
         uint8_t *__restrict__ qa,            /* [n_tokens][heads][128] e2m1-in-byte */
@@ -217,12 +252,29 @@ static void idx_expand_q_kernel(
  * lose again -- ptxas spills (16 B and 32 B of stack) and the slope goes to
  * 1.376e-4 and 1.497e-4. */
 #ifndef IDX_MINBLK
+/// The scorer's minBlocksPerMultiprocessor (overridable at build).
 #define IDX_MINBLK 3
 #endif
 /* HEADS is the only free parameter: the M is HEADS/16 m-tiles of 16 and the
  * eight warps divide as (n-split, m-tile), so NSPLITS and the per-split n-tile
  * count follow from it.  32 heads -> 2 m-tiles x 4 splits of 32 columns (V4.1);
  * 64 -> 4 x 2 (V4, which L218 dropped). */
+/** The indexer scorer on the block-scaled tensor cores: scores[t][c] = scale * sum_h w[t][h] * relu(q_h . k_c)
+ *  over e2m1 operands (see the block above for the tiling).  Grid (ceil(n_comp / IDX_NTILE), ceil(n_tokens /
+ *  IDX_TOKGROUP)); block IDX_THREADS; static smem for one token's Q, the compressed tile (lane-major) and the
+ *  head-group partials.  A causally hidden column scores -inf.
+ *  @tparam HEADS indexer heads (32 or 64; a multiple of 16)
+ *  @param scores   out: f32 [n_tokens][n_comp]
+ *  @param qa       [n_tokens][HEADS][128] e2m1-in-byte Q (idx_expand_q_kernel)
+ *  @param qsf      [n_tokens][HEADS][4] ue8m0 Q scales
+ *  @param weights  f32 [n_tokens][HEADS] per-head weights
+ *  @param comp     [n_comp][68] MXKV-FP4 compressed rows
+ *  @param n_comp   compressed rows
+ *  @param n_tokens query tokens
+ *  @param pos0     position of token 0
+ *  @param ratio    compression ratio (token positions per compressed row)
+ *  @param scale    score scale
+ *  @param causal   nonzero: column c is visible to token t only when c < (pos0 + t + 1) / ratio */
 template <uint32_t HEADS>
 __global__ __launch_bounds__(IDX_THREADS, IDX_MINBLK)
 static void idx_scores_mxfp4_kernel(
@@ -468,6 +520,19 @@ static void idx_scores_mxfp4_kernel(
 
 /* No extern "C": pulsar_gpu.h declares the whole backend seam with plain
  * linkage, and mismatching it here is a hard error once the header is in. */
+/** @param scores   device f32 out [n_tokens][n_comp]
+ *  @param q        device packed MXKV-FP4 Q rows [n_tokens][n_head]
+ *  @param weights  device f32 [n_tokens][n_head]
+ *  @param comp     device packed MXKV-FP4 compressed rows [n_comp]
+ *  @param n_comp   compressed rows
+ *  @param n_tokens query tokens
+ *  @param pos0     position of token 0
+ *  @param n_head   indexer heads (PULSAR_IDX_MXFP4_HEADS_V41 or _V4)
+ *  @param head_dim head width (128)
+ *  @param ratio    compression ratio
+ *  @param scale    score scale
+ *  @param causal   nonzero: mask columns not yet visible
+ *  @return nonzero on success, 0 on a refusal (unsupported shape or device) or a launch failure */
 int pulsar_gpu_indexer_scores_mxfp4(
         float *scores, const pulsar_mxkv_pack_t *q, const float *weights,
         const pulsar_mxkv_pack_t *comp,
@@ -521,3 +586,7 @@ int pulsar_gpu_indexer_scores_mxfp4(
     }
     return cuda_ok(cudaGetLastError(), "indexer scores mxfp4 launch");
 }
+/** @def IDX_NB
+ *  Inside idx_scores_mxfp4_kernel: n-tiles of B a warp holds in registers against one A fragment (default 4). */
+/** @def IDX_BSEL(v, i)
+ *  Inside idx_scores_mxfp4_kernel: word i (0..3) of the uint4 v, folded at compile time. */
