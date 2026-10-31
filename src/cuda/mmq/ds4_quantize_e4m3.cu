@@ -4,8 +4,8 @@
  *
  * The routed-expert MMQ GEMMs read block_mx_act_mmq: qs[] holds E4M3 bit
  * patterns and d4[i] carries the block's ue8m0 byte as a float, one scale per
- * 32 values -- the MX block.  The struct is byte-for-byte the q8_1 staging
- * shape (d4[4] over qs[128]), which is what lets load_B_tile's ldmatrix and its
+ * 32 values -- the MX block.  The struct keeps the vendored MMQ's staging
+ * shape (d4[4] over qs[128]; it was block_q8_1_mmq), which is what lets load_B_tile's ldmatrix and its
  * sizeof-derived stride stay untouched; 12 spare bytes per 144-byte block buy a
  * hand-tuned staging pipeline that never changes.
  *

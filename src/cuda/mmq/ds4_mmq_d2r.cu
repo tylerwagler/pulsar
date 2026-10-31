@@ -630,9 +630,9 @@ __device__ __forceinline__ void make_iq2_A_tile_e4m3(
 
 
 
-/* MXFP8 arm of the k32 pair: same decomposition as mma_fold_iq2_k32_pair_t, but
- * both operands are E4M3 and the HARDWARE applies the ue8m0 scales, so there is
- * NO fold -- the accumulator is f32 and the MMA reads/writes it in place.
+/* The k32 pair on the block-scaled MMA (the D2R lane's only arm since the integer
+ * fold went): both operands are E4M3 and the HARDWARE applies the ue8m0 scales, so
+ * there is NO fold -- the accumulator is f32 and the MMA reads/writes it in place.
  *
  * WHERE THE SCALES COME FROM, which is the easy thing to get wrong:
  *   sfa -- from make_iq2_A_tile_e4m3, keyed on `tig` (tig == 1 supplies row

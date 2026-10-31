@@ -103,8 +103,8 @@ __global__ static void matmul_nt_kernel(
      * row (the 1 GB head at NT=16: 129280 rows x 128 KB = 16 GB of L2 traffic
      * per call, +0.5 ms per row in the L151 sweep).  With R rows per block the
      * per-token activation loads are issued once and applied to R weight rows.
-     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 1 up to 4 rows, 2 above,
-     * capped by out_dim) -- that is allowed because R never changes
+     * R FOLLOWS THE ROW COUNT (nt_rows_per_block: 2 when more than 4 tokens
+     * ride and out_dim >= 8192, else 1) -- that is allowed because R never changes
      * a (row, token) accumulator's sequence: the per-(row, token) FMA
      * sequence and the 256-wide tree reduction below are exactly the R=1
      * kernel's, so every output is bit-identical at every M and every R.

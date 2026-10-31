@@ -430,7 +430,8 @@ __global__ static void rope_tail_kernel(
  * value is rounded to bf16 first: the reference quantises the bf16 tensor the
  * projection (fp8 GEMM, bf16 out) and RoPE (fp32 math, copied back to bf16)
  * left, and our f32 staging carries those steps unrounded.  0731's 128-point
- * Hadamard rotation before the quant is gone with that checkpoint.
+ * Hadamard rotation before the same quant is indexer_hadamard_block_absmax_dev
+ * below (an indexer that compresses its own keys; V4.1 has none).
  *
  * Both kernels below run this ONE copy (the packing kernel's contract is a
  * bit-identical row to the rope-fused one; two hand-kept copies is how such a

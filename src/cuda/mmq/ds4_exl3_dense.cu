@@ -124,9 +124,9 @@ struct Workspace {
     }
 };
 
-/** One projection of a launch: its weight's planes, its workspace, its output, its counters.  A launch runs one
- *  or two (gridDim.z) projections of the same shape and rate over the same rows, each with exactly the
- *  arithmetic it has alone. */
+/** One projection of a launch: its weight's planes, its workspace, its output, its counters.  A launch runs a set
+ *  of up to kMaxProj projections of one rate over the same rows (a flat grid; proj_of names a CTA's projection),
+ *  each with exactly the arithmetic it has alone. */
 struct dense_proj {
     /// The weight's trellis words (the slice's first plane), device.
     const uint32_t *trellis;

@@ -302,8 +302,8 @@ static void idx_scores_mxfp4_kernel(
     const uint32_t g    = lane >> 2u;        /* groupID  0..7 */
     const uint32_t tig  = lane & 3u;         /* thread-in-group 0..3 */
 
-    /* Two tokens share this block, so the tile is only fully masked when it is
-     * masked for the LATER (more permissive) of the two. */
+    /* IDX_TOKGROUP tokens share this block, so the tile is only fully masked
+     * when it is masked for the LAST (most permissive) of them. */
     const uint32_t vis_max = (pos0 + tok_base + ngroup) / ratio;
     if (causal && tile_c >= vis_max) {
         for (uint32_t i = tid; i < IDX_NTILE * ngroup; i += IDX_THREADS) {

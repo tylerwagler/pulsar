@@ -659,8 +659,8 @@ int pulsar_gpu_indexer_score_one_tensor(
  * (and refuses a span whose runs are not consecutive); the descriptor
  * (positions/seq_id/bank-table) arm this entry once carried, and the generic
  * per-(comp,row) kernel behind it, served no engine shape and are gone
- * (L176).  n_head must be 64 and head_dim 128 -- the tier's shape; anything
- * else is refused by name. */
+ * (L176).  n_head must be 32 (V4.1) or 64 (V4) and head_dim 128 -- the tier's
+ * shapes (pulsar_idx_mxfp4_heads_supported); anything else is refused by name. */
 /** @param scores     f32 [n_tokens][n_comp] out (-inf past each row's reach)
  *  @param q          packed MXFP4 queries, [n_tokens][n_head]
  *  @param weights    f32 [n_tokens][n_head] per-head weights
@@ -695,7 +695,7 @@ int pulsar_gpu_indexer_scores_decode_batch_tensor(
  * of each scores row.  Reassociation-class vs the generic kernel (MMA
  * accumulation): NOT bit-identical, same fidelity class the non-banked
  * prefill spans already ship (suite-v1 KL + top-k overlap evidence).
- * Requires n_head == 64, head_dim == 128.  Returns 0 on refusal/failure. */
+ * Requires n_head 32 or 64 (pulsar_idx_mxfp4_heads_supported), head_dim == 128.  Returns 0 on refusal/failure. */
 /** @param scores          f32 [run_n][n_comp] out
  *  @param q               packed MXFP4 queries, [run_n][n_head]
  *  @param weights         f32 [run_n][n_head]
@@ -981,7 +981,7 @@ int pulsar_gpu_attention_f16_indexed(
  * Raw pointers, not tensors: it is a leaf kernel behind indexer_scores_launch,
  * which does the tensor-level bounds checking.  Returns 0 on refusal or
  * failure; the caller checks the shape conditions itself so a 0 is always a
- * real failure.  Requires n_head == 64 and head_dim == 128. */
+ * real failure.  Requires n_head 32 or 64 (pulsar_idx_mxfp4_heads_supported) and head_dim == 128. */
 /** @param scores   f32 [n_tokens][n_comp] out
  *  @param q        packed MXFP4 queries, [n_tokens][n_head]
  *  @param weights  f32 [n_tokens][n_head] per-head weights
