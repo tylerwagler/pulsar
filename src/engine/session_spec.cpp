@@ -992,8 +992,6 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         spec_redraft_req *q = &r->redraft;
         pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
         q->valid = features_ready;
-        q->n_batch = n_batch;
-        q->commit = commit;
         return n_accept;
     }
     uint32_t keep;
