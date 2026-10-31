@@ -91,44 +91,8 @@ static const char kToolsTail[] =
     "do not tell the user about function calls\n"
     "</IMPORTANT>";
 
-/* ---- Python str.strip ------------------------------------------------------ */
-
-
 namespace {
 
-/* Jinja |trim on UTF-8 bytes -- the kept range [*lo, *hi) of s[0, n); invalid bytes are never whitespace. */
-/// @param s      the bytes
-/// @param n      their count
-/// @param lo_out receives the first kept byte
-/// @param hi_out receives one past the last kept byte
-void py_strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
-    const unsigned char *u = (const unsigned char *)s;
-    size_t lo = 0;
-    while (lo < n) {
-        const int k = utf8_seq_ok(u + lo, n - lo);
-        if (!k || !py_isspace(utf8_cp_at(u + lo, k))) break;
-        lo += (size_t)k;
-    }
-    size_t hi = n;
-    while (hi > lo) {
-        size_t b = hi - 1;
-        while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
-        const int k = utf8_seq_ok(u + b, hi - b);
-        if (!k || b + (size_t)k != hi || !py_isspace(utf8_cp_at(u + b, k))) break;
-        hi = b;
-    }
-    *lo_out = lo;
-    *hi_out = hi;
-}
-
-/// @param s a NUL-terminated string, or NULL (= "")
-/// @return `s` with leading and trailing Unicode whitespace removed (Python str.strip())
-std::string py_strip(const char *s) {
-    if (!s) return std::string();
-    size_t lo = 0, hi = 0;
-    py_strip_bounds(s, strlen(s), &lo, &hi);
-    return std::string(s + lo, hi - lo);
-}
 
 /// Write "<key>: <fmt...>" into `err` (when given) and fail.
 /// @param err    the caller's error buffer, or NULL

@@ -80,39 +80,6 @@ bool refuse(char *err, size_t errlen, const char *key, const char *fmt, ...) {
     return false;
 }
 
-/* Jinja |trim (Python str.strip) on UTF-8 bytes: the kept range [*lo, *hi) of s[0, n). */
-/// @param s      the bytes
-/// @param n      their count
-/// @param lo_out receives the first kept byte
-/// @param hi_out receives one past the last kept byte
-void strip_bounds(const char *s, size_t n, size_t *lo_out, size_t *hi_out) {
-    const unsigned char *u = (const unsigned char *)s;
-    size_t lo = 0;
-    while (lo < n) {
-        const int k = utf8_seq_ok(u + lo, n - lo);
-        if (!k || !py_isspace(utf8_cp_at(u + lo, k))) break;
-        lo += (size_t)k;
-    }
-    size_t hi = n;
-    while (hi > lo) {
-        size_t b = hi - 1;
-        while (b > lo && (u[b] & 0xc0) == 0x80 && hi - b < 4) b--;
-        const int k = utf8_seq_ok(u + b, hi - b);
-        if (!k || b + (size_t)k != hi || !py_isspace(utf8_cp_at(u + b, k))) break;
-        hi = b;
-    }
-    *lo_out = lo;
-    *hi_out = hi;
-}
-
-/// @param s the text
-/// @return `s` with leading and trailing Unicode whitespace removed (Python str.strip())
-std::string py_strip(const std::string &s) {
-    size_t lo = 0, hi = 0;
-    strip_bounds(s.data(), s.size(), &lo, &hi);
-    return s.substr(lo, hi - lo);
-}
-
 /* A piece of text with the client-data ranges inside it (offsets into `s`): what the template's string operations
  * (concatenation, split, trim) act on, carrying the spans along. */
 /// Text plus the client-data spans inside it (see the comment above).
@@ -155,7 +122,7 @@ struct piece {
     /// @return the piece with Python str.strip() whitespace removed from both ends, spans clipped
     piece trimmed() const {
         size_t lo = 0, hi = 0;
-        strip_bounds(s.data(), s.size(), &lo, &hi);
+        py_strip_bounds(s.data(), s.size(), &lo, &hi);
         return sub(lo, hi);
     }
     /// @param t a NUL-terminated substring
