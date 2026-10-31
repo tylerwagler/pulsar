@@ -288,9 +288,6 @@ bool render_msg(writer &w, const qwen_msg_in &m, const char *prev, const char *n
     return true;
 }
 
-/* The head: the system block the template writes before the first message -- the effort line, the tools
- * block (`tools` NULL = none) and the system message's content (`system` NULL = none), or nothing at all when
- * there is no effort line, no tools and no system text. */
 /* The tools block's entries: each tool on its own line, tojson -- the one encoding of a tool definition, in the head
  * and (L325) in place where a deferred tool is loaded. */
 /// @param w     the output
@@ -304,7 +301,10 @@ void write_tool_entries(writer &w, const pyjson_value &tools) {
     }
 }
 
-/// Write the head (see the comment above write_tool_entries).
+/* The head: the system block the template writes before the first message -- the effort line, the tools
+ * block (`tools` NULL = none) and the system message's content (`system` NULL = none), or nothing at all when
+ * there is no effort line, no tools and no system text. */
+/// Write the head (see the comment above).
 /// @param w      the output
 /// @param tools  the tools array, or NULL
 /// @param system the system message's content, or NULL
