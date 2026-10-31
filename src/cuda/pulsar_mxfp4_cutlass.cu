@@ -215,8 +215,10 @@ __global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
 
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
+  /* The one exponent authority (pulsar_cuda_mx.cuh): frexpf, exact.  This kernel used to spell
+   * floorf(log2f(mx)) itself, which --use_fast_math lowers to lg2.approx -- one binade (a 2x block
+   * scale) too high for an amax just below a power of two (L335). */
+  const int se = pulsar_mx_shared_exp(mx);
   const float inv=exp2f((float)-se);
 
   cutlass::float_e4m3_t ob[4];
