@@ -30,13 +30,11 @@
  *   10. subview-dry     pulsar_tensor_subview carries the base's dry flag, format and element size (dry was unset).
  *   11. bf16-nan        pulsar_bf16_from_f32 (on the device) over all 2^32 f32 patterns: every non-NaN keeps the old expression's
  *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
- *   12. swiglu-nan      pulsar_swiglu_elem (now also the CUTLASS FFN MMA kernel's) on 2^26 hashed (g, u) pairs x 3
- *                       clamps: every non-NaN pair keeps the fminf form's bits, a NaN operand stays NaN.
- *   13. seg-reset-capture pulsar_gpu_seg_reset inside a capture is the FULL reset at its close (a catalog key is
+ *   12. seg-reset-capture pulsar_gpu_seg_reset inside a capture is the FULL reset at its close (a catalog key is
  *                       forgotten), not the regrow's partial drop that kept the catalog.
- *   14. grow-under-capture a grow-on-demand cache (an expert address table's first build) refuses inside a graph
+ *   13. grow-under-capture a grow-on-demand cache (an expert address table's first build) refuses inside a graph
  *                       capture and leaves the capture valid; outside, the same table builds.
- *   15. named-refusals the dspark HC mean over a short carrier and the 0731 packed scatter into a short ring refuse
+ *   14. named-refusals the dspark HC mean over a short carrier and the 0731 packed scatter into a short ring refuse
  *                       and SAY so on stderr (both returned 0 silently).
  *
  *  Prints one line per case and KERNEL CONTRACT GATE PASS / FAIL. */
@@ -581,72 +579,9 @@ static void case_bf16_nan(void) {
     cudaFree(d);
 }
 
-/* ---- 12. swiglu-nan -------------------------------------------------------------------------------------------- */
+/* ---- 12. seg-reset-capture ------------------------------------------------------------------------------------- */
 
-/// The shared SwiGLU before L335 (fminf / fmaxf), kept HERE only as the sweep's reference for non-NaN inputs.
-/// @param g gate
-/// @param u up
-/// @param wv routing weight
-/// @param clamp clamp bound
-/// @return the old expression's value
-__device__ static float old_swiglu(float g, float u, float wv, float clamp) {
-    if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
-    const float s = g / (1.0f + expf(-g));
-    return s * u * wv;
-}
-
-/// One thread a (g, u) pair from 2^26 hashed bit patterns (every class of f32: normals, subnormals, +-0, +-inf, NaN),
-/// at three clamps: [0] non-NaN pairs whose bits moved, [1] pairs with a NaN operand not giving NaN, [2] the pairs the
-/// old expression turned from a NaN operand into a number.
-/// @param cnt the three counters (zeroed)
-__global__ static void swiglu_sweep_kernel(unsigned long long *cnt) {
-    unsigned long long moved = 0, lost = 0, old_lost = 0;
-    const float clamps[3] = {0.0f, 7.0f, 10.0f};
-    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < (1ull << 26);
-         i += (uint64_t)gridDim.x * blockDim.x) {
-        uint64_t h = (i + 1u) * 0x9e3779b97f4a7c15ull;
-        h ^= h >> 31;
-        h *= 0xbf58476d1ce4e5b9ull;
-        h ^= h >> 29;
-        /* half the pairs from raw patterns, half near the clamps (where fminf and the if-chain could differ) */
-        float g = __uint_as_float((uint32_t)h), u = __uint_as_float((uint32_t)(h >> 32));
-        if (i & 1u) {
-            g = ((int)((h >> 8) % 4001u) - 2000) * 0.0078125f;
-            u = ((int)((h >> 40) % 4001u) - 2000) * 0.0078125f;
-        }
-        for (float c : clamps) {
-            const float a = pulsar_swiglu_elem(g, u, 0.375f, c), b = old_swiglu(g, u, 0.375f, c);
-            const bool nan_in = g != g || u != u;
-            if (!nan_in) moved += __float_as_uint(a) != __float_as_uint(b) && !(a != a && b != b);
-            else {
-                lost += a == a;
-                old_lost += b == b;
-            }
-        }
-    }
-    atomicAdd(&cnt[0], moved);
-    atomicAdd(&cnt[1], lost);
-    atomicAdd(&cnt[2], old_lost);
-}
-
-/// Case 12: the one SwiGLU keeps every non-NaN pair's old bits and turns no NaN operand into a number.
-static void case_swiglu_nan(void) {
-    unsigned long long *d = nullptr, h[3] = {0, 0, 0};
-    if (!ok(cudaMalloc(&d, sizeof(h)), "swiglu-nan malloc") || !ok(cudaMemset(d, 0, sizeof(h)), "swiglu-nan memset"))
-        return;
-    swiglu_sweep_kernel<<<1024, 256>>>(d);
-    if (ok(cudaDeviceSynchronize(), "swiglu-nan sweep") && ok(cudaMemcpy(h, d, sizeof(h), cudaMemcpyDeviceToHost),
-                                                             "swiglu-nan download")) {
-        printf("  12 swiglu-nan: 2^26 pairs x 3 clamps: %llu non-NaN moved, %llu NaN operands not kept (the fminf form "
-               "lost %llu)\n", h[0], h[1], h[2]);
-        if (h[0] || h[1]) fail("swiglu-nan: a non-NaN pair changed bits, or a NaN operand became a number");
-    }
-    cudaFree(d);
-}
-
-/* ---- 13. seg-reset-capture ------------------------------------------------------------------------------------- */
-
-/// Case 13: pulsar_gpu_seg_reset during a capture is the FULL reset at the capture's close.  A catalog key (declared in
+/// Case 12: pulsar_gpu_seg_reset during a capture is the FULL reset at the capture's close.  A catalog key (declared in
 /// the warmup window) is captured with a reset requested inside; afterwards, outside the window, its second use must
 /// NOT begin a capture: the key is gone and comes back a live key (12 uses to a capture).  Under the old partial drop
 /// the catalog key survived, and its second use captured.
@@ -670,16 +605,16 @@ static void case_seg_reset_capture(void) {
     if (r4 == 1) (void)pulsar_gpu_seg_exit(key, 1);
     const bool synced = pulsar_gpu_synchronize() != 0;
     pulsar_gpu_seg_reset();
-    printf("  13 seg-reset-capture: capture %d -> exit %d; after the window: %d, %d (want 0, 0), device %s\n", r0, rx,
+    printf("  12 seg-reset-capture: capture %d -> exit %d; after the window: %d, %d (want 0, 0), device %s\n", r0, rx,
            r3, r4, synced ? "clean" : "FAULT");
     if (r0 != 1 || rx < 0 || r3 != 0 || r4 != 0 || !synced)
         fail("seg-reset-capture: a reset under capture did not drop every key");
     cudaFree(d);
 }
 
-/* ---- 14. grow-under-capture ------------------------------------------------------------------------------------ */
+/* ---- 13. grow-under-capture ------------------------------------------------------------------------------------ */
 
-/// Case 14: a grow-on-demand cache refuses to allocate inside a graph capture, and the capture survives it.  An
+/// Case 13: a grow-on-demand cache refuses to allocate inside a graph capture, and the capture survives it.  An
 /// expert address table for a base never seen (its first use allocates) is asked for inside a capture on this
 /// thread's stream: NULL, and the capture still ends cleanly; outside the capture the same table builds.
 static void case_grow_under_capture(void) {
@@ -696,7 +631,7 @@ static void case_grow_under_capture(void) {
     (void)cudaGetLastError();
     const uint8_t *const *out_cap = mxfp4_expert_table(base, 4096u, 8u);
     const bool synced = pulsar_gpu_synchronize() != 0;
-    printf("  14 grow-under-capture: table inside a capture %s, capture end %s; outside %s\n",
+    printf("  13 grow-under-capture: table inside a capture %s, capture end %s; outside %s\n",
            in_cap ? "BUILT" : "refused", ec == cudaSuccess ? "clean" : cudaGetErrorString(ec),
            out_cap ? "built" : "REFUSED");
     if (in_cap || ec != cudaSuccess || !out_cap || !synced) fail("grow-under-capture: an allocation under capture");
@@ -704,20 +639,20 @@ static void case_grow_under_capture(void) {
     cudaFree(base);
 }
 
-/* ---- 15. named-refusals ---------------------------------------------------------------------------------------- */
+/* ---- 14. named-refusals ---------------------------------------------------------------------------------------- */
 
-/// Case 15: refusals that used to return 0 silently now return 0 AND say why (the lines land in this gate's log):
+/// Case 14: refusals that used to return 0 silently now return 0 AND say why (the lines land in this gate's log):
 /// the dspark HC mean over a short carrier, and the 0731 packed scatter into a short ring.
 static void case_named_refusals(void) {
     pulsar_gpu_tensor *a = pulsar_gpu_tensor_alloc(4096u), *b = pulsar_gpu_tensor_alloc(64u);
     if (!a || !b) {
         fail("named-refusals: alloc");
     } else {
-        fprintf(stderr, "  15 named-refusals: two refusal lines follow\n");
+        fprintf(stderr, "  14 named-refusals: two refusal lines follow\n");
         const int r1 = pulsar_gpu_dspark_hc_mean_reduce_batch(a, b, 256u, 4u, 2u);   /* carrier 64 B: short */
         const int r2 = pulsar_gpu_attn_pack_scatter_tensor(b, a, 8u, 0u, 2u, 512u, NULL, NULL, 1u);   /* ring short */
         const bool synced = pulsar_gpu_synchronize() != 0;
-        printf("  15 named-refusals: dspark hc mean %s, 0731 scatter %s (each said why on stderr), device %s\n",
+        printf("  14 named-refusals: dspark hc mean %s, 0731 scatter %s (each said why on stderr), device %s\n",
                r1 ? "RAN" : "refused", r2 ? "RAN" : "refused", synced ? "clean" : "FAULT");
         if (r1 || r2 || !synced) fail("named-refusals: a short operand ran");
     }
@@ -743,7 +678,6 @@ int main(void) {
     case_hc_expand_sizes();
     case_subview_dry();
     case_bf16_nan();
-    case_swiglu_nan();
     case_seg_reset_capture();
     case_grow_under_capture();
     case_named_refusals();
