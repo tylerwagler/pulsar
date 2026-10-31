@@ -4350,7 +4350,9 @@ bool pulsar_tp_plan_add(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor 
 bool pulsar_tp_plan_add1(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor *t, pulsar_tp_axis axis, uint64_t lo,
                          uint64_t hi);
 /** At open, after the family's load (before the inspect-only exit): the family declares, the core chooses each
- *  operation and marks what the rank never stages.  Refuses an operation the format has not, or the forward reads not. */
+ *  operation and marks what the rank never stages.  Refuses an operation the format has not, or the forward reads not.
+ *  The plan is attached (and tensors marked unstaged) only when every slice validated: a refusal leaves nothing
+ *  behind, so a second call refuses again; once a plan is attached a second call keeps it. */
 /// @param e  the engine
 /// @return false (said) on a refusal.
 bool pulsar_tp_plan_build(pulsar_engine *e);

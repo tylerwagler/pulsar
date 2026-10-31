@@ -9,9 +9,10 @@
  * through a registered slab (RDMA SEND/RECV when verbs are available,
  * full-duplex TCP otherwise).
  *
- * Wire format is byte-identical to upstream (magic 0x44533454, protocol
- * version 7, the pulsar_tp_hello_fixed frame and the ds4_tp.h frame-type
- * numbers).  The control socket is a plain blocking TCP stream carrying
+ * The wire format began as upstream's (magic 0x44533454, the
+ * pulsar_tp_hello_fixed frame and the ds4_tp.h frame-type numbers) and has
+ * since moved on: the version is PULSAR_TP_PROTOCOL_VERSION (pulsar_tp.h, its
+ * history beside it).  The control socket is a plain blocking TCP stream carrying
  * framed commands; gate traffic rides a dedicated full-duplex TCP socket (or
  * RDMA) so control frames never interleave with gate payloads.
  *
@@ -177,7 +178,8 @@ typedef void *tp_ibv_comp_channel;  /* struct ibv_comp_channel * */
  * carries IDENTICAL bytes at a later index, only distinguishable by gid_type.
  * RC rejected that AV with EINVAL at RTR; UC swallowed it into a dead QP.
  * Secondary finding: the mirrored tp_ibv_port_attr put link_layer at offset
- * 39 where the real struct has it at 46.  Both argue for the same discipline —
+ * 39 where the real struct has it at 46 (the fallback below now mirrors the
+ * real layout, offsets asserted).  Both argue for the same discipline —
  * when libibverbs-dev is installed (dev + both Sparks) use the REAL rdma-core
  * structs for every value handed to the verbs stack, and query the per-entry
  * gid_type via _ibv_query_gid_ex.  The TP_IBV_* names below alias to the real
@@ -423,31 +425,42 @@ struct tp_ibv_qp_attr {
     uint32_t rate_limit;
 };
 
-/* struct ibv_port_attr: stable-prefix fields only; the version-varying tail
- * is absorbed by padding.  Load-bearing offsets — state@0, active_mtu@8,
- * gid_tbl_len@12, lid@34, link_layer@39 — are constant across rdma-core. */
+/* struct ibv_port_attr, field for field as rdma-core's libibverbs/verbs.h
+ * declares it; the version-varying tail is absorbed by padding.  The fields
+ * we read -- state, active_mtu, max_msg_sz, lid, link_layer -- sit at the
+ * offsets asserted below (link_layer is @46, after phys_state: the old mirror
+ * had it @39, where max_vl_num lives). */
 struct tp_ibv_port_attr {
     int state;              /* enum ibv_port_state      @0  */
     int max_mtu;            /* enum ibv_mtu             @4  */
     int active_mtu;         /* enum ibv_mtu             @8  */
-    uint32_t gid_tbl_len;   /*                           @12 */
-    uint32_t port_cap_flags_stub;
-    uint32_t max_msg_sz;
+    int gid_tbl_len;        /*                           @12 */
+    uint32_t port_cap_flags;
+    uint32_t max_msg_sz;    /*                           @20 */
     uint32_t bad_pkey_cntr;
     uint32_t qkey_viol_cntr;
     uint16_t pkey_tbl_len;  /*                           @32 */
     uint16_t lid;           /*                           @34 */
     uint16_t sm_lid;
     uint8_t lmc;
-    uint8_t link_layer;     /* enum ibv_link_layer      @39 */
-    uint8_t max_vl_num;
+    uint8_t max_vl_num;     /*                           @39 */
     uint8_t sm_sl;
     uint8_t subnet_timeout;
     uint8_t init_type_reply;
+    uint8_t active_width;
     uint8_t active_speed;
     uint8_t phys_state;
+    uint8_t link_layer;     /* enum ibv_link_layer      @46 */
+    uint8_t flags;
+    uint16_t port_cap_flags2;
+    uint32_t active_speed_ex;
     uint8_t pad[32];        /* version-varying tail */
 };
+static_assert(offsetof(tp_ibv_port_attr, active_mtu) == 8, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, max_msg_sz) == 20, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, lid) == 34, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, link_layer) == 46, "rdma-core ibv_port_attr layout");
+static_assert(offsetof(tp_ibv_port_attr, active_speed_ex) == 52, "rdma-core ibv_port_attr layout");
 
 /* Object prefixes read back from library-owned memory (only the leading,
  * stable members are touched). */
@@ -662,8 +675,6 @@ typedef struct {
     int data_fd;
     /// The peer's ctx_size from its hello.
     uint32_t peer_ctx;
-    /// Set when the legacy pair's link comes up (the mesh path never sets it; nothing reads it).
-    bool connected;
     /* What the peer told us about itself in the NODE frame (protocol v13). */
     /// What the peer said about itself in the NODE frame.
     pulsar_tp_node node;
@@ -680,7 +691,7 @@ struct pulsar_tp {
     /// The options this rank was created with (pointers are the caller's).
     pulsar_tp_options opt;
     /// This rank's index in the group (legacy pair: 0 leader, 1 worker).
-    int rank;                   /* 0 leader, 1 worker */
+    int rank;                   /* 0 leader, 1..n_ranks-1 workers */
     /// Ranks in the TP group (2 for the pair).
     int n_ranks;                /* ranks in this TP group (2 for the pair) */
     /// Connected peers: n_ranks - 1.
@@ -2675,13 +2686,9 @@ void pulsar_tp_slab_layout_init(uint32_t n_layer, uint32_t n_embd, pulsar_tp_sla
 }
 
 uint64_t pulsar_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
-    const uint64_t vec = (uint64_t)n_embd * sizeof(float);
-    const uint64_t slots = pulsar_tp_gate_ring_slots(n_layer);
-    return slots * vec * 2 +    /* out + in vectors */
-           slots * 8 * 2 +      /* in seq flags + out flag staging */
-           16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * PULSAR_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+    pulsar_tp_slab s;
+    pulsar_tp_slab_layout_init(n_layer, n_embd, &s);
+    return s.slab_bytes;
 }
 
 /// Slab slot index of gate [layer, gate].
@@ -3067,7 +3074,6 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
     tp->peers[0].control_fd = tp->control_fd;
     tp->peers[0].data_fd = tp->data_fd;
     tp->peers[0].peer_ctx = tp->peer_ctx;
-    tp->peers[0].connected = true;
     {
         /* The leader knows its listen port; a dialing worker has none of its own. */
         char addr[PULSAR_TP_NODE_STR];
@@ -3491,6 +3497,11 @@ void pulsar_tp_bulk_layout(const pulsar_tp *tp, pulsar_tp_bulk_layout_t *out) {
 }
 
 int pulsar_tp_bulk_begin(pulsar_tp *tp, uint64_t bytes, uint64_t *exch, uint32_t *buf) {
+    if (tp && tp->n_ranks != 2) {
+        fprintf(stderr, "pulsar-tp: bulk lane refused: a %d-rank group (the lane is pair-only, n_ranks 2)\n",
+                tp->n_ranks);
+        return 0;
+    }
     if (!pulsar_tp_bulk_lane(tp) || bytes == 0 || bytes > tp->bulk_cap || !exch || !buf) {
         fprintf(stderr, "pulsar-tp: bulk lane refused (%llu bytes, cap %llu; pair+rdma+bulk buffer "
                         "required) -- the caller must pick the lane\n",
@@ -3536,6 +3547,11 @@ void pulsar_tp_row_lane_layout(const pulsar_tp *tp, pulsar_tp_row_lane_layout_t 
 
 
 int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, uint64_t *exch) {
+    if (tp && tp->n_ranks != 2) {
+        fprintf(stderr, "pulsar-tp: row lane refused: a %d-rank group (the lane is pair-only, n_ranks 2)\n",
+                tp->n_ranks);
+        return 0;
+    }
     if (!pulsar_tp_row_lane(tp) || !tp->proxy_started || rows == 0 ||
         rows > PULSAR_TP_BATCH_MAX_ROWS || !first_msg || !exch) {
         fprintf(stderr, "pulsar-tp: row lane refused (%u rows; pair+rdma+slab+proxy required, "
@@ -4149,9 +4165,9 @@ typedef struct {
 /* Broadcast ONE frame to every peer's control socket.  The command plane is
  * leader -> workers, so an n-rank group must reach all n_ranks-1 of them; for
  * the pair this is exactly the old single send, because control_fd IS
- * peers[0].  Worker -> leader frames (ack, logits half, verify) do NOT come
- * through here: a worker has one peer, the leader, so its control_fd is already
- * that link. */
+ * peers[0].  Worker -> leader frames (acks, a worker's verify commit) do NOT
+ * come through here: they go to the leader's link alone (in a mesh a worker's
+ * other peers are workers). */
 /// Send one control frame to every peer.
 /// @param tp      the transport (leader)
 /// @param type    the frame type
@@ -4855,27 +4871,18 @@ int pulsar_tp_send_stop(pulsar_tp *tp) {
 
 void pulsar_tp_command_free(pulsar_tp_command *command) {
     if (!command) return;
+    /* Every malloc'd array first, then zero: zeroing first loses the pointers. */
     free(command->tokens);
     free(command->items);
-    memset(command, 0, sizeof(*command));
-    command->type = PULSAR_TP_FRAME_ERROR;
     free(command->logits);
-    command->logits = NULL;
-    command->n_logits = 0;
     free(command->spec_banks);
     free(command->spec_rngs);
-    command->spec_banks = NULL;
-    command->spec_rngs = NULL;
     free(command->spec_steps);
-    command->spec_steps = NULL;
     free(command->images);
     free(command->image_bytes);
-    command->images = NULL;
-    command->image_bytes = NULL;
-    command->n_images = 0;
     free(command->keys);
-    command->keys = NULL;
-    command->n_keys = 0;
+    memset(command, 0, sizeof(*command));
+    command->type = PULSAR_TP_FRAME_ERROR;
 }
 
 /// Decode a token-carrying frame's payload into `command` (session, tokens, value).
@@ -5170,23 +5177,34 @@ int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
 }
 
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept, int32_t replay_n) {
-    /* Worker -> leader: a worker has ONE peer (the leader), so its control_fd is
-     * that link at any n -- nothing to loop. */
+    /* The leader broadcasts its decision to EVERY peer (at n > 2 the primary
+     * control_fd is only rank 1); a worker sends its verdict to the leader
+     * alone -- in a mesh its other peers are workers, which never read one. */
+    if (!tp) return 0;
     struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
-    return tp_send_frame(tp->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+    if (tp->rank == 0)
+        return tp_send_frame_to_peers(tp, PULSAR_TP_FRAME_VERIFY_COMMIT, &msg, sizeof(msg));
+    const pulsar_tp_peer *leader = tp_peer_by_rank(tp, 0);
+    if (!leader || leader->control_fd < 0) return 0;
+    return tp_send_frame(leader->control_fd, PULSAR_TP_FRAME_VERIFY_COMMIT, &msg, sizeof(msg));
 }
 
 int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *replay_n) {
-    /* One commit per PEER, and every one must AGREE.  Every rank verifies
-     * against the same assembled logits (the vocab split all-gathers them), so a
-     * split verdict means the ranks disagree about the same computation -- a
-     * real bug, and this REFUSES rather than silently taking one worker's word.
-     * n=2 is the one-peer case and behaves exactly as before. */
+    /* The leader collects one commit per PEER, and every one must AGREE.  Every
+     * rank verifies against the same assembled logits (the vocab split
+     * all-gathers them), so a split verdict means the ranks disagree about the
+     * same computation -- a real bug, and this REFUSES rather than silently
+     * taking one worker's word.  A worker reads the leader's ONE commit: its
+     * other mesh peers are workers and send it none.  n=2 is the one-peer case
+     * either way. */
     if (!tp || tp->n_peers < 1 || !full_accept || !replay_n) return 0;
+    pulsar_tp_peer *const leader = tp->rank == 0 ? NULL : tp_peer_by_rank(tp, 0);
+    if (tp->rank != 0 && !leader) return 0;
+    pulsar_tp_peer *const from = leader ? leader : tp->peers;
+    const int n_from = leader ? 1 : tp->n_peers;
     int32_t first_full = 0, first_replay = 0;
-    for (int i = 0; i < tp->n_peers; i++) {
-        const int pfd = tp->peers[i].control_fd;
+    for (int i = 0; i < n_from; i++) {
+        const int pfd = from[i].control_fd;
         uint32_t type = 0, bytes = 0;
         struct { int32_t full; int32_t replay; } msg;
         if (pfd < 0 || !tp_read_frame_header(pfd, &type, &bytes) ||
@@ -5194,7 +5212,7 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *r
             !tp_read_full(pfd, &msg, sizeof(msg))) {
             fprintf(stderr,
                     "pulsar-tp: bad verify-commit frame from rank %d (type %u bytes %u)\n",
-                    tp->peers[i].rank, type, bytes);
+                    from[i].rank, type, bytes);
             return 0;
         }
         if (i == 0) {
@@ -5204,8 +5222,8 @@ int pulsar_tp_recv_verify_commit(pulsar_tp *tp, int32_t *full_accept, int32_t *r
             fprintf(stderr,
                     "pulsar-tp: verify-commit SPLIT: rank %d says (%d,%d), rank %d says "
                     "(%d,%d) -- refusing\n",
-                    tp->peers[0].rank, first_full, first_replay,
-                    tp->peers[i].rank, msg.full, msg.replay);
+                    from[0].rank, first_full, first_replay,
+                    from[i].rank, msg.full, msg.replay);
             return 0;
         }
     }

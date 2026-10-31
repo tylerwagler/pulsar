@@ -200,7 +200,7 @@ uint32_t pulsar_tp_gate_ring_slots(uint32_t n_layer);
 /// @param n_embd  the hidden width (vec_bytes = n_embd * 4)
 /// @param out     receives the layout
 void pulsar_tp_slab_layout_init(uint32_t n_layer, uint32_t n_embd, pulsar_tp_slab *out);
-/// Total slab bytes for a model (the same figure as pulsar_tp_slab_layout_init's slab_bytes).
+/// Total slab bytes for a model: pulsar_tp_slab_layout_init's slab_bytes, read from the layout (one authority).
 /// @param n_layer the model's layer count
 /// @param n_embd  the hidden width
 /// @return the slab size in bytes
@@ -272,9 +272,10 @@ void pulsar_tp_identity_init_defaults(pulsar_tp_identity *id,
 /* ------------------------------------------------------------------------
  * Transport (slice 3).  Public surface of the ported upstream ds4_tp.c: the
  * connection/lockstep transport that runs the slice-1 slab contract.  The
- * wire format is byte-identical to upstream antirez/ds4 (magic 0x44533454,
- * protocol version 7, the hello frame above, and the ds4_tp.h frame type
- * numbers).  Functions return 1 on success / 0 on failure and snprintf into
+ * wire format began as upstream antirez/ds4's (magic 0x44533454, the hello
+ * frame above, the ds4_tp.h frame type numbers) and has since moved on: the
+ * version is PULSAR_TP_PROTOCOL_VERSION, its history beside the constant, and
+ * both ends must speak the same one.  Functions return 1 on success / 0 on failure and snprintf into
  * (err, errlen) when err is non-NULL, matching the tree convention.
  * ---------------------------------------------------------------------- */
 
@@ -308,8 +309,8 @@ int pulsar_tp_create(pulsar_tp **out, const pulsar_tp_options *opt,
 void pulsar_tp_free(pulsar_tp *tp);
 /// This rank's index in the group.
 /// @param tp the transport
-/// @return the rank (legacy pair: 0 leader, 1 worker)
-int pulsar_tp_rank(const pulsar_tp *tp);            /* 0 leader, 1 worker */
+/// @return the rank: 0 the leader, 1..n_ranks-1 the workers (the pair: 1 its one worker)
+int pulsar_tp_rank(const pulsar_tp *tp);
 /// Ranks in this TP group.
 /// @param tp the transport
 /// @return the group size
@@ -493,7 +494,9 @@ int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);
 
 /* The ROW LANE (L241 4g-2): the pair's decode and verify exchanges, fully
- * asynchronous.  An exchange swaps `rows` (1..PULSAR_TP_BATCH_MAX_ROWS)
+ * asynchronous.  PAIR-ONLY (n_ranks == 2): an exchange swaps rows with the ONE
+ * peer.  An n > 2 group brings it up OFF (the bring-up line says so) and
+ * pulsar_tp_row_lane_begin refuses by name.  An exchange swaps `rows` (1..PULSAR_TP_BATCH_MAX_ROWS)
  * vectors of vec_bytes with the peer and never makes the engine thread wait:
  *
  *  - the engine thread calls pulsar_tp_row_lane_begin, which numbers the
@@ -565,7 +568,9 @@ int pulsar_tp_row_lane_begin(pulsar_tp *tp, uint32_t rows, uint64_t *first_msg, 
 /// @return 1 when every enqueued exchange completed cleanly, 0 otherwise
 int pulsar_tp_row_lane_check(pulsar_tp *tp);
 
-/* THE BULK LANE (v14): prefill-sized exchanges on the row lane's machinery.
+/* THE BULK LANE (v14): prefill-sized exchanges on the row lane's machinery,
+ * so PAIR-ONLY like it (n_ranks == 2): an n > 2 group brings up no bulk QP and
+ * pulsar_tp_bulk_begin refuses by name.
  * The engine attaches a caller-owned, host-pinned, GPU-mapped buffer BEFORE
  * pulsar_tp_attach_slab (pulsar_tp_set_bulk); attach registers it and brings up
  * a second UC QP whose receive queue holds only zero-length imm receives, so
@@ -1266,7 +1271,7 @@ typedef struct {
     /// MIXED_BATCH head_runs, NOTE_PREFILLED headed run (-1 none), SYNC_CHECK the leader's cached position.
     int value;
     /// Token array (malloc'd) for SYNC, SYNC_MM, VERIFY, NOTE_COMMITTED and NOTE_PREFILLED; n_tokens entries.
-    int *tokens;          /* malloc'd for FRAME_SYNC/VERIFY/MIXED_BATCH */
+    int *tokens;
     /// Entries in `tokens`.
     uint32_t n_tokens;
     /// Batch rows (malloc'd) for EVAL_BATCH / MIXED_BATCH / FUSED_BATCH; n_items entries.
@@ -1334,14 +1339,14 @@ void pulsar_tp_command_free(pulsar_tp_command *command);
 /// @return 1 when sent to every peer, 0 on failure
 int pulsar_tp_send_verify(pulsar_tp *tp, uint64_t session_id,
                           const int *drafts, uint32_t n);
-/// Send the verify decision on the primary control link.
+/// Send a verify decision: the leader broadcasts it to every peer; a worker sends it to the leader alone.
 /// @param tp          the transport
 /// @param full_accept 1 when every draft matched
 /// @param replay_n    accepted rows
-/// @return 1 when sent, 0 on failure
+/// @return 1 when sent to every recipient, 0 on failure
 int pulsar_tp_send_verify_commit(pulsar_tp *tp, int32_t full_accept,
                                  int32_t replay_n);
-/// Collect one verify commit per peer; all must agree.
+/// Receive a verify decision: the leader collects one per peer and all must agree; a worker reads the leader's.
 /// @param tp          the transport
 /// @param full_accept receives the agreed full_accept
 /// @param replay_n    receives the agreed replay_n

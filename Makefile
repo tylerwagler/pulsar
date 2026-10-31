@@ -225,7 +225,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -1437,7 +1437,7 @@ cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_b
 # (L279) is the artifact builder's suite: no GPU, the synthetic builds' golden
 # SHA-256s, and the oracle suites that read the mounted checkpoints' headers.
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
-             indexer-score-check attn-pack-fixture-check tp-core-test container-tests
+             indexer-score-check attn-pack-fixture-check tp-core-test tp-command-free-test container-tests
 	./pulsar-eval --self-test-extractors
 	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
 
@@ -3356,6 +3356,15 @@ tests/tp_plan_test.o: tests/tp_plan_test.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L335: a refused pulsar_tp_plan_build attaches nothing and a second call refuses again (tests/tp_plan_build_test.cpp:
+# a fabricated engine and test families, no model, no GPU work).
+tests/tp_plan_build_test.o: tests/tp_plan_build_test.cpp src/engine/pulsar_engine_internal.h src/engine/family.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/tp_plan_build_test: tests/tp_plan_build_test.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+.PHONY: tp-plan-build-test
+tp-plan-build-test: tests/tp_plan_build_test
+	./tests/tp_plan_build_test
 # L296 N9: the chained-MTP drafter on a container (tests/mtp_spec_gate.cpp; reads the drafter's numbers and the state)
 tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/spec_mtp.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
@@ -3575,6 +3584,15 @@ tests/tp_core_test: tests/tp_core_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp
 
 tp-core-test: tests/tp_core_test
 	./tests/tp_core_test
+
+# TP command-free test (L335).  Host-only, built with AddressSanitizer: a command of every received frame kind
+# with every malloc'd array set goes through pulsar_tp_command_free, and LeakSanitizer must find nothing (the
+# pre-L335 free zeroed the command before freeing logits / spec / image / key arrays).
+tests/tp_command_free_test: tests/tp_command_free_test.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer $(PULSAR_INC) -o $@ tests/tp_command_free_test.cpp src/tp/pulsar_tp.cpp
+
+tp-command-free-test: tests/tp_command_free_test
+	./tests/tp_command_free_test
 
 # TP n-way full-mesh test (slice n-way).  Host-only: forks n ranks over TCP
 # loopback and drives create_mesh + allreduce_sum; asserts the all-reduce is

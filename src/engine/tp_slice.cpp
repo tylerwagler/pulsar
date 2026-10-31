@@ -170,26 +170,37 @@ bool pulsar_tp_plan_build(pulsar_engine *e) {
         fprintf(stderr, "pulsar: family %s declares no tensor-parallel slices -- refusing\n", e->family->name);
         return false;
     }
+    /* Declare and validate on a detached plan; attach it and mark the residency rule only once every slice has an
+     * operation.  A refused build leaves nothing behind (no plan, no unstaged marks), so a second call refuses
+     * again instead of finding a half-built plan and returning true. */
     pulsar_tp_plan *p = new pulsar_tp_plan();
     p->key = e;
-    e->tp_plan = p;
-    e->model.tp_plan = p;
-    e->dspark_model.tp_plan = p;   /* the drafter's tensors are in the plan too (a merged drafter aliases the model) */
-    if (!e->family->tp_slices(e, p)) return false;
-    uint32_t count[9] = {0};   /* one per operation bit */
-    uint64_t unstaged = 0;
+    if (!e->family->tp_slices(e, p)) {
+        delete p;
+        return false;
+    }
     for (const pulsar_tp_slice &s : p->slices) {
         const pulsar_tp_op op = plan_op(&s, e->family->act_kind);
-        char nm[256];
-        tname(s.t, nm, sizeof(nm));
         if (op == PULSAR_TP_OP_NONE || !plan_ranges_ok(&s, op)) {
+            char nm[256];
+            tname(s.t, nm, sizeof(nm));
             fprintf(stderr, "pulsar: TP plan: no %s slice of %s (%s, %u range(s) along %s) for a %s reader -- refusing\n",
                     op == PULSAR_TP_OP_NONE ? "operation for a" : "aligned in-bounds", nm, tensor_type_name(s.t->type),
                     s.n, axis_name(s.axis), e->family->act_kind == PULSAR_ACT_KIND_ROWS ? "bf16-rows" : "MX-slot");
+            delete p;
             return false;
         }
         p->by_tensor[s.t] = p->ops.size();
         p->ops.push_back(op);
+    }
+    e->tp_plan = p;
+    e->model.tp_plan = p;
+    e->dspark_model.tp_plan = p;   /* the drafter's tensors are in the plan too (a merged drafter aliases the model) */
+    uint32_t count[9] = {0};   /* one per operation bit */
+    uint64_t unstaged = 0;
+    for (size_t i = 0; i < p->slices.size(); i++) {
+        const pulsar_tp_slice &s = p->slices[i];
+        const pulsar_tp_op op = p->ops[i];
         for (uint32_t b = 0; b < 9; b++) if ((uint32_t)op == 1u << b) count[b]++;
         if (op_replaces(op)) {
             /* the residency rule: the model that holds the tensor (a merged drafter aliases the main model) */
