@@ -148,7 +148,7 @@ static int effort_row_nearest(int value) {
 /// @param a    receives level (a column, -1 for none / an integer) and value (the integer, 0 for none)
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
-/// @return false on a malformed value (err set, except on a JSON syntax error)
+/// @return false + err on a malformed value (a JSON syntax error included, L335)
 static bool effort_value(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) {
@@ -158,7 +158,10 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
     }
     if (**p == '"') {
         char *name = NULL;
-        if (!json_string(p, &name)) return false;
+        if (!json_string(p, &name)) {
+            snprintf(err, errlen, "%s: a malformed JSON string", key);
+            return false;
+        }
         const int row = effort_row(name);
         if (row < 0)
             snprintf(err, errlen, "%s: \"%.40s\" is not an effort -- send none, minimal, low, medium, high, xhigh, "
@@ -181,14 +184,20 @@ static bool effort_value(const char **p, const char *key, chat_effort_ask *a, ch
 }
 
 /// One boolean thinking switch: null (not sent) or true / false.
-/// @param p  the JSON cursor, advanced past the value
-/// @param a  receives thinking (1 / 0) when one was sent
-/// @return false on a value that is neither null nor a bool
-static bool thinking_bool(const char **p, chat_effort_ask *a) {
+/// @param p       the JSON cursor, advanced past the value
+/// @param key     the control's name, for the error
+/// @param a       receives thinking (1 / 0) when one was sent
+/// @param err     receives the reason on false (L335: it used to be left empty)
+/// @param errlen  size of `err`
+/// @return false + err on a value that is neither null nor a bool
+static bool thinking_bool(const char **p, const char *key, chat_effort_ask *a, char *err, size_t errlen) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     bool on = true;
-    if (!json_bool(p, &on)) return false;
+    if (!json_bool(p, &on)) {
+        snprintf(err, errlen, "%s: must be true, false or null", key);
+        return false;
+    }
     a->thinking = on ? 1 : 0;
     return true;
 }
@@ -210,7 +219,7 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
                 a->thinking = on ? 1 : 0;
             }
         } else if (!strcmp(k, "think") || !strcmp(k, "enable_thinking")) {
-            ok = thinking_bool(&q, a);
+            ok = thinking_bool(&q, k, a, err, errlen);
         } else if (!strcmp(k, "reasoning_effort") || !strcmp(k, "reasoning.effort")) {
             ok = effort_value(&q, k, a, err, errlen);
         } else if (!strcmp(k, "output_config")) {
@@ -231,7 +240,7 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
                     ok = ok && *q == ':';
                     if (ok) q++;
                     if (ok && !strcmp(kk, "enable_thinking")) {
-                        ok = thinking_bool(&q, a);
+                        ok = thinking_bool(&q, "chat_template_kwargs.enable_thinking", a, err, errlen);
                     } else if (ok && !strcmp(kk, "reasoning_effort")) {
                         ok = effort_value(&q, "chat_template_kwargs.reasoning_effort", a, err, errlen);
                     } else if (ok) {

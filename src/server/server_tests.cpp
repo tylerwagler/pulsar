@@ -2273,6 +2273,28 @@ static void test_api_thinking_controls_parse(void) {
     free(oc.raw);
 }
 
+/* L335: a malformed effort string or a non-bool thinking switch refuses WITH its reason (both left err empty, so the
+ * client got the generic "invalid JSON request"). */
+static void test_effort_controls_name_their_error(void) {
+    static const struct { const char *key, *raw, *why; } k[] = {
+        {"reasoning_effort", "\"high", "reasoning_effort: a malformed JSON string"},
+        {"reasoning.effort", "\"lo", "reasoning.effort: a malformed JSON string"},
+        {"enable_thinking", "1", "enable_thinking: must be true, false or null"},
+        {"think", "\"yes\"", "think: must be true, false or null"},
+        {"chat_template_kwargs", "{\"enable_thinking\":\"on\"}",
+         "chat_template_kwargs.enable_thinking: must be true, false or null"},
+    };
+    for (const auto &c : k) {
+        chat_control ctl = {c.key, xstrdup(c.raw)};
+        chat_effort_ask a;
+        char err[160] = "";
+        TEST_ASSERT(!chat_effort_ask_read(&ctl, 1, &a, err, sizeof err));
+        if (strcmp(err, c.why)) fprintf(stderr, "effort control %s=%s: \"%s\"\n", c.key, c.raw, err);
+        TEST_ASSERT(!strcmp(err, c.why));
+        free(ctl.raw);
+    }
+}
+
 
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -12015,6 +12037,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_effort_names_one_table();
     test_api_thinking_controls_parse();
+    test_effort_controls_name_their_error();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
     test_inline_system_message_placement();
