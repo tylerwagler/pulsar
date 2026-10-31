@@ -167,8 +167,12 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
         fprintf(stderr, "%s: no lane, or %d forks already pending on it -- refusing\n", tag, lane ? lane->n : 0);
         return -1;
     }
-    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess)
+    if (cudaEventRecord(lane->fork, stream) != cudaSuccess || cudaStreamWaitEvent(lane->s, lane->fork, 0) != cudaSuccess) {
+        /* the contract's -3 (exl3_moe.cuh): nothing was launched; said, like every other refusal here (L335) */
+        fprintf(stderr, "%s: the fork's event record / wait failed: %s -- refusing\n", tag,
+                cudaGetErrorString(cudaGetLastError()));
         return -3;
+    }
     const ds4_exl3_dense_proj gu[2] = {{sh.gate, sh.k2_gate, sh.mid, sh.yg, nullptr},
                                        {sh.up, sh.k2_up, sh.mid, sh.yu, nullptr}};
     int rc = ds4_exl3_dense_multi_launch(gu, 2, x.x, T, in_dim, sh.ws, sh.ws_bytes, lane->s, prompt);
