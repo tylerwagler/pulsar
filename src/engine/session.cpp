@@ -350,6 +350,14 @@ bool pulsar_ds4_family_load(pulsar_engine *e, const pulsar_engine_options *opt) 
     if (!ds4_load_stage_ok("the tokenizer")) return false;
     config_validate_model(&e->model);
     if (!ds4_load_stage_ok("the configuration")) return false;
+    /* L335: the V4.1 template writes the System marker (chat_tmpl_push_system_marker), so the V4.1 profile needs
+     * it in the vocab; 0731's does not (its pre-V4.1 artifacts lack it).  Refused here, once the profile is
+     * known, instead of exiting the process at the first prompt that renders it. */
+    if (!opt->inspect_only && PULSAR_CHAT_SYSTEM_MARKER && e->vocab.system_id < 0) {
+        fprintf(stderr, "pulsar: deepseek4: the vocabulary has no <｜System｜> marker, which the V4.1 chat template "
+                        "requires -- refusing\n");
+        return false;
+    }
     /* L280: DeepSeek's container declares its YaRN (validated above); the option may only restate it */
     if (opt->rope_yarn_factor != 0.0 && opt->rope_yarn_factor != (double)PULSAR_ROPE_SCALE_FACTOR) {
         fprintf(stderr, "pulsar: --rope-yarn %g contradicts the container's YaRN factor %g -- refusing\n",

@@ -3850,6 +3850,37 @@ static void test_l308_copy_estimate(void) {
     TEST_ASSERT(pulsar_spec_copy_price(&sp, 0.0f, 8u, conf, &rp) == 8u && !rp && conf[0] == 1.0f);
 }
 
+/* L335: the tokenizer entries on a family without a tokenizer or chat front (an encoder's) refuse by name and return
+ * their failure values -- never exit the process (they did, tokenizer_require / chat_require).  A host engine with
+ * only its family set: nothing else is read before the refusal. */
+static void test_tokenizer_refusals(void) {
+    static pulsar_family fam{};
+    fam.arch = "l335-test";
+    fam.name = "L335 test (no tokenizer)";
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    TEST_ASSERT(!pulsar_engine_has_tokenizer(e));
+    pulsar_tokens out = {0};
+    TEST_ASSERT(!pulsar_tokenize_text(e, "hello", &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_tokenize_rendered_chat(e, "hello", &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, "hello", NULL, 0u, &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, NULL, PULSAR_THINK_NONE) && out.len == 0);
+    const pulsar_chat_message m = {"user", "hi", false};
+    TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &m, 1, true, PULSAR_THINK_NONE) && out.len == 0);
+    TEST_ASSERT(!pulsar_chat_end_assistant(e, &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_encode_chat_prompt(e, NULL, "hi", PULSAR_THINK_NONE, &out) && out.len == 0);
+    size_t len = 7;
+    TEST_ASSERT(pulsar_token_text(e, 1, &len) == NULL && len == 0);
+    TEST_ASSERT(pulsar_token_eos(e) == -1);
+    TEST_ASSERT(pulsar_token_is_stop(e, 1));   /* fail closed: a generation ends */
+    TEST_ASSERT(pulsar_token_think_close(e) == -1);
+    pulsar_turn_markers tm;
+    TEST_ASSERT(!pulsar_chat_turn_markers(e, &tm) && tm.n_user == 0 && tm.n_assistant == 0);
+    TEST_ASSERT(!pulsar_tokenize_text(e, "again", &out) && out.len == 0);   /* said once: the log has one line */
+    pulsar_tokens_free(&out);
+    free(e);
+}
+
 /* L335: the library's say-once table (family.cpp pulsar_refusal_first) -- an op is said the first time only; past
  * PULSAR_REFUSAL_OPS_MAX ops every refusal is said (the table never silently drops one), and that fact once. */
 static void test_refusal_once(void) {
@@ -4841,6 +4872,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-cost", "fused-cost", "the prompt chunk cost fit (solo + fused, persisted) and the verify curve's round cost, what the round selection and the disk restore price by (L304, L312, L327)", test_fused_cost},
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
+    {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},

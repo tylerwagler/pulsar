@@ -597,9 +597,9 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
      * 0731 artifacts built before that encoding landed do not carry it -- their
      * vocab is otherwise complete.  Required-vs-optional is therefore a
      * two-profile decision, not a format check: requiring it makes the unified
-     * engine refuse a 0731 artifact it served the day before.  Optional here,
-     * with the requirement enforced where the marker is actually written
-     * (chat_tmpl_push_system_marker). */
+     * engine refuse a 0731 artifact it served the day before.  Optional here;
+     * the V4.1 profile, whose template writes it, refuses a vocab without it at
+     * load (pulsar_ds4_family_load, once the profile is known). */
     vocab->system_id    = vocab->vocab_find("<｜System｜>");
     vocab->think_start_id = vocab->vocab_lookup("<think>");
     vocab->think_end_id = vocab->vocab_lookup("</think>");
@@ -717,7 +717,7 @@ static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
     token_vec_push((token_vec *)t, id);
 }
 
-/** Push the System MARKER, refusing loudly if this artifact has no such token.
+/** Push the System MARKER (V4.1's template only).
  *
  * The marker is the V4.1 template's (see encode_chat_lead_in), and V4.1's own
  * vocab always carries it -- but the 0731 artifacts built before the V4.1
@@ -728,19 +728,16 @@ static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
  * `v5mx4-0731-srcfmt-v1-reapfix-lt.gguf` ran; one commit later it exited at load
  * with "required tokenizer token is missing".
  *
- * So the lookup is optional (like the image placeholder) and the requirement
- * lives HERE, at the point of use, where the family is already known: a V4.1
- * prompt rendered against a vocab without the marker would silently drop it --
- * exactly the silent-template-drift class the render-bytes gate exists for --
- * so it refuses by name instead. */
-/// @param v the vocab
-/// @param t the tokens (the marker appended; exits the process when the vocab has none)
+ * So the lookup is optional (like the image placeholder) and the requirement is
+ * the PROFILE's: a V4.1 vocab without the marker is refused at load, by name
+ * (pulsar_ds4_family_load, L335 -- this used to exit the process at the first
+ * render), because a V4.1 prompt rendered without it would silently drop it --
+ * exactly the silent-template-drift class the render-bytes gate exists for.  A
+ * template that writes the marker is therefore only ever rendered against a
+ * vocab that has it. */
+/// @param v the vocab (its system_id is a token: the load refused a V4.1 vocab without one)
+/// @param t the tokens, the marker appended
 static void chat_tmpl_push_system_marker(const pulsar_vocab *v, pulsar_tokens *t) {
-    if (v->system_id < 0) {
-        fprintf(stderr, "pulsar: this artifact's vocabulary has no System marker, which the V4.1 chat "
-                        "template requires -- refusing to render a prompt without it\n");
-        exit(1);
-    }
     chat_tmpl_push_marker(t, v->system_id);
 }
 
@@ -840,22 +837,23 @@ static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
 /* The tokenizer entries serve a family with a tokenizer table (pulsar_family::tokenizer); the chat front's entries
  * (chat_open / chat_turn / chat_end_assistant) a family that also declares its chat front (family.h
  * PULSAR_FAMILY_CAP_CHAT) -- L295: a family's tokenizer can be wired before its chat renderer is (token ids and
- * text in and out without the turn-by-turn chat front).  These entries return no error, so a family without
- * what they need ends the process here, by name, instead of tokenizing with an empty vocabulary; the front ends
- * refuse such an engine at startup (pulsar_engine_has_tokenizer, which asks for both) before they can reach this. */
-/** The engine's tokenizer, or exit(1) by name when its family has none.  @param e the engine
- *  @param op names the entry  @return the tokenizer ops */
+ * text in and out without the turn-by-turn chat front).  A family without what an entry needs is refused there,
+ * by name, once per entry (pulsar_refusal_first), and the entry returns its failure value (pulsar.h) -- never
+ * tokenizes with an empty vocabulary, never exits the process (L335).  The front ends refuse such an engine at
+ * startup (pulsar_engine_has_tokenizer, which asks for both), so a served path never reaches the refusal. */
+/** The engine's tokenizer, or NULL (said once per entry) when its family has none.  @param e the engine
+ *  @param op names the entry (a string literal)  @return the tokenizer ops, or NULL */
 static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
     if (e && e->family->tokenizer) return e->family->tokenizer;
-    fprintf(stderr, "pulsar: %s has no tokenizer table (%s) -- exiting\n", e ? e->family->name : "(no engine)", op);
-    exit(1);
+    if (pulsar_refusal_first(op))
+        fprintf(stderr, "pulsar: %s has no tokenizer table (%s) -- refusing\n", e ? e->family->name : "(no engine)", op);
+    return NULL;
 }
-/** The engine's tokenizer for a chat entry, or exit(1) when the family has no chat front.  @param e the engine
- *  @param op names the entry  @return the tokenizer ops */
+/** The engine's tokenizer for a chat entry, or NULL (said once per entry) when the family has no chat front.
+ *  @param e the engine  @param op names the entry (a string literal)  @return the tokenizer ops, or NULL */
 static const pulsar_family_tokenizer *chat_require(const pulsar_engine *e, const char *op) {
-    if (e && pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return tokenizer_require(e, op);
-    fprintf(stderr, "pulsar: %s has no chat front in this build -- exiting\n", e ? e->family->name : "(no engine)");
-    exit(1);
+    if (e && !pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return NULL;   /* said by the require */
+    return tokenizer_require(e, op);
 }
 
 bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
@@ -863,13 +861,17 @@ bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
 }
 
 bool pulsar_token_is_stop(pulsar_engine *e, int token) {
-    return tokenizer_require(e, "pulsar_token_is_stop")->is_stop(e, token);
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_is_stop");
+    return !t || t->is_stop(e, token);   /* refused: every token is a stop (the generation ends, fail closed) */
 }
 
 
 
-void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_tokenize_text")->encode_text(e, text, out);
+bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_text");
+    if (!t) return false;
+    t->encode_text(e, text, out);
+    return true;
 }
 
 
@@ -984,15 +986,20 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
     vocab->tokenize_span(span, (size_t)(p - span), out);
 }
 
-void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    tokenizer_require(e, "pulsar_tokenize_rendered_chat")->encode_rendered(e, text, NULL, 0u, out);
+bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat");
+    if (!t) return false;
+    t->encode_rendered(e, text, NULL, 0u, out);
+    return true;
 }
 
-void pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
+bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
                                          pulsar_tokens *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
+    if (!t) return false;
     t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out);
+    return true;
 }
 
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
@@ -1019,25 +1026,34 @@ pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_
 
 
 
-void pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode) {
-    chat_require(e, "pulsar_chat_open")->chat_open(e, tokens, trusted, system, think_mode);
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open");
+    if (!t) return false;
+    t->chat_open(e, tokens, trusted, system, think_mode);
+    return true;
 }
 
-void pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode) {
-    chat_require(e, "pulsar_chat_append_turn")->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_append_turn");
+    if (!t) return false;
+    t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
+    return true;
 }
 
-void pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
-    chat_require(e, "pulsar_chat_end_assistant")->chat_end_assistant(e, tokens);
+bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_end_assistant");
+    if (!t) return false;
+    t->chat_end_assistant(e, tokens);
+    return true;
 }
 
-void pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
+bool pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
                                pulsar_tokens *out) {
-    pulsar_chat_open(e, out, NULL, system, think_mode);
+    if (!pulsar_chat_open(e, out, NULL, system, think_mode)) return false;
     const pulsar_chat_message user = {"user", prompt ? prompt : "", false};
-    pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
+    return pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
 }
 
 
@@ -1301,7 +1317,12 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
-    return tokenizer_require(e, "pulsar_token_text")->token_text(e, token, len);
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_text");
+    if (!t) {
+        if (len) *len = 0;
+        return NULL;
+    }
+    return t->token_text(e, token, len);
 }
 
 
@@ -1338,7 +1359,8 @@ char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
 
 
 int pulsar_token_eos(pulsar_engine *e) {
-    return tokenizer_require(e, "pulsar_token_eos")->eos(e);
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_eos");
+    return t ? t->eos(e) : -1;
 }
 
 
@@ -1350,7 +1372,7 @@ int pulsar_token_eos(pulsar_engine *e) {
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_chat_turn_markers");
     memset(out, 0, sizeof(*out));
-    return t->turn_markers(e, out);
+    return t && t->turn_markers(e, out);
 }
 
 int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
@@ -1365,7 +1387,8 @@ int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int
 }
 
 int pulsar_token_think_close(pulsar_engine *e) {
-    return tokenizer_require(e, "pulsar_token_think_close")->think_close(e);
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_think_close");
+    return t ? t->think_close(e) : -1;
 }
 
 
