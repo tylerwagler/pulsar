@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: system prompt rendering and the worker's output queues. */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,7 @@
  * ============================================================================
  */
 
+/** The system prompt's opening: the agent's role, the DSML tool-call shape and the read tools. */
 static const char agent_tools_prompt_intro[] =
     "You are a coding agent running in a local workspace. Use tools for local file and system work. "
     "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
@@ -29,6 +32,7 @@ static const char agent_tools_prompt_intro[] =
 
 
 
+/** The system prompt's file-editing guidance (write, edit, anchored [upto] old text). */
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
@@ -62,6 +66,7 @@ static const char agent_tools_prompt_edit_line[] =
 
 
 
+/** The system prompt's bash-job guidance and the tool schemas. */
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
@@ -247,6 +252,8 @@ const char agent_dsml_syntax_reminder[] =
     PULSAR_TOOL_CALLS_END "\n";
 
 
+/** @brief The tools prompt (agent_build_tools_prompt) wrapped in "[System prompt reminder ...]" markers.
+ *  @return the text, malloc'd; caller frees */
 static char *agent_build_system_prompt_reminder(void) {
     char *tools = agent_build_tools_prompt();
     const char *start = "\n\n[System prompt reminder follows.]\n";
@@ -388,7 +395,9 @@ void agent_publishf(agent_worker *w, const char *fmt, ...) {
 
 
 
+/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
 bool worker_is_idle(agent_worker *w);
+/// @endcond
 
 
 

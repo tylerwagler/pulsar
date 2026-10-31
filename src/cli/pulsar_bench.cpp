@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-bench: prefill and decode throughput at fixed context frontiers. */
 #include "pulsar.h"
 #include "pulsar_help.h"
 #include "pulsar_ctxmem.h"
@@ -50,20 +52,30 @@ typedef struct {
     const char *dump_frontier_logits_dir;  ///< write each step's frontier logits here, for divergence checks
 } bench_config;
 
+/** @brief Monotonic wall clock.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+/** @brief Print pulsar-bench's help text.
+ *  @param fp    the stream to print to
+ *  @param topic help topic, or NULL for the overview */
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_BENCH, topic);
 }
 
+/** @brief The backend selected when none is given.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
 
+/** @brief Read a whole file into a NUL-terminated buffer; any failure exits 1 (said on stderr).
+ *  @param path the file
+ *  @return a malloc'd buffer; caller frees */
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -103,6 +115,11 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/** @brief Parse the command line into a sweep configuration; --help prints usage and exits 0, a bad argument
+ *  or an inconsistent sweep exits 2.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the resolved configuration */
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
         .model_path = "model",
@@ -184,6 +201,9 @@ static bench_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/** @brief Write a NUL-terminated string as a JSON string literal (control bytes escaped).
+ *  @param fp the stream
+ *  @param s  the string; NULL writes "" */
 static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
@@ -206,6 +226,14 @@ static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
+/** @brief With --dump-frontier-logits: write the session's frontier logits row (non-finite as null) and its
+ *  argmax as JSON to `<dir>/frontier_<frontier>.logits.json`; a no-op without the option.
+ *  @param cfg      the sweep configuration
+ *  @param engine   the loaded engine
+ *  @param session  the session at the frontier
+ *  @param frontier the frontier, tokens
+ *  @param previous the previous frontier, tokens (prefill_tokens = frontier - previous)
+ *  @return 0, or 1 on failure (said on stderr) */
 static int write_frontier_logits_json(
         const bench_config *cfg,
         pulsar_engine         *engine,
@@ -279,6 +307,11 @@ static int write_frontier_logits_json(
     return 0;
 }
 
+/** @brief The sweep's next depth after cur: + step_incr (step_mul == 1) or ceil(cur * step_mul) (at least
+ *  cur + 1), clamped to ctx_max.
+ *  @param c   the sweep configuration
+ *  @param cur the current depth, tokens
+ *  @return the next depth; ctx_max once cur reaches it */
 static int next_frontier(const bench_config *c, int cur) {
     if (cur >= c->ctx_max) return c->ctx_max;
     int next;
@@ -294,6 +327,10 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
+/** @brief pulsar-bench's entry point: open the engine and run the depth sweep.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit status (0 = success) */
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 

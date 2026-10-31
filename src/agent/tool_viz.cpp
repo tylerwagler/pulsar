@@ -1,3 +1,6 @@
+/** @file
+ *  pulsar-agent: streaming tool visualisation -- hides raw DSML and paints compact per-tool
+ *  progress while the model is still sampling. */
 #include "pulsar_agent_internal.h"
 
 
@@ -12,6 +15,13 @@
  * "Reading file 1:500...".
  */
 
+/** @brief Whether `s` equals any of up to four candidates.
+ *  @param s the string
+ *  @param a candidate; NULL = none
+ *  @param b candidate; NULL = none
+ *  @param c candidate; NULL = none
+ *  @param d candidate; NULL = none
+ *  @return true on a match */
 static bool streq_any(const char *s, const char *a, const char *b,
                       const char *c, const char *d) {
     return (a && !strcmp(s, a)) || (b && !strcmp(s, b)) ||
@@ -20,6 +30,10 @@ static bool streq_any(const char *s, const char *a, const char *b,
 
 
 
+/** @brief How a tool parameter is displayed (bash command, edit old / new diff, path, offset, content, ...).
+ *  @param tool  the tool's name; NULL = ""
+ *  @param param the parameter's name; NULL = ""
+ *  @return its AGENT_TOOL_PARAM_* kind */
 static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const char *param) {
     if (!tool) tool = "";
     if (!param) param = "";
@@ -42,6 +56,9 @@ static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const c
 
 
 
+/** @brief The SGR colour a parameter kind is shown in.
+ *  @param kind the kind
+ *  @return the escape sequence (static) */
 static const char *agent_tool_param_color(agent_tool_param_kind kind) {
     switch (kind) {
     case AGENT_TOOL_PARAM_PATH: return "\x1b[32m";
@@ -56,6 +73,10 @@ static const char *agent_tool_param_color(agent_tool_param_kind kind) {
 
 
 
+/** @brief Write visualizer bytes through the renderer (plain, no markdown) and track the line start.
+ *  @param sr the stream renderer
+ *  @param s  bytes
+ *  @param n  byte count */
 static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_t n) {
     renderer_plain(sr->renderer, s, n);
     for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
@@ -63,12 +84,18 @@ static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_
 
 
 
+/** @brief agent_tool_viz_write of a NUL-terminated string.
+ *  @param sr the stream renderer
+ *  @param s  the string */
 static void agent_tool_viz_puts(agent_stream_renderer *sr, const char *s) {
     agent_tool_viz_write(sr, s, strlen(s));
 }
 
 
 
+/** @brief Reset and activate the visualizer for a new DSML block (clearing the partial row on the live UI, or
+ *  ending the line in replay).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_start(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     bool line_open = !sr->renderer->last_output_newline;
@@ -91,6 +118,8 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
 
 
 
+/** @brief Start a visualizer line: a newline if needed, then the tool glyph.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
@@ -100,6 +129,9 @@ static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
 
 
 
+/** @brief The display prefix for a tool's line ("$ " for bash, "read ", "write ", "edit ", "search ").
+ *  @param name the tool's name
+ *  @return the prefix (static), or NULL for other tools */
 static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "bash")) return "$ ";
     if (!strcmp(name, "read")) return "read ";
@@ -111,6 +143,9 @@ static const char *agent_tool_viz_prefix(const char *name) {
 
 
 
+/** @brief Announce the tool being called (once per name); read gets its own `Reading <path>` style.
+ *  @param sr   the stream renderer
+ *  @param name the tool's name; NULL = "tool" */
 static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->tool_announced && !strcmp(v->tool_name, name)) return;
@@ -140,6 +175,10 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
 
 
 
+/** @brief Append one byte to a NUL-terminated fixed buffer, dropping it when full.
+ *  @param dst the buffer
+ *  @param cap bytes at `dst`
+ *  @param c   the byte */
 static void agent_tool_viz_append(char *dst, size_t cap, char c) {
     size_t len = strlen(dst);
     if (len + 1 >= cap) return;
@@ -149,6 +188,10 @@ static void agent_tool_viz_append(char *dst, size_t cap, char c) {
 
 
 
+/** @brief Collect one byte of a read call's path / start_line / max_lines / whole argument (the path also echoes
+ *  once its prefix is shown).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (!strcmp(v->param_name, "path")) {
@@ -165,6 +208,8 @@ static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Paint a read call's summary line (path and range) once; nothing for other tools or when already painted.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->read_style || v->read_line_rendered) return;
@@ -202,6 +247,10 @@ static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
 
 
 
+/** @brief Whether the current parameter is a code body (write content, edit old / new / content) shown
+ *  through the syntax highlighter.
+ *  @param v the visualizer
+ *  @return true for a code body */
 static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
     if (!strcmp(v->tool_name, "write") &&
         v->param_kind == AGENT_TOOL_PARAM_CONTENT)
@@ -216,6 +265,10 @@ static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
 
 
 
+/** @brief The diff prefix and colour of an edit parameter: "- " red for old, "+ " green for new.
+ *  @param kind  the parameter kind
+ *  @param color receives the colour (NULL when there is no prefix); may be NULL
+ *  @return the prefix, or NULL for other kinds */
 static const char *agent_tool_viz_diff_prefix(agent_tool_param_kind kind,
                                               const char **color) {
     if (color) *color = NULL;
@@ -232,6 +285,8 @@ static const char *agent_tool_viz_diff_prefix(agent_tool_param_kind kind,
 
 
 
+/** @brief At a line start inside a diff parameter, write its coloured diff prefix.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_prefix(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->at_line_start) return;
@@ -249,6 +304,9 @@ static void agent_tool_viz_code_prefix(agent_stream_renderer *sr) {
 
 
 
+/** @brief Start streaming a code-body parameter through the renderer's code stream, with the syntax of the
+ *  call's path (and [upto] highlighting for edit's old text).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_begin(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     const agent_syntax *syntax = agent_syntax_for_path(v->tool_path);
@@ -272,6 +330,8 @@ static void agent_tool_viz_code_begin(agent_stream_renderer *sr) {
 
 
 
+/** @brief End an active code-body parameter's code stream.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->code_param_active) return;
@@ -283,6 +343,9 @@ static void agent_tool_viz_code_end(agent_stream_renderer *sr) {
 
 
 
+/** @brief One byte of a code-body parameter (diff prefix at line starts).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_code_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     agent_tool_viz_code_prefix(sr);
@@ -293,6 +356,9 @@ static void agent_tool_viz_code_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief A parameter opened: record its name and kind and start its display (colour, code stream, label).
+ *  @param sr   the stream renderer
+ *  @param name the parameter's name; NULL = "" */
 static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *name) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->tool_announced && sr->parser->current.name)
@@ -343,6 +409,8 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
 
 
 
+/** @brief A parameter closed: end its code stream and colour, clear its state.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     v->param_end_len = 0;
@@ -354,6 +422,9 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
 
 
 
+/** @brief Display one byte of a parameter value already known not to be part of its closing tag.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->read_style) {
@@ -385,6 +456,8 @@ static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Re-emit the active parameter's colour (after the UI reset terminal attributes between chunks).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active || !v->param_active || v->read_style) return;
@@ -396,6 +469,9 @@ static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
 /* Stream one DSML parameter byte into the visualizer.  The visualizer must not
  * wait for the whole parameter: large write/edit contents should show progress
  * as the model emits them, while still detecting the closing parameter tag. */
+/// @brief Stream one parameter byte into the visualizer (see above), holding a possible closing tag.
+/// @param sr the stream renderer
+/// @param c  the byte
 static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
 
@@ -428,6 +504,9 @@ static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Close the visualizer: end an open parameter, paint a pending read line, show `status` in grey.
+ *  @param sr     the stream renderer
+ *  @param status a closing note (e.g. "[tool call interrupted]"); NULL or empty = none */
 static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -445,6 +524,8 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
 
 
 
+/** @brief Show the exact DSML bytes the parser rejected (in red), so a parse failure is visible as evidence.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -470,6 +551,9 @@ static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
 
 
 
+/** @brief Report a tool call ignored because it was inside thinking: mark it, trace it, show it in red.
+ *  @param sr     the stream renderer
+ *  @param detail the reason; NULL or empty = the default message */
 static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const char *detail) {
     const char *msg =
         detail && detail[0] ? detail :
@@ -491,6 +575,10 @@ static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const ch
 
 
 
+/** @brief Mark the parser failed with a malformed-DSML error (once), trace it and show it in red; the model gets
+ *  it as a tool error.
+ *  @param sr     the stream renderer
+ *  @param detail the reason; NULL or empty = the default message */
 static void agent_stream_malformed_dsml(agent_stream_renderer *sr,
                                         const char *detail) {
     const char *msg = detail && detail[0] ? detail :
@@ -511,6 +599,8 @@ static void agent_stream_malformed_dsml(agent_stream_renderer *sr,
 
 /* Mirror parser progress into the terminal visualizer.  Parser state is the
  * source of truth; this function only decides what the user should see. */
+/// @brief Mirror the parser's progress into the visualizer (see above).
+/// @param sr the stream renderer
 static void agent_stream_tool_events(agent_stream_renderer *sr) {
     agent_dsml_parser *p = sr->parser;
     agent_tool_visualizer *v = &sr->viz;
@@ -534,6 +624,9 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
 
 
 
+/** @brief When edit's `old` parameter closes (live UI only), check it against the file before `new` streams;
+ *  a failure is recorded in tool_preflight_error / _msg and stops the call.
+ *  @param sr the stream renderer */
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
     if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
         return;
@@ -559,6 +652,10 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
 
 
 
+/** @brief Feed one byte of an open DSML block to the parser and the visualizer; handles the parameter close,
+ *  the edit preflight and the block's end.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
     bool was_param = !sr->dsml_ignored && sr->viz.param_active;
     agent_dsml_feed(sr->parser, &c, 1);
@@ -604,6 +701,9 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
 /* Start a DSML block from the streaming detector.  The detector may accept a
  * known malformed opening form for robustness, but the parser is seeded with
  * canonical bytes so all later parsing remains strict. */
+/// @brief Open a DSML block from the streaming detector (see above).
+/// @param sr      the stream renderer
+/// @param ignored the block is inside thinking: parse it but never show or execute it
 static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     sr->dsml_active = true;
     sr->dsml_ignored = ignored;
@@ -625,6 +725,8 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr, char c)
 
 
 
+/** @brief Release the bytes the start detector held as ordinary text (they did not open a DSML block).
+ *  @param sr the stream renderer */
 static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
     if (!sr->dsml_start_len) return;
     sr->post_think_gap = false;
@@ -643,6 +745,12 @@ static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
  * bare invoke opener also starts a block (the model often knows it wants a
  * tool but forgets the outer wrapper), but only in the marker-bearing
  * spellings: a plain "<invoke" is ordinary XML in prose. */
+/// @brief Match held bytes against the accepted DSML openers (see above).
+/// @param tail            the bytes held since a '<'
+/// @param len             byte count
+/// @param complete        receives true when `tail` is a whole opener
+/// @param implicit_invoke receives true when it is a bare invoke opener
+/// @return true when `tail` is a prefix of (or equal to) an opener
 static bool agent_stream_dsml_start_match(const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
@@ -667,6 +775,12 @@ static bool agent_stream_dsml_start_match(const char *tail, size_t len,
 
 
 
+/** @brief Whether the tail ends with `needle`.
+ *  @param tail       the bytes
+ *  @param len        byte count
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`
+ *  @return true on a match */
 static bool agent_tail_matches(const char *tail, size_t len,
                                const char *needle, size_t needle_len) {
     return len >= needle_len &&
@@ -680,6 +794,10 @@ static bool agent_tail_matches(const char *tail, size_t len,
  * <think> the marker means "tool call attempted too early", while in normal
  * assistant output it means malformed DSML that the model should see as a tool
  * error. */
+/// @brief Feed one byte to a DSML-marker detector (see above).
+/// @param d the detector (a sliding tail)
+/// @param c the byte
+/// @return true when the tail now ends in a DSML-looking marker
 static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
                                             char c) {
     if (d->len == sizeof(d->tail)) {
@@ -704,6 +822,9 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
 
 
 
+/** @brief Inside thinking, watch for DSML markers; one sets dsml_in_think (a tool call attempted too early).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
                                                  char c) {
     if (!sr->renderer->think.in_think || sr->dsml_in_think) return;
@@ -713,6 +834,9 @@ static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
 
 
 
+/** @brief In ordinary output outside any DSML block, a DSML marker is malformed DSML: report it.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
                                               char c) {
     if (sr->parser->state == AGENT_DSML_ERROR) return;
@@ -728,6 +852,9 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
 /* Route ordinary assistant bytes either to normal markdown rendering or into
  * the DSML detector.  The detector must hold short prefixes because the model
  * can split "<｜DSML｜ calls>" across arbitrary tokens. */
+/// @brief Route one ordinary assistant byte (see above).
+/// @param sr the stream renderer
+/// @param c  the byte
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     const char *start = PULSAR_DSML_CANONICAL->tool_calls_start;
     const char *canonical_invoke = PULSAR_DSML_CANONICAL->invoke_start;

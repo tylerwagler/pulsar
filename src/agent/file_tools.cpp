@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: tool argument parsing and the file tools' helpers. */
 #include "pulsar_agent_internal.h"
 
 
@@ -51,6 +53,9 @@ void agent_line_spans_free(agent_line_spans *spans) {
 
 
 
+/** @brief Append one span to `spans`, growing by doubling (128 first).
+ *  @param spans the list
+ *  @param span  the span to append */
 static void agent_line_spans_push(agent_line_spans *spans, agent_line_span span) {
     if (spans->len == spans->cap) {
         spans->cap = spans->cap ? spans->cap * 2 : 128;
@@ -133,6 +138,10 @@ int agent_read_file_bytes(const char *path, char **data, size_t *len,
 
 
 
+/** @brief The 1-based line holding byte `offset`.
+ *  @param spans the file's line spans
+ *  @param offset byte offset into the file
+ *  @return the line number; 1 for an empty file, the last line for an offset past the end */
 static int agent_line_for_offset(const agent_line_spans *spans, size_t offset) {
     if (!spans || spans->len <= 0) return 1;
     for (int i = 0; i < spans->len; i++) {
@@ -168,11 +177,13 @@ bool agent_old_new_line_effect(const char *old_data, size_t old_len,
 
 
 
+/// @cond AGENT_REDECLARATIONS (redeclares functions documented in pulsar_agent_internal.h)
 void agent_edit_result_append_context(agent_buf *b,
                                              const char *path,
                                              const char *data, size_t len,
                                              int anchor_start,
                                              int anchor_end);
+/// @endcond
 
 
 
@@ -207,6 +218,11 @@ char *agent_edit_result(const char *path,
 
 
 
+/** @brief Record (or clear) where the `more` tool continues reading.
+ *  @param w         the worker
+ *  @param path      the file; NULL or empty clears the continuation
+ *  @param next_line the 1-based line `more` starts at; <= 0 clears
+ *  @param bare      the continuation reads raw (no line numbers) */
 static void agent_worker_set_more(agent_worker *w, const char *path,
                                   int next_line, bool bare) {
     snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
@@ -235,6 +251,15 @@ bool agent_tool_result_fits_context(agent_worker *w, const char *result,
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
  * mode is reserved for cases where line decoration would corrupt the payload
  * being inspected. */
+/// @brief Read lines of a file as the read / more tools' result (see above).
+/// @param w          the worker (for the `more` continuation)
+/// @param path       the file
+/// @param start_line first line, 1-based (< 1 = 1)
+/// @param max_lines  lines to read; <= 0 = AGENT_READ_DEFAULT_LINES (ignored with whole_file)
+/// @param whole_file read to the end of the file
+/// @param bare       raw text without line numbers
+/// @param set_more   record the continuation for `more` (cleared when the read reached the end)
+/// @return the tool result (or a "Tool error: ..." text), malloc'd; caller frees
 static char *agent_read_range(agent_worker *w, const char *path, int start_line,
                               int max_lines, bool whole_file, bool bare,
                               bool set_more) {

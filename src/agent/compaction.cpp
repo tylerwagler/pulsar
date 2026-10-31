@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: context compaction (summarise the task state, rebuild the transcript around it). */
 #include "pulsar_agent_internal.h"
 
 
@@ -14,6 +16,10 @@
 /* Decide when to compact before an ordinary turn or before appending a large
  * tool result.  The fixed free-token threshold is capped proportionally for
  * smaller contexts so tests with tiny contexts still compact rather than fail. */
+/// @brief Whether the transcript is full enough to compact (see above).
+/// @param w the worker
+/// @return true at AGENT_COMPACT_SOFT_PERCENT of the context, or when free tokens fall to
+///         min(AGENT_COMPACT_MIN_FREE_TOKENS, ctx / 4)
 static bool agent_worker_should_compact(agent_worker *w) {
     int ctx = w->cfg->gen.ctx_size;
     int used = w->transcript.len;
@@ -29,6 +35,10 @@ static bool agent_worker_should_compact(agent_worker *w) {
 
 /* The id `rendered` tokenizes to as ONE special token, or -1 when the loaded family has none (Qwen spells
  * DeepSeek's DSML marker as text). */
+/// @brief The single special token `rendered` tokenizes to (see above).
+/// @param engine   the loaded engine
+/// @param rendered the special token's text
+/// @return its id, or -1 when it is not exactly one token
 static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
     pulsar_tokenize_rendered_chat(engine, rendered, &t);
@@ -41,6 +51,11 @@ static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
 
 /* Pick a recent verbatim tail for the compacted transcript.  Prefer a user
  * boundary inside the budget so the rebuilt context starts at a natural turn. */
+/// @brief Where the verbatim tail of a compacted transcript starts (see above).
+/// @param w       the worker (its transcript and ctx_size)
+/// @param bottom  end of the region to keep, token index (exclusive)
+/// @param sys_len tokens of the system prompt, never cut into
+/// @return the first user-turn marker in [bottom - budget, bottom), else bottom - budget (clamped to sys_len)
 static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int tail_budget = w->cfg->gen.ctx_size / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
@@ -61,6 +76,11 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
 
 
 
+/** @brief Append src->v[start, end) to `dst` (the range clamped to src).
+ *  @param dst   destination tokens
+ *  @param src   source tokens
+ *  @param start first index
+ *  @param end   end index (exclusive) */
 static void agent_tokens_append_range(pulsar_tokens *dst, const pulsar_tokens *src,
                                       int start, int end) {
     if (start < 0) start = 0;
@@ -73,6 +93,9 @@ static void agent_tokens_append_range(pulsar_tokens *dst, const pulsar_tokens *s
 /* Build the private prompt used to ask the model for durable state.  The prompt
  * explicitly forbids tool calls because the result is consumed internally, not
  * delivered as an assistant turn. */
+/// @brief The compaction request prompt (see above).
+/// @param reason why compaction runs, appended when non-empty; may be NULL
+/// @return the prompt, malloc'd; caller frees
 static char *agent_compact_make_prompt(const char *reason) {
     agent_buf b = {0};
     agent_buf_puts(&b,

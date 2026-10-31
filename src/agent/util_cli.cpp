@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: small utilities and command-line parsing. */
 #include "pulsar_agent_internal.h"
 #include "pulsar_argparse.h"
 
@@ -101,6 +103,10 @@ void agent_input_buf_free(agent_input_buf *b) {
 
 
 
+/** @brief Whether `cmd` is the slash command `name`, alone or followed by whitespace and arguments.
+ *  @param cmd  the input line
+ *  @param name the command, e.g. "/switch"
+ *  @return true on a match */
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -125,6 +131,8 @@ bool agent_slash_command_known(const char *cmd) {
 
 
 
+/** @brief The backend the agent opens when none is named.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }

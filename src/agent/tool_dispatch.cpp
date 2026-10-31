@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: executes one parsed tool call and returns its model-visible result. */
 #include "pulsar_agent_internal.h"
 
 
@@ -10,6 +12,10 @@
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
+/// @brief Execute one tool call (see above).
+/// @param w    the worker
+/// @param call the parsed call
+/// @return the tool-role result text (a "Tool error: ..." text on failure), malloc'd; caller frees
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");

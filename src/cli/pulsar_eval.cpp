@@ -1,3 +1,6 @@
+/** @file
+ *  pulsar-eval: built-in benchmark integration test -- real model, chat prompts, graded answers,
+ *  with a small ANSI terminal UI. */
 #include "pulsar.h"
 #include "pulsar_help.h"
 #include "pulsar_ctxmem.h"
@@ -47,19 +50,31 @@
 #include <time.h>
 #include <unistd.h>
 
+/** SGR: reset every attribute. */
 #define ANSI_RESET "\x1b[0m"
+/** SGR: bright black (grey), used for dim / thinking text. */
 #define ANSI_DIM "\x1b[90m"
+/** SGR: red foreground. */
 #define ANSI_RED "\x1b[31m"
+/** SGR: green foreground. */
 #define ANSI_GREEN "\x1b[32m"
+/** SGR: yellow foreground. */
 #define ANSI_YELLOW "\x1b[33m"
+/** SGR: blue foreground. */
 #define ANSI_BLUE "\x1b[34m"
+/** SGR: cyan foreground. */
 #define ANSI_CYAN "\x1b[36m"
+/** SGR: bold. */
 #define ANSI_BOLD "\x1b[1m"
 
+/** Most multiple-choice options a case carries (eval_case::choice). */
 #define EVAL_MAX_CHOICES 10
+/** Bytes of an extracted answer buffer, NUL included. */
 #define EVAL_ANSWER_MAX 32
+/** Ceiling on --max-tokens, --ctx and the auto-sized context, tokens. */
 #define EVAL_MAX_CONTEXT 1000000
 
+/** A case's state in the run, from pending through its graded outcome. */
 typedef enum {
     EVAL_PENDING,
     EVAL_PREFILL,
@@ -77,6 +92,7 @@ typedef enum {
 /* The one spelling of a status in traces and reports (defined with the report). */
 static const char *report_status_name(eval_status st);
 
+/** How run_one_case returned: done, failed, or the user switched case / quit mid-run. */
 typedef enum {
     EVAL_RUN_OK,
     EVAL_RUN_ERROR,
@@ -84,6 +100,8 @@ typedef enum {
     EVAL_RUN_QUIT,
 } eval_run_result;
 
+/** How a case's reasoning block closed: not at all, by the model (natural), or forced by the soft limit
+ *  (`</think>` near the top under the soft reply budget) or the hard limit (the hard reply budget reached). */
 typedef enum {
     EVAL_THINK_CLOSE_NONE,
     EVAL_THINK_CLOSE_NATURAL,
@@ -102,6 +120,7 @@ typedef struct {
     const char *answer;    ///< the correct choice
 } eval_case;
 
+/** The built-in benchmark cases, in run order. */
 static const eval_case eval_cases[] = {
     {
         .source = "GPQA Diamond",
@@ -1410,10 +1429,13 @@ typedef struct {
     pulsar_think_scanner think; ///< `<think>` tag state: in_think styles `stream`, held tag prefix
 } eval_ui;
 
+/** The run's UI, for tui_restore (atexit) and the signal handler's terminal repair; NULL until tui_start. */
 static eval_ui *global_ui;
 
 static double run_clock_sec(void);
 
+/** @brief Fold the time since the last tick into run_elapsed_sec (only while the clock runs).
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
     double now = run_clock_sec();
@@ -1422,18 +1444,25 @@ static void tui_run_clock_tick(eval_ui *ui) {
     ui->run_last_sec = now;
 }
 
+/** @brief Start (or resume) the run clock.
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_start(eval_ui *ui) {
     if (!ui || ui->run_clock_active) return;
     ui->run_last_sec = run_clock_sec();
     ui->run_clock_active = true;
 }
 
+/** @brief Stop (pause) the run clock, folding in the time since the last tick.
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_stop(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
     tui_run_clock_tick(ui);
     ui->run_clock_active = false;
 }
 
+/** @brief The run time to display: the accumulated time plus the running stretch, paused time excluded.
+ *  @param ui the UI, or NULL
+ *  @return seconds; 0 for NULL */
 static double tui_run_clock_visible_sec(const eval_ui *ui) {
     if (!ui) return 0.0;
     double elapsed = ui->run_elapsed_sec;
@@ -1444,6 +1473,10 @@ static double tui_run_clock_visible_sec(const eval_ui *ui) {
     return elapsed;
 }
 
+/** @brief Format a duration as "HHh:MMm".
+ *  @param dst    receives the text
+ *  @param dstlen capacity of dst, bytes
+ *  @param sec    the duration, seconds (negative = 0) */
 static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
     if (sec < 0.0) sec = 0.0;
     unsigned long long minutes = (unsigned long long)(sec / 60.0);
@@ -1472,10 +1505,15 @@ typedef struct {
     bool quit_pressed;   ///< stop the run
 } eval_input;
 
+/** The keyboard reader's state (one per process). */
 static eval_input global_input = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
 };
 
+/** @brief Append bytes, keeping the buffer NUL-terminated; exits on allocation failure.
+ *  @param b the buffer
+ *  @param p bytes
+ *  @param n byte count */
 static void buf_append(byte_buf *b, const char *p, size_t n) {
     if (n == 0) return;
     if (b->len + n + 1 > b->cap) {
@@ -1494,6 +1532,9 @@ static void buf_append(byte_buf *b, const char *p, size_t n) {
     b->v[b->len] = '\0';
 }
 
+/** @brief Append printf-formatted text; exits on allocation failure, ignores a formatting error.
+ *  @param b   the buffer
+ *  @param fmt printf format, then its arguments */
 static void buf_appendf(byte_buf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -1516,20 +1557,33 @@ static void buf_appendf(byte_buf *b, const char *fmt, ...) {
     free(tmp);
 }
 
+/** @brief Count a case's multiple-choice options.
+ *  @param tc the case
+ *  @return options before the first NULL (0 = not multiple choice) */
 static int eval_case_nchoices(const eval_case *tc) {
     int n = 0;
     while (n < EVAL_MAX_CHOICES && tc->choice[n]) n++;
     return n;
 }
 
+/** @brief Whether a case is multiple choice (has options).
+ *  @param tc the case
+ *  @return true when it has at least one option */
 static bool eval_case_is_multiple_choice(const eval_case *tc) {
     return eval_case_nchoices(tc) > 0;
 }
 
+/** @brief Whether a case comes from the COMPSEC set (answered by a line spec).
+ *  @param tc the case
+ *  @return true when its source is "COMPSEC" */
 static bool eval_case_is_compsec(const eval_case *tc) {
     return tc->source && !strcmp(tc->source, "COMPSEC");
 }
 
+/** @brief Append n copies of a style code (one per byte appended to the stream); exits on allocation failure.
+ *  @param b     the style buffer
+ *  @param style the style code (0 = reply, 1 = thinking)
+ *  @param n     bytes the code covers */
 static void style_append(style_buf *b, unsigned char style, size_t n) {
     if (n == 0) return;
     if (b->len + n > b->cap) {
@@ -1547,36 +1601,54 @@ static void style_append(style_buf *b, unsigned char style, size_t n) {
     b->len += n;
 }
 
+/** @brief Free a byte buffer and zero it.
+ *  @param b the buffer */
 static void buf_free(byte_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
 }
 
+/** @brief Free a style buffer and zero it.
+ *  @param b the buffer */
 static void style_free(style_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
 }
 
+/** @brief Monotonic wall clock.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+/** @brief The run clock's time source (the same clock as now_sec).
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
 static double run_clock_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+/** @brief The backend selected when none is given.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
 
+/** @brief Print pulsar-eval's help text.
+ *  @param fp    the stream to print to
+ *  @param topic help topic, or NULL for the overview */
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_EVAL, topic);
 }
 
+/** @brief Parse the command line into a run configuration; --help prints usage and exits 0, a bad argument
+ *  exits 2.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the resolved configuration */
 static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
         .model_path = "model",
@@ -1698,6 +1770,10 @@ static eval_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/** @brief The terminal's size (80 x 24 when stdout is not a terminal).
+ *  @param cols receives the width, columns
+ *  @param rows receives the height, rows
+ *  @return 0, or -1 when the size is unknown (the defaults were written) */
 static int terminal_size(int *cols, int *rows) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
@@ -1710,14 +1786,21 @@ static int terminal_size(int *cols, int *rows) {
     return 0;
 }
 
+/** @brief Move the cursor (1-based).
+ *  @param row the row
+ *  @param col the column */
 static void term_move(int row, int col) {
     printf("\x1b[%d;%dH", row, col);
 }
 
+/** @brief Clear from the cursor to the end of the line. */
 static void term_clear_to_eol(void) {
     fputs("\x1b[K", stdout);
 }
 
+/** @brief Usable text width of the right pane (one less than its width; see the note inside).
+ *  @param ui the UI
+ *  @return columns */
 static int tui_right_text_w(const eval_ui *ui) {
     /** Avoid writing the physical last column.  Many terminals defer wrapping
      * until the next byte after the last column, which would spill right-pane
@@ -1725,6 +1808,9 @@ static int tui_right_text_w(const eval_ui *ui) {
     return ui->right_w > 1 ? ui->right_w - 1 : ui->right_w;
 }
 
+/** @brief Blank one row of the left pane, redraw its divider and leave the cursor at its start.
+ *  @param ui the UI
+ *  @param row the row (1-based) */
 static void tui_clear_left_line(eval_ui *ui, int row) {
     term_move(row, 1);
     for (int i = 0; i < ui->left_w; i++) fputc(' ', stdout);
@@ -1733,6 +1819,8 @@ static void tui_clear_left_line(eval_ui *ui, int row) {
     term_move(row, 1);
 }
 
+/** @brief Emit the SGR colour a status is drawn in.
+ *  @param st the status */
 static void term_set_color_for_status(eval_status st) {
     switch (st) {
     case EVAL_PENDING:  fputs(ANSI_DIM, stdout); break;
@@ -1746,6 +1834,9 @@ static void term_set_color_for_status(eval_status st) {
     }
 }
 
+/** @brief A status's short UI label (PEND, FILL, RUN, ...).
+ *  @param st the status
+ *  @return a static string; "?" for an unknown value */
 static const char *status_name(eval_status st) {
     switch (st) {
     case EVAL_PENDING: return "PEND";
@@ -1760,10 +1851,16 @@ static const char *status_name(eval_status st) {
     return "?";
 }
 
+/** @brief Whether a status means the case is in flight (prefill or generation).
+ *  @param st the status
+ *  @return true for EVAL_PREFILL and EVAL_THINKING */
 static bool eval_status_running(eval_status st) {
     return st == EVAL_PREFILL || st == EVAL_THINKING;
 }
 
+/** @brief Print a string cut to width columns, ending in "..." when cut.
+ *  @param s     the string
+ *  @param width columns available; <= 0 prints nothing */
 static void print_trimmed(const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
@@ -1779,6 +1876,9 @@ static void print_trimmed(const char *s, int width) {
     fputs("...", stdout);
 }
 
+/** @brief Draw the first three rows of the case's question (whitespace collapsed) in the right pane.
+ *  @param ui the UI
+ *  @param tc the case */
 static void tui_draw_question_preview(eval_ui *ui, const eval_case *tc) {
     const char *q = tc->question;
     size_t pos = 0;
@@ -1819,6 +1919,9 @@ static void tui_draw_question_preview(eval_ui *ui, const eval_case *tc) {
     term_clear_to_eol();
 }
 
+/** @brief Record a key press for the run loop (under global_input.mu): 'A' / 'B' (the arrow keys' final
+ *  bytes) move the cursor, Enter selects, p pauses, q quits; other keys are ignored.
+ *  @param key the key */
 static void input_queue_key(int key) {
     pthread_mutex_lock(&global_input.mu);
     if (key == 'A') {
@@ -1835,6 +1938,10 @@ static void input_queue_key(int key) {
     pthread_mutex_unlock(&global_input.mu);
 }
 
+/** @brief The keyboard reader thread: polls stdin until global_input.running clears, decoding arrow-key
+ *  escape sequences, and queues each key with input_queue_key.
+ *  @param arg unused
+ *  @return NULL */
 static void *input_thread_main(void *arg) {
     (void)arg;
     int esc_state = 0;
@@ -1898,6 +2005,7 @@ static void tui_start_input(void) {
     }
 }
 
+/** @brief Stop and join the reader thread and restore the saved terminal mode. */
 static void tui_stop_input(void) {
     if (global_input.thread_started) {
         global_input.running = 0;
@@ -1911,6 +2019,9 @@ static void tui_stop_input(void) {
     global_input.enabled = false;
 }
 
+/** @brief Apply the keys pressed since the last call: quit, pause toggle, cursor movement, and a case
+ *  request on Enter (unless it names the case already running).
+ *  @param ui the UI */
 static void tui_consume_input(eval_ui *ui) {
     if (!ui->enabled || !global_input.enabled) return;
 
@@ -1957,6 +2068,7 @@ static void tui_consume_input(eval_ui *ui) {
     }
 }
 
+/** @brief Stop keyboard input and leave the alternate screen (registered with atexit). */
 static void tui_restore(void) {
     eval_ui *ui = global_ui;
     tui_stop_input();
@@ -1966,6 +2078,8 @@ static void tui_restore(void) {
     ui->active = false;
 }
 
+/** @brief Signal handler: minimal terminal repair, then re-raise with the default action (see the note inside).
+ *  @param sig the signal */
 static void tui_signal_restore(int sig) {
     /** Signal handlers cannot safely run the full tui_restore() path: that path
      * joins the input thread and uses stdio.  For Ctrl-C / termination, do the
@@ -1986,6 +2100,8 @@ static void tui_signal_restore(int sig) {
     raise(sig);
 }
 
+/** @brief Draw the title row: key hints, the run clock and the PAUSED flag.
+ *  @param ui the UI */
 static void tui_draw_title(eval_ui *ui) {
     term_move(1, 1);
     tui_clear_left_line(ui, 1);
@@ -1998,6 +2114,8 @@ static void tui_draw_title(eval_ui *ui) {
     }
 }
 
+/** @brief Clear the screen and draw the static frame (title, right-pane heading, divider).
+ *  @param ui the UI */
 static void tui_draw_frame(eval_ui *ui) {
     fputs("\x1b[2J", stdout);
     tui_draw_title(ui);
@@ -2010,6 +2128,8 @@ static void tui_draw_frame(eval_ui *ui) {
     }
 }
 
+/** @brief Draw the left pane: the score line and the case list around the selection cursor.
+ *  @param ui the UI */
 static void tui_draw_left(eval_ui *ui) {
     int passed = 0;
     int failed = 0;
@@ -2083,6 +2203,10 @@ static void tui_draw_left(eval_ui *ui) {
     }
 }
 
+/** @brief Start a new case's stream: clear the buffers, counters and right pane, then draw its question.
+ *  @param ui the UI
+ *  @param tc       the case
+ *  @param in_think the generation starts inside a reasoning block */
 static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     ui->stream.len = 0;
     if (ui->stream.v) ui->stream.v[0] = '\0';
@@ -2102,6 +2226,10 @@ static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     tui_draw_question_preview(ui, tc);
 }
 
+/** @brief Append bytes to the stream with the current style (thinking or reply).
+ *  @param ui the UI
+ *  @param p  bytes
+ *  @param n  byte count */
 static void stream_append_visible(eval_ui *ui, const char *p, size_t n) {
     buf_append(&ui->stream, p, n);
     style_append(&ui->styles, ui->think.in_think ? 1 : 0, n);
@@ -2130,6 +2258,11 @@ struct eval_think_sink {
     void text(char c) { stream_append_visible(ui, &c, 1); }
 };
 
+/** @brief Run generated text through the think-tag scanner into the stream.
+ *  @param ui the UI
+ *  @param text   generated text (may be NULL with len 0)
+ *  @param len    bytes in text
+ *  @param finish flush a held tag prefix (end of output) */
 static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, bool finish) {
     eval_think_sink sink = { ui };
     pulsar_think_scan(&ui->think, text, len, finish, 0, sink);
@@ -2141,6 +2274,8 @@ typedef struct {
     size_t end;    ///< offset just past its last byte
 } line_span;
 
+/** @brief Draw the stream's last body_h wrapped lines in the right pane, styled per byte.
+ *  @param ui the UI */
 static void tui_draw_stream(eval_ui *ui) {
     if (!ui->enabled) return;
     const int width = tui_right_text_w(ui);
@@ -2218,6 +2353,10 @@ static void tui_draw_stream(eval_ui *ui) {
     free(lines);
 }
 
+/** @brief Format a count compactly: n, then "Nk" from 10000, "Nm" from a million (rounded).
+ *  @param dst    receives the text
+ *  @param dstlen capacity of dst, bytes
+ *  @param n      the count */
 static void format_short_count(char *dst, size_t dstlen, int n) {
     if (n >= 1000000) {
         snprintf(dst, dstlen, "%dm", (n + 500000) / 1000000);
@@ -2228,6 +2367,9 @@ static void format_short_count(char *dst, size_t dstlen, int n) {
     }
 }
 
+/** @brief A phase name's short status-line label.
+ *  @param phase the phase ("prefill", "thinking", "answer", ...)
+ *  @return a static string; "RUN" for any other phase */
 static const char *short_phase_name(const char *phase) {
     if (!strcmp(phase, "prefill")) return "FILL";
     if (!strcmp(phase, "thinking")) return "THINK";
@@ -2238,6 +2380,9 @@ static const char *short_phase_name(const char *phase) {
     return "RUN";
 }
 
+/** @brief Draw the right pane's status line: speed, the phase's progress and the case id.
+ *  @param ui the UI
+ *  @param phase the current phase name */
 static void tui_draw_right_status(eval_ui *ui, const char *phase) {
     term_move(1, ui->right_x);
     term_clear_to_eol();
@@ -2269,6 +2414,9 @@ static void tui_draw_right_status(eval_ui *ui, const char *phase) {
     print_trimmed(line, tui_right_text_w(ui));
 }
 
+/** @brief Redraw the left pane, the status line and the stream (when the UI is enabled).
+ *  @param ui the UI
+ *  @param phase the current phase name */
 static void tui_refresh(eval_ui *ui, const char *phase) {
     if (!ui->enabled) return;
     tui_draw_left(ui);
@@ -2277,6 +2425,13 @@ static void tui_refresh(eval_ui *ui, const char *phase) {
     fflush(stdout);
 }
 
+/** @brief Set up the run's UI state (per-case arrays, owned by ui) and, when enabled and the terminal is at
+ *  least 90 x 18, enter the alternate screen, install the restore handlers and start keyboard input.
+ *  @param ui the UI
+ *  @param cases      the case table (borrowed)
+ *  @param ncases     cases in the run
+ *  @param max_tokens the generation cap shown in the status line
+ *  @param enabled    draw the TUI (false = plain output) */
 static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_tokens,
                       bool enabled) {
     memset(ui, 0, sizeof(*ui));
@@ -2328,6 +2483,8 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     tui_refresh(ui, "idle");
 }
 
+/** @brief Restore the terminal if active, free the UI's arrays and buffers and zero it.
+ *  @param ui the UI */
 static void tui_free(eval_ui *ui) {
     if (ui->active) tui_restore();
     free(ui->status);
@@ -2339,19 +2496,29 @@ static void tui_free(eval_ui *ui) {
     memset(ui, 0, sizeof(*ui));
 }
 
+/** @brief Plain mode: start the dim style used for thinking text.
+ *  @param use_color stdout takes ANSI colour */
 static void plain_set_thinking_color(bool use_color) {
     if (use_color) fputs(ANSI_DIM, stdout);
 }
 
+/** @brief Plain mode: reset the text style.
+ *  @param use_color stdout takes ANSI colour */
 static void plain_reset_color(bool use_color) {
     if (use_color) fputs(ANSI_RESET, stdout);
 }
 
+/** @brief The system prompt every case runs under.
+ *  @return a static string */
 static const char *eval_system_prompt(void) {
     return "You are solving a hard benchmark question. Reason carefully. "
            "The final answer must follow the requested format exactly.";
 }
 
+/** @brief The user prompt for a case: the question, its lettered choices if any, and the required final
+ *  "Answer: ..." line format (letter, line numbers for COMPSEC, else integer).
+ *  @param tc the case
+ *  @return a malloc'd string (caller frees); NULL only if even the empty fallback cannot be allocated */
 static char *build_question_prompt(const eval_case *tc) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
@@ -2391,6 +2558,13 @@ static char *build_question_prompt(const eval_case *tc) {
     return empty;
 }
 
+/** @brief The longest rendered prompt over the cases, in tokens.
+ *  @param engine       the loaded engine (renders and tokenizes)
+ *  @param cfg          the configuration (think mode)
+ *  @param cases        the cases
+ *  @param ncases       how many
+ *  @param max_case_out receives the longest case's index (-1 when ncases is 0); may be NULL
+ *  @return the longest prompt's length, tokens */
 static int eval_max_prompt_tokens(pulsar_engine *engine,
                                   const eval_config *cfg,
                                   const eval_case *cases,
@@ -2423,6 +2597,9 @@ static int eval_max_prompt_tokens(pulsar_engine *engine,
 /** Generation budget for one attempt at a case.  A retry of an INCOMPLETE case
  * (--retry-incomplete) gets twice the budget, once; both are capped at the
  * context ceiling.  Upstream antirez/ds4 29aa7267's rule. */
+/// @param cfg   the configuration (max_tokens)
+/// @param retry the attempt is the retry of an INCOMPLETE case
+/// @return the budget, tokens
 static int eval_generation_budget(const eval_config *cfg, bool retry) {
     long long budget = cfg->max_tokens;
     if (retry) budget *= 2;
@@ -2430,6 +2607,16 @@ static int eval_generation_budget(const eval_config *cfg, bool retry) {
     return (int)budget;
 }
 
+/** @brief The context the run needs: the longest prompt plus the generation budget; exits 2 past
+ *  EVAL_MAX_CONTEXT.
+ *  @param engine                the loaded engine
+ *  @param cfg                   the configuration
+ *  @param cases                 the cases
+ *  @param ncases                how many
+ *  @param max_generation_tokens the generation budget, tokens
+ *  @param max_prompt_out        receives the longest prompt, tokens; may be NULL
+ *  @param max_case_out          receives its case index; may be NULL
+ *  @return the context size, tokens */
 static int eval_auto_context_size(pulsar_engine *engine,
                                   eval_config *cfg,
                                   const eval_case *cases,
@@ -2456,6 +2643,12 @@ static int eval_auto_context_size(pulsar_engine *engine,
     return ctx;
 }
 
+/** @brief Warn on stderr when the largest prompt does not fit ctx_size or leaves less than the requested
+ *  generation room.
+ *  @param cfg                   the configuration (ctx_size)
+ *  @param max_prompt_tokens     the longest prompt, tokens
+ *  @param max_prompt_case       its case index
+ *  @param max_generation_tokens the requested generation budget, tokens */
 static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens,
                                      int max_prompt_case, int max_generation_tokens) {
     if (max_prompt_tokens >= cfg->ctx_size) {
@@ -2479,6 +2672,11 @@ static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_toke
     }
 }
 
+/** @brief Write a counted block to the trace: "<label>_BEGIN bytes=N", the text (newline-terminated),
+ *  "<label>_END".
+ *  @param trace the trace file; NULL is a no-op
+ *  @param label the block's label
+ *  @param text  the content; NULL = empty */
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
@@ -2492,6 +2690,9 @@ static void trace_write_block(FILE *trace, const char *label, const char *text) 
     fprintf(trace, "%s_END\n", label);
 }
 
+/** @brief A think-close kind's trace spelling.
+ *  @param kind the kind
+ *  @return "natural", "soft_forced", "hard_forced" or "none" */
 static const char *think_close_kind_name(eval_think_close_kind kind) {
     switch (kind) {
     case EVAL_THINK_CLOSE_NATURAL: return "natural";
@@ -2502,6 +2703,11 @@ static const char *think_close_kind_name(eval_think_close_kind kind) {
     }
 }
 
+/** @brief The token's 1-based rank among the session's top max_rank logprobs.
+ *  @param session  the session (its live logits)
+ *  @param token    the token
+ *  @param max_rank how deep to look
+ *  @return the rank, or 0 when it is not in the top max_rank (or on bad input / allocation failure) */
 static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
     if (token < 0 || max_rank <= 0) return 0;
     pulsar_token_score *top = (pulsar_token_score *)malloc((size_t)max_rank * sizeof(*top));
@@ -2518,6 +2724,13 @@ static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
     return rank;
 }
 
+/** @brief Write the trace file's header: the run's model, sampling settings and budgets.
+ *  @param trace                 the trace file; NULL is a no-op
+ *  @param cfg                   the configuration
+ *  @param model_name            the model's display name
+ *  @param ncases                cases in the run
+ *  @param max_prompt_tokens     the longest prompt, tokens
+ *  @param max_generation_tokens the generation budget, tokens */
 static void trace_write_header(FILE *trace, const eval_config *cfg,
                                const char *model_name,
                                int ncases,
@@ -2564,6 +2777,26 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
     fflush(trace);
 }
 
+/** @brief Write one case's trace record: a "===== CASE i/n =====" header of key: value fields (status, picked
+ *  and expected answers, token counts, sampling, the think close), then the counted SYSTEM_PROMPT,
+ *  QUESTION_PROMPT and MODEL_OUTPUT blocks.  --regrade-trace reads this format back.
+ *  @param trace                the trace file; NULL is a no-op
+ *  @param cfg                  the configuration (sampling knobs)
+ *  @param tc                   the case
+ *  @param idx                  its index in the run (0-based; written 1-based)
+ *  @param ncases               cases in the run
+ *  @param status               the status spelling (report_status_name)
+ *  @param error                an error message, or NULL / empty
+ *  @param system_prompt        the system prompt sent
+ *  @param question_prompt      the user prompt sent
+ *  @param model_output         the generated text
+ *  @param effective_think_mode the think mode the case ran under
+ *  @param prompt_tokens        prompt length, tokens
+ *  @param generated_tokens     tokens generated
+ *  @param generation_budget    the attempt's budget, tokens
+ *  @param elapsed_sec          the case's wall time, seconds
+ *  @param picked               the extracted answer, or NULL / empty ("?")
+ *  @param think_close          how the reasoning block closed; NULL = none */
 static void trace_write_case(FILE *trace,
                              const eval_config *cfg,
                              const eval_case *tc,
@@ -2654,10 +2887,17 @@ static void trace_write_case(FILE *trace,
  * line, so an extractor is only ever handed text that carries it.  The old
  * bare-"answer" fallback was reachable from nothing but its own self-tests
  * (L192). */
+/// @brief Whether the characters on both sides of a span are non-letters (a word boundary).
+/// @param before the character before the span
+/// @param after  the character after it
+/// @return true when neither is alphabetic
 static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
 
+/** @brief The last "Answer:" marker in visible (the rule in the comment above is_letter_boundary).
+ *  @param visible the text to search
+ *  @return a pointer to the marker's "a" inside visible, or NULL */
 static char *find_last_answer_marker(const char *visible) {
     char *last = NULL;
     const size_t nlen = strlen("answer");
@@ -2685,6 +2925,9 @@ static char *find_last_answer_marker(const char *visible) {
  * selection-vs-rejection sentence parsing (issue #321).  It never looks before
  * `start` or across a newline, so "D, not B" still grades D: the pick is
  * reached and accepted before the rejected distractor is ever inspected. */
+/// @param start  the start of the answer line (the scan never goes before it)
+/// @param letter the candidate capital, inside the line
+/// @return true when the word (or "rule out") before it rejects it
 static bool mc_letter_is_negated(const char *start, const char *letter) {
     const char *p = letter;
     /* Step back over the gap to the previous word: spaces and light separating
@@ -2732,6 +2975,11 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
     return false;
 }
 
+/** @brief Extract a multiple-choice pick from the visible reply (after `</think>`): the first standalone,
+ *  non-prose, non-rejected letter in range on the last "Answer:" line, else the last standalone letter in range.
+ *  @param generated the generated text
+ *  @param nchoices  options in the case (letters A .. A + nchoices - 1)
+ *  @return the letter, or '?' when none is found */
 static char find_answer_letter(const char *generated, int nchoices) {
     if (nchoices <= 0) return '?';
     const char *visible = strstr(generated, "</think>");
@@ -2778,6 +3026,11 @@ static char find_answer_letter(const char *generated, int nchoices) {
     return '?';
 }
 
+/** @brief Copy an integer's digits with leading zeros dropped (one zero kept for 0), truncated to dstlen.
+ *  @param p      the digits
+ *  @param len    digit count
+ *  @param dst    receives the NUL-terminated digits
+ *  @param dstlen capacity of dst, bytes; 0 writes nothing */
 static void normalize_integer_answer(const char *p, size_t len,
                                      char *dst, size_t dstlen) {
     while (len > 1 && *p == '0') {
@@ -2790,6 +3043,12 @@ static void normalize_integer_answer(const char *p, size_t len,
     dst[n] = '\0';
 }
 
+/** @brief Find the first run of digits in [start, end) and normalize it into dst.
+ *  @param start  the range's start
+ *  @param end    the range's end (a NUL also stops the scan)
+ *  @param dst    receives the normalized integer
+ *  @param dstlen capacity of dst, bytes
+ *  @return true when an integer was found */
 static bool scan_first_integer(const char *start, const char *end,
                                char *dst, size_t dstlen) {
     const char *p = start;
@@ -2805,6 +3064,11 @@ static bool scan_first_integer(const char *start, const char *end,
     return false;
 }
 
+/** @brief Extract an integer answer from the visible reply: on the last "Answer:" line, the first integer after
+ *  its last '=' (else its first integer); without such a line, the last integer in the reply.
+ *  @param generated the generated text
+ *  @param dst       receives the normalized integer, or "?"
+ *  @param dstlen    capacity of dst, bytes */
 static void find_integer_answer(const char *generated, char *dst, size_t dstlen) {
     if (dstlen == 0) return;
     snprintf(dst, dstlen, "?");
@@ -2845,6 +3109,11 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     }
 }
 
+/// @brief Normalize answer-line text into the compact line spec ("9,15", "20-22").
+/// @param p      the text's start
+/// @param end    its end (a NUL also stops the scan)
+/// @param dst    receives the spec, or "?" when no number was found
+/// @param dstlen capacity of dst, bytes; 0 writes nothing
 static void normalize_compsec_line_spec(const char *p, const char *end,
                                         char *dst, size_t dstlen) {
     if (dstlen == 0) return;
@@ -2885,6 +3154,11 @@ static void normalize_compsec_line_spec(const char *p, const char *end,
     if (n == 0) snprintf(dst, dstlen, "?");
 }
 
+/** @brief Extract a COMPSEC line-spec answer from the last "Answer:" line of the visible reply, falling back to
+ *  find_integer_answer.
+ *  @param generated the generated text
+ *  @param dst       receives the spec, or "?"
+ *  @param dstlen    capacity of dst, bytes */
 static void find_compsec_answer(const char *generated, char *dst, size_t dstlen) {
     if (dstlen == 0) return;
     snprintf(dst, dstlen, "?");
@@ -2903,6 +3177,12 @@ static void find_compsec_answer(const char *generated, char *dst, size_t dstlen)
     find_integer_answer(generated, dst, dstlen);
 }
 
+/** @brief Mark the lines a spec names ("9", "9,15", "20-22"; a reversed range is swapped) in a set, clamped to
+ *  [0, setlen).
+ *  @param spec   the spec; NULL = empty
+ *  @param set    the set, setlen flags (only set, never cleared)
+ *  @param setlen flags in set
+ *  @return true when at least one line was marked */
 static bool parse_line_spec(const char *spec, bool *set, size_t setlen) {
     bool any = false;
     const char *p = spec;
@@ -2933,6 +3213,11 @@ static bool parse_line_spec(const char *spec, bool *set, size_t setlen) {
     return any;
 }
 
+/** @brief Whether a COMPSEC answer is acceptable: every line it names is in the expected set and it names at
+ *  least one (lines 0..255; see the note inside).
+ *  @param expected_spec the case's key
+ *  @param got_spec      the extracted answer
+ *  @return true on a match */
 static bool compsec_answer_matches(const char *expected_spec, const char *got_spec) {
     bool expected[256] = {0};
     bool got[256] = {0};
@@ -2953,6 +3238,11 @@ static bool compsec_answer_matches(const char *expected_spec, const char *got_sp
     return hit;
 }
 
+/** @brief Extract the case's answer by its kind: a letter, a COMPSEC line spec, or an integer.
+ *  @param tc        the case
+ *  @param generated the text to extract from
+ *  @param dst       receives the answer ("?" when none)
+ *  @param dstlen    capacity of dst, bytes; 0 writes nothing */
 static void find_case_answer(const eval_case *tc, const char *generated,
                              char *dst, size_t dstlen) {
     if (dstlen == 0) return;
@@ -2966,6 +3256,11 @@ static void find_case_answer(const eval_case *tc, const char *generated,
     }
 }
 
+/** @brief Whether an extracted answer is the case's key (letter equality, COMPSEC set rule, or integer equality
+ *  after normalization).
+ *  @param tc  the case
+ *  @param got the extracted answer, or NULL
+ *  @return true on a match */
 static bool answer_matches(const eval_case *tc, const char *got) {
     if (eval_case_is_multiple_choice(tc)) {
         return got && got[0] && tc->answer && got[0] == tc->answer[0];
@@ -2982,6 +3277,8 @@ static bool answer_matches(const eval_case *tc, const char *got) {
  * line of the visible reply must carry the "Answer:" marker the prompt asked
  * for.  Only that line reaches the extractors, so a provisional "Answer:"
  * earlier in the reply is never graded by mistake. */
+/// @param line the reply's last non-empty line
+/// @return true when it carries an "Answer:" marker
 static bool line_has_answer_marker(const char *line) {
     return find_last_answer_marker(line) != NULL;
 }
@@ -2992,6 +3289,11 @@ static bool line_has_answer_marker(const char *line) {
  * writing -- and is EVAL_INCOMPLETE: nothing was graded, so it is neither a
  * pass nor a fail.  Otherwise EVAL_PASSED or EVAL_FAILED; `got` receives the
  * extracted answer ("?" when incomplete). */
+/** @param tc        the case
+ *  @param generated the whole generated text (graded after `</think>`)
+ *  @param got       receives the extracted answer
+ *  @param gotlen    capacity of got, bytes
+ *  @return EVAL_PASSED, EVAL_FAILED or EVAL_INCOMPLETE */
 static eval_status grade_model_output(const eval_case *tc, const char *generated,
                                       char *got, size_t gotlen) {
     if (gotlen) snprintf(got, gotlen, "?");
@@ -3021,6 +3323,10 @@ static eval_status grade_model_output(const eval_case *tc, const char *generated
     return st;
 }
 
+/** @brief Read a whole file (a trace) into a NUL-terminated buffer.
+ *  @param path    the file
+ *  @param len_out receives its length, bytes; may be NULL
+ *  @return a malloc'd buffer (caller frees), or NULL on failure (said on stderr) */
 static char *read_text_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -3063,6 +3369,11 @@ static char *read_text_file(const char *path, size_t *len_out) {
     return buf;
 }
 
+/** @brief strstr within [start, end).
+ *  @param start  the range's start
+ *  @param end    its end
+ *  @param needle the NUL-terminated string to find
+ *  @return the first match, start for an empty needle, or NULL */
 static const char *bounded_strstr(const char *start, const char *end,
                                   const char *needle) {
     size_t nlen = strlen(needle);
@@ -3074,6 +3385,11 @@ static const char *bounded_strstr(const char *start, const char *end,
     return NULL;
 }
 
+/** @brief Copy [start, end) without its trailing CR / LF, truncated to dstlen.
+ *  @param dst    receives the NUL-terminated copy
+ *  @param dstlen capacity of dst, bytes; 0 writes nothing
+ *  @param start  the span's start
+ *  @param end    its end */
 static void copy_span(char *dst, size_t dstlen, const char *start, const char *end) {
     if (dstlen == 0) return;
     while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
@@ -3083,6 +3399,11 @@ static void copy_span(char *dst, size_t dstlen, const char *start, const char *e
     dst[n] = '\0';
 }
 
+/// @brief If `line` opens a well-formed counted block ("<label>_BEGIN bytes=N", N bytes, "<label>_END"), skip it.
+/// @param line     the line's start
+/// @param line_end the line's end (its newline, or end)
+/// @param end      the end of the trace
+/// @return the start of the line after the block's END marker, or NULL when it is not a valid counted block
 static const char *trace_skip_counted_block(const char *line,
                                             const char *line_end,
                                             const char *end) {
@@ -3122,6 +3443,11 @@ static const char *trace_skip_counted_block(const char *line,
     return after_line ? after_line + 1 : end;
 }
 
+/** @brief The next "===== CASE " line at or after start, skipping counted blocks (so a header inside a
+ *  model's output is not taken for one).
+ *  @param start where to search from
+ *  @param end   the end of the trace
+ *  @return the header line's start, or NULL */
 static const char *trace_find_next_case(const char *start, const char *end) {
     const char *p = start;
     while (p < end) {
@@ -3145,6 +3471,11 @@ static const char *trace_find_next_case(const char *start, const char *end) {
     return NULL;
 }
 
+/** @brief The first line in [start, end) beginning with label, skipping other counted blocks.
+ *  @param start where to search from
+ *  @param end   the end of the case
+ *  @param label the line prefix (e.g. "MODEL_OUTPUT_BEGIN")
+ *  @return the line's start, or NULL */
 static const char *trace_find_block_begin(const char *start, const char *end,
                                           const char *label) {
     size_t label_len = strlen(label);
@@ -3168,6 +3499,13 @@ static const char *trace_find_block_begin(const char *start, const char *end,
     return NULL;
 }
 
+/** @brief Copy the value of the first line in [start, end) beginning with key (e.g. "status: ").
+ *  @param start  the case's start
+ *  @param end    its end
+ *  @param key    the line prefix, separator included
+ *  @param dst    receives the rest of the line ("" when absent)
+ *  @param dstlen capacity of dst, bytes
+ *  @return true when the key was found */
 static bool trace_get_line_field(const char *start, const char *end,
                                  const char *key, char *dst, size_t dstlen) {
     size_t keylen = strlen(key);
@@ -3186,6 +3524,10 @@ static bool trace_get_line_field(const char *start, const char *end,
     return false;
 }
 
+/** @brief Look up a built-in case by its source and id.
+ *  @param source the benchmark name
+ *  @param id     the case id
+ *  @return the case, or NULL */
 static const eval_case *find_eval_case_by_source_id(const char *source,
                                                     const char *id) {
     size_t ncases = sizeof(eval_cases) / sizeof(eval_cases[0]);
@@ -3198,6 +3540,11 @@ static const eval_case *find_eval_case_by_source_id(const char *source,
     return NULL;
 }
 
+/** @brief Copy a trace case's MODEL_OUTPUT block: by its byte count, or up to "MODEL_OUTPUT_END" for traces
+ *  written before counted blocks.
+ *  @param case_start the case's start
+ *  @param case_end   its end
+ *  @return a malloc'd copy (caller frees), or NULL when the block is missing or malformed */
 static char *trace_copy_model_output(const char *case_start, const char *case_end) {
     const char *begin = trace_find_block_begin(case_start, case_end, "MODEL_OUTPUT_BEGIN");
     if (!begin) return NULL;
@@ -3244,6 +3591,13 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
  * the status grade_model_output() gives the traced output TODAY, which may
  * differ from the traced one -- that difference is what --regrade-trace is
  * for. */
+/// @param tc            the case
+/// @param traced_status the trace's status line value ("" for a legacy trace)
+/// @param model_output  the traced output
+/// @param got           receives the extracted answer ("" when not graded)
+/// @param gotlen        capacity of got, bytes
+/// @param outcome       receives today's grade when graded
+/// @return true when the case is gradeable
 static bool regrade_case_outcome(const eval_case *tc,
                                  const char *traced_status,
                                  const char *model_output,
@@ -3261,6 +3615,9 @@ static bool regrade_case_outcome(const eval_case *tc,
     return true;
 }
 
+/** @brief --regrade-trace: re-grade every case of a trace with today's grader and print the drift and totals.
+ *  @param path the trace file
+ *  @return 0; 1 when a case was unknown or malformed or the trace had none; 2 when it could not be read */
 static int regrade_trace_file(const char *path) {
     size_t len = 0;
     char *text = read_text_file(path, &len);
@@ -3346,6 +3703,13 @@ static int regrade_trace_file(const char *path) {
     return (unknown || parse_errors || total == 0) ? 1 : 0;
 }
 
+/** @brief One extractor self-test: extract from generated and check it equals expected_extract and grades as
+ *  the case's key.
+ *  @param name             the test's label (printed on failure)
+ *  @param tc               the case (its kind and key)
+ *  @param generated        the model text
+ *  @param expected_extract the answer the extractor must return
+ *  @return 0 on pass, 1 on failure (said on stderr) */
 static int extractor_self_test_case(const char *name, const eval_case *tc,
                                     const char *generated,
                                     const char *expected_extract) {
@@ -3359,6 +3723,9 @@ static int extractor_self_test_case(const char *name, const eval_case *tc,
     return 1;
 }
 
+/** @brief Self-test: a CASE header and MODEL_OUTPUT_BEGIN inside counted blocks do not split a case, and
+ *  the model output is copied byte for byte.
+ *  @return 0 on pass, 1 on failure */
 static int trace_copy_self_test_case(void) {
     const char *prompt_output =
         "Prompt text may mention\n"
@@ -3412,6 +3779,12 @@ static int trace_copy_self_test_case(void) {
 /* The grading contract, exercised through the ONE grading entry the live run
  * and the regrade share.  expected_extract is checked only when the outcome is
  * graded (an INCOMPLETE reply extracts nothing). */
+/// @param name             the test's label (printed on failure)
+/// @param tc               the case
+/// @param generated        the model text
+/// @param expected_status  the outcome grade_model_output must give
+/// @param expected_extract the extracted answer when graded (unused for EVAL_INCOMPLETE)
+/// @return 0 on pass, 1 on failure (said on stderr)
 static int grading_self_test_case(const char *name, const eval_case *tc,
                                   const char *generated,
                                   eval_status expected_status,
@@ -3429,6 +3802,8 @@ static int grading_self_test_case(const char *name, const eval_case *tc,
     return 1;
 }
 
+/** @brief Self-tests of regrade_case_outcome's gradeable-status rule.
+ *  @return the number of failed checks */
 static int regrade_status_self_test_case(void) {
     int failed = 0;
     const eval_case integer = {.source = "AIME2025", .answer = "82"};
@@ -3469,6 +3844,8 @@ static int regrade_status_self_test_case(void) {
     return failed;
 }
 
+/** @brief --self-test-extractors: run every grading, extractor and trace self-test.
+ *  @return 0 when all pass (printed), else 1 */
 static int run_extractor_self_tests(void) {
     int failed = 0;
 
@@ -3653,6 +4030,10 @@ static int run_extractor_self_tests(void) {
     return 0;
 }
 
+/** @brief Whether the user asked (Enter on the case list) to jump to a case other than the running one.
+ *  @param ui          the UI
+ *  @param running_idx the running case's index
+ *  @return true when a valid other case is requested */
 static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
     return ui->enabled &&
            ui->requested_case >= 0 &&
@@ -3660,15 +4041,25 @@ static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
            ui->requested_case != running_idx;
 }
 
+/** @brief Whether the user pressed q.
+ *  @param ui the UI
+ *  @return true when the TUI is enabled and a quit was requested */
 static bool tui_has_quit_request(eval_ui *ui) {
     return ui->enabled && ui->quit_requested;
 }
 
+/** @brief Return a case to PENDING and clear its extracted answer (a switched-away case runs again later).
+ *  @param ui  the UI
+ *  @param idx the case's index */
 static void mark_case_pending(eval_ui *ui, int idx) {
     ui->status[idx] = EVAL_PENDING;
     ui->guess[idx][0] = '\0';
 }
 
+/** @brief While the run is paused, stop the run clock and poll input every 50 ms until it resumes.
+ *  @param ui    the UI
+ *  @param phase the phase name shown while waiting
+ *  @return the seconds spent paused (0 when not paused) */
 static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     if (!ui->enabled || !ui->paused) return 0.0;
     bool was_running = ui->run_clock_active;
@@ -3685,6 +4076,12 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     return now_sec() - start;
 }
 
+/** @brief Session progress callback during a case's prefill: updates the counts and speed, redraws, and
+ *  honours a pause (the paused time is taken out of the phase's speed).
+ *  @param ud      the eval_ui
+ *  @param event   the event name; only "prefill_chunk" and "prefill_display" are handled
+ *  @param current prefill rows done
+ *  @param total   prefill rows total */
 static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = (eval_ui *)ud;
     if (!ui || !event) return;
@@ -3701,6 +4098,18 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
 }
 
+/** @brief Run one case: render and prefill its prompt, generate under the budget (forcing `</think>` by the
+ *  soft / hard reply limits), grade the reply, update the UI and write its trace record.  A prompt that does
+ *  not fit the context is SKIPPED.
+ *  @param engine            the loaded engine
+ *  @param session           the run's session
+ *  @param cfg               the configuration
+ *  @param ui                the UI (per-case arrays updated)
+ *  @param trace             the trace file, or NULL
+ *  @param idx               the case's index in eval_cases
+ *  @param generation_budget the attempt's generation budget, tokens
+ *  @param rng               the sampler stream (stepped)
+ *  @return EVAL_RUN_OK, EVAL_RUN_ERROR, or EVAL_RUN_SWITCH / EVAL_RUN_QUIT when the user interrupted it */
 static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *session,
                                     const eval_config *cfg, eval_ui *ui,
                                     FILE *trace, int idx, int generation_budget,
@@ -4070,6 +4479,10 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     return EVAL_RUN_OK;
 }
 
+/** @brief The first PENDING case at or after start, wrapping around.
+ *  @param ui    the UI
+ *  @param start where to start looking
+ *  @return the case's index, or -1 when none is pending */
 static int next_pending_case(eval_ui *ui, int start) {
     if (ui->ncases <= 0) return -1;
     for (int off = 0; off < ui->ncases; off++) {
@@ -4079,6 +4492,12 @@ static int next_pending_case(eval_ui *ui, int start) {
     return -1;
 }
 
+/** @brief Parse --case-sequence: comma-separated 1-based case numbers in [1, ncases].
+ *  @param arg     the option's value
+ *  @param ncases  cases in the run
+ *  @param seq_out receives a malloc'd array of 0-based indices (caller frees)
+ *  @param len_out receives its length
+ *  @return 0, or -1 on an empty, malformed or out-of-range list (said on stderr; nothing returned) */
 static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *len_out) {
     int cap = 8;
     int len = 0;
@@ -4136,6 +4555,8 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
     return 0;
 }
 
+/// @param st the status
+/// @return its spelling ("PASSED", "RUNNING", ...); "PENDING" for an unknown value
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
@@ -4150,6 +4571,12 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
+/** @brief Print the end-of-run summary and a per-case table (state, token counts, given and correct answers).
+ *  @param ui         the UI (per-case arrays)
+ *  @param ncases     cases in the run
+ *  @param passed     cases passed
+ *  @param failed     cases failed
+ *  @param incomplete cases incomplete */
 static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed,
                               int incomplete) {
     char elapsed[32];
@@ -4179,6 +4606,11 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+/** @brief pulsar-eval's entry point: self-tests or a trace regrade when asked, else open the engine and run the
+ *  cases.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit status (2 on bad arguments) */
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();

@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the trace log (timestamped records of events, tokens and text). */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,8 @@
  * ============================================================================
  */
 
+/** @brief Print the local wall-clock time, millisecond resolution, as a trace line's timestamp.
+ *  @param fp the trace file */
 static void agent_trace_time(FILE *fp) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -35,6 +39,10 @@ void agent_trace(agent_worker *w, const char *fmt, ...) {
 
 
 
+/** @brief Print bytes C-escaped (backslash, quote, \\n \\r \\t, other control bytes as \\xNN).
+ *  @param fp the trace file
+ *  @param s  bytes
+ *  @param n  byte count */
 static void agent_trace_escaped(FILE *fp, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
