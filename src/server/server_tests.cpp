@@ -8702,9 +8702,8 @@ static void test_random_prefixed_id_format(void) {
     TEST_ASSERT(strcmp(a, b) != 0);
     random_prefixed_id(a, sizeof(a), "cmpl-", 12);
     TEST_ASSERT(strncmp(a, "cmpl-", 5) == 0 && strlen(a) == 5 + 24);
-    char small[8];
-    random_prefixed_id(small, sizeof(small), "resp_", 12);   /* truncates, never overruns */
-    TEST_ASSERT(strlen(small) < sizeof(small) && strncmp(small, "resp_", 5) == 0);
+    /* L335: a buffer too small for the whole id dies (test_l335_random_id_refuses_loudly); it used to
+     * truncate the id */
 }
 
 static void test_logprob_token_json_sanitizes_ill_formed_utf8(void) {
@@ -11961,8 +11960,9 @@ static void test_l335_grammar_compiler_is_write_once(void) {
     }) == 1);
 }
 
-/* L335: an id of more than 16 random bytes dies (it was capped at 16 without a word); 16 is 32 hex digits. */
-static void test_l335_random_id_refuses_more_than_16_bytes(void) {
+/* L335: an id of more than 16 random bytes dies (it was capped at 16 without a word), and so does a buffer too small
+ * for the whole id (it was shortened); 16 bytes are 32 hex digits. */
+static void test_l335_random_id_refuses_loudly(void) {
     char id[64];
     random_prefixed_id(id, sizeof id, "x_", 16);
     TEST_ASSERT(strlen(id) == 2 + 32 && !strncmp(id, "x_", 2));
@@ -11970,6 +11970,21 @@ static void test_l335_random_id_refuses_more_than_16_bytes(void) {
         char big[64];
         random_prefixed_id(big, sizeof big, "x_", 17);
     }) == 1);
+    /* the id fits exactly (prefix + 2 * nbytes + NUL), or the call dies -- it used to come back shortened */
+    char exact[2 + 24 + 1];
+    random_prefixed_id(exact, sizeof exact, "x_", 12);
+    TEST_ASSERT(strlen(exact) == 2 + 24);
+    TEST_ASSERT(l335_exit_status([&] {
+        char small[2 + 24];
+        random_prefixed_id(small, sizeof small, "x_", 12);
+    }) == 1);
+    /* every caller's buffer holds its id: the longest prefix and size each one uses */
+    char tool[64];
+    random_tool_id(tool, sizeof tool, API_ANTHROPIC);
+    TEST_ASSERT(strlen(tool) == strlen("toolu_") + 32);
+    TEST_ASSERT(strlen("resp_") + 24 + 1 <= sizeof(responses_stream::response_id) &&
+                strlen("msg_") + 24 + 1 <= sizeof(responses_stream::message_id));
+    TEST_ASSERT(strlen("chatcmpl-") + 24 + 1 <= sizeof(gen_state::id));
 }
 
 /* L335: request_init sets no family and no model; a request that reaches the worker's queue without either dies by
@@ -12064,7 +12079,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();
     test_l335_request_without_family_dies_at_enqueue();
-    test_l335_random_id_refuses_more_than_16_bytes();
+    test_l335_random_id_refuses_loudly();
     test_l335_grammar_compiler_is_write_once();
     test_l334_server_positions();
     test_l334_prompt_held_across_a_seam();

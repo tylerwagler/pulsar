@@ -3720,8 +3720,9 @@ void random_tool_id(char *dst, size_t dstlen, api_style api);
 /** `prefix` + 2*nbytes lowercase hex from the OS RNG; dies when no RNG is
  * available (ids must never be predictable).  The ONE id generator: tool-call,
  * Responses item and chat/completion ids all come from here (L192 item 7). */
-/// @param dst     receives the id (NUL-terminated, truncated to `dstlen`)
-/// @param dstlen  size of `dst`
+/// @param dst     receives the id (NUL-terminated)
+/// @param dstlen  size of `dst`: at least strlen(prefix) + 2 * nbytes + 1 (L335: smaller dies; the id used to be
+///                shortened silently)
 /// @param prefix  the id's prefix ("call_", "resp_", ...)
 /// @param nbytes  random bytes, at most 16 (L335: more dies; it used to be capped at 16 silently)
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes);

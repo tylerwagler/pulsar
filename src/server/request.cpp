@@ -12,9 +12,16 @@
 
 void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes) {
     unsigned char bytes[16];
-    if (nbytes > sizeof(bytes)) pulsar_die("random_prefixed_id: more than 16 random bytes asked");
+    if (nbytes > sizeof(bytes)) {
+        pulsar_die("random_prefixed_id: more than 16 random bytes asked");
+        return;   /* unreachable (pulsar_die exits); tells the compiler nbytes <= 16 below */
+    }
+    /* L335: the whole id fits or nothing is written -- a shortened id is a weaker one nobody asked for */
+    if (strlen(prefix) + 2 * nbytes + 1 > dstlen) {
+        pulsar_die("random_prefixed_id: the id does not fit its buffer");
+        return;   /* unreachable */
+    }
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
-    if (pos >= dstlen) return;
 
     if (!random_bytes(bytes, nbytes)) {
         /* Fail closed: ids must not be predictable, and with getrandom() +
@@ -24,7 +31,7 @@ void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nby
     }
 
     static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < nbytes && pos + 2 < dstlen; i++) {
+    for (size_t i = 0; i < nbytes; i++) {
         dst[pos++] = hex[bytes[i] >> 4];
         dst[pos++] = hex[bytes[i] & 15];
     }
