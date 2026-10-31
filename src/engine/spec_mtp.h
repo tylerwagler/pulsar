@@ -213,7 +213,7 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
 /// @param top_p request top-p
 /// @param min_p request min-p
 /// @param rng the request's stream
-/// @return drafts kept; 0 on failure (said; the pendings dropped)
+/// @return drafts kept, or PULSAR_DRAFT_REFUSED (said; the pendings dropped): the round refuses (L306)
 uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, bool features_ready, float temperature, int top_k,
                           float top_p, float min_p, uint64_t *rng);
 /// pulsar_drafter_ops::draft_batch.
