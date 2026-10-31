@@ -227,6 +227,16 @@ bool tool_call_json(const inkling_tool_call_in &c, std::string *out, char *err, 
     return true;
 }
 
+/// @param m      the message
+/// @param i      its index, for the refusal
+/// @param err    the error buffer
+/// @param errlen its size
+/// @return false (unexpected_role) when the role has no message marker (a NULL role included)
+bool check_role(const inkling_msg_in &m, int i, char *err, size_t errlen) {
+    if (role_marker(m.role)) return true;
+    return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
+}
+
 /* One message as render_inkling_messages writes it (its loop body after the effort block), with the
  * tool_call_id -> name map the earlier calls filled.  `end_sampling`: an assistant message closes with
  * <|content_model_end_sampling|> (false: a sampled tool-call turn, whose close is its tail's first bytes). */
@@ -246,13 +256,14 @@ struct message_writer {
     }
 
     /// Write one message.
-    /// @param m            the message (its role already checked by check_role)
+    /// @param m            the message (its role checked here: check_role)
     /// @param i            its index, for refusals
     /// @param end_sampling close an assistant message with <|content_model_end_sampling|>
     /// @param err          the error buffer
     /// @param errlen       its size
-    /// @return false on a refusal (tool_result_not_text, raw_calls_without_calls, a call's)
+    /// @return false on a refusal (unexpected_role, tool_result_not_text, raw_calls_without_calls, a call's)
     bool message(const inkling_msg_in &m, int i, bool end_sampling, char *err, size_t errlen) {
+        if (!check_role(m, i, err, errlen)) return false;
         const char *marker = role_marker(m.role);
         if (!strcmp(m.role, "tool")) {
             std::string name = m.name && m.name[0] ? m.name : "";
@@ -315,16 +326,6 @@ struct message_writer {
         return true;
     }
 };
-
-/// @param m      the message
-/// @param i      its index, for the refusal
-/// @param err    the error buffer
-/// @param errlen its size
-/// @return false (unexpected_role) when the role has no message marker
-bool check_role(const inkling_msg_in &m, int i, char *err, size_t errlen) {
-    if (role_marker(m.role)) return true;
-    return refuse(err, errlen, "unexpected_role", "message %d has role %s", i, m.role ? m.role : "(none)");
-}
 
 /// @param out    the finished render
 /// @param err    the error buffer
@@ -429,7 +430,7 @@ bool inkling_chat_render_turn(const inkling_msg_in *msgs, int n, int from, bool 
     for (int i = 0; i < from; i++) mw.note_calls(msgs[i]);
     if (close_turn) mw.w.put(kContentModelEndSampling);
     for (int i = from; i < n; i++)
-        if (!check_role(msgs[i], i, err, errlen) || !mw.message(msgs[i], i, true, err, errlen)) return false;
+        if (!mw.message(msgs[i], i, true, err, errlen)) return false;
     if (add_generation_prompt) mw.w.put(kMessageModel);
     return fits(out, err, errlen);
 }
