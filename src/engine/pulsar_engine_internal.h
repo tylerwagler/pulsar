@@ -827,13 +827,13 @@ enum {
  * cutlass_mxfp4_expert_layout), not in a table indexed by a foreign id. */
 
 
-/** The drafter markov_w2 table's storage, derived from its GGUF type -- the one
+/** Print "pulsar: <msg>" and exit(1). */
+/// @param msg  the message, printed as "pulsar: <msg>" before exit(1)
+void pulsar_die(const char *msg);   /* declared again with the shared functions below; needed here */
+/** The drafter markov_w2 table's kernel arm for its storage, derived from its GGUF type -- the one
  * place the type -> kernel-arm mapping is spelled (L213).  Any other type is a
  * refusal, not a default: the loader's dims contract already rejected it, so
  * reaching here with one is a bug. */
-/// @param msg  the message, printed as "pulsar: <msg>" before exit(1)
-void pulsar_die(const char *msg);   /* declared in full further down; needed here */
-/// The drafter markov_w2 table's kernel arm for its storage type (see the comment above pulsar_die).
 /// @param type  the tensor's PULSAR_TENSOR_* type: F32, BF16 or FP8_E4M3_SOA_K
 /// @return a PULSAR_MARKOV_W2_* format; any other type dies.
 static inline int pulsar_markov_w2_fmt(uint32_t type) {
@@ -2872,16 +2872,6 @@ bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, 
 bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
                         int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen);
 
-/** Tier-2 PATH A: per-bank host carry for the unified bank model.  The shared
- * pool-session's HOST per-conversation state (checkpoint token history, host
- * logits, and the whole DSpark fused-loop / spec-carry shadow) is single-
- * instance on pulsar_session, so time-slicing classic/spec work across banks in
- * one graph must save the leaving bank's carry and restore the entering bank's.
- * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the
- * engine header (gpu_graph_bank_repoint contract) delegates to the caller.
- * The three heap members are owned deep copies; every other field is a scalar
- * mirror of the identically-named pulsar_session field; the speculative/DSpark
- * scalars are carried wholesale as one embedded pulsar_spec_carry_state. */
 /** L302: a session's device sampling state (session_sampler.cpp): the live row -- the authority; the host mirror
  *  pulsar_session::logits is read back only on demand -- each bank's saved live row, the sampler's scratch, and the
  *  rows the last batched step headed into the family's slab. */
@@ -2911,8 +2901,15 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks);
 /// @param s  the session
 void pulsar_session_dev_free(pulsar_session *s);
 
-/** One bank's saved HOST state while another bank is installed (see the block comment above
- *  pulsar_session_dev_rows: owned deep copies plus scalar mirrors of pulsar_session fields). */
+/** Tier-2 PATH A: one bank's saved HOST state while another bank is installed -- the per-bank host carry for the
+ * unified bank model.  The shared pool-session's HOST per-conversation state (checkpoint token history, and the
+ * whole DSpark fused-loop / spec-carry shadow) is single-instance on pulsar_session, so time-slicing classic/spec
+ * work across banks in one graph must save the leaving bank's carry and restore the entering bank's.
+ * gpu_graph_bank_repoint swaps the DEVICE views; this covers the HOST half the engine header
+ * (gpu_graph_bank_repoint contract) delegates to the caller (the live logits row stays on the device, L302:
+ * pulsar_session_dev_rows::bank_rows).  The heap member is an owned deep copy; every other field is a scalar
+ * mirror of the identically-named pulsar_session field; the speculative/DSpark scalars are carried wholesale as
+ * one embedded pulsar_spec_carry_state. */
 typedef struct pulsar_bank_carry {
     bool      valid;  ///< has this bank's state ever been saved
     /** heap-backed (owned): */
@@ -3638,15 +3635,6 @@ static inline bool pulsar_attn_runs_indexer(pulsar_attn_mode m) {
     return m == PULSAR_ATTN_FULL || m == PULSAR_ATTN_REINDEX;
 }
 
-/** Depends on an index source's top-k: FULL and REINDEX publish one, REUSE
- * consumes one it did not compute.  FULL_UNINDEXED is the single compressed mode
- * that does not -- it has no indexer, so it has no top-k and no index source to
- * read.
- *
- * This is NOT pulsar_attn_runs_indexer: that asks whether the indexer KERNEL
- * runs, and REUSE -- the mode that reads a top-k it never computed -- answers no
- * to it.  Anything asking "does this layer's behaviour depend on its index
- * source?" wants this one. */
 /** The mode's name, for instruments and refusals.  One authority: a test that
  * spells the modes out again is a second list that can drift from this one. */
 /// @param m  the mode
@@ -3662,7 +3650,15 @@ static inline const char *pulsar_attn_mode_name(pulsar_attn_mode m) {
     return "?";
 }
 
-/// Whether the layer's behaviour depends on an index source's top-k (see the comment above pulsar_attn_mode_name).
+/** Depends on an index source's top-k: FULL and REINDEX publish one, REUSE
+ * consumes one it did not compute.  FULL_UNINDEXED is the single compressed mode
+ * that does not -- it has no indexer, so it has no top-k and no index source to
+ * read.
+ *
+ * This is NOT pulsar_attn_runs_indexer: that asks whether the indexer KERNEL
+ * runs, and REUSE -- the mode that reads a top-k it never computed -- answers no
+ * to it.  Anything asking "does this layer's behaviour depend on its index
+ * source?" wants this one. */
 /// @param m  the layer's mode
 /// @return true for FULL, REINDEX and REUSE.
 static inline bool pulsar_attn_reads_index(pulsar_attn_mode m) {
@@ -5098,11 +5094,6 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
 /// @return 1, or 0 when no grid fits
 int vision_image_grid(int width, int height, const pulsar_vision_args *args,
                       pulsar_vision_image *out);
-/** Decode image BYTES to 8-bit RGB.  PNG (libpng) and JPEG (libjpeg-turbo, with
- * Pillow's settings, which are libjpeg's defaults) only -- the caller fails
- * loudly on 0 rather than guessing at a format.  `*rgb_out` is malloc'd and the
- * caller owns it.  CMYK/YCCK JPEG is refused: Pillow keeps those in CMYK and its
- * own .convert("RGB") is a different transform from libjpeg's. */
 /** L321: the process's GPU phase lock.  The engines of a group (pulsar_engine_open_group) share one GPU, the fixed
  *  GEMM's shapes and workspace and the encoders' scratch, so a single-call family (an encoder, a parser) runs its GPU
  *  work in PHASES -- a packed encode forward, one ViT block, a page's prefill, one decode step -- each one a
@@ -5701,10 +5692,6 @@ bool gpu_graph_encode_output_head(
         uint32_t               vocab_lo,
         uint64_t               vocab_dim,
         pulsar_gpu_tensor      *out);
-/** The output head for rows [row0, row0 + n_tokens) of the sweep-final stream
- * into `out` rows [0, n_tokens), covering the vocab range
- * [vocab_lo, vocab_lo + vocab_dim).  The single-box caller passes
- * (0, N_VOCAB, g->spec_logits). */
 /** L292: the output head's graph-capture key -- the carrier parity, the head's row count, and its decode
  *  prefix (pulsar_gpu_matmul_decode_prefix: which rows take the decode arms).  Every host-side fact the
  *  captured launches depend on is a field; n_tokens <= 16, so each fits its byte. */
@@ -5931,8 +5918,8 @@ pulsar_gpu_tensor *gpu_graph_heads_row_view(
         pulsar_gpu_tensor *base,
         uint32_t          row,
         uint64_t          row_values);
-/** Read an HC residual carrier (BF16 storage; task #62) into an f32 host buffer,
- * expanding each sample. Dev-only (parity self-test + env-gated DSpark dumps). */
+/** Read a stored Q buffer (f16 storage, L045) into an f32 host buffer -- the one f32-decoding host read of a Q
+ * buffer (a plain f32 read would take twice its bytes). */
 /// @param t a Q buffer (f16 storage)
 /// @param off_elems first element
 /// @param[out] out [n] f32
@@ -6091,7 +6078,7 @@ bool gpu_graph_prefill_layer_major(
 pulsar_prefill_shape gpu_graph_prefill_shape(const pulsar_gpu_graph *g);
 /** Prefill prompt[start, start + n_tokens) on the graph's installed bank outside a session -- the imatrix collector
  *  and the gates' classic suffix -- by the one cut rule over gpu_graph_prefill_shape (text only), capturing grid
- *  checkpoints by the shared rule.  `logits` (NULL = none) receives the last row. */
+ *  checkpoints by the shared rule.  `head_out` (NULL = none) receives the last row's logits. */
 /// @param g the graph
 /// @param model the model
 /// @param weights the weights

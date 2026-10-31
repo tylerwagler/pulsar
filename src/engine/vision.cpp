@@ -852,7 +852,10 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
 
 /* Formats the server accepts today: PNG and JPEG.  A GIF/WebP/... payload is
  * refused by name rather than mis-parsed. */
-/// Decode PNG or JPEG bytes to RGB8 (anything else, and CMYK / YCCK JPEG, refused).
+/** Decode PNG or JPEG bytes to RGB8 (anything else, and CMYK / YCCK JPEG, refused).  PNG through libpng, JPEG
+ *  through libjpeg-turbo with Pillow's settings (libjpeg's defaults); the caller fails loudly on 0 rather than
+ *  guessing at a format.  CMYK / YCCK JPEG is refused because Pillow keeps those in CMYK and its own
+ *  .convert("RGB") is a different transform from libjpeg's. */
 /// @param bytes the encoded image
 /// @param len its length
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)

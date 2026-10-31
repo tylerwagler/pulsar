@@ -1088,8 +1088,9 @@ uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32
            (0xFFull << 16) | (2ull << 8) | (uint64_t)(n_tokens & 0xFFu);
 }
 
-/// The output head over batch rows [row0, row0 + n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim)
-/// (a full-range head at row 0 runs as a captured segment).
+/// The output head over batch rows [row0, row0 + n_tokens) of the sweep-final stream into `out` rows
+/// [0, n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim) (a full-range head at row 0 runs as a captured
+/// segment; the single-box caller passes 0, N_VOCAB and g->spec_logits).
 /// @param g the graph
 /// @param model the model
 /// @param weights its device weights
