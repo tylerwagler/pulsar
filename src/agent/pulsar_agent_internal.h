@@ -809,7 +809,9 @@ struct agent_bash_job {
 };
 
 /** Prompts typed while the model was busy, drained in order at the next safe
- * point. Guarded by agent_worker::mu. */
+ * point. A local of the UI loop (runtime.cpp), touched by that thread only, so
+ * it takes no lock: the worker receives its contents as text the UI thread
+ * takes out and hands over under agent_worker::mu (worker_answer_queued_user_drain). */
 typedef struct {
     char **v;    ///< queued prompt strings, owned
     size_t len;  ///< prompts queued
