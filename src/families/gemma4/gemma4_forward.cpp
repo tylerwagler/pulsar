@@ -221,8 +221,9 @@ uint64_t lin_ws(int in, int out, uint32_t rows) {
 
 /* ---- scratch layouts: one function each, for sizing AND carving -------------------------------------------------- */
 
-/** The ROWS arena: int32 [R] token ids, then the routed experts' non-finite flag (zeroed by every stage). */
-struct rows_scratch { uint64_t ids, nf, total; };
+/** The ROWS arena: int32 [R] token ids, the routed experts' non-finite flag (zeroed by every stage), u8 [R] the rows
+ *  the runtime adapter applies to (L338 P2: uploaded by a stage whose banks run it). */
+struct rows_scratch { uint64_t ids, nf, ad, total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the ROWS arena's offsets and size */
 rows_scratch rows_layout(uint32_t R) {
@@ -230,6 +231,7 @@ rows_scratch rows_layout(uint32_t R) {
     uint64_t o = 0;
     r.ids = o; o += a256((uint64_t)R * 4u);
     r.nf = o;  o += 256u;
+    r.ad = o;  o += a256(R);
     r.total = o;
     return r;
 }
@@ -238,7 +240,7 @@ rows_scratch rows_layout(uint32_t R) {
  *  qf / kf / vf f32 and qb / kb / vb bf16 the projections (kb also v's source on a global layer), vn bf16 the
  *  unweighted-normed v, ab bf16 the attention's output, of f32 / db bf16 the o_proj's, dn bf16 its post-norm; the
  *  dense arm's workspace; F1's workspace (the wider declaration's). */
-struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, dn, lin, lin_bytes, gqa, gqa_bytes, total; };
+struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, dn, lora, lin, lin_bytes, gqa, gqa_bytes, total; };
 /** @param R    the step's row capacity (max_rows)
  *  @param ctx  the pools' capacity in tokens (F1's workspace; 0 = sized for 1)
  *  @return the MIX arena's offsets and size */
@@ -261,6 +263,7 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     t.of = o; o += a256((uint64_t)R * E * 4u);
     t.db = o; o += a256((uint64_t)R * E * 2u);
     t.dn = o; o += a256((uint64_t)R * E * 2u);
+    t.lora = o; o += a256((uint64_t)R * PULSAR_GEMMA4_LORA_RANK_MAX * 4u);   /* L338 P2: the runtime LoRA's [R][r] */
     const int qkv[3] = {(int)Qw, (int)KVw, (int)KVw}, qk[2] = {(int)Qf, (int)KVf};
     t.lin = o;
     t.lin_bytes = umax(umax(multi_ws((int)E, 3, qkv, R), multi_ws((int)E, 2, qk, R)),
@@ -278,7 +281,7 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
 /** The FFN arena: xd / xm / xr bf16 the three normed inputs (dense MLP, experts, router); fo f32 the routed sum; e1 /
  *  e2 bf16 the dense MLP's and the experts' rows; d1 / d2 bf16 their post-norms; then the MoE block's carved
  *  workspace (router, routed, the dense MLP's buffers as the block's one shared expert). */
-struct ffn_scratch { uint64_t xd, xm, xr, fo, e1, e2, d1, d2, u, moe_bytes, total; };
+struct ffn_scratch { uint64_t xd, xm, xr, fo, e1, e2, d1, d2, lora, u, moe_bytes, total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the FFN arena's offsets and size */
 ffn_scratch ffn_layout(uint32_t R) {
@@ -289,6 +292,7 @@ ffn_scratch ffn_layout(uint32_t R) {
     for (uint64_t *x : {&f.xd, &f.xm, &f.xr}) { *x = o; o += a256((uint64_t)R * E * 2u); }
     f.fo = o; o += a256((uint64_t)R * E * 4u);
     for (uint64_t *x : {&f.e1, &f.e2, &f.d1, &f.d2}) { *x = o; o += a256((uint64_t)R * E * 2u); }
+    f.lora = o; o += a256((uint64_t)R * PULSAR_GEMMA4_LORA_RANK_MAX * 4u);   /* L338 P2: the dense MLP's LoRA [R][r] */
     const pulsar_moe_block_shape bs = moe_shape(s);
     f.u = o; f.moe_bytes = a256(pulsar_moe_block_workspace_bytes(&bs, (int)R)); o += f.moe_bytes;
     f.total = o;
@@ -364,6 +368,14 @@ struct g4_state : pulsar_driver_state {
     pulsar_gpu_tensor *attn_desc;
     /// One call's descriptor bytes at max_rows, 256-aligned
     uint64_t attn_desc_max;
+    /// Host [max_rows]: L338 P2 -- 1 where the row's bank runs the runtime adapter (stage builds it; rows_scratch::ad)
+    uint8_t *row_adapter;
+    /// The staged step has rows on adapter banks: the LoRAs launch (stage sets it; part of the graph key)
+    bool step_adapter;
+    /// bf16 [n_embd]: L338 P2 -- the final-norm hidden of the last row the head read (the decision head's input)
+    pulsar_gpu_tensor *last_hidden;
+    /// The head has run since create: last_hidden holds a row
+    bool headed;
 };
 
 /** A step object: the driver's step (its base) plus the family's view -- the weights and the session state. */
@@ -388,7 +400,8 @@ const pulsar_gemma4_model *W(const pulsar_engine *e) { return (const pulsar_gemm
  *  @param st  the state (NULL = nothing) */
 void state_free(g4_state *st) {
     if (!st) return;
-    for (pulsar_gpu_tensor *t : {st->h, st->xa, st->rope_tab, st->ones, st->escale, st->attn_desc}) pulsar_gpu_tensor_free(t);
+    for (pulsar_gpu_tensor *t : {st->h, st->xa, st->rope_tab, st->ones, st->escale, st->attn_desc, st->last_hidden})
+        pulsar_gpu_tensor_free(t);
     free(st->seq_first);
     free(st->seq_bank);
     free(st->row_seq);
@@ -397,6 +410,7 @@ void state_free(g4_state *st) {
     free(st->attn_call);
     free(st->attn_off);
     free(st->attn_desc_host);
+    free(st->row_adapter);
     free(st->trunk);
     free(st);
 }
@@ -447,6 +461,7 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->seq_bank = (int32_t *)xmalloc(R * sizeof(int32_t));
     st->row_seq = (uint32_t *)xmalloc(R * sizeof(uint32_t));
     st->row_pos = (uint32_t *)xmalloc(R * sizeof(uint32_t));
+    st->row_adapter = (uint8_t *)xcalloc(R, 1);
     st->seqs = (pulsar_gqa_seq *)xcalloc(R, sizeof(pulsar_gqa_seq));
     st->trunk = (g4_step *)xcalloc(1, sizeof(g4_step));
     st->trunk->w = W(e);
@@ -456,7 +471,9 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->attn_off = (uint64_t *)xcalloc(NL, sizeof(uint64_t));
     st->attn_desc_host = (uint8_t *)xmalloc(NL * st->attn_desc_max);
     st->attn_desc = pulsar_gpu_tensor_alloc(NL * st->attn_desc_max);
-    const bool ok = st->h && st->xa && st->rope_tab && st->ones && st->escale && st->attn_desc && constants(e, st);
+    st->last_hidden = pulsar_gpu_tensor_alloc((uint64_t)sh.n_embd * 2u);
+    const bool ok = st->h && st->xa && st->rope_tab && st->ones && st->escale && st->attn_desc && st->last_hidden &&
+                    constants(e, st);
     if (!ok) {
         fprintf(stderr, "pulsar: %s: session state allocation failed (%u banks x %d tokens)\n", ARCH, n_banks,
                 s->ctx_size);
@@ -478,6 +495,11 @@ bool verifies(const pulsar_session *) { return false; }
  *  @param s  the session
  *  @return the trunk's step object */
 pulsar_driver_step *trunk(pulsar_session *s) { return ST(s)->trunk; }
+
+/** pulsar_driver_ops::adapter (L338 P2).
+ *  @param e  the engine
+ *  @return the container carries the runtime adapter */
+bool has_adapter(const pulsar_engine *e) { return W(e)->adapter; }
 
 /** pulsar_driver_ops::artifact.
  *  @param e  the engine
@@ -665,10 +687,20 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
         if (!plan_call(st, il, bound, (uint64_t)il * stride, stride)) return false;
     if (pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)st->plan->n_layer * stride) == 0)
         return fail("could not upload the attention descriptors");
-    /* the key: the "G4" tag in bits 48..63, the bound in bits 1..32, bit 0 set (a key is nonzero); a decode step's
-     * shapes follow from the row count (one sequence a row) */
+    /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only) */
+    q->step_adapter = false;
+    for (uint32_t r = 0; r < st->n_rows; r++) {
+        q->row_adapter[r] = q->bank_adapter && q->bank_adapter[st->bank[r]] ? 1u : 0u;
+        q->step_adapter |= q->row_adapter[r] != 0;
+    }
+    if (q->step_adapter && pulsar_gpu_tensor_write_async(q->scratch[ARENA_ROWS], rows_layout(q->max_rows).ad,
+                                                         q->row_adapter, st->n_rows) == 0)
+        return fail("could not upload the adapter rows");
+    /* the key: the "G4" tag in bits 48..63, bit 47 the LoRAs launched (L338 P2: which rows they touch is the mask's,
+     * read at replay), the bound in bits 1..32, bit 0 set (a key is nonzero); a decode step's shapes follow from the
+     * row count (one sequence a row) */
     if (bound > st->states->ctx) return fail("an attention bound past the pools' context");
-    *graph_key = (0x4734ull << 48) | ((uint64_t)bound << 1) | 1u;
+    *graph_key = (0x4734ull << 48) | ((uint64_t)q->step_adapter << 47) | ((uint64_t)bound << 1) | 1u;
     return true;
 }
 
@@ -687,6 +719,27 @@ bool embed(const pulsar_driver_step *st0) {
                                     (const int32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + L.ids), st->n_rows,
                                     (uint16_t *)dptr(st->st->h), s.n_embd, 0) == 0 ||
            fail("the embedding refused");
+}
+
+/* ---- the runtime adapter (L338 P2) ---------------------------------------------------------------------------------- */
+
+/* one projection's LoRA on its f32 output, on the step's adapter rows (rows_scratch::ad) */
+/** @param st    the step (its model and adapter rows)
+ *  @param l     the projection's pair
+ *  @param x     the projection's bf16 input rows
+ *  @param ld_x  their pitch
+ *  @param in    the LoRA's input width
+ *  @param y     the f32 output rows
+ *  @param ld_y  their pitch
+ *  @param out   the LoRA's output width
+ *  @param ws    the f32 [rows][r] workspace
+ *  @return true = launched */
+bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x, uint64_t ld_x, uint32_t in, float *y,
+               uint64_t ld_y, uint32_t out, float *ws) {
+    const float *A = (const float *)wp(st, l.a, "gemma4 lora_A"), *B = (const float *)wp(st, l.b, "gemma4 lora_B");
+    const uint8_t *rows = (const uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).ad;
+    return A && B && pulsar_rows_lora_launch(x, ld_x, st->n_rows, in, A, st->w->lora_r, B, out, st->w->lora_scale, y,
+                                             ld_y, ws, rows, 0) == 0;
 }
 
 /* ---- the attention ------------------------------------------------------------------------------------------------- */
@@ -717,6 +770,16 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
         uint16_t *yb16[3] = {qb, kb, vb};
         if (!step_linears(st, full ? 2 : 3, t, (int)E, outs, what, xa, y, yb16, base + M.lin, M.lin_bytes))
             return failf("the q / k / v projections refused", il);
+        /* L338 P2: the adapter's LoRAs on the f32 projections, then their bf16 rows again (a plain row re-rounds to the
+         * same bits); on a global layer k's carries into v (K = V: v is k_proj's output) */
+        if (q->step_adapter) {
+            float *ws = (float *)(base + M.lora);
+            const pulsar_gemma4_lora *lp[3] = {&L.lora_q, &L.lora_k, &L.lora_v};
+            for (int j = 0; j < (full ? 2 : 3); j++)
+                if (!lora_rows(st, *lp[j], xa, E, E, y[j], (uint64_t)outs[j], (uint32_t)outs[j], ws) ||
+                    !emit(y[j], yb16[j], n, (uint32_t)outs[j]))
+                    return failf("the q / k / v LoRAs refused", il);
+        }
     }
     /* v = v_norm(v_pre) per KV head, no weight (the ones vector: bit-exact); v_pre is k_proj's output on a global
      * layer (HF: value_states = key_states before k_norm when attention_k_eq_v) */
@@ -742,6 +805,9 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     uint16_t *yb16[1] = {db};
     if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, yb16, base + M.lin, M.lin_bytes))
         return failf("the o_proj refused", il);
+    if (q->step_adapter && (!lora_rows(st, L.lora_o, ab, Q, Q, y[0], E, E, (float *)(base + M.lora)) ||
+                            !emit(y[0], db, n, E)))   /* L338 P2 */
+        return failf("the o_proj LoRA refused", il);
     return norm(db, (const uint16_t *)wp(st, L.attn_post_norm, "gemma4 post_attention_layernorm"),
                 (uint16_t *)(base + M.dn), n, E) ||
            failf("the post-attention norm refused", il);
@@ -775,8 +841,31 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
     pulsar_moe_block_parts parts;
     if (pulsar_moe_block_carve(&bs, (int)n, base + F.u, F.moe_bytes, &parts) != 0) return failf("the MoE workspace", il);
     /* the dense MLP: down(gelu_tanh(gate xd) * up xd), per row-kind segment, through the block's shared-expert buffers */
+    /* L338 P2: the adapter's LoRAs on the dense MLP's three Linears (the shared producer adds them to its f32 outputs) */
+    const uint8_t *ad_rows = (const uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).ad;
+    pulsar_rows_lora lg{}, lu{}, ld{};
+    if (st->st->step_adapter) {
+        const pulsar_gemma4_lora *src[3] = {&L.lora_gate, &L.lora_up, &L.lora_down};
+        pulsar_rows_lora *dst[3] = {&lg, &lu, &ld};
+        for (int j = 0; j < 3; j++) {
+            dst[j]->A = (const float *)wp(st, src[j]->a, "gemma4 mlp lora_A");
+            dst[j]->B = (const float *)wp(st, src[j]->b, "gemma4 mlp lora_B");
+            dst[j]->r = st->w->lora_r;
+            dst[j]->in = j < 2 ? E : s.n_ff;
+            dst[j]->out = j < 2 ? s.n_ff : E;
+            dst[j]->scale = st->w->lora_scale;
+            if (!dst[j]->A || !dst[j]->B) return failf("the MLP LoRA's weights are missing", il);
+        }
+    }
     const bool dense_ok = arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
         pulsar_rows_moe_shared qd{};
+        if (st->st->step_adapter) {
+            qd.lora_gate = &lg;
+            qd.lora_up = &lu;
+            qd.lora_down = &ld;
+            qd.lora_rows = ad_rows + r0;
+            qd.lora_ws = (float *)(base + F.lora);
+        }
         qd.act = PULSAR_FFN_ACT_GEGLU_TANH;
         qd.scale = NULL;
         qd.yg = parts.yg + (size_t)r0 * Fd;
@@ -900,7 +989,38 @@ bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out
         pulsar_rows_linear_launch(&l, xb, (int)n, logits, base + H.lin, H.lin_bytes, 0) != 0)
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
-    return pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) == 0 || fail("the logits finish refused");
+    if (pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) != 0) return fail("the logits finish refused");
+    /* L338 P2: the last headed row's final-norm hidden, kept for the decision head (pulsar_session_copy_hidden) */
+    const uint64_t rb = (uint64_t)s.n_embd * 2u;
+    if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, 0, st->st->xa, (uint64_t)(row0 + n - 1) * rb, rb) == 0)
+        return fail("could not keep the last row's hidden");
+    st->st->headed = true;
+    return true;
+}
+
+/** pulsar_driver_ops::hidden (L338 P2): the last headed row's final-norm hidden, widened from bf16.
+ *  @param s      the session
+ *  @param out    receives n_embd floats
+ *  @param cap    floats at out
+ *  @return n_embd, or 0 when nothing was headed or cap is short (said) */
+uint32_t hidden(pulsar_session *s, float *out, uint32_t cap) {
+    g4_state *q = ST(s);
+    const uint32_t E = W(s->engine)->shape.n_embd;
+    if (!q->headed || cap < E) {
+        fprintf(stderr, "pulsar: %s: hidden readout: %s -- refusing\n", ARCH,
+                !q->headed ? "no row headed yet" : "the buffer is shorter than the hidden width");
+        return 0;
+    }
+    std::vector<uint16_t> h(E);
+    if (pulsar_gpu_synchronize() == 0 || !pulsar_gpu_tensor_read(q->last_hidden, 0, h.data(), (uint64_t)E * 2u)) {
+        fail("could not read the last row's hidden");
+        return 0;
+    }
+    for (uint32_t i = 0; i < E; i++) {
+        const uint32_t u = (uint32_t)h[i] << 16;
+        memcpy(&out[i], &u, 4);
+    }
+    return E;
 }
 
 /** pulsar_driver_ops::step_end: the routed experts' non-finite flag (rule 9).
@@ -979,5 +1099,7 @@ const pulsar_driver_ops PULSAR_GEMMA4_DRIVER = {
     /* .stage         = */ stage,   /* the host half; the ops are launch-only (a decode step graphs) */
     /* .read_ahead    = */ NULL,
     /* .read_ahead_pool = */ NULL,
+    /* .adapter       = */ has_adapter,   /* L338 P2: the JEV LoRA, per bank */
+    /* .hidden        = */ hidden,        /* L338 P2: the decision head's input */
 };
 static_assert(PULSAR_LAYER_BLOCKS == 4 && PULSAR_LAYER_KIND_COUNT == 5, "the block table's slot is the kind's value");

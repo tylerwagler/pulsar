@@ -67,6 +67,8 @@ static void driver_bufs_free(pulsar_driver_state *d) {
     d->mtp = NULL;
     pulsar_block_lane_free(d->block);
     d->block = NULL;
+    free(d->bank_adapter);
+    d->bank_adapter = NULL;
 }
 
 /* The family's state, the driver's buffers and the declared state, built into a session the core allocated (L272
@@ -130,7 +132,10 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks) {
         ok = (d->tp_ticket = pulsar_gpu_tensor_alloc(sizeof(uint32_t))) != NULL &&
              (d->tp_vocab_own = pulsar_gpu_tensor_alloc(vb)) != NULL;
     }
+    /* L338 P2: the per-bank adapter switch, every bank plain (host only: the family's stage reads it per step) */
+    if (ok && ops->adapter && ops->adapter(e)) d->bank_adapter = (uint8_t *)xcalloc(n_banks, 1);
     if (ok) s->states->ckpt.artifact = ops->artifact(e);
+    if (ok) s->states->ckpt.bank_adapter = d->bank_adapter;
     if (ok && e->tp) {   /* L266 step 7: the engine's lanes; the ticket is the session's (priced with it), zeroed here */
         const uint32_t zero = 0;
         d->tp = e->tp;

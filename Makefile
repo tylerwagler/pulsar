@@ -1161,6 +1161,20 @@ GEMMA4_GATE_MODEL ?= $(call need_path,GEMMA4_GATE_MODEL)
 gemma4-family-gate: tests/gemma4_family_gate tests/loader_open
 	./tests/gemma4_family_gate $(GEMMA4_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(GEMMA4_GATE_MODEL)
+# L338 P2.3: the runtime JEV adapter on a container built with --adapter jev (tests/gemma4_jev_gate.cpp): the bank
+# switch, every decision prompt synced on an adapter bank, reuse == cold, the plain bank untouched; then the decision
+# head on the captured hidden rows against the BF16 reference (tests/gemma4/jev_grade.py).  Needs the full model (the
+# RTX 6000).  GEMMA4_JEV_REF = decision_ref.pt (L338 P0), GEMMA4_JEV_SNAP = the JEV snapshot (head + calibration).
+GEMMA4_JEV_MODEL ?= $(call need_path,GEMMA4_JEV_MODEL)
+GEMMA4_JEV_REF ?= $(call need_path,GEMMA4_JEV_REF)
+GEMMA4_JEV_SNAP ?= $(call need_path,GEMMA4_JEV_SNAP)
+GEMMA4_JEV_WORK ?= /tmp/gemma4-jev
+.PHONY: gemma4-jev-gate
+gemma4-jev-gate: tests/gemma4_jev_gate
+	mkdir -p $(GEMMA4_JEV_WORK)
+	python3 tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
+	./tests/gemma4_jev_gate $(GEMMA4_JEV_MODEL) $(GEMMA4_JEV_WORK)/cases.bin $(GEMMA4_JEV_WORK)/out.bin
+	python3 tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
 # L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
 # every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
@@ -3389,6 +3403,10 @@ tests/gemma4_family_gate.o: tests/gemma4_family_gate.cpp src/families/gemma4/gem
                             src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/gemma4_family_gate: tests/gemma4_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/gemma4_jev_gate.o: tests/gemma4_jev_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/gemma4_jev_gate: tests/gemma4_jev_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotron_h/nemotron_h.h src/engine/role_bind.h \
                               src/engine/pulsar_engine_internal.h src/pulsar.h

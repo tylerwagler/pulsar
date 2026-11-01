@@ -395,10 +395,12 @@ constexpr int kLoraUpThreads = 256;
 /// @param A    f32 [r][in]
 /// @param r    the rank
 /// @param ws   f32 [rows][r]
+/// @param rows u8 [rows] the rows the LoRA applies to, or NULL (every row)
 __global__ void lora_down_kernel(const __nv_bfloat16 *__restrict__ x, uint64_t ld_x, uint32_t in,
-                                 const float *__restrict__ A, uint32_t r, float *__restrict__ ws) {
+                                 const float *__restrict__ A, uint32_t r, float *__restrict__ ws,
+                                 const uint8_t *__restrict__ rows) {
     const uint32_t t = blockIdx.x, j = blockIdx.y * kLoraWarps + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (j >= r) return;
+    if (j >= r || (rows && !rows[t])) return;
     const __nv_bfloat16 *xr = x + (uint64_t)t * ld_x;
     const float *a = A + (uint64_t)j * in;
     float acc = 0.0f;
@@ -415,10 +417,11 @@ __global__ void lora_down_kernel(const __nv_bfloat16 *__restrict__ x, uint64_t l
 /// @param scale alpha / r
 /// @param y     f32 output rows
 /// @param ld_y  y's row pitch
+/// @param rows  u8 [rows] the rows the LoRA applies to, or NULL (every row)
 __global__ void lora_up_kernel(const float *__restrict__ ws, uint32_t r, const float *__restrict__ B, uint32_t out,
-                               float scale, float *__restrict__ y, uint64_t ld_y) {
+                               float scale, float *__restrict__ y, uint64_t ld_y, const uint8_t *__restrict__ rows) {
     const uint32_t t = blockIdx.y, o = blockIdx.x * kLoraUpThreads + threadIdx.x;
-    if (o >= out) return;
+    if (o >= out || (rows && !rows[t])) return;
     const float *w = ws + (uint64_t)t * r, *b = B + (uint64_t)o * r;
     float acc = 0.0f;
     for (uint32_t j = 0; j < r; j++) acc = fmaf(__ldg(b + j), w[j], acc);
@@ -427,7 +430,7 @@ __global__ void lora_up_kernel(const float *__restrict__ ws, uint32_t r, const f
 
 extern "C" int pulsar_rows_lora_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t in, const float *A,
                                        uint32_t r, const float *B, uint32_t out, float scale, float *y, uint64_t ld_y,
-                                       float *ws, cudaStream_t stream) {
+                                       float *ws, const uint8_t *rows, cudaStream_t stream) {
     if (!x || !A || !B || !y || !ws || n_rows == 0 || n_rows > 65535u || in == 0 || in > ld_x || r == 0 || r > 1024u ||
         out == 0 || out > ld_y || !isfinite(scale)) {
         fprintf(stderr, "pulsar: rows lora: %u rows (1 .. 65535), in %u <= ld_x %llu, rank %u (1 .. 1024), out %u <= "
@@ -436,10 +439,10 @@ extern "C" int pulsar_rows_lora_launch(const uint16_t *x, uint64_t ld_x, uint32_
         return -1;
     }
     lora_down_kernel<<<dim3(n_rows, (r + kLoraWarps - 1) / kLoraWarps), kLoraWarps * 32, 0, stream>>>(
-        (const __nv_bfloat16 *)x, ld_x, in, A, r, ws);
+        (const __nv_bfloat16 *)x, ld_x, in, A, r, ws, rows);
     if (launched("lora down")) return -3;
     lora_up_kernel<<<dim3((out + kLoraUpThreads - 1) / kLoraUpThreads, n_rows), kLoraUpThreads, 0, stream>>>(
-        ws, r, B, out, scale, y, ld_y);
+        ws, r, B, out, scale, y, ld_y, rows);
     return launched("lora up");
 }
 

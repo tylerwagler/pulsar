@@ -385,17 +385,20 @@ static uint32_t segment_pools(pulsar_ckpt_store *st, pulsar_kv_pool *pools) {
     return n <= PULSAR_KV_POOLS_MAX ? n : 0u;   /* a model past the bound refuses every segment */
 }
 
-/** FNV-1a over what makes a segment's bytes readable: the state model's name, the artifact (when set), the grid,
- *  the slot size and every pool's tokens per row and row bytes.
- *  @param st the store
+/** FNV-1a over what makes a segment's bytes readable: the state model's name, the artifact (when set), the bank's
+ *  runtime adapter (L338: only when on -- a plain bank's digest is as it was), the grid, the slot size and every
+ *  pool's tokens per row and row bytes.
+ *  @param st   the store
+ *  @param bank the bank the segment is written from / read into
  *  @return the digest */
-static uint64_t segment_layout_digest(pulsar_ckpt_store *st) {
+static uint64_t segment_layout_digest(pulsar_ckpt_store *st, uint32_t bank) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     for (const char *c = st->ops->name; *c; c++) mix((uint8_t)*c);
     if (st->artifact) mix(st->artifact);   /* 0 leaves DeepSeek's digests as they were */
+    if (st->bank_adapter && st->bank_adapter[bank]) for (const char *c = "runtime-adapter"; *c; c++) mix((uint8_t)*c);
     mix(st->ops->resume_grid);
     mix(st->slot_bytes);
     mix(n);
@@ -573,7 +576,7 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     io.fp = fp;
     payload_digest_init(&io.digest);
     pulsar_writeback_init(&io.wb, fp);
-    const uint64_t layout = segment_layout_digest(st);
+    const uint64_t layout = segment_layout_digest(st, bank);
     const uint32_t header[SEGMENT_U32_FIELDS] = {
         PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION,
         (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G_prev, G,
@@ -635,7 +638,7 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
         payload_set_err(err, errlen, "load segment: unsupported segment version");
         return 1;
     }
-    const uint64_t layout = segment_layout_digest(st);
+    const uint64_t layout = segment_layout_digest(st, bank);
     if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes ||
         h[5] != st->ops->resume_grid) {
         payload_set_err(err, errlen, "load segment: written for a different state layout");
@@ -851,9 +854,11 @@ static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
 /// @param pools [n] the payload's pools
 /// @param n     pools
 /// @param width the logits width
+/// @param bank  the bank the payload is written from / read into (its runtime adapter, L338)
 /// @return the digest
-static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t width) {
-    uint64_t h = segment_layout_digest(st);
+static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t width,
+                                  uint32_t bank) {
+    uint64_t h = segment_layout_digest(st, bank);
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     mix(n);
     for (uint32_t i = 0; i < n; i++) { mix(pools[i].tokens_per_row); mix(pools[i].row_bytes); mix(pools[i].whole_rows); }
@@ -982,7 +987,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     io.fp = fp;
     payload_digest_init(&io.digest);
     pulsar_writeback_init(&io.wb, fp);
-    const uint64_t layout = kvp_layout_digest(st, p.pools, p.n_pools, p.width);
+    const uint64_t layout = kvp_layout_digest(st, p.pools, p.n_pools, p.width, pulsar_session_live_bank(s));
     const uint32_t header[KVP_U32_FIELDS] = {
         PULSAR_SESSION_KV_PAYLOAD_MAGIC, PULSAR_SESSION_KV_PAYLOAD_VERSION, (uint32_t)layout, (uint32_t)(layout >> 32),
         p.T, p.PF, p.G, p.width,
@@ -1050,7 +1055,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
-    const uint64_t layout = kvp_layout_digest(st, pools, n, width);
+    const uint64_t layout = kvp_layout_digest(st, pools, n, width, bank);
     if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[7] != width) {
         payload_set_err(err, errlen, "session payload: written for a different state layout");
         return 1;

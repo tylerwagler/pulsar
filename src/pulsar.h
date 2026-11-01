@@ -1317,6 +1317,13 @@ int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token,
  *  @param cap floats at out
  *  @return floats copied (the width), or 0 when cap is short or nothing is live */
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
+/** L338 P2: the final-norm hidden state of the last row the head produced logits for -- after a sync, the prompt's
+ *  last token's (what a decision head reads: Gemma 4's JEV judge) -- as f32.
+ *  @param s the session
+ *  @param out receives the model's hidden width of floats
+ *  @param cap floats at out
+ *  @return floats copied (the hidden width), or 0 when the family offers none, cap is short or nothing was headed */
+int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap);
 /** Overwrite the live logits row (mirrored on a TP group).
  *  @param s the session
  *  @param logits the row
@@ -1505,6 +1512,24 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
 /** @param s the session
  *  @return the pool size (1 when not pooled; 0 for a family without banks) */
 int  pulsar_session_bank_count(pulsar_session *s);
+/** L338 P2: whether the engine carries a runtime adapter (a LoRA its family applies per bank: Gemma 4's JEV judge).
+ *  @param e the engine
+ *  @return true when pulsar_session_set_bank_adapter can turn it on */
+bool pulsar_engine_has_adapter(pulsar_engine *e);
+/** L338 P2: run bank `bank` with (on) or without the engine's runtime adapter.  A bank's K / V are the adapter's while
+ *  it is on, so the switch moves only an EMPTY bank (position 0: invalidate it first); the bank's segments and
+ *  payloads carry the switch in their layout digest, so the disk store never crosses it.  The caller keeps adapter
+ *  banks' prompts apart from plain ones (slot routing, adoption).
+ *  @param s    the session
+ *  @param bank the bank
+ *  @param on   adapter on (true) or off
+ *  @return true = set; false = refused (said): no adapter, a bank out of range or not empty */
+bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on);
+/** L338 P2: whether bank `bank` runs the runtime adapter.
+ *  @param s    the session
+ *  @param bank the bank
+ *  @return true when on */
+bool pulsar_session_bank_adapter(const pulsar_session *s, uint32_t bank);
 /** Point the device views at `bank` (a family without a separate repoint restores it instead).
  *  @param s the session
  *  @param bank the bank

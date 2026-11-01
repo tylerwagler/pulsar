@@ -229,10 +229,23 @@ int pulsar_rows_gather_f16_launch(const uint16_t *table, uint32_t n_vocab, uint3
 /// @param y      device f32 output rows (ld_y apart), accumulated into
 /// @param ld_y   y's row pitch in elements (>= out)
 /// @param ws     device f32 [n_rows][r] workspace
+/// @param rows   device u8 [n_rows]: the rows the LoRA applies to (nonzero); NULL = every row.  A row not marked is not
+///               read or written -- its bytes are the base linear's (a step mixing adapter banks with plain ones)
 /// @param stream stream to launch on
 int pulsar_rows_lora_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t in, const float *A, uint32_t r,
                             const float *B, uint32_t out, float scale, float *y, uint64_t ld_y, float *ws,
-                            cudaStream_t stream);
+                            const uint8_t *rows, cudaStream_t stream);
+
+/** L338: one projection's runtime LoRA as a producer takes it (pulsar_rows_moe_shared's dense MLP): its device pair at
+ *  the logical widths and its scale; the rows and the workspace are the call's. */
+typedef struct pulsar_rows_lora {
+    const float *A;   ///< device f32 [r][in]
+    const float *B;   ///< device f32 [out][r]
+    uint32_t r;       ///< the rank
+    uint32_t in;      ///< the input width (<= the producer's input pitch)
+    uint32_t out;     ///< the output width (<= the producer's output pitch)
+    float scale;      ///< alpha / r
+} pulsar_rows_lora;
 
 #ifdef __cplusplus
 }

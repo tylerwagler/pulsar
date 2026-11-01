@@ -7,6 +7,7 @@
  *   L3  row independence: every row of a 37-row call == that row computed alone (1-row call), byte for byte
  *   L4  determinism: two calls on the same inputs, byte for byte
  *   L5  refusals: rank 0, in > ld_x, out > ld_y, NaN scale
+ *   L6  a row mask: the marked rows == the full call's, the unmarked rows == the base y, byte for byte
  * Exit 0 = every check passed. */
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -45,7 +46,7 @@ static bool run_case(uint32_t T, uint32_t in, uint64_t ld_x, uint32_t r, uint32_
     cudaMemcpy(dB.p, B.data(), B.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dy.p, y0.data(), y0.size() * 4, cudaMemcpyHostToDevice);
     if (pulsar_rows_lora_launch((const uint16_t *)dx.p, ld_x, T, in, (float *)dA.p, r, (float *)dB.p, out, scale,
-                                (float *)dy.p, ld_y, (float *)dw.p, 0) != 0 || cudaDeviceSynchronize() != cudaSuccess)
+                                (float *)dy.p, ld_y, (float *)dw.p, NULL, 0) != 0 || cudaDeviceSynchronize() != cudaSuccess)
         return false;
     std::vector<float> y(y0.size());
     cudaMemcpy(y.data(), dy.p, y.size() * 4, cudaMemcpyDeviceToHost);
@@ -81,7 +82,7 @@ static bool run_case(uint32_t T, uint32_t in, uint64_t ld_x, uint32_t r, uint32_
     /* L4: the same call again */
     cudaMemcpy(dy2.p, y0.data(), y0.size() * 4, cudaMemcpyHostToDevice);
     pulsar_rows_lora_launch((const uint16_t *)dx.p, ld_x, T, in, (float *)dA.p, r, (float *)dB.p, out, scale,
-                            (float *)dy2.p, ld_y, (float *)dw.p, 0);
+                            (float *)dy2.p, ld_y, (float *)dw.p, NULL, 0);
     std::vector<float> y2(y0.size());
     cudaMemcpy(y2.data(), dy2.p, y2.size() * 4, cudaMemcpyDeviceToHost);
     CHECK(memcmp(y.data(), y2.data(), y.size() * 4) == 0, "L4 %s: two calls byte-identical", what);
@@ -90,12 +91,25 @@ static bool run_case(uint32_t T, uint32_t in, uint64_t ld_x, uint32_t r, uint32_
     for (uint32_t t = 0; t < T && same; t++) {
         cudaMemcpy(dy2.p, y0.data() + t * ld_y, ld_y * 4, cudaMemcpyHostToDevice);
         pulsar_rows_lora_launch((const uint16_t *)dx.p + t * ld_x, ld_x, 1, in, (float *)dA.p, r, (float *)dB.p, out,
-                                scale, (float *)dy2.p, ld_y, (float *)dw.p, 0);
+                                scale, (float *)dy2.p, ld_y, (float *)dw.p, NULL, 0);
         std::vector<float> one(ld_y);
         cudaMemcpy(one.data(), dy2.p, ld_y * 4, cudaMemcpyDeviceToHost);
         same = memcmp(one.data(), y.data() + t * ld_y, ld_y * 4) == 0;
     }
     CHECK(same, "L3 %s: every row of the %u-row call == that row alone, byte for byte", what, T);
+    /* L6: a row mask -- marked rows == the unmasked call's, unmarked rows == y0, byte for byte */
+    std::vector<uint8_t> mask(T);
+    for (uint32_t t = 0; t < T; t++) mask[t] = (uint8_t)(t % 3 != 1);
+    dev dm(T);
+    cudaMemcpy(dm.p, mask.data(), T, cudaMemcpyHostToDevice);
+    cudaMemcpy(dy2.p, y0.data(), y0.size() * 4, cudaMemcpyHostToDevice);
+    pulsar_rows_lora_launch((const uint16_t *)dx.p, ld_x, T, in, (float *)dA.p, r, (float *)dB.p, out, scale,
+                            (float *)dy2.p, ld_y, (float *)dw.p, (const uint8_t *)dm.p, 0);
+    cudaMemcpy(y2.data(), dy2.p, y2.size() * 4, cudaMemcpyDeviceToHost);
+    bool masked = true;
+    for (uint32_t t = 0; t < T; t++)
+        masked &= memcmp(y2.data() + t * ld_y, (mask[t] ? y.data() : y0.data()) + t * ld_y, ld_y * 4) == 0;
+    CHECK(masked, "L6 %s: a row mask -- marked rows == the full call's, the others == the base, byte for byte", what);
     return true;
 }
 
@@ -116,10 +130,10 @@ int main() {
     dev d(1 << 20);
     float *f = (float *)d.p;
     const uint16_t *x = (const uint16_t *)d.p;
-    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 0, f, 64, 1.0f, f, 64, f, 0) == -1, "L5 rank 0 refused");
-    CHECK(pulsar_rows_lora_launch(x, 32, 1, 64, f, 4, f, 64, 1.0f, f, 64, f, 0) == -1, "L5 in > ld_x refused");
-    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 4, f, 65, 1.0f, f, 64, f, 0) == -1, "L5 out > ld_y refused");
-    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 4, f, 64, NAN, f, 64, f, 0) == -1, "L5 a NaN scale refused");
+    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 0, f, 64, 1.0f, f, 64, f, NULL, 0) == -1, "L5 rank 0 refused");
+    CHECK(pulsar_rows_lora_launch(x, 32, 1, 64, f, 4, f, 64, 1.0f, f, 64, f, NULL, 0) == -1, "L5 in > ld_x refused");
+    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 4, f, 65, 1.0f, f, 64, f, NULL, 0) == -1, "L5 out > ld_y refused");
+    CHECK(pulsar_rows_lora_launch(x, 64, 1, 64, f, 4, f, 64, NAN, f, 64, f, NULL, 0) == -1, "L5 a NaN scale refused");
     printf("\nlora_rows_gate: %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;
 }

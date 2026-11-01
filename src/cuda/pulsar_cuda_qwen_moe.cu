@@ -438,6 +438,11 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int m
 /// @return true when q can ride (SwiGLU, three EXL3 slices H -> mid -> H); false said
 static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
     const int smid = q->gate.out;
+    if (q->lora_gate || q->lora_up || q->lora_down) {   /* L338: the routed fold has no LoRA step */
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert carries a runtime LoRA; it runs "
+                        "pulsar_rows_moe_shared_launch (the LoRA is added to its f32 outputs) -- refusing\n");
+        return false;
+    }
     if (q->act != PULSAR_FFN_ACT_SWIGLU) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is SwiGLU (the EXL3 front door's fold); "
                         "activation %d runs pulsar_rows_moe_shared_launch -- refusing\n", (int)q->act);
@@ -631,12 +636,13 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
     const bool gated = q && q->act != PULSAR_FFN_ACT_RELU2;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
+    const bool any_lora = q && (q->lora_gate || q->lora_up || q->lora_down);
     if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2 && q->act != PULSAR_FFN_ACT_GEGLU_TANH) ||
         (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
-        q->down.in != smid || q->down.out != H) {
-        fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers -- "
-                        "refusing\n", what, q ? (int)q->act : -1, gated ? "a gate of the up's shape, " : "", H, smid,
-                q ? q->down.in : -1, q ? q->down.out : -1);
+        q->down.in != smid || q->down.out != H || (any_lora && !q->lora_ws) || (q && q->lora_gate && !gated)) {
+        fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers "
+                        "(a LoRA's workspace; no gate LoRA without a gate) -- refusing\n", what, q ? (int)q->act : -1,
+                gated ? "a gate of the up's shape, " : "", H, smid, q ? q->down.in : -1, q ? q->down.out : -1);
         return false;
     }
     return true;
@@ -649,13 +655,22 @@ static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
 /// @param stream stream to launch on
 /// @return 0 on success, negative on a refusal or a launch failure
 static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
+    /* L338: a Linear's runtime LoRA on its f32 output, before anything reads it */
+    auto lora = [&](const pulsar_rows_lora *l, const uint16_t *x, uint64_t ld_x, float *y, uint64_t ld_y) {
+        return !l ? 0 : pulsar_rows_lora_launch(x, ld_x, (uint32_t)T, l->in, l->A, l->r, l->B, l->out, l->scale, y, ld_y,
+                                                q->lora_ws, q->lora_rows, stream);
+    };
+    const int H = q->up.in, mid = q->up.out;
     int rc = q->act != PULSAR_FFN_ACT_RELU2 ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
                                                                         stream) : 0;
+    if (!rc && q->act != PULSAR_FFN_ACT_RELU2) rc = lora(q->lora_gate, x_bf16, H, q->yg, mid);
     if (!rc) rc = pulsar_rows_linear_launch(&q->up, x_bf16, T, q->yu, q->ws, q->ws_bytes, stream);
+    if (!rc) rc = lora(q->lora_up, x_bf16, H, q->yu, mid);
     if (rc) return rc;
     rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, q->up.out, (int)q->act, (__nv_bfloat16 *)q->h);
     if (!launch_ok("shared activation")) return -3;
-    return pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
+    rc = pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
+    return rc ? rc : lora(q->lora_down, q->h, mid, q->ys, q->down.out);
 }
 
 /* out += scale * ys */
