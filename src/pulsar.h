@@ -126,6 +126,7 @@ typedef enum {
     PULSAR_FAMILY_ID_NEMOTRON_H = 3, ///< NVIDIA Nemotron-H (Nemotron 3.5 Super VL; HF nemotron_h_omni; src/families/nemotron_h)
     PULSAR_FAMILY_ID_NEMOTRON_ENC = 4, ///< NVIDIA Nemotron-3.5 Embed / Rerank encoders (HF mistral3; src/families/nemotron_enc)
     PULSAR_FAMILY_ID_NEMOTRON_PARSE = 5, ///< NVIDIA Nemotron-3.5 Parse (HF nemotron_parse; src/families/nemotron_parse)
+    PULSAR_FAMILY_ID_GEMMA4 = 6,     ///< Google Gemma 4 26B-A4B (HF gemma4; src/families/gemma4; L338)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the

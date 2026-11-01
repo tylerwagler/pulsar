@@ -1145,6 +1145,15 @@ inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
 	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
+# L338 E2: the Gemma 4 family's load on a built container (tests/gemma4_family_gate.cpp): every tensor bound by its
+# bind record, every byte priced, the plan (PULSAR_FFN_DENSE_MOE), the stored widths, the facts, the session refusals;
+# then the loader contract's neutral faults on it.  Host-only.  The container: tools/container/build.py emit --hf <the
+# BF16 checkpoint> --exl3 <its exllamav3 1.6.5 K4 pack> --recipe format-maps/gemma4-exl3-k4.json --all (L338 E1).
+GEMMA4_GATE_MODEL ?= $(call need_path,GEMMA4_GATE_MODEL)
+.PHONY: gemma4-family-gate
+gemma4-family-gate: tests/gemma4_family_gate tests/loader_open
+	./tests/gemma4_family_gate $(GEMMA4_GATE_MODEL)
+	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(GEMMA4_GATE_MODEL)
 # L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
 # every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
@@ -3342,6 +3351,11 @@ tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/
                              src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/gemma4_family_gate.o: tests/gemma4_family_gate.cpp src/families/gemma4/gemma4.h src/engine/role_bind.h \
+                            src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/gemma4_family_gate: tests/gemma4_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotron_h/nemotron_h.h src/engine/role_bind.h \
                               src/engine/pulsar_engine_internal.h src/pulsar.h
