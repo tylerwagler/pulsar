@@ -740,6 +740,8 @@ const server_family_ops *server_tool_family(const server *s);
 extern const server_family_ops k_family_inkling;
 /** Nemotron-H's (family_nemotron_h.cpp). */
 extern const server_family_ops k_family_nemotron_h;
+/// Gemma 4's table (family_gemma4.cpp, L338).
+extern const server_family_ops k_family_gemma4;
 /** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */

@@ -2,16 +2,19 @@
  *
  * The shared BPE engine (src/lib/bpe_tokenizer.h) in its SentencePiece-BPE row ("gemma4": Replace(' ' -> U+2581), one
  * piece a run, a symbol per character with <0xXX> byte fallback) -- the checkpoint's tokenizer.json and
- * generation_config.json's eos_token_id list (<eos>, <turn|>, <tool_response|>) -- graded byte-exact against HF
+ * generation_config.json's eos_token_id list (<eos>, <turn|>, <|tool_response>) -- graded byte-exact against HF
  * tokenizers by gemma4-tok-gate.  The container carries both files beside its shards (tools/container/gemma4.py side
  * files).  A container without them does not load.
  *
- * The chat front (chat_open / chat_turn / chat_end_assistant) is not here yet: the family declares no CAP_CHAT, so the
- * core refuses those entries by name before it would call them (tokenizer.cpp chat_require). */
+ * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is the renderer,
+ * src/lib/gemma4_chat: the head is <bos> and the system turn (thinking's <|think|>, the system text), a turn the
+ * renderer's messages and generation prompt, the close the "<turn|>\n" a sampled turn's tail opens with.  The server
+ * renders with the same library behind its family table (src/server/family_gemma4.cpp). */
 /** @file gemma4_tokenizer.cpp
  *  @brief Gemma 4's tokenizer table: the shared BPE engine's SentencePiece-BPE row. */
 #include "gemma4.h"
 #include "lib/bpe_tokenizer.h"
+#include "lib/gemma4_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>
@@ -85,6 +88,89 @@ void encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span 
     encode_into(e, text, text ? strlen(text) : 0, spans, n_spans, out);
 }
 
+/* ---- the chat front, turn by turn: gemma4_chat's pieces, tokenized with their client spans.  The entries have no
+ * error return, so a refusal ends the process by name. */
+
+/** End the process for a chat-front refusal (the entries have no error return).
+ *  @param op   the public entry that refused
+ *  @param err  the renderer's or the think-mode check's reason */
+[[noreturn]] void chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s: %s -- exiting\n", ARCH, op, err);
+    exit(1);
+}
+
+/** Tokenize one rendered piece with its client spans and append it.
+ *  @param e       the engine
+ *  @param r       the renderer's text and spans
+ *  @param tokens  the ids are appended here */
+void chat_append(const pulsar_engine *e, const gemma4_render_out &r, pulsar_tokens *tokens) {
+    encode_into(e, r.text.data(), r.text.size(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
+}
+
+/* thinking on or off (the template has no effort level) */
+/** @param e           the engine
+ *  @param think_mode  the caller's mode; one the engine does not support ends the process
+ *  @param op          the public entry, for the refusal
+ *  @return thinking on */
+bool chat_thinking(pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
+    char err[256];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) chat_refuse(op, err);
+    return pulsar_think_mode_enabled(think_mode);
+}
+
+/* The head: <bos> and the system turn, its content the trusted text (another family's tool prompt: text here) and
+ * the client's system text -- client data both. */
+/** pulsar_family_tokenizer::chat_open.
+ *  @param e           the engine
+ *  @param tokens      the head's ids are appended here
+ *  @param trusted     the trusted system prefix (NULL = none)
+ *  @param system      the client's system text (NULL = none)
+ *  @param think_mode  thinking on or off (an unsupported mode ends the process) */
+void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+               pulsar_think_mode think_mode) {
+    const bool thinking = chat_thinking(e, think_mode, "pulsar_chat_open");
+    const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
+    gemma4_render_out r;
+    char err[256];
+    if (!gemma4_chat_render_head(content.empty() ? NULL : content.c_str(), thinking, &r, err, sizeof err))
+        chat_refuse("pulsar_chat_open", err);
+    chat_append(e, r, tokens);
+}
+
+/* One turn: the messages as the full render writes them after the head or a sampled turn's close, then the generation
+ * prompt. */
+/** pulsar_family_tokenizer::chat_turn.
+ *  @param e                  the engine
+ *  @param tokens             the turn's ids are appended here
+ *  @param msgs               the turn's messages (a NULL role reads as "user")
+ *  @param n                  the number of messages
+ *  @param generation_prompt  append the model's opening after the messages
+ *  @param think_mode         the generation prompt's thinking (an unsupported mode ends the process) */
+void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
+               pulsar_think_mode think_mode) {
+    const bool thinking = chat_thinking(e, think_mode, "pulsar_chat_append_turn");
+    std::vector<gemma4_msg_in> m((size_t)(n > 0 ? n : 0));
+    for (int i = 0; i < n; i++) {
+        m[(size_t)i] = {};
+        m[(size_t)i].role = msgs[i].role ? msgs[i].role : "user";
+        m[(size_t)i].content = msgs[i].content;
+    }
+    gemma4_render_out r;
+    char err[256];
+    if (!gemma4_chat_render_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err))
+        chat_refuse("pulsar_chat_append_turn", err);
+    chat_append(e, r, tokens);
+}
+
+/* the sampled turn's close: the "<turn|>\n" a tail opens with (the stop the model sampled is not committed) */
+/** pulsar_family_tokenizer::chat_end_assistant.
+ *  @param e       the engine
+ *  @param tokens  the close's ids are appended here */
+void chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    const char *close = gemma4_chat_assistant_close();
+    encode_into(e, close, strlen(close), NULL, 0u, tokens);
+}
+
 /** pulsar_family_tokenizer::is_stop.
  *  @param e      the engine
  *  @param token  a token id
@@ -94,7 +180,7 @@ bool is_stop(pulsar_engine *e, int token) {
     return false;
 }
 /* the config's eos_token_id (<eos> 1; the load checked it is one of generation_config's stop ids); a caller that ends
- * generation tests them all (<turn|> closes a chat turn) */
+ * generation tests them all (<turn|> closes a chat turn; <|tool_response> ends one that made calls) */
 /** pulsar_family_tokenizer::eos.
  *  @param e  the engine
  *  @return the shape's eos_id */
@@ -186,9 +272,9 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER = {
     /* .encode_text              = */ encode_text,
     /* .encode_rendered          = */ encode_rendered,
-    /* .chat_open                = */ NULL,   /* no CAP_CHAT yet: the core refuses the chat entries by name */
-    /* .chat_turn                = */ NULL,
-    /* .chat_end_assistant       = */ NULL,
+    /* .chat_open                = */ chat_open,
+    /* .chat_turn                = */ chat_turn,
+    /* .chat_end_assistant       = */ chat_end_assistant,
     /* .is_stop                  = */ is_stop,
     /* .eos                      = */ eos,
     /* .token_text               = */ token_text,

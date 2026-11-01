@@ -4751,6 +4751,72 @@ static void test_nemotron_refusals(void) {
     chat_conversation_free(&c);
 }
 
+/* ---- L338: Gemma 4's server table (family_gemma4.cpp over src/lib/gemma4_chat) -------------------------------- */
+
+/* The effort map: thinking on unless asked off (the server's one rule) -- on writes <|think|> in a system turn, off
+ * closes an empty thought channel in the generation prompt; every named effort but none is on (one level). */
+static void test_gemma4_effort_map(void) {
+    char err[256];
+    request r;
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
+    TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nx<turn|>\n<|turn>model\n"));
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    request_free(&r);
+    static const char *const off[] = {",\"reasoning_effort\":\"none\"",
+                                      ",\"chat_template_kwargs\":{\"enable_thinking\":false}"};
+    char body[256];
+    for (const char *o : off) {
+        snprintf(body, sizeof body, EFFORT_BODY("%s"), o);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == 0 && r.think_mode == PULSAR_THINK_NONE);
+        TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"));
+        request_free(&r);
+    }
+    for (const char *on : {"\"minimal\"", "\"low\"", "\"high\"", "\"max\"", "60"}) {
+        snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), on);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
+        request_free(&r);
+    }
+}
+
+/* A tool round trip through the server: the declaration in the system turn, the call and its result folded into the
+ * model turn (the result named by tool_call_id), and -- thinking off after a result -- no generation prompt (the
+ * model's turn continues); the refusals by name. */
+static void test_gemma4_tools_and_refusals(void) {
+    char err[256];
+    request r;
+    const char *tools = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{"
+                        "\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}]";
+    std::string body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"w?\"},{\"role\":\"assistant\","
+                       "\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":"
+                       "\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":"
+                       "\"c1\",\"content\":\"sunny\"}],\"reasoning_effort\":\"none\"") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    TEST_ASSERT(r.has_tools);
+    TEST_ASSERT(!strcmp(r.prompt_text,
+                        "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|><|\"|>,parameters:{properties:{"
+                        "city:{type:<|\"|>STRING<|\"|>}},type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nw?<turn|>\n"
+                        "<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:"
+                        "get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>"));
+    request_free(&r);
+    /* a required call: no forced-call prefill for this family yet -- refused by name */
+    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tool_choice\":\"required\"") + tools + "}";
+    TEST_ASSERT(!effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "gemma4") != NULL && strstr(err, "tool_choice") != NULL);
+    request_free(&r);
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
+    chat_conversation c = {};
+    c.msgs = msgs;
+    test_request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_GEMMA4, NULL, &c, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "vision tower") != NULL);
+    request_free(&r);
+    chat_conversation_free(&c);
+}
+
 /* The model-visible retry: the turn's close, ONE tool result (the error, the system turn reminded), the generation
  * prompt. */
 static void test_nemotron_tool_error_suffix_reminds_the_system_turn(void) {
@@ -12217,6 +12283,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_nemotron_hooks_compose_to_the_full_render();
     test_nemotron_raw_calls_replay_and_key();
     test_nemotron_refusals();
+    test_gemma4_effort_map();
+    test_gemma4_tools_and_refusals();
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
     test_live_tail_joins_before_a_committed_stop();

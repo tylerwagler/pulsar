@@ -107,8 +107,8 @@ int main(int argc, char **argv) {
           pulsar_engine_logits_width(e));
     check(!strcmp(pulsar_engine_model_name(e), "Gemma-4-26B-A4B"), "model name '%s'", pulsar_engine_model_name(e));
     check(pulsar_engine_model_id(e) == 7, "disk-KV model id %d", pulsar_engine_model_id(e));
-    check(!pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_NONE,
-          "no chat front yet (no CAP_CHAT)");
+    check(pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_GEMMA4,
+          "the chat front: CAP_CHAT, the Gemma 4 renderer");
     check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs");
     /* the tokenizer table (gemma4_tokenizer.cpp; tokenization itself is gemma4-chat-gate's, graded against HF) */
     pulsar_tokens hello = {0};
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
               pulsar_token_is_stop(e, 1) && pulsar_token_is_stop(e, 106) && pulsar_token_is_stop(e, 50) &&
               !pulsar_token_is_stop(e, 2) && pulsar_token_think_close(e) == 101 && pulsar_chat_turn_markers(e, &tm) &&
               tm.n_user == 2 && tm.user[0] == 105 && tm.n_assistant == 2 && tm.assistant[0] == 105,
-          "the tokenizer table: %d ids, \"Hello world\" -> %d tokens, stops <eos> <turn|> <tool_response|>, think close "
+          "the tokenizer table: %d ids, \"Hello world\" -> %d tokens, stops <eos> <turn|> <|tool_response>, think close "
           "<channel|>, turn markers <|turn> + the role word", pulsar_engine_vocab_size(e), hello.len);
     pulsar_tokens_free(&hello);
     int k2 = 0;
@@ -149,10 +149,11 @@ int main(int argc, char **argv) {
                                                                         : PULSAR_GEMMA4_STATE_KV_WIN);
     check(state_ok, "the declared state: kv_win RING %u keys x %llu B a window layer, kv_full POOL %llu B a token a "
           "global layer", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes);
-    check(e->family->caps == (PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_PAYLOAD) &&
+    check(e->family->caps == (PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
+                              PULSAR_FAMILY_CAP_PAYLOAD) &&
               e->family->banks == &PULSAR_BANK_OPS_DECLARED && e->family->spec == NULL &&
               e->family->driver->absorb == NULL && e->family->driver->mtp == NULL,
-          "caps 0x%x (banks, segments, payload: the driver's session over the declared state; no chat, spec, TP or "
+          "caps 0x%x (chat, banks, segments, payload: the driver's session over the declared state; no spec, TP or "
           "images yet)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "GEMMA4-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
