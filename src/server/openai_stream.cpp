@@ -236,15 +236,16 @@ bool http_error_context_length_exceeded(int fd,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-/// Write the 200 text/event-stream response head that opens every SSE stream.
-/// @param fd  the client socket
-/// @return false when the write failed
+/// The SSE response head (pulsar_server_internal.h).
 extern const char k_sse_head[] =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/event-stream\r\n"
     "Cache-Control: no-cache\r\n"
     "Connection: close\r\n\r\n";
 
+/// Write the 200 text/event-stream response head that opens every SSE stream.
+/// @param fd  the client socket
+/// @return false when the write failed
 bool sse_headers(int fd) {
     return send_all(fd, k_sse_head, sizeof k_sse_head - 1);
 }

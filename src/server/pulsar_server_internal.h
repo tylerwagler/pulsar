@@ -1196,7 +1196,6 @@ bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
 /** Start the writer's keepalive clock now (the socket carried bytes before the writer existed: L249 D). */
-/// @param w  the writer
 void slot_writer_mark_written(slot_writer *w);
 bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);

@@ -395,14 +395,9 @@ bool tool_call_declared(const request *r, const char *name, char *detail, size_t
 
 
 
-/// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs.  No model and no
-///        family: the family is the loaded engine's (the render or the completions parse sets it), the model the
-///        client's or the served id (http_server); server::enqueue dies on a request without either (L335).
-/// @param r the request
-/// @param kind chat or completion
-/// @param max_tokens the generation cap
 /* ---- L249 D: the gateway hint headers ---- */
 
+/// The request class names, /metrics label values (pulsar_server_internal.h).
 extern const char *const k_request_class_names[REQ_CLASS_COUNT] = {"none", "main", "subagent", "workflow",
                                                                    "compaction", "auxiliary", "other"};
 
@@ -450,6 +445,12 @@ void client_hints_read_line(client_hints *h, const char *line, size_t len) {
 
 
 
+/// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs.  No model and no
+///        family: the family is the loaded engine's (the render or the completions parse sets it), the model the
+///        client's or the served id (http_server); server::enqueue dies on a request without either (L335).
+/// @param r the request
+/// @param kind chat or completion
+/// @param max_tokens the generation cap
 void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
