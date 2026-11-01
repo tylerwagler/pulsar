@@ -194,7 +194,7 @@ def recipe(tmp, label, rows):
     return p
 
 
-def build_grade(tmp, label, args, n_files):
+def build_grade(tmp, label, args, n_files, n_side=len(SIDE)):
     o1, o2 = os.path.join(tmp, f"{label}-1"), os.path.join(tmp, f"{label}-2")
     ok, out = run("plan", *args)
     check(ok, f"{label}: plan")
@@ -205,10 +205,10 @@ def build_grade(tmp, label, args, n_files):
     files = sorted(os.listdir(o1)) if ok1 else []
     same = ok1 and ok2 and files == sorted(os.listdir(o2)) and all(
         open(os.path.join(o1, f), "rb").read() == open(os.path.join(o2, f), "rb").read() for f in files)
-    check(same and len(files) == n_files + 1 + len(SIDE),
+    check(same and len(files) == n_files + 1 + n_side,
           f"{label}: emit --all twice, byte-identical ({len(files)} files: shards, index, side files)")
     ok, out = run("verify", *args, "--out", o1, "--all")
-    check(ok and "failing: 0" in out and out.count("side file ") == len(SIDE) and "-> FAIL" not in out,
+    check(ok and "failing: 0" in out and out.count("side file ") == n_side and "-> FAIL" not in out,
           f"{label}: verify --all PASS (the side files byte-equal)")
     ok, out = run("audit", "--out", o1)
     check(ok and "AUDIT PASS" in out, f"{label}: audit PASS")
@@ -226,6 +226,53 @@ def records(o):
     hv, _ = header(os.path.join(o, shards[0]))
     kv = {e["key"]: e["value"] for e in json.loads(hv["__metadata__"]["pulsar.kv"])}
     return shards, decl, names, experts, kv, hv
+
+
+JEV_REGEX = r"model\.language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+R, SLOTS = 4, 6
+
+
+def make_adapter(root, rng, cfg_edit=None, edit=None):
+    """A JEV-shaped adapter for the synthetic target: PEFT LoRA (r 4, alpha 8) on q / k / v / o + the dense MLP, a
+    [SLOTS, H] head, judge_config + calibration_gold.  Returns {container name: F32 bytes}."""
+    os.makedirs(os.path.join(root, "adapter"), exist_ok=True)
+    cfg = {"peft_type": "LORA", "r": R, "lora_alpha": 8, "target_modules": JEV_REGEX, "bias": "none",
+           "use_dora": False, "use_rslora": False, "fan_in_fan_out": False, "lora_dropout": 0.05,
+           "base_model_name_or_path": "x", "peft_version": "0.21.0"}
+    if cfg_edit:
+        cfg_edit(cfg)
+    json.dump(cfg, open(os.path.join(root, "adapter", "adapter_config.json"), "w"))
+    json.dump({"hidden_size": H, "slots": {"num_slots": SLOTS}, "softcap": 30.0, "readout": {"type": "last_token"},
+               "lora": {"r": R, "alpha": 8, "target_modules": JEV_REGEX}},
+              open(os.path.join(root, "judge_config.json"), "w"))
+    json.dump({"per_kind": {"noul": 1.2}}, open(os.path.join(root, "calibration_gold.json"), "w"))
+    t, want = {}, {}
+
+    def f32(src, cname, *shape):
+        b = (rng.standard_normal(shape).astype(np.float32) * 0.01).tobytes()
+        t[src] = ("F32", list(shape), b)
+        want[cname] = b
+
+    for il, typ in enumerate(TYPES):
+        nkv, hd = FULL if typ == "full_attention" else SLIDING
+        dims = {"self_attn.q_proj": (NQ * hd, H), "self_attn.k_proj": (nkv * hd, H), "self_attn.o_proj": (H, NQ * hd),
+                "mlp.gate_proj": (FF, H), "mlp.up_proj": (FF, H), "mlp.down_proj": (H, FF)}
+        if typ == "sliding_attention":
+            dims["self_attn.v_proj"] = (nkv * hd, H)
+        for s, (o, i) in dims.items():
+            pre = f"base_model.model.{P}layers.{il}.{s}"
+            f32(pre + ".lora_A.weight", f"adapter.layers.{il}.{s}.lora_A.weight", R, i)
+            f32(pre + ".lora_B.weight", f"adapter.layers.{il}.{s}.lora_B.weight", o, R)
+    if edit:
+        edit(t)
+    write_st(os.path.join(root, "adapter", "adapter_model.safetensors"), t)
+    head = {}
+    for n, cname, shape in (("proj.weight", "adapter.head.weight", (SLOTS, H)), ("proj.bias", "adapter.head.bias", (SLOTS,))):
+        b = (rng.standard_normal(shape).astype(np.float32)).tobytes()
+        head[n] = ("F32", list(shape), b)
+        want[cname] = b
+    write_st(os.path.join(root, "head.safetensors"), head)
+    return want
 
 
 ROWS_K4 = [{"role": "dense", "format": "exl3m_k4"}, {"role": "expert_gate_up", "format": "exl3m_k4"},
@@ -309,6 +356,57 @@ def main():
               and kv["pulsar.vision_present"] is False and [k for k in hv if k != "__metadata__"] == [],
               "pulsar.kv: text_config verbatim (both ropes flattened, layer_types); the primary shard holds no tensor")
         check(not any("vision" in n for n in names), "no vision tensor in the container (consumed by name)")
+
+        print("the JEV adapter (--adapter jev):")
+        ad = os.path.join(tmp, "jev")
+        aw = make_adapter(ad, np.random.default_rng(9))
+        rjev = recipe(tmp, "k4-jev", ROWS_K4 + [{"role": "adapter", "format": "native"}])
+        oa = build_grade(tmp, "k4-jev", ["--hf", hf, "--exl3", pk, "--recipe", rjev, "--adapter", "jev", ad], n_files + 1,
+                         n_side=len(SIDE) + 3)
+        a_shards, a_decl, a_names, _a_exp, a_kv, _ = records(oa)
+        last = a_shards[-1]
+        lora = [n for n in a_names if n.startswith("adapter.layers.")]
+        ok_bytes = all(entry_bytes(oa, last, n) == b for n, b in aw.items())
+        check(len(lora) == 2 * (6 * L + 1) and all(n in header(os.path.join(oa, last))[0] for n in aw) and ok_bytes,
+              f"the adapter shard holds every LoRA pair ({len(lora)} tensors: no v on the global layer) and the head, "
+              "bytes == the source's F32")
+        q0 = a_decl["adapter.layers.0.self_attn.q_proj.lora_A.weight"]
+        b1 = a_decl["adapter.layers.1.mlp.down_proj.lora_B.weight"]
+        check(q0["role"] == "attn_q_lora_a" and q0["layer"] == 0 and q0["block"] == "layers" and q0["layout"] == "f32"
+              and q0["dims_ne"] == [H, R] and b1["role"] == "ffn_down_lora_b" and b1["dims_ne"] == [R, H]
+              and a_decl["adapter.layers.0.mlp.gate_proj.lora_B.weight"]["dims_ne"] == [R, FF]
+              and a_decl["adapter.head.weight"]["role"] == "decision_head"
+              and a_decl["adapter.head.bias"]["role"] == "decision_head_bias"
+              and "adapter.layers.1.self_attn.v_proj.lora_A.weight" not in a_decl,
+              "adapter records: <target>_lora_a / _lora_b per layer (block layers), the logical widths (the MLP at "
+              f"{FF}, not {stored(FF)}), decision_head / _bias")
+        check(a_kv["pulsar.adapter"] == "jev" and a_kv["pulsar.adapter.lora_r"] == R
+              and a_kv["pulsar.adapter.lora_alpha"] == 8.0
+              and all(os.path.isfile(os.path.join(oa, f)) for f in ("judge_config.json", "calibration_gold.json",
+                                                                     "adapter_config.json")),
+              "adapter kv (kind, rank, alpha) and its side files")
+        base_same = all(entry_bytes(oa, a_shards[i], n) == entry_bytes(o, shards[i], n)
+                        for i in range(len(shards)) for n in header(os.path.join(o, shards[i]))[0] if n != "__metadata__")
+        check(base_same, "the base tensors' bytes unchanged beside the adapter")
+
+        def adapter_refused(label, contains, **kw):
+            dd = os.path.join(tmp, "badjev-" + label.replace(" ", "-")[:30])
+            make_adapter(dd, np.random.default_rng(10), **kw)
+            ok, _ = run("plan", "--hf", hf, "--exl3", pk, "--recipe", rjev, "--adapter", "jev", dd, expect_fail=True,
+                        contains=contains)
+            check(ok, f"refused: adapter {label}")
+            shutil.rmtree(dd, ignore_errors=True)
+
+        adapter_refused("DoRA", "use_dora", cfg_edit=lambda c: c.update(use_dora=True))
+        adapter_refused("another target set", "target_modules", cfg_edit=lambda c: c.update(target_modules="q_proj"))
+        adapter_refused("an unknown config key", "does not know", cfg_edit=lambda c: c.update(new_switch=1))
+        x = f"base_model.model.{P}layers.0.self_attn.q_proj.lora_B.weight"
+        adapter_refused("a wrong shape", "disagree", edit=lambda t: t.update({x: ("F32", [7, R], bytes(28 * R))}))
+        adapter_refused("an extra tensor", "does not map",
+                        edit=lambda t: t.update({"base_model.model.extra.weight": ("F32", [1], bytes(4))}))
+        ok, _ = run("plan", "--hf", hf, "--exl3", pk, "--recipe", rjev, "--adapter", "other", ad, expect_fail=True,
+                    contains="reads ['jev']")
+        check(ok, "refused: an adapter kind the builder does not read")
 
         print("refusals:")
 

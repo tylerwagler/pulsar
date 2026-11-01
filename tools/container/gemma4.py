@@ -55,6 +55,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, replace
 
+import adapters as AD
 import entries as EN
 import exl3_rates
 import kv as KV
@@ -318,6 +319,24 @@ def source(hf):
     return hf
 
 
+def with_adapter(hf, kind, path):
+    """build.py --adapter KIND DIR: the checkpoint view carrying the adapter (adapters.py), checked against this
+    declaration's per-layer projections at their LOGICAL widths (the dense MLP 2112: the engine pads to the stored)."""
+    sh = hf.decl
+    shapes = {}
+    for il in range(sh.n_layer):
+        nkv, hd = sh.full_kv if sh.full[il] else sh.sliding_kv
+        q, kv = sh.n_head * hd, nkv * hd
+        shapes[(il, "self_attn.q_proj")] = [q, sh.hidden]
+        shapes[(il, "self_attn.k_proj")] = [kv, sh.hidden]
+        shapes[(il, "self_attn.v_proj")] = None if sh.full[il] else [kv, sh.hidden]   # K = V: no v_proj
+        shapes[(il, "self_attn.o_proj")] = [sh.hidden, q]
+        shapes[(il, "mlp.gate_proj")] = [sh.ffn, sh.hidden]
+        shapes[(il, "mlp.up_proj")] = [sh.ffn, sh.hidden]
+        shapes[(il, "mlp.down_proj")] = [sh.hidden, sh.ffn]
+    return AD.with_adapter(hf, kind, path, AD.Target(sh.hidden, sh.n_layer, shapes))
+
+
 def map_hf(name: str, shape: Shape) -> Mapped | None:
     return shape.table.get(name)
 
@@ -338,7 +357,8 @@ def shape(hf, ctx):
 
 
 def shard_order(shape):
-    return ["vision"] + [f"layers.{i}" for i in range(shape.n_layer)] + ["top"]
+    adapter = any(m.shard == "adapter" for m in shape.table.values())
+    return ["vision"] + [f"layers.{i}" for i in range(shape.n_layer)] + ["top"] + (["adapter"] if adapter else [])
 
 
 def _suffix(m):
@@ -360,6 +380,8 @@ def declared_shape(m, hshape):
 def admit(hf, m, fmt, name):
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
     allowed = {"native", native}
+    if m.role == "adapter" and fmt not in allowed:   # the runtime LoRA and the head read their F32 as stored
+        raise SystemExit(f"{name}: the adapter's tensors are written as stored ({native}), not {fmt}")
     if m.role == "dense":
         allowed |= EXL3
         if m.layer is not None and _suffix(m) in MLP_STORED:
@@ -438,6 +460,8 @@ def build_kv(hf, ctx):
     if src is not None:
         kvs.append(("pulsar.source.exl3", "string", os.path.basename(os.path.normpath(src.dir))))
     kvs.append(("pulsar.source.hf", "string", os.path.basename(os.path.normpath(hf.dir))))
+    if isinstance(hf, AD.WithAdapter):
+        kvs += hf.adapter.kvs
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):
@@ -459,4 +483,6 @@ def side_files(hf, ctx):
     if missing:
         raise SystemExit(f"the Gemma 4 container carries the checkpoint's tokenizer: {', '.join(missing)} missing "
                          f"(--tokenizer DIR names a directory with {', '.join(SIDE)})")
+    if isinstance(hf, AD.WithAdapter):
+        files += hf.adapter.side
     return files

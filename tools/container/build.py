@@ -6,6 +6,8 @@
     plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
             [--drafter KIND DIR] a block drafter written into the container (drafters.py): Nemotron-H lilicorr
             (NVIDIA's LiLiCorr), qwen4_exp dflash2 (z-lab's DFlash2, L299)
+            [--adapter KIND DIR] a LoRA adapter + decision head written into the container for runtime application
+            (adapters.py): gemma4 jev (autotrust's JEV System 1 judge, L338)
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
             DeepSeek: [--layers L,L,...] a layer-subset test fixture (names.py drop rule 4);
                       [--engram-layout JSON] V4.1's Engram hash layout (tools/engram/engram_layout.py)
@@ -546,7 +548,7 @@ _HF = {}
 def hf_of(args):
     """The HF source as its family reads it (fam.source: the checkpoint itself, or a view that names the tensors a
     fused HF tensor holds -- inkling.Source)."""
-    key = (args.hf, tuple(args.drafter or ()))
+    key = (args.hf, tuple(args.drafter or ()), tuple(getattr(args, 'adapter', None) or ()))
     if key not in _HF:
         hf = HFCheckpoint(args.hf)
         fam = family_of(hf)
@@ -555,6 +557,10 @@ def hf_of(args):
             if not hasattr(fam, 'with_drafter'):
                 raise SystemExit(f'--drafter: the {fam.__name__} family reads no drafter input (nemotron_h, qwen do)')
             src = fam.with_drafter(src, *args.drafter)
+        if getattr(args, 'adapter', None):
+            if not hasattr(fam, 'with_adapter'):
+                raise SystemExit(f'--adapter: the {fam.__name__} family reads no adapter input (gemma4 does)')
+            src = fam.with_adapter(src, *args.adapter)
         _HF[key] = src
     return _HF[key]
 
@@ -632,6 +638,10 @@ def main():
                            help='a separate block-drafter checkpoint written into the container, shard `drafter` '
                            '(drafters.py): KIND lilicorr on Nemotron-H (NVIDIA\'s LiLiCorr), dflash2 on qwen4_exp '
                            '(z-lab\'s DFlash2, its head the target lm_head\'s draft-vocabulary rows)')
+            p.add_argument('--adapter', nargs=2, metavar=('KIND', 'DIR'),
+                           help='a LoRA adapter (and its decision head) written into the container beside the base, '
+                           'shard `adapter`, for the engine to apply at runtime (adapters.py): KIND jev on gemma4 '
+                           '(autotrust\'s JEV System 1 judge)')
             p.add_argument('--recipe', metavar='JSON', help='a pulsar.recipe.v1 (recipe.py; format-maps/*.json).  '
                            'DeepSeek default: generated from policy.py + the EXL3 source (`recipe` prints it)')
             p.add_argument('--mxfp8-scale', choices=('rederive', 'verbatim'), default='rederive',
