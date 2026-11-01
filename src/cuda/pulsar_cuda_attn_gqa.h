@@ -7,7 +7,9 @@
  *
  * What a family declares (pulsar_gqa_layer), all at RUNTIME:
  *   geometry      n_q query heads, n_kv KV heads (n_q % n_kv == 0, the group
- *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64 or 128)
+ *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64 or 128, or
+ *                 L338's wide heads 256 / 512 -- S in 128-dim passes, O in
+ *                 128-dim slices, one CTA a slice; no bias, gate or block)
  *   KV rows       the row format (pulsar_gqa_kv_fmt; BF16 today)
  *   span          FULL (every earlier key) or WINDOW (the last `window` keys,
  *                 self included, held in a ring of `cap` >= window slots)
@@ -104,7 +106,7 @@ typedef enum {
 typedef struct {
     uint32_t          n_q;          /**< query heads */
     uint32_t          n_kv;         /**< KV heads; n_q % n_kv == 0, n_q / n_kv <= 64 */
-    uint32_t          head_dim;     /**< 64 or 128 */
+    uint32_t          head_dim;     /**< 64 or 128; 256 or 512 (L338: no rel bias, out_gate or block) */
     /** The KV row format of this layer's pools (and of the call's own fresh rows). */
     pulsar_gqa_kv_fmt kv_fmt;
     /** Which keys a row attends: FULL or WINDOW (with `window`). */

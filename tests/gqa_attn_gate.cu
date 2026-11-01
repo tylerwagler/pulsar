@@ -29,6 +29,8 @@
  *   8. store      (L298, every geometry) pulsar_gqa_store of the prompt's rows,
  *                 one call and calls of 1, 37, 64, 63, 200, == the prefill's
  *                 pool, byte-identical (a window's ring wraps).
+ * L338, Gemma 4's wide heads: a 16q/8kv/256 window layer (NeoX rope 1e4) and a 16q/2kv/512 global layer with the
+ * proportional rope (a per-pair table, 192 of 256 pairs at frequency 0), both at scale 1 -- the whole battery above.
  * L298, the block drafter's layer (32q/8kv/128, window, qk norm, NeoX rope base
  * 1e6): the whole battery above with rope on (the host's rope is its own
  * transcription of the HF / vLLM bf16 arithmetic; the mutations 'no rope' and
@@ -109,6 +111,8 @@ struct Case {
     double in_sd = 1.0;      /* raw q / k scale */
     uint16_t *d_qw = nullptr, *d_kw = nullptr, *d_P = nullptr;
     uint64_t ld = 0, off_k = 0, off_v = 0, off_r = 0, off_g = 0;   /* the fused input row */
+    /* L338: a case's own fidelity bars (0 = the battery's), each with its reason -- Gemma 4 at its own softmax scale 1 */
+    double bar_fro = 0, bar_max = 0;
 };
 
 static void upload_bf(uint16_t **d, const std::vector<float> &h) {
@@ -391,6 +395,9 @@ static Grade grade(const Case &C, const History &H, const std::vector<uint32_t> 
 }
 
 static const double BAR_FRO = 2e-5, BAR_MAX = 2e-4, BAR_EQ = 0.99;
+/// The case's fidelity bars (Case::bar_fro / bar_max, else the battery's).
+static double bar_fro(const Case &C) { return C.bar_fro > 0 ? C.bar_fro : BAR_FRO; }
+static double bar_max(const Case &C) { return C.bar_max > 0 ? C.bar_max : BAR_MAX; }
 
 /* the mean over rows / heads of the largest attention weight (fixture liveness) */
 static double mean_peak(const Case &C, const History &H, const std::vector<uint32_t> &p_list) {
@@ -450,9 +457,9 @@ static void run_case(Case &C) {
     for (uint32_t p = 0; p < N; p++) { all[p] = p; gp[p] = &pre[p]; }
     const Grade G = grade(C, H, all, gp);
     printf("  reference rms %.4f, mean peak attention weight %.3f\n", G.rms, mean_peak(C, H, all));
-    check(G.fro <= BAR_FRO && G.max <= BAR_MAX && G.eq >= BAR_EQ,
+    check(G.fro <= bar_fro(C) && G.max <= bar_max(C) && G.eq >= BAR_EQ,
           "fidelity (prefill, %u rows, graded): fro %.2e (bar %.0e), max %.2e (bar %.0e), bf16 out == bf16(ref) %.4f (bar %.2f)",
-          N, G.fro, BAR_FRO, G.max, BAR_MAX, G.eq, BAR_EQ);
+          N, G.fro, bar_fro(C), G.max, bar_max(C), G.eq, BAR_EQ);
 
     /* 2. decode */
     {
@@ -568,7 +575,7 @@ static void run_case(Case &C) {
         for (auto &m : ms) {
             if (!m.applies) continue;
             const Grade M = grade(C, H, all, gp, m.mu);
-            check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
+            check(M.fro >= 20 * bar_fro(C) || M.max >= 20 * bar_max(C),
                   "mutation '%s' fails the grade: fro %.2e, max %.2e", m.what, M.fro, M.max);
         }
         kv_mutations(C, 1, N, 0, 0, all, gp, "");
@@ -637,7 +644,7 @@ static void kv_mutations(const Case &C, uint64_t sid, uint32_t n, uint32_t from,
         History Hm;
         history_build(C, sid, n, Hm, from, rows_from, m.mu);
         const Grade M = grade(C, Hm, pl, gp, m.mu);
-        check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX, "mutation '%s'%s fails the grade: fro %.2e, max %.2e",
+        check(M.fro >= 20 * bar_fro(C) || M.max >= 20 * bar_max(C), "mutation '%s'%s fails the grade: fro %.2e, max %.2e",
               m.what, where, M.fro, M.max);
     }
 }
@@ -932,6 +939,10 @@ static void run_refusals(Case &C, Case &Rp) {
     L = C.L;
     L.n_kv = 3; expect("n_q not a multiple of n_kv", L, {{0, 0}});
     L = C.L; L.head_dim = 96; expect("head_dim 96 (no built tile)", L, {{0, 0}});
+    /* L338: the wide heads are built for plain attention */
+    L = C.L; L.head_dim = 256; expect("head_dim 256 with a relative bias (the wide heads have none)", L, {{0, 0}});
+    L = Rp.L; L.head_dim = 512; L.out_gate = 1; expect("head_dim 512 with an output gate", L, {{0, 0}});
+    L = Rp.L; L.head_dim = 512; L.block = 1; expect("head_dim 512 with a block run", L, {{0, 0}});
     L = C.L; L.rel_dim = 32; expect("rel_dim 32", L, {{0, 0}});
     L = C.L; L.qk_norm = 1; L.q_norm_w = nullptr; expect("qk_norm without its weight", L, {{0, 0}});
     L = C.L; L.window = 5000; L.span = PULSAR_GQA_WINDOW; expect("a ring smaller than the window", L, {{0, 0}});
@@ -1069,6 +1080,46 @@ int main(int argc, char **argv) {
     run_case(g2);
     run_case(g3);
     run_case(g4);
+
+    /* L338: Gemma 4's WIDE heads -- the 256 / 512 tiles (S in 128-dim passes, O in 128-dim slices), q and k RMS-normed
+     * with weights (eps 1e-6), no bias / temperature / gate; each geometry TWICE:
+     *   at 1 / sqrt(head_dim) against the battery's bars -- the kernel's accuracy (measured 2026-11-01, RTX 5000: fro
+     *   7.2e-6 / 9.6e-6, max 2.5e-5 / 3.5e-5);
+     *   at Gemma 4's own softmax scale 1 against bars that are the logits' -- unit-RMS q and k at scale 1 make logits
+     *   16 / 23 x larger, and f32 rounding of q . k and of the softmax grows with them: measured fro 2.7e-5 / 5.5e-5, max
+     *   1.2e-3 / 1.7e-3, below one bf16 output step (2^-8 = 3.9e-3), the bf16 output == bf16(reference) on 99.9 / 99.8 %
+     *   (the battery's 0.99 bar unchanged).  Bars there: fro 1e-4, max 4e-3 (one bf16 step).  The window layer: 16q/8kv/256, NeoX
+     * rope base 1e4 (Gemma's window is 1024; 300 here runs the battery cheaply -- the span is the same mechanism).
+     * The global layer: 16q/2kv/512 (G = 8), FULL, the PROPORTIONAL rope -- 64 of the 256 pairs rotate at
+     * 1e6^(-2p/512), the other 192 carry inverse frequency 0 (an exact identity: cos 1, sin 0) -- as a per-pair table */
+    Case gw, gg;
+    case_init(gw, "gemma4-window256-rope", 16, 8, 256, 300, 300 + 15, true, 0, 0.f, 0.f, false, 1.0f, N, 338);
+    gw.R.rope_theta = 1e4f; gw.L.rope_theta = 1e4f;
+    case_init(gg, "gemma4-global512-proprope", 16, 2, 512, 0, N + 64, true, 0, 0.f, 0.f, false, 1.0f, N, 339);
+    gg.R.rope_theta = 1e6f; gg.L.rope_theta = 1e6f;
+    {
+        gg.R.inv_freq.assign(256, 0.0f);
+        for (uint32_t i = 0; i < 64; i++) gg.R.inv_freq[i] = (float)(1.0 / pow(1e6, (double)(2u * i) / 512.0));
+        float *d_inv = nullptr;
+        CK(cudaMalloc(&d_inv, 256 * sizeof(float)));
+        CK(cudaMemcpy(d_inv, gg.R.inv_freq.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+        gg.L.rope_inv_freq = d_inv;
+    }
+    gw.bar_fro = gg.bar_fro = 1e-4;
+    gw.bar_max = gg.bar_max = 4e-3;
+    run_case(gw);
+    run_case(gg);
+    Case gw1, gg1;   /* at 1 / sqrt(head_dim): the battery's bars */
+    case_init(gw1, "gemma4-window256-rope@1/sqrt(hd)", 16, 8, 256, 300, 300 + 15, true, 0, 0.f, 0.f, false, 1.0f / 16.0f, N,
+              338);
+    gw1.R.rope_theta = 1e4f; gw1.L.rope_theta = 1e4f;
+    case_init(gg1, "gemma4-global512-proprope@1/sqrt(hd)", 16, 2, 512, 0, N + 64, true, 0, 0.f, 0.f, false,
+              1.0f / sqrtf(512.f), N, 339);
+    gg1.R.rope_theta = 1e6f; gg1.L.rope_theta = 1e6f;
+    gg1.R.inv_freq = gg.R.inv_freq;
+    gg1.L.rope_inv_freq = gg.L.rope_inv_freq;
+    run_case(gw1);
+    run_case(gg1);
 
     Case gl;
     const uint32_t P0 = 131000;
