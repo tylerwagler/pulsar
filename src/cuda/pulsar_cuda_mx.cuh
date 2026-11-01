@@ -190,4 +190,17 @@ __device__ __forceinline__ static float pulsar_relu2_elem(float u, float wv) {
     return r * r * wv;
 }
 
+/* ONE GeGLU element with the tanh GELU for every gated path that names it (L338: Gemma 4's `gelu_pytorch_tanh`, its
+ * experts and its dense MLP): gelu(g) = 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))) -- torch's tanh approximation,
+ * the formula HF runs -- then gelu(g) * u * w in that order.  No clamp (Gemma has none). */
+/// @param g  gate value
+/// @param u  up value
+/// @param wv the row's routing weight (1 for an unweighted path)
+/// @return gelu_tanh(g) * u * wv
+__device__ __forceinline__ static float pulsar_geglu_tanh_elem(float g, float u, float wv) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;   /* sqrt(2 / pi), torch's cubic coefficient */
+    const float s = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+    return s * u * wv;
+}
+
 #endif /* PULSAR_CUDA_MX_CUH */

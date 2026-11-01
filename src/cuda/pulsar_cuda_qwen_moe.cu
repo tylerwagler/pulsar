@@ -42,7 +42,8 @@ namespace {
  * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
  * exponent, so there is no per-32 block and no scale slab any more. */
 /* L296 N4: the same producer for the non-gated activation (pulsar_ffn_act RELU2): relu(u)^2, g unread. */
-/** The shared expert's activation, emitted bf16: SwiGLU silu(g) * u, or (act RELU2) relu(u)^2 with g unread.
+/** The shared expert's activation, emitted bf16: SwiGLU silu(g) * u, (act GEGLU_TANH, L338) gelu_tanh(g) * u, or
+ *  (act RELU2) relu(u)^2 with g unread.
  *  Grid = T blocks (one per row), block = 256 threads striding the D channels.
  *  @param g   f32 [T][D] gate projection (unread under RELU2)
  *  @param u   f32 [T][D] up projection
@@ -57,8 +58,9 @@ rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, i
         const int c = c0 + (int)threadIdx.x;
         if (c < D) {
             const size_t i = (size_t)t * D + c;
-            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2 ? pulsar_relu2_elem(u[i], 1.0f)
-                                                                 : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
+            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2        ? pulsar_relu2_elem(u[i], 1.0f)
+                                     : act == PULSAR_FFN_ACT_GEGLU_TANH ? pulsar_geglu_tanh_elem(g[i], u[i], 1.0f)
+                                                                        : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
         }
     }
 }
@@ -623,9 +625,9 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 /// @param what the caller's name for the message
 /// @return true when the descriptor and its buffers are consistent; false said
 static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
-    const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
+    const bool gated = q && q->act != PULSAR_FFN_ACT_RELU2;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
-    if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
+    if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2 && q->act != PULSAR_FFN_ACT_GEGLU_TANH) ||
         (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
         q->down.in != smid || q->down.out != H) {
         fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers -- "
@@ -643,8 +645,8 @@ static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
 /// @param stream stream to launch on
 /// @return 0 on success, negative on a refusal or a launch failure
 static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
-    int rc = q->act == PULSAR_FFN_ACT_SWIGLU ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
-                                                                         stream) : 0;
+    int rc = q->act != PULSAR_FFN_ACT_RELU2 ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
+                                                                        stream) : 0;
     if (!rc) rc = pulsar_rows_linear_launch(&q->up, x_bf16, T, q->yu, q->ws, q->ws_bytes, stream);
     if (rc) return rc;
     rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, q->up.out, (int)q->act, (__nv_bfloat16 *)q->h);

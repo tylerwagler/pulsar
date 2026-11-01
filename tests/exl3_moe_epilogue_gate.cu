@@ -280,6 +280,12 @@ static float swiglu_host(float g, float u, float wv, float clamp) {
     const float s = g / (1.0f + expf(-g));
     return s * u * wv;
 }
+/* L338: Gemma 4's gelu_pytorch_tanh GeGLU, in double (the host authority the device's pulsar_geglu_tanh_elem is graded
+ * against): 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))) * u * w */
+static double geglu_tanh_host(double g, double u, double wv) {
+    const double k0 = 0.7978845608028654, k1 = 0.044715;
+    return 0.5 * g * (1.0 + tanh(k0 * (g + k1 * g * g * g))) * u * wv;
+}
 
 #include "exl3_moe_epilogue_gate_qwen.inc"
 #include "exl3_moe_epilogue_gate_uponly.inc"
@@ -351,10 +357,14 @@ int main(void) {
             CUDA_OK(cudaMalloc((void **)&d_mq, (size_t)r.n_assign * M));
             CUDA_OK(cudaMalloc((void **)&d_msf, sf_bytes));
             CUDA_OK(cudaMemset(d_msf, 0, sf_bytes));
-            const int frc = ds4_exl3_moe_fold_launch(d_zg, d_zu, d_sel, d_w, sg.table, su.table, sd.table, K, M, r.n_assign, 0.0f, d_mq, d_msf, kbp, 0);
-            CHECK(frc == 0, "fold launch rc=%d", frc);
+            /* L338: the pair folds two gated activations -- SwiGLU and Gemma 4's GeGLU-tanh -- through one host chain */
+            std::vector<uint8_t> mq((size_t)r.n_assign * M), msf(sf_bytes);   /* the last fold's (SwiGLU's after the loop) */
+            for (const int act : {(int)PULSAR_FFN_ACT_GEGLU_TANH, (int)PULSAR_FFN_ACT_SWIGLU}) {
+            const char *act_name = act == PULSAR_FFN_ACT_SWIGLU ? "SwiGLU" : "GeGLU-tanh";
+            const int frc = ds4_exl3_moe_fold_launch(d_zg, d_zu, d_sel, d_w, sg.table, su.table, sd.table, K, M, r.n_assign,
+                                                     0.0f, d_mq, d_msf, kbp, 0, nullptr, 1, 0, act);
+            CHECK(frc == 0, "fold launch (%s) rc=%d", act_name, frc);
             CUDA_OK(cudaDeviceSynchronize());
-            std::vector<uint8_t> mq((size_t)r.n_assign * M), msf(sf_bytes);
             CUDA_OK(cudaMemcpy(mq.data(), d_mq, mq.size(), cudaMemcpyDeviceToHost));
             CUDA_OK(cudaMemcpy(msf.data(), d_msf, sf_bytes, cudaMemcpyDeviceToHost));
             /* host: from the DEVICE z (the fold's own input), the rest in double */
@@ -368,7 +378,9 @@ int main(void) {
                 for (int n = 0; n < M; n++) {
                     const float yg = (float)(g[n] * exl3_f16_to_f32(gate[e].svh(K)[n]));
                     const float yu = (float)(u[n] * exl3_f16_to_f32(up[e].svh(K)[n]));
-                    t[n] = (double)swiglu_host(yg, yu, r.weights[pair], 0.0f) * exl3_f16_to_f32(down[e].suh()[n]);
+                    const double h = act == PULSAR_FFN_ACT_SWIGLU ? (double)swiglu_host(yg, yu, r.weights[pair], 0.0f)
+                                                                  : geglu_tanh_host(yg, yu, r.weights[pair]);
+                    t[n] = h * exl3_f16_to_f32(down[e].suh()[n]);
                 }
                 had_blocks(t);
                 for (int grp = 0; grp < M / 32; grp++) {
@@ -388,9 +400,18 @@ int main(void) {
                     }
                 }
             }
-            CHECK(n_bad == 0, "fold: %zu of %zu mid values outside one E4M3 ulp of the host chain", n_bad, (size_t)r.n_assign * M);
-            printf("  fold: %d pairs x %d, worst |err|/amax %.2e, %zu outside tolerance; bytes fnv %016llx\n",
-                   r.n_assign, M, fold_worst, n_bad, (unsigned long long)(fnv64b(mq) ^ (fnv64b(msf) * 3u)));
+            CHECK(n_bad == 0, "fold (%s): %zu of %zu mid values outside one E4M3 ulp of the host chain", act_name, n_bad,
+                  (size_t)r.n_assign * M);
+            printf("  fold (%s): %d pairs x %d, worst |err|/amax %.2e, %zu outside tolerance; bytes fnv %016llx\n",
+                   act_name, r.n_assign, M, fold_worst, n_bad, (unsigned long long)(fnv64b(mq) ^ (fnv64b(msf) * 3u)));
+            }
+            /* the pair's refusals: GeGLU-tanh has no clamp, and an activation the fold does not implement */
+            CHECK(ds4_exl3_moe_fold_launch(d_zg, d_zu, d_sel, d_w, sg.table, su.table, sd.table, K, M, r.n_assign, 7.0f,
+                                           d_mq, d_msf, kbp, 0, nullptr, 1, 0, PULSAR_FFN_ACT_GEGLU_TANH) == -1,
+                  "a clamped GeGLU-tanh fold is refused");
+            CHECK(ds4_exl3_moe_fold_launch(d_zg, d_zu, d_sel, d_w, sg.table, su.table, sd.table, K, M, r.n_assign, 0.0f,
+                                           d_mq, d_msf, kbp, 0, nullptr, 1, 0, PULSAR_FFN_ACT_RELU2) == -1,
+                  "relu^2 on the pair fold is refused (the up-only fold runs it)");
 
             /* 4. the sum on random z_d [pair][K] (out_dim = K here) */
             std::vector<float> zd((size_t)r.n_assign * K);

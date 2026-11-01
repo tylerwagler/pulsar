@@ -56,6 +56,7 @@ struct exl3_moe_shared_add {
 /// @param mid_bf16 out: the down input as bf16 rows instead of the slot, or NULL.
 /// @param z_splits K-split partial planes in the z input (1: a finished z).
 /// @param z_split_stride floats between partial planes.
+/// @param act the activation, a pulsar_ffn_act: SWIGLU (0) or GEGLU_TANH (L338, no clamp); anything else refused.
 /// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_moe_fold_launch(
     const float   * gate_z,
@@ -75,7 +76,8 @@ int ds4_exl3_moe_fold_launch(
     cudaStream_t    stream,
     void          * mid_bf16 = nullptr,
     int             z_splits = 1,
-    int64_t         z_split_stride = 0);
+    int64_t         z_split_stride = 0,
+    int             act = 0);
 
 /** The fold over a FUSED gate_up: gate_up_z [pairs][2 mid] (gate columns
  *  0..mid-1, up columns mid..2 mid-1), svh of the one gate_up slice (gate's at

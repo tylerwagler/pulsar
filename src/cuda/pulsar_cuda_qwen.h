@@ -374,13 +374,16 @@ static inline pulsar_router_cfg pulsar_qwen_router_cfg(int n_expert, int top_k) 
  *  rank's experts are dropped here and summed there. */
 struct pulsar_tessera_proj;   /* src/cuda/mmq/pulsar_tessera.h (L255) */
 /** L295 F7: an FFN's activation, family-neutral -- the expert arms key on it, never on a family.  SWIGLU: h =
- *  silu(gate x) * up x (gate + up stacks); RELU2: h = relu(up x)^2 (up-only stacks, no gate: Nemotron-H's experts).
+ *  silu(gate x) * up x (gate + up stacks); RELU2: h = relu(up x)^2 (up-only stacks, no gate: Nemotron-H's experts);
+ *  GEGLU_TANH (L338): h = gelu_tanh(gate x) * up x (gate + up stacks: Gemma 4's experts and dense MLP).
  *  Zero is SWIGLU, so a descriptor that never names one keeps every arm's behaviour. */
-typedef enum { PULSAR_FFN_ACT_SWIGLU = 0, PULSAR_FFN_ACT_RELU2 = 1 } pulsar_ffn_act;
+typedef enum { PULSAR_FFN_ACT_SWIGLU = 0, PULSAR_FFN_ACT_RELU2 = 1, PULSAR_FFN_ACT_GEGLU_TANH = 2 } pulsar_ffn_act;
 /** @var PULSAR_FFN_ACT_SWIGLU
  *  h = silu(gate x) * up x */
 /** @var PULSAR_FFN_ACT_RELU2
  *  h = relu(up x)^2 (no gate) */
+/** @var PULSAR_FFN_ACT_GEGLU_TANH
+ *  h = gelu_tanh(gate x) * up x (pulsar_geglu_tanh_elem; no clamp) */
 /** One shared expert: out += scale[t] * down(act(gate x, up x)), added after the routed sum (a block's N shared
  *  experts in order).  Task #44: one whose three Linears are EXL3 dense slices rides the routed launches (the EXL3
  *  routed front door, mmq/exl3_moe.cuh) -- keyed on that format, SwiGLU only; any other runs
