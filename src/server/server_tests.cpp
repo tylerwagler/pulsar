@@ -4884,6 +4884,99 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
     }
 }
 
+/* L249 D: per-turn effort.  Claude Code sends the effort for a turn as a role:"system" entry with empty content and
+ * output_config.effort.  The entry renders nothing (it is dropped), and its effort is the reply's when it took
+ * effect -- directly after a user turn with new input, or before the next one -- exactly as the request-level
+ * output_config.effort would be; placed after an assistant turn with only tool results behind it, it waits. */
+static void anthropic_test_render_effort(const char *body, pulsar_chat_format fmt, std::string *text, int *effort,
+                                         pulsar_think_mode *mode) {
+    request r;
+    test_request_init(&r, REQ_CHAT, 256);
+    chat_conversation c = {};
+    char err[300] = "";
+    const bool ok = parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err) &&
+                    render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "anthropic render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    *text = ok && r.prompt_text ? r.prompt_text : "";
+    *effort = r.family_effort;
+    *mode = r.think_mode;
+    chat_conversation_free(&c);
+    request_free(&r);
+}
+
+static void test_anthropic_per_turn_effort(void) {
+    const std::string head =
+        "{\"model\":\"m\",\"max_tokens\":64,\"thinking\":{\"type\":\"adaptive\"},\"system\":\"Be terse.\",";
+    const std::string turn1 =
+        "{\"role\":\"user\",\"content\":\"Plan a migration.\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"1. Export. 2. Import.\"}]},";
+    const std::string last = "{\"role\":\"user\",\"content\":\"Summarize the plan.\"}";
+    const std::string low_entry = "{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},";
+    const std::string plain = head + "\"messages\":[" + turn1 + last + "]}";
+    const std::string top_low = head + "\"output_config\":{\"effort\":\"low\"},\"messages\":[" + turn1 + last + "]}";
+    /* between the assistant turn and the next user turn: from that turn on */
+    const std::string before_user = head + "\"messages\":[" + turn1 + low_entry + last + "]}";
+    /* directly after the user turn it answers */
+    const std::string after_user = head + "\"messages\":[" + turn1 + last + "," +
+                                   low_entry.substr(0, low_entry.size() - 1) + "]}";
+    /* a later entry overrides the request level */
+    const std::string over_top = head + "\"output_config\":{\"effort\":\"max\"},\"messages\":[" + turn1 + low_entry +
+                                 last + "]}";
+    /* an empty system entry with no effort: dropped, nothing else changes */
+    const std::string empty_entry = head + "\"messages\":[" + turn1 + "{\"role\":\"system\",\"content\":[]}," + last +
+                                    "]}";
+    /* in a tool loop: after the call's result only, it waits for the next user turn with new input */
+    const std::string tool_head =
+        head + "\"tools\":[{\"name\":\"bash\",\"description\":\"Run.\",\"input_schema\":{\"type\":\"object\","
+               "\"properties\":{\"command\":{\"type\":\"string\"}}}}],\"messages\":[" + turn1.substr(0, turn1.find("{\"role\":\"assistant\"")) +
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":"
+        "{\"command\":\"ls\"}}]},";
+    const std::string tool_tail =
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"a\"}]}";
+    const std::string loop_plain = tool_head + tool_tail + "]}";
+    const std::string loop_waits = tool_head + low_entry + tool_tail + "]}";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4};
+    bool some_family_moves = false;
+    for (pulsar_chat_format fmt : fmts) {
+        std::string t_plain, t_top, t;
+        int e_plain = 0, e_top = 0, e = 0;
+        pulsar_think_mode m_plain, m_top, m;
+        anthropic_test_render_effort(plain.c_str(), fmt, &t_plain, &e_plain, &m_plain);
+        anthropic_test_render_effort(top_low.c_str(), fmt, &t_top, &e_top, &m_top);
+        some_family_moves = some_family_moves || e_top != e_plain || t_top != t_plain;
+        for (const std::string *b : {&before_user, &after_user, &over_top}) {
+            anthropic_test_render_effort(b->c_str(), fmt, &t, &e, &m);
+            TEST_ASSERT(t == t_top && e == e_top && m == m_top);
+        }
+        anthropic_test_render_effort(empty_entry.c_str(), fmt, &t, &e, &m);
+        TEST_ASSERT(t == t_plain && e == e_plain && m == m_plain);
+        std::string t_loop;
+        int e_loop = 0;
+        pulsar_think_mode m_loop;
+        anthropic_test_render_effort(loop_plain.c_str(), fmt, &t_loop, &e_loop, &m_loop);
+        anthropic_test_render_effort(loop_waits.c_str(), fmt, &t, &e, &m);
+        TEST_ASSERT(t == t_loop && e == e_loop && m == m_loop);
+    }
+    /* the test means something: low is not the default effort on at least one family */
+    TEST_ASSERT(some_family_moves);
+    /* a bad effort name on an entry in effect is refused like the request-level one */
+    {
+        const std::string bad = head + "\"messages\":[" + turn1 +
+                                "{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"huge\"}}," + last +
+                                "]}";
+        request r;
+        test_request_init(&r, REQ_CHAT, 256);
+        chat_conversation c = {};
+        char err[300] = "";
+        const bool ok = parse_chat_conversation_anthropic(bad.c_str(), &c, &r, err, sizeof err) &&
+                        render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err);
+        TEST_ASSERT(!ok && strstr(err, "output_config.effort"));
+        chat_conversation_free(&c);
+        request_free(&r);
+    }
+}
+
 /* The live side of the same identity: a Qwen tool turn ends at the stop token, and whether the KV holds it is the
  * decode lane's (a batched lane evaluates the token it emits; a speculative round's base stop is never
  * evaluated).  The tool-result tail opens with the template's own "<|im_end|>\n", so it joins the history before
@@ -12219,6 +12312,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_nemotron_refusals();
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
+    test_anthropic_per_turn_effort();
     test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();

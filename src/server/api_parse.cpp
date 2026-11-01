@@ -419,6 +419,7 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
     bool got_messages = false;
     int skr = 0;
     char *system = NULL;
+    char *turn_effort = NULL;   /* L249 D: the per-turn effort in effect for the reply (parse_anthropic_messages) */
 
     json_ws(&p);
     if (*p != '{') return false;
@@ -437,7 +438,8 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
         ok = true;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&c->msgs);
-            ok = parse_anthropic_messages(&p, &c->msgs, err, errlen);
+            free(turn_effort);
+            ok = parse_anthropic_messages(&p, &c->msgs, err, errlen, &turn_effort);
             got_messages = true;
         } else if (!strcmp(key, "system")) {
             free(system);
@@ -525,9 +527,13 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
         chat_msgs_push(&c->msgs, msg);
     }
     free(system);
+    /* the per-turn effort overrides the request-level output_config.effort: the controls are read in arrival
+     * order, a later one replacing an earlier one's value */
+    if (turn_effort) chat_conversation_control(c, "output_config", turn_effort);
     return true;
 bad:
     free(system);
+    free(turn_effort);
     return false;
 }
 

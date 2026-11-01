@@ -3839,7 +3839,11 @@ bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r,
 /// @return the malloc'd JSON array, or NULL
 char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
+/** Read an Anthropic messages array into parts; empty role:"system" entries are dropped, and `turn_effort` (when
+ *  not NULL) receives the raw output_config of the system entry whose effort is in effect for the reply (L249 D's
+ *  per-turn effort; NULL: none). */
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen,
+                              char **turn_effort = NULL);
 /** An inline base64 `data:image/...;base64,` URL -> the encoded file's bytes (malloc'd, `*len_out` set), or NULL +
  *  `err` (a remote URL, another scheme, a malformed payload).  The one reader of inline images: the chat / Responses
  *  image blocks and /v1/parse (L321). */

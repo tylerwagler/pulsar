@@ -2568,24 +2568,51 @@ static bool parse_anthropic_content(const char **p, chat_msgs *parts, char *err,
 
 
 
+/* L249 D: per-turn effort.  A role:"system" entry may carry output_config.effort (the effort-only form has empty
+ * content).  Placed directly after a user turn with new input it sets the level of the reply to that turn; anywhere
+ * else it takes effect from the next user turn with new input (a user turn of tool_result blocks only is not new
+ * input), and the level holds until a later entry changes it.  So the reply this request asks for runs at the
+ * effort of the last entry that took effect, and the request-level output_config.effort when none did. */
+/// Whether a user message's parts hold new input (anything but tool results).
+/// @param parts  the message's parts (a tool result's part has role "tool")
+/// @return true when a text, image or document part is not empty
+static bool anthropic_parts_new_input(const chat_msgs *parts) {
+    for (int i = 0; i < parts->len; i++) {
+        const chat_msg *m = &parts->v[i];
+        if (m->role && !strcmp(m->role, "tool")) continue;
+        if ((m->content && m->content[0]) || m->images_len > 0 || m->tool_refs_len > 0) return true;
+    }
+    return false;
+}
+
 /// @brief Read an Anthropic "messages" array: each message becomes one or more parts (text, tool results).
+/// Empty role:"system" entries (the per-turn effort form) are not kept: they carry no text to render.
 /// @param p the cursor; advanced past the array
 /// @param msgs the parts are appended here
 /// @param err receives a refusal's reason ("" for malformed JSON)
 /// @param errlen bytes at `err`
+/// @param turn_effort receives the output_config (raw JSON, malloc'd) of the system entry whose effort is in
+///        effect for the reply, NULL when none is (NULL: not read)
 /// @return false on malformed JSON or a refused block
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen) {
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen, char **turn_effort) {
     if (err && errlen) err[0] = '\0';
+    if (turn_effort) *turn_effort = NULL;
+    char *pending_effort = NULL;      /* an entry waiting for the next user turn with new input */
+    bool after_new_input = false;     /* the last non-system message was a user turn with new input */
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
 
     json_ws(p);
     while (**p && **p != ']') {
-        if (**p != '{') return false;
+        if (**p != '{') goto fail_effort;
         (*p)++;
-        char *role = NULL;
-        chat_msgs parts = {0};
+        char *role;
+        role = NULL;
+        char *output_config;
+        output_config = NULL;
+        chat_msgs parts;
+        parts = {0};
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -2608,6 +2635,13 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
                     free(key);
                     goto fail;
                 }
+            } else if (!strcmp(key, "output_config")) {
+                free(output_config);
+                output_config = NULL;
+                if (!json_raw_value(p, &output_config)) {
+                    free(key);
+                    goto fail;
+                }
             } else if (!json_skip_value(p)) {
                 free(key);
                 goto fail;
@@ -2622,6 +2656,39 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
         /* The role may follow the content (JSON member order is not meaningful),
          * so the parts take it now; a tool result's part keeps "tool". */
         if (parts.len == 0) anthropic_text_part(&parts);
+        {
+            const bool system = role && !strcmp(role, "system");
+            const bool user = !role || !strcmp(role, "user");
+            if (system) {
+                /* an entry's effort, if it has one: in effect now, or from the next user turn with new input */
+                char *effort = output_config ? json_object_member_raw(output_config, "effort") : NULL;
+                if (effort) {
+                    char **slot = after_new_input ? turn_effort : &pending_effort;
+                    if (slot) {
+                        free(*slot);
+                        *slot = output_config;
+                        output_config = NULL;
+                    }
+                }
+                free(effort);
+            } else if (user && anthropic_parts_new_input(&parts)) {
+                after_new_input = true;
+                if (pending_effort && turn_effort) {
+                    free(*turn_effort);
+                    *turn_effort = pending_effort;
+                    pending_effort = NULL;
+                }
+            } else {
+                after_new_input = false;
+            }
+            /* an empty system entry has nothing to render (the effort-only form): dropped, so a request without
+             * one renders exactly as before */
+            const chat_msg *only = parts.len == 1 ? &parts.v[0] : NULL;
+            if (system && only && (!only->content || !only->content[0]) && only->images_len == 0 &&
+                only->tool_refs_len == 0) {
+                chat_msgs_free(&parts);
+            }
+        }
         for (int i = 0; i < parts.len; i++) {
             chat_msg *m = &parts.v[i];
             if (!m->role) m->role = server_xstrdup(role ? role : "user");
@@ -2630,6 +2697,7 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
         }
         free(parts.v);
         free(role);
+        free(output_config);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -2637,11 +2705,20 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t
 fail:
         chat_msgs_free(&parts);
         free(role);
-        return false;
+        free(output_config);
+        goto fail_effort;
     }
-    if (**p != ']') return false;
+    if (**p != ']') goto fail_effort;
     (*p)++;
+    free(pending_effort);
     return true;
+fail_effort:
+    free(pending_effort);
+    if (turn_effort) {
+        free(*turn_effort);
+        *turn_effort = NULL;
+    }
+    return false;
 }
 
 
