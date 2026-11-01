@@ -1769,7 +1769,7 @@ CONTAINER_V41_EXL3 ?= $(call need_path,CONTAINER_V41_EXL3)
 container-tests:
 	cd tools/container && export PULSAR_SERVED='$(CONTAINER_SERVED)' PULSAR_HF_SNAPSHOT='$(CONTAINER_VEXP_HF)' \
 	  PULSAR_V41_SNAPSHOT='$(CONTAINER_V41_HF)' PULSAR_V41_EXL3='$(CONTAINER_V41_EXL3)' && \
-	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py; do \
+	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run

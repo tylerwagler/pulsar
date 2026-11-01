@@ -44,6 +44,7 @@ import inkling as I        # noqa: E402
 import nemotron_h as N     # noqa: E402
 import nemotron_enc as NE  # noqa: E402
 import nemotron_parse as NP  # noqa: E402
+import gemma4 as G         # noqa: E402
 import entries as EN       # noqa: E402
 
 ALIGN = 32
@@ -104,9 +105,11 @@ def dense_entry(hf, fam, m, name, fmt, ctx):
     entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
     if layout in exl3_rates.K2:
         exl3_rates.admit(m.role, layout, name)
-        if hf.dtype(name) != 'BF16' or len(hshape) != 2 or not name.endswith('.weight'):
+        if hf.dtype(name) != 'BF16' or len(hshape) != 2 or len(dshape) != 2 or not name.endswith('.weight'):
             raise SystemExit(f'{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {hf.dtype(name)} {hshape}')
-        out, inp = hshape
+        # the DECLARED [out, in]: the source's, except where a family declares the pack's stored width (gemma4's
+        # dense MLP, padded to 128 by exllamav3 on both sides with exact zeros -- gemma4.py docstring)
+        out, inp = dshape
         ranges, nbytes = EN.exl3_ranges(ctx.sources[src], name[:-len('.weight')], layout, inp, out)
         entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes, src=('ranges', ranges))
     elif layout == 'tessera':
@@ -331,9 +334,10 @@ def write_index(out_dir):
 # (InklingForConditionalGeneration, model_type inkling_mm_model); nemotron_h.py: Nemotron-H (the Omni checkpoint,
 # NemotronH_Omni_Reasoning_V3, model_type nemotron_h_omni); nemotron_enc.py: the Nemotron-3.5 retrieval encoders
 # (Mistral3Model / Mistral3ForSequenceClassification, model_type mistral3; L321); nemotron_parse.py: Nemotron-3.5
-# Parse (RadioMBartPrefixForCausalLM, model_type nemotron_parse; L321).
+# Parse (RadioMBartPrefixForCausalLM, model_type nemotron_parse; L321); gemma4.py: Gemma 4 26B-A4B
+# (Gemma4ForConditionalGeneration, model_type gemma4; L338).
 FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q, I.MODEL_TYPE: I, N.MODEL_TYPE: N, NE.MODEL_TYPE: NE,
-            NP.MODEL_TYPE: NP}
+            NP.MODEL_TYPE: NP, G.MODEL_TYPE: G}
 
 
 def family_of(hf):
