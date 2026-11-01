@@ -201,6 +201,42 @@ static void part_add(uint32_t width, uint32_t rows) {
     CK(cudaFree(dr)); CK(cudaFree(dd)); CK(cudaFree(dw)); CK(cudaFree(dy)); CK(cudaFree(dr2)); CK(cudaFree(dy2));
 }
 
+/* L338: the scaled add -- res = bf16(bf16(res + delta) * s), then the next norm of the scaled row (Gemma 4's
+ * layer_scalar at a layer's end, fused with the next layer's input norm) */
+static void part_add_scale(uint32_t width, uint32_t rows) {
+    Rng g(width * 11 + rows);
+    const float eps = 1e-6f;
+    std::vector<uint16_t> res = rand_bf16(g, (size_t)rows * width, 2.0), d = rand_bf16(g, (size_t)rows * width, 0.5),
+                          w = rand_bf16(g, width, 0.3), ypre((size_t)rows * width, 0x1234u);
+    const uint16_t sb = sref_f2bf(0.4375f);   /* a layer_scalar-like bf16 scalar */
+    uint16_t *dr = dev(res), *dd = dev(d), *dw = dev(w), *dy = dev(ypre), *ds = dev(std::vector<uint16_t>{sb});
+    check(pulsar_rows_add_scale_launch(dr, width, dd, width, rows, width, ds, dw, eps, dy, width, 0) == 0,
+          "add-scale + norm launched");
+    const std::vector<uint16_t> r2 = host(dr, res.size()), y = host(dy, ypre.size());
+    uint64_t ok = 0, norm_exact = 0, off1 = 0;
+    std::vector<uint16_t> rep(width);
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t c = 0; c < width; c++) {
+            const size_t i = (size_t)r * width + c;
+            const uint16_t sum = sref_f2bf(sref_bf2f(res[i]) + sref_bf2f(d[i]));
+            ok += r2[i] == sref_f2bf(sref_bf2f(sum) * sref_bf2f(sb));
+        }
+        replica_norm(&r2[(size_t)r * width], w.data(), width, eps, rep.data());
+        for (uint32_t c = 0; c < width; c++) {
+            norm_exact += y[(size_t)r * width + c] == rep[c];
+            off1 += bf_ulps(y[(size_t)r * width + c], rep[c]) > 1;
+        }
+    }
+    const uint64_t n = (uint64_t)rows * width;
+    check(ok == n, "add-scale %ux%u: res == bf16(bf16(res + delta) * s) on every element (%llu of %llu)", rows, width,
+          (unsigned long long)ok, (unsigned long long)n);
+    check(off1 == 0 && norm_exact * 1000 >= n * 999, "add-scale's norm %ux%u: %.4f%% == the replica on the SCALED row, "
+          "none past 1 ulp", rows, width, 100.0 * norm_exact / n);
+    check(pulsar_rows_add_scale_launch(dr, width, dd, width, rows, width, nullptr, dw, eps, dy, width, 0) == -1,
+          "add-scale: no scale -- refused");
+    CK(cudaFree(dr)); CK(cudaFree(dd)); CK(cudaFree(dw)); CK(cudaFree(dy)); CK(cudaFree(ds));
+}
+
 static void part_emit() {
     Rng g(99);
     const uint32_t width = 6656, rows = 37;
@@ -260,6 +296,7 @@ int main() {
     part_norm(4096, 300);
     part_norm(1024, 17);
     part_add(4096, 129);
+    part_add_scale(2816, 37);   /* L338: Gemma 4's width */
     part_emit();
     part_refusals();
     printf(g_fail ? "ROWOPS GATE FAIL\n" : "ROWOPS GATE PASS\n");

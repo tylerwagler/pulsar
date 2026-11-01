@@ -30,7 +30,9 @@ __device__ __forceinline__ uint32_t f2bf(float f) { return (uint32_t)__bfloat16_
  * is of the stored bytes); its squares are an f32 fma chain over its chunks in order, the warps fold by
  * xor-shuffle, warp 0 adds the eight warp sums in order. */
 /** Optional residual add then optional RMS norm, bf16.  Grid n_rows (blockIdx.x = row); block kNormThreads; static
- *  smem only.  With delta: res[t] = bf16(res[t] + delta[t]) stored.  With w: y[t] = bf16((res[t] * rstd) * w).
+ *  smem only.  With delta: res[t] = bf16(res[t] + delta[t]) stored -- and with a scale (L338), res[t] =
+ *  bf16(bf16(res[t] + delta[t]) * s): the sum rounded, then the scaled sum rounded, as torch's two bf16 ops.  With w:
+ *  y[t] = bf16((res[t] * rstd) * w) of the stored row.
  *  @param res      device bf16 rows (the residual; updated in place with delta), 16-byte aligned
  *  @param ld_res   res row pitch in elements (a multiple of 8)
  *  @param delta    device bf16 rows to add, or NULL
@@ -39,10 +41,12 @@ __device__ __forceinline__ uint32_t f2bf(float f) { return (uint32_t)__bfloat16_
  *  @param w        device bf16 [width] norm weight as uint4 chunks, or NULL: the add alone
  *  @param eps      the norm's epsilon
  *  @param y        device bf16 output rows (read only with w)
- *  @param ld_y     y row pitch in elements */
+ *  @param ld_y     y row pitch in elements
+ *  @param scale    device bf16 scalar the summed row is multiplied by (with delta), or NULL */
 __global__ void __launch_bounds__(kNormThreads)
 rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__restrict__ delta, uint64_t ld_delta,
-                 uint32_t width, const uint4 *__restrict__ w, float eps, uint16_t *__restrict__ y, uint64_t ld_y) {
+                 uint32_t width, const uint4 *__restrict__ w, float eps, uint16_t *__restrict__ y, uint64_t ld_y,
+                 const uint16_t *__restrict__ scale) {
     __shared__ float warp_ss[kNormThreads / 32];
     __shared__ float s_rstd;
     const uint64_t t = blockIdx.x;
@@ -58,8 +62,13 @@ rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__
             const uint32_t du[4] = {dv.x, dv.y, dv.z, dv.w};
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const uint32_t lo = f2bf(__fadd_rn(bf2f(u[k] & 0xffffu), bf2f(du[k] & 0xffffu)));
-                const uint32_t hi = f2bf(__fadd_rn(bf2f(u[k] >> 16), bf2f(du[k] >> 16)));
+                uint32_t lo = f2bf(__fadd_rn(bf2f(u[k] & 0xffffu), bf2f(du[k] & 0xffffu)));
+                uint32_t hi = f2bf(__fadd_rn(bf2f(u[k] >> 16), bf2f(du[k] >> 16)));
+                if (scale) {
+                    const float s = bf2f(*scale);
+                    lo = f2bf(__fmul_rn(bf2f(lo), s));
+                    hi = f2bf(__fmul_rn(bf2f(hi), s));
+                }
                 u[k] = lo | (hi << 16);
             }
             v = make_uint4(u[0], u[1], u[2], u[3]);
@@ -339,7 +348,7 @@ extern "C" int pulsar_rows_rmsnorm_launch(const uint16_t *x, uint64_t ld_x, uint
         return -1;
     }
     rows_norm_kernel<<<n_rows, kNormThreads, 0, stream>>>(const_cast<uint16_t *>(x), ld_x, nullptr, 0, width,
-                                                          (const uint4 *)w, eps, y, ld_y);
+                                                          (const uint4 *)w, eps, y, ld_y, nullptr);
     return launched("rmsnorm");
 }
 
@@ -353,8 +362,22 @@ extern "C" int pulsar_rows_add_launch(uint16_t *res, uint64_t ld_res, const uint
         return -1;
     }
     rows_norm_kernel<<<n_rows, kNormThreads, 0, stream>>>(res, ld_res, delta, ld_delta, width, (const uint4 *)w, eps,
-                                                          y, ld_y);
+                                                          y, ld_y, nullptr);
     return launched("add");
+}
+
+extern "C" int pulsar_rows_add_scale_launch(uint16_t *res, uint64_t ld_res, const uint16_t *delta, uint64_t ld_delta,
+                                            uint32_t n_rows, uint32_t width, const uint16_t *scale, const uint16_t *w,
+                                            float eps, uint16_t *y, uint64_t ld_y, cudaStream_t stream) {
+    if (!delta || !scale || (w && !(eps >= 0.0f)) ||
+        !norm_args_ok("add-scale", res, ld_res, delta, ld_delta, n_rows, width, w, y, ld_y)) {
+        if (!delta || !scale || (w && !(eps >= 0.0f)))
+            fprintf(stderr, "pulsar: rows add-scale: no delta, no scale or a negative eps -- refusing\n");
+        return -1;
+    }
+    rows_norm_kernel<<<n_rows, kNormThreads, 0, stream>>>(res, ld_res, delta, ld_delta, width, (const uint4 *)w, eps,
+                                                          y, ld_y, scale);
+    return launched("add-scale");
 }
 
 extern "C" int pulsar_rows_emit_bf16_launch(const float *x, uint64_t ld_x, uint32_t n_rows, uint32_t width,

@@ -10,6 +10,8 @@
  *
  * THE ARITHMETIC (one per op; a row's bytes never depend on the rows beside it, the call's row count or its CTA):
  *   add       res[t][c] = bf16_rn(res[t][c] + delta[t][c])          (f32 add of the two widened values, one rounding)
+ *   add-scale res[t][c] = bf16_rn(bf16_rn(res[t][c] + delta[t][c]) * s)  for a device bf16 scalar s (L338: Gemma 4's
+ *             layer_scalar, which scales the whole stream after the layer's last add -- torch's add, then its mul)
  *   rmsnorm   y[t][c]   = bf16_rn((x[t][c] * rstd) * w[c]),  rstd = rsqrtf(sum_c x^2 / width + eps)
  *             -- vLLM's rmsnorm / add_rmsnorm (one rounding; the sum over the ROUNDED residual when it follows an add).
  *             The squares are one f32 fma chain per thread over its 8-element chunks in order, the warps fold by
@@ -87,6 +89,25 @@ int pulsar_rows_rmsnorm_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows
 int pulsar_rows_add_launch(uint16_t *res, uint64_t ld_res, const uint16_t *delta, uint64_t ld_delta, uint32_t n_rows,
                            uint32_t width, const uint16_t *w, float eps, uint16_t *y, uint64_t ld_y,
                            cudaStream_t stream);
+
+/** res = bf16(bf16(res + delta) * s) in place (L338), then, when `w` is given, y = rmsnorm(res) * w of the scaled row
+ *  -- the layer's last add, its scalar and the next layer's input norm in one pass.  `scale` a device bf16 scalar.
+ *  @return 0, -1 refused, -3 launch failure. */
+/// @param res      device bf16 residual rows, updated in place
+/// @param ld_res   res row pitch in elements (a multiple of 8)
+/// @param delta    device bf16 rows added to res
+/// @param ld_delta delta row pitch in elements (a multiple of 8)
+/// @param n_rows   rows
+/// @param width    row width (a multiple of 8)
+/// @param scale    device bf16 scalar the summed row is multiplied by
+/// @param w        device bf16 [width] norm weight, or NULL: the scaled add alone
+/// @param eps      the norm's epsilon
+/// @param y        device bf16 normed output rows (with w)
+/// @param ld_y     y row pitch in elements
+/// @param stream   stream to launch on
+int pulsar_rows_add_scale_launch(uint16_t *res, uint64_t ld_res, const uint16_t *delta, uint64_t ld_delta,
+                                 uint32_t n_rows, uint32_t width, const uint16_t *scale, const uint16_t *w, float eps,
+                                 uint16_t *y, uint64_t ld_y, cudaStream_t stream);
 
 /** y = bf16(x [* s]) for n_rows rows of `width`: x f32 rows ld_x apart (elements; a multiple of 4), y bf16 rows ld_y
  *  apart.  `scale` is a device pointer to one value stored as `kind` (NULL with PULSAR_ROWS_SCALE_NONE).
