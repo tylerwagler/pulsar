@@ -2011,8 +2011,10 @@ void server::gen_step_finish(session_slot *sl) {
     if (j->req.api == API_ANTHROPIC) {
         /* a family without a tool-result tail keeps no live tool state (its renderer refuses a
          * continuation that would need it), so nothing is remembered for it */
-        if (parsed_calls.len && j->req.family->tool_result_tail && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
+        /* L337: nor after an edited prompt -- the KV is the edited history, and the client's next request renders
+         * as sent unless its own edits clear the same parts, so only a prefix match can tell */
+        if (parsed_calls.len && j->req.family->tool_result_tail && !j->req.ctx_edited &&
+            strcmp(final_finish, "error") && strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);
         } else {

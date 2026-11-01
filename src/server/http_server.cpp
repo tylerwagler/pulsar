@@ -1355,7 +1355,12 @@ void *client_main(void *arg) {
             goto done;
         }
         buf cb = {0};
-        buf_printf(&cb, "{\"input_tokens\":%d}\n", creq.prompt.len);
+        /* L337: with context_management, input_tokens is the edited prompt's and original_input_tokens the
+         * prompt's as sent */
+        buf_printf(&cb, "{\"input_tokens\":%d", creq.prompt.len);
+        if (creq.ctx_mgmt)
+            buf_printf(&cb, ",\"context_management\":{\"original_input_tokens\":%d}", creq.ctx_original_tokens);
+        buf_puts(&cb, "}\n");
         http_response(fd, 200, "application/json", cb.ptr);
         buf_free(&cb);
         request_free(&creq);

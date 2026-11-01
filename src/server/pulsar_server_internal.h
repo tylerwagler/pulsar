@@ -323,6 +323,9 @@ typedef struct {
      * because reproducing a prefix requires the bytes the model actually
      * produced, not a re-serialisation of the parse. */
     char *raw_calls;
+    /** L337: context editing cleared one of these calls' inputs, so the sampled bytes tool memory holds no longer
+     *  describe them: the calls render from their (edited) arguments, never from remembered raw_calls. */
+    bool inputs_cleared;
 } tool_calls;
 
 /** How a replayed conversation's tool calls were resolved.
@@ -834,6 +837,35 @@ typedef struct constrain_plan constrain_plan;
 /// @param p  the plan (NULL: nothing)
 void constrain_plan_free(constrain_plan *p);
 
+/* ---- L337: Anthropic context editing (context_management.edits) ------------------------------------------------
+ * The edits are applied to the conversation BEFORE the family renders it, so the prompt -- and with it every prefix
+ * match, the disk chain keys and the live-continuation decision -- is the edited one.  Parsed by the Anthropic
+ * protocol half (api_parse.cpp), planned and applied by context_edit.cpp. */
+/// The context edits this server applies (BetaContextManagementConfig.edits).
+typedef enum {
+    CTX_EDIT_CLEAR_TOOL_USES = 0,  ///< clear_tool_uses_20250919: old tool results replaced by a notice
+    CTX_EDIT_CLEAR_THINKING,       ///< clear_thinking_20251015: reasoning of older assistant turns dropped
+} ctx_edit_kind;
+/// The most edits one request may carry (one of each kind: each type may appear once).
+#define PULSAR_CTX_EDITS_MAX 2
+/** One requested edit, defaults filled (the API's: trigger 100,000 input tokens, keep 3 tool uses, thinking "all"). */
+typedef struct {
+    ctx_edit_kind kind;          ///< which edit
+    bool trigger_tool_uses;      ///< clear_tool_uses: the trigger counts tool uses (else input tokens)
+    long trigger;                ///< clear_tool_uses: the prompt must EXCEED this to clear
+    int keep;                    ///< tool uses kept (clear_tool_uses); thinking turns kept, -1 = all (clear_thinking)
+    long clear_at_least;         ///< clear_tool_uses: input tokens a clear must remove or it is not applied (0: none)
+    char *exclude;               ///< clear_tool_uses: tool names never cleared, one per line, owned (NULL: none)
+    bool clear_inputs;           ///< clear_tool_uses: the cleared calls' inputs are cleared too
+    char *clear_inputs_only;     ///< ... only for these tool names, one per line, owned (NULL: every cleared call)
+} ctx_edit;
+/** What one applied edit cleared (BetaContextManagementResponse.applied_edits[]). */
+typedef struct {
+    ctx_edit_kind kind;          ///< which edit
+    int cleared;                 ///< tool uses (clear_tool_uses) or thinking turns (clear_thinking) cleared
+    int cleared_input_tokens;    ///< prompt tokens the edit removed: the render before it minus the render after
+} ctx_edit_applied;
+
 /* ---- L249 D: Claude Code's gateway hint headers -------------------------------------------------------------
  * Sent when the client sets CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 (the gate forwards every x-claude-code-* header
  * unchanged).  Fixed vocabularies, ids and a random prompt UUID, never prompt text.  Read by the front door
@@ -991,6 +1023,15 @@ typedef struct request {
     constrain_plan *constrain;
     /** L249 D: the gateway hint headers the request arrived with (none: zero). */
     client_hints hints;
+    /** L337: the request carried context_management -- the response reports context_management.applied_edits
+     *  (an empty list when nothing was cleared). */
+    bool ctx_mgmt;
+    ctx_edit_applied ctx_applied[PULSAR_CTX_EDITS_MAX];  ///< L337: the edits applied, in request order
+    int n_ctx_applied;                                  ///< L337: entries in ctx_applied
+    int ctx_original_tokens;   ///< L337: the unedited render's prompt size (count_tokens' original_input_tokens)
+    /** L337: the prompt is not the render of the conversation as sent (an applied edit changed it): the slot's live
+     *  tool binding is neither continued nor recorded, since the client's next request may render it either way. */
+    bool ctx_edited;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -4146,9 +4187,48 @@ typedef struct chat_conversation {
     chat_control *controls;         ///< thinking / effort controls in arrival order, owned
     int n_controls;                 ///< entries in controls
     response_format_spec response_format;  ///< L303: the answer's format (NONE = text)
+    /** L337: Anthropic's context_management.edits, in request order (context_edit.cpp applies them). */
+    ctx_edit ctx_edits[PULSAR_CTX_EDITS_MAX];
+    int n_ctx_edits;                ///< entries in ctx_edits
 } chat_conversation;
 
 void chat_conversation_free(chat_conversation *c);
+
+/* ---- L337: context editing (context_edit.cpp) ---- */
+/** Read Anthropic's context_management ({"edits": [...]} or null) into the conversation's edits; sets
+ *  request::ctx_mgmt.  false + err (the Messages API's wording): an unknown member or edit type, a malformed value,
+ *  compact_20260112 (server-side compaction is not implemented), a repeated type, clear_thinking not first. */
+/// @param p       the cursor, at the value (advanced past it)
+/// @param c       the conversation (ctx_edits appended)
+/// @param r       the request (ctx_mgmt set)
+/// @param err     receives the client error on false
+/// @param errlen  size of `err`
+/// @return false on a refused value
+bool ctx_management_parse(const char **p, chat_conversation *c, request *r, char *err, size_t errlen);
+/// Free the conversation's edits (chat_conversation_free calls it).
+/// @param c  the conversation
+void ctx_edits_free(chat_conversation *c);
+/** Parse and render an Anthropic Messages body with its context edits applied.  No edits, or none that clears
+ *  anything: ONE parse and render, the request as sent (byte-identical to a body without context_management).
+ *  Otherwise each edit that clears something is applied on top of the ones before it, rendered and measured; it
+ *  stays when its trigger is passed (input tokens: the unedited prompt's size) and it removes at least
+ *  clear_at_least, and the request is the last render kept.  request::ctx_applied reports what each removed.  The
+ *  size is the prompt's tokens; with no engine (the renderer tests) its bytes. */
+/// @param e           the engine (NULL: text only)
+/// @param fmt         the chat format to render in
+/// @param s           the server (may be NULL)
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on false)
+/// @param err         receives the reason on false
+/// @param errlen      size of `err`
+/// @return false when refused
+bool parse_anthropic_request_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body,
+                                    int def_tokens, request *r, char *err, size_t errlen);
+/** Append `,"context_management":{"applied_edits":[...]}` when the request carried context_management. */
+/// @param b  the JSON being built (a message object, or a message_delta event)
+/// @param r  the request
+void append_ctx_management_json(buf *b, const request *r);
 /** The raw JSON text of member `key` of object `obj` (malloc'd), or NULL when absent. */
 /// @param obj  the object's JSON text
 /// @param key  the member name

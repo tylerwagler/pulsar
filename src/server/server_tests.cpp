@@ -4988,6 +4988,421 @@ static void test_anthropic_per_turn_effort(void) {
     }
 }
 
+static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, uint32_t b, const char *text,
+                         uint64_t n, uint8_t fill, char key[41]);   /* the L264 segstore tests' helper, below */
+
+/* ---- L337: Anthropic context editing (context_edit.cpp) --------------------------------------------------------- */
+
+/* A three-call tool loop with thinking on every assistant turn: toolu_1 bash, toolu_2 read, toolu_3 bash, each result
+ * and input carrying a marker the assertions look for.  `cm` is the context_management member ("" = none). */
+static std::string ctx_test_body(const std::string &cm) {
+    std::string b =
+        "{\"model\":\"m\",\"max_tokens\":64,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024},"
+        "\"system\":\"Be terse.\",\"tools\":["
+        "{\"name\":\"bash\",\"description\":\"Run.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{\"type\":\"string\"}}}},"
+        "{\"name\":\"read\",\"description\":\"Read.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"path\":{\"type\":\"string\"}}}}],\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Look around.\"},";
+    const char *calls[3][5] = {
+        {"THINK_ONE", "toolu_1", "bash", "{\"command\":\"ls /dir_one\"}", "RESULT_ONE"},
+        {"THINK_TWO", "toolu_2", "read", "{\"path\":\"/file_two\"}", "RESULT_TWO"},
+        {"THINK_THREE", "toolu_3", "bash", "{\"command\":\"ls /dir_three\"}", "RESULT_THREE"},
+    };
+    for (int i = 0; i < 3; i++) {
+        b += std::string("{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"") + calls[i][0] +
+             "\",\"signature\":\"sig\"},{\"type\":\"tool_use\",\"id\":\"" + calls[i][1] + "\",\"name\":\"" +
+             calls[i][2] + "\",\"input\":" + calls[i][3] + "}]},";
+        b += std::string("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"") + calls[i][1] +
+             "\",\"content\":\"" + calls[i][4] + " " + std::string(200, 'x') + "\"}]}";
+        if (i < 2) b += ",";
+    }
+    b += "]";
+    if (!cm.empty()) b += ",\"context_management\":" + cm;
+    return b + "}";
+}
+
+/// The request a body renders to (no engine: the prompt's size is its bytes); false + err on a refusal.
+static bool ctx_test_render(const std::string &body, pulsar_chat_format fmt, server *s, request *r, char *err,
+                            size_t errlen) {
+    err[0] = '\0';
+    return parse_anthropic_request_render(NULL, fmt, s, body.c_str(), 256, r, err, errlen);
+}
+
+static std::string ctx_text(const request *r) { return r->prompt_text ? r->prompt_text : ""; }
+
+static size_t ctx_common_prefix(const std::string &a, const std::string &b) {
+    size_t n = 0;
+    while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+    return n;
+}
+
+/* Parse: the accepted shapes and every refusal, in the Messages API's wording. */
+static void test_l337_context_management_parse(void) {
+    struct { const char *cm; const char *want; } bad[] = {
+        {"{\"edits\":[{\"type\":\"clear_everything\"}]}", "does not match any of the expected tags"},
+        {"{\"edits\":[{\"type\":\"compact_20260112\"}]}", "compact_20260112"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"},{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]}",
+         "must be the first edit"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"},{\"type\":\"clear_tool_uses_20250919\"}]}",
+         "may appear once"},
+        {"{\"edits\":[],\"strategy\":1}", "context_management.strategy: Extra inputs are not permitted"},
+        {"{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\",\"value\":0}}]}",
+         "context_management.edits.0.keep.value"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"turns\",\"value\":3}}]}",
+         "context_management.edits.0.trigger.type"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"clear_tool_inputs\":\"yes\"}]}",
+         "context_management.edits.0.clear_tool_inputs"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"keep\":{\"type\":\"tool_uses\",\"value\":1.5}}]}",
+         "context_management.edits.0.keep.value"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"keeep\":1}]}",
+         "context_management.edits.0.keeep: Extra inputs are not permitted"},
+        {"{\"edits\":{}}", "context_management.edits: Input should be a valid list"},
+        {"{\"edits\":[{\"keep\":\"all\"}]}", "context_management.edits.0.type: Field required"},
+    };
+    for (const auto &c : bad) {
+        request r;
+        char err[300];
+        const bool ok = ctx_test_render(ctx_test_body(c.cm), PULSAR_CHAT_QWEN, NULL, &r, err, sizeof err);
+        if (ok || !strstr(err, c.want)) fprintf(stderr, "L337 parse: %s -> ok=%d err=%s\n", c.cm, ok, err);
+        TEST_ASSERT(!ok && strstr(err, c.want) != NULL);
+    }
+    /* the accepted spellings parse to the defaults the API documents */
+    {
+        const std::string body = ctx_test_body(
+            "{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"all\"}},"
+            "{\"type\":\"clear_tool_uses_20250919\",\"exclude_tools\":[\"read\",\"web\"],"
+            "\"clear_tool_inputs\":[\"bash\"],\"clear_at_least\":{\"type\":\"input_tokens\",\"value\":5}}]}");
+        chat_conversation c = {};
+        request r;
+        test_request_init(&r, REQ_CHAT, 64);
+        char err[300] = "";
+        TEST_ASSERT(parse_chat_conversation_anthropic(body.c_str(), &c, &r, err, sizeof err));
+        TEST_ASSERT(r.ctx_mgmt && c.n_ctx_edits == 2);
+        if (c.n_ctx_edits == 2) {
+            TEST_ASSERT(c.ctx_edits[0].kind == CTX_EDIT_CLEAR_THINKING && c.ctx_edits[0].keep == -1);
+            const ctx_edit *t = &c.ctx_edits[1];
+            TEST_ASSERT(t->kind == CTX_EDIT_CLEAR_TOOL_USES && !t->trigger_tool_uses && t->trigger == 100000 &&
+                        t->keep == 3 && t->clear_at_least == 5 && t->clear_inputs);
+            TEST_ASSERT(t->exclude && !strcmp(t->exclude, "read\nweb\n"));
+            TEST_ASSERT(t->clear_inputs_only && !strcmp(t->clear_inputs_only, "bash\n"));
+        }
+        chat_conversation_free(&c);
+        request_free(&r);
+    }
+    /* null is no context management at all; {} and an empty list are context management with no edits */
+    for (const char *cm : {"null", "{}", "{\"edits\":[]}", "{\"edits\":null}"}) {
+        request r;
+        char err[300];
+        TEST_ASSERT(ctx_test_render(ctx_test_body(cm), PULSAR_CHAT_QWEN, NULL, &r, err, sizeof err));
+        TEST_ASSERT(r.ctx_mgmt == (strcmp(cm, "null") != 0) && r.n_ctx_applied == 0 && !r.ctx_edited);
+        request_free(&r);
+    }
+}
+
+/* Every family: the no-op cases render byte-identically to the body without context_management (and to the
+ * pre-L337 path, parse then render), and each edit clears what the spec says, measured, never estimated. */
+static void test_l337_context_edits_every_family(void) {
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4,
+                                       PULSAR_CHAT_INKLING, PULSAR_CHAT_NEMOTRON_H};
+    const char *const notice = "[tool result cleared to save context]";
+    bool some_thinking_rendered = false;
+    for (pulsar_chat_format fmt : fmts) {
+        char err[300];
+        request base;
+        const bool base_ok = ctx_test_render(ctx_test_body(""), fmt, NULL, &base, err, sizeof err);
+        if (!base_ok) fprintf(stderr, "L337: fmt %d refused the plain body: %s\n", (int)fmt, err);
+        TEST_ASSERT(base_ok);
+        if (!base_ok) continue;
+        const std::string bt = ctx_text(&base);
+        TEST_ASSERT(!base.ctx_mgmt && base.n_ctx_applied == 0);
+        TEST_ASSERT(bt.find("RESULT_ONE") != std::string::npos && bt.find("/dir_one") != std::string::npos);
+        /* the pre-L337 path: the protocol parse, then the family's render */
+        {
+            request old;
+            test_request_init(&old, REQ_CHAT, 256);
+            chat_conversation c = {};
+            const bool ok = parse_chat_conversation_anthropic(ctx_test_body("").c_str(), &c, &old, err, sizeof err) &&
+                            render_chat_conversation(NULL, fmt, NULL, &c, &old, err, sizeof err);
+            TEST_ASSERT(ok && ctx_text(&old) == bt && old.prompt_n_spans == base.prompt_n_spans);
+            for (uint32_t i = 0; ok && i < old.prompt_n_spans && i < base.prompt_n_spans; i++)
+                TEST_ASSERT(old.prompt_spans[i].lo == base.prompt_spans[i].lo &&
+                            old.prompt_spans[i].hi == base.prompt_spans[i].hi);
+            chat_conversation_free(&c);
+            request_free(&old);
+        }
+        /* no-ops: Claude Code's every-request keep "all", the default trigger not reached, a tool_uses trigger not
+         * exceeded, a clear_at_least no clear can meet */
+        const char *noops[] = {
+            "{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\",\"value\":3}}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\",\"value\":1},"
+            "\"keep\":{\"type\":\"tool_uses\",\"value\":0},\"clear_at_least\":{\"type\":\"input_tokens\","
+            "\"value\":1000000}}]}",
+        };
+        for (const char *cm : noops) {
+            request r;
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            TEST_ASSERT(ctx_text(&r) == bt && r.ctx_mgmt && r.n_ctx_applied == 0 && !r.ctx_edited);
+            TEST_ASSERT(r.ctx_original_tokens == (int)bt.size());
+            TEST_ASSERT(r.anthropic_live_call_ids.len == base.anthropic_live_call_ids.len);
+            request_free(&r);
+        }
+        /* clear_tool_uses past a tool_uses trigger, keep 1: toolu_1 and toolu_2 cleared, their calls kept */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":2},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_TWO") == std::string::npos);
+            TEST_ASSERT(t.find("RESULT_THREE") != std::string::npos && count_substr(t.c_str(), notice) == 2);
+            TEST_ASSERT(t.find("/dir_one") != std::string::npos && t.find("/file_two") != std::string::npos);
+            TEST_ASSERT(r.ctx_edited && r.n_ctx_applied == 1);
+            TEST_ASSERT(r.ctx_applied[0].kind == CTX_EDIT_CLEAR_TOOL_USES && r.ctx_applied[0].cleared == 2);
+            TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens == (int)bt.size() - (int)t.size());
+            TEST_ASSERT(r.ctx_original_tokens == (int)bt.size());
+            /* the edited render leaves the unedited one at or before the first cleared result: no prefix of the
+             * unedited render past it is the edited request's */
+            TEST_ASSERT(ctx_common_prefix(bt, t) <= bt.find("RESULT_ONE"));
+            /* the live binding is the unedited history's: an edited request carries no live continuation */
+            TEST_ASSERT(r.anthropic_live_call_ids.len == 0 && r.anthropic_live_suffix_text == NULL);
+            request_free(&r);
+        }
+        /* an input_tokens trigger is the unedited prompt's size: just under it clears, at it does not */
+        for (int delta : {-1, 0}) {
+            char cm[300];
+            snprintf(cm, sizeof cm,
+                     "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"input_tokens\","
+                     "\"value\":%d}}]}", (int)bt.size() + delta);
+            request r;
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            /* keep defaults to 3: three uses, nothing to clear either way -- then keep 0 through clear_at_least 0 */
+            TEST_ASSERT(r.n_ctx_applied == 0 && ctx_text(&r) == bt);
+            request_free(&r);
+            snprintf(cm, sizeof cm,
+                     "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"input_tokens\","
+                     "\"value\":%d},\"keep\":{\"type\":\"tool_uses\",\"value\":0}}]}", (int)bt.size() + delta);
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            TEST_ASSERT(r.n_ctx_applied == (delta < 0 ? 1 : 0));
+            TEST_ASSERT(delta < 0 ? count_substr(r.prompt_text, notice) == 3 : ctx_text(&r) == bt);
+            request_free(&r);
+        }
+        /* exclude_tools: read's result is never cleared, nor counted against keep */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":0},\"exclude_tools\":[\"read\"]}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_THREE") == std::string::npos);
+            TEST_ASSERT(t.find("RESULT_TWO") != std::string::npos);
+            TEST_ASSERT(r.n_ctx_applied == 1 && r.ctx_applied[0].cleared == 2);
+            request_free(&r);
+        }
+        /* clear_tool_inputs: every cleared call's input, or only the named tools' */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":true}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("/dir_one") == std::string::npos && t.find("/file_two") == std::string::npos);
+            TEST_ASSERT(t.find("/dir_three") != std::string::npos);
+            request_free(&r);
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":[\"read\"]}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            t = ctx_text(&r);
+            TEST_ASSERT(t.find("/dir_one") != std::string::npos && t.find("/file_two") == std::string::npos);
+            request_free(&r);
+        }
+        /* clear_thinking keep 1: the two older thinking turns go (from the prompt when the family renders them) */
+        const bool renders_old_thinking = bt.find("THINK_ONE") != std::string::npos;
+        some_thinking_rendered = some_thinking_rendered || renders_old_thinking;
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\","
+                              "\"value\":1}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("THINK_ONE") == std::string::npos && t.find("THINK_TWO") == std::string::npos);
+            TEST_ASSERT((t.find("THINK_THREE") != std::string::npos) == (bt.find("THINK_THREE") != std::string::npos));
+            TEST_ASSERT(r.n_ctx_applied == 1 && r.ctx_applied[0].kind == CTX_EDIT_CLEAR_THINKING &&
+                        r.ctx_applied[0].cleared == 2);
+            TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens == (int)bt.size() - (int)t.size());
+            /* a family that never renders an older turn's reasoning: the turns are cleared, the prompt (and its live
+             * binding) is the one as sent */
+            TEST_ASSERT(r.ctx_edited == (t != bt));
+            if (!renders_old_thinking) TEST_ASSERT(t == bt && r.anthropic_live_call_ids.len == base.anthropic_live_call_ids.len);
+            request_free(&r);
+        }
+        /* both, thinking first: reported in request order, each measured on top of the one before */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\","
+                              "\"value\":1}},{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":2}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(r.n_ctx_applied == 2);
+            if (r.n_ctx_applied == 2) {
+                TEST_ASSERT(r.ctx_applied[0].kind == CTX_EDIT_CLEAR_THINKING && r.ctx_applied[0].cleared == 2);
+                TEST_ASSERT(r.ctx_applied[1].kind == CTX_EDIT_CLEAR_TOOL_USES && r.ctx_applied[1].cleared == 1);
+                TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens + r.ctx_applied[1].cleared_input_tokens ==
+                            (int)bt.size() - (int)t.size());
+            }
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_TWO") != std::string::npos);
+            request_free(&r);
+        }
+        request_free(&base);
+    }
+    /* the thinking assertions meant something on at least one family */
+    TEST_ASSERT(some_thinking_rendered);
+}
+
+/* Tool memory: a cleared input renders from its edited arguments, never from the sampled bytes the memory holds for
+ * the call (which carry the original input); a call whose input stays keeps its exact replay. */
+static void test_l337_cleared_inputs_skip_tool_memory(void) {
+    const char *sampled =
+        "\n\n" PULSAR_TOOL_CALLS_START "\n"
+        "<｜DSML｜ invoke name=\"bash\">\n"
+        "<｜DSML｜ parameter name=\"command\" string=\"true\">SAMPLED_MARK</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n" PULSAR_TOOL_CALLS_END;
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.tool_memory_put("toolu_1", sampled);
+    char err[300];
+    request r;
+    TEST_ASSERT(ctx_test_render(ctx_test_body(""), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") != NULL);   /* the exact replay */
+    request_free(&r);
+    const char *keep_inputs = "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}";
+    TEST_ASSERT(ctx_test_render(ctx_test_body(keep_inputs), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") != NULL && strstr(r.prompt_text, "RESULT_ONE") == NULL);
+    request_free(&r);
+    const char *clear_inputs = "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                               "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":true}]}";
+    TEST_ASSERT(ctx_test_render(ctx_test_body(clear_inputs), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") == NULL && strstr(r.prompt_text, "/dir_one") == NULL);
+    request_free(&r);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* The disk KV chain keys on the rendered text, and the rendered text is the edited one: a chain stored for the
+ * unedited conversation serves an edited request no deeper than the bytes the two share. */
+static void test_l337_disk_chain_keys_on_the_edited_render(void) {
+    char err[300];
+    request base, ed;
+    TEST_ASSERT(ctx_test_render(ctx_test_body(""), PULSAR_CHAT_QWEN, NULL, &base, err, sizeof err));
+    TEST_ASSERT(ctx_test_render(
+        ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                      "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}"),
+        PULSAR_CHAT_QWEN, NULL, &ed, err, sizeof err));
+    const std::string bt = ctx_text(&base), et = ctx_text(&ed);
+    const size_t cp = ctx_common_prefix(bt, et);
+    TEST_ASSERT(cp > 0 && cp < bt.size() && cp < et.size());
+    char tmpl[] = "/tmp/pulsar-l337-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    pulsar_segstore *st = dir ? pulsar_segstore_open(dir, 0, 7, NULL, NULL) : NULL;
+    TEST_ASSERT(st != NULL);
+    if (st) {
+        /* the unedited conversation's chain: a segment inside the shared bytes, one across the divergence, the rest */
+        const uint32_t a = (uint32_t)(cp / 2), b = (uint32_t)(cp + (bt.size() - cp) / 2), n = (uint32_t)bt.size();
+        char k0[41], k1[41], k2[41];
+        TEST_ASSERT(test_seg_put(st, "", 0, a, bt.substr(0, a).c_str(), 64, 0x11, k0));
+        TEST_ASSERT(test_seg_put(st, k0, a, b, bt.substr(a, b - a).c_str(), 64, 0x22, k1));
+        TEST_ASSERT(test_seg_put(st, k1, b, n, bt.substr(b).c_str(), 64, 0x33, k2));
+        pulsar_segstore_seg chain[8];
+        TEST_ASSERT(pulsar_segstore_lookup(st, bt.c_str(), bt.size(), NULL, chain, 8) == 3);
+        const int m = pulsar_segstore_lookup(st, et.c_str(), et.size(), NULL, chain, 8);
+        TEST_ASSERT(m == 1 && chain[0].text_end <= cp);
+        pulsar_segstore_close(st);
+    }
+    if (dir) {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        TEST_ASSERT(system(cmd) == 0);
+    }
+    request_free(&base);
+    request_free(&ed);
+}
+
+/* The response: context_management.applied_edits in the message body and in the final message_delta, an empty list
+ * when the request asked and nothing was cleared, absent when it did not ask. */
+static void test_l337_applied_edits_in_both_response_shapes(void) {
+    request r;
+    test_request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    buf b = {0};
+    append_ctx_management_json(&b, &r);
+    TEST_ASSERT(b.len == 0);
+    r.ctx_mgmt = true;
+    append_ctx_management_json(&b, &r);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, ",\"context_management\":{\"applied_edits\":[]}"));
+    buf_free(&b);
+    r.n_ctx_applied = 2;
+    r.ctx_applied[0] = {CTX_EDIT_CLEAR_THINKING, 3, 150};
+    r.ctx_applied[1] = {CTX_EDIT_CLEAR_TOOL_USES, 8, 5000};
+    const char *want = "\"context_management\":{\"applied_edits\":["
+                       "{\"type\":\"clear_thinking_20251015\",\"cleared_thinking_turns\":3,\"cleared_input_tokens\":150},"
+                       "{\"type\":\"clear_tool_uses_20250919\",\"cleared_tool_uses\":8,\"cleared_input_tokens\":5000}]}";
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_ctx", "OK", NULL, NULL, "stop", NULL, 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, want) != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    r.stream = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_ctx", 10, &st));
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_ctx", &st, &w, "OK", 2, NULL, "stop", NULL, 3));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    const std::string delta = std::string("\"usage\":{\"output_tokens\":3},") + want + "}";
+    TEST_ASSERT(out && strstr(out, delta.c_str()) != NULL);
+    TEST_ASSERT(out && count_substr(out, "context_management") == 1);   /* message_delta only, not message_start */
+    free(out);
+    deepseek_stream_walk_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* a request without context_management: neither shape mentions it */
+    r.ctx_mgmt = false;
+    r.n_ctx_applied = 0;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_ctx", 10, &st));
+    deepseek_stream_walk_init(&w, &r);
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_ctx", &st, &w, "OK", 2, NULL, "stop", NULL, 3));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "context_management") == NULL &&
+                strstr(out, "\"usage\":{\"output_tokens\":3}}") != NULL);
+    free(out);
+    deepseek_stream_walk_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
+}
+
 /* The live side of the same identity: a Qwen tool turn ends at the stop token, and whether the KV holds it is the
  * decode lane's (a batched lane evaluates the token it emits; a speculative round's base stop is never
  * evaluated).  The tool-result tail opens with the template's own "<|im_end|>\n", so it joins the history before
@@ -12517,6 +12932,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
     test_anthropic_per_turn_effort();
+    test_l337_context_management_parse();
+    test_l337_context_edits_every_family();
+    test_l337_cleared_inputs_skip_tool_memory();
+    test_l337_disk_chain_keys_on_the_edited_render();
+    test_l337_applied_edits_in_both_response_shapes();
     test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();

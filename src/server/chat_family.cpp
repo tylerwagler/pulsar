@@ -35,6 +35,7 @@ void chat_conversation_free(chat_conversation *c) {
     for (int i = 0; i < c->n_controls; i++) free(c->controls[i].raw);
     free(c->controls);
     response_format_free(&c->response_format);
+    ctx_edits_free(c);
     memset(c, 0, sizeof(*c));
 }
 

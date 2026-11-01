@@ -501,6 +501,8 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
             ok = parse_stop(&p, &r->stops);
         } else if (!strcmp(key, "output_config")) {
             ok = take_output_config(&p, c, err, errlen);
+        } else if (!strcmp(key, "context_management")) {
+            ok = ctx_management_parse(&p, c, r, err, errlen);   /* L337: applied by parse_anthropic_request_render */
         } else if (!strcmp(key, "thinking") || !strcmp(key, "reasoning_effort")) {
             ok = take_control(&p, c, chat_control_key(key));
         } else {
@@ -548,8 +550,8 @@ bad:
 /// @return false on a malformed or refused request
 bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
                                     request *r, char *err, size_t errlen) {
-    request_init(r, REQ_CHAT, def_tokens);
-    return parse_and_render(e, engine_chat_format(e), s, body, r, err, errlen, parse_chat_conversation_anthropic);
+    /* L337: the protocol half and the family's render with the request's context edits between them */
+    return parse_anthropic_request_render(e, engine_chat_format(e), s, body, def_tokens, r, err, errlen);
 }
 
 
