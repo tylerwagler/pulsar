@@ -8059,6 +8059,92 @@ static void test_session_eviction_ledger_math(void) {
  * and protected slots skipped, ties broken by smallest committed bytes
  * (cheapest to bring back). Pure host-field selection — no session is ever
  * touched. */
+/* L249 D: Claude Code's gateway hint headers.  The front door reads them from the request head (names any case,
+ * printable values, x-claude-code-compaction makes the request a compaction whatever its class); a compaction marks
+ * its session's banks dead -- evicted first, never persisted, taken before a fresh bank -- and a job bound to one
+ * replaces or revives it. */
+static void test_hint_headers_parse(void) {
+    client_hints h = {};
+    auto line = [&](const char *l) { client_hints_read_line(&h, l, strlen(l)); };
+    line("Content-Type: application/json\r");
+    TEST_ASSERT(h.cls == REQ_CLASS_NONE && !h.session[0]);
+    line("X-Claude-Code-Session-Id:  3f2a-77 \r");
+    line("x-claude-code-agent-id: agent-1");
+    line("x-claude-code-parent-agent-id: agent-0");
+    line("x-claude-code-prompt-id: 9c1e");
+    line("x-claude-code-request-class: Main");
+    TEST_ASSERT(!strcmp(h.session, "3f2a-77") && !strcmp(h.agent, "agent-1") && !strcmp(h.parent_agent, "agent-0") &&
+                !strcmp(h.prompt, "9c1e") && h.cls == REQ_CLASS_MAIN);
+    line("x-claude-code-request-class: auxiliary");
+    TEST_ASSERT(h.cls == REQ_CLASS_AUXILIARY);
+    line("x-claude-code-request-class: brand-new-class");
+    TEST_ASSERT(h.cls == REQ_CLASS_OTHER);
+    line("x-claude-code-context-compacted: auto");
+    TEST_ASSERT(!strcmp(h.context_compacted, "auto") && h.cls == REQ_CLASS_OTHER);
+    line("x-claude-code-request-class: auxiliary");
+    line("x-claude-code-compaction: manual");
+    TEST_ASSERT(!strcmp(h.compaction, "manual") && h.cls == REQ_CLASS_COMPACTION);
+    line("x-claude-code-request-class: main");   /* the compaction mark holds whatever order the lines come in */
+    TEST_ASSERT(h.cls == REQ_CLASS_COMPACTION);
+    /* a value with a non-printable byte is not taken; a long id is cut to fit */
+    client_hints g = {};
+    const char bad[] = "x-claude-code-session-id: a\x01b";
+    client_hints_read_line(&g, bad, sizeof bad - 1);
+    TEST_ASSERT(!g.session[0]);
+    const std::string longid = "x-claude-code-session-id: " + std::string(200, 'z');
+    client_hints_read_line(&g, longid.c_str(), longid.size());
+    TEST_ASSERT(strlen(g.session) == PULSAR_HINT_ID_MAX - 1);
+    TEST_ASSERT(!strcmp(k_request_class_names[REQ_CLASS_AUXILIARY], "auxiliary") &&
+                !strcmp(k_request_class_names[REQ_CLASS_NONE], "none"));
+    /* through the front door's reader */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char req[] = "POST /v1/messages HTTP/1.1\r\nHost: x\r\nx-claude-code-session-id: s-1\r\n"
+                       "x-claude-code-request-class: compaction\r\nContent-Length: 2\r\n\r\n{}";
+    TEST_ASSERT(write(sv[1], req, sizeof req - 1) == (ssize_t)(sizeof req - 1));
+    http_request hr = {};
+    TEST_ASSERT(read_http_request(sv[0], &hr));
+    TEST_ASSERT(!strcmp(hr.hints.session, "s-1") && hr.hints.cls == REQ_CLASS_COMPACTION && hr.body_len == 2);
+    http_request_free(&hr);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_hint_compaction_marks_dead(void) {
+    /* the persist rule: a dead prefix is never stored but by a shutdown or a guard spill (whose restore reads it);
+     * a compaction job's own prompt stores are skipped, the history it displaces ("evict") is not */
+    TEST_ASSERT(server_hint_persist_skips(true, false, "evict") && server_hint_persist_skips(true, false, "prompt"));
+    TEST_ASSERT(!server_hint_persist_skips(true, false, "shutdown") && !server_hint_persist_skips(true, false, "spill"));
+    TEST_ASSERT(server_hint_persist_skips(false, true, "continued") && server_hint_persist_skips(false, true, "prompt"));
+    TEST_ASSERT(!server_hint_persist_skips(false, true, "evict") && !server_hint_persist_skips(false, false, "prompt"));
+
+    server *s = (server *)calloc(1, sizeof(server));
+    pthread_mutex_init(&s->mu, NULL);
+    s->n_slots = 4;
+    for (int i = 0; i < 4; i++) {
+        s->slots[i].provisioned = true;
+        s->slots[i].bank = (uint32_t)i;
+        s->slots[i].last_serviced_us = 100 + (uint64_t)i;
+    }
+    snprintf(s->slots[1].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[2].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[3].hint_session, PULSAR_HINT_ID_MAX, "sess-b");
+    s->slots[2].active_job = (struct job *)s;   /* busy: its job decides, not the hint */
+    TEST_ASSERT(s->hint_dead_bank() == NULL);
+    TEST_ASSERT(s->hint_mark_dead("") == 0 && s->hint_mark_dead("sess-x") == 0);
+    TEST_ASSERT(s->hint_mark_dead("sess-a") == 1 && s->slots[1].hint_dead && !s->slots[2].hint_dead &&
+                !s->slots[3].hint_dead);
+    TEST_ASSERT(s->hint_mark_dead("sess-a") == 0 && s->m_hint_dead_banks == 1);   /* counted once */
+    TEST_ASSERT(s->hint_dead_bank() == &s->slots[1]);
+    /* the dead bank is the make-room eviction's first victim, ahead of the LRU (slot 0 is older) */
+    bool dom[PULSAR_SESSION_POOL_CAP] = {};
+    for (int i = 0; i < 4; i++) dom[i] = s->slots[i].hint_dead;
+    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, dom) == 1);
+    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, NULL) == 0);
+    pthread_mutex_destroy(&s->mu);
+    free(s);
+}
+
 static void test_session_eviction_victim_selection(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     session_slot slots[PULSAR_SESSION_POOL_CAP];
@@ -12317,6 +12403,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_guard_touched_budget_is_physical();
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
+    test_hint_headers_parse();
+    test_hint_compaction_marks_dead();
     test_slot_route_trivial_match_decision();
     test_l264_route_in_place();
     test_l275_route_turn_anchor();

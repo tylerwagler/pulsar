@@ -455,6 +455,47 @@ session_slot *server::empty_bank() {
     return i < 0 ? NULL : &s->slots[i];
 }
 
+/* ---- L249 D: compaction hints ------------------------------------------------------------------------------
+ * Claude Code marks the request that summarizes a conversation (x-claude-code-compaction) and the first main
+ * request after it (x-claude-code-context-compacted): the conversation prefix before it is no longer used.  The
+ * bank that holds it would otherwise stay warm, be persisted to disk on eviction, and outlive live conversations
+ * in the LRU.  So such a bank is marked dead: evicted first and never persisted, and taken before a fresh bank.
+ * Routing and the prefix match are unchanged -- a request that still continues the history revives the bank. */
+
+int server::hint_mark_dead(const char *session) {
+    auto *s = this;
+    if (!session || !session[0]) return 0;
+    int n = 0;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *c = &s->slots[i];
+        if (!c->provisioned || c->active_job || c->hint_dead || strcmp(c->hint_session, session)) continue;
+        c->hint_dead = true;
+        n++;
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: hint: bank %u's session was compacted -- its prefix is dead "
+                                       "(evicted first, not persisted)", c->bank);
+    }
+    for (int k = 0; k < n; k++) s->count_metric(&s->m_hint_dead_banks);
+    return n;
+}
+
+session_slot *server::hint_dead_bank() {
+    auto *s = this;
+    session_slot *best = NULL;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *c = &s->slots[i];
+        if (!c->provisioned || c->active_job || c->spilled || c->preempted || !c->hint_dead) continue;
+        if (!best || c->last_serviced_us < best->last_serviced_us) best = c;
+    }
+    return best;
+}
+
+bool server_hint_persist_skips(bool dead, bool compaction, const char *reason) {
+    if (!strcmp(reason, "shutdown") || !strcmp(reason, "spill")) return false;
+    if (dead) return true;
+    return compaction && (!strcmp(reason, "continued") || !strcmp(reason, "prompt") || !strcmp(reason, "terminal") ||
+                          !strcmp(reason, "sys-prefix") || !strcmp(reason, "abandoned"));
+}
+
 session_slot *server::provision_slot(int ctx,
                                     provision_refusal *refusal) {
     auto *s = this;
@@ -772,6 +813,8 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * took a conversation's bank for it (gpuq #463 / #473 / #474: banks 3..15 provisioned on retries, slot 0 evicted,
      * B on bank 0) -- the retry now takes the same bank again. */
     session_slot *empty = s->empty_bank();
+    /* L249 D: a dead prefix's bank before a fresh one (its pages, no eviction; its history is not persisted) */
+    if (!empty) empty = s->hint_dead_bank();
     /* L280: a fresh bank is preferred to keep the best bank's conversation -- but the prompt's KV lands in it, and
      * when that cannot fit the resident-KV budget even by spilling idle banks (prompt_kv_check on the empty bank),
      * continuing on the best bank reuses its resident pages instead (the same clobber the pool-exhausted fallback
@@ -1099,11 +1142,16 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     auto *s = this;
     bool dominated[PULSAR_SESSION_POOL_CAP];
     s->dominated_slots(dominated);
+    /* L249 D: a dead prefix goes first, like a dominated history */
+    for (int i = 0; i < s->n_slots; i++) dominated[i] = dominated[i] || s->slots[i].hint_dead;
     const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect,
                                             /*allow_slot0=*/s->pool_banks > 0, dominated);
     if (vi < 0) return false;
     session_slot *sl = &s->slots[vi];
-    if (dominated[vi])
+    if (sl->hint_dead)
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u holds a dead prefix (its session compacted)",
+                   sl->bank);
+    else if (dominated[vi])
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u is dominated (another bank holds its whole "
                                        "history)", sl->bank);
 
@@ -1564,6 +1612,8 @@ bool server::worker_try_bind() {
         return true;
     }
 
+    /* L249 D: the first request after a compaction: the session's earlier banks hold a dead prefix */
+    if (j->req.hints.context_compacted[0]) s->hint_mark_dead(j->req.hints.session);
     int reject_ctx = 0;
     bool waiting_owner = false;
     bool clobbers = false;
@@ -1764,9 +1814,10 @@ void server::observe_request_timings(const req_timings *t, double e2e_s) {
 
 
 
-/* Bump a /metrics counter under mu. Worker-thread callers only; the lock is
- * what keeps the value coherent for send_metrics reading on a client thread.
- * Never called with mu already held — the mutex is not recursive. */
+/* Bump a /metrics counter under mu: the lock is what keeps the value coherent
+ * for send_metrics reading on a client thread (a client thread may bump one too,
+ * L249 D's per-class counts at acceptance).  Never called with mu already held —
+ * the mutex is not recursive. */
 void server::count_metric(uint64_t *counter) {
     auto *s = this;
     pthread_mutex_lock(&s->mu);
@@ -1801,6 +1852,13 @@ void server::worker_finish_slot(session_slot *sl) {
     PULSAR_NVTX_FN();
     auto *s = this;
     job *j = sl->active_job;
+    /* L249 D: the bank that ran a compaction's summarization holds the conversation it retires */
+    if (j->req.hints.cls == REQ_CLASS_COMPACTION && !sl->hint_dead) {
+        sl->hint_dead = true;
+        s->count_metric(&s->m_hint_dead_banks);
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: hint: bank %u ran a compaction (%s) -- its prefix is dead",
+                   sl->bank, j->req.hints.compaction[0] ? j->req.hints.compaction : "class");
+    }
     s->generate_job_end(sl);
     pthread_mutex_lock(&s->mu);
     if (s->n_generating > 0) s->n_generating--;

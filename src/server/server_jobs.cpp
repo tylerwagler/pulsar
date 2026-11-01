@@ -1059,6 +1059,11 @@ void server::gen_begin(session_slot *sl) {
         if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
         s->kv_cache_persist(sl, "evict", true);
     }
+    /* L249 D: the bank's history is this job's from here -- a replaced dead prefix is gone (its bank reused), a
+     * continued one revived -- and so is its session */
+    if (sl->hint_dead && (sync_from_zero || pick != RESUME_OWN)) s->count_metric(&s->m_hint_dead_reuse);
+    sl->hint_dead = false;
+    snprintf(sl->hint_session, sizeof sl->hint_session, "%s", j->req.hints.session);
     if (pick == RESUME_ADOPT) {
         char aerr[192] = "";
         const double t_a = server_now_sec();

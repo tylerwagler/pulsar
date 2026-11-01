@@ -834,6 +834,51 @@ typedef struct constrain_plan constrain_plan;
 /// @param p  the plan (NULL: nothing)
 void constrain_plan_free(constrain_plan *p);
 
+/* ---- L249 D: Claude Code's gateway hint headers -------------------------------------------------------------
+ * Sent when the client sets CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 (the gate forwards every x-claude-code-* header
+ * unchanged).  Fixed vocabularies, ids and a random prompt UUID, never prompt text.  Read by the front door
+ * (read_http_request), carried on the request; the scheduler reads the session and the compaction marks (a dead
+ * prefix's bank: server::hint_mark_dead and its readers), /metrics counts the classes. */
+/** x-claude-code-request-class (x-claude-code-compaction makes a request COMPACTION whatever its class says). */
+typedef enum {
+    REQ_CLASS_NONE = 0,    ///< no header: a client without hints (every non-Claude-Code client)
+    REQ_CLASS_MAIN,        ///< a turn of the main conversation
+    REQ_CLASS_SUBAGENT,    ///< a turn of a subagent
+    REQ_CLASS_WORKFLOW,    ///< an agent running inside a workflow
+    REQ_CLASS_COMPACTION,  ///< the summarization request that compacts a conversation
+    REQ_CLASS_AUXILIARY,   ///< a side request: session titles, classifiers, summaries
+    REQ_CLASS_OTHER,       ///< a value this server does not know (a newer client)
+    REQ_CLASS_COUNT,       ///< array bound for the /metrics counters, not a class
+} request_class;
+/** The class names, /metrics label values, indexed by request_class. */
+extern const char *const k_request_class_names[REQ_CLASS_COUNT];
+/// Bytes kept of a hint id (session, agent, prompt); longer values are cut (ids are UUIDs).
+#define PULSAR_HINT_ID_MAX 80
+/** The hints one request carried; zero = none (memset-safe, nothing owned). */
+typedef struct {
+    request_class cls;                         ///< the request's class (NONE when the header is absent)
+    char session[PULSAR_HINT_ID_MAX];          ///< x-claude-code-session-id ("" = absent)
+    char agent[PULSAR_HINT_ID_MAX];            ///< x-claude-code-agent-id
+    char parent_agent[PULSAR_HINT_ID_MAX];     ///< x-claude-code-parent-agent-id
+    char prompt[PULSAR_HINT_ID_MAX];           ///< x-claude-code-prompt-id
+    char compaction[16];                       ///< x-claude-code-compaction: auto / manual / reactive ("" = absent)
+    char context_compacted[16];                ///< x-claude-code-context-compacted: the same values ("" = absent)
+} client_hints;
+/** Read one request-head line into the hints when it is one of the x-claude-code-* headers above (case-insensitive
+ *  names, printable ASCII values, surrounding blanks trimmed); any other line is left alone. */
+/// @param h     the hints
+/// @param line  the header line (no line end)
+/// @param len   bytes at `line`
+void client_hints_read_line(client_hints *h, const char *line, size_t len);
+/** Whether a disk-KV persist of a bank is skipped for a hint: the bank's history is dead (any reason but a shutdown
+ *  or a guard spill, whose restore reads the chain), or the bank runs a compaction's summarization request (its
+ *  prompt is the conversation that compaction retires: the continued / prompt / terminal stores). */
+/// @param dead        the bank's history is dead (session_slot::hint_dead)
+/// @param compaction  the bank's active job is a compaction request
+/// @param reason      the persist's reason
+/// @return true to skip it
+bool server_hint_persist_skips(bool dead, bool compaction, const char *reason);
+
 /** One parsed request, normalised across the three supported APIs.
  *
  * `kind` and `api` are separate on purpose: the same logical operation (a chat
@@ -944,6 +989,8 @@ typedef struct request {
     /** L303: the turn's grammars (a response format, strict or forced tool calls); NULL = unconstrained,
      *  today's path.  Owned. */
     constrain_plan *constrain;
+    /** L249 D: the gateway hint headers the request arrived with (none: zero). */
+    client_hints hints;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -1785,6 +1832,13 @@ typedef struct session_slot {
      * so a continuation can never match another slot's frontier. */
     live_tool_state responses_live;      ///< Responses call-id binding at this slot's frontier
     live_tool_state anthropic_live;      ///< Anthropic tool_use binding at this slot's frontier
+    /** L249 D: the x-claude-code-session-id of the conversation this bank holds ("" = none sent). */
+    char         hint_session[PULSAR_HINT_ID_MAX];
+    /** L249 D: the bank's history is a DEAD prefix -- its session compacted (the context-compacted hint), or it ran
+     *  the compaction's summarization request.  Evicted first and never persisted to the disk KV cache; a free
+     *  bank to take before a fresh one.  A hint, not an invalidation: a job that continues the history in place
+     *  revives it, and the prefix match decides as always. */
+    bool         hint_dead;
 } session_slot;
 
 /* Forward declarations / relocated types referenced by struct server's member
@@ -2194,6 +2248,11 @@ struct server {
     KvBytes  m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
     KvBytes  m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
     uint64_t m_persist_skipped;   ///< disk-KV persists skipped: MemAvailable could not cover them over the floor
+    /** L249 D: requests accepted per x-claude-code-request-class (k_request_class_names; "none" = no header) */
+    uint64_t m_req_class[REQ_CLASS_COUNT];
+    uint64_t m_hint_dead_banks;      ///< L249 D: banks marked dead by a compaction (their prefix is no longer used)
+    uint64_t m_hint_persist_skipped; ///< L249 D: disk-KV persists skipped: a dead prefix, or a compaction's prompt
+    uint64_t m_hint_dead_reuse;      ///< L249 D: a dead bank taken instead of a fresh bank or an eviction
     uint64_t m_prefill_mem_refusals;  ///< prefills stopped mid-prompt: MemAvailable under the floor before a chunk
     KvBytes  m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
@@ -2883,6 +2942,15 @@ struct server {
      *  most resident pages); NULL when there is none. */
     /// @return the empty provisioned slot, or NULL (also off the bank pool)
     session_slot *empty_bank();
+    /** L249 D: mark dead the idle banks holding session `session` (its context was compacted: the prefix is no
+     *  longer used).  Counted in m_hint_dead_banks. */
+    /// @param session  the x-claude-code-session-id
+    /// @return banks newly marked
+    int hint_mark_dead(const char *session);
+    /** L249 D: an idle bank whose history is dead (the least recently serviced), to take before provisioning a
+     *  fresh bank or evicting a live one; NULL when there is none. */
+    /// @return the slot, or NULL
+    session_slot *hint_dead_bank();
     /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
      * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
      * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
@@ -3676,6 +3744,7 @@ typedef struct {
     char path[256];    ///< request path, NUL-terminated
     char *body;        ///< request body, owned; NULL when there is none
     size_t body_len;   ///< body length in bytes
+    client_hints hints;  ///< L249 D: the x-claude-code-* hint headers
 } http_request;
 
 /** Argument handed to a client thread at spawn: the server and the socket it

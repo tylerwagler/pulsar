@@ -106,6 +106,14 @@ bool read_http_request(int fd, http_request *r) {
     q = strchr(r->path, '?');
     if (q) *q = '\0';
 
+    /* L249 D: the gateway hint headers, from the head's lines after the request line */
+    for (const char *hl = b.ptr, *he = b.ptr + hend; hl < he;) {
+        const char *nl = (const char *)memchr(hl, '\n', (size_t)(he - hl));
+        const size_t ll = nl ? (size_t)(nl - hl) : (size_t)(he - hl);
+        client_hints_read_line(&r->hints, hl, ll);
+        if (!nl) break;
+        hl = nl + 1;
+    }
     long clen;
     clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -531,6 +539,11 @@ bool server::send_metrics(int fd) {
     const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
     const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
     const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
+    unsigned long long req_class[REQ_CLASS_COUNT];                                 /* L249 D */
+    for (int i = 0; i < REQ_CLASS_COUNT; i++) req_class[i] = (unsigned long long)s->m_req_class[i];
+    const unsigned long long hint_dead_banks = (unsigned long long)s->m_hint_dead_banks;
+    const unsigned long long hint_persist_skipped = (unsigned long long)s->m_hint_persist_skipped;
+    const unsigned long long hint_dead_reuse = (unsigned long long)s->m_hint_dead_reuse;
     const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
@@ -1023,6 +1036,19 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_persist_skipped_total Disk-KV persists skipped because MemAvailable could not cover them over the memory floor.\n");
     buf_puts(&b, "# TYPE pulsar:kv_persist_skipped_total counter\n");
     buf_printf(&b, "pulsar:kv_persist_skipped_total %llu\n", persist_skipped);
+    buf_puts(&b, "# HELP pulsar:requests_by_class_total Generation requests accepted, by Claude Code's x-claude-code-request-class hint (none: no header).\n");
+    buf_puts(&b, "# TYPE pulsar:requests_by_class_total counter\n");
+    for (int i = 0; i < REQ_CLASS_COUNT; i++)
+        buf_printf(&b, "pulsar:requests_by_class_total{class=\"%s\"} %llu\n", k_request_class_names[i], req_class[i]);
+    buf_puts(&b, "# HELP pulsar:hint_dead_banks_total Banks marked dead by a compaction hint: evicted first, never persisted.\n");
+    buf_puts(&b, "# TYPE pulsar:hint_dead_banks_total counter\n");
+    buf_printf(&b, "pulsar:hint_dead_banks_total %llu\n", hint_dead_banks);
+    buf_puts(&b, "# HELP pulsar:hint_persist_skipped_total Disk-KV persists skipped for a dead prefix or a compaction request's prompt.\n");
+    buf_puts(&b, "# TYPE pulsar:hint_persist_skipped_total counter\n");
+    buf_printf(&b, "pulsar:hint_persist_skipped_total %llu\n", hint_persist_skipped);
+    buf_puts(&b, "# HELP pulsar:hint_dead_reuse_total Requests placed on a dead bank instead of a fresh bank or an eviction.\n");
+    buf_puts(&b, "# TYPE pulsar:hint_dead_reuse_total counter\n");
+    buf_printf(&b, "pulsar:hint_dead_reuse_total %llu\n", hint_dead_reuse);
     buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
     buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);
@@ -1361,7 +1387,10 @@ void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = server_xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        req.raw_body = server_xstrndup(hr.body, hr.body_len);
+        req.hints = hr.hints;
+    }
     if (ok && s->capture) {
         /* L216 --capture-requests: the accepted body verbatim, one JSON line. */
         pthread_mutex_lock(&s->capture_mu);
@@ -1380,6 +1409,7 @@ void *client_main(void *arg) {
         free(req.model);
         req.model = server_xstrdup(server_served_model_id(s));
     }
+    s->count_metric(&s->m_req_class[req.hints.cls]);   /* L249 D: per request class, at acceptance */
     int ctx_size;
     ctx_size = pulsar_session_ctx(s->sess).raw();
     if (request_exceeds_context(&req, ctx_size)) {

@@ -401,6 +401,55 @@ bool tool_call_declared(const request *r, const char *name, char *detail, size_t
 /// @param r the request
 /// @param kind chat or completion
 /// @param max_tokens the generation cap
+/* ---- L249 D: the gateway hint headers ---- */
+
+extern const char *const k_request_class_names[REQ_CLASS_COUNT] = {"none", "main", "subagent", "workflow",
+                                                                   "compaction", "auxiliary", "other"};
+
+/// Copy a header value into a fixed field: printable ASCII only (a value with anything else is dropped), cut to fit.
+/// @param dst  the field
+/// @param cap  its size
+/// @param v    the value
+/// @param n    bytes at `v`
+static void hint_copy(char *dst, size_t cap, const char *v, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)v[i] < 0x20 || (unsigned char)v[i] > 0x7e) return;
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, v, n);
+    dst[n] = '\0';
+}
+
+void client_hints_read_line(client_hints *h, const char *line, size_t len) {
+    static const char prefix[] = "x-claude-code-";
+    const size_t pl = sizeof prefix - 1;
+    if (len <= pl || strncasecmp(line, prefix, pl)) return;
+    const char *colon = (const char *)memchr(line, ':', len);
+    if (!colon) return;
+    const char *name = line + pl;
+    const size_t nlen = (size_t)(colon - name);
+    const char *v = colon + 1, *end = line + len;
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    while (end > v && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) end--;
+    const size_t vlen = (size_t)(end - v);
+    auto is = [&](const char *n) { return nlen == strlen(n) && !strncasecmp(name, n, nlen); };
+    if (is("session-id")) hint_copy(h->session, sizeof h->session, v, vlen);
+    else if (is("agent-id")) hint_copy(h->agent, sizeof h->agent, v, vlen);
+    else if (is("parent-agent-id")) hint_copy(h->parent_agent, sizeof h->parent_agent, v, vlen);
+    else if (is("prompt-id")) hint_copy(h->prompt, sizeof h->prompt, v, vlen);
+    else if (is("compaction")) hint_copy(h->compaction, sizeof h->compaction, v, vlen);
+    else if (is("context-compacted")) hint_copy(h->context_compacted, sizeof h->context_compacted, v, vlen);
+    else if (is("request-class")) {
+        h->cls = REQ_CLASS_OTHER;
+        for (int c = REQ_CLASS_MAIN; c < REQ_CLASS_OTHER; c++)
+            if (vlen == strlen(k_request_class_names[c]) && !strncasecmp(v, k_request_class_names[c], vlen))
+                h->cls = (request_class)c;
+    }
+    /* the summarization request of a compaction, whatever class it was sent as */
+    if (h->compaction[0]) h->cls = REQ_CLASS_COMPACTION;
+}
+
+
+
 void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
