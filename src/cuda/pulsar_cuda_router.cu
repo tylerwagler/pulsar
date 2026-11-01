@@ -189,7 +189,7 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
     float raw[PER], p[PER];
 #pragma unroll
     for (int i = 0; i < PER; ++i) {
-        raw[i] = lg[lane + 32 * i];
+        raw[i] = lg[lane + 32 * i] * c.logit_scale;
         if (c.logits_bf16) raw[i] = bf16_round(raw[i]);
     }
     if (c.score == PULSAR_ROUTER_SCORE_SOFTMAX) {
@@ -370,7 +370,7 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
 #pragma unroll
         for (int j = 0; j < PULSAR_ROUTER_SHARED_MAX; ++j) {
             if (j < S) {
-                float g = lg[c.n_expert + j];
+                float g = lg[c.n_expert + j] * c.logit_scale;
                 if (c.logits_bf16) g = bf16_round(g);
                 vals[TOPK + j] = g;
             }
@@ -411,11 +411,12 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
         float v = vals[k] / sum * c.route_scale;
+        if (a.l.expert_scale) v *= a.l.expert_scale[ids[k]];
         if (c.weights_bf16) v = bf16_round(v);
         w[k] = v;
     }
     for (int j = 0; j < S; ++j) {   /* PULSAR_ROUTER_SHARED_SIGMOID: each gate row's own sigmoid */
-        float g = lg[c.n_expert + j];
+        float g = lg[c.n_expert + j] * c.logit_scale;
         if (c.logits_bf16) g = bf16_round(g);
         float v = 1.0f / (1.0f + expf(-g));
         if (c.weights_bf16) v = bf16_round(v);
@@ -477,11 +478,14 @@ extern "C" int pulsar_router_select_launch(const pulsar_router_cfg *c, const pul
     if (!score_ok || !gate_ok || (!sinks && c->renorm != PULSAR_ROUTER_RENORM_SUM) ||
         sinks != (c->shared_gate == PULSAR_ROUTER_SHARED_SINK) || c->n_shared < 0 ||
         c->n_shared > PULSAR_ROUTER_SHARED_MAX || (S > 0 && !gammas) || (sinks && S == 0) ||
-        (l->table && (sinks || !tokens || l->table_rows <= 0))) {
+        (l->table && (sinks || !tokens || l->table_rows <= 0)) || (l->expert_scale && sinks) ||
+        !(c->logit_scale > 0.0f && isfinite(c->logit_scale))) {
         fprintf(stderr, "pulsar: router select: score %d, renorm %d, %d shared experts gated %d, a %s table -- not a "
                         "router this file has (a sink gate needs the sink renormalisation and gammas, a table needs "
-                        "token ids and the sum renormalisation) -- refusing\n",
-                (int)c->score, (int)c->renorm, c->n_shared, (int)c->shared_gate, l->table ? "token-id" : "no");
+                        "token ids and the sum renormalisation, an expert scale the sum renormalisation, and the logit "
+                        "scale is finite and > 0: %g) -- refusing\n",
+                (int)c->score, (int)c->renorm, c->n_shared, (int)c->shared_gate, l->table ? "token-id" : "no",
+                (double)c->logit_scale);
         return -1;
     }
     const router_args a{*c, *l, pulsar_router_logit_rows(c)};
@@ -495,12 +499,13 @@ extern "C" int pulsar_router_select_launch(const pulsar_router_cfg *c, const pul
     }
     /* the routers the engine serves: Qwen3.8-Flash-Next 512 / top-10; Nemotron 3.5 Super's 512 / top-22 (L296 N4);
      * DeepSeek V4.1's 384 / top-6 target, 0731's 256 / top-6 target (and Inkling-Small's 256 / top-6) and V4.1's
-     * 128 / top-3 DSpark drafter */
+     * 128 / top-3 DSpark drafter; Gemma 4's 128 / top-8 (L338) */
     PULSAR_ROUTER_ARM(512, 10)
     PULSAR_ROUTER_ARM(512, 22)
     PULSAR_ROUTER_ARM(384, 6)
     PULSAR_ROUTER_ARM(256, 6)
     PULSAR_ROUTER_ARM(128, 3)
+    PULSAR_ROUTER_ARM(128, 8)    /* L338: Gemma 4 26B-A4B */
 #undef PULSAR_ROUTER_ARM
     fprintf(stderr, "pulsar: router select: no instance for %d experts / top-%d -- refusing\n", E, K);
     return -1;

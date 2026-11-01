@@ -712,6 +712,7 @@ static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_use
     c.weights_bf16 = false;
     c.sum_floor = 6.103515625e-5f;
     c.route_scale = expert_weight_scale;
+    c.logit_scale = 1.0f;
     return c;
 }
 

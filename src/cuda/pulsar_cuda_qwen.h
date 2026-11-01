@@ -363,6 +363,7 @@ static inline pulsar_router_cfg pulsar_qwen_router_cfg(int n_expert, int top_k) 
     c.weights_bf16 = true;
     c.sum_floor = 0.0f;
     c.route_scale = 1.0f;
+    c.logit_scale = 1.0f;
     return c;
 }
 

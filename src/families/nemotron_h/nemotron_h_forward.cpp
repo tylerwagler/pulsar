@@ -185,6 +185,7 @@ pulsar_router_cfg router_cfg(const pulsar_nemotron_h_shape &s) {
     c.weights_bf16 = false;
     c.sum_floor = 0.0f;
     c.route_scale = s.route_scale;
+    c.logit_scale = 1.0f;
     return c;
 }
 
