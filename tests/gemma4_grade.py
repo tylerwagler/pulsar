@@ -10,7 +10,7 @@ transformers BF16 reference.
       OUT_PREFIX_hidden.npy (f16 [n_layer][T][E], every decoder block's output) and OUT_PREFIX_logits.f32 (the last
       N_LAST positions).  The same weights through another engine: pulsar's distance to it is the engine's own, both
       engines' distance to the reference the quantization's.  (aarch64 builds of its extension link -lgcc.)
-  gemma4_grade.py grade REF_PT PROMPT CAP_DIR BASE_DIR [--exl3 OUT_PREFIX]
+  gemma4_grade.py grade REF_PT PROMPT CAP_DIR BASE_DIR [--exl3 OUT_PREFIX] [--decode DEC_DIR]
       grades what `nemotron_fwd_gate capture <container> <ids> CAP_DIR` left in CAP_DIR, run with
       PULSAR_CUDA_GRAPH_DUMP_PREFIX=CAP_DIR/d PULSAR_CUDA_GRAPH_DUMP_NAME=gemma4 (no position filter):
         hidden   per layer, the residual after it (the driver's "gemma4" tap): every prompt row, the prefill's chunks
@@ -20,7 +20,9 @@ transformers BF16 reference.
         logits   every reference-logit position: pulsar's residual through the final norm and BASE_DIR's tied BF16
                  head (soft-capped) -- the trunk's grade, the head apart -- KL(ref || x) mean / median / max, top-1
                  agreement, and the NLL of the prompt's real next tokens (the quality that matters: the BF16 model's
-                 own NLL is the floor); the prefill's last row through pulsar's own EXL3 head (prefill_last.f32)
+                 own NLL is the floor); the prefill's last row through pulsar's own EXL3 head (prefill_last.f32);
+                 when the capture decoded (decode_logits.f32: every position one row a step, the decode arms and the
+                 EXL3 head; --decode: from DEC_DIR, a capture with its own taps filtered), those rows the same way
 
 rel-fro = ||x - y||_F / ||y||_F; KL and NLL in nats over the full vocabulary.  Needs torch + safetensors.
 Exit 0 always: the grade is read, its numbers recorded in the ledger row (L338).
@@ -144,14 +146,18 @@ def grade(a):
     tgt = ref["ids"][first + 1:first + n].long()   # the real next token of each graded position but the last
     print(f"logits over {n} positions        KL mean   KL median  KL max    top-1     NLL (real next tokens)")
     rows = [("bf16 reference", lg), ("pulsar (bf16 head)", trunk)]
+    dl = os.path.join(a.decode or a.cap, "decode_logits.f32")
+    if os.path.exists(dl) and os.path.getsize(dl) >= T * lg.shape[1] * 4:   # the decode path: one row a step
+        rows.append(("pulsar decode (EXL3 head)", read_f32(dl, lg.shape[1])[first:first + n]))
     if a.exl3:
-        rows.append(("exllamav3", read_f32(a.exl3 + "_logits.f32", lg.shape[1])[-n:]))
+        ex_logits = read_f32(a.exl3 + "_logits.f32", lg.shape[1])[-n:]
+        rows.append(("exllamav3", ex_logits))
     for name, l in rows:
         m, md, mx, t = kl_stats(lg, l) if name != "bf16 reference" else (0.0, 0.0, 0.0, 1.0)
         nll = F.cross_entropy(l[:-1].double(), tgt, reduction="mean").item()
         print(f" {name:28s}  {m:.5f}   {md:.5f}    {mx:7.3f}   {t:.3f}     {nll:.4f}")
     if a.exl3:
-        m, md, mx, t = kl_stats(rows[2][1], trunk)
+        m, md, mx, t = kl_stats(ex_logits, trunk)
         print(f" {'pulsar vs exllamav3':28s}  {m:.5f}   {md:.5f}    {mx:7.3f}   {t:.3f}")
     last = read_f32(os.path.join(a.cap, "prefill_last.f32"), lg.shape[1])
     m, _, _, t = kl_stats(lg[-1:], last)
@@ -165,7 +171,7 @@ def main():
     q = s.add_parser("exl3"); q.add_argument("pack"); q.add_argument("ids"); q.add_argument("n_last", type=int)
     q.add_argument("out")
     q = s.add_parser("grade"); q.add_argument("ref"); q.add_argument("prompt"); q.add_argument("cap")
-    q.add_argument("base"); q.add_argument("--exl3")
+    q.add_argument("base"); q.add_argument("--exl3"); q.add_argument("--decode")
     a = p.parse_args()
     {"prep": prep, "exl3": exl3, "grade": grade}[a.cmd](a)
 

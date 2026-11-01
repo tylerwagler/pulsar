@@ -7,7 +7,7 @@
  * every layer); EVERY tensor of the directory is bound by its bind record, every byte priced by a role, and the price is
  * what the core stages and admission charges; every slot the plan declares is bound (a global layer has no attn_v: K =
  * V), the dense MLP and the experts at the pack's stored widths; the engine facts; and the session side as declared
- * (E4: the core driver's table covers the plan, the window ring + global pool state, the caps).  The forward itself is
+ * (E4: the core driver's table covers the plan, the window ring + global pool state, the caps); the tokenizer table.  The forward itself is
  * graded on the GPU by the core driver's forward gate + tests/gemma4_grade.py.  Exit 0 = every check passed. */
 #include "families/gemma4/gemma4.h"
 #include "engine/exl3_trellis.h"
@@ -110,6 +110,17 @@ int main(int argc, char **argv) {
     check(!pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_NONE,
           "no chat front yet (no CAP_CHAT)");
     check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs");
+    /* the tokenizer table (gemma4_tokenizer.cpp; tokenization itself is gemma4-tok-gate's, graded against HF) */
+    pulsar_tokens hello = {0};
+    const bool tok_ok = pulsar_tokenize_text(e, "Hello world", &hello) && hello.len == 2;
+    pulsar_turn_markers tm;
+    check(pulsar_engine_vocab_size(e) == (int)PULSAR_GEMMA4_SHAPE_26B_A4B.n_vocab && tok_ok &&
+              pulsar_token_is_stop(e, 1) && pulsar_token_is_stop(e, 106) && pulsar_token_is_stop(e, 50) &&
+              !pulsar_token_is_stop(e, 2) && pulsar_token_think_close(e) == 101 && pulsar_chat_turn_markers(e, &tm) &&
+              tm.n_user == 2 && tm.user[0] == 105 && tm.n_assistant == 2 && tm.assistant[0] == 105,
+          "the tokenizer table: %d ids, \"Hello world\" -> %d tokens, stops <eos> <turn|> <tool_response|>, think close "
+          "<channel|>, turn markers <|turn> + the role word", pulsar_engine_vocab_size(e), hello.len);
+    pulsar_tokens_free(&hello);
     int k2 = 0;
     for (uint32_t il = 0; il < s->n_layer; il++) {
         const int g = exl3_type_k2(w->layer[il].exp_gate->type);

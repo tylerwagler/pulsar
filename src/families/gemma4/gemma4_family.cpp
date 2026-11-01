@@ -3,15 +3,17 @@
 /** @file gemma4_family.cpp
  *  @brief The Gemma 4 family descriptor: load, the engine facts, the session on the core row-step driver. */
 #include "gemma4.h"
+#include "lib/bpe_tokenizer.h"
 
 namespace {
 
 /// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_GEMMA4_ARCH;
 
-/** pulsar_family::unload: free the family state load allocated (safe after a partial load).
+/** pulsar_family::unload: free the tokenizer and the family state load allocated (safe after a partial load).
  *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
+    if (e->family_state) bpe_tokenizer_free(((pulsar_gemma4_model *)e->family_state)->tok);
     free(e->family_state);
     e->family_state = NULL;
 }
@@ -65,6 +67,8 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
                 pulsar_load_refusals());
         return false;
     }
+    /* stage 4: the tokenizer beside the shards */
+    if (!pulsar_gemma4_load_tokenizer(w, opt->model_path)) return false;
     /* the session's declared state and the digest its disk segments are keyed by: the directory's names, types and
      * sizes */
     pulsar_gemma4_state_plan(e);
@@ -180,7 +184,8 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .quant_bits   = */ quant_bits,
     /* .spec         = */ NULL,
     /* .session      = */ &k_session_ops,
-    /* .tokenizer    = */ NULL,   /* the chat increment: tokenizer.json through the shared BPE engine + the renderer */
+    /* .tokenizer    = */ &PULSAR_GEMMA4_TOKENIZER,   /* gemma4_tokenizer.cpp (the shared BPE engine's SentencePiece-BPE row); the
+                                                     chat renderer next (CAP_CHAT) */
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ NULL,

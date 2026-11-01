@@ -18,7 +18,7 @@
  * known profile, every switch pinned, any unknown key refused), the layer plan (PULSAR_LAYER_BLOCKS: window vs full
  * attention, PULSAR_FFN_DENSE_MOE on every layer), the role-driven binding of every tensor with its format admitted
  * through the core's front doors, and the byte census; the state declaration and the driver ops (E4,
- * gemma4_forward.cpp).  The tokenizer and chat front are not here yet (no CAP_CHAT): sessions are driven by token ids.
+ * gemma4_forward.cpp); the tokenizer table (gemma4_tokenizer.cpp).  The chat front is not here yet (no CAP_CHAT).
  *
  * THE CONTAINER CONTRACT (tools/container/gemma4.py emits, this family reads):
  *   general.architecture = "gemma4";
@@ -150,7 +150,19 @@ typedef struct {
     pulsar_role_census census;
     /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
     uint64_t artifact_digest;
+    /** The tokenizer table (gemma4_tokenizer.cpp): the shared BPE engine's SentencePiece-BPE row, from the container's
+     *  tokenizer.json + generation_config.json.  Owned; freed by unload. */
+    struct bpe_tokenizer *tok;
 } pulsar_gemma4_model;
+
+/** The family's tokenizer table (gemma4_tokenizer.cpp); no chat entries until the chat increment (no CAP_CHAT). */
+extern const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER;
+/** Load the tokenizer from tokenizer.json + generation_config.json beside the shards and check it against the shape:
+ *  the "gemma4" pipeline, the eos among the stop ids, n_vocab ids (gemma4_tokenizer.cpp).
+ *  @param w           the family state: its shape is read; tok is written
+ *  @param model_path  the container's directory, or a shard path inside it
+ *  @return true = loaded; false = refused (said) */
+bool pulsar_gemma4_load_tokenizer(pulsar_gemma4_model *w, const char *model_path);
 
 /** Bind every tensor the shape declares, admit its format, price it (gemma4_weights.cpp).  false = refused. */
 bool pulsar_gemma4_bind(const pulsar_model *m, pulsar_gemma4_model *w);

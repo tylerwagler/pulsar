@@ -1366,6 +1366,19 @@ tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util
 nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
 	./tests/nemotron_enc_tok_gate --tok $(NEMOTRON_ENC_TOK_DIR) --vectors tests/test-vectors/nemotron_enc --calib $(QWEN_CALIB)
 
+# L338: Gemma 4's tokenizer (the shared engine's SentencePiece-BPE row: Replace(' ' -> U+2581), one piece a run, a
+# symbol per character with <0xXX> byte fallback) graded against HF tokenizers -- T1-T4 of the chat gate + the token
+# bytes (T5) and the facts (T6); goldens from tests/gemma4/gen_tok_goldens.py.  Model-free; GEMMA4_TOK_DIR holds the
+# checkpoint's tokenizer.json + generation_config.json (the container's copies).
+GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
+tests/gemma4_tok_gate: tests/gemma4_tok_gate.cpp tests/bpe_gate_util.h src/lib/bpe_tokenizer.cpp \
+                       src/lib/pyjson.cpp src/lib/bpe_tokenizer.h src/lib/bpe_unicode_tables.inc src/lib/pyjson.h \
+                       src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_tok_gate.cpp src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp
+.PHONY: gemma4-tok-gate
+gemma4-tok-gate: tests/gemma4_tok_gate
+	./tests/gemma4_tok_gate --tok $(GEMMA4_TOK_DIR) --vectors tests/test-vectors/gemma4 --calib $(QWEN_CALIB)
+
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
 # mode rows are checkable with no model and no device.  The arrays in the test are
