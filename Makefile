@@ -3352,6 +3352,15 @@ tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L338: the f16 m16n8k16 MMA's sm_75 body (two m16n8k8) graded against the exact product and the k16 instruction --
+# model-free, on an sm_80+ card (it refuses below: the k16 instruction is the comparison).  The split is not the k16
+# instruction's bits (a numerics change on sm_75); both must hold 2^-21 * sum |terms| of exact.
+MMA_K8_ARCH ?= sm_120f
+tests/mma_k8_split_gate: tests/mma_k8_split_gate.cu src/cuda/pulsar_cuda_arch.cuh
+	$(NVCC) -O3 -gencode arch=compute_$(subst sm_,,$(MMA_K8_ARCH)),code=$(MMA_K8_ARCH) -o $@ $<
+.PHONY: mma-k8-split-gate
+mma-k8-split-gate: tests/mma_k8_split_gate
+	./tests/mma_k8_split_gate
 tests/gemma4_family_gate.o: tests/gemma4_family_gate.cpp src/families/gemma4/gemma4.h src/engine/role_bind.h \
                             src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<

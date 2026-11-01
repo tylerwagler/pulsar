@@ -195,18 +195,6 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
                  : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
 }
 
-/** 16 bytes global -> shared, asynchronously; src_bytes 0 writes zeros. */
-/// @param smem       16-byte aligned shared destination
-/// @param gmem       16-byte aligned global source
-/// @param src_bytes  bytes read from gmem (16, or 0 to zero-fill); traps below sm_80
-__device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src_bytes) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-#if PULSAR_SM80
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
-#else
-    __trap();
-#endif
-}
 
 /** A 16 x 16 fp16 tile in shared memory as 32 chunks of 8 halves: chunk
  *  (row, half) at 16-byte slot row * 2 + (half ^ bit 2 of row), so the 8 rows
@@ -351,19 +339,16 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
             if (i < nb) {
                 const int kt = (b_lo + i) * 8 + warp;
                 const size_t src = (size_t)(creal ? crow : 0) * K + (size_t)kt * 16 + chalf * 8;
-                cp_async16(&s_a[warp][i][0][tile_chunk(crow, chalf) * 8], p.hi + src, creal ? 16 : 0);
-                cp_async16(&s_a[warp][i][1][tile_chunk(crow, chalf) * 8], p.lo + src, creal ? 16 : 0);
+                pulsar_cp_async16(&s_a[warp][i][0][tile_chunk(crow, chalf) * 8], p.hi + src, creal ? 16 : 0);
+                pulsar_cp_async16(&s_a[warp][i][1][tile_chunk(crow, chalf) * 8], p.lo + src, creal ? 16 : 0);
             }
         }
         for (int t = tid; t < nr * nb; t += kOut * kWarps) {
             const int m = t / nb, i = t - m * nb;
             s_inv[i][m] = p.inv[(size_t)m * blocks + b_lo + i];
         }
-#if PULSAR_SM80
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
-#else
-        __trap();
-#endif
+        pulsar_cp_async_commit();
+        pulsar_cp_async_wait<0>();
     }
     __syncthreads();
 
@@ -589,15 +574,8 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         }
         return 0;
     }
-    /* L321: decode rows are the GEMV, whose MMA is m16n8k16 (sm_80+); prompt chunks above are cuBLASLt fp16, which a
-     * Turing card has.  A device without the MMA refuses decode rows here, by name, instead of trapping in the kernel. */
-    if (pulsar_cuda_device_major() < 8) {
-        static bool said = false;
-        if (!__atomic_exchange_n(&said, true, __ATOMIC_RELAXED))
-            fprintf(stderr, "%s: EXL3 dense decode rows need sm_80 (mma m16n8k16); this device is sm_%dx -- refusing "
-                            "(prompt chunks run)\n", tag, pulsar_cuda_device_major());
-        return -1;
-    }
+    /* decode rows are the GEMV; its m16n8k16 MMA and cp.async run on sm_75 through their arch bodies (L338,
+     * pulsar_cuda_arch.cuh) */
     if (M > kRows) {
         /* L288 C1: decode rows past the MMA's 16 (a wide verify) run the GEMV a 16-row block at a time -- each block
          * the call it is alone, so every row is the bytes a one-row decode gives at ANY width.  The GEMM above lost

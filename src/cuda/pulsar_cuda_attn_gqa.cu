@@ -181,17 +181,10 @@ __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1,
 #else
     /* sm_75 (L321): Turing has no bf16 MMA and no k16 shape.  The same products as fp16 operands (gqa_bf2h, exact)
      * on two m16n8k8 MMAs, k 0..7 then k 8..15: the k16 fragment's registers split along k exactly so (A a0 a1 / B b0
-     * hold k 0..7, a2 a3 / b1 hold k 8..15), the split exllamav3's sm_75 port uses.  f32 accumulate as on sm_80. */
-    const uint32_t A0 = gqa_bf2h(a0), A1 = gqa_bf2h(a1), A2 = gqa_bf2h(a2), A3 = gqa_bf2h(a3);
-    const uint32_t B0 = gqa_bf2h(b0), B1 = gqa_bf2h(b1);
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(A0), "r"(A1), "r"(B0));
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(A2), "r"(A3), "r"(B1));
+     * hold k 0..7, a2 a3 / b1 hold k 8..15), the split exllamav3's sm_75 port uses -- pulsar_mma_f16_16816_k8, the one
+     * definition (pulsar_cuda_arch.cuh).  f32 accumulate as on sm_80. */
+    const uint32_t A[4] = {gqa_bf2h(a0), gqa_bf2h(a1), gqa_bf2h(a2), gqa_bf2h(a3)};
+    pulsar_mma_f16_16816_k8(d, A, gqa_bf2h(b0), gqa_bf2h(b1));
 #endif
 }
 /// ldmatrix .x4 of four 8x8 b16 tiles from shared memory.

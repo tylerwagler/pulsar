@@ -14,7 +14,8 @@
  * __CUDA_ARCH__ and sees every tier as present, which keeps host stubs and template instantiations identical across
  * targets; a GB10 build (sm_120f) has every tier, so its device code is the same source it was before these guards.
  *
- *   PULSAR_SM80  mma.sync m16n8k16 (f16 and bf16), cp.async, __reduce_*_sync
+ *   PULSAR_SM80  mma.sync m16n8k16 (f16 and bf16), cp.async, __reduce_*_sync -- the f16 MMA and cp.async have sm_75 bodies
+ *                (L338): cp.async a synchronous copy (the same bytes); the MMA two m16n8k8, a graded numerics change
  *   PULSAR_SM89  mma.sync with e4m3 operands, cvt.*.e4m3x2
  *   PULSAR_SM90  thread-block clusters (__cluster_dims__, cooperative_groups::this_cluster)
  *
@@ -48,7 +49,25 @@
  * butterfly of shuffles.  Integer min/max/add are exact and order-free, so both bodies return identical bits: these
  * are one function per target, not two answers. */
 /* The m16n8k16 tensor-core MMAs, ONE definition each (L335: the bf16 one was copied into three TUs and the f16 one into
- * two).  sm_80+; below it the body traps -- the launchers refuse such a device by name first (the tiers above). */
+ * two).  The bf16 one is sm_80+ (below it the body traps -- the launchers refuse such a device by name first, the tiers
+ * above); the f16 one runs on sm_75 as two m16n8k8 (pulsar_mma_f16_16816_k8, L338). */
+/** The f16 m16n8k16 MMA as two m16n8k8 MMAs (k 0..7, then k 8..15) -- the sm_75 body of pulsar_mma_f16_16816, defined on
+ *  every target (m16n8k8 f16 is sm_75+) so the k8 split gate can run it beside the k16 instruction on one card.
+ *  @param d  the thread's four f32 accumulators (in / out)
+ *  @param a  the thread's A fragment, four f16x2 registers (a[0] a[1]: k 0..7; a[2] a[3]: k 8..15)
+ *  @param b0 B fragment register 0 (k 0..7)
+ *  @param b1 B fragment register 1 (k 8..15) */
+__device__ __forceinline__ void pulsar_mma_f16_16816_k8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0,
+                                                        uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b0));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b1));
+}
 /** One mma.sync m16n8k16 bf16 x bf16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8).
  *  @param d  the thread's four f32 accumulators (in / out)
  *  @param a  the thread's A fragment, four bf16x2 registers
@@ -67,6 +86,13 @@ __device__ __forceinline__ void pulsar_mma_bf16_16816(float (&d)[4], const uint3
 }
 
 /** One mma.sync m16n8k16 f16 x f16 -> f32, accumulating into d (A row-major 16x16, B col-major 16x8).
+ *  sm_75 (L338, plan 123): Turing has the fp16 MMA at m16n8k8 only, so the same products run as two m16n8k8 MMAs, k 0..7
+ *  then k 8..15 -- the k16 fragment's registers split along k exactly so (A a[0] a[1] / B b0 hold k 0..7, a[2] a[3] / b1
+ *  k 8..15), the split exllamav3's sm_75 port and the GQA block's (L321) use; f32 accumulate as on sm_80.  NOT the k16
+ *  instruction's bits: each half rounds its partial sum once more, so 35 % of the accumulators differ by an ulp or a few
+ *  (measured on GB10, which has both) -- a numerics change on sm_75, the only arithmetic Turing has for this shape,
+ *  graded by tests/mma_k8_split_gate.cu (both within 2^-21 * sum |terms| of the exact product: k16 4.8, split 6.2 units of
+ *  2^-24) and by the EXL3 lanes' own gates on the card.
  *  @param d  the thread's four f32 accumulators (in / out)
  *  @param a  the thread's A fragment, four f16x2 registers
  *  @param b0 B fragment register 0 (f16x2: k rows 2c, 2c+1)
@@ -78,8 +104,45 @@ __device__ __forceinline__ void pulsar_mma_f16_16816(float (&d)[4], const uint32
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #else
-    (void)d; (void)a; (void)b0; (void)b1;
-    __trap();
+    pulsar_mma_f16_16816_k8(d, a, b0, b1);
+#endif
+}
+
+/* cp.async, ONE definition (L338: the EXL3 MoE and dense-decode TUs each carried a copy).  sm_80+ issues the async copy
+ * and its group commit / wait; sm_75 has no cp.async, so the copy is a synchronous 16-byte store with cp.async's exact
+ * zero-fill (bytes past src_bytes are 0) and the commit / wait have nothing to wait for.  The shared-memory bytes a
+ * consumer reads after its __syncthreads are the same on both targets: the callers' barriers between filling a buffer
+ * and reading it (and between reading it and refilling it) are what order the copy, not the wait. */
+/** 16 bytes global -> shared (cp.async.cg on sm_80+; a synchronous store on sm_75), zero-filling past `src_bytes`.
+ *  @param smem       16-byte aligned shared destination
+ *  @param gmem       16-byte aligned global source (not read when src_bytes is 0)
+ *  @param src_bytes  bytes read, 0 .. 16; the rest of the 16 are zero */
+__device__ __forceinline__ void pulsar_cp_async16(void *smem, const void *gmem, int src_bytes) {
+#if PULSAR_SM80
+    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
+#else
+    if (src_bytes == 16) {
+        *(int4 *)smem = *(const int4 *)gmem;
+    } else {
+        uint8_t *d = (uint8_t *)smem;
+        const uint8_t *g = (const uint8_t *)gmem;
+        for (int i = 0; i < 16; ++i) d[i] = i < src_bytes ? g[i] : (uint8_t)0;
+    }
+#endif
+}
+/** Commit the cp.async issued so far as one group (sm_80+); nothing to commit on sm_75 (the copies are done). */
+__device__ __forceinline__ void pulsar_cp_async_commit(void) {
+#if PULSAR_SM80
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
+/** Wait until at most `N` committed cp.async groups are pending (sm_80+); nothing pending on sm_75.
+ *  @tparam N  groups allowed to stay in flight */
+template <int N>
+__device__ __forceinline__ void pulsar_cp_async_wait(void) {
+#if PULSAR_SM80
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
 #endif
 }
 
