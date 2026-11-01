@@ -5,8 +5,9 @@
  * The formats.  The forward hands its linears raw bf16 rows (pulsar_act_kind ROWS, as Qwen's and Inkling's), so every
  * linear -- attention q / k / v / o and the dense MLP -- takes what the registry serves a dense linear at bf16 rows,
  * and the routed experts take the registry's split gate / up pair and down arms at bf16 rows, checked as a combo
- * (pulsar_format_moe_combo).  The dense MLP and the experts are bound at their STORED widths (gemma4.h).  Norms, the
- * router, its two scales, the per-layer scalar and the embedding (= the tied head) are read as stored: bf16. */
+ * (pulsar_format_moe_combo).  The dense MLP and the experts are bound at their STORED widths (gemma4.h).  The head is
+ * the pack's EXL3 one, a dense linear at bf16 rows (the embedding it was quantized from is bound for the lookups).
+ * Norms, the router, its two scales, the per-layer scalar and the embedding are read as stored: bf16. */
 /** @file gemma4_weights.cpp
  *  @brief Gemma 4's weights: every tensor bound by role, its format admitted and priced. */
 #include "gemma4.h"
@@ -79,6 +80,7 @@ bool pulsar_gemma4_bind(const pulsar_model *m, pulsar_gemma4_model *w) {
     pulsar_role_binder *b = pulsar_role_binder_open(m, OWNER);
     w->embed = pulsar_role_bind(b, pulsar_role_top("embed"), A_BF16, 2, s->n_embd, s->n_vocab);
     w->output_norm = pulsar_role_bind(b, pulsar_role_top("output_norm"), A_BF16, 1, s->n_embd);
+    w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_LINEAR, 2, s->n_embd, s->n_vocab);
     for (uint32_t il = 0; il < s->n_layer; il++) bind_layer(b, s, (int32_t)il, &w->layer[il]);
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);

@@ -88,9 +88,11 @@ int main(int argc, char **argv) {
           (double)e->model.mapped_bytes / 1073741824.0, (double)c.bytes / 1073741824.0);
 
     /* every slot the plan declares is bound; the stored widths */
-    bool slots = w->embed && w->output_norm;
+    bool slots = w->embed && w->output_norm && w->head;
     for (uint32_t il = 0; slots && il < s->n_layer; il++) slots = layer_bound(w->layer[il], pulsar_gemma4_is_full(s, il));
-    check(slots, "every slot bound: embed (= the tied head), output_norm, and each layer's (no attn_v on a global layer)");
+    check(slots, "every slot bound: embed, output_norm, head (the pack's EXL3), and each layer's (no attn_v on a global "
+                 "layer)");
+    check(exl3_type_k2(w->head->type) > 0, "the head is EXL3 (rate K%d: the Turing build's head)", exl3_type_k2(w->head->type) / 2);
     const pulsar_gemma4_block &L0 = w->layer[0];
     check(pulsar_gemma4_ff_stored(s) == 2176 && pulsar_gemma4_ff_exp_stored(s) == 768 &&
               L0.ffn_down->dim[0] == 2176 && L0.exp_down->dim[0] == 768 && L0.exp_gate->dim[1] == 768 &&

@@ -4,13 +4,14 @@ attention layers, every layer a dense GeGLU MLP AND 128 top-8 routed GeGLU exper
 
 Sources (no GGUF anywhere, L247):
   --hf     the BF16 checkpoint: the authority for the config and every tensor the recipe writes native (norms, the
-           router, the per-layer scalar, the embedding = the tied head).  The vision tower (`model.vision_tower.`,
+           router, the per-layer scalar, the embedding, for lookups).  The vision tower (`model.vision_tower.`,
            `model.embed_vision.`) is consumed by name and written nowhere in v1 (text first).
   --exl3   the exllamav3 pack of the same checkpoint (exllamav3 >= 1.6.5 `architecture/gemma4.py`, mul1 codebook): every
            Linear byte-copied, under the checkpoint's own names -- dense `...layers.N.{self_attn,mlp}.<proj>`, routed
-           `...layers.N.experts.<e>.{gate,up,down}_proj` (the pack splits HF's fused gate_up stack per expert).  The
-           pack's lm_head (exllamav3 quantizes one from the tied embedding) is not read in v1: the head is the BF16
-           embedding.
+           `...layers.N.experts.<e>.{gate,up,down}_proj` (the pack splits HF's fused gate_up stack per expert), and
+           the head: HF ties it to the embedding, exllamav3 quantizes one from it as `lm_head` (6 bpw by default), and
+           the Turing build runs that one (Tyler 2026-11-01: pulsar's BF16 head GEMM needs sm_80+); Source names it
+           `lm_head.weight`.
   --recipe a pulsar.recipe.v1 (format-maps/gemma4-*.json): required.
 
 The stored widths (L338 pack census).  exllamav3 pads every Linear to the 128 Hadamard block on BOTH sides
@@ -36,12 +37,13 @@ Roles: the recipe role (dense | norm | router | other | embed | expert_gate_up |
 layer (block `layers`): attn_norm, attn_q / _k / _v / _o, attn_q_norm, attn_k_norm, attn_post_norm; ffn_pre_norm,
 ffn_gate / _up / _down (the dense MLP), ffn_post_norm_1 (its output norm); moe_pre_norm, router, router_scale,
 router_expert_scale, expert_gate / _up / _down, ffn_post_norm_2 (the experts' output norm); ffn_post_norm (of the
-sum); layer_scalar.  Global layers have no attn_v (K = V).  At the top: embed (also the head), output_norm.
+sum); layer_scalar.  Global layers have no attn_v (K = V).  At the top: embed, output_norm, head (the pack's
+EXL3 head).
 
 The container:
   * names ARE the HF names; routed experts fold to one U8 entry per expert-projection,
     `model.language_model.layers.N.experts.<e>.{gate,up,down}_proj.weight`, families in pulsar.experts carrying
-    `entry_name`, `layer`, `role`, `block`.  Layouts: bf16 native; exl3m_k* for every Linear from the pack.
+    `entry_name`, `layer`, `role`, `block`.  Layouts: bf16 native; exl3m_k* for every Linear from the pack, the head included.
   * shards: `vision` (primary: pulsar.kv only -- no tower in v1), `layers.0..29`, `top`.
   * pulsar.kv: general.architecture = "gemma4"; text_config verbatim under `gemma4.` (kv.config_kvs); the builder's
     facts (recipe, sources, pulsar.vision_present false).
@@ -68,6 +70,7 @@ SETTINGS = ()
 EXPERT_STACKS = True            # an HF expert tensor is the whole [E, out, in] stack; split per expert from the pack
 GATE_UP_PARTS = ("gate_proj", "up_proj")
 VISION_PREFIXES = ("model.vision_tower.", "model.embed_vision.")
+HEAD = "lm_head.weight"         # the pack's EXL3 head, under the name exllamav3 keys it (Source)
 EXL3 = set(exl3_rates.K2)
 
 # the switches the engine implements: text_config key -> the one value it implements
@@ -126,7 +129,7 @@ class Shape:
                 f"{self.sliding_kv[0]}kv/{self.sliding_kv[1]}, {nf} global {self.n_head}q/{self.full_kv[0]}kv/"
                 f"{self.full_kv[1]} K=V), {self.hidden} wide, dense GeGLU {self.ffn} (stored {self.ffn_stored}) + "
                 f"{self.n_expert} experts top-{self.top_k} x {self.expert_ffn} (stored {self.expert_ffn_stored}), "
-                f"softcap {self.softcap}, tied head, vision not written (v1), recipe {self.recipe}")
+                f"softcap {self.softcap}, EXL3 head (the pack's), vision not written (v1), recipe {self.recipe}")
 
 
 def declare(top: dict) -> Shape:
@@ -233,6 +236,7 @@ def expected(sh: Shape):
             add(f"{LM}layers.{il}.{s}", dims[s], bind, role, f"layers.{il}", il, part)
     add(LM + "embed_tokens.weight", [sh.vocab, H], "embed", "embed", "top")
     add(LM + "norm.weight", [H], "output_norm", "norm", "top")
+    add(HEAD, [sh.vocab, H], "head", "head", "top")
     return out
 
 
@@ -266,8 +270,49 @@ def table(hf, decl: Shape):
 # ---------------------------------------------------------------------------
 # the family hooks (build.plan)
 # ---------------------------------------------------------------------------
+class Source:
+    """The checkpoint plus the head (L338, Tyler 2026-11-01: the Turing build runs the pack's EXL3 head).  HF ties the
+    head to the embedding and stores no `lm_head.weight`; exllamav3 quantizes one from the embedding into the pack as
+    `lm_head`.  This view names it -- HEAD, with the embedding's BF16 [vocab, hidden] shape and dtype (the [out, in] the
+    plan sizes the EXL3 Linear by) -- so the head is an entry like any other; its bytes come from the pack only (admit
+    takes the head EXL3, never native), so the embedding's bytes are never written twice."""
+
+    def __init__(self, hf):
+        self.hf = hf
+        self.embed = LM + "embed_tokens.weight"
+
+    def __getattr__(self, k):
+        return getattr(self.hf, k)
+
+    def _n(self, name):
+        return self.embed if name == HEAD else name
+
+    def names(self):
+        return self.hf.names() + [HEAD]
+
+    def has(self, name):
+        return name == HEAD or self.hf.has(name)
+
+    def shape(self, name):
+        return self.hf.shape(self._n(name))
+
+    def dtype(self, name):
+        return self.hf.dtype(self._n(name))
+
+    def raw(self, name):
+        if name == HEAD:
+            raise SystemExit(f"{HEAD}: the head's bytes are the pack's (EXL3); the BF16 view is not read")
+        return self.hf.raw(name)
+
+    def copy_src(self, name):
+        if name == HEAD:
+            raise SystemExit(f"{HEAD}: the head's bytes are the pack's (EXL3); the BF16 view is not copied")
+        return self.hf.copy_src(name)
+
+
 def source(hf):
-    """The checkpoint as is: every tensor the plan writes is an HF tensor by its own name."""
+    """The checkpoint plus the head entry (Source): every other tensor the plan writes is an HF tensor by its own name."""
+    hf = Source(hf)
     hf.decl = declare(hf.config["top_level"])
     hf.mapped = table(hf, hf.decl)
     return hf
@@ -319,7 +364,7 @@ def admit(hf, m, fmt, name):
         allowed |= EXL3
         if m.layer is not None and _suffix(m) in MLP_STORED:
             allowed = set(EXL3)
-    if m.role in ("expert_gate_up", "expert_down"):
+    if m.role in ("expert_gate_up", "expert_down", "head"):   # the head: the pack's (Source)
         allowed = set(EXL3)
     if fmt not in allowed:
         raise SystemExit(f"{name}: the Gemma 4 loader binds this {m.role} tensor as {sorted(a for a in allowed if a)}, "

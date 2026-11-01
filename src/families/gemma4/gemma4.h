@@ -11,7 +11,8 @@
  * k_norm) under the proportional rope (64 of 256 frequency pairs rotate at theta 1e6 over the 512 head, the rest pass
  * through), the router's input rmsnorm(r) (no weight) * scale * hidden^-1/2 -> softmax -> top 8 -> renormalised ->
  * per_expert_scale; GELU tanh; an embedding scaled by sqrt(hidden) (bf16-rounded); a head tied to the embedding with a
- * final logit soft-cap (tanh(x / 30) * 30).  RMSNorm is x * (mean(x^2) + eps)^-1/2 * w (w, not 1 + w).
+ * final logit soft-cap (tanh(x / 30) * 30) -- run here as the head exllamav3 quantizes from the embedding (6 bpw, the
+ * pack's `lm_head`; Tyler 2026-11-01: pulsar's BF16 head GEMM needs sm_80+, the Turing build runs the EXL3 one).  RMSNorm is x * (mean(x^2) + eps)^-1/2 * w (w, not 1 + w).
  *
  * WHAT IS HERE (E2): the shape struct (read from the container's gemma4.* keys, every geometry field pinned to the
  * known profile, every switch pinned, any unknown key refused), the layer plan (PULSAR_LAYER_BLOCKS: window vs full
@@ -26,7 +27,7 @@
  *   pulsar.vision_present (false in v1: the tower is not written).
  *   Every tensor carries a bind record: role (+ block `layers`, layer).  Linears are stored [in, out] in ne order;
  *   routed experts are pulsar.experts stacks [in, out, n_expert], gate and up apart (the builder splits HF's fused
- *   stack per expert, as exllamav3's pack holds them).  The dense MLP and the experts are declared at the EXL3 pack's
+ *   stack per expert, as exllamav3's pack holds them); the head is the pack's EXL3 `lm_head.weight`.  The dense MLP and the experts are declared at the EXL3 pack's
  *   STORED width -- exl3_out_stored(2112) = 2176, exl3_out_stored(704) = 768 -- whose padded gate / up columns decode
  *   to exactly zero (the builder checks svh = 0 there), so the stored width is the model's width.
  */
@@ -141,8 +142,9 @@ typedef struct {
 typedef struct {
     /// The loaded, checked shape (pulsar_gemma4_read_shape) every bind and forward reads.
     pulsar_gemma4_shape shape;
-    pulsar_tensor *embed;               ///< embed [n_vocab rows of n_embd]; also the head (tied)
+    pulsar_tensor *embed;               ///< embed [n_vocab rows of n_embd]: the lookups
     pulsar_tensor *output_norm;         ///< output_norm [n_embd]
+    pulsar_tensor *head;                ///< head [n_embd -> n_vocab]: the pack's EXL3 head (quantized from the tied embedding)
     /// The layers; entries [0, shape.n_layer) are bound, the rest stay zero.
     pulsar_gemma4_block layer[PULSAR_FAMILY_MAX_LAYER];
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */

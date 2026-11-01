@@ -14,7 +14,7 @@ const char *const ARCH = PULSAR_GEMMA4_ARCH;
 /// The one reason every session entry refuses with, until Gemma 4's driver blocks exist.
 const char *const NOT_WIRED =
     "forward not yet wired: Gemma 4's driver blocks (pulsar_family::driver -- block[PULSAR_LAYER_BLOCKS] over the GQA "
-    "block at head_dim 256 / 512 with K = V, PULSAR_FFN_DENSE_MOE, the soft-capped tied head; L338 E3 / E4) and its "
+    "block at head_dim 256 / 512 with K = V, PULSAR_FFN_DENSE_MOE, the soft-capped head; L338 E3 / E4) and its "
     "state declaration";
 
 /** pulsar_family::unload: free the family state load allocated (safe after a partial load).
@@ -77,7 +77,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     uint32_t n_full = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) n_full += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL;
     fprintf(stderr, "pulsar: %s: %s, %u layers: %u window (%u keys, %uq/%ukv x %u) + %u global (%uq/%ukv x %u, K = V); "
-                    "every layer a dense GeGLU MLP (%u, stored %u) + %u of %u experts (%u, stored %u); tied head, "
+                    "every layer a dense GeGLU MLP (%u, stored %u) + %u of %u experts (%u, stored %u); the pack's EXL3 head, "
                     "soft-cap %g; %.2f GiB bound\n",
             ARCH, s->name, s->n_layer, s->n_layer - n_full, s->window, s->n_head, s->swa_n_head_kv, s->swa_head_dim, n_full,
             s->n_head, s->n_head_kv, s->head_dim, s->n_ff, pulsar_gemma4_ff_stored(s), s->n_expert_used, s->n_expert,

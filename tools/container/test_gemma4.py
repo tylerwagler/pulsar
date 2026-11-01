@@ -5,14 +5,14 @@ v_proj --, the dense MLP beside the fused expert stacks, the router's scales, th
 and its synthetic exllamav3 pack (every Linear under the checkpoint's names, experts split per expert, every width
 padded to 128 with svh 0 on the gate / up pad, as exllamav3 writes it):
 
-  * EXL3 K4: plan, emit --all twice byte-identical, verify --all (side files byte-equal), audit; GOLDEN
+  * EXL3 K4 (the head K6, the pack's): plan, emit --all twice byte-identical, verify --all (side files byte-equal), audit; GOLDEN
   * the records: every bind role per layer (block layers, layer N), no attn_v on the global layer, embed /
     output_norm at the top; the dense MLP declared at the stored width ([H -> 256] for a 200-wide MLP); the expert
     families gate / up / down at the stored width (128 for a 100-wide expert), role, layer, block; every Linear's bytes
     == the pack's [trellis | suh | svh]; pulsar.kv: text_config verbatim (both ropes flattened, layer_types)
   * refusals by name: an unknown tensor, a missing tensor, a wrong shape, a switch (attention_k_eq_v false), the
     global rope (partial factor 0.5), a nonzero svh on a padded gate column (dense MLP and expert), a dense-MLP row
-    written bf16, no --exl3
+    written bf16, the head written bf16, no --exl3
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from test_qwen import bf16, write_st, exl3_parts  # noqa: E402
 FAILS: list[str] = []
 # sha256 over (file name, sha256(file)) of every emitted file but the side files; fixed when the family landed (L338)
 GOLDEN = {
-    "k4": "79d17c8e07c46cc053bdc65620b63e8519701ad2b85e2ab3233dfc03a8c710a2",
+    "k4": "82672c0483a73b8d0cbf649419beb3e06a6fed774eebdffbb7779677d85e7d9d",
 }
 H, V, NQ, FF, E, FE = 128, 64, 2, 200, 4, 100
 SLIDING, FULL = (1, 128), (1, 256)          # (n_kv, head_dim)
@@ -146,6 +146,7 @@ def make_exl3(root, rng, dirty=None):
                 key = q + f"experts.{e}.{p}"
                 pack_linear(t, rng, key, H, stored(FE), FE, dirty_pad=dirty == key)
             pack_linear(t, rng, q + f"experts.{e}.down_proj", stored(FE), H)
+    pack_linear(t, rng, "lm_head", H, stored(V), K=6)   # the head exllamav3 quantizes from the tied embedding
     os.makedirs(root, exist_ok=True)
     names = sorted(t)
     half = len(names) // 2
@@ -230,7 +231,7 @@ def records(o):
 ROWS_K4 = [{"role": "dense", "format": "exl3m_k4"}, {"role": "expert_gate_up", "format": "exl3m_k4"},
            {"role": "expert_down", "format": "exl3m_k4"}, {"role": "router", "format": "native"},
            {"role": "norm", "format": "native"}, {"role": "embed", "format": "native"},
-           {"role": "other", "format": "native"}]
+           {"role": "head", "format": "exl3m_k6"}, {"role": "other", "format": "native"}]
 
 
 def main():
@@ -266,9 +267,11 @@ def main():
               and d(0, "router.per_expert_scale")["role"] == "router_expert_scale"
               and d(1, "layer_scalar")["role"] == "layer_scalar"
               and decl[P + "embed_tokens.weight"]["role"] == "embed" and "block" not in decl[P + "embed_tokens.weight"]
-              and decl[P + "norm.weight"]["role"] == "output_norm",
+              and decl[P + "norm.weight"]["role"] == "output_norm"
+              and decl["lm_head.weight"]["role"] == "head" and decl["lm_head.weight"]["layout"] == "exl3m_k6"
+              and decl["lm_head.weight"]["dims_ne"] == [H, V],
               "records: every bind role per layer (block layers, layer N), K = V (no attn_v on the global layer), "
-              "embed / output_norm at the top")
+              "embed / output_norm / head (EXL3 K6) at the top")
         check(d(0, "mlp.gate_proj.weight")["dims_ne"] == [H, stored(FF)]
               and d(0, "mlp.up_proj.weight")["dims_ne"] == [H, stored(FF)]
               and d(0, "mlp.down_proj.weight")["dims_ne"] == [stored(FF), H]
@@ -287,15 +290,15 @@ def main():
               "entry_name")
         bad, n_lin = 0, 0
         for name in sorted(names):
-            if not name.startswith(P + "layers.") or not (".self_attn." in name and name.endswith("_proj.weight")
-                                                          or ".mlp." in name or ".experts." in name):
+            if name != "lm_head.weight" and (not name.startswith(P + "layers.") or not (".self_attn." in name and name.endswith("_proj.weight")
+                                                          or ".mlp." in name or ".experts." in name)):
                 continue
             key = name[:-len(".weight")]
             want = b"".join(pt[f"{key}.{s}"][2] for s in ("trellis", "suh", "svh"))
             f = next(x for x in shards if name in header(os.path.join(o, x))[0])
             bad += entry_bytes(o, f, name) != want
             n_lin += 1
-        check(bad == 0 and n_lin == L * (3 + 3 + 3 * E) + 1,
+        check(bad == 0 and n_lin == L * (3 + 3 + 3 * E) + 1 + 1,
               f"every Linear's bytes == the pack's [trellis | suh | svh] ({n_lin})")
         check(kv["general.architecture"] == "gemma4" and kv["gemma4.attention_k_eq_v"] is True
               and kv["gemma4.rope_parameters.full_attention.rope_type"] == "proportional"
@@ -347,8 +350,11 @@ def main():
         rows = [r if r["role"] != "dense" else {"role": "dense", "format": "native"} for r in ROWS_K4]
         refused("the dense MLP written bf16 (its width is the pack's)", "binds this dense tensor",
                 rec=recipe(tmp, "mlp-bf16", rows))
+        rows = [r if r["role"] != "head" else {"role": "head", "format": "native"} for r in ROWS_K4]
+        refused("the head written bf16 (the Turing build runs the pack's)", "binds this head tensor",
+                rec=recipe(tmp, "head-bf16", rows))
         refused("no --exl3", "pass --exl3", rec=recipe(tmp, "no-exl3", [
-            {"role": r, "format": "native"} for r in ("router", "norm", "embed", "other")]), exl3=False)
+            {"role": r, "format": "native"} for r in ("router", "norm", "embed", "head", "other")]), exl3=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'test_gemma4: PASS' if not FAILS else 'test_gemma4: FAIL (' + str(len(FAILS)) + ')'}")
