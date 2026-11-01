@@ -507,6 +507,10 @@ int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t con
 /** @brief Print the device's free / total memory to stderr.
  *  @param label prefix for the line, or NULL */
 void pulsar_gpu_print_memory_report(const char *label);
+/** Whether the device's memory is the host's (GB10: unified) or its own (a discrete card) -- cudaDevAttrIntegrated,
+ *  read in one place (L338).
+ *  @return 1 integrated, 0 discrete, -1 when the device did not answer */
+int pulsar_gpu_integrated(void);
 /** cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
 /** @param free_out  receives free device bytes
  *  @param total_out receives total device bytes */

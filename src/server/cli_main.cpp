@@ -287,6 +287,32 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
     return PULSAR_SERVER_USABLE_BYTES - reserved;
 }
 
+/* L338: a DISCRETE card's sessions live in its own memory, which server_kv_budget_bytes' constants (GB10's unified
+ * 121 GiB and its process reserve) do not describe -- on a 24 GB RTX 6000 they budgeted 84.6 GiB, auto-sized 16
+ * banks, and the create died out of device memory at bank 11.  There the budget is what the device has free once the
+ * weights are staged, less server_discrete_margin_bytes (the working set that materializes after startup); the
+ * post-warmup re-derivation still min()s it. */
+/// @param free_bytes  the device's free memory, the weights staged
+/// @param total_bytes the device's memory
+/// @return the session budget in bytes (0 when the margin exceeds what is free)
+static uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t total_bytes) {
+    const uint64_t margin = server_discrete_margin_bytes(total_bytes);
+    return free_bytes > margin ? free_bytes - margin : 0;
+}
+
+/* The budget for the device this process runs on: the discrete formula when the device says its memory is its own,
+ * else (GB10, or a device that did not answer) the unified one. */
+/// @param weights_resident_bytes the resident weights, bytes (the unified formula's)
+/// @return the session budget in bytes
+static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
+    if (pulsar_gpu_integrated() == 0) {
+        uint64_t free_b = 0, total_b = 0;
+        pulsar_gpu_mem_info(&free_b, &total_b);
+        return server_kv_budget_discrete_bytes(free_b, total_b);
+    }
+    return server_kv_budget_bytes(weights_resident_bytes);
+}
+
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
  * every lazy slot provisioning in the scheduler (server_sched.cpp); an over-budget
@@ -868,7 +894,7 @@ int main(int argc, char **argv) {
      * then gate the slot's graph allocation on it. The scheduler runs the same
      * predicate for every lazily provisioned slot. */
     const uint64_t weights_resident = pulsar_engine_weights_resident_bytes(engine);
-    const uint64_t kv_budget = server_kv_budget_bytes(weights_resident);
+    const uint64_t kv_budget = server_kv_budget_for_device(weights_resident);
 
     /* Tier-2 pool auto-sizing (batching ON by default, auto-fit). Batching is
      * the default: the bank count is DERIVED from --ctx so a moderate ctx yields
@@ -985,14 +1011,26 @@ int main(int argc, char **argv) {
         overcommit_admission_est = oc_shared + (uint64_t)finalN * oc_eager_pb;
     }
     const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;
-    server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
-               "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
-               (double)PULSAR_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
-               (double)PULSAR_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    if (pulsar_gpu_integrated() == 0) {   /* L338: the discrete card's own memory (server_kv_budget_for_device) */
+        uint64_t free_b = 0, total_b = 0;
+        pulsar_gpu_mem_info(&free_b, &total_b);
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: session admission: discrete GPU -- device %.1f GiB, free after the weights %.1f GiB "
+                   "(weights_resident=%.1f GiB), margin %.1f GiB, budget=%.1f GiB",
+                   (double)total_b / (1024.0 * 1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0 * 1024.0),
+                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
+                   (double)server_discrete_margin_bytes(total_b) / (1024.0 * 1024.0 * 1024.0),
+                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
+                   "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
+                   (double)PULSAR_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    }
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: session admission: per-session true cost est=%.2f GiB (ctx=%d)",
                (double)session_est / (1024.0 * 1024.0 * 1024.0),

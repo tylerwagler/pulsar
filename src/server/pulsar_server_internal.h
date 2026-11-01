@@ -1663,6 +1663,16 @@ typedef struct {
  *     constants are an upper bound rather than the load-bearing estimate.
  * Re-measure the constants when the measured/static gap logged at startup
  * ("session admission: measured budget") exceeds ~2 GiB. */
+/** L338: a discrete card's working set past its staged weights and its sessions' priced state -- cuBLAS workspaces,
+ *  graph instantiation, scratch, the CUDA context's growth -- the larger of 2 GiB and an eighth of the card.  Measured
+ *  on the 24 GB RTX 6000 (Gemma 4, 4 banks, after warmup): 21.9 GB in use against 19.8 priced (weights 14.4 + context
+ *  0.3 + shared 1.89 + banks 3.24), a 2.1 GiB working set under the 3 GiB margin.
+ *  @param total_bytes the device's memory
+ *  @return the margin, bytes */
+static inline uint64_t server_discrete_margin_bytes(uint64_t total_bytes) {
+    const uint64_t eighth = total_bytes / 8u, two = 2ull * 1024ull * 1024ull * 1024ull;
+    return eighth > two ? eighth : two;
+}
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 /// The process's measured steady-state overhead the admission budget reserves, bytes.

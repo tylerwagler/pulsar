@@ -902,6 +902,25 @@ static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
 
 
 
+/* One question, asked of the device: is its memory the host's (GB10) or its own (a discrete card)?  The one place the
+ * attribute is read (L338); each caller keeps its own answer for a failed query. */
+/// @param integrated receives 1 for an integrated GPU, 0 for a discrete one (untouched on failure)
+/// @return true when the device answered
+static bool cuda_device_integrated(int *integrated) {
+    int dev = 0, v = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    *integrated = v;
+    return true;
+}
+
+int pulsar_gpu_integrated(void) {
+    int v = 0;
+    return cuda_device_integrated(&v) ? (v ? 1 : 0) : -1;
+}
+
 /// @return the device weight-cache budget in bytes: 96 GiB integrated, else total memory less max(2 GiB, a fifth)
 static uint64_t cuda_model_cache_limit_bytes(void) {
     /* One Spark can run the IQ2 model (~81 GiB) and larger mixed models
@@ -913,11 +932,10 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
      * 121 GiB GB10, and a model past its budget must refuse at load rather than die half staged. */
     static uint64_t limit = 0;
     if (!limit) {
-        int dev = 0, integrated = 1;
+        int integrated = 1;   /* a failed query: the integrated budget */
         size_t free_b = 0, total_b = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess &&
-            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess && !integrated &&
-            cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b) {
+        if (cuda_device_integrated(&integrated) && !integrated && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+            total_b) {
             const uint64_t head = std::max<uint64_t>(2ull * 1073741824ull, (uint64_t)total_b / 5u);
             limit = (uint64_t)total_b > head ? (uint64_t)total_b - head : 0u;
         } else {
@@ -2527,12 +2545,8 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
      * A discrete card would accept it too and then read every weight over PCIe on every use, ~1/30 of its own
      * memory's bandwidth -- so a discrete card takes the staged route instead, which copies each span into device
      * memory once (cuda_model_range_ptr_from_fd).  One question, asked of the device: cudaDevAttrIntegrated. */
-    int dev_id = 0, integrated = 0;
-    if (cudaGetDevice(&dev_id) != cudaSuccess ||
-        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_id) != cudaSuccess) {
-        (void)cudaGetLastError();
-        integrated = 0;
-    }
+    int integrated = 0;   /* a failed query: the staged route */
+    (void)cuda_device_integrated(&integrated);
     cudaError_t err = cudaErrorNotSupported;
     if (integrated) {
         err = cudaHostRegister((void *)model_map, (size_t)model_size, cudaHostRegisterMapped | cudaHostRegisterReadOnly);

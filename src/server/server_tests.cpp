@@ -7868,6 +7868,11 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
     TEST_ASSERT(server_kv_budget_bytes(PULSAR_SERVER_USABLE_BYTES) == 0);
+    /* L338: a discrete card's budget is its own free memory less the margin (the larger of 2 GiB and an eighth) */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 24ull * GiB) == 6ull * GiB);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(3ull * GiB, 16ull * GiB) == 1ull * GiB);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 16ull * GiB) == 0);   /* no underflow */
+    TEST_ASSERT(server_discrete_margin_bytes(80ull * GiB) == 10ull * GiB);
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
     TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));
