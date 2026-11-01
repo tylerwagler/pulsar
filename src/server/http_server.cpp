@@ -1393,6 +1393,7 @@ void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.accepted_at = server_now_sec();
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -1419,6 +1420,8 @@ void *client_main(void *arg) {
                 pthread_cond_timedwait(&j.cv, &j.mu, &ts);
                 if (!j.done && !j.cancelled && gen_client_disconnected(j.fd))
                     j.cancelled = true;
+                /* L249 D: a streaming job still waiting for the worker gets its stream opened and kept alive */
+                if (!j.done && !j.cancelled) job_early_keepalive(&j, server_now_sec());
             }
         }
     }

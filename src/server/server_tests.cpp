@@ -1511,7 +1511,13 @@ static void test_stream_heartbeat_only_fires_when_silent(void) {
     gen_state g;
     memset(&g, 0, sizeof(g));
     slot_writer_init(&g.writer, sv[0]);
-    g.anthropic_live.active = true;
+    /* L249 D: the beat follows the open stream (its head sent), whatever has been projected on it yet */
+    job j;
+    memset(&j, 0, sizeof j);
+    j.req.api = API_ANTHROPIC;
+    j.req.stream = true;
+    g.j = &j;
+    g.progress.headers_sent = true;
 
     /* Clock unarmed (nothing ever sent): no beat — we do not know the client
      * is idle rather than simply not started. */
@@ -1546,11 +1552,16 @@ static void test_stream_heartbeat_openai_uses_sse_comment(void) {
     memset(&g, 0, sizeof(g));
     slot_writer_init(&g.writer, sv[0]);
     g.writer.last_write_ms = 1;
+    job j;
+    memset(&j, 0, sizeof j);
+    j.req.api = API_OPENAI;
+    g.j = &j;
+    g.progress.headers_sent = true;
 
-    /* No stream projection active (non-streaming request): never beat. */
+    /* A non-streaming request: never beat. */
     TEST_ASSERT(!gen_stream_heartbeat(&g));
 
-    g.openai_live.active = true;
+    j.req.stream = true;
     TEST_ASSERT(gen_stream_heartbeat(&g));
 
     shutdown(sv[0], SHUT_WR);
@@ -8505,6 +8516,110 @@ static void test_slot_route_trivial_match_decision(void) {
  * send_all() routes through a slot_writer — writes that do not fit the socket
  * buffer defer instead of blocking, and flushes deliver every byte in order.
  * The wire stream must be identical to the blocking path. */
+/* L249 D: the early stream.  A streaming job that waits for the worker gets the SSE head and the protocol's keepalive
+ * from its client thread once it has waited a heartbeat interval, then a beat an interval; nothing once the worker
+ * claims the socket.  A bound job's heartbeat opens the stream the same way.  An error after the stream opened is an
+ * error event with the status's type (overloaded_error for a capacity refusal); before, the HTTP error carries
+ * Retry-After. */
+static std::string early_drain(int fd) {
+    std::string out;
+    char tmp[4096];
+    ssize_t n;
+    while ((n = recv(fd, tmp, sizeof tmp, MSG_DONTWAIT)) > 0) out.append(tmp, (size_t)n);
+    return out;
+}
+
+static void test_early_stream_keepalive(void) {
+    signal(SIGPIPE, SIG_IGN);
+    const double iv = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    for (api_style api : {API_ANTHROPIC, API_OPENAI}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        set_client_socket_nonblocking(sv[0]);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = api;
+        j.req.stream = true;
+        pthread_mutex_init(&j.mu, NULL);
+        j.accepted_at = 100.0;
+        const char *beat = api == API_ANTHROPIC ? "event: ping\ndata: {\"type\": \"ping\"}\n\n" : ": ping\n\n";
+        job_early_keepalive(&j, 100.0 + iv / 2);   /* not waited an interval yet */
+        TEST_ASSERT(early_drain(sv[1]).empty() && !j.sse_early);
+        job_early_keepalive(&j, 100.0 + iv);
+        TEST_ASSERT(early_drain(sv[1]) == std::string(k_sse_head) + beat && j.sse_early);
+        job_early_keepalive(&j, 100.0 + iv * 1.5);   /* the next beat is an interval away */
+        TEST_ASSERT(early_drain(sv[1]).empty());
+        job_early_keepalive(&j, 100.0 + iv * 2);
+        TEST_ASSERT(early_drain(sv[1]) == beat);
+        bool dead = true;
+        TEST_ASSERT(job_claim_writes(&j, &dead) && !dead);
+        job_early_keepalive(&j, 100.0 + iv * 10);   /* the worker's now */
+        TEST_ASSERT(early_drain(sv[1]).empty());
+        /* the capacity refusal after the stream opened: an error event of the status's type */
+        TEST_ASSERT(job_reply_error(&j, true, 503, "not enough KV memory"));
+        const std::string ev = early_drain(sv[1]);
+        TEST_ASSERT(ev.rfind("event: error\ndata: ", 0) == 0);
+        TEST_ASSERT(ev.find(api == API_ANTHROPIC ? "\"type\":\"overloaded_error\"" : "\"type\":\"server_error\"") !=
+                    std::string::npos);
+        /* a non-streaming job never opens a stream */
+        job k;
+        memset(&k, 0, sizeof k);
+        k.fd = sv[0];
+        k.req.api = api;
+        job_early_keepalive(&k, 1e9);
+        TEST_ASSERT(early_drain(sv[1]).empty() && !k.sse_early);
+        pthread_mutex_destroy(&j.mu);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    /* before the stream opened: the HTTP error, Anthropic's typed by status and retryable for capacity */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = API_ANTHROPIC;
+        TEST_ASSERT(job_reply_error(&j, false, 503, "busy"));
+        TEST_ASSERT(job_reply_error(&j, false, 500, "broke"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(out && strstr(out, "HTTP/1.1 503") && strstr(out, "Retry-After: ") &&
+                    strstr(out, "\"type\":\"overloaded_error\"") && strstr(out, "\"type\":\"api_error\""));
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    /* a bound job the worker has written nothing for: its heartbeat opens the stream, then beats an interval */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        set_client_socket_nonblocking(sv[0]);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = API_ANTHROPIC;
+        j.req.stream = true;
+        j.accepted_at = server_now_sec();
+        gen_state *g = (gen_state *)calloc(1, sizeof(gen_state));
+        g->j = &j;
+        slot_writer_init(&g->writer, sv[0]);
+        TEST_ASSERT(!gen_stream_heartbeat(g));   /* accepted just now */
+        j.accepted_at -= iv;
+        TEST_ASSERT(gen_stream_heartbeat(g) && g->progress.headers_sent);
+        TEST_ASSERT(early_drain(sv[1]) == std::string(k_sse_head) + "event: ping\ndata: {\"type\": \"ping\"}\n\n");
+        TEST_ASSERT(!gen_stream_heartbeat(g));   /* the next beat is an interval away */
+        j.req.stream = false;                     /* a non-streaming job: never */
+        g->progress.headers_sent = false;
+        TEST_ASSERT(!gen_stream_heartbeat(g));
+        slot_writer_free(&g->writer);
+        free(g);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_slot_writer_defers_and_preserves_order(void) {
     signal(SIGPIPE, SIG_IGN);
     int sv[2];
@@ -12212,6 +12327,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l325_deferred_tool_in_place();
     test_l326_responses_tool_search_in_place();
     test_slot_writer_defers_and_preserves_order();
+    test_early_stream_keepalive();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();

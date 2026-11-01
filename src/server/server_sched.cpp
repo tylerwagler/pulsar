@@ -1609,8 +1609,16 @@ bool server::worker_try_bind() {
          * context), then wake the client thread exactly like
          * worker_finish_slot does for a completed job. */
         s->queue_unlink(j);
-        http_error_context_length_exceeded(j->fd, &j->req,
-                                           j->req.prompt.len, reject_ctx);
+        bool dead = false;
+        if (!job_claim_writes(j, &dead)) {
+            http_error_context_length_exceeded(j->fd, &j->req, j->req.prompt.len, reject_ctx);
+        } else if (!dead) {
+            /* L249 D: the stream opened while it waited -- the same message, as an error event */
+            char msg[160];
+            snprintf(msg, sizeof msg, "Prompt has %d tokens, but the configured context size is %d tokens",
+                     j->req.prompt.len, reject_ctx);
+            sse_error_event(j->fd, &j->req, 400, msg);
+        }
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -1625,9 +1633,9 @@ bool server::worker_try_bind() {
          * way the context-length reject above does. */
         s->note_provision_refusal(j, refusal);
         s->queue_unlink(j);
-        const char *emsg = "session bank could not be installed (state restore refused)";
-        if (j->req.api == API_ANTHROPIC) http_error_anthropic(j->fd, 500, emsg);
-        else http_error(j->fd, 500, emsg);
+        bool dead = false;
+        const bool open = job_claim_writes(j, &dead);
+        if (!dead) job_reply_error(j, open, 500, "session bank could not be installed (state restore refused)");
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -2796,8 +2804,9 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     server_log(PULSAR_LOG_WARNING, "pulsar-server: kv admission REFUSED (503): %s", msg);
     s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
     *refused = true;
-    if (j->req.api == API_ANTHROPIC) http_error_anthropic(j->fd, 503, msg);
-    else http_error_retry(j->fd, 503, msg, HTTP_RETRY_GOING_AWAY_S);
+    bool dead = false;
+    const bool open = job_claim_writes(j, &dead);
+    if (!dead) job_reply_error(j, open, 503, msg);
     return false;
 }
 
@@ -2887,11 +2896,9 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
     s->trace_event(g->trace_id, "prefill refused: %s", g->err);
     if (g->j->req.stream && g->progress.headers_sent) {
-        if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, g->err);
-    } else if (g->j->req.api == API_ANTHROPIC) {
-        http_error_anthropic(g->j->fd, 503, g->err);
+        if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, 503, g->err);
     } else {
-        http_error_retry(g->j->fd, 503, g->err, HTTP_RETRY_GOING_AWAY_S);
+        job_reply_error(g->j, false, 503, g->err);
     }
     g->phase = GEN_DONE;
     return false;

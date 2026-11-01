@@ -1148,6 +1148,9 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
 bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
+/** Start the writer's keepalive clock now (the socket carried bytes before the writer existed: L249 D). */
+/// @param w  the writer
+void slot_writer_mark_written(slot_writer *w);
 bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);
 
@@ -3279,7 +3282,36 @@ struct job {
      *  freed address is not the leader). */
     uint64_t seq;
     prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
+    /** L249 D: the early stream.  A streaming request the worker has not started writing to gets its SSE head and
+     *  keepalives from its client thread once it has waited PULSAR_SERVER_HEARTBEAT_MS (queued for a bank, a slot,
+     *  a prefill it shares): a gateway in front (Cloudflare's ~100 s origin timeout) sees bytes from then on, not at
+     *  the first prefill chunk.  The worker claims the socket (job_claim_writes) before its first write; after that
+     *  the client thread writes nothing.  All under mu. */
+    double accepted_at;   ///< server_now_sec when the client thread enqueued it
+    bool worker_writes;   ///< the worker owns the socket's writes
+    bool sse_early;       ///< the client thread sent the SSE head (the stream is open)
+    bool sse_early_dead;  ///< an early write failed: the stream is dead
+    double early_last;    ///< server_now_sec of the last early write
 };
+/** Client thread, mu held, while the job waits: open the stream / send a keepalive when one is due (a streaming
+ *  request the worker has not claimed).  A write that does not go out whole marks the stream dead. */
+/// @param j    the job
+/// @param now  server_now_sec
+void job_early_keepalive(job *j, double now);
+/** Worker: take the socket's writes from the client thread (before the job's first write).  Returns whether the
+ *  stream is already open; `*dead` = an early write failed (nothing more can be written). */
+/// @param j     the job
+/// @param dead  receives whether the early stream died
+/// @return true when the client thread opened the stream
+bool job_claim_writes(job *j, bool *dead);
+/** Answer a job with an error in the shape its response is in: an error event when its stream is open (the type
+ *  the status would have had, anthropic_error_type), else the protocol's HTTP error (a 503 retryable). */
+/// @param j         the job
+/// @param sse_open  the job's SSE stream is open
+/// @param code      the HTTP status
+/// @param msg       the message
+/// @return false when the write failed
+bool job_reply_error(const job *j, bool sse_open, int code, const char *msg);
 
 
 /** A window of token ids around the point where a replayed prompt stopped
@@ -4186,6 +4218,11 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s);
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
+/** The Messages API's error type for an HTTP status (overloaded_error for 503 / 529, rate_limit_error for 429,
+ *  invalid_request_error for other 4xx, api_error for 5xx). */
+/// @param code  the HTTP status
+/// @return the type's name (static)
+const char *anthropic_error_type(int code);
 bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
 /* ---- L303: the request's grammars and its gate (constrain.cpp) ---- */
 /** After the family's render: the request's response format and its strict or forced tool calls as compiled
@@ -4267,8 +4304,15 @@ bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size);
+/** The 200 text/event-stream response head every SSE stream opens with (sse_headers writes it). */
+extern const char k_sse_head[];
 bool sse_headers(int fd);
-bool sse_error_event(int fd, const request *r, const char *msg);
+/** The keepalive a stream of `r`'s protocol sends while it has nothing else to say: Anthropic's ping event (its
+ *  clients skip it, before message_start too), an SSE comment for the OpenAI surfaces. */
+/// @param r  the request
+/// @return the beat's bytes (static)
+const char *stream_keepalive_beat(const request *r);
+bool sse_error_event(int fd, const request *r, int code, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
 int clamp_usage_tokens(int value, int max);
 /* The one shared sampling-knob parser every protocol surface routes through
