@@ -1,7 +1,7 @@
 /* gemma4_jev_gate -- L338 P2: the runtime adapter (Gemma 4's JEV LoRA) through the public API, on a real container
  * that carries it (tools/container --adapter jev).  The capture the decision grade reads (tests/gemma4/jev_grade.py):
  *
- *   gemma4_jev_gate <container> <cases.bin> <out.bin>
+ *   gemma4_jev_gate [--plain] <container> <cases.bin> <out.bin>
  *
  * cases.bin: u32 n, then per case u32 len + i32 ids[len] (jev_grade.py prep writes them from decision_ref.pt);
  * out.bin:   per case, the final-norm hidden of its last prompt token, f32 [hidden] (pulsar_session_copy_hidden).
@@ -14,6 +14,8 @@
  *       for byte the same hidden
  *   J4  the adapter is on the bank only: the first case on a plain bank of the same engine gives a DIFFERENT hidden
  *       (the LoRA ran), and that plain hidden is the same bytes on a second plain session
+ * --plain: the yardstick capture on a container WITHOUT a runtime adapter (the JEV merged into the weights before the
+ * EXL3 conversion): J2 on a plain bank and the capture, nothing else; it refuses a container that carries an adapter.
  * Public API only.  Exit 0 = every check passed (the decision grade is jev_grade.py's). */
 #include "pulsar.h"
 #include "gate_entry.h"
@@ -75,8 +77,10 @@ static pulsar_session *fresh(pulsar_engine *e, int ctx, bool adapter) {
 
 int GATE_ENTRY(int argc, char **argv) {
     n_fail = 0;
+    const bool plain = argc > 1 && !strcmp(argv[1], "--plain");
+    if (plain) { argv++; argc--; }
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <container> <cases.bin> <out.bin>\n", argv[0]);
+        fprintf(stderr, "usage: %s [--plain] <container> <cases.bin> <out.bin>\n", argv[0]);
         return 2;
     }
     const std::vector<std::vector<int32_t>> cases = read_cases(argv[2]);
@@ -102,33 +106,38 @@ int GATE_ENTRY(int argc, char **argv) {
         if (s) pulsar_session_free(s);
     }
     printf("gemma4-jev: %s, %zu cases (longest %zu), hidden %d\n", argv[1], cases.size(), longest, E);
-    CHECK(pulsar_engine_has_adapter(e) && E > 0, "J1 the engine carries the runtime adapter; the hidden is %d wide", E);
-    if (E <= 0) { pulsar_engine_close(e); return 1; }
+    if (plain) {
+        CHECK(!pulsar_engine_has_adapter(e) && E > 0, "--plain: the engine carries no runtime adapter; the hidden is %d wide", E);
+    } else {
+        CHECK(pulsar_engine_has_adapter(e) && E > 0, "J1 the engine carries the runtime adapter; the hidden is %d wide", E);
+    }
+    if (E <= 0 || n_fail) { pulsar_engine_close(e); printf("GEMMA4-JEV GATE FAIL\n"); return 1; }
     /* J1: the switch moves an empty bank only */
-    {
+    if (!plain) {
         pulsar_session *s = fresh(e, ctx, false);
         std::vector<float> h = s ? run(s, cases[0], E) : std::vector<float>();
         CHECK(s && !h.empty() && !pulsar_session_set_bank_adapter(s, 0, true) && !pulsar_session_bank_adapter(s, 0),
               "J1 a bank holding %zu tokens refuses the switch", cases[0].size());
         if (s) pulsar_session_free(s);
     }
-    /* J2: every case on one adapter bank, in order */
+    /* J2: every case on one adapter bank (--plain: a plain one), in order */
     std::vector<std::vector<float>> hid;
     {
-        pulsar_session *s = fresh(e, ctx, true);
-        CHECK(s && pulsar_session_bank_adapter(s, 0), "J1 an empty bank takes the switch");
+        pulsar_session *s = fresh(e, ctx, !plain);
+        if (!plain) CHECK(s && pulsar_session_bank_adapter(s, 0), "J1 an empty bank takes the switch");
         const double t0 = gate_now_s();
         for (size_t i = 0; s && i < cases.size(); i++) hid.push_back(run(s, cases[i], E));
         const double dt = gate_now_s() - t0;
         size_t ok = 0;
         for (const auto &h : hid) ok += !h.empty();
-        CHECK(ok == cases.size(), "J2 %zu / %zu cases synced on the adapter bank, each reusing the one before "
-                                  "(%.2f s, %.0f ms a case)", ok, cases.size(), dt, 1e3 * dt / (double)cases.size());
+        CHECK(ok == cases.size(), "J2 %zu / %zu cases synced on the %s bank, each reusing the one before "
+                                  "(%.2f s, %.0f ms a case)", ok, cases.size(), plain ? "plain" : "adapter", dt,
+              1e3 * dt / (double)cases.size());
         if (s) pulsar_session_free(s);
     }
     if (hid.size() != cases.size()) { pulsar_engine_close(e); printf("GEMMA4-JEV GATE FAIL\n"); return 1; }
     /* J3: prefix reuse == cold */
-    for (size_t i = 0; i < 3 && i < cases.size(); i++) {
+    for (size_t i = 0; !plain && i < 3 && i < cases.size(); i++) {
         pulsar_session *s = fresh(e, ctx, true);
         const std::vector<float> h = s ? run(s, cases[i], E) : std::vector<float>();
         CHECK(!h.empty() && hid[i].size() == h.size() && !memcmp(h.data(), hid[i].data(), h.size() * 4),
@@ -136,7 +145,7 @@ int GATE_ENTRY(int argc, char **argv) {
         if (s) pulsar_session_free(s);
     }
     /* J4: the plain bank */
-    {
+    if (!plain) {
         pulsar_session *a = fresh(e, ctx, false), *b = fresh(e, ctx, false);
         const std::vector<float> pa = a ? run(a, cases[0], E) : std::vector<float>();
         if (a) pulsar_session_free(a);

@@ -11,8 +11,9 @@ reads one f32 [hidden] row per prompt back and runs the decision head on it exac
 z = 30 tanh((W h + b) / 30), softmax over the kind's slot range / T[kind].
 
 Pass: every judge case keeps its expected verdict at P(block) = 0.5, |dP(block)| <= 0.10 on them, |dE[score]| <= 0.5.
-Reported, not graded: the replay cases' verdict agreement with the reference and the hidden's cosine (the EXL3 4 bpw
-backbone against BF16 is the fidelity being shown, not a bit-exact claim)."""
+Reported, not graded: the replay cases' |dP(block)| and verdict agreement with the reference at 0.25 and 0.5, and the
+hidden's cosine (the EXL3 4 bpw backbone against BF16 is the fidelity being shown, not a bit-exact claim).  A capture
+of a merged container (gemma4_jev_gate --plain) grades the same way: the yardstick for the runtime adapter."""
 import json
 import os
 import struct
@@ -23,6 +24,7 @@ import torch
 from safetensors.numpy import load_file
 
 P_TOL, SCORE_TOL, CUT = 0.10, 0.5, 0.5
+CUTS = (0.25, 0.5)
 
 
 def load(ref):
@@ -73,7 +75,9 @@ def grade(ref, outbin, snap):
         cos = float(H[k] @ h_ref / (np.linalg.norm(H[k]) * np.linalg.norm(h_ref)))
         p = probs(H[k], kind, 2 if kind == "noul" else 6)
         rows.setdefault(i, {})[kind] = (cos, p, c[f"{kind}_p"].double().numpy())
-    n_agree = n_rep = 0
+    n_rep = 0
+    agree = {c: 0 for c in CUTS}
+    rep_dp = []
     print(f"{'group':8s} {'label':28s} {'exp':6s} {'P(block) ref':>12s} {'pulsar':>8s} {'cos':>8s} {'E[s] ref':>8s} {'pulsar':>8s}")
     for i, c in enumerate(dec["cases"]):
         cos, p, pr = rows[i]["noul"]
@@ -90,14 +94,17 @@ def grade(ref, outbin, snap):
             line += "" if ok else "   FAIL"
         else:
             n_rep += 1
-            n_agree += same
+            rep_dp.append(abs(p[1] - pr[1]))
+            for cut in CUTS:
+                agree[cut] += (p[1] >= cut) == (pr[1] >= cut)
             line += "" if same else "   (verdict flips vs ref)"
         print(line)
     j = [rows[i]["noul"] for i, c in enumerate(dec["cases"]) if c["group"] == "judge18"]
     dps = [abs(p[1] - pr[1]) for _, p, pr in j]
     coss = [rows[i][k][0] for i in rows for k in rows[i]]
-    print(f"judge18: max |dP(block)| {max(dps):.4f}, mean {np.mean(dps):.4f}; replay verdicts agree {n_agree}/{n_rep}; "
-          f"hidden cosine min {min(coss):.5f} mean {np.mean(coss):.5f}")
+    print(f"judge18: max |dP(block)| {max(dps):.4f}, mean {np.mean(dps):.4f}; replay: max |dP(block)| {max(rep_dp):.4f}, "
+          f"mean {np.mean(rep_dp):.4f}, verdicts agree " + ", ".join(f"{agree[c]}/{n_rep} at {c}" for c in CUTS) +
+          f"; hidden cosine min {min(coss):.5f} mean {np.mean(coss):.5f}")
     print(f"JEV GRADE {'FAIL' if fails else 'PASS'} ({fails} judge cases out of tolerance)")
     return 1 if fails else 0
 
