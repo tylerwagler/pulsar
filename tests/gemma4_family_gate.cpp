@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     check(!pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_NONE,
           "no chat front yet (no CAP_CHAT)");
     check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs");
-    /* the tokenizer table (gemma4_tokenizer.cpp; tokenization itself is gemma4-tok-gate's, graded against HF) */
+    /* the tokenizer table (gemma4_tokenizer.cpp; tokenization itself is gemma4-chat-gate's, graded against HF) */
     pulsar_tokens hello = {0};
     const bool tok_ok = pulsar_tokenize_text(e, "Hello world", &hello) && hello.len == 2;
     pulsar_turn_markers tm;

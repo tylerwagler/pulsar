@@ -170,7 +170,7 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
-                src/lib/inkling_chat.o src/lib/nemotron_chat.o
+                src/lib/inkling_chat.o src/lib/nemotron_chat.o src/lib/chat_render_kit.o src/lib/gemma4_chat.o
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
 # L303: grammar-constrained decoding.  xgrammar's C++ core is vendored VERBATIM under src/vendor/xgrammar (the pin
 # and the copy recipe: src/vendor/xgrammar/UPSTREAM), so a refresh is a copy.  Its flags are confined to it and to
@@ -1342,7 +1342,7 @@ inkling-chat-gate: tests/inkling_chat_gate
 # parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
 # tokenizer files and the L216 corpus.
 NEMOTRON_TOK_DIR ?= $(call need_path,NEMOTRON_TOK_DIR)
-NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/qwen_output.cpp \
+NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/chat_render_kit.cpp src/lib/qwen_output.cpp \
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                           src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/qwen_chat.h \
@@ -1366,18 +1366,21 @@ tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util
 nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
 	./tests/nemotron_enc_tok_gate --tok $(NEMOTRON_ENC_TOK_DIR) --vectors tests/test-vectors/nemotron_enc --calib $(QWEN_CALIB)
 
-# L338: Gemma 4's tokenizer (the shared engine's SentencePiece-BPE row: Replace(' ' -> U+2581), one piece a run, a
-# symbol per character with <0xXX> byte fallback) graded against HF tokenizers -- T1-T4 of the chat gate + the token
-# bytes (T5) and the facts (T6); goldens from tests/gemma4/gen_tok_goldens.py.  Model-free; GEMMA4_TOK_DIR holds the
-# checkpoint's tokenizer.json + generation_config.json (the container's copies).
+# L338: the Gemma 4 frontend -- the shared BPE engine's SentencePiece-BPE row (Replace(' ' -> U+2581), one piece a run,
+# a symbol per character with <0xXX> byte fallback) graded against HF tokenizers (T1-T6), the renderer of the
+# checkpoint's chat_template.jinja against transformers' apply_chat_template (R1 hand cases, R2 the L216 corpus) and the
+# turn-by-turn front's composition (C1); goldens from tests/gemma4/gen_tok_goldens.py and gen_render_goldens.py.
+# Model-free; GEMMA4_TOK_DIR holds the checkpoint's tokenizer.json + generation_config.json (the container's copies).
 GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
-tests/gemma4_tok_gate: tests/gemma4_tok_gate.cpp tests/bpe_gate_util.h src/lib/bpe_tokenizer.cpp \
-                       src/lib/pyjson.cpp src/lib/bpe_tokenizer.h src/lib/bpe_unicode_tables.inc src/lib/pyjson.h \
-                       src/lib/sha1.hpp Makefile
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_tok_gate.cpp src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp
-.PHONY: gemma4-tok-gate
-gemma4-tok-gate: tests/gemma4_tok_gate
-	./tests/gemma4_tok_gate --tok $(GEMMA4_TOK_DIR) --vectors tests/test-vectors/gemma4 --calib $(QWEN_CALIB)
+GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/gemma4_chat.cpp src/lib/chat_render_kit.cpp
+tests/gemma4_chat_gate: tests/gemma4_chat_gate.cpp tests/bpe_gate_util.h $(GEMMA4_CHAT_SRCS) src/lib/bpe_tokenizer.h \
+                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/gemma4_chat.h src/lib/chat_render_kit.h \
+                        src/lib/chat_refuse.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_chat_gate.cpp $(GEMMA4_CHAT_SRCS)
+.PHONY: gemma4-chat-gate
+gemma4-chat-gate: tests/gemma4_chat_gate
+	./tests/gemma4_chat_gate --tok $(GEMMA4_TOK_DIR) --vectors tests/test-vectors/gemma4 --calib $(QWEN_CALIB) \
+	    --cases $(QWEN_RENDER_CASES)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
