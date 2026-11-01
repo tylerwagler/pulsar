@@ -109,6 +109,18 @@ void pulsar_gemma4_plan(const pulsar_gemma4_shape *s, pulsar_layer_plan *plan);
 
 /* ---- 2. Weights ------------------------------------------------------------------------------------------------- */
 
+/** L338 P2: the largest LoRA rank the runtime adapter takes (the scratch is sized before any engine exists: the LoRA
+ *  workspace holds max_rows x this many f32); a container's larger rank is refused at load. */
+#define PULSAR_GEMMA4_LORA_RANK_MAX 64u
+
+/** L338 P2: one targeted projection's LoRA pair (adapters.py: adapter.layers.N.<proj>.lora_{A,B}), applied at runtime
+ *  as y += scale * B (A x) at the projection's LOGICAL widths -- A f32 [r][in] (ne in, r), B f32 [out][r] (ne r, out);
+ *  both NULL when the container carries no adapter or the layer has no such projection. */
+typedef struct {
+    pulsar_tensor *a;   ///< lora_A: f32 [r][in]
+    pulsar_tensor *b;   ///< lora_B: f32 [out][r]
+} pulsar_gemma4_lora;
+
 /** One layer.  Bind roles in the comments. */
 typedef struct {
     pulsar_tensor *attn_norm;           ///< attn_norm [n_embd] (input_layernorm)
@@ -136,6 +148,14 @@ typedef struct {
     pulsar_tensor *ffn_post_norm_2;     ///< ffn_post_norm_2 [n_embd]: the experts' output norm
     pulsar_tensor *ffn_post_norm;       ///< ffn_post_norm [n_embd]: of the sum (post_feedforward_layernorm)
     pulsar_tensor *layer_scalar;        ///< layer_scalar [1]: the whole stream's scale at the layer's end
+    /* L338 P2: the adapter's LoRA pairs on the projections it targets (zero without an adapter) */
+    pulsar_gemma4_lora lora_q;          ///< attn_q_lora_a / _b
+    pulsar_gemma4_lora lora_k;          ///< attn_k_lora_a / _b
+    pulsar_gemma4_lora lora_v;          ///< attn_v_lora_a / _b (none on a global layer)
+    pulsar_gemma4_lora lora_o;          ///< attn_o_lora_a / _b
+    pulsar_gemma4_lora lora_gate;       ///< ffn_gate_lora_a / _b (logical width n_ff, not the stored)
+    pulsar_gemma4_lora lora_up;         ///< ffn_up_lora_a / _b
+    pulsar_gemma4_lora lora_down;       ///< ffn_down_lora_a / _b
 } pulsar_gemma4_block;
 
 /** The family's state (pulsar_engine::family_state). */
@@ -154,6 +174,13 @@ typedef struct {
     /** The tokenizer table (gemma4_tokenizer.cpp): the shared BPE engine's SentencePiece-BPE row, from the container's
      *  tokenizer.json + generation_config.json.  Owned; freed by unload. */
     struct bpe_tokenizer *tok;
+    /* L338 P2: the runtime adapter (pulsar.adapter in the container; adapters.py) -- absent: every field zero */
+    bool adapter;                       ///< the container carries a LoRA adapter (pulsar.adapter = "jev")
+    uint32_t lora_r;                    ///< its rank (pulsar.adapter.lora_r, <= PULSAR_GEMMA4_LORA_RANK_MAX)
+    float lora_scale;                   ///< alpha / r (pulsar.adapter.lora_alpha / lora_r): y += scale * B (A x)
+    pulsar_tensor *decision_head;       ///< decision_head: f32 [slots][n_embd] (ne n_embd, slots), read on the host
+    pulsar_tensor *decision_head_bias;  ///< decision_head_bias: f32 [slots]
+    uint32_t decision_slots;            ///< the head's slots
 } pulsar_gemma4_model;
 
 /** The family's tokenizer table and chat front (gemma4_tokenizer.cpp over src/lib/gemma4_chat). */

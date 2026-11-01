@@ -212,6 +212,28 @@ int pulsar_rows_layernorm32_launch(const void *x, bool x_f32, uint64_t ld_x, con
 int pulsar_rows_gather_f16_launch(const uint16_t *table, uint32_t n_vocab, uint32_t width, const int32_t *ids,
                                   uint32_t n, float scale, float *y, uint64_t ld_y, cudaStream_t stream);
 
+/** L338: a runtime LoRA on a linear's f32 output -- y[t][o] += scale * sum_j B[o][j] * (sum_k A[j][k] * x[t][k]) for
+ *  t < n_rows, o < out, j < r, k < in, in f32 (x widened from bf16).  Every sum runs in one fixed order and each row
+ *  alone: the result is the same bytes whatever the row count or the batch around a row (prompt cuts, banks).  Columns
+ *  of y past `out` and of x past `in` are not read or written (a padded stored width).  `ws` is f32 [n_rows][r].
+ *  @return 0, -1 refused (named), -3 launch failure. */
+/// @param x      device bf16 input rows (ld_x apart; the linear's input)
+/// @param ld_x   x's row pitch in elements (>= in)
+/// @param n_rows rows (1 .. 65535)
+/// @param in     the LoRA's input width (<= ld_x)
+/// @param A      device f32 [r][in]: lora_A
+/// @param r      the rank (1 .. 1024)
+/// @param B      device f32 [out][r]: lora_B
+/// @param out    the LoRA's output width (<= ld_y)
+/// @param scale  alpha / r
+/// @param y      device f32 output rows (ld_y apart), accumulated into
+/// @param ld_y   y's row pitch in elements (>= out)
+/// @param ws     device f32 [n_rows][r] workspace
+/// @param stream stream to launch on
+int pulsar_rows_lora_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t in, const float *A, uint32_t r,
+                            const float *B, uint32_t out, float scale, float *y, uint64_t ld_y, float *ws,
+                            cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

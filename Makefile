@@ -294,7 +294,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate \
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/lora_rows_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate \
                        tests/kernel_contract_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
@@ -814,6 +814,13 @@ tests/rowops_gate: tests/rowops_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_r
 .PHONY: rowops-gate
 rowops-gate: tests/rowops_gate
 	./tests/rowops_gate
+# L338: the runtime LoRA primitive (pulsar_rows_lora_launch) against the f64 reference at Gemma 4's shapes; row
+# independence, determinism, the padded pitches untouched, refusals.  Model-free.
+tests/lora_rows_gate: tests/lora_rows_gate.cu src/cuda/pulsar_cuda_rowops.o src/cuda/pulsar_cuda_rowops.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lora_rows_gate.cu src/cuda/pulsar_cuda_rowops.o
+.PHONY: lora-rows-gate
+lora-rows-gate: tests/lora_rows_gate
+	./tests/lora_rows_gate
 
 # The same on the Inkling-Small mini against its transformers fp32 capture: the embedding
 # norm, and the 1/16 logit scale + padding on the head's unscaled f32 output.

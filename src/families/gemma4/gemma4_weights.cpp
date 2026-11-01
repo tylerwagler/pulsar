@@ -27,6 +27,71 @@ const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULS
 const pulsar_role_admit A_EXP_GATE_UP = {0, true, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 /// A routed down stack at bf16 rows.
 const pulsar_role_admit A_EXP_DOWN = {0, true, PULSAR_ROLE_EXPERT_DOWN, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
+/// L338 P2: the adapter's tensors, read as stored: f32 only.
+const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+
+/** L338 P2: one projection's LoRA pair at its logical widths: A [r][in] (ne in, r), B [out][r] (ne r, out).
+ *  @param b      the open binder
+ *  @param target the projection's bind role (attn_q ...): the pair is <target>_lora_a / _lora_b
+ *  @param il     the layer
+ *  @param r      the rank
+ *  @param in     the projection's logical input width
+ *  @param out    its logical output width
+ *  @param L      receives the pair */
+void bind_lora(pulsar_role_binder *b, const char *target, int32_t il, uint64_t r, uint64_t in, uint64_t out,
+               pulsar_gemma4_lora *L) {
+    char ra[48], rb[48];
+    snprintf(ra, sizeof(ra), "%s_lora_a", target);
+    snprintf(rb, sizeof(rb), "%s_lora_b", target);
+    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, il), A_F32, 2, in, r);
+    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, il), A_F32, 2, r, out);
+}
+
+/** L338 P2: the adapter, when the container carries one (pulsar.adapter): its rank and scale from the kv, every
+ *  targeted projection's LoRA pair at the logical widths (the dense MLP at n_ff, which the engine pads to the stored
+ *  width), the decision head.  A container without one binds nothing here.
+ *  @param m  the container
+ *  @param b  the open binder
+ *  @param w  the family state: adapter fields and every layer's LoRA pairs are written */
+void bind_adapter(const pulsar_model *m, pulsar_role_binder *b, pulsar_gemma4_model *w) {
+    pulsar_str kind = {NULL, 0};
+    if (!model_get_string(m, "pulsar.adapter", &kind)) return;
+    const pulsar_gemma4_shape *s = &w->shape;
+    float alpha = 0.0f;
+    if (!pulsar_streq(kind, "jev") || !model_get_u32(m, "pulsar.adapter.lora_r", &w->lora_r) ||
+        !model_get_f32_compat(m, "pulsar.adapter.lora_alpha", &alpha) || w->lora_r == 0 ||
+        w->lora_r > PULSAR_GEMMA4_LORA_RANK_MAX || !(alpha > 0.0f)) {
+        fprintf(stderr, "pulsar: %s: the container's adapter is '%.*s', rank %u, alpha %g: the runtime adapter takes a "
+                        "jev LoRA of rank 1..%u and a positive alpha -- refusing\n", OWNER, (int)kind.len, kind.ptr,
+                w->lora_r, (double)alpha, PULSAR_GEMMA4_LORA_RANK_MAX);
+        pulsar_load_refuse();
+        return;
+    }
+    w->adapter = true;
+    w->lora_scale = alpha / (float)w->lora_r;
+    const uint64_t r = w->lora_r, E = s->n_embd, nq = s->n_head;
+    for (uint32_t il = 0; il < s->n_layer; il++) {
+        pulsar_gemma4_block *L = &w->layer[il];
+        const bool full = pulsar_gemma4_is_full(s, il);
+        const uint64_t nkv = full ? s->n_head_kv : s->swa_n_head_kv, hd = full ? s->head_dim : s->swa_head_dim;
+        bind_lora(b, "attn_q", (int32_t)il, r, E, nq * hd, &L->lora_q);
+        bind_lora(b, "attn_k", (int32_t)il, r, E, nkv * hd, &L->lora_k);
+        if (!full) bind_lora(b, "attn_v", (int32_t)il, r, E, nkv * hd, &L->lora_v);
+        bind_lora(b, "attn_o", (int32_t)il, r, nq * hd, E, &L->lora_o);
+        bind_lora(b, "ffn_gate", (int32_t)il, r, E, s->n_ff, &L->lora_gate);
+        bind_lora(b, "ffn_up", (int32_t)il, r, E, s->n_ff, &L->lora_up);
+        bind_lora(b, "ffn_down", (int32_t)il, r, s->n_ff, E, &L->lora_down);
+    }
+    const pulsar_tensor *h = pulsar_role_binder_find(b, pulsar_role_top("decision_head"));
+    w->decision_slots = h && h->ndim == 2 ? (uint32_t)h->dim[1] : 0;
+    if (!w->decision_slots) {
+        fprintf(stderr, "pulsar: %s: the adapter carries no [slots][%u] decision_head -- refusing\n", OWNER, s->n_embd);
+        pulsar_load_refuse();
+        return;
+    }
+    w->decision_head = pulsar_role_bind(b, pulsar_role_top("decision_head"), A_F32, 2, E, w->decision_slots);
+    w->decision_head_bias = pulsar_role_bind(b, pulsar_role_top("decision_head_bias"), A_F32, 1, w->decision_slots);
+}
 
 /** One layer: attention at the layer kind's geometry (a global layer has no attn_v), the dense MLP, the MoE.
  *  @param b   the open binder
@@ -82,6 +147,7 @@ bool pulsar_gemma4_bind(const pulsar_model *m, pulsar_gemma4_model *w) {
     w->output_norm = pulsar_role_bind(b, pulsar_role_top("output_norm"), A_BF16, 1, s->n_embd);
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_LINEAR, 2, s->n_embd, s->n_vocab);
     for (uint32_t il = 0; il < s->n_layer; il++) bind_layer(b, s, (int32_t)il, &w->layer[il]);
+    bind_adapter(m, b, w);
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);
 }
