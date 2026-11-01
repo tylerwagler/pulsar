@@ -1,21 +1,13 @@
-/* gemma4_family.cpp -- the Gemma 4 family's descriptor (family.h): load, the engine facts, and the session entries,
- * which refuse by name until the forward is wired (gemma4.h). */
+/* gemma4_family.cpp -- the Gemma 4 family's descriptor (family.h): load, the engine facts, and the session on the
+ * core row-step driver (gemma4_forward.cpp). */
 /** @file gemma4_family.cpp
- *  @brief The Gemma 4 family descriptor: load, the engine facts, and session entries that refuse until the forward is
- *  wired. */
+ *  @brief The Gemma 4 family descriptor: load, the engine facts, the session on the core row-step driver. */
 #include "gemma4.h"
 
 namespace {
 
 /// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_GEMMA4_ARCH;
-
-/* What a session needs that is not built yet, named once for every entry that refuses for it (L338 E3 / E4). */
-/// The one reason every session entry refuses with, until Gemma 4's driver blocks exist.
-const char *const NOT_WIRED =
-    "forward not yet wired: Gemma 4's driver blocks (pulsar_family::driver -- block[PULSAR_LAYER_BLOCKS] over the GQA "
-    "block at head_dim 256 / 512 with K = V, PULSAR_FFN_DENSE_MOE, the soft-capped head; L338 E3 / E4) and its "
-    "state declaration";
 
 /** pulsar_family::unload: free the family state load allocated (safe after a partial load).
  *  @param e  the engine; its family_state is freed and set to NULL */
@@ -73,6 +65,22 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
                 pulsar_load_refusals());
         return false;
     }
+    /* the session's declared state and the digest its disk segments are keyed by: the directory's names, types and
+     * sizes */
+    pulsar_gemma4_state_plan(e);
+    {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](const void *p, size_t n) {
+            for (size_t i = 0; i < n; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+        };
+        for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+            const pulsar_tensor *t = &e->model.tensors[i];
+            mix(t->name.ptr, t->name.len);
+            mix(&t->type, sizeof(t->type));
+            mix(&t->bytes, sizeof(t->bytes));
+        }
+        w->artifact_digest = h;
+    }
     const pulsar_gemma4_shape *s = &w->shape;
     uint32_t n_full = 0;
     for (uint32_t il = 0; il < e->plan.n_layer; il++) n_full += e->plan.desc[il].mixer == PULSAR_MIXER_ATTN_FULL;
@@ -86,10 +94,17 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     return true;
 }
 
-/** pulsar_family::after_gpu: nothing to register on the device; announces that every session refuses.
- *  @return always true */
-bool after_gpu(pulsar_engine *) {
-    fprintf(stderr, "pulsar: %s: %s -- every session refuses\n", ARCH, NOT_WIRED);
+/* The lane, announced once at open (rule 5): the core driver over the family's blocks, and what its table lacks for
+ * the plan (a session refuses with exactly that). */
+/** @param e  the engine
+ *  @return always true (a missing block is said here and refused by the session) */
+bool after_gpu(pulsar_engine *e) {
+    uint32_t at = 0;
+    const char *miss = pulsar_driver_first_missing(e->family->driver, &e->plan, &at);
+    fprintf(stderr, "pulsar: %s: the core step driver over %u layers of shared blocks (F1 GQA window 256 / global 512 "
+                    "K = V, the rows dense GeGLU MLP + F2 router 128 / 8 + the rows MoE's GeGLU experts, E5 head soft-cap); "
+                    "state: kv_win RING + kv_full POOL%s%s\n", ARCH,
+            pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_BLOCKS), miss ? "; MISSING " : "", miss ? miss : "");
     return true;
 }
 
@@ -139,59 +154,10 @@ int quant_bits(pulsar_engine *e) {
     return bits;
 }
 
-/* ---- the session: refused by name until the driver blocks -------------------------------------------------------- */
-
-/** pulsar_family_session_ops::create: refuses (NOT_WIRED).
- *  @return always 1 (refused) */
-int session_create(pulsar_session *, uint32_t) {
-    fprintf(stderr, "pulsar: %s: %s -- refusing the session\n", ARCH, NOT_WIRED);
-    return 1;
-}
-/* create refuses, so no session of this family exists to destroy, sync or step; the step entries say why anyway */
-/** The step entries' shared refusal.
- *  @param err     receives "<arch>: NOT_WIRED" when non-NULL
- *  @param errlen  err's capacity in bytes
- *  @return always -1 */
-int step_refused(char *err, size_t errlen) {
-    if (err) snprintf(err, errlen, "%s: %s", ARCH, NOT_WIRED);
-    return -1;
-}
-/** pulsar_family_session_ops::eval_row: refuses (no session can exist).
- *  @param err     the refusal text
- *  @param errlen  err's capacity in bytes
- *  @return always -1 */
-int eval_row(pulsar_session *, int, char *err, size_t errlen) { return step_refused(err, errlen); }
-/** pulsar_family_session_ops::decode_multiseq: refuses (no session can exist).
- *  @param err     the refusal text
- *  @param errlen  err's capacity in bytes
- *  @return always -1 */
-int decode_multiseq(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, char *err, size_t errlen) {
-    return step_refused(err, errlen);
-}
-/** pulsar_family_session_ops::decode_mixed: refuses (no session can exist).
- *  @param err     the refusal text
- *  @param errlen  err's capacity in bytes
- *  @return always -1 */
-int decode_mixed(pulsar_session *, const pulsar_multiseq_req *, uint32_t, float *, int, uint32_t *, uint32_t, char *err,
-                 size_t errlen) {
-    return step_refused(err, errlen);
-}
-
-/// The session table: create refuses, so the step entries only ever say why.
-const pulsar_family_session_ops k_session_ops = {
-    /* .create          = */ session_create,
-    /* .destroy         = */ NULL,   /* no session is ever built (create refuses) */
-    /* .sync            = */ NULL,
-    /* .eval_row        = */ eval_row,
-    /* .decode_multiseq = */ decode_multiseq,
-    /* .decode_mixed    = */ decode_mixed,
-    /* .invalidate      = */ NULL,
-    /* .decode_fused    = */ NULL,
-    /* .fused_heads_max = */ 0,
-};
-
-/// The bank table: every hook NULL (no session exists to bank; no CAP_BANKS).
-const pulsar_family_bank_ops k_bank_ops = {};
+/// The sync ops the core driver's session table runs over (step_driver.h).
+const pulsar_sync_ops k_sync = PULSAR_DRIVER_SYNC_OPS(PULSAR_GEMMA4_ARCH);
+/// The session table: the core row-step driver's ops (step_driver.cpp) over k_sync.
+const pulsar_family_session_ops k_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_sync);
 
 }  // namespace
 
@@ -199,7 +165,7 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .id           = */ PULSAR_FAMILY_ID_GEMMA4,
     /* .arch         = */ PULSAR_GEMMA4_ARCH,
     /* .name         = */ "Gemma 4",
-    /* .caps         = */ 0,   /* the forward (E4), CHAT, SPEC (P3) next */
+    /* .caps         = */ PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_PAYLOAD,   /* CHAT, SPEC (P3) next */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -218,8 +184,8 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ NULL,
-    /* .banks        = */ &k_bank_ops,
+    /* .banks        = */ &PULSAR_BANK_OPS_DECLARED,   /* state_kinds.cpp over the declared state */
     /* .imatrix      = */ NULL,
-    /* .driver       = */ NULL,   /* its blocks on the core driver are not written yet (NOT_WIRED) */
+    /* .driver       = */ &PULSAR_GEMMA4_DRIVER,   /* gemma4_forward.cpp */
     /* .unload       = */ unload,
 };

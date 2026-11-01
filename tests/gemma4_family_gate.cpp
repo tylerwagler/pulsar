@@ -1,4 +1,4 @@
-/* gemma4_family_gate.cpp -- L338 E2: the Gemma 4 family on a container, graded on what it claims today.
+/* gemma4_family_gate.cpp -- L338 E2 / E4: the Gemma 4 family on a container, graded on what it claims today.
  *
  *   gemma4_family_gate MODEL
  *
@@ -6,8 +6,9 @@
  * `general.architecture`; the plan is the config's (window vs full attention from layer_types, the dense MLP + MoE on
  * every layer); EVERY tensor of the directory is bound by its bind record, every byte priced by a role, and the price is
  * what the core stages and admission charges; every slot the plan declares is bound (a global layer has no attn_v: K =
- * V), the dense MLP and the experts at the pack's stored widths; the engine facts; and the session entries refuse by
- * name (Gemma 4's blocks on the core driver are not written yet).  Exit 0 = every check passed. */
+ * V), the dense MLP and the experts at the pack's stored widths; the engine facts; and the session side as declared
+ * (E4: the core driver's table covers the plan, the window ring + global pool state, the caps).  The forward itself is
+ * graded on the GPU by the core driver's forward gate + tests/gemma4_grade.py.  Exit 0 = every check passed. */
 #include "families/gemma4/gemma4.h"
 #include "engine/exl3_trellis.h"
 
@@ -117,20 +118,31 @@ int main(int argc, char **argv) {
     check(k2 > 0 && e->routed_quant_bits() == 20 + k2, "routed quant tier %d (EXL3: 20 + the highest half-bit rate)",
           e->routed_quant_bits());
 
-    /* the session entries refuse by name: Gemma 4's driver blocks are not written */
-    pulsar_session *dummy = (pulsar_session *)xcalloc(1, sizeof(pulsar_session));
-    dummy->engine = e;
-    const pulsar_family_session_ops *so = e->family->session;
-    check(so->create(dummy, 1) != 0, "a session's create refuses (the log names the driver blocks)");
-    char err[512] = "";
-    check(so->eval_row(dummy, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"), "eval_row refuses: %s", err);
-    err[0] = 0;
-    check(so->decode_multiseq(dummy, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_multiseq refuses by name");
-    err[0] = 0;
-    check(so->decode_mixed(dummy, NULL, 0, NULL, 0, NULL, 0, err, sizeof(err)) != 0 && strstr(err, "driver blocks"),
-          "decode_mixed refuses by name");
-    free(dummy);
+    /* the session side as declared (E4): the driver's table covers the plan; the state is a window layer's K|V ring
+     * (RING over the 1024-key window, 8 kv x 256 BF16) and a global layer's K|V pool (POOL, one token a row, 2 kv x
+     * 512 BF16); the session ops are the core driver's over the declared banks */
+    uint32_t miss_at = 0;
+    const char *miss = pulsar_driver_first_missing(e->family->driver, p, &miss_at);
+    check(e->family->driver == &PULSAR_GEMMA4_DRIVER && !miss, "the core driver's table covers the plan (%s)",
+          miss ? miss : "nothing missing");
+    const pulsar_state_plan *sp = &e->state_plan;
+    const pulsar_state_decl &win = sp->decl[PULSAR_GEMMA4_STATE_KV_WIN], &full = sp->decl[PULSAR_GEMMA4_STATE_KV_FULL];
+    bool state_ok = sp->n_decl == PULSAR_GEMMA4_STATE_COUNT && sp->split_invariant && sp->resume_grid > 0 &&
+                    win.kind == PULSAR_STATE_RING && win.capture == PULSAR_STATE_CAPTURE_NONE && win.tokens == s->window &&
+                    win.bytes == 2ull * s->swa_n_head_kv * s->swa_head_dim * 2u &&
+                    full.kind == PULSAR_STATE_POOL && full.capture == PULSAR_STATE_CAPTURE_NONE && full.tokens == 1u &&
+                    full.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
+                    sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer;
+    for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
+        state_ok = sp->slot[il] == 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL
+                                                                        : PULSAR_GEMMA4_STATE_KV_WIN);
+    check(state_ok, "the declared state: kv_win RING %u keys x %llu B a window layer, kv_full POOL %llu B a token a "
+          "global layer", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes);
+    check(e->family->caps == (PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS | PULSAR_FAMILY_CAP_PAYLOAD) &&
+              e->family->banks == &PULSAR_BANK_OPS_DECLARED && e->family->spec == NULL &&
+              e->family->driver->absorb == NULL && e->family->driver->mtp == NULL,
+          "caps 0x%x (banks, segments, payload: the driver's session over the declared state; no chat, spec, TP or "
+          "images yet)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "GEMMA4-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

@@ -489,12 +489,16 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         return -1;
     }
     /* L295 F7 / L296: a non-gated activation (relu^2) runs on up-only stacks alone -- BF16 (no gate stack) or EXL3
-     * (an up table alone); an EXL3 up table alone is relu^2 only */
-    if ((w->act != PULSAR_FFN_ACT_SWIGLU &&
-         (w->act != PULSAR_FFN_ACT_RELU2 || (bf16 ? w->bf16_gate != nullptr : !exl3_up))) ||
-        (exl3_up && w->act != PULSAR_FFN_ACT_RELU2)) {
-        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on up-only stacks (BF16 without a gate, or an "
-                        "EXL3 up table alone) and only there; the gated arms are SwiGLU -- refusing\n", (int)w->act);
+     * (an up table alone); an EXL3 up table alone is relu^2 only.  L338: GeGLU-tanh is a gated activation on the
+     * EXL3 gated arms (fused gate_up or the gate + up pair: the fold's ACT); the BF16 and Tessera arms stay SwiGLU */
+    const bool act_ok = w->act == PULSAR_FFN_ACT_SWIGLU       ? !exl3_up
+                        : w->act == PULSAR_FFN_ACT_RELU2      ? (bf16 ? w->bf16_gate == nullptr : exl3_up)
+                        : w->act == PULSAR_FFN_ACT_GEGLU_TANH ? exl3 && !exl3_up && !tessera && !bf16
+                                                              : false;
+    if (!act_ok) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d does not run on these stacks (SwiGLU: any gated "
+                        "arm; relu^2: up-only stacks -- BF16 without a gate, or an EXL3 up table alone; GeGLU-tanh: the "
+                        "EXL3 gated arms) -- refusing\n", (int)w->act);
         return -1;
     }
     if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)

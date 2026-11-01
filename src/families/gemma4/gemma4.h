@@ -17,9 +17,8 @@
  * WHAT IS HERE (E2): the shape struct (read from the container's gemma4.* keys, every geometry field pinned to the
  * known profile, every switch pinned, any unknown key refused), the layer plan (PULSAR_LAYER_BLOCKS: window vs full
  * attention, PULSAR_FFN_DENSE_MOE on every layer), the role-driven binding of every tensor with its format admitted
- * through the core's front doors, and the byte census.  The forward is not here (E3 kernels on sm_75, E4 the blocks
- * on the core row-step driver), so a session refuses by name (gemma4_family.cpp); the tokenizer and chat front are not
- * here either (no CAP_CHAT).
+ * through the core's front doors, and the byte census; the state declaration and the driver ops (E4,
+ * gemma4_forward.cpp).  The tokenizer and chat front are not here yet (no CAP_CHAT): sessions are driven by token ids.
  *
  * THE CONTAINER CONTRACT (tools/container/gemma4.py emits, this family reads):
  *   general.architecture = "gemma4";
@@ -149,6 +148,8 @@ typedef struct {
     pulsar_gemma4_block layer[PULSAR_FAMILY_MAX_LAYER];
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
+    /** The digest a session's disk segments are keyed by: the directory's names, types and sizes (FNV-1a). */
+    uint64_t artifact_digest;
 } pulsar_gemma4_model;
 
 /** Bind every tensor the shape declares, admit its format, price it (gemma4_weights.cpp).  false = refused. */
@@ -161,5 +162,21 @@ static inline const pulsar_gemma4_model *pulsar_gemma4_of(const pulsar_engine *e
     return e && e->family && e->family->id == PULSAR_FAMILY_ID_GEMMA4 ? (const pulsar_gemma4_model *)e->family_state
                                                                       : NULL;
 }
+
+/* ---- 3. The forward on the core row-step driver (gemma4_forward.cpp) ------------------------------------------ */
+
+/** The ids of the family's state declarations (state_kinds.h kinds), in the plan's table order: a window layer carries
+ *  KV_WIN, a global layer KV_FULL. */
+enum pulsar_gemma4_state_id {
+    PULSAR_GEMMA4_STATE_KV_WIN = 0,   ///< RING of window slots: a window layer's K | V rows (F1's BF16 rows, 8 x 256)
+    PULSAR_GEMMA4_STATE_KV_FULL,      ///< POOL, one token a row: a global layer's K | V rows (2 x 512)
+    PULSAR_GEMMA4_STATE_COUNT
+};
+
+/** Build the family's state declaration into e->state_plan (the load, after the plan and the bind). */
+void pulsar_gemma4_state_plan(pulsar_engine *e);
+
+/** The family's ops on the core row-step driver (step_driver.h): block[PULSAR_LAYER_BLOCKS] composes each layer. */
+extern const pulsar_driver_ops PULSAR_GEMMA4_DRIVER;
 
 #endif /* PULSAR_FAMILY_GEMMA4_H */
