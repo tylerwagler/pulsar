@@ -24,6 +24,15 @@
  *     the generation prompt is "<|turn>model\n" (+ "<|channel>thought\n<channel|>" with thinking off) unless the last
  *     message ended in calls or results: after results it is "<|channel>thought\n" with thinking on and nothing with it
  *     off, after unanswered calls nothing.
+ * OUTPUT PARSER (gemma4_output.cpp).  The output-parser kit in Gemma's configuration -- vLLM's gemma4 reading
+ * (vllm/parser/gemma4.py): <|channel> opens reasoning (a repeated one and a stray <channel|> or <tool_call|> in
+ * content are dropped), <channel|> ends it, <|tool_call> opens a call from either (a call ends the reasoning),
+ * <tool_call|> closes it; the reasoning's "thought\n" label is dropped; reasoning right-stripped, content trimmed
+ * around calls (vLLM's defaults).  A call body is "call:NAME{ARGS}" (or ":NAME{" / "(", as vLLM reads it) with ARGS
+ * the template's own format_argument spelling read back -- <|"|>string<|"|>, bare true / false / null, a bare JSON
+ * number, {k:v,...}, [..] -- so a call the server replays renders the bytes the model sampled; a bare value whose
+ * property the schema declares a string stays the raw string.  Departure from vLLM, by design: vLLM leaves every
+ * bare value a string unless the schema coerces it (count:42 with no schema reads "42" there, 42 here).
  * Refusals, by name: no_messages; content_parts (a content array: not in v1); tools_not_array; tool_function_missing
  * (a tool with no "function" object: the template's lookup raises); tool_name_missing; tool_arguments_missing,
  * tool_arguments_not_json, tool_arguments_not_object (the template raises unless the arguments are an object or
@@ -37,7 +46,9 @@
 #include <vector>
 
 #include "chat_render_kit.h"
+#include "out_parse_kit.h"
 #include "pulsar.h"
+#include "pyjson.h"
 
 /** One tool call of an assistant message, as the API carries it. */
 struct gemma4_tool_call_in {
@@ -109,3 +120,58 @@ bool gemma4_chat_render_turn(const gemma4_msg_in *msgs, int n, bool thinking, bo
 /// The close of a sampled model turn: "<turn|>\n" (the stop the model sampled, then the template's newline).
 /// @return the close's text
 const char *gemma4_chat_assistant_close(void);
+
+/* ---- the output parser (gemma4_output.cpp) ------------------------------------------------------------------- */
+
+/** Gemma's output grammar (the kit's configuration). */
+/// @return the grammar (static storage)
+const out_grammar &gemma4_output_grammar(void);
+
+/** Gemma's call body: "call:NAME{ARGS}<tool_call|>" -- the name announced at its "{", the arguments read back from
+ *  the template's spelling at the close (one TOOL_ARGS fragment), the payload any <|"|>-quoted string in them. */
+class gemma4_call_body : public out_call_body {
+public:
+    /** The request's tools (a bare value whose top-level property is declared a string stays the raw text). */
+    pyjson_value tools;
+    void open() override;
+    void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
+    bool in_payload() const override { return in_str_; }
+    bool close(const std::string &b, int index, std::vector<out_event> *ev, out_call *call, const char **why,
+               size_t *at) override;
+
+private:
+    /// @param fn  the call's function name
+    /// @param key a top-level argument key
+    /// @return true when the tools declare that property a string (its type is or includes "string")
+    bool declared_string(const std::string &fn, const std::string &key) const;
+    bool began_ = false;       ///< TOOL_BEGIN sent
+    size_t args_lo_ = 0;       ///< where the arguments start (past the "{" / "("); 0 = not yet
+    size_t scan_ = 0;          ///< bytes of the arguments scanned for quotes
+    bool in_str_ = false;      ///< inside a <|"|> string: the next byte is payload
+};
+
+/** The parser: one per assistant turn. */
+class gemma4_output_parser : public out_parser {
+public:
+    /** `reasoning`: the prompt left the turn inside an open <|channel> (the generation prompt after tool results
+     *  with thinking on).  `tools_json`: the request's tools (NULL for none).  false + reason if tools_json is not
+     *  a JSON array. */
+    /// @param reasoning  the turn starts in OUT_REASONING
+    /// @param tools_json the request's tools array as JSON text, or NULL
+    /// @param err        receives "tools_not_array: <detail>" on failure
+    /// @param errlen     its size
+    /// @return true when the parser is ready for the turn
+    bool init(bool reasoning, const char *tools_json, char *err, size_t errlen);
+    out_parser *clone() const override;
+
+private:
+    /// The call-body reader.
+    gemma4_call_body body_;
+};
+
+/** Whether a rendered prompt leaves the model's turn inside an open thinking channel (vLLM's
+ *  _prompt_ends_in_open_reasoning: a <|channel> after the last <channel|>, <|tool_call>, <|turn> or
+ *  <|tool_response>). */
+/// @param prompt the rendered prompt text
+/// @return true when the turn starts in reasoning
+bool gemma4_prompt_opens_reasoning(const char *prompt);

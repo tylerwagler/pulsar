@@ -24,6 +24,16 @@
  *                                 of the guarded ids == HF's (--cases)
  *   C1 the turn-by-turn front     head + turn == the full render of the same conversation (a system message, user
  *                                 turns, thinking on and off)
+ *   P1 output parser vs vLLM      gemma4_output_parser's reading of sampled turns == vLLM's gemma4 reading
+ *                                 (tests/gemma4/gen_parse_goldens.py), argument values compared as text (a value's
+ *                                 text, or its JSON) -- the one typing departure by design: a bare scalar is typed by
+ *                                 its spelling here, a string in vLLM unless the schema coerces it; departures named:
+ *                                 a call the turn ends inside is broken here (L272), lenient there; text after the calls
+ *                                 is content here, dropped by vLLM's final reading (after_calls, as Nemotron); the reading is the
+ *                                 same fed whole and fed byte by byte (the kit's chunking invariance)
+ *   P2 call round trip            every call of the L216 corpus rendered by gemma4_chat (format_argument) and read back
+ *                                 by the parser == the call's arguments (the template-inverse property: a replayed call
+ *                                 renders the bytes the model sampled), JSON-equal up to key order
  *
  * usage: gemma4_chat_gate --tok DIR --vectors DIR [--calib FILE] [--cases DIR]
  *        DIR = the checkpoint's tokenizer.json + generation_config.json */
@@ -34,6 +44,7 @@
 #include <string>
 #include <vector>
 
+#include <functional>
 #include <map>
 
 #include "bpe_gate_util.h"
@@ -300,6 +311,201 @@ static void r2_corpus(const bpe_tokenizer *t, const std::string &dir, const std:
            ref.empty() ? " none" : ref.c_str(), bad);
 }
 
+/* ---- the output parser ------------------------------------------------------------------------------------- */
+
+struct reading {
+    std::string reasoning, content;
+    std::vector<out_call> calls;
+    int errors = 0;
+};
+
+static reading read_turn(const std::string &text, bool start_reasoning, const char *tools, bool bytewise) {
+    gemma4_output_parser p;
+    char err[200];
+    reading r;
+    if (!p.init(start_reasoning, tools, err, sizeof err)) { fail("P: parser init: %s", err); return r; }
+    std::vector<out_event> ev;
+    if (bytewise) for (char c : text) p.feed(&c, 1, &ev);
+    else p.feed(text.data(), text.size(), &ev);
+    p.finish(&ev);
+    r.reasoning = p.reasoning();
+    r.content = p.content();
+    r.calls = p.calls();
+    r.errors = p.errors();
+    return r;
+}
+
+/* a value as text: a string itself, anything else its JSON (objects and arrays canonical, recursively) */
+static std::string canon(const pyjson_value &v) {
+    if (v.kind == pyjson_value::STR) return v.s;
+    if (v.kind == pyjson_value::OBJ) {
+        std::vector<std::pair<std::string, std::string>> kv;
+        for (const auto &e : v.o) kv.push_back({e.first, canon(e.second)});
+        std::sort(kv.begin(), kv.end());
+        std::string s = "{";
+        for (const auto &e : kv) s += e.first + "=" + e.second + ";";
+        return s + "}";
+    }
+    if (v.kind == pyjson_value::ARR) {
+        std::string s = "[";
+        for (const auto &e : v.a) s += canon(e) + ";";
+        return s + "]";
+    }
+    std::string d;
+    pyjson_dump(v, &d);
+    return d;
+}
+
+static void p1_vllm(const std::string &dir) {
+    const pyjson_value v = load_json(dir + "/parse_cases.json");
+    int bad = 0, typed = 0, broken = 0, after = 0;
+    for (size_t i = 0; i < v.a.size(); i++) {
+        const pyjson_value &c = v.a[i];
+        const std::string &text = c.get("text")->s;
+        std::string tools;
+        pyjson_dump(*c.get("tools"), &tools);
+        const reading r = read_turn(text, c.get("start_reasoning")->b, tools.c_str(), false);
+        const reading rb = read_turn(text, c.get("start_reasoning")->b, tools.c_str(), true);
+        const pyjson_value *ex = c.get("expect");
+        const int before = g_fail;
+        g_checks++;
+        if (rb.reasoning != r.reasoning || rb.content != r.content || rb.calls.size() != r.calls.size() ||
+            rb.errors != r.errors)
+            fail("P1 case %zu: byte-by-byte reading differs from the whole feed", i);
+        const pyjson_value &want_calls = *ex->get("calls");
+        /* the L272 departure: the turn ended inside a call -- broken here (an error), a call there */
+        const bool ends_inside = text.rfind("<|tool_call>") != std::string::npos &&
+                                 text.rfind("<|tool_call>") > (text.rfind("<tool_call|>") == std::string::npos
+                                                                   ? 0 : text.rfind("<tool_call|>"));
+        size_t want_n = want_calls.a.size();
+        if (ends_inside && r.errors == 1 && want_n == r.calls.size() + 1) {
+            broken++;
+            want_n--;
+        }
+        if (r.reasoning != ex->get("reasoning")->s) fail("P1 case %zu: reasoning '%s' vs vLLM '%s'", i, r.reasoning.c_str(), ex->get("reasoning")->s.c_str());
+        if (r.content != ex->get("content")->s) {
+            /* the after_calls departure (Nemotron's too): text after the calls is content here -- the client sees what
+             * was sampled (Qwen's rule) -- and vLLM's final reading drops it (deferred content) */
+            const std::string &wc = ex->get("content")->s;
+            if (!r.calls.empty() && r.content.size() > wc.size() && !r.content.compare(0, wc.size(), wc)) after++;
+            else fail("P1 case %zu: content '%s' vs vLLM '%s'", i, r.content.c_str(), wc.c_str());
+        }
+        if (r.calls.size() != want_n) {
+            fail("P1 case %zu: %zu calls vs vLLM %zu", i, r.calls.size(), want_n);
+        } else {
+            for (size_t k = 0; k < want_n; k++) {
+                const pyjson_value &w = want_calls.a[k];
+                pyjson_value ours;
+                char jerr[100];
+                pyjson_parse(r.calls[k].arguments.data(), r.calls[k].arguments.size(), &ours, jerr, sizeof jerr);
+                std::string wd, od;
+                pyjson_dump(*w.get("arguments"), &wd);
+                pyjson_dump(ours, &od);
+                if (r.calls[k].name != w.get("name")->s) fail("P1 case %zu call %zu: name %s vs %s", i, k, r.calls[k].name.c_str(), w.get("name")->s.c_str());
+                else if (canon(ours) != canon(*w.get("arguments"))) fail("P1 case %zu call %zu: arguments %s vs vLLM %s", i, k, od.c_str(), wd.c_str());
+                else typed += od != wd;
+            }
+        }
+        bad += g_fail != before;
+    }
+    printf("P1 output parser vs vLLM: %zu turns (whole and byte by byte), %d mismatched; departures: %d calls typed by "
+           "their spelling where vLLM reads strings, %d turns ending inside a call (L272: broken here), %d with text "
+           "after the calls (kept here)\n", v.a.size(), bad, typed, broken, after);
+}
+
+/* P2: every corpus call rendered (format_argument) and read back == its arguments */
+static void p2_roundtrip(const std::string &cases_dir) {
+    int calls = 0, bad = 0, declared = 0;
+    std::vector<std::string> files;   /* the corpus's file names: the render goldens' tsv lists them */
+    std::string tsv;
+    read_file("tests/test-vectors/gemma4/render_corpus.tsv", &tsv);
+    for (size_t pos = 0; pos < tsv.size();) {
+        const size_t nl = tsv.find('\n', pos);
+        const std::string line = tsv.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.empty() || line[0] == '#') continue;
+        const std::string f = line.substr(0, line.find('\t'));
+        if (files.empty() || files.back() != f) files.push_back(f);
+    }
+    for (const std::string &f : files) {
+        const pyjson_value cases = load_json(cases_dir + "/" + f);
+        for (const auto &c : cases.a) {
+            const pyjson_value *tools = c.get("tools");
+            std::string tools_json;
+            if (tools && tools->kind == pyjson_value::ARR) pyjson_dump(*tools, &tools_json);
+            for (const auto &m : c.get("messages")->a) {
+                const pyjson_value *tcs = m.get("tool_calls");
+                if (!tcs) continue;
+                for (const auto &tc : tcs->a) {
+                    const pyjson_value *fn = tc.get("function");
+                    const pyjson_value *args = fn ? fn->get("arguments") : NULL;
+                    if (!fn || !args || args->kind != pyjson_value::STR) continue;
+                    pyjson_value want;
+                    char jerr[100];
+                    if (!pyjson_parse(args->s.data(), args->s.size(), &want, jerr, sizeof jerr) ||
+                        want.kind != pyjson_value::OBJ)
+                        continue;   /* the renderer refuses it (R2's tool_arguments_not_object) */
+                    gemma4_tool_call_in call = {"c", fn->get("name")->s.c_str(), args->s.c_str()};
+                    gemma4_msg_in msgs[2] = {};
+                    msgs[0].role = "user";
+                    msgs[0].content = "x";
+                    msgs[1].role = "assistant";
+                    msgs[1].calls = &call;
+                    msgs[1].n_calls = 1;
+                    gemma4_render_out out;
+                    char err[200];
+                    if (!gemma4_chat_render_turn(msgs, 2, false, false, &out, err, sizeof err)) {
+                        fail("P2: render refused: %s", err);
+                        continue;
+                    }
+                    const size_t lo = out.text.find("<|tool_call>"), hi = out.text.find("<tool_call|>");
+                    const reading r = read_turn(out.text.substr(lo, hi + 12 - lo), false,
+                                                tools_json.empty() ? NULL : tools_json.c_str(), false);
+                    calls++;
+                    g_checks++;
+                    pyjson_value got;
+                    if (r.calls.size() != 1 ||
+                        !pyjson_parse(r.calls[0].arguments.data(), r.calls[0].arguments.size(), &got, jerr, sizeof jerr)) {
+                        bad++;
+                        fail("P2 %s: the rendered call did not read back", f.c_str());
+                        continue;
+                    }
+                    if (canon(got) == canon(want)) {
+                        /* equal as text; exactly equal unless the schema declared a non-string value a string */
+                        std::function<bool(const pyjson_value &, const pyjson_value &)> same =
+                            [&](const pyjson_value &x, const pyjson_value &y) -> bool {
+                            if (x.kind != y.kind) return false;
+                            if (x.kind == pyjson_value::OBJ) {
+                                if (x.o.size() != y.o.size()) return false;
+                                for (const auto &e : x.o) {
+                                    const pyjson_value *o = y.get(e.first.c_str());
+                                    if (!o || !same(e.second, *o)) return false;
+                                }
+                                return true;
+                            }
+                            if (x.kind == pyjson_value::ARR) {
+                                if (x.a.size() != y.a.size()) return false;
+                                for (size_t q = 0; q < x.a.size(); q++) if (!same(x.a[q], y.a[q])) return false;
+                                return true;
+                            }
+                            return canon(x) == canon(y);
+                        };
+                        declared += !same(got, want);
+                    } else {
+                        bad++;
+                        std::string a, b;
+                        pyjson_dump(got, &a);
+                        pyjson_dump(want, &b);
+                        if (bad <= 5) fail("P2 %s: read back %s vs %s", f.c_str(), a.c_str(), b.c_str());
+                    }
+                }
+            }
+        }
+    }
+    printf("P2 call round trip: %d corpus calls rendered and read back, %d typed differently where the schema declares "
+           "a string, %d mismatched\n", calls, declared, bad);
+}
+
 /* C1: the turn-by-turn front (head, then turns, each closed as a sampled turn is) == the full render */
 static void c1_composition(void) {
     int bad = 0, n = 0;
@@ -376,6 +582,8 @@ int main(int argc, char **argv) {
     r1_hand(t, vec_dir);
     if (!cases.empty()) r2_corpus(t, vec_dir, cases);
     c1_composition();
+    p1_vllm(vec_dir);
+    if (!cases.empty()) p2_roundtrip(cases);
     bpe_tokenizer_free(t);
     printf("\ngemma4_chat_gate: %d checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
