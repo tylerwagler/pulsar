@@ -511,6 +511,19 @@ pulsar_driver_step *trunk(pulsar_session *s) { return ST(s)->trunk; }
  *  @return the container carries the runtime adapter */
 bool has_adapter(const pulsar_engine *e) { return W(e)->adapter; }
 
+/** pulsar_driver_ops::decision_head (L338 P2.4): the JEV head's bound tensors.
+ *  @param e the engine
+ *  @param w receives the weight (f32 [slots][n_embd])
+ *  @param b receives the bias (f32 [slots])
+ *  @return the slots, 0 without an adapter */
+uint32_t decision_head(const pulsar_engine *e, const pulsar_tensor **w, const pulsar_tensor **b) {
+    const pulsar_gemma4_model *m = W(e);
+    if (!m->adapter || !m->decision_head || !m->decision_head_bias || !m->decision_slots) return 0;
+    *w = m->decision_head;
+    *b = m->decision_head_bias;
+    return m->decision_slots;
+}
+
 /** pulsar_driver_ops::artifact.
  *  @param e  the engine
  *  @return the artifact digest load computed */
@@ -1125,5 +1138,6 @@ const pulsar_driver_ops PULSAR_GEMMA4_DRIVER = {
     /* .read_ahead_pool = */ NULL,
     /* .adapter       = */ has_adapter,   /* L338 P2: the JEV LoRA, per bank */
     /* .hidden        = */ hidden,        /* L338 P2: the decision head's input */
+    /* .decision_head = */ decision_head, /* L338 P2.4: the decision head (read on the host) */
 };
 static_assert(PULSAR_LAYER_BLOCKS == 4 && PULSAR_LAYER_KIND_COUNT == 5, "the block table's slot is the kind's value");

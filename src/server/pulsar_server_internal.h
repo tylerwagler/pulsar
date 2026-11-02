@@ -1969,6 +1969,9 @@ struct server {
      *  `token_bytes` first, then `grammar` by a release store that publishes both (client threads read it with
      *  an acquire load, constrain_compiler_published); a second build dies. */
     struct pulsar_grammar_compiler *grammar;
+    /** L338 P2.4: the /v1/systemone judge -- its reserved bank (past pool_banks: no chat slot is it), its decision
+     *  head and calibration, its queue (under mu); NULL = no judge.  Owned (systemone.cpp). */
+    struct server_judge *judge;
     /// every token's bytes, indexed by token id (built with `grammar`; owned, freed at shutdown)
     std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
@@ -3688,6 +3691,9 @@ typedef struct {
     const char *models[SERVER_MODELS_MAX];
     /// entries in `models`
     int n_models;
+    /** L338 P2.4: banks reserved for /v1/systemone (the runtime adapter's judge): -1 = one when the container carries
+     *  an adapter, 0 = none; at most 1 (the pool's last bank) */
+    int judge_banks;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -4186,6 +4192,20 @@ void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix);
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix);
 bool http_response(int fd, int code, const char *type, const char *body);
+/* ---- L338 P2.4: /v1/systemone (systemone.cpp) ---- */
+/** Open the judge on reserved bank `bank`: the container's decision head, its judge_config.json and
+ *  calibration_gold.json, the bank emptied with the adapter on.  Single-threaded startup.
+ *  @return false (said in err) when the container cannot serve it */
+bool server_judge_open(struct server *s, const char *container_dir, int bank, char *err, size_t errlen);
+/** Free the judge (its queue drained by the worker before shutdown). */
+void server_judge_close(struct server *s);
+/** A judge job waits (read under s->mu).  @return true when the worker has judge work */
+bool server_judge_queued(const struct server *s);
+/** The worker's judge turn: one chunk of the current judge prompt on the reserved bank, its decision when the prompt
+ *  is in.  @return true when it did work */
+bool server_judge_step(struct server *s);
+/** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer. */
+void server_judge_http(struct server *s, int fd, const char *body, size_t len);
 bool http_error(int fd, int code, const char *msg);
 /* Retry-After for a retryable 503, by cause: the box is going away
  * (shutting down, draining), or it is briefly full (connections, metric

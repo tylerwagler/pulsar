@@ -46,6 +46,7 @@
 #include "../src/server/sched_value.cpp"
 #include "../src/server/server_sched.cpp"
 #include "../src/server/http_server.cpp"
+#include "../src/server/systemone.cpp"
 #include "../src/server/watchdog.cpp"
 #include "../src/server/cli_main.cpp"
 

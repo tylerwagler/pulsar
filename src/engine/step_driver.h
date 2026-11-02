@@ -237,6 +237,10 @@ typedef struct pulsar_driver_ops {
      *  head reads: Gemma 4's JEV), widened to f32 into out[0, cap).  Returns the floats written (the model's hidden
      *  width); 0 = nothing headed yet / cap short / refused.  NULL = not offered (pulsar_session_copy_hidden refuses). */
     uint32_t (*hidden)(pulsar_session *s, float *out, uint32_t cap);
+    /** Optional (L338 P2.4): the adapter's decision head -- its weight (f32 [slots][hidden], row s the slot's) and
+     *  bias (f32 [slots]) as the container's tensors, read on the host from the mapping.  Returns the slots; 0 = none
+     *  (*w / *b untouched).  NULL = not offered. */
+    uint32_t (*decision_head)(const pulsar_engine *e, const pulsar_tensor **w, const pulsar_tensor **b);
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its

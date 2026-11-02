@@ -1516,6 +1516,14 @@ int  pulsar_session_bank_count(pulsar_session *s);
  *  @param e the engine
  *  @return true when pulsar_session_set_bank_adapter can turn it on */
 bool pulsar_engine_has_adapter(pulsar_engine *e);
+/** L338 P2.4: the runtime adapter's decision head, on the host (the container's mapping): w f32 [slots][width] (row
+ *  s the slot's weights over the final-norm hidden pulsar_session_copy_hidden returns), b f32 [slots].
+ *  @param e the engine
+ *  @param w receives the weight (borrowed: valid while the engine is open)
+ *  @param b receives the bias (borrowed)
+ *  @param width receives the hidden width
+ *  @return the slots; 0 = no decision head (outputs untouched) */
+uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const float **b, uint32_t *width);
 /** L338 P2: run bank `bank` with (on) or without the engine's runtime adapter.  A bank's K / V are the adapter's while
  *  it is on, so the switch moves only an EMPTY bank (position 0: invalidate it first); the bank's segments and
  *  payloads carry the switch in their layout digest, so the disk store never crosses it.  The caller keeps adapter

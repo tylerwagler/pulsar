@@ -216,6 +216,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         /* the drafter flags are parsed by the server and the CLI only (cli_main.cpp, pulsar_cli.cpp) */
         if (tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_DS4) {
             opt(fp, c, "--no-dspark", "Run without the container's speculative drafter (DSpark, MTP or a block drafter).");
+            opt(fp, c, "--judge-banks N", "Banks reserved for /v1/systemone, the container's runtime-adapter judge (Gemma 4's JEV System 1): 1 (default when the container carries an adapter; the pool's last bank, outside the chat pool, needs a pool of 3) or 0 (no endpoint).");
             opt(fp, c, "--drafter NAME", "Which drafter the container holds runs, and so is loaded at all: mtp, or its block drafter -- lilicorr (Nemotron-H), dflash2 (Qwen3.8-Flash-Next). Default: the one the container holds; of two, the block drafter on Qwen (dflash2), a choice on Nemotron-H; a name it does not hold refuses.");
             opt(fp, c, "--spec-depth N", "Draft depth a session starts at (default: the drafter's -- DSpark 3, then its adaptive controller walks 2..5; MTP 4, its controller walks 4..7 and a chain stops sooner when one more draft would not pay its step and verify row). Env PULSAR_SPEC_DEPTH.");
             opt(fp, c, "--spec-tau F|off", "Draft stop threshold: a chain ends at its first draft whose confidence is under F, that draft its last verified (default: the drafter's -- DSpark 0.55, MTP 0.7). Env PULSAR_SPEC_TAU.");

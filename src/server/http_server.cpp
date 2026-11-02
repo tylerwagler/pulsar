@@ -382,7 +382,7 @@ bool server::send_root(int fd) {
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
-        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\","
+        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/v1/systemone\",\"/metrics\","
         "\"/metrics/stream\"]}\n",
         PULSAR_VERSION_STR);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
@@ -1339,6 +1339,13 @@ void *client_main(void *arg) {
         http_response(fd, 200, "application/json", cb.ptr);
         buf_free(&cb);
         request_free(&creq);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* L338 P2.4: the judge's decisions (systemone.cpp): its own queue on its reserved bank */
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/systemone")) {
+        server_judge_http(s, fd, hr.body, hr.body_len);
         http_request_free(&hr);
         goto done;
     }

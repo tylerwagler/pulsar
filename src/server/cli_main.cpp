@@ -425,6 +425,7 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
 
 void server::close_resources() {
     auto *s = this;
+    server_judge_close(s);   /* L338 P2.4 */
     for (int i = 0; i < s->tp_rank_json_n; i++) free(s->tp_rank_json[i]);
     free(s->tp_rank_json);
     free(s->tp_rank_ids);
@@ -647,6 +648,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 1048576,
         .default_tokens = 393216,
     };
+    c.judge_banks = -1;   /* L338 P2.4: one reserved bank when the container carries an adapter */
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
@@ -675,6 +677,12 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--drafter")) {
             c.engine.drafter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--judge-banks")) {
+            c.judge_banks = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.judge_banks < 0 || c.judge_banks > 1) {
+                fprintf(stderr, "pulsar-server: --judge-banks takes 0 or 1\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--rope-yarn")) {
             c.engine.rope_yarn_factor = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 1.0f, 64.0f);
         } else if (!strcmp(arg, "--spec-depth")) {
@@ -1193,6 +1201,25 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    /* L338 P2.4: the judge's reserved bank -- the pool's last, past the chat pool (no chat slot is it).  The chat
+     * pool keeps at least two banks (a pool); a smaller one serves no judge. */
+    int judge_bank = -1;
+    {
+        const bool has = pulsar_engine_has_adapter(engine);
+        const int want = cfg.judge_banks < 0 ? (has ? 1 : 0) : cfg.judge_banks;
+        if (want > 0 && !has) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: --judge-banks %d: the container carries no adapter -- "
+                       "refusing to start", want);
+            return 1;
+        }
+        if (want > 0 && s.pool_banks - 1 >= 2) {
+            s.pool_banks -= 1;
+            judge_bank = s.pool_banks;
+        } else if (want > 0) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: no /v1/systemone: the bank pool (%d) leaves no chat pool of "
+                       "two beside a judge bank (set PULSAR_MSEQ_BANKS >= 3 or a smaller --ctx)", pool_banks_clamped);
+        }
+    }
     /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
      * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
      * clamps kstep to 1 and the step exceeds the chunk cap on every quantum
@@ -1496,6 +1523,15 @@ int main(int argc, char **argv) {
      * calls into the engine (CUDA-state audit, pulsar_server_internal.h). This
      * runs before the worker thread starts, so it is still single-threaded
      * engine access. */
+    /* L338 P2.4: the judge on its reserved bank (single-threaded: before the worker starts) */
+    if (judge_bank >= 0) {
+        char jerr[320];
+        if (!server_judge_open(&s, cfg.engine.model_path, judge_bank, jerr, sizeof jerr)) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: /v1/systemone: %s -- refusing to start", jerr);
+            s.close_resources();
+            return 1;
+        }
+    }
     s.publish_metrics_snapshot();
     /* Same window: still single-threaded, and the TP records are final. */
     s.build_tp_health();

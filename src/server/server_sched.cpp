@@ -4668,6 +4668,8 @@ void *server_worker_main(void *arg) {
         pulsar_stall_mark("worker: scheduling");   /* the watchdog's heartbeat (pulsar_stall.h) */
         bool bound = false;
         while (s->worker_try_bind()) bound = true;
+        /* L338 P2.4: the judge's turn -- one chunk on its reserved bank between the decode quanta */
+        const bool judged = server_judge_step(s);
         /* L314: a preempted decoder whose KV fits again is reloaded -- once no queued prompt waits on KV (the prompt
          * it was preempted for binds first; readmitting ahead of it would only preempt it again) */
         {
@@ -4698,6 +4700,7 @@ void *server_worker_main(void *arg) {
             usleep(10000);   /* L314: only parked decoders, waiting for room: poll their readmission */
             continue;
         }
+        if (n_active == 0 && judged) continue;   /* L338 P2.4: the judge's next chunk before any wait */
         if (n_active == 0) {
             /* With every slot free, choose_slot_for_job never returns NULL
              * (provision_bank floor-gates only the SECOND bank onward, so an
@@ -4723,8 +4726,8 @@ void *server_worker_main(void *arg) {
             {
                 pulsar::ScopedLock lk(&s->mu);
                 had_head = s->head != NULL;
-                while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-                quit = !s->head && s->stopping;   /* read shared state under the lock */
+                while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+                quit = !s->head && !server_judge_queued(s) && s->stopping;   /* read shared state under the lock */
             }
             if (quit) break;
             /* A head that was already queued when nothing is active is a head

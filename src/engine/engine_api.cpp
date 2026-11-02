@@ -1164,6 +1164,21 @@ bool pulsar_engine_has_adapter(pulsar_engine *e) {
     return ops && ops->adapter && ops->adapter(e);
 }
 
+uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const float **b, uint32_t *width) {
+    const pulsar_driver_ops *ops = e && e->family ? e->family->driver : NULL;
+    const pulsar_tensor *tw = NULL, *tb = NULL;
+    const uint32_t slots = ops && ops->decision_head ? ops->decision_head(e, &tw, &tb) : 0u;
+    if (!slots || !tw || !tb || tw->type != PULSAR_TENSOR_F32 || tb->type != PULSAR_TENSOR_F32 || tw->ndim != 2 ||
+        tw->dim[1] != slots || tb->elements != slots) {
+        if (slots) fprintf(stderr, "pulsar: the decision head is not f32 [%u][hidden] + [%u] -- refusing\n", slots, slots);
+        return 0;
+    }
+    *w = (const float *)((const uint8_t *)tensor_map_base(&e->model, tw) + tw->abs_offset);
+    *b = (const float *)((const uint8_t *)tensor_map_base(&e->model, tb) + tb->abs_offset);
+    *width = (uint32_t)tw->dim[0];
+    return slots;
+}
+
 bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on) {
     pulsar_driver_state *d = s ? s->driver : NULL;
     const int n = s && s->states ? (int)s->states->n_banks : 0;

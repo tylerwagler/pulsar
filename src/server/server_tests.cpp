@@ -9208,6 +9208,20 @@ static void l284_steps(lane_price *lp, pulsar_lane_cost *fit, int li, uint32_t k
         fit->n++;
     }
 }
+/* L338 P2.4 -- /v1/systemone renders an object `state` as the adapter's training data did, json.dumps(state, indent=1)
+ * (ASCII-escaped, 1-space indent): the expected bytes are Python's own (non-ASCII, a surrogate pair, the short
+ * escapes, empty containers, nested arrays, numbers). */
+static void test_l338_systemone_state_dump(void) {
+    static const char src[] = "{\"user_request\": \"fix the bug \303\274n\303\257code \342\200\223 \342\200\234quotes\342\200\235\", \"working_directory\": \"/tmp\", \"n\": 3, \"f\": 1.5, \"neg\": -0.25, \"t\": true, \"z\": null, \"action\": {\"tool\": \"Bash\", \"input\": {\"command\": \"echo \\\"hi\\\"\\n\\tdone\\\\\", \"argv\": [], \"obj\": {}, \"emoji\": \"\360\237\231\202\"}}, \"list\": [1, [2, {\"a\": \"b\"}]]}";
+    static const char want[] = "{\n \"user_request\": \"fix the bug \\u00fcn\\u00efcode \\u2013 \\u201cquotes\\u201d\",\n \"working_directory\": \"/tmp\",\n \"n\": 3,\n \"f\": 1.5,\n \"neg\": -0.25,\n \"t\": true,\n \"z\": null,\n \"action\": {\n  \"tool\": \"Bash\",\n  \"input\": {\n   \"command\": \"echo \\\"hi\\\"\\n\\tdone\\\\\",\n   \"argv\": [],\n   \"obj\": {},\n   \"emoji\": \"\\ud83d\\ude42\"\n  }\n },\n \"list\": [\n  1,\n  [\n   2,\n   {\n    \"a\": \"b\"\n   }\n  ]\n ]\n}";
+    pyjson_value v;
+    char err[160];
+    TEST_ASSERT(pyjson_parse(src, sizeof src - 1, &v, err, sizeof err));
+    std::string got;
+    judge_dump_indent1(v, 0, &got);
+    TEST_ASSERT(got == want);
+}
+
 static void test_l284_lane_price_pick(void) {
     lane_price lp;
     memset(&lp, 0, sizeof lp);
@@ -12377,6 +12391,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_batch_leave_when_spec_lane_carries_all();
     test_l293_batch_leave_stops_at_the_budget();
     test_l284_lane_price_pick();
+    test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
