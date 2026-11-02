@@ -945,9 +945,11 @@ constexpr uint32_t GQA_DEC_GROUP_MAX = 4u;
 /// q in smem), the chunk's max and sum by fixed-order block reductions, then O = P V with warp w taking keys w, w + 8,
 /// ... and each lane HD / 32 dims (16-byte V loads), the warps summed in warp order -- the same operations in the same
 /// order whatever RB is, so a row's bytes never depend on the rows beside it.  Each row's chunk is its own chunk0 +
-/// blockIdx.x, as one row a CTA.  When the group's rows read one sequence's keys from the same first chunk (the same
+/// blockIdx.y, as one row a CTA.  When the group's rows read one sequence's keys from the same first chunk (the same
 /// pool, ring, fresh rows and chunk0: a verify's), each K and V vector is loaded once for all of them; otherwise each
-/// row loads its own.  Grid (grid_chunks, n_q, ceil(n_rows / RB)), 256 threads.  The wide-head MMA kernel
+/// row loads its own.  Grid (n_q, grid_chunks, ceil(n_rows / RB)), 256 threads: the query heads fastest, so the G
+/// heads of a KV head read a chunk's keys together (one DRAM read, the others L2's; the chunk fastest made each head
+/// sweep the whole context before the next read it again -- 8x the DRAM traffic on a G = 8 layer past L2's size).  The wide-head MMA kernel
 /// spends 62 of its 64 MMA rows on padding for a decode row (G = 2) and stages every K / V slice: on Turing 71 us a
 /// window layer for 8 MB of keys (L338).
 /// @tparam HD head_dim (a multiple of 256: one 16-byte load a lane per 8 dims).
@@ -965,7 +967,8 @@ __global__ void __launch_bounds__(GQA_DEC_THREADS) gqa_decode_kernel(const gqa_a
     __shared__ float sp[RB][GQA_CHUNK];
     __shared__ float sred[RB][GQA_DEC_THREADS / 32];
     __shared__ float sacc[GQA_DEC_THREADS / 32][HD];
-    const uint32_t r0 = blockIdx.z * (uint32_t)RB, h = blockIdx.y, tid = threadIdx.x, w = tid >> 5, lane = tid & 31u;
+    const uint32_t r0 = blockIdx.z * (uint32_t)RB, h = blockIdx.x, kc = blockIdx.y;   /* kc: the chunk, from chunk0 */
+    const uint32_t tid = threadIdx.x, w = tid >> 5, lane = tid & 31u;
     const uint32_t nr = n_rows - r0 < (uint32_t)RB ? n_rows - r0 : (uint32_t)RB;
     gqa_row R[RB];
 #pragma unroll
@@ -975,7 +978,7 @@ __global__ void __launch_bounds__(GQA_DEC_THREADS) gqa_decode_kernel(const gqa_a
     bool any = false, shared_kv = true;
 #pragma unroll
     for (int r = 0; r < RB; r++) {
-        const uint32_t ch = R[r].chunk0 + blockIdx.x;
+        const uint32_t ch = R[r].chunk0 + kc;
         x0[r] = ch * GQA_CHUNK;
         live[r] = (uint32_t)r < nr && ch <= R[r].hi / GQA_CHUNK;
         any = any || live[r];
@@ -1112,7 +1115,7 @@ __global__ void __launch_bounds__(GQA_DEC_THREADS) gqa_decode_kernel(const gqa_a
 #pragma unroll
         for (int e = 0; e < DPL; e++) sacc[w][lane * DPL + e] = acc[r][e];
         __syncthreads();
-        const uint64_t slot = ((uint64_t)(r0 + r) * a.n_q + h) * a.max_chunks + blockIdx.x;
+        const uint64_t slot = ((uint64_t)(r0 + r) * a.n_q + h) * a.max_chunks + kc;
         for (uint32_t dd = tid; dd < (uint32_t)HD; dd += GQA_DEC_THREADS) {
             float z = 0.f;
 #pragma unroll
@@ -1283,7 +1286,7 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
                                   * below) -- a verify's rows and a plain decode's are then the same arm's bytes, so
                                   * speculation never changes the output */
             const uint32_t rb = group;   /* 1, 2 or 4 (pulsar_gqa_launch) */
-            const dim3 dgrid(grid_chunks, L->n_q, (n_rows + rb - 1u) / rb);
+            const dim3 dgrid(L->n_q, grid_chunks, (n_rows + rb - 1u) / rb);
             const bool e4 = L->kv_fmt == PULSAR_GQA_KV_E4M3;
             if (rb == 4u) {
                 if (e4) gqa_decode_kernel<HD, true, 4><<<dgrid, GQA_DEC_THREADS, 0, st>>>(aa, n_rows);
