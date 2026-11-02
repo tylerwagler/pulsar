@@ -845,11 +845,22 @@ __global__ void __launch_bounds__(PULSAR_QSA_HEAD_DIM) qsa_combine_kernel(
     const qsa_row row = rows[r];
     const uint32_t ns = (row.n_list + QSA_SPLIT - 1u) / QSA_SPLIT;
     const uint64_t base = ((uint64_t)rg * Qs::N_HEAD + h) * QSA_MAX_SPLITS;
-    float M = -INFINITY, L = 0.f, A = 0.f;
-    for (uint32_t s = 0; s < ns; s++) {
-        const float2 e = ml[base + s];
-        qsa_fold(M, L, A, e.x, e.y, part[(base + s) * PULSAR_QSA_HEAD_DIM + d]);
+    /* L345 (after FlashInfer 49e254ebf): every split's (m, l) and partial is loaded before the first fold -- the
+     * runtime trip count kept each load behind the previous step's fold.  The fold is the same recurrence in the
+     * same split order, so the bytes are the old loop's. */
+    float2 e[QSA_MAX_SPLITS];
+    float a[QSA_MAX_SPLITS];
+#pragma unroll
+    for (uint32_t s = 0; s < QSA_MAX_SPLITS; s++) {
+        if (s < ns) {
+            e[s] = ml[base + s];
+            a[s] = part[(base + s) * PULSAR_QSA_HEAD_DIM + d];
+        }
     }
+    float M = -INFINITY, L = 0.f, A = 0.f;
+#pragma unroll
+    for (uint32_t s = 0; s < QSA_MAX_SPLITS; s++)
+        if (s < ns) qsa_fold(M, L, A, e[s].x, e[s].y, a[s]);
     const float y = qsa_gated(A, L, qg[(uint64_t)r * Qs::Q_IN + (uint64_t)h * 2u * PULSAR_QSA_HEAD_DIM
                                        + PULSAR_QSA_HEAD_DIM + d]);
     const uint32_t col = h * PULSAR_QSA_HEAD_DIM + d;
