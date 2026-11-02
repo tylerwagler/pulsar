@@ -273,6 +273,7 @@ __device__ __forceinline__ float prep_block(const __nv_bfloat16 *__restrict__ x,
 /// @param K     input width (a multiple of 128)
 __global__ void __launch_bounds__(256)
 exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, int rows, int K) {
+    pulsar_pdl_trigger();   /* L340: the GEMV may launch now and load its trellis words under this grid */
     const dense_proj &p = proj_at(P, (int)blockIdx.y);
     const int64_t task = (int64_t)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     const int blocks = K >> 7;
@@ -344,6 +345,9 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
             }
         }
     }
+
+    /* L340: everything above reads only the weight; the prep planes and prescales below are the prep's output */
+    pulsar_pdl_wait();
 
     /* L341: the passes -- rows r0..r0+15 each, every one exactly the arithmetic a 16-row launch of those rows has
      * (its A tiles staged, the same MMAs, the same fmaf order over the blocks, the same warp-order reduction into
@@ -503,15 +507,17 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param P       the set's projections, all at rate k2
 /// @param M       rows, 1..kMaxRows
 /// @param K       input width
-void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M, int K) {
-    switch (k2) {
-    case 4:  exl3_dense_kernel<4><<<grid, block, 0, stream>>>(P, M, K); break;
-    case 6:  exl3_dense_kernel<6><<<grid, block, 0, stream>>>(P, M, K); break;
-    case 8:  exl3_dense_kernel<8><<<grid, block, 0, stream>>>(P, M, K); break;
-    case 10: exl3_dense_kernel<10><<<grid, block, 0, stream>>>(P, M, K); break;
-    case 12: exl3_dense_kernel<12><<<grid, block, 0, stream>>>(P, M, K); break;
-    default: exl3_dense_kernel<16><<<grid, block, 0, stream>>>(P, M, K); break;  /* k2 == 16, checked */
-    }
+/// @return the launch's error
+cudaError_t gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M,
+                        int K) {
+    void (*k)(const dense_set, int, int) = k2 == 4  ? exl3_dense_kernel<4>
+                                         : k2 == 6  ? exl3_dense_kernel<6>
+                                         : k2 == 8  ? exl3_dense_kernel<8>
+                                         : k2 == 10 ? exl3_dense_kernel<10>
+                                         : k2 == 12 ? exl3_dense_kernel<12>
+                                                    : exl3_dense_kernel<16>;   /* k2 == 16, checked */
+    /* L340: under the previous kernel's tail (the prep, or the last rate's GEMV): the kernel waits before its planes */
+    return pulsar_launch_pdl(k, grid, block, 0, stream, P, M, K);
 }
 
 /* One projection's workspace bytes at (M <= kMaxRows, K, N), 16-byte aligned so the next one's starts aligned. */
@@ -696,7 +702,11 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             g.end[m++] = ctas;
         }
         for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
-        gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
+        const cudaError_t le = gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
+        if (le != cudaSuccess) {
+            fprintf(stderr, "%s: GEMV launch failed: %s\n", tag, cudaGetErrorString(le));
+            return -3;
+        }
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
