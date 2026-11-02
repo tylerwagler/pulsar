@@ -5,7 +5,7 @@ Synthetic images (zlib-only PNGs: no PIL on the box) whose content a working vis
 thinking off at temperature 0; each check passes when the answer NAMES the content:
   V1  a red disc                         "red"
   V2  a blue square beside a yellow triangle    "blue" for the square's colour; "triangle" for the right-hand shape
-  V3  the digits 42 drawn as seven-segment bars  "42"
+  V3  the digits 42 drawn as seven-segment bars  "42" (thinking on, the model's default: graded on the answer)
   V4  a green background                 "green"  (a tile the processor upscales: 100 x 80 px)
   V5  a wide banner, black on white "7"  "7"      (an extreme aspect: 1200 x 150 px)
   V6  two images in one message, numbered <image 1> / <image 2>: "which one is red" -> "first" / "1"
@@ -117,14 +117,16 @@ class NemotronVisionLive(Leg):
         r = urllib.request.urlopen(req, timeout=900)
         return json.loads(r.read().decode()), time.time() - t
 
-    def ask(self, parts, max_tokens=64, history=()):
-        body = {"model": "m", "max_tokens": max_tokens, "temperature": 0, "reasoning_effort": "none",
+    def ask(self, parts, max_tokens=64, history=(), effort="none"):
+        body = {"model": "m", "max_tokens": max_tokens, "temperature": 0,
                 "messages": list(history) + [{"role": "user", "content": parts}]}
+        if effort:
+            body["reasoning_effort"] = effort
         j, dt = self.post("/v1/chat/completions", body)
         return (j["choices"][0]["message"].get("content") or ""), j, dt
 
-    def expect(self, label, parts, words):
-        txt, _j, dt = self.ask(parts)
+    def expect(self, label, parts, words, **kw):
+        txt, _j, dt = self.ask(parts, **kw)
         hit = any(w in txt.lower() for w in words)
         self.g.check(hit, "%s -> %r (%.1fs; wants one of %s)" % (label, txt[:100], dt, words))
         return txt
@@ -141,8 +143,11 @@ class NemotronVisionLive(Leg):
                     "What shape is on the right? Answer with one word."}], ["triangle"])
 
     def v3(self):
+        # the model's own default (thinking on): with thinking off it reasons in the content anyway on this image and
+        # runs past any short budget (it reads "42" there too, 2026-11-02); the answer is graded, not the reasoning
         self.expect("V3 digits", [url_part(digits("42", 480, 240)), {"type": "text", "text":
-                    "What number is written in this image? Answer with the number only."}], ["42"])
+                    "What number is written in this image? Answer with the number only."}], ["42"],
+                    max_tokens=1024, effort=None)
 
     def v4(self):
         self.expect("V4 small green tile (upscaled)", [url_part(png(100, 80, lambda x, y: (20, 170, 40))),
