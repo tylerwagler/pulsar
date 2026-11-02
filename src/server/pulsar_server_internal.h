@@ -1201,6 +1201,10 @@ typedef struct {
     /// loads observed (kv_read_cost_observe calls that counted); 0 = unmeasured
     uint32_t loads;
     double cold_ms_per_gib, cached_ms_per_gib;   ///< the solved costs, valid from the first load
+    double best_cold_ms_per_gib;     ///< L342: the lowest cold_ms_per_gib has been (the relaxation's floor)
+    double best_cached_ms_per_gib;   ///< L342: the lowest cached_ms_per_gib has been (the relaxation's floor)
+    /// L342: server_now_sec() of the last load's start, slice or finish; 0 = never
+    double last_sec;
 } kv_read_cost;
 /** @var kv_read_cost::scc
  *  EW sum of cold^2 (cold = disk-read GiB of a load). */
@@ -1214,14 +1218,26 @@ typedef struct {
  *  The solved cost of a GiB read from the disk, ms (clamped >= 0); valid from the first load. */
 /** The ridge weight (GiB^2) pulling kv_read_cost's two rates toward each other. */
 #define KV_READ_RIDGE 1e-3
-void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms);
-/** The estimated read of `bytes`, `cached` of them in the page cache; false (and 0) before the first load. */
-/// @param c       the fit
-/// @param bytes   bytes to read
-/// @param cached  of which in the page cache
-/// @param ms      receives the estimate, ms
+/** L342 (after Flare bb01013): with no load running or finished for this long, each solved cost's gap above its
+ *  best halves.  Only a load measures the read, and a slow estimate prices every chain to RECOMPUTE, so without this
+ *  one slow load (disk contention) froze the verdict until restart.  The fit's sums are untouched: the relaxed price
+ *  only lets a load happen, and that load re-measures.  A running restore stamps the clock (kv_read_cost_touch), so a
+ *  device that really is slow is probed about once per interval. */
+#define KV_READ_RELAX_SEC 10.0
+void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms, double now_sec);
+/** L342: a load started or progressed at `now_sec` -- holds the relaxation (kv_read_cost::last_sec). */
+/// @param c        the fit (caller holds server::mu)
+/// @param now_sec  server_now_sec() now; an earlier reading is ignored
+void kv_read_cost_touch(kv_read_cost *c, double now_sec);
+/** The estimated read of `bytes`, `cached` of them in the page cache, at `now_sec`; false (and 0) before the first
+ *  load.  Each cost's gap above its best halves every KV_READ_RELAX_SEC since the last load (L342). */
+/// @param c        the fit
+/// @param bytes    bytes to read
+/// @param cached   of which in the page cache
+/// @param now_sec  server_now_sec() now (the relaxation's clock)
+/// @param ms       receives the estimate, ms
 /// @return false before the first load
-bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double *ms);
+bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double now_sec, double *ms);
 
 /** L318: where a request's sync resumes -- the DEEPEST valid state among the bank's own (its grid checkpoint, record
  *  or the history it continues), another resident bank's published checkpoint copied in (L313's adopt), and the disk
