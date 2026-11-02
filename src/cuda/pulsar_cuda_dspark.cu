@@ -375,7 +375,7 @@ int pulsar_gpu_dspark_markov_step_model(
     if (grid_dim > rb.cap) {
         /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
         if (cuda_grow_refused_under_capture("the dspark reduce buffers")) return 0;
-        if (rb.id || rb.val || rb.out) pulsar_gpu_seg_note_device_free();
+        if (rb.id || rb.val || rb.out) pulsar_gpu_seg_note_device_free("the dspark reduce buffers");
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
         pulsar_gpu_tensor_free(rb.out);
@@ -959,7 +959,7 @@ static int dspark_markov_banks_launch(
     if (need > bb.cap) {
         /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
         if (cuda_grow_refused_under_capture("the dspark banked reduce buffers")) return 0;
-        if (bb.id || bb.val) pulsar_gpu_seg_note_device_free();
+        if (bb.id || bb.val) pulsar_gpu_seg_note_device_free("the dspark banked reduce buffers");
         pulsar_gpu_tensor_free(bb.id);
         pulsar_gpu_tensor_free(bb.val);
         const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;

@@ -284,7 +284,7 @@ static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
      * cudaFree below is what makes it worse.  One live arena per slot. */
     if (g_cuda_tmp_bytes[slot] >= bytes) return g_cuda_tmp[slot];
     if (g_cuda_tmp[slot]) {
-        pulsar_gpu_seg_note_device_free();   /* baked scratch pointers die */
+        pulsar_gpu_seg_note_device_free(what);   /* baked scratch pointers die */
         (void)cudaFree(g_cuda_tmp[slot]);
         g_cuda_tmp[slot] = NULL;
         g_cuda_tmp_bytes[slot] = 0;
@@ -2282,16 +2282,16 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
  * -- only invalidation does.  L306: the catalog stays declared and recaptures on its next uses; a regrow after the
  * warmup is announced once and counted. */
 /// Scratch-regrow hook: drops every exec (keeps the catalog), deferred while a capture is open.
-void pulsar_gpu_seg_note_device_free(void) {
+void pulsar_gpu_seg_note_device_free(const char *what) {
     if (g_seg_capturing) {
         g_seg_reset_pending = true;
         return;
     }
     if (g_seg.empty()) return;
     if (g_seg_catalog_done && !g_seg_catalog_on && g_seg_st.regrows == 0)
-        fprintf(stderr, "pulsar: L306 a scratch regrow after the warmup dropped every captured graph (%llu); the catalog "
-                        "recaptures on use (counted: pulsar_gpu_seg_stats::regrows, ::live_captures)\n",
-                (unsigned long long)g_seg_st.graphs);
+        fprintf(stderr, "pulsar: L306 a scratch regrow after the warmup (%s) dropped every captured graph (%llu); the "
+                        "catalog recaptures on use (counted: pulsar_gpu_seg_stats::regrows, ::live_captures)\n",
+                what ? what : "unnamed", (unsigned long long)g_seg_st.graphs);
     if (!g_seg_catalog_on) g_seg_st.regrows++;
     seg_drop_graphs();
 }

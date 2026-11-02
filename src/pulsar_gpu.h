@@ -411,8 +411,8 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
 /** @brief Note a scratch free: every cached graph is dropped (deferred to seg_exit mid-capture); catalog keys
- *  recapture on use. */
-void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
+ *  recapture on use.  @param what the buffer regrown (named in the first post-warmup regrow's line) */
+void pulsar_gpu_seg_note_device_free(const char *what); /* REQUIRED at every grow-realloc
                                     * scratch free: baked pointers go stale */
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */

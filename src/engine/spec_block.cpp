@@ -247,8 +247,9 @@ const kind_decl k_kinds[] = {
      "rope_parameters.rope_type", NULL, NULL},
     /* L338: z-lab's plain DFlash (z-lab/gemma-4-26B-A4B-it-DFlash): no convolutions (NULL keys), no chain head
      * (PLAIN, kPlainTopk candidates), no causal key (bidirectional inside the block, as every kind), windowed and full
-     * layers, the soft-cap; tau the shared default until measured on it */
-    {"dflash", PULSAR_BLOCK_HEAD_PLAIN, 0.5f, "hidden_size", "num_hidden_layers", "num_attention_heads",
+     * layers, the soft-cap; tau 0.3, measured on the RTX 6000 (server bench code/explain/list/story, tok/s: tau 0.3
+     * 181.5/131.2/126.5/101.6, 0.5 179/129/123/98, 0.7 172.7/126.6/120.9/95.7, off 176.1/128.7/124.0/102.5) */
+    {"dflash", PULSAR_BLOCK_HEAD_PLAIN, 0.3f, "hidden_size", "num_hidden_layers", "num_attention_heads",
      "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size", "block_size", "rms_norm_eps", "rope_theta",
      "dflash_config.mask_token_id", NULL, NULL, "sliding_window", NULL, "dflash_config.target_layer_ids", NULL,
      "use_sliding_window", "rope_scaling.rope_type", "layer_types", "final_logit_softcapping"},

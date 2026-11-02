@@ -39,7 +39,7 @@
 #include <vector>
 
 /* The two symbols the CUTLASS object needs from the rest of the backend. */
-void pulsar_gpu_seg_note_device_free(void) {}
+void pulsar_gpu_seg_note_device_free(const char *) {}
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "expert_gemv_bench: %s: %s\n", what, cudaGetErrorString(err));
