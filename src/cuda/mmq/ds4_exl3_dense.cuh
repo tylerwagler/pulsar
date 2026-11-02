@@ -35,7 +35,9 @@
 // Every row is bit-identical at every M: the split count depends on (K, N)
 // only, every row block is 16 rows (the MMA's M; rows past M are zero), a
 // row's k order, warp order and split order do not depend on its batchmates;
-// decode rows past 16 run 16-row blocks in turn (L288 C1).  Prompt chunks take
+// a launch carries up to 32 decode rows as 16-row passes over trellis words it
+// reads once (L341), and rows past 32 run 32-row launches in turn (L288 C1).
+// Prompt chunks take
 // the tensor-core prefill GEMM (qwen_exl3_dense_prefill.cu), which agrees to
 // rounding.
 
@@ -53,9 +55,9 @@
 bool ds4_exl3_dense_rate_supported(int k2);
 
 /** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
- *  partials (at the stored width) and the prep planes of min(M, 16) rows
- *  (decode rows past 16 reuse them a block at a time; a prompt chunk's prefill
- *  GEMM needs none).  0 for a shape the arm refuses. */
+ *  partials (at the stored width) and the prep planes of min(M, 32) rows
+ *  (decode rows past 32 reuse them a launch at a time, L341; a prompt chunk's
+ *  prefill GEMM needs none).  0 for a shape the arm refuses. */
 /// @param M activation rows.
 /// @param K input width (a multiple of 128).
 /// @param N logical output width (a multiple of 4).
@@ -105,7 +107,7 @@ int ds4_exl3_dense_launch(
     cudaStream_t   stream,
     /* L266: a prompt chunk takes the prefill GEMM at every M (qwen_exl3_dense_prefill.cu), so a
      * prompt cut anywhere is byte-identical to one prefilled whole; false: decode rows, the GEMV at
-     * every M (16-row blocks past 16, L288 C1) */
+     * every M (16-row passes in a launch of up to 32 rows, L341; 32-row launches past that, L288 C1) */
     bool           prompt = false);
 
 /** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
