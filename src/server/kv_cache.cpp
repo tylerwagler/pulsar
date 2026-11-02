@@ -7,6 +7,8 @@
 #include "lib/pulsar_segstore.h"
 #include "lib/pulsar_kvchain.h"
 
+#include <deque>
+#include <pthread.h>
 #include <string>
 
 
@@ -299,6 +301,160 @@ static void kv_seg_log(void *ud, const char *msg) {
     server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache %s", msg);
 }
 
+/* ===== L338: the background segment writer ================================================================== */
+/* A persist stages each segment on the worker (the bank's rows and state copied to host memory: PCIe speed) and
+ * hands it here; this thread writes, fsyncs and renames the file; the worker indexes it at its next persist or
+ * lookup (kv_cache_commit_written) -- the store is the worker's alone, the writer reads only its job.  Before, the
+ * worker wrote the file itself before the reply's first token: on CT 130's RTX 6000 each Gemma prompt persist
+ * (~280 MiB a 2K-token segment) cost the judge 0.3-0.56 s. */
+
+/// The staged bytes the writer may hold: past it a persist waits for the writer.
+#define KV_WRITER_MAX_BYTES (2ull << 30)
+
+/** One staged segment: the reserved job and its bytes (owned). */
+struct kv_write_item {
+    pulsar_segstore_job *job;
+    uint8_t *payload;
+    uint64_t payload_len;
+    uint8_t *trailer;
+    uint64_t trailer_len;
+    double staged_at;      ///< server_now_sec at submit
+    double written_ms;     ///< the file write's wall time
+    bool ok;
+    char err[256];
+};
+
+struct kv_writer {
+    pthread_t th;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    std::deque<kv_write_item> queue;   ///< staged, not yet written
+    std::deque<kv_write_item> done;    ///< written (or failed), not yet committed
+    uint64_t staged = 0;               ///< payload + trailer bytes in `queue` and the item being written
+    bool busy = false;                 ///< the thread is writing an item
+    bool stop = false;
+};
+
+namespace {
+/** pulsar_segstore_write_fn over a staged buffer.  @param fp the file  @param ud the item  @param err unused
+ *  @param errlen unused  @return 0 when every byte was written */
+int write_staged_payload(FILE *fp, void *ud, char *err, size_t errlen) {
+    const kv_write_item *it = (const kv_write_item *)ud;
+    if (fwrite(it->payload, 1, it->payload_len, fp) == it->payload_len) return 0;
+    snprintf(err, errlen, "segment write: %s", strerror(errno));
+    return 1;
+}
+/** ... and over its staged trailer.  @param fp the file  @param ud the item  @param err unused
+ *  @param errlen unused  @return 0 when every byte was written */
+int write_staged_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
+    const kv_write_item *it = (const kv_write_item *)ud;
+    if (fwrite(it->trailer, 1, it->trailer_len, fp) == it->trailer_len) return 0;
+    snprintf(err, errlen, "segment write: trailer: %s", strerror(errno));
+    return 1;
+}
+/** The writer thread.  @param arg the kv_writer  @return NULL */
+void *kv_writer_main(void *arg) {
+    kv_writer *w = (kv_writer *)arg;
+    pthread_mutex_lock(&w->mu);
+    for (;;) {
+        while (w->queue.empty() && !w->stop) pthread_cond_wait(&w->cv, &w->mu);
+        if (w->queue.empty()) break;   /* stop, and nothing left to write */
+        kv_write_item it = w->queue.front();
+        w->queue.pop_front();
+        w->busy = true;
+        pthread_mutex_unlock(&w->mu);
+        const double t0 = server_now_sec();
+        it.ok = pulsar_segstore_job_write(it.job, write_staged_payload, it.trailer ? write_staged_trailer : NULL, &it,
+                                          it.err, sizeof it.err);
+        it.written_ms = (server_now_sec() - t0) * 1000.0;
+        free(it.payload);
+        free(it.trailer);
+        const uint64_t bytes = it.payload_len + it.trailer_len;
+        it.payload = it.trailer = NULL;
+        pthread_mutex_lock(&w->mu);
+        w->staged -= bytes;
+        w->busy = false;
+        w->done.push_back(it);
+        pthread_cond_broadcast(&w->cv);
+    }
+    pthread_mutex_unlock(&w->mu);
+    return NULL;
+}
+/** pulsar_kvchain_writer::admit: wait while the writer holds too much, or the host has no room above the floor
+ *  for `bytes` more, and something is in flight to free it.  @param ud the kv_writer  @param bytes the segment's
+ *  staged size  @return false when nothing in flight can make room */
+bool kv_writer_admit(void *ud, uint64_t bytes) {
+    kv_writer *w = (kv_writer *)ud;
+    pulsar::ScopedLock lk(&w->mu);
+    for (;;) {
+        const bool under_cap = w->staged + bytes <= KV_WRITER_MAX_BYTES;
+        if (under_cap && server_headroom_admits(KvBytes{server_mem_available_bytes()}, KvBytes{bytes},
+                                                server_mem_floor()))
+            return true;
+        if (w->queue.empty() && !w->busy) return false;
+        pthread_cond_wait(&w->cv, &w->mu);
+    }
+}
+/** pulsar_kvchain_writer::submit: queue a staged segment.  @param ud the kv_writer  @param job the reserved job
+ *  @param payload staged payload  @param payload_len its bytes  @param trailer staged trailer (or NULL)
+ *  @param trailer_len its bytes */
+void kv_writer_submit(void *ud, pulsar_segstore_job *job, uint8_t *payload, uint64_t payload_len, uint8_t *trailer,
+                      uint64_t trailer_len) {
+    kv_writer *w = (kv_writer *)ud;
+    kv_write_item it;
+    memset(&it, 0, sizeof it);
+    it.job = job;
+    it.payload = payload;
+    it.payload_len = payload_len;
+    it.trailer = trailer;
+    it.trailer_len = trailer_len;
+    it.staged_at = server_now_sec();
+    pulsar::ScopedLock lk(&w->mu);
+    w->staged += payload_len + trailer_len;
+    w->queue.push_back(it);
+    pthread_cond_broadcast(&w->cv);
+}
+}  // namespace
+
+int kv_cache_commit_written(kv_disk_cache *kc) {
+    if (!kc || !kc->writer) return 0;
+    kv_writer *w = kc->writer;
+    std::deque<kv_write_item> done;
+    {
+        pulsar::ScopedLock lk(&w->mu);
+        done.swap(w->done);
+    }
+    int n = 0;
+    const double now = server_now_sec();
+    for (kv_write_item &it : done) {
+        char key[41];
+        memcpy(key, pulsar_segstore_job_key(it.job), 41);
+        const uint32_t G_prev = pulsar_segstore_job_G_prev(it.job), G = pulsar_segstore_job_G(it.job);
+        const uint64_t bytes = pulsar_segstore_job_bytes(it.job);
+        const bool indexed = pulsar_segstore_commit(kc->st, it.job, it.ok);
+        if (!it.ok)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache segment %.40s [%u,%u) not written: %s", key,
+                       G_prev, G, it.err);
+        else if (indexed) {
+            n++;
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: kv cache segment %.12s [%u,%u) %.1f MiB written in %.0f ms, indexed %.0f ms "
+                       "after staging", key, G_prev, G, (double)bytes / (1024.0 * 1024.0), it.written_ms,
+                       (now - it.staged_at) * 1000.0);
+        }
+    }
+    return n;
+}
+
+void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted) {
+    *staged = 0;
+    *uncommitted = 0;
+    if (!kc || !kc->writer) return;
+    pulsar::ScopedLock lk(&kc->writer->mu);
+    *staged = kc->writer->staged;
+    *uncommitted = (int)kc->writer->done.size();
+}
+
 /// @brief Open the segment store at `dir` and enable the disk cache.
 /// @param kc         the cache (zeroed first)
 /// @param dir        the store directory (copied)
@@ -312,14 +468,43 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint3
     kc->opt = opt;
     kc->st = pulsar_segstore_open(dir, budget_mb << 20, identity, kv_seg_log, NULL);
     if (!kc->st) return false;
+    kv_writer *w = new kv_writer();
+    pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->cv, NULL);
+    if (pthread_create(&w->th, NULL, kv_writer_main, w) != 0) {
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: kv cache: the segment writer thread could not start");
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        delete w;
+        pulsar_segstore_close(kc->st);
+        kc->st = NULL;
+        return false;
+    }
+    kc->writer = w;
     kc->dir = server_xstrdup(dir);
     kc->enabled = true;
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: kv cache: segments are written in the background (one writer "
+               "thread, up to %llu MiB staged; indexed at the next persist or lookup)",
+               (unsigned long long)(KV_WRITER_MAX_BYTES >> 20));
     return true;
 }
 
 /// @brief Close the store, free the directory and zero the cache.
 /// @param kc  the cache
 void kv_cache_close(kv_disk_cache *kc) {
+    if (kc->writer) {   /* every staged segment is written and indexed before the store closes */
+        kv_writer *w = kc->writer;
+        pthread_mutex_lock(&w->mu);
+        w->stop = true;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+        pthread_join(w->th, NULL);
+        (void)kv_cache_commit_written(kc);
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        delete w;
+        kc->writer = NULL;
+    }
     pulsar_segstore_close(kc->st);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
@@ -495,14 +680,17 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
     }
     pulsar_stall_mark("kv cache persist");
     const double t0 = server_now_sec();
+    (void)kv_cache_commit_written(&s->kv);   /* L338: the chain this persist extends may have just been written */
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
+    const pulsar_kvchain_writer writer = { s->kv.writer, kv_writer_admit, kv_writer_submit };
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, close, &tool_maps, &r);
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, close, &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
     if (r.written)
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) %.1f ms",
+                   "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) staged in "
+                   "%.1f ms, written in the background",
                    reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
     if (chain_end) *chain_end = r.end;
     return r.written;
@@ -595,6 +783,7 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
     hit->bytes = 0;
     hit->cached = 0;
     if (!s->kv.enabled || !prompt_text) return 0;
+    (void)kv_cache_commit_written(&s->kv);   /* L338: segments the writer finished since the last look */
     char err[384];
     hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
                                  s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));

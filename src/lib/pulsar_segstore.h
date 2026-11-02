@@ -190,6 +190,60 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
                          uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
                          void *ud, char key_out[41], char *err, size_t errlen);
 
+/** L338: one put in three steps, so the file write can run on another thread.  pulsar_segstore_reserve makes the
+ *  room and names the segment (the store's thread); pulsar_segstore_job_write writes its file and reads no store
+ *  state (any thread, one job at a time); pulsar_segstore_commit indexes it, or drops it (the store's thread).  While
+ *  a job is out its key is pending (a reserve of it writes nothing, eviction skips it, a child may name it as parent)
+ *  and its parent is never evicted; lookups do not see it until the commit.  pulsar_segstore_put is the three in a
+ *  row. */
+typedef struct pulsar_segstore_job pulsar_segstore_job;
+/// @param st            the store
+/// @param parent        the parent's key, "" for a root (stored, or pending)
+/// @param G_prev        the segment's first token position (the parent's G)
+/// @param G             the segment's end position
+/// @param text          the segment's own rendered text (copied)
+/// @param text_len      bytes of `text`
+/// @param payload_bytes bytes the payload writer will write
+/// @param state_bytes   of those, the payload's trailing state part (0 = rows only)
+/// @param trailer_bytes bytes the trailer writer will write (0 = none)
+/// @param key_out       receives the segment's key
+/// @param job_out       receives the job on 1, NULL otherwise
+/// @param err           receives a reason on -1
+/// @param errlen        size of `err`
+/// @return 1: a job to write and commit; 0: the store holds (or is writing) what this write would; -1: refused
+int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
+                            size_t text_len, uint64_t payload_bytes, uint64_t state_bytes, uint64_t trailer_bytes,
+                            char key_out[41], pulsar_segstore_job **job_out, char *err, size_t errlen);
+/// @param job           the job (pulsar_segstore_reserve)
+/// @param write_payload writes exactly the job's payload bytes
+/// @param write_trailer writes exactly its trailer bytes (NULL when it has none)
+/// @param ud            context for both writers
+/// @param err           receives a reason on failure
+/// @param errlen        size of `err`
+/// @return true when the file is in place (fsynced, renamed); false leaves no file
+bool pulsar_segstore_job_write(pulsar_segstore_job *job, pulsar_segstore_write_fn write_payload,
+                               pulsar_segstore_write_fn write_trailer, void *ud, char *err, size_t errlen);
+/// @param st      the store the job was reserved in
+/// @param job     the job (freed here)
+/// @param written its pulsar_segstore_job_write succeeded
+/// @return true when the segment is indexed (false: the write failed, or its parent's did and the file is removed)
+bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool written);
+/// @param job the job
+/// @return its key (40 hex chars)
+const char *pulsar_segstore_job_key(const pulsar_segstore_job *job);
+/// @param job the job
+/// @return its first token position
+uint32_t pulsar_segstore_job_G_prev(const pulsar_segstore_job *job);
+/// @param job the job
+/// @return its end position
+uint32_t pulsar_segstore_job_G(const pulsar_segstore_job *job);
+/// @param job the job
+/// @return its rendered text (NUL-terminated)
+const char *pulsar_segstore_job_text(const pulsar_segstore_job *job);
+/// @param job the job
+/// @return the file's bytes
+uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job);
+
 /// @param st            the store
 /// @param key           40 hex chars
 /// @param payload_bytes receives the payload's size, or NULL

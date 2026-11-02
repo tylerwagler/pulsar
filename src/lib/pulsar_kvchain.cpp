@@ -9,39 +9,37 @@
 #include <string.h>
 
 namespace {
-/** What kvchain_put hands pulsar_segstore_put as `ud`: the bank and span its write callbacks serialise. */
-struct seg_ctx {
-    /// The session whose bank holds the segment's rows
-    pulsar_session *s;
-    /** Token span [G_prev, G) of the segment, as raw positions. */
-    int G_prev, G;
-    ///< G: the segment's end (exclusive)
-    char key[41];       ///< the key the store will name it by (the same rule, pulsar_segstore_child_key)
-    /// The span's rendered text, NUL-terminated (owned by kvchain_put)
-    const char *text;
-    /// The caller's trailer writer; NULL when no trailer is written
-    const pulsar_kvchain_trailer *trailer;
-};
-/** pulsar_segstore_write_fn for the payload: the session's segment [G_prev, G) under the segment's key.
- *  @param fp destination, positioned at the payload
- *  @param ud the seg_ctx
- *  @param err receives a message on failure
+/** Stage `bytes` written by `fill` into a malloc'd buffer (a memory stream over it).
+ *  @param bytes the exact count `fill` writes
+ *  @param fill  writes them to its stream; 0 on success, else a message in err
+ *  @param ud    context for `fill`
+ *  @param out   receives the buffer (NULL on failure)
+ *  @param err   receives a reason on failure
  *  @param errlen bytes at err
- *  @return 0 on success (pulsar_session_save_segment's status) */
-int write_payload(FILE *fp, void *ud, char *err, size_t errlen) {
-    const seg_ctx *c = (const seg_ctx *)ud;
-    /* L334: the chain keeps its spans raw (the disk chain is a later phase); they enter as positions here */
-    return pulsar_session_save_segment(c->s, fp, TokPos{c->G_prev}, TokPos{c->G}, c->key, err, errlen);
-}
-/** pulsar_segstore_write_fn for the trailer: forwards to the caller's pulsar_kvchain_trailer::write.
- *  @param fp destination, positioned at the trailer
- *  @param ud the seg_ctx
- *  @param err receives a message on failure
- *  @param errlen bytes at err
- *  @return 0 on success */
-int write_trailer(FILE *fp, void *ud, char *err, size_t errlen) {
-    const seg_ctx *c = (const seg_ctx *)ud;
-    return c->trailer->write(fp, c->trailer->ud, c->text, err, errlen);
+ *  @return true when exactly `bytes` were staged */
+template <typename F>
+bool stage(uint64_t bytes, F fill, uint8_t **out, char *err, size_t errlen) {
+    *out = NULL;
+    /* one byte past the payload: glibc's fmemopen writes a NUL at the end of what was written on every flush and the
+     * close, onto the buffer's last byte when the write filled it (a segment's closing digest byte: every staged
+     * segment failed its load, 2026-11-02) */
+    uint8_t *buf = (uint8_t *)malloc(bytes + 1);
+    FILE *m = buf ? fmemopen(buf, bytes + 1, "wb") : NULL;
+    if (!m) {
+        free(buf);
+        snprintf(err, errlen, "segment stage: no memory for %llu bytes", (unsigned long long)bytes);
+        return false;
+    }
+    int rc = fill(m);
+    if (rc == 0 && (fflush(m) != 0 || (uint64_t)ftello(m) != bytes)) {
+        snprintf(err, errlen, "segment stage: wrote %lld bytes, promised %llu", (long long)ftello(m),
+                 (unsigned long long)bytes);
+        rc = 1;
+    }
+    fclose(m);
+    if (rc != 0) { free(buf); return false; }
+    *out = buf;
+    return true;
 }
 /** A non-owning pulsar_tokens over t[from, to); its `v` aliases t's storage and must not be freed.
  *  @param t source tokens
@@ -59,8 +57,9 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
 enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
 /* Store the bank's segment [G_prev, G) under `parent` (its key into key_out).  PUT_NO_CUT: [G_prev, G) is not a
  * segment span (an image block lies across G); PUT_FAILED: `r->err` says why.  A segment the store holds is not
- * written again -- the same key -- unless the store's copy lacks the state this bank holds at G (pulsar_segstore_put
- * replaces it in place); only a write counts in r. */
+ * written again -- the same key -- unless the store's copy lacks the state this bank holds at G (the reserve
+ * replaces it in place), nor one being written; only a write counts in r.  L338: the segment is staged here and
+ * written by `writer` (pulsar_kvchain_writer). */
 /** Store one segment of the bank (see the comment above).
  *  @param st the segment store
  *  @param e the engine, for rendering the span's text
@@ -70,12 +69,13 @@ enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
  *  @param G_prev span start (token position)
  *  @param G span end (token position)
  *  @param trailer optional trailer writer (NULL = none)
+ *  @param writer where the staged segment goes
  *  @param r counters updated on a write; `r->err` set on PUT_FAILED
  *  @param key_out receives the segment's key
  *  @return PUT_STORED, PUT_NO_CUT or PUT_FAILED */
 put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const pulsar_tokens *toks,
                    const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
-                   pulsar_kvchain_persist_result *r, char key_out[41]) {
+                   const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r, char key_out[41]) {
     uint64_t state_bytes = 0;
     const uint64_t payload = pulsar_session_segment_bytes(s, TokPos{G_prev}, TokPos{G}, &state_bytes);
     if (payload == 0) return PUT_NO_CUT;
@@ -88,28 +88,75 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     }
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
-    seg_ctx ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.s = s;
-    ctx.G_prev = G_prev;
-    ctx.G = G;
-    ctx.text = text;
-    ctx.trailer = trailer;
-    pulsar_segstore_child_key(parent, text, text_len, ctx.key);
-    pulsar_segstore_seg had;
-    const bool held = pulsar_segstore_get(st, ctx.key, &had) && (had.state_bytes > 0 || state_bytes == 0);
-    const bool ok = pulsar_segstore_put(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload, state_bytes,
-                                        write_payload, tbytes, tbytes ? write_trailer : NULL, &ctx, key_out, r->err,
-                                        sizeof(r->err));
-    free(text);
-    if (!ok) return PUT_FAILED;
-    if (!held) {
-        r->written++;
-        r->bytes += payload + tbytes;
+    pulsar_segstore_job *job = NULL;
+    const int rc = pulsar_segstore_reserve(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload,
+                                           state_bytes, tbytes, key_out, &job, r->err, sizeof(r->err));
+    if (rc <= 0) {   /* held or being written (0), or refused (-1, err) */
+        free(text);
+        return rc == 0 ? PUT_STORED : PUT_FAILED;
     }
+    /* L338: the bank's rows and state at G are copied out now (the bank moves on); the file is the writer's */
+    uint8_t *pbuf = NULL, *tbuf = NULL;
+    bool ok = writer->admit(writer->ud, payload + tbytes);
+    if (!ok)
+        snprintf(r->err, sizeof(r->err), "segment [%d,%d): no host memory to stage %llu bytes now", G_prev, G,
+                 (unsigned long long)(payload + tbytes));
+    if (ok)
+        ok = stage(payload, [&](FILE *m) {
+                 return pulsar_session_save_segment(s, m, TokPos{G_prev}, TokPos{G}, key_out, r->err, sizeof(r->err));
+             }, &pbuf, r->err, sizeof(r->err));
+    if (ok && tbytes)
+        ok = stage(tbytes, [&](FILE *m) { return trailer->write(m, trailer->ud, text, r->err, sizeof(r->err)); },
+                   &tbuf, r->err, sizeof(r->err));
+    free(text);
+    if (!ok) {
+        free(pbuf);
+        (void)pulsar_segstore_commit(st, job, false);
+        return PUT_FAILED;
+    }
+    writer->submit(writer->ud, job, pbuf, payload, tbuf, tbytes);
+    r->written++;
+    r->bytes += payload + tbytes;
     return PUT_STORED;
 }
 }  // namespace
+
+namespace {
+/** A staged buffer as a pulsar_segstore_write_fn's ud. */
+struct staged_bytes { const uint8_t *p; uint64_t n; };
+/** pulsar_segstore_write_fn over a staged_bytes.  @param fp the file  @param ud the staged_bytes  @param err reason
+ *  @param errlen bytes at err  @return 0 when every byte was written */
+int write_staged(FILE *fp, void *ud, char *err, size_t errlen) {
+    const staged_bytes *b = (const staged_bytes *)ud;
+    if (fwrite(b->p, 1, b->n, fp) == b->n) return 0;
+    snprintf(err, errlen, "segment write: short write");
+    return 1;
+}
+/** The inline writer's admit: always room.  @param ud unused  @param bytes unused  @return true */
+bool inline_admit(void *ud, uint64_t bytes) { (void)ud; (void)bytes; return true; }
+/** The inline writer's submit: write, commit, free.  @param ud the store  @param job the reserved job
+ *  @param payload staged payload  @param payload_len its bytes  @param trailer staged trailer or NULL
+ *  @param trailer_len its bytes */
+void inline_submit(void *ud, pulsar_segstore_job *job, uint8_t *payload, uint64_t payload_len, uint8_t *trailer,
+                   uint64_t trailer_len) {
+    staged_bytes pb = { payload, payload_len }, tb = { trailer, trailer_len };
+    struct both { staged_bytes *p, *t; } b = { &pb, &tb };
+    char err[256];
+    const bool ok = pulsar_segstore_job_write(job,
+        [](FILE *fp, void *u, char *e, size_t el) { return write_staged(fp, ((both *)u)->p, e, el); },
+        trailer ? [](FILE *fp, void *u, char *e, size_t el) { return write_staged(fp, ((both *)u)->t, e, el); }
+                : (pulsar_segstore_write_fn)NULL,
+        &b, err, sizeof err);
+    (void)pulsar_segstore_commit((pulsar_segstore *)ud, job, ok);
+    free(payload);
+    free(trailer);
+}
+}  // namespace
+
+pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st) {
+    pulsar_kvchain_writer w = { st, inline_admit, inline_submit };
+    return w;
+}
 
 int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s).raw(); }
 
@@ -122,9 +169,15 @@ int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int
 }
 
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
-                           const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out) {
+                           const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
+                           pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof(r));
+    if (!writer || !writer->admit || !writer->submit) {
+        snprintf(r.err, sizeof(r.err), "persist: no segment writer");
+        if (out) *out = r;
+        return 0;
+    }
     const pulsar_tokens *toks = st ? pulsar_session_tokens(s) : NULL;
     /* The chain ends at the bank's deepest grid checkpoint at or before the persist end: the rows below it are the
      * prefill's (a checkpoint is valid only while the bank holds that history), and its state is the tail's.  No
@@ -169,7 +222,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
                         continue;
                     char key[41];
                     if (kvchain_put(st, e, s, toks, i ? chain[i - 1].key : "", (int)chain[i].G_prev, (int)chain[i].G,
-                                    trailer, &r, key) == PUT_FAILED) break;
+                                    trailer, writer, &r, key) == PUT_FAILED) break;
                 }
             }
         }
@@ -178,7 +231,7 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     const int m = r.err[0] ? 0 : pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, PULSAR_KVCHAIN_MAX);
     for (int k = 0; k < m; k++) {
         char key[41];
-        const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, &r, key);
+        const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, writer, &r, key);
         if (rc == PUT_NO_CUT && ends[k] != deepest) continue;   /* an image block across this grid point: no cut */
         if (rc != PUT_STORED) {
             if (!r.err[0]) snprintf(r.err, sizeof(r.err), "[%d,%d) is not a segment span", prev, ends[k]);

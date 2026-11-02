@@ -6999,6 +6999,95 @@ static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, ui
                                err, sizeof err);
 }
 
+/* L338: a put in three steps (reserve / job_write / commit) -- the file write off the store's thread.  While a job
+ * is out its key is pending (a second reserve writes nothing, a lookup does not see it, a child may name it as
+ * parent), its parent is pinned against eviction, and the budget counts it; a child whose parent's write failed is
+ * dropped at its commit, file and all. */
+static void test_l338_segstore_reserve_commit(void) {
+    char tmpl[] = "/tmp/pulsar-seg-async.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    /* a budget for two 1000-byte segments plus headers (~1.2 KB each) */
+    pulsar_segstore *st = pulsar_segstore_open(dir, 2600, 7, NULL, NULL);
+    TEST_ASSERT(st != NULL);
+    char err[256], root[41], k[41];
+    pulsar_segstore_job *jr = NULL, *jc = NULL, *again = NULL;
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "SYSTEM:", 7, 1000, 0, 0, root, &jr, err, sizeof err) == 1);
+    /* pending: a second reserve of the same text writes nothing, a lookup does not see it */
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "SYSTEM:", 7, 1000, 0, 0, k, &again, err, sizeof err) == 0);
+    TEST_ASSERT(again == NULL && !strcmp(k, root));
+    pulsar_segstore_seg chain[4];
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: hi", 10, NULL, chain, 4) == 0);
+    /* a child may name the pending root */
+    char child[41];
+    TEST_ASSERT(pulsar_segstore_reserve(st, root, 128, 256, " user", 5, 1000, 0, 0, child, &jc, err, sizeof err) == 1);
+    /* the budget counts both in flight: a third has no room (nothing stored to evict) */
+    pulsar_segstore_job *j3 = NULL;
+    char k3[41];
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "OTHER:", 6, 1000, 0, 0, k3, &j3, err, sizeof err) == -1);
+    /* written off-thread, committed in order: both indexed, the chain found */
+    test_seg_payload p = { 1000, 0x5a };
+    TEST_ASSERT(pulsar_segstore_job_write(jr, test_seg_write, NULL, &p, err, sizeof err));
+    TEST_ASSERT(pulsar_segstore_job_write(jc, test_seg_write, NULL, &p, err, sizeof err));
+    TEST_ASSERT(pulsar_segstore_commit(st, jr, true));
+    TEST_ASSERT(pulsar_segstore_commit(st, jc, true));
+    TEST_ASSERT(pulsar_segstore_lookup(st, "SYSTEM: user asks", 17, NULL, chain, 4) == 2);
+    /* a parent's failed write drops its child at commit */
+    char p2[41], c2[41];
+    pulsar_segstore_job *jp2 = NULL, *jc2 = NULL;
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);   /* unbounded from here */
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "B:", 2, 10, 0, 0, p2, &jp2, err, sizeof err) == 1);
+    TEST_ASSERT(pulsar_segstore_reserve(st, p2, 128, 256, " b", 2, 10, 0, 0, c2, &jc2, err, sizeof err) == 1);
+    test_seg_payload small = { 10, 0x11 };
+    TEST_ASSERT(pulsar_segstore_job_write(jc2, test_seg_write, NULL, &small, err, sizeof err));
+    TEST_ASSERT(!pulsar_segstore_commit(st, jp2, false));
+    TEST_ASSERT(!pulsar_segstore_commit(st, jc2, true));
+    TEST_ASSERT(!pulsar_segstore_contains(st, p2) && !pulsar_segstore_contains(st, c2));
+    char path[4200];
+    snprintf(path, sizeof path, "%s/%s.seg", dir, c2);
+    TEST_ASSERT(access(path, F_OK) != 0);   /* its file is gone too */
+    /* a pinned parent survives eviction: a leaf whose child is in flight */
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 3500, 7, NULL, NULL);   /* the root + child (2 x ~1.17 KB) stored */
+    pulsar_segstore_job *jx = NULL, *jy = NULL;
+    char kx[41], ky[41];
+    TEST_ASSERT(pulsar_segstore_reserve(st, child, 256, 384, " more", 5, 1000, 0, 0, kx, &jx, err, sizeof err) == 1);
+    /* another root needs room: the only leaf is `child`, pinned by jx -- refused, nothing evicted */
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "NEW:", 4, 1200, 0, 0, ky, &jy, err, sizeof err) == -1);
+    TEST_ASSERT(pulsar_segstore_contains(st, child));
+    (void)pulsar_segstore_commit(st, jx, false);   /* abandoned: unpinned, the room released */
+    TEST_ASSERT(pulsar_segstore_reserve(st, "", 0, 128, "NEW:", 4, 1200, 0, 0, ky, &jy, err, sizeof err) == 1);
+    TEST_ASSERT(!pulsar_segstore_contains(st, child));   /* now the leaf could go */
+    (void)pulsar_segstore_commit(st, jy, false);
+    pulsar_segstore_close(st);
+    char cmd[4300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
+/* L338: the disk cache's background writer starts with the store and drains into it at the close */
+static void test_l338_kv_writer_lifecycle(void) {
+    char tmpl[] = "/tmp/pulsar-kvw.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    kv_disk_cache kc;
+    TEST_ASSERT(kv_cache_open(&kc, dir, 64, 0, kv_cache_default_options()));
+    TEST_ASSERT(kc.writer != NULL);
+    uint64_t staged = 1;
+    int uncommitted = 1;
+    kv_cache_writer_state(&kc, &staged, &uncommitted);
+    TEST_ASSERT(staged == 0 && uncommitted == 0);
+    TEST_ASSERT(kv_cache_commit_written(&kc) == 0);
+    kv_cache_close(&kc);
+    TEST_ASSERT(kc.writer == NULL && kc.st == NULL);
+    char cmd[4300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_l264_segstore_chain_lookup(void) {
     char tmpl[] = "/tmp/pulsar-seg-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -12490,6 +12579,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_writeback_preserves_bytes();
     test_sha1_bytes_hex_matches_known_vector();
     test_l264_segstore_chain_lookup();
+    test_l338_segstore_reserve_commit();
+    test_l338_kv_writer_lifecycle();
     test_l280_kv_identity_rope();
     test_l323_kvchain_segment_ends();
     test_l323_grid_cut_dedupes_copies();

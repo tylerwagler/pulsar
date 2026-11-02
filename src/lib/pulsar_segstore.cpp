@@ -18,6 +18,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -72,6 +73,12 @@ struct pulsar_segstore {
     std::unordered_map<std::string, std::vector<std::string>> children;   ///< parent key ("" = roots) -> child keys
     /// Sum of file_bytes over segs: what the budget is checked against
     uint64_t used = 0;
+    /// L338: file bytes of the reserved writes not yet committed (pulsar_segstore_reserve): the budget counts them
+    uint64_t reserved = 0;
+    /// L338: keys being written (reserved, not committed): a second reserve of one writes nothing
+    std::unordered_set<std::string> pending;
+    /// L338: parents of the writes in flight, with their count: eviction never takes one
+    std::unordered_map<std::string, int> pinned;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -218,6 +225,7 @@ struct pulsar_segstore {
         const pulsar_segstore_seg *victim = nullptr;
         for (auto &kv : segs) {
             if ((keep && kv.first == keep) || (keep2 && kv.first == keep2)) continue;
+            if (pinned.count(kv.first) || pending.count(kv.first)) continue;   /* L338: a write in flight */
             auto ch = children.find(kv.first);
             if (ch != children.end() && !ch->second.empty()) continue;
             const pulsar_segstore_seg &c = kv.second;
@@ -375,45 +383,99 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
  *  @return 0 when every byte was written, 1 on a short write */
 static int write_all(FILE *fp, const void *p, size_t n) { return fwrite(p, 1, n, fp) == n ? 0 : 1; }
 
-bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
-                         const char *text, size_t text_len,
-                         uint64_t payload_bytes, uint64_t state_bytes, pulsar_segstore_write_fn write_payload,
-                         uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
-                         void *ud, char key_out[41], char *err, size_t errlen) {
-    if (!st || !write_payload || G <= G_prev || (G_prev == 0) != (!parent || !parent[0])) {
+/* L338: a put in three steps, so the file write can leave the thread that owns the index.  The job carries
+ * everything the write needs (no store state is read while it runs); the store keeps the job's key PENDING (a second
+ * reserve of it writes nothing) and its parent PINNED (eviction takes leaves only, and a pending child is not yet a
+ * child in the index) until the commit. */
+struct pulsar_segstore_job {
+    char key[41];
+    char parent[41];
+    uint32_t G_prev, G;
+    std::string text;
+    uint64_t payload_bytes, state_bytes, trailer_bytes;
+    bool with_trailer;
+    bool replace;            ///< the key is stored without state; this write adds it in place
+    uint32_t hits;           ///< the stored copy's hits, carried into the header on a replace
+    uint64_t need;           ///< the file's bytes
+    uint32_t identity;
+    std::string final_path;
+};
+
+int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
+                            size_t text_len, uint64_t payload_bytes, uint64_t state_bytes, uint64_t trailer_bytes,
+                            char key_out[41], pulsar_segstore_job **job_out, char *err, size_t errlen) {
+    *job_out = nullptr;
+    if (!st || G <= G_prev || (G_prev == 0) != (!parent || !parent[0])) {
         snprintf(err, errlen, "segment put: a root starts at 0 and only a root has no parent");
-        return false;
+        return -1;
     }
     if (state_bytes > payload_bytes) {
         snprintf(err, errlen, "segment put: a state part larger than its payload");
-        return false;
+        return -1;
     }
-    if (parent && parent[0] && !pulsar_segstore_contains(st, parent)) {
+    if (parent && parent[0] && !pulsar_segstore_contains(st, parent) && !st->pending.count(std::string(parent, 40))) {
         snprintf(err, errlen, "segment put: parent %.40s is not stored", parent);
-        return false;
+        return -1;
     }
     char key[41];
     pulsar_segstore_child_key(parent, text, text_len, key);
     memcpy(key_out, key, 41);
     /* the same text is the same segment; L323: a stored copy without the state is replaced by one with it */
+    if (st->pending.count(std::string(key, 40))) return 0;   /* being written: its write carries what this one would */
     pulsar_segstore_seg had;
     const bool replace = pulsar_segstore_get(st, key, &had);
-    if (replace && (had.state_bytes > 0u || state_bytes == 0u)) return true;
-    const uint64_t need = HDR + text_len + payload_bytes + (write_trailer ? trailer_bytes : 0u);
+    if (replace && (had.state_bytes > 0u || state_bytes == 0u)) return 0;
+    const uint64_t need = HDR + text_len + payload_bytes + trailer_bytes;
     const uint64_t freed = replace ? had.file_bytes : 0u;
     if (st->budget && need > st->budget) {
         snprintf(err, errlen, "segment put: %llu bytes exceed the whole budget", (unsigned long long)need);
-        return false;
+        return -1;
     }
-    while (st->budget && st->used - freed + need > st->budget)
+    while (st->budget && st->used + st->reserved - freed + need > st->budget)
         if (!st->evict_one(parent, key)) break;
-    if (st->budget && st->used - freed + need > st->budget) {
-        snprintf(err, errlen, "segment put: no room (only the chain being extended remains)");
+    if (st->budget && st->used + st->reserved - freed + need > st->budget) {
+        snprintf(err, errlen, "segment put: no room (only the chain being extended and the segments being written "
+                              "remain)");
+        return -1;
+    }
+    pulsar_segstore_job *j = new pulsar_segstore_job();
+    memcpy(j->key, key, 41);
+    memset(j->parent, 0, sizeof j->parent);
+    if (parent && parent[0]) memcpy(j->parent, parent, 40);
+    j->G_prev = G_prev;
+    j->G = G;
+    j->text.assign(text, text_len);
+    j->payload_bytes = payload_bytes;
+    j->state_bytes = state_bytes;
+    j->trailer_bytes = trailer_bytes;
+    j->with_trailer = trailer_bytes > 0u;
+    j->replace = replace;
+    j->hits = replace ? had.hits : 0u;
+    j->need = need;
+    j->identity = st->identity;
+    j->final_path = st->path(key);
+    st->reserved += need;
+    st->pending.insert(std::string(key, 40));
+    if (j->parent[0]) st->pinned[std::string(j->parent, 40)]++;
+    *job_out = j;
+    return 1;
+}
+
+const char *pulsar_segstore_job_key(const pulsar_segstore_job *job) { return job->key; }
+uint32_t pulsar_segstore_job_G_prev(const pulsar_segstore_job *job) { return job->G_prev; }
+uint32_t pulsar_segstore_job_G(const pulsar_segstore_job *job) { return job->G; }
+const char *pulsar_segstore_job_text(const pulsar_segstore_job *job) { return job->text.c_str(); }
+uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job) { return job->need; }
+
+bool pulsar_segstore_job_write(pulsar_segstore_job *job, pulsar_segstore_write_fn write_payload,
+                               pulsar_segstore_write_fn write_trailer, void *ud, char *err, size_t errlen) {
+    if (!write_payload || (job->with_trailer && !write_trailer)) {
+        snprintf(err, errlen, "segment put: no writer for the payload or its trailer");
         return false;
     }
     char tmp[64];
     snprintf(tmp, sizeof tmp, ".tmp.%ld", (long)getpid());
-    const std::string final_path = st->path(key), tmp_path = final_path + tmp;
+    const std::string tmp_path = job->final_path + tmp;
     FILE *fp = fopen(tmp_path.c_str(), "wb");
     if (!fp) { snprintf(err, errlen, "segment put: %s: %s", tmp_path.c_str(), strerror(errno)); return false; }
     pulsar_writeback wb;
@@ -423,33 +485,34 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
     const uint64_t now = (uint64_t)time(nullptr);
     put32(h, PULSAR_SEGSTORE_MAGIC);
     put32(h + 4, PULSAR_SEGSTORE_VERSION);
-    put32(h + 8, st->identity);
-    put32(h + 12, write_trailer ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
-    memcpy(h + 16, key, 40);
-    if (parent && parent[0]) memcpy(h + 56, parent, 40);
-    put32(h + 96, G_prev);
-    put32(h + 100, G);
-    put64(h + 104, text_len);
-    put64(h + 112, payload_bytes);
-    put64(h + 120, write_trailer ? trailer_bytes : 0u);
-    put32(h + 128, replace ? had.hits : 0u);
+    put32(h + 8, job->identity);
+    put32(h + 12, job->with_trailer ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
+    memcpy(h + 16, job->key, 40);
+    if (job->parent[0]) memcpy(h + 56, job->parent, 40);
+    put32(h + 96, job->G_prev);
+    put32(h + 100, job->G);
+    put64(h + 104, job->text.size());
+    put64(h + 112, job->payload_bytes);
+    put64(h + 120, job->trailer_bytes);
+    put32(h + 128, job->hits);
     put64(h + 136, now);
     put64(h + 144, now);
-    put64(h + 152, state_bytes);
-    int rc = write_all(fp, h, HDR) || write_all(fp, text, text_len);
+    put64(h + 152, job->state_bytes);
+    int rc = write_all(fp, h, HDR) || write_all(fp, job->text.data(), job->text.size());
+    if (rc) snprintf(err, errlen, "segment put: header: %s", strerror(errno));
     if (rc == 0) {
         const long at = ftell(fp);
         rc = write_payload(fp, ud, err, errlen);
-        if (rc == 0 && (uint64_t)(ftell(fp) - at) != payload_bytes) {
+        if (rc == 0 && (uint64_t)(ftell(fp) - at) != job->payload_bytes) {
             snprintf(err, errlen, "segment put: payload wrote %ld bytes, promised %llu", ftell(fp) - at,
-                     (unsigned long long)payload_bytes);
+                     (unsigned long long)job->payload_bytes);
             rc = 1;
         }
     }
-    if (rc == 0 && write_trailer) {
+    if (rc == 0 && job->with_trailer) {
         const long at = ftell(fp);
         rc = write_trailer(fp, ud, err, errlen);
-        if (rc == 0 && (uint64_t)(ftell(fp) - at) != trailer_bytes) {
+        if (rc == 0 && (uint64_t)(ftell(fp) - at) != job->trailer_bytes) {
             snprintf(err, errlen, "segment put: trailer size mismatch");
             rc = 1;
         }
@@ -461,41 +524,83 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
     if (rc == 0) pulsar_writeback_finish(&wb);
     pulsar_writeback_drop_file(fp);
     fclose(fp);
-    if (rc == 0 && rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+    if (rc == 0 && rename(tmp_path.c_str(), job->final_path.c_str()) != 0) {
         snprintf(err, errlen, "segment put: rename: %s", strerror(errno));
         rc = 1;
     }
     if (rc != 0) { ::unlink(tmp_path.c_str()); return false; }
     {
-        const int dfd = open(st->dir.c_str(), O_RDONLY | O_DIRECTORY);
+        const std::string dir = job->final_path.substr(0, job->final_path.rfind('/'));
+        const int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
     }
-    if (replace) {   /* same key, same text, same children: only the file and its sizes change */
-        pulsar_segstore_seg &e = st->segs[key];
-        st->used = st->used - e.file_bytes + need;
-        e.payload_bytes = payload_bytes;
-        e.state_bytes = state_bytes;
-        e.trailer_bytes = write_trailer ? trailer_bytes : 0u;
-        e.file_bytes = need;
-        e.last_used = now;
-        return true;
-    }
-    pulsar_segstore_seg e;
-    memset(&e, 0, sizeof e);
-    memcpy(e.key, key, 41);
-    if (parent && parent[0]) memcpy(e.parent, parent, 40);
-    e.G_prev = G_prev;
-    e.G = G;
-    e.text_len = text_len;
-    e.payload_bytes = payload_bytes;
-    e.state_bytes = state_bytes;
-    e.trailer_bytes = write_trailer ? trailer_bytes : 0u;
-    e.file_bytes = need;
-    e.last_used = now;
-    e.text_end = (parent && parent[0] ? st->segs[parent].text_end : 0u) + text_len;
-    st->link(e);
-    st->refresh_dominated(e.parent);
     return true;
+}
+
+bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool written) {
+    const std::string key(job->key, 40), parent(job->parent);
+    st->reserved -= job->need;
+    st->pending.erase(key);
+    if (!parent.empty()) {
+        auto p = st->pinned.find(parent);
+        if (p != st->pinned.end() && --p->second == 0) st->pinned.erase(p);
+    }
+    /* a parent that was itself pending and whose write failed is not stored: its child cannot be named by a chain */
+    const bool parent_ok = parent.empty() || st->segs.count(parent) != 0;
+    bool indexed = false;
+    if (written && !parent_ok) {
+        st->logf("dropped segment %s [%u,%u): its parent %s was not stored", job->key, job->G_prev, job->G,
+                 parent.c_str());
+        ::unlink(job->final_path.c_str());
+    } else if (written) {
+        const uint64_t now = (uint64_t)time(nullptr);
+        auto it = st->segs.find(key);
+        if (it != st->segs.end()) {   /* a replace: the same key, same children; only the file and its sizes change */
+            pulsar_segstore_seg &e = it->second;
+            st->used = st->used - e.file_bytes + job->need;
+            e.payload_bytes = job->payload_bytes;
+            e.state_bytes = job->state_bytes;
+            e.trailer_bytes = job->trailer_bytes;
+            e.file_bytes = job->need;
+            e.last_used = now;
+        } else {
+            pulsar_segstore_seg e;
+            memset(&e, 0, sizeof e);
+            memcpy(e.key, job->key, 41);
+            if (!parent.empty()) memcpy(e.parent, job->parent, 40);
+            e.G_prev = job->G_prev;
+            e.G = job->G;
+            e.text_len = job->text.size();
+            e.payload_bytes = job->payload_bytes;
+            e.state_bytes = job->state_bytes;
+            e.trailer_bytes = job->trailer_bytes;
+            e.file_bytes = job->need;
+            e.last_used = now;
+            e.text_end = (parent.empty() ? 0u : st->segs[parent].text_end) + job->text.size();
+            st->link(e);
+            st->refresh_dominated(e.parent);
+        }
+        indexed = true;
+    }
+    delete job;
+    return indexed;
+}
+
+bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
+                         const char *text, size_t text_len,
+                         uint64_t payload_bytes, uint64_t state_bytes, pulsar_segstore_write_fn write_payload,
+                         uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
+                         void *ud, char key_out[41], char *err, size_t errlen) {
+    if (!write_payload) {
+        snprintf(err, errlen, "segment put: no payload writer");
+        return false;
+    }
+    pulsar_segstore_job *job = nullptr;
+    const int rc = pulsar_segstore_reserve(st, parent, G_prev, G, text, text_len, payload_bytes, state_bytes,
+                                           write_trailer ? trailer_bytes : 0u, key_out, &job, err, errlen);
+    if (rc <= 0) return rc == 0;
+    const bool ok = pulsar_segstore_job_write(job, write_payload, write_trailer, ud, err, errlen);
+    return pulsar_segstore_commit(st, job, ok) && ok;
 }
 
 FILE *pulsar_segstore_open_payload(pulsar_segstore *st, const char key[41], uint64_t *payload_bytes) {

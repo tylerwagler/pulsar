@@ -1362,9 +1362,14 @@ typedef struct {
     double last_prefill_ms;            ///< ... and its prefill price
 } kv_restore_meter;
 
+/** L338: the disk KV cache's background segment writer (kv_cache.cpp). */
+struct kv_writer;
+
 /** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
 typedef struct {
     pulsar_segstore *st;     ///< NULL while disabled
+    /// L338: writes the persists' staged segments off the worker; they are indexed by kv_cache_commit_written
+    struct kv_writer *writer;
     /// the store's directory (owned); also where preempted banks' payloads are written; NULL while disabled
     char *dir;
     /// kv_cache_open succeeded: the store is configured and open
@@ -4428,6 +4433,16 @@ char *path_join(const char *dir, const char *name);
 bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
                    kv_cache_options opt);
 void kv_cache_close(kv_disk_cache *kc);
+/** L338: index the segments the background writer has finished (the store's thread: the worker, or the close). */
+/// @param kc the cache
+/// @return segments indexed
+int kv_cache_commit_written(kv_disk_cache *kc);
+/** L338: how much the background writer holds now: staged bytes not yet written, and finished jobs not yet
+ *  committed (for /metrics and the tests). */
+/// @param kc        the cache
+/// @param staged    receives the staged bytes
+/// @param uncommitted receives the finished jobs waiting for kv_cache_commit_written
+void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
 void build_prompt_from_exact_prefix_and_text_suffix(

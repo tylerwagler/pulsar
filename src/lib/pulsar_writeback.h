@@ -36,7 +36,8 @@ typedef struct {
 static inline void pulsar_writeback_init(pulsar_writeback *w, FILE *fp) {
     w->fp = fp;
     w->synced = fp ? ftello(fp) : 0;
-    if (w->synced < 0) w->fp = NULL;
+    /* L338: a memory stream (fmemopen: a segment's payload staged for the background writer) has no descriptor */
+    if (w->synced < 0 || (fp && fileno(fp) < 0)) w->fp = NULL;
 }
 
 /* Push [synced, end) to disk and drop it from the cache.  Always waits: the

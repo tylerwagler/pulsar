@@ -62,11 +62,32 @@ typedef struct {
     int (*write)(FILE *fp, void *ud, const char *text, char *err, size_t errlen);
 } pulsar_kvchain_trailer;
 
+/** L338: where a persist's segments go once staged -- the server's background writer.  A segment is staged on the
+ *  calling thread (its rows and state copied out of the bank, which moves on), then written elsewhere and committed
+ *  back on the store's thread (pulsar_segstore_reserve / _job_write / _commit). */
+typedef struct {
+    /// context for both hooks
+    void *ud;
+    /** Room for `bytes` of staged segment now (may wait for the writer to drain); false = none: the segment is not
+     *  written by this persist. */
+    bool (*admit)(void *ud, uint64_t bytes);
+    /** Take the reserved job and its staged payload and trailer (malloc'd, `trailer` NULL when it has none); the
+     *  writer owns all three from here and commits the job. */
+    void (*submit)(void *ud, pulsar_segstore_job *job, uint8_t *payload, uint64_t payload_len, uint8_t *trailer,
+                   uint64_t trailer_len);
+} pulsar_kvchain_writer;
+
+/** L338: a writer that writes and commits each staged segment on the calling thread before the persist goes on --
+ *  for the gates and tools that persist and load in one breath (the server writes in the background). */
+/// @param st the store the persist writes to
+/// @return the writer (its ud is `st`)
+pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st);
+
 /** What a persist did. */
 typedef struct {
-    int written;        ///< new segments
+    int written;        ///< new segments, staged and handed to the writer (L338: committed later, on its thread)
     int end;            ///< the chain's end after the write (0: none)
-    uint64_t bytes;     ///< payload + trailer bytes written
+    uint64_t bytes;     ///< payload + trailer bytes staged
     char key[41];       ///< the chain's last key ("" when none)
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
@@ -101,10 +122,12 @@ int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int
 /// @param min_tokens write nothing when the deepest grid checkpoint is below this
 /// @param close      end the chain with the tail (prompt end, evict, spill)
 /// @param trailer    the per-segment trailer, or NULL for none
+/// @param writer     where the staged segments go (required)
 /// @param out        receives what the persist did, or NULL
 /// @return the number of segments written
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
-                           const pulsar_kvchain_trailer *trailer, pulsar_kvchain_persist_result *out);
+                           const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
+                           pulsar_kvchain_persist_result *out);
 
 /** L310: the chain a restore of `text` would load, without loading it -- the deepest whose text is a byte prefix of
  *  `text` ending at a stored state, cut at the request's images exactly as pulsar_kvchain_restore cuts it (and back
