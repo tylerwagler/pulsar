@@ -718,7 +718,9 @@ kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double tran
 /// @param bytes   bytes the load read (0: ignored)
 /// @param cached  of which in the page cache (clamped to `bytes`)
 /// @param ms      the load's wall time, ms (<= 0: ignored)
-void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms) {
+/// @param now_sec server_now_sec() at the load's end (stamps the relaxation clock, L342)
+void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, double ms, double now_sec) {
+    kv_read_cost_touch(c, now_sec);
     if (!(ms > 0.0) || bytes == 0u) return;
     if (cached > bytes) cached = bytes;
     const double x = (double)(bytes - cached) / KV_GIB, z = (double)cached / KV_GIB;
@@ -736,13 +738,25 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
     const double u = (c->scy * d - b * c->swy) / det, w = (a * c->swy - b * c->scy) / det;
     c->cold_ms_per_gib = u > 0.0 ? u : 0.0;
     c->cached_ms_per_gib = w > 0.0 ? w : 0.0;
+    const bool first = c->loads == 1u;
+    if (first || c->cold_ms_per_gib < c->best_cold_ms_per_gib) c->best_cold_ms_per_gib = c->cold_ms_per_gib;
+    if (first || c->cached_ms_per_gib < c->best_cached_ms_per_gib) c->best_cached_ms_per_gib = c->cached_ms_per_gib;
 }
 
-bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double *ms) {
+void kv_read_cost_touch(kv_read_cost *c, double now_sec) {
+    if (now_sec > c->last_sec) c->last_sec = now_sec;
+}
+
+bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, double now_sec, double *ms) {
     *ms = 0.0;
     if (c->loads == 0u) return false;
     if (cached > bytes) cached = bytes;
-    *ms = (double)(bytes - cached) / KV_GIB * c->cold_ms_per_gib + (double)cached / KV_GIB * c->cached_ms_per_gib;
+    /* L342: each cost's gap above its best halves every KV_READ_RELAX_SEC without a load */
+    const double idle = now_sec - c->last_sec;
+    const double keep = idle > 0.0 ? exp2(-idle / KV_READ_RELAX_SEC) : 1.0;
+    const double u = c->best_cold_ms_per_gib + (c->cold_ms_per_gib - c->best_cold_ms_per_gib) * keep;
+    const double w = c->best_cached_ms_per_gib + (c->cached_ms_per_gib - c->best_cached_ms_per_gib) * keep;
+    *ms = (double)(bytes - cached) / KV_GIB * u + (double)cached / KV_GIB * w;
     return true;
 }
 
@@ -815,7 +829,7 @@ kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
     const bool priced = pulsar_engine_prefill_ms(s->engine, gained, (uint32_t)base, cap > 0 ? (uint32_t)cap : 0u,
                                                  &prefill_ms);
     pthread_mutex_lock(&s->mu);
-    const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, &transfer_ms);
+    const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, hit->cached, server_now_sec(), &transfer_ms);
     pthread_mutex_unlock(&s->mu);
     const kv_restore_verdict v = kv_restore_decide(gained, measured, transfer_ms, priced, prefill_ms);
     pthread_mutex_lock(&s->mu);
@@ -869,6 +883,9 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
     r->read_ms = 0.0;
     r->slice_max_ms = 0.0;
     r->slices = 0;
+    pthread_mutex_lock(&s->mu);
+    kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342: a load is running: hold the relaxation */
+    pthread_mutex_unlock(&s->mu);
     if (!sliced) return;
     /* the read each segment costs, disk and page cache apart (L327), as the meter prices the whole chain */
     for (int i = 0; i < hit->n; i++) {
@@ -877,7 +894,7 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
         const uint64_t cached = pulsar_segstore_cached_bytes(s->kv.st, g->key, bytes - g->trailer_bytes, true);
         double ms = 0.0;
         pthread_mutex_lock(&s->mu);
-        const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, &ms);
+        const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, server_now_sec(), &ms);
         pthread_mutex_unlock(&s->mu);
         r->pred_ms[i] = measured ? ms : -1.0;
     }
@@ -893,6 +910,7 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     r->slices++;
     if (ms > r->slice_max_ms) r->slice_max_ms = ms;
     pthread_mutex_lock(&s->mu);
+    kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342 */
     s->m_restore_slices++;
     if (ms > s->m_restore_stall_max_ms) s->m_restore_stall_max_ms = ms;
     pthread_mutex_unlock(&s->mu);
@@ -939,7 +957,7 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
     if (G == 0) return 0;
     const size_t text_bytes = strlen(text);
     pthread_mutex_lock(&s->mu);
-    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes, r->hit->cached, r->read_ms);
+    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes, r->hit->cached, r->read_ms, server_now_sec());
     s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base) : 0u;
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
