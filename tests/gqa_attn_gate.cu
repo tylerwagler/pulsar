@@ -174,6 +174,8 @@ static uint32_t g_bound = 0;
 /* L338: the next calls' rows are DECODE rows (pulsar_gqa_io::decode_rows): run_schedule's one-width schedules up to
  * 16 rows (decodes, verifies) and the batched decode of 16 sequences -- a prompt's chunks stay prompt chunks */
 static bool g_decode_call = false;
+/* L338: rows a flash-decoding CTA attends (pulsar_gqa_io::decode_group) for the decode calls */
+static int g_decode_group = 1;
 /* f(i) for i in [0, n) on up to 16 host threads */
 template <class F> static void par_for(uint32_t n, F f) {
     const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
@@ -215,6 +217,7 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
     for (size_t i = 0; i < seqs.size(); i++) ss[i] = {seqs[i]->kv, seqs[i]->bytes, seqs[i]->cap};
     pulsar_gqa_io io{};
     io.decode_rows = g_decode_call ? 1 : 0;   /* L338: the call's row kind (run_schedule's one-row decodes) */
+    io.decode_group = g_decode_group;
     io.q = {d_in, C.ld, C.R.hd};
     io.k = {d_in + C.off_k, C.ld, C.R.hd};
     io.v = {d_in + C.off_v, C.ld, C.R.hd};
@@ -540,13 +543,35 @@ static void run_case(Case &C) {
         std::vector<Out> v = run_schedule(C, B, 0, N0, {N0});
         bool ok = v.size() == N0;
         uint32_t p = N0;
+        std::vector<Out> v_runs;   /* every run's rows, in order (the decode-group comparison below) */
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
             ok = ok && o.size() == k && dec_diff(pre, o, p) == UINT32_MAX;   /* decode rows (g_flashdec: graded) */
+            v_runs.insert(v_runs.end(), o.begin(), o.end());
             p += k;
         }
         check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
               "%s", N0, g_flashdec ? "graded (decode rows: flash-decoding), pools bit-exact" : "bit-exact");
+        /* L338: the same runs with a verify's decode groups (2, 4 rows a CTA, one sequence's keys loaded once) ==
+         * one row a CTA, byte for byte */
+        for (int grp : {2, 4}) {
+            Seq Bg = seq_new(C, 1);
+            run_schedule(C, Bg, 0, N0, {N0});
+            g_decode_group = grp;
+            bool gok = true;
+            uint32_t q = N0, k0 = 0;
+            for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
+                std::vector<Out> o = run_schedule(C, Bg, q, q + k, {k});
+                gok = gok && o.size() == k;
+                for (uint32_t i = 0; gok && i < k; i++) gok = same(o[i], v_runs[k0 + i]);
+                q += k;
+                k0 += k;
+            }
+            g_decode_group = 1;
+            check(gok && pools_equal(C, B, Bg, N), "verify at decode group %d: every run's rows byte-identical to one "
+                  "row a CTA, pools bit-exact", grp);
+            seq_free(Bg);
+        }
         seq_free(B);
     }
     /* 5. rollback of a junk verify */
@@ -595,6 +620,24 @@ static void run_case(Case &C) {
             ok = one.size() == 1 && same(one[0], bat[s]);
         }
         check(ok, "batching: 16 decode rows of 16 sequences in one call == each alone, bit-exact");
+        if (g_flashdec) {   /* L338: the same 16 rows at decode group 4: sequences of their own, each loads its keys */
+            std::vector<Seq> Z(NS);
+            std::vector<Seq *> zs;
+            for (uint32_t s = 0; s < NS; s++) {
+                Z[s] = seq_new(C, 100 + s);
+                run_schedule(C, Z[s], 0, len[s], {len[s]});
+                zs.push_back(&Z[s]);
+            }
+            std::vector<Out> bat4;
+            g_decode_call = true;
+            g_decode_group = 4;
+            bool gok = run_call(C, zs, rows, &bat4) == 0 && bat4.size() == bat.size();
+            g_decode_group = 1;
+            g_decode_call = false;
+            for (uint32_t s = 0; gok && s < NS; s++) gok = same(bat4[s], bat[s]);
+            check(gok, "batching at decode group 4 (16 sequences, no keys shared): == one row a CTA, bit-exact");
+            for (uint32_t s = 0; s < NS; s++) seq_free(Z[s]);
+        }
         /* the folded schedule: sequence 0 runs 70 rows, 1..5 one row each */
         rows.clear(); xs.clear();
         for (uint32_t s = 0; s < 6; s++) xs.push_back(&X[s]);

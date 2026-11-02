@@ -170,6 +170,12 @@ typedef struct {
      *  CUDA cores: not the MMA tile's bytes; a row's bytes the same whatever rides with it, so a verified row is the
      *  plain decode's); 0 = the MMA tile, whose bytes a prompt cut anywhere keeps. */
     int           decode_rows;
+    /** L338: the most rows a flash-decoding CTA may attend together (0 or 1 = one a CTA; 2; 4) -- the caller's: 4 when
+     *  consecutive rows are one sequence's (a verify's), whose keys a group then loads once for all of them.  The call
+     *  runs at the group the layer's shape and its row count measure best, at most this.  A row's bytes are the same at
+     *  any group (each row's arithmetic is the one-row CTA's); rows of different sequences in a group each load their
+     *  own keys. */
+    int           decode_group;
 } pulsar_gqa_io;
 
 /** Bytes of one token's KV row for this layer (every KV head, K and V). */
