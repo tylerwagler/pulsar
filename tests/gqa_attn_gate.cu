@@ -591,20 +591,23 @@ static void run_case(Case &C) {
          * decoded one at a time on it (a verify's rows and a plain decode's are its bytes alike), graded against the
          * flash-decoding reference, pools bit-exact */
         if (g_flashdec && G % 8u == 0u) {
+          for (int grp : {2, 4}) {
             Seq Bm = seq_new(C, 1), Bd = seq_new(C, 1);
             run_schedule(C, Bm, 0, N0, {N0});
             run_schedule(C, Bd, 0, N0, {N0});
             pulsar_gqa_decode_arm_force(2);
-            g_decode_group = 4;
+            g_decode_group = grp;
             bool same_ok = true, graded = true;
             uint32_t q = N0, k0 = 0;
             for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
                 std::vector<Out> o = run_schedule(C, Bm, q, q + k, {k});
                 std::vector<Out> d1;
+                g_decode_group = 1;   /* the plain decode's one row a CTA */
                 for (uint32_t i = 0; i < k; i++) {
                     std::vector<Out> one = run_schedule(C, Bd, q + i, q + i + 1, {1});
                     d1.insert(d1.end(), one.begin(), one.end());
                 }
+                g_decode_group = grp;
                 same_ok = same_ok && o.size() == k && d1.size() == k;
                 for (uint32_t i = 0; same_ok && i < k; i++) {
                     same_ok = same(o[i], d1[i]);
@@ -616,11 +619,12 @@ static void run_case(Case &C) {
             g_decode_group = 1;
             pulsar_gqa_decode_arm_force(0);
             check(same_ok && pools_equal(C, B, Bm, N) && pools_equal(C, Bm, Bd, N),
-                  "verify on the tensor-core decode arm: every run's rows byte-identical to the same rows decoded one at "
-                  "a time, pools bit-exact");
+                  "verify on the tensor-core decode arm, up to %d rows a CTA: every run's rows byte-identical to the "
+                  "same rows decoded one at a time, pools bit-exact", grp);
             check(graded, "the tensor-core decode arm's rows within 2^-12 of each row's max of flash-decoding's");
             seq_free(Bm);
             seq_free(Bd);
+          }
         }
         seq_free(B);
     }
@@ -680,13 +684,12 @@ static void run_case(Case &C) {
             }
             std::vector<Out> bat4;
             g_decode_call = true;
-            pulsar_gqa_decode_force(2, 2);
+            g_decode_group = 4;   /* rows grouped a CTA (flash 2 x 2, or the tensor-core arm's 4 in per-sequence passes) */
             bool gok = run_call(C, zs, rows, &bat4) == 0 && bat4.size() == bat.size();
-            pulsar_gqa_decode_force(0, 0);
+            g_decode_group = 1;
             g_decode_call = false;
             for (uint32_t s = 0; gok && s < NS; s++) gok = same(bat4[s], bat[s]);
-            check(gok, "batching at a CTA of 2 rows x 2 heads (16 sequences, no keys shared): == the launch's own shape, "
-                  "bit-exact");
+            check(gok, "batching with rows grouped a CTA (16 sequences, no keys shared): == one row a CTA, bit-exact");
             for (uint32_t s = 0; s < NS; s++) seq_free(Z[s]);
         }
         /* the folded schedule: sequence 0 runs 70 rows, 1..5 one row each */
