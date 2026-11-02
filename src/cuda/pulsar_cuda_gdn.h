@@ -147,6 +147,15 @@ typedef struct {
     /** L288 verify: out [rows][pulsar_gdn_upd_floats(tp_ranks)] per-row recurrent updates, or NULL; set
      *  together with conv_rows (see conv_rows). */
     float         *rec_upd;
+    /** L339 the DELTA fold, or NULL (no pending rows; rec_upd's call row r at record r).  Device int32 table: [0] the
+     *  record row this call's rec_upd starts at (row r at rec_upd + (rec_fold[0] + r) * pulsar_gdn_upd_floats);
+     *  [1 + 2 s] / [2 + 2 s] slot s's PENDING records -- the first row in rec_fold_rows and the count, 0 = none.  A
+     *  sequence on a slot with pending rows applies them first with the commit's own operation (its state is then the
+     *  bytes pulsar_gdn_commit would have left) and its state is stored after them even under a capture.  The pending
+     *  rows must not be ones this call's capture writes. */
+    const int32_t *rec_fold;
+    /** L339 the records rec_fold's pending rows index (16-byte aligned); set with rec_fold. */
+    const float   *rec_fold_rows;
     /** L266 step 7: the tensor-parallel degree (0 or 1 = the whole layer).  At 2 the call is ONE rank's
      *  heads -- NK / 2 key heads and the NV / 2 value heads reading them -- with its own qkv / z / a / b
      *  rows, conv channels, A_log and dt_bias (the caller offsets the pointers), state pools of

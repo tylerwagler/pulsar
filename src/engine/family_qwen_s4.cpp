@@ -1440,6 +1440,11 @@ bool pulsar_qwen_s2_gdn(const pulsar_qwen_step *st, uint32_t il) {
     c.a   = (const float *)(base + g.a) + hv0;   c.ld_a = NVG;
     c.b   = (const float *)(base + g.b) + hv0;   c.ld_b = NVG;
     c.tp_ranks = (int)pulsar_qwen_tp(s);
+    /* L339: the DELTA fold (state_kinds.h THE FOLD) -- every call applies its slots' pending rows first */
+    c.rec_fold = pulsar_state_fold_table(st->states);
+    c.rec_fold_rows = c.rec_fold ? (const float *)pulsar_state_capture_rows(st->states, il, PULSAR_QWEN_STATE_GDN_REC)
+                                 : NULL;
+    if (c.rec_fold && !c.rec_fold_rows) return fail("a folding state with no GDN delta records");
     c.scratch = base + g.ws; c.scratch_bytes = g.ws_bytes;
     c.out_f32 = NULL;                               /* the bf16 row is the consumer's input, not f32 */
     c.out_bf16 = base + g.obf16;                    /* L251 / ac69748f: no E4M3 slot in this family */

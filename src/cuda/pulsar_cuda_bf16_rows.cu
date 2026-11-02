@@ -14,6 +14,12 @@
 // fresh fragment that is added into the row's f32 accumulator in k order, so a row's bytes are a function of its own
 // activation and the weight alone -- not of NT, the chunking, or the other rows of the call.
 //
+// The DENSE decode arm (L339) is the same arithmetic without the staging: a CTA is kDenseWarps warps (32 outputs at
+// 2), so a narrow Linear still spreads over the GPU (a 1024-wide output is 32 CTAs, not 8: the drafters' k / v and
+// conv projections), each lane reads its activation fragment straight from global memory (a call's rows are a few
+// KiB, cache-resident), and the weight loads of kDenseU 64-k steps are in flight before the first is used.  Per row
+// the MMAs, their operands and the k order of the fragment adds are the staged kernel's, so the bytes are too.
+//
 // The routed arm runs the same kernel per work item: an expert's assignments [start, start + count) of the
 // expert-sorted schedule (count <= 64), the activation rows gathered by the schedule's source index, the outputs
 // scattered by its destination (the pair).  Gate and up are one launch (gridDim.z), the down another.
@@ -38,6 +44,10 @@ constexpr int kOutPerCta = 16 * kWarps;
 constexpr int kStageBytes = 32768;     ///< the staged activation chunk, at most (no opt-in shared memory)
 constexpr int kRoutedNT = 8;           ///< the routed arm's n8 tiles: 64 assignments a work item
 constexpr int kMaxE = 1024;            ///< experts the one-block plan kernel scans
+/* L339, measured on GB10 at the LiLiCorr drafter's shapes (tests/bf16_rows_gate time section): small CTAs spread a
+ * narrow Linear over the SMs, and four 64-k steps of weight loads in flight keep the read stream full */
+constexpr int kDenseWarps = 2;         ///< the dense decode kernel's warps a CTA: 16 weight rows each
+constexpr int kDenseU = 4;             ///< the dense decode kernel's 64-k steps of loads in flight
 
 /** Elements of K a chunk stages for NT n8 tiles: kStageBytes over 8 NT rows, a multiple of 64. */
 /// @tparam NT n8 activation tiles per CTA (1, 2 or kRoutedNT).
@@ -49,7 +59,7 @@ template <int NT> __host__ __device__ constexpr int stage_stride() { return chun
 /// @tparam NT n8 activation tiles per CTA.
 /// @return Dynamic shared memory of one CTA's staged chunk: 8 NT rows x stage_stride.
 template <int NT> __host__ __device__ constexpr size_t stage_bytes() { return (size_t)8 * NT * stage_stride<NT>(); }
-static_assert(stage_bytes<1>() <= 48 * 1024 && stage_bytes<2>() <= 48 * 1024 && stage_bytes<kRoutedNT>() <= 48 * 1024,
+static_assert(stage_bytes<kRoutedNT>() <= 48 * 1024,
               "the staged chunk must fit the default dynamic shared memory");
 
 
@@ -139,21 +149,93 @@ __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, i
         }
 }
 
-/* The dense Linear: one work item, the call's rows 0 .. nr - 1. */
-/// Grid ceil(out / 128), 256 threads, stage_bytes<NT>() dynamic shared memory: Y [nr][out] f32 = X W^T.
+/* The dense Linear, decode rows (L339): rows_tile's arithmetic -- the same lane fragments, MMAs and k order of the
+ * fragment adds -- with each lane's activation fragment read from global memory and U 64-k steps of weight (and
+ * activation) loads issued before the first is consumed. */
+/// Grid ceil(out / (16 kDenseWarps)), 32 kDenseWarps threads, no shared memory: Y [nr][out] f32 = X W^T.
 /// @tparam NT n8 activation tiles (nr <= 8 NT).
-/// @param W the weight, bf16 [out][in].
+/// @tparam U 64-k steps whose loads are in flight.
+/// @param W the weight, bf16 [out][in], rows 16-byte aligned.
 /// @param out output width.
 /// @param in input width (a multiple of 64).
-/// @param X the rows, bf16 [nr][in].
+/// @param X the rows, bf16 [nr][in], 16-byte aligned.
 /// @param nr rows.
-/// @param Y the output, f32 [nr][out].
-template <int NT>
-__global__ void __launch_bounds__(32 * kWarps)
+/// @param Y the output, f32 [nr][out], or NULL.
+/// @param Yb the output rounded to bf16 [nr][out], or NULL.
+template <int NT, int U>
+__global__ void __launch_bounds__(32 * kDenseWarps)
 bf16_rows_dense_kernel(const __nv_bfloat16 *__restrict__ W, int out, int in, const __nv_bfloat16 *__restrict__ X,
-                       int nr, float *__restrict__ Y) {
-    extern __shared__ __align__(16) uint8_t hx[];
-    rows_tile<NT>(W, out, in, (int)blockIdx.x * kOutPerCta, X, nullptr, nullptr, 0, nr, Y, hx);
+                       int nr, float *__restrict__ Y, __nv_bfloat16 *__restrict__ Yb) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    const int r0 = ((int)blockIdx.x * kDenseWarps + warp) * 16 + g, r1 = r0 + 8;
+    const bool v0 = r0 < out, v1 = r1 < out;
+    const int nt = (nr + 7) >> 3;   /* the n8 tiles holding rows: warp-uniform */
+    const __nv_bfloat16 *w0 = W + (size_t)(v0 ? r0 : 0) * in + 16 * c;
+    const __nv_bfloat16 *w1 = W + (size_t)(v1 ? r1 : 0) * in + 16 * c;
+    const __nv_bfloat16 *xr[NT];
+    bool xv[NT];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        xv[j] = j < nt && j * 8 + g < nr;
+        xr[j] = X + (size_t)(xv[j] ? j * 8 + g : 0) * in + 16 * c;
+    }
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
+    const uint4 z4 = make_uint4(0u, 0u, 0u, 0u);
+    for (int k0 = 0; k0 < in; k0 += 64 * U) {
+        uint4 a[U][4], b[U][NT][2];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int k = k0 + 64 * u;
+            const bool kv = k < in;
+            const uint4 *p0 = reinterpret_cast<const uint4 *>(w0 + k), *p1 = reinterpret_cast<const uint4 *>(w1 + k);
+            a[u][0] = kv && v0 ? __ldcs(p0) : z4;
+            a[u][1] = kv && v0 ? __ldcs(p0 + 1) : z4;
+            a[u][2] = kv && v1 ? __ldcs(p1) : z4;
+            a[u][3] = kv && v1 ? __ldcs(p1 + 1) : z4;
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                const uint4 *px = reinterpret_cast<const uint4 *>(xr[j] + k);
+                b[u][j][0] = kv && xv[j] ? __ldg(px) : z4;
+                b[u][j][1] = kv && xv[j] ? __ldg(px + 1) : z4;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (k0 + 64 * u >= in) break;
+            /* [2s] = k 4s, 4s+1; [2s+1] = k 4s+2, 4s+3 of the lane's 16 (rows_tile's mapping) */
+            const uint32_t A0[8] = {a[u][0].x, a[u][0].y, a[u][0].z, a[u][0].w, a[u][1].x, a[u][1].y, a[u][1].z, a[u][1].w};
+            const uint32_t A1[8] = {a[u][2].x, a[u][2].y, a[u][2].z, a[u][2].w, a[u][3].x, a[u][3].y, a[u][3].z, a[u][3].w};
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                if (j >= nt) break;
+                const uint32_t B[8] = {b[u][j][0].x, b[u][j][0].y, b[u][j][0].z, b[u][j][0].w,
+                                       b[u][j][1].x, b[u][j][1].y, b[u][j][1].z, b[u][j][1].w};
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const uint32_t af[4] = {A0[2 * s], A1[2 * s], A0[2 * s + 1], A1[2 * s + 1]};
+                    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    pulsar_mma_bf16_16816(d, af, B[2 * s], B[2 * s + 1]);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) acc[j][e] += d[e];
+                }
+            }
+        }
+    }
+    /* acc[j][0..1] = row r0, call rows 8j + 2c, +1; acc[j][2..3] = row r1 */
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int t = 8 * j + 2 * c + (e & 1), row = e < 2 ? r0 : r1;
+            if (t < nr && (e < 2 ? v0 : v1)) {
+                if (Y) Y[(size_t)t * out + row] = acc[j][e];
+                if (Yb) Yb[(size_t)t * out + row] = __float2bfloat16_rn(acc[j][e]);   /* rows_emit's rounding */
+            }
+        }
 }
 
 #ifdef PULSAR_HAVE_MMQ
@@ -255,12 +337,12 @@ bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 } // namespace
 
 int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
-                                   bool prompt, cudaStream_t stream) {
+                                   uint16_t *y_bf16, bool prompt, cudaStream_t stream) {
     PULSAR_REQUIRE_CC(80, "the bf16 rows linear (bf16 m16n8k16 / cuBLASLt bf16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
-    if (!w || !x_bf16 || !y || rows <= 0 || in <= 0 || out <= 0 || in % 64 || !aligned16(w) || !aligned16(x_bf16) ||
-        !aligned16(y)) {
-        fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64 and 16-byte aligned "
-                        "weight, rows and output -- refusing\n", in, out, rows);
+    if (!w || !x_bf16 || (!y && !y_bf16) || (prompt && (!y || y_bf16)) || rows <= 0 || in <= 0 || out <= 0 || in % 64 ||
+        !aligned16(w) || !aligned16(x_bf16) || (y && !aligned16(y)) || (y_bf16 && !aligned16(y_bf16))) {
+        fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64, 16-byte aligned weight, "
+                        "rows and outputs, and an output (a prompt chunk: f32 only) -- refusing\n", in, out, rows);
         return -1;
     }
     if (prompt) {
@@ -281,18 +363,20 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
         fprintf(stderr, "pulsar: BF16 linear (bf16 rows), decode rows = the tensor-core rows kernel, %d-row blocks, "
                         "M-independent at every width (first: %d -> %d at %d rows)\n", PULSAR_BF16_ROWS_DECODE_MAX, in,
                 out, rows);
-    const dim3 grid((unsigned)((out + kOutPerCta - 1) / kOutPerCta));
+    const dim3 grid((unsigned)((out + 16 * kDenseWarps - 1) / (16 * kDenseWarps)));
     const __nv_bfloat16 *W = static_cast<const __nv_bfloat16 *>(w), *X = reinterpret_cast<const __nv_bfloat16 *>(x_bf16);
     /* decode rows past the kernel's 16 run 16-row blocks in turn: each block is the call it is alone (as the EXL3 and
      * mxfp8 decode arms do, L288 C1) */
     for (int r0 = 0; r0 < rows; r0 += PULSAR_BF16_ROWS_DECODE_MAX) {
         const int m = rows - r0 < PULSAR_BF16_ROWS_DECODE_MAX ? rows - r0 : PULSAR_BF16_ROWS_DECODE_MAX;
         if (m > 8)
-            bf16_rows_dense_kernel<2><<<grid, 32 * kWarps, stage_bytes<2>(), stream>>>(W, out, in, X + (size_t)r0 * in, m,
-                                                                                      y + (size_t)r0 * out);
+            bf16_rows_dense_kernel<2, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
+                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
+                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
         else
-            bf16_rows_dense_kernel<1><<<grid, 32 * kWarps, stage_bytes<1>(), stream>>>(W, out, in, X + (size_t)r0 * in, m,
-                                                                                      y + (size_t)r0 * out);
+            bf16_rows_dense_kernel<1, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
+                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
+                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
     }
     return launch_ok("dense") ? 0 : -3;
 }

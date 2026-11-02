@@ -15,6 +15,12 @@
  *   6. batching   16 sequences on permuted slots: ragged prefill runs (one of 70 rows), then a mixed decode +
  *                 multi-row call, then a captured verify of every sequence in ONE call committed to a different
  *                 keep each == each sequence alone, bit-exact.
+ *   8. fold       (L339) the DELTA commit folded into the slot's next call (pulsar_mamba2_call::ssm_fold): 6
+ *                 sequences on permuted slots, 12 rounds of ONE captured verify call (runs of 1..6 rows, junk after
+ *                 each run's keep) whose records alternate between two generations of the capture, each round's
+ *                 call applying the previous round's kept rows first, then a decode call folding the last ones ==
+ *                 each sequence alone, bit-exact (outputs, conv slot, SSM slot); negative controls: dropping one
+ *                 round's pending rows, or reading them from the wrong generation, must differ.
  *   7. mutations  the double reference without D, without the gate, with the norm group halved or whole, with
  *                 the B/C group map wrong, or without the conv bias must FAIL the grade (>= 10x the bar).
  * Then refusals.
@@ -211,7 +217,9 @@ static bool same_slots(const Slots &a, const Slots &b) { return same16(a.conv, b
 struct Run { uint32_t q, slot, start, count, junk_from = ~0u; };
 
 /* Runs the call; out holds call row r's output ([rows][HP]); captures when asked. */
-static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *out, bool capture) {
+static int32_t *g_fold_dev = nullptr;   /* L339: the fold table a folding call reads (section 8) */
+static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *out, bool capture,
+                const std::vector<int32_t> *fold = nullptr) {
     std::vector<int32_t> first(1, 0), slot;
     std::vector<uint16_t> hx;
     uint32_t longest = 0;
@@ -241,6 +249,12 @@ static int call(Case &c, const std::vector<Run> &runs, std::vector<uint16_t> *ou
     k.ssm_capture = capture ? c.d_scap : nullptr;
     k.scratch = c.d_scr; k.scratch_bytes = c.scr_bytes;
     k.out = c.d_out; k.ld_out = c.HP;
+    if (fold) {   /* L339: the table, and the records its pending rows index (the capture area, both generations) */
+        if (!g_fold_dev) CK(cudaMalloc(&g_fold_dev, (1 + 2 * kSlots) * 4));
+        CK(cudaMemcpy(g_fold_dev, fold->data(), fold->size() * 4, cudaMemcpyHostToDevice));
+        k.ssm_fold = g_fold_dev;
+        k.ssm_fold_rows = c.d_scap;
+    }
     const int rc = pulsar_mamba2_forward(&c.L, &k, 0);
     if (rc) return rc;
     CK(cudaDeviceSynchronize());
@@ -468,6 +482,75 @@ static void run_case(Case &c) {
                   "verify call, a different keep each) == each alone");
     }
 
+    /* 8: the fold (L339) -- rounds of captured verify calls, each applying the previous round's kept rows */
+    {
+        const uint32_t NS = 6, VR = 64, rounds = 12;
+        auto fold_run = [&](int mode, bool *same) {   /* mode 0 the fold; 1 drop round 5's pending; 2 wrong generation */
+            uint32_t slot_of[NS], len[NS];
+            for (uint32_t q = 0; q < NS; ++q) {
+                slot_of[q] = 9 + (q * 7u) % 20u;
+                len[q] = 3u + q;
+                zero_slot(c, slot_of[q]);
+            }
+            std::vector<Run> runs;
+            for (uint32_t q = 0; q < NS; ++q) runs.push_back({q, slot_of[q], 0, len[q]});
+            std::vector<uint16_t> o;
+            std::vector<Seqout> so(NS);
+            bool ok = call(c, runs, &o, false) == 0;
+            size_t r0 = 0;
+            for (uint32_t q = 0; ok && q < NS; ++q)
+                for (uint32_t r = 0; r < len[q]; ++r, ++r0) so[q].put(c, r, &o[r0 * HP]);
+            std::vector<int32_t> fold(1 + 2 * kSlots, 0);
+            for (uint32_t rd = 0; ok && rd < rounds; ++rd) {
+                const uint32_t gen = rd % 2;
+                fold[0] = (int32_t)(gen * VR);
+                uint32_t keep[NS], first[NS], f = 0;
+                runs.clear();
+                for (uint32_t q = 0; q < NS; ++q) {
+                    const uint32_t n = 1u + (q * 5u + rd * 3u) % 6u;
+                    keep[q] = 1u + (q + rd * 7u) % n;
+                    runs.push_back({q, slot_of[q], len[q], n, keep[q]});
+                    first[q] = f;
+                    f += n;
+                }
+                ok = call(c, runs, &o, true, &fold) == 0;
+                for (uint32_t q = 0; ok && q < NS; ++q) {
+                    for (uint32_t r = 0; r < keep[q]; ++r) so[q].put(c, len[q] + r, &o[(size_t)(first[q] + r) * HP]);
+                    /* the commit, folded: the kept rows pending in this generation; the conv record copied back */
+                    const uint32_t row = gen * VR + first[q] + (mode == 2 && rd == 5 ? VR : 0u);
+                    fold[1 + 2 * slot_of[q]] = (int32_t)(row % (2 * VR));
+                    fold[2 + 2 * slot_of[q]] = mode == 1 && rd == 5 ? 0 : (int32_t)keep[q];
+                    CK(cudaMemcpy(c.d_conv + slot_of[q] * c.rec, c.d_ccap + (size_t)(first[q] + keep[q] - 1) * c.rec,
+                                  c.rec * 2, cudaMemcpyDeviceToDevice));
+                    len[q] += keep[q];
+                }
+            }
+            /* a decode call folds the last round's rows */
+            runs.clear();
+            for (uint32_t q = 0; q < NS; ++q) runs.push_back({q, slot_of[q], len[q], 1});
+            ok = ok && call(c, runs, &o, false, &fold) == 0;
+            for (uint32_t q = 0; ok && q < NS; ++q) so[q].put(c, len[q], &o[(size_t)q * HP]), len[q] += 1;
+            bool eq = ok;
+            for (uint32_t q = 0; eq && q < NS; ++q) {
+                std::vector<uint16_t> alone;
+                zero_slot(c, 1);
+                eq = call(c, {{q, 1, 0, len[q]}}, &alone, false) == 0;
+                const std::vector<uint16_t> got(so[q].y.begin(), so[q].y.begin() + (size_t)len[q] * HP);
+                eq = eq && same16(got, alone) && same_slots(get_slots(c, slot_of[q]), get_slots(c, 1));
+            }
+            *same = eq;
+            return ok;
+        };
+        bool same = false;
+        const bool ran = fold_run(0, &same);
+        check(ran && same, "fold: 6 sequences, 12 rounds of one captured verify call folding the previous round's kept "
+                           "rows (two capture generations), then a folding decode == each alone (out, conv, ssm)");
+        bool s1 = true, s2 = true;
+        const bool r1 = fold_run(1, &s1), r2 = fold_run(2, &s2);
+        check(r1 && !s1, "fold negative control: dropping round 5's pending rows differs");
+        check(r2 && !s2, "fold negative control: round 5's pending rows read from the wrong generation differ");
+    }
+
     /* 7: mutations */
     for (m2ref_mut m : {M2_NO_D, M2_NO_GATE, M2_GROUP_HALF, M2_GROUP_WHOLE, M2_GROUP_MAP, M2_NO_CONV_BIAS}) {
         if (m == M2_GROUP_WHOLE && c.R.NG == (int)HP) continue;
@@ -525,6 +608,8 @@ static void refusals(Case &c) {
     t = k; t.n_seqs = 0; refused("no sequences", c.L, t);
     t = k; t.max_seq_rows = 5; refused("a longest run past the rows", c.L, t);
     t = k; t.seq_first = nullptr; refused("no row descriptors", c.L, t);
+    t = k; t.ssm_fold = c.d_first; refused("a fold table without its records (L339)", c.L, t);
+    t = k; t.ssm_fold = c.d_first; t.ssm_fold_rows = c.d_scap + 1; refused("misaligned fold records (L339)", c.L, t);
     check(pulsar_mamba2_commit(&c.L.geom, c.d_ssm, 0, c.d_scap, 0, 0) == -1, "refused: a commit of 0 rows");
     check(pulsar_mamba2_commit(&c.L.geom, c.d_ssm, 0, c.d_scap + 1, 1, 0) == -1, "refused: a misaligned DELTA record");
     L = c.L; L.geom.head_dim = 32;

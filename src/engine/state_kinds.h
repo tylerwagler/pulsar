@@ -23,7 +23,8 @@
  *               tail), overwritten as positions advance, walked into a checkpoint.  Its verify capture is one of
  *               SNAPSHOT (row r of the verify writes the state after it; a commit of `keep` rows copies row keep-1
  *               back), DELTA (row r writes its update and the verify leaves the state alone; the commit applies the
- *               kept rows -- the decl's `commit`) or, for a HOST decl, REPLAY (the bank's bytes before the step;
+ *               kept rows -- the decl's `commit`, or (L339) FOLDED: the kept rows stay PENDING and the bank's next
+ *               trunk step applies them in its own recurrent op, see THE FOLD) or, for a HOST decl, REPLAY (the bank's bytes before the step;
  *               the commit puts them back and replays the kept tokens -- the decl's `replay`).
  *   (d) STAGED  an open block of `tokens` rows that fills position by position and is flushed into a POOL when it
  *               closes (the indexer's partial block).  Capture STAGE: each run's block before the step and each
@@ -35,6 +36,18 @@
  * is one tensor per decl, [the slots carrying it][verify rows] -- slot k's rows at k * verify_rows.  Slots
  * [n_trunk, n_slots) are a drafter's layers: they trail the trunk by one row, so their pools are no segment's
  * (a payload carries them as trailing pools), they are never evicted and never captured.
+ *
+ * THE FOLD (L339).  A DELTA commit reads and rewrites a bank's whole recurrent state at every round end, and the
+ * bank's next step reads it again.  With a verify capture, the set instead records the kept rows as the bank's
+ * PENDING rows and the next trunk step's recurrent op applies them first (the commit's own arithmetic, so the same
+ * bytes), then runs its rows: one state read and write saved per layer and bank a round.  The ops read the FOLD
+ * TABLE (pulsar_state_fold_table: [0] the record row the step's capture starts at, [1 + 2 b] / [2 + 2 b] bank b's
+ * pending first row and count) and a DELTA decl's records through pulsar_state_capture_rows, both fixed device
+ * addresses (captured graphs replay them); the table's contents are uploaded in the step's host half
+ * (pulsar_state_step_begin).  A DELTA capture holds TWO generations of rows, [slot][generation][verify rows], and a
+ * verify step writes the one the pending rows are not in.  Anything else that reads the state first FLUSHES the
+ * bank (the decl's commit hook): the walk into a checkpoint / payload, and a bank whose pending rows sit in the
+ * generation a verify step is about to write.  A reset, or a walk that overwrites the state, drops them.
  *
  * THE WALK ORDER (the checkpoint slot's bytes, a payload's lanes): slots in order, each slot's decls in id order,
  * then the session decls in id order.  Pools the same way. */
@@ -155,6 +168,10 @@ typedef struct pulsar_state_set {
     pulsar_gpu_tensor *cap_runs[PULSAR_STATE_DECLS_MAX];   ///< STAGE: each run's block before the step
     uint8_t *cap_host[PULSAR_STATE_DECLS_MAX];             ///< REPLAY: each run's bank bytes before the step
     uint8_t ord[PULSAR_STATE_SLOTS_MAX][PULSAR_STATE_DECLS_MAX];   ///< a slot's index among the slots carrying a decl
+    /* L339 the fold (the header's THE FOLD) */
+    pulsar_gpu_tensor *fold_dev;   ///< int32 [1 + 2 n_banks]: the fold table the ops read; NULL = the set does not fold
+    int32_t *fold_host;            ///< its host image, the authority: [0] capture row, [1 + 2 b] / [2 + 2 b] pending
+    uint32_t cap_gen;              ///< the DELTA capture generation the current / last verify step writes (0 / 1)
     /** The last verify step's runs: run k is step rows [run_first[k], run_first[k + 1]) of bank run_bank[k] from
      *  position run_pos0[k]. */
     uint32_t n_runs;
@@ -250,6 +267,32 @@ uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, uint32_t slot, 
 static inline pulsar_gpu_tensor *pulsar_state_capture_tensor(const pulsar_state_set *ss, uint32_t id) {
     return ss->cap_rows[id];
 }
+
+/** L339 the fold table the recurrent ops read (device int32, the header's THE FOLD), NULL when the set does not fold
+ *  (no verify capture, or no DELTA decl).  A fixed address for the set's life. */
+/// @param ss the set
+/// @return the device table, or NULL
+const int32_t *pulsar_state_fold_table(const pulsar_state_set *ss);
+/** L339 a trunk step's host half begins (before any upload its launches read): a verify step takes the other DELTA
+ *  capture generation and first flushes every bank whose pending rows sit in it; then the fold table goes to the
+ *  device.  No-op when the set does not fold.  false = a flush or the upload failed (said). */
+/// @param ss     the set
+/// @param verify the step verifies (it writes a DELTA capture)
+/// @return false on a failure
+bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify);
+/** L339 a trunk step ended: on success its banks' pending rows were folded into their state (dropped here); a
+ *  failed step's banks are reset by the caller. */
+/// @param ss     the set
+/// @param bank   [n_rows] the step's row banks
+/// @param n_rows the step's rows
+/// @param ok     the step completed
+void pulsar_state_step_end(pulsar_state_set *ss, const int32_t *bank, uint32_t n_rows, bool ok);
+/** L339 apply bank `bank`'s pending DELTA rows now (the decls' commit hooks) -- before anything but a trunk step reads
+ *  its state.  No-op without pending rows.  false = a commit hook refused (said). */
+/// @param ss   the set
+/// @param bank the bank
+/// @return false on a failure
+bool pulsar_state_fold_flush(pulsar_state_set *ss, uint32_t bank);
 
 /** A verify step begins: its runs (`n_runs` runs, run k rows [run_first[k], run_first[k + 1]) of bank[run_first[k]]
  *  from pos[run_first[k]]), each run's host REPLAY state kept.  Then, on the step's stream inside its commands,

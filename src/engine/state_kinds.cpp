@@ -49,6 +49,12 @@ static uint64_t capture_row_bytes(const pulsar_state_decl *d) {
     return d->capture == PULSAR_STATE_CAPTURE_SNAPSHOT ? d->bytes : d->capture_bytes;
 }
 
+/* L339: the generations a capture holds -- a DELTA capture two (THE FOLD: the pending rows and the step's), the rest
+ * one. */
+/// @param d the decl
+/// @return 2 for a DELTA capture, else 1
+static uint64_t capture_gens(const pulsar_state_decl *d) { return d->capture == PULSAR_STATE_CAPTURE_DELTA ? 2u : 1u; }
+
 /* A plan the core can run, or the first thing that is not (rule 9: refused by name at the session's create). */
 /// @param p the plan
 /// @return NULL when the plan is runnable, else the first violation (a static buffer, overwritten by the next call)
@@ -188,6 +194,8 @@ void pulsar_state_destroy(pulsar_state_set *ss) {
         pulsar_gpu_tensor_free(ss->cap_runs[id]);
         free(ss->cap_host[id]);
     }
+    pulsar_gpu_tensor_free(ss->fold_dev);
+    free(ss->fold_host);
     free(ss->bank_pos);
     free(ss->kv_hw);
     free(ss->prefill_pos);
@@ -214,6 +222,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank) {
         if (p->decl[id].init) p->decl[id].init(ss->engine, h);
         else memset(h, 0, p->decl[id].bytes);
     }
+    if (ss->fold_host) ss->fold_host[2 + 2 * bank] = 0;   /* L339: its pending rows went with its state */
     pulsar_state_set_pos(ss, bank, 0);
     ss->prefill_pos[bank] = 0;
     ss->frontier_stale[bank] = false;
@@ -223,7 +232,8 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank) {
 }
 
 uint64_t pulsar_state_capture_offset(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
-    return (uint64_t)ss->ord[slot][id] * ss->verify_rows * capture_row_bytes(&ss->plan->decl[id]);
+    const pulsar_state_decl *d = &ss->plan->decl[id];
+    return (uint64_t)ss->ord[slot][id] * capture_gens(d) * ss->verify_rows * capture_row_bytes(d);
 }
 
 void *pulsar_state_capture_rows(const pulsar_state_set *ss, uint32_t slot, uint32_t id) {
@@ -263,6 +273,59 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss) {
     return ok;
 }
 
+/* ---- L339 the fold (state_kinds.h THE FOLD) --------------------------------------------------------------------- */
+
+const int32_t *pulsar_state_fold_table(const pulsar_state_set *ss) {
+    return ss->fold_dev ? (const int32_t *)dptr(ss->fold_dev) : NULL;
+}
+
+bool pulsar_state_fold_flush(pulsar_state_set *ss, uint32_t bank) {
+    if (!ss->fold_host || bank >= ss->n_banks) return true;
+    const int32_t row = ss->fold_host[1 + 2 * bank], keep = ss->fold_host[2 + 2 * bank];
+    if (keep <= 0) return true;
+    const pulsar_state_plan *p = ss->plan;
+    bool ok = true;
+    for (uint32_t k = 0; ok && k < p->n_trunk; k++)
+        for (uint32_t id = 0; ok && id < p->n_decl; id++)
+            if (has(p->slot[k], id) && p->decl[id].capture == PULSAR_STATE_CAPTURE_DELTA)
+                ok = p->decl[id].commit(dptr(ss->t[k][id]), bank,
+                                        (const uint8_t *)pulsar_state_capture_rows(ss, k, id) +
+                                            (uint64_t)row * p->decl[id].capture_bytes,
+                                        (uint32_t)keep);
+    if (!ok) {
+        fprintf(stderr, "pulsar: %s: bank %u's pending delta rows could not be applied\n", p->name, bank);
+        return false;
+    }
+    ss->fold_host[2 + 2 * bank] = 0;
+    return true;
+}
+
+bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify) {
+    if (!ss->fold_host) return true;
+    if (verify) {
+        /* the other generation; a bank whose pending rows sit in it (two verify steps old) is applied first */
+        ss->cap_gen ^= 1u;
+        const int32_t g0 = (int32_t)(ss->cap_gen * ss->verify_rows), g1 = g0 + (int32_t)ss->verify_rows;
+        for (uint32_t b = 0; b < ss->n_banks; b++) {
+            const int32_t row = ss->fold_host[1 + 2 * b];
+            if (ss->fold_host[2 + 2 * b] > 0 && row >= g0 && row < g1 && !pulsar_state_fold_flush(ss, b)) return false;
+        }
+        ss->fold_host[0] = g0;
+    }
+    if (!pulsar_gpu_tensor_write_async(ss->fold_dev, 0, ss->fold_host, (uint64_t)(1u + 2u * ss->n_banks) * 4u)) {
+        fprintf(stderr, "pulsar: %s: the fold table upload failed\n", ss->plan->name);
+        return false;
+    }
+    return true;
+}
+
+void pulsar_state_step_end(pulsar_state_set *ss, const int32_t *bank, uint32_t n_rows, bool ok) {
+    if (!ss->fold_host || !ok) return;
+    /* every trunk step runs every recurrent layer on each of its banks: their pending rows are in their state now */
+    for (uint32_t r = 0; r < n_rows; r++)
+        if (bank[r] >= 0 && (uint32_t)bank[r] < ss->n_banks) ss->fold_host[2 + 2 * bank[r]] = 0;
+}
+
 /** Print a commit refusal under the plan's name.
  *  @param ss   the set
  *  @param what the reason
@@ -282,15 +345,14 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
     if (keep == 0 || keep > R) return commit_fail(ss, "a commit keeps 1 .. the run's rows");
     const uint64_t VR = ss->verify_rows;
     /* L288: a DELTA state advances by the kept rows -- the verify left it as it found it -- at every keep, a full
-     * accept included */
+     * accept included.  L339: they become the bank's PENDING rows (the step's generation), applied by its next trunk
+     * step -- or by a flush, when something else reads the state first.  The verify step folded any older ones. */
     bool ok = true;
-    for (uint32_t k = 0; ok && k < p->n_trunk; k++)
-        for (uint32_t id = 0; ok && id < p->n_decl; id++)
-            if (has(p->slot[k], id) && p->decl[id].capture == PULSAR_STATE_CAPTURE_DELTA)
-                ok = p->decl[id].commit(dptr(ss->t[k][id]), bank,
-                                        (const uint8_t *)dptr(ss->cap_rows[id]) +
-                                            (ss->ord[k][id] * VR + f) * p->decl[id].capture_bytes,
-                                        keep);
+    if (ss->fold_host) {   /* a set with a DELTA capture always folds (pulsar_state_create) */
+        ok = pulsar_state_fold_flush(ss, bank);   /* none expected: the verify step carried the bank */
+        ss->fold_host[1 + 2 * bank] = (int32_t)(ss->cap_gen * VR + f);
+        ss->fold_host[2 + 2 * bank] = (int32_t)keep;
+    }
     if (!ok) return commit_fail(ss, "a verify commit of a delta state failed");
     if (keep == R) return true;
     const uint32_t p0 = (uint32_t)ss->run_pos0[run], pnext = p0 + keep;
@@ -345,6 +407,9 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
     const uint32_t bank = ss->live_bank;
     uint64_t off = slot_off;
     bool ok = true;
+    /* L339: a walk out reads the state -- its pending rows go in first; a walk in replaces it -- they are dropped */
+    if (dir == 0) ok = pulsar_state_fold_flush(ss, bank);
+    else if (dir > 0 && ss->fold_host) ss->fold_host[2 + 2 * bank] = 0;
     for (uint32_t k = 0; k < p->n_slots; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             pulsar_gpu_tensor *t = ss->t[k][id];
@@ -583,7 +648,12 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         const uint64_t rows = (uint64_t)n_l * verify_rows;
         if (d.capture == PULSAR_STATE_CAPTURE_STAGE)
             ok = (ss->cap_runs[id] = pulsar_gpu_tensor_alloc(rows * pulsar_state_decl_bank_bytes(&d))) != NULL;
-        if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(rows * capture_row_bytes(&d))) != NULL;
+        if (ok) ok = (ss->cap_rows[id] = pulsar_gpu_tensor_alloc(rows * capture_gens(&d) * capture_row_bytes(&d))) != NULL;
+        /* L339: a DELTA capture folds (state_kinds.h THE FOLD) -- the set's one fold table */
+        if (ok && d.capture == PULSAR_STATE_CAPTURE_DELTA && !ss->fold_host) {
+            ss->fold_host = (int32_t *)xcalloc(1u + 2u * n_banks, sizeof(int32_t));
+            ok = (ss->fold_dev = pulsar_gpu_tensor_alloc((uint64_t)(1u + 2u * n_banks) * 4u)) != NULL;
+        }
     }
     ss->bank_pos = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));
     ss->kv_hw = (uint32_t *)xcalloc(n_banks, sizeof(uint32_t));

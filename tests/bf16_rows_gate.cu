@@ -9,6 +9,8 @@
  *      width off 16 (4096 -> 1000) and a wide one (1024 -> 201024); M = 16 graded, and M = 1, 5, 9 and 40 (16-row
  *      blocks) BIT-IDENTICAL to the same rows at M = 16 (the decode contract: a row's bytes do not depend on the
  *      batch width);
+ *      (L339) the bf16 epilogue alone == the f32 output rounded to nearest (rows_emit's rounding), bit for bit;
+ *      a prompt chunk with a bf16 output refuses;
  *   2. dense, prompt chunks (cuBLASLt, one fixed-order kernel per shape): M = 40 graded, and the rows of a prompt cut
  *      at 1 / 7 / 33 bit-identical to the M = 40 call's (chunk invariance);
  *   3. the front door: pulsar_rows_linear_launch with a BF16 reference == the arm, bit for bit; refusals (in % 64,
@@ -24,7 +26,11 @@
  *   4''. (L296 N4) the non-gated shared expert through pulsar_rows_moe_shared_launch (BF16 4096 -> 5376 -> 4096,
  *      RELU2): up graded, the bf16 relu^2 rows within one ulp, the down graded on them, out == the routed sum + the
  *      expert's f32 output bit for bit, rows alone == batched;
- *   5. timing (information): the 4096 -> 201024 BF16 head at 1 / 4 / 16 rows.
+ *   5. timing (information): the 4096 -> 201024 BF16 head at 1 / 4 / 16 rows, and (L339) the block drafters' BF16
+ *      shapes (LiLiCorr's q / o 4096 -> 4096, k / v and conv projections 4096 -> 1024, its head's 1024 -> 1024 and
+ *      1024 -> 3072) at 1 and 8 rows;
+ *   6. (L339) BF16_ROWS_DUMP=FILE writes the dense decode outputs at those shapes (M = 1, 8, 16, 40 from a fixed
+ *      seed) to FILE: two trees' dumps compared byte for byte prove a kernel change kept every output's bits.
  *
  * usage: ./tests/bf16_rows_gate
  */
@@ -131,7 +137,7 @@ static void section_dense(void) {
         CUDA_OK(cudaMalloc((void **)&dY, (size_t)MR * out * sizeof(float)));
         auto run = [&](int M, bool prompt, int r0) {
             CUDA_OK(cudaMemset(dY, 0xff, (size_t)M * out * sizeof(float)));
-            const int rc = pulsar_bf16_rows_linear_launch(dW, dX + (size_t)r0 * in, M, in, out, dY, prompt, 0);
+            const int rc = pulsar_bf16_rows_linear_launch(dW, dX + (size_t)r0 * in, M, in, out, dY, nullptr, prompt, 0);
             CHECK(rc == 0, "%s: M=%d prompt=%d refused (rc=%d)", sh.what, M, prompt, rc);
             return download(dY, (size_t)M * out);
         };
@@ -160,6 +166,25 @@ static void section_dense(void) {
               "from the same rows of the M = 16 call", sh.what, diff);
         printf("  dense %-22s %5d -> %-6d decode M=16: worst err/sum|wx| %.2e; M=1,5,9,40 %s\n", sh.what, in, out, worst,
                diff ? "DIFFER" : "bit-identical to M=16's rows");
+        {   /* L339: the bf16 epilogue (no f32 output) == the f32 output rounded to nearest, as rows_emit rounds it */
+            uint16_t *dYb = nullptr;
+            CUDA_OK(cudaMalloc((void **)&dYb, (size_t)16 * out * 2));
+            CUDA_OK(cudaMemset(dYb, 0xff, (size_t)16 * out * 2));
+            CHECK(pulsar_bf16_rows_linear_launch(dW, dX, 16, in, out, nullptr, dYb, false, 0) == 0,
+                  "%s: the bf16-only decode launch refused", sh.what);
+            const std::vector<uint16_t> yb = download(dYb, (size_t)16 * out);
+            size_t bad = 0;
+            for (size_t i = 0; i < yb.size(); i++) {
+                const __nv_bfloat16 r = __float2bfloat16_rn(y16[i]);
+                uint16_t u;
+                memcpy(&u, &r, 2);
+                bad += yb[i] != u;
+            }
+            CHECK(bad == 0, "%s: %zu bf16 epilogue outputs != the f32 output rounded to nearest", sh.what, bad);
+            CHECK(pulsar_bf16_rows_linear_launch(dW, dX, 16, in, out, dY, dYb, true, 0) == -1,
+                  "%s: a prompt chunk with a bf16 output accepted", sh.what);
+            cudaFree(dYb);
+        }
         if (out > 100000) {
             cudaFree(dW); cudaFree(dX); cudaFree(dY);
             continue;
@@ -190,7 +215,7 @@ static void section_dense(void) {
               sh.what);
         cudaFree(dW); cudaFree(dX); cudaFree(dY);
     }
-    CHECK(pulsar_bf16_rows_linear_launch((void *)256, (const uint16_t *)256, 4, 4096 + 32, 64, (float *)256, false, 0) == -1,
+    CHECK(pulsar_bf16_rows_linear_launch((void *)256, (const uint16_t *)256, 4, 4096 + 32, 64, (float *)256, nullptr, false, 0) == -1,
           "in %% 64 != 0 accepted");
     printf("  dense refusals: in %% 64, a BF16 reference carrying an EXL3 rate -- refused\n");
 }
@@ -456,9 +481,9 @@ static void section_time(void) {
     CUDA_OK(cudaEventCreate(&e1));
     printf("  time, the BF16 head 4096 -> 201024 (1.65 GB):");
     for (const int M : {1, 4, 16}) {
-        for (int i = 0; i < 2; i++) (void)pulsar_bf16_rows_linear_launch(dW, dX, M, in, out, dY, false, 0);
+        for (int i = 0; i < 2; i++) (void)pulsar_bf16_rows_linear_launch(dW, dX, M, in, out, dY, nullptr, false, 0);
         CUDA_OK(cudaEventRecord(e0));
-        for (int i = 0; i < 10; i++) (void)pulsar_bf16_rows_linear_launch(dW, dX, M, in, out, dY, false, 0);
+        for (int i = 0; i < 10; i++) (void)pulsar_bf16_rows_linear_launch(dW, dX, M, in, out, dY, nullptr, false, 0);
         CUDA_OK(cudaEventRecord(e1));
         CUDA_OK(cudaEventSynchronize(e1));
         float ms = 0;
@@ -471,6 +496,73 @@ static void section_time(void) {
     cudaFree(dW); cudaFree(dX); cudaFree(dY);
 }
 
+/* 5'. the block drafters' BF16 Linears at their decode widths (L339) */
+struct dshape { int in, out; const char *what; };
+static const dshape k_draft_shapes[] = {{4096, 4096, "q / o 4096 -> 4096"}, {4096, 1024, "k / v / conv 4096 -> 1024"},
+                                        {1024, 1024, "head 1024 -> 1024"}, {1024, 3072, "head 1024 -> 3072"}};
+static void section_time_drafter(void) {
+    cudaEvent_t e0, e1;
+    CUDA_OK(cudaEventCreate(&e0));
+    CUDA_OK(cudaEventCreate(&e1));
+    for (const dshape &sh : k_draft_shapes) {
+        /* a weight set larger than the L2 (cycled), so each call reads DRAM as a served pass does */
+        const int sets = (int)(64ll * 1024 * 1024 / ((long long)sh.out * sh.in * 2)) + 1;
+        uint16_t *dW = nullptr, *dX = nullptr;
+        float *dY = nullptr;
+        const size_t wb = (size_t)sh.out * sh.in * 2;
+        CUDA_OK(cudaMalloc((void **)&dW, wb * sets));
+        CUDA_OK(cudaMemset(dW, 0x3c, wb * sets));
+        CUDA_OK(cudaMalloc((void **)&dX, (size_t)16 * sh.in * 2));
+        CUDA_OK(cudaMemset(dX, 0x3c, (size_t)16 * sh.in * 2));
+        CUDA_OK(cudaMalloc((void **)&dY, (size_t)16 * sh.out * 4));
+        printf("  time, drafter %-26s", sh.what);
+        for (const int M : {1, 8}) {
+            const int reps = 20 * sets;
+            for (int i = 0; i < sets; i++)
+                (void)pulsar_bf16_rows_linear_launch((const char *)dW + wb * i, dX, M, sh.in, sh.out, dY, nullptr, false, 0);
+            CUDA_OK(cudaEventRecord(e0));
+            for (int i = 0; i < reps; i++)
+                (void)pulsar_bf16_rows_linear_launch((const char *)dW + wb * (i % sets), dX, M, sh.in, sh.out, dY, nullptr, false, 0);
+            CUDA_OK(cudaEventRecord(e1));
+            CUDA_OK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("  %d rows %6.1f us (%3.0f GB/s)", M, ms * 1e3 / reps, (double)wb / (ms / reps * 1e-3) / 1e9);
+        }
+        printf("\n");
+        cudaFree(dW); cudaFree(dX); cudaFree(dY);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+}
+
+/* 6. the dense decode outputs at the drafter shapes, from a fixed seed, to BF16_ROWS_DUMP (L339) */
+static void section_dump(void) {
+    const char *path = getenv("BF16_ROWS_DUMP");
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "wb");
+    CHECK(f, "cannot write %s", path);
+    if (!f) return;
+    g_rng = 0xD0D0CAFEF00DULL;
+    size_t bytes = 0;
+    for (const dshape &sh : k_draft_shapes) {
+        const std::vector<uint16_t> W = rnd_bf16((size_t)sh.out * sh.in, 0.02, sh.in), X = rnd_bf16((size_t)40 * sh.in, 1.0, sh.in);
+        uint16_t *dW = upload(W), *dX = upload(X);
+        float *dY = nullptr;
+        CUDA_OK(cudaMalloc((void **)&dY, (size_t)40 * sh.out * sizeof(float)));
+        for (const int M : {1, 8, 16, 40}) {
+            CUDA_OK(cudaMemset(dY, 0xff, (size_t)M * sh.out * sizeof(float)));
+            CHECK(pulsar_bf16_rows_linear_launch(dW, dX, M, sh.in, sh.out, dY, nullptr, false, 0) == 0, "dump %s M=%d refused",
+                  sh.what, M);
+            const std::vector<float> y = download(dY, (size_t)M * sh.out);
+            bytes += fwrite(y.data(), sizeof(float), y.size(), f) * sizeof(float);
+        }
+        cudaFree(dW); cudaFree(dX); cudaFree(dY);
+    }
+    fclose(f);
+    printf("  dump: the dense decode outputs at the drafter shapes, M = 1 / 8 / 16 / 40 (%zu bytes) -> %s\n", bytes, path);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("bf16-rows-gate: BF16 weights x raw bf16 rows (dense and routed) vs double\n");
@@ -479,6 +571,8 @@ int main(void) {
     section_routed(PULSAR_FFN_ACT_RELU2);
     section_shared_relu2();
     section_time();
+    section_time_drafter();
+    section_dump();
     printf(g_fail ? "BF16-ROWS GATE FAIL\n" : "BF16-ROWS GATE PASS\n");
     return g_fail;
 }
