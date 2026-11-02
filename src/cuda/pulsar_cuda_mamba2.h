@@ -55,6 +55,9 @@
  *         dt [H], dA [H] (f32) -- and pulsar_mamba2_commit advances a slot by
  *         any prefix of a sequence's rows with exactly the forward's
  *         operations, so the state is BIT-IDENTICAL to a forward over them.
+ *         L339: the commit may instead be FOLDED into the slot's next call
+ *         (pulsar_mamba2_call::ssm_fold): the call applies the kept rows with
+ *         the same operations before its own, so the state is the same bytes.
  *   A fresh sequence starts from zeroed slots.  Both captures or neither. */
 #ifndef PULSAR_CUDA_MAMBA2_H
 #define PULSAR_CUDA_MAMBA2_H
@@ -115,7 +118,16 @@ typedef struct {
     uint16_t *conv_state;     /**< bf16 pool, pulsar_mamba2_conv_state_elems a slot */
     float    *ssm_state;      /**< f32 pool, pulsar_mamba2_ssm_state_floats a slot, 16-byte aligned */
     uint16_t *conv_capture;   /**< NULL, or the SNAPSHOT records: one conv slot per call row */
-    float    *ssm_capture;    /**< NULL, or the DELTA records: pulsar_mamba2_upd_floats per call row */
+    float    *ssm_capture;    /**< NULL, or the DELTA records: pulsar_mamba2_upd_floats per call row (from ssm_fold[0]) */
+    /** L339 the DELTA fold, or NULL (no pending rows; a capture's call row r at record r).  Device int32 table:
+     *  [0] the record row this call's capture starts at (call row r's record is ssm_capture + (ssm_fold[0] + r) *
+     *  pulsar_mamba2_upd_floats); [1 + 2 s] / [2 + 2 s] slot s's PENDING records -- the first row in ssm_fold_rows and
+     *  the count, 0 = none.  A sequence on a slot with pending rows applies them first with the commit's own
+     *  arithmetic (its state is then the bytes pulsar_mamba2_commit would have left), and its state is stored after
+     *  them even under a capture.  The pending rows must not be ones this call's capture writes. */
+    const int32_t *ssm_fold;
+    /** L339 the DELTA records ssm_fold's pending rows index (16-byte aligned); set with ssm_fold. */
+    const float *ssm_fold_rows;
     void     *scratch;        /**< >= pulsar_mamba2_scratch_bytes(geom, n_rows), 16-byte aligned */
     /** Bytes at scratch (refused below pulsar_mamba2_scratch_bytes). */
     size_t    scratch_bytes;

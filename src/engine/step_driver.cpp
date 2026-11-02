@@ -335,8 +335,11 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     if (st.verify) pulsar_state_verify_begin(ss, n_vruns, run_first, bank, pos);
     /* L296 N9: the verify rows' tokens, which the MTP lane's absorb pairs a bank's still-parked row with */
     if (st.verify && d->mtp) pulsar_mtp_note_verify(d->mtp, tokens, n_verify);
-    /* L289: enqueued, not waited for -- the step's uploads never drain the stream */
-    bool ok = pulsar_gpu_tensor_write_async(d->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
+    /* L339: the DELTA fold's table (state_kinds.h THE FOLD) -- a verify step's capture generation, the pending rows
+     * every recurrent op of the step applies first -- before the uploads; L289: enqueued, not waited for -- the
+     * step's uploads never drain the stream */
+    bool ok = pulsar_state_step_begin(ss, st.verify) &&
+              pulsar_gpu_tensor_write_async(d->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write_async(d->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
     int32_t rf[PULSAR_DRIVER_HEADS_MAX + 1];
     if (ok && n_vruns > 1) {   /* a ragged verify's runs (the recurrent ops read them on the device) */
@@ -412,6 +415,7 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     /* the family's step end: settles what a failed step left in flight and, on a completed step, its own checks
      * (rule 9) */
     ok = ops->step_end(&st, ok);
+    pulsar_state_step_end(ss, bank, n_rows, ok);   /* L339: the step's banks folded their pending rows */
     if (!ok) {
         /* the step may have advanced any of its banks' state before it failed: those banks start over, and the
          * live bank's checkpoint no longer describes its state */

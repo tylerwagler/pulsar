@@ -94,6 +94,35 @@ mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint
     mamba2_dt(dt_raw[(uint64_t)row * ld_dt + h], dt_bias[h], A_log[h], &dt_out[i], &dA_out[i]);
 }
 
+/* ---- one DELTA record applied to a thread's state slice: the scan's own update on the recorded values ---- */
+/// Apply DELTA record U to a scan thread's NPT state columns -- S = fmaf(dt * B, x, dA * S), each op rounded, the
+/// scan's row update on the values it recorded.  The commit and the scan's fold (L339) both run it, so a state
+/// advanced either way is the same bytes.
+/// @param s   the thread's state slice (columns q * NPT .. q * NPT + NPT - 1 of row p of head h), updated.
+/// @param U   the record, f32: x [H*P], B [G*N], dt [H], dA [H].
+/// @param h   the head.
+/// @param p   the state row (head_dim index).
+/// @param q   the column quarter.
+/// @param g   h's B / C group.
+/// @param H   heads.
+/// @param HP  H * P.
+/// @param GN  G * N.
+__device__ __forceinline__ void mamba2_apply_delta(float (&s)[NPT], const float *__restrict__ U, uint32_t h,
+                                                   uint32_t p, int q, uint32_t g, uint32_t H, uint32_t HP,
+                                                   uint32_t GN) {
+    const float xv = U[h * P + p], dt = U[HP + GN + h], da = U[HP + GN + H + h];
+    const float4 *b4 = reinterpret_cast<const float4 *>(U + HP + (uint64_t)g * N + q * NPT);
+#pragma unroll
+    for (int i = 0; i < NPT / 4; ++i) {
+        const float4 b = b4[i];
+        float *si = &s[4 * i];
+        si[0] = __fmaf_rn(__fmul_rn(dt, b.x), xv, __fmul_rn(da, si[0]));
+        si[1] = __fmaf_rn(__fmul_rn(dt, b.y), xv, __fmul_rn(da, si[1]));
+        si[2] = __fmaf_rn(__fmul_rn(dt, b.z), xv, __fmul_rn(da, si[2]));
+        si[3] = __fmaf_rn(__fmul_rn(dt, b.w), xv, __fmul_rn(da, si[3]));
+    }
+}
+
 /* ---- 3. the scan ------------------------------------------------------------------------------------- */
 /// The scan kernel's arguments (passed by value).
 struct scan_args {
@@ -119,8 +148,13 @@ struct scan_args {
      *  [n_seqs] each sequence's pool slot. */
     /// SSM state pool, f32 [slots][H][P][N].
     float *ssm;                    /* pool */
-    /// The verify's DELTA records, f32 [rows][upd] = x [H*P], dt*B [G*N], dt [H], dA [H]; or NULL (then the state is written back).
+    /// The verify's DELTA records, f32 [rows][upd] = x [H*P], B [G*N], dt [H], dA [H]; or NULL (then the state is written
+    /// back).  With `fold`, call row r's record is at cap + (fold[0] + r) * upd.
     float *cap;                    /* DELTA records, or NULL */
+    /// L339 the fold table (pulsar_mamba2_call::ssm_fold), or NULL: no pending rows, records from row 0.
+    const int32_t *fold;
+    /// L339 the records the fold table's pending rows index (pulsar_mamba2_call::ssm_fold_rows).
+    const float *fold_rows;
     /// Out: the scan output y, bf16 [rows][H*P].
     uint16_t *y;                   /* [rows][H*P] */
     /// Heads.
@@ -151,13 +185,29 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
     const int32_t T = a.seq_first[seq + 1] - r0;
     const uint64_t slot = (uint64_t)a.seq_slot[seq];
     float *S = a.ssm + slot * HP * N + (uint64_t)h * P * N + (uint64_t)(ph * PC + pl) * N + q * NPT;
-    const bool cap_b = a.cap && ph == 0 && h % (a.H / a.G) == 0;   /* the CTA that records its group's B */
+    /* the call's records: from the fold table's first row (L339: the capture generation), else row 0 */
+    float *const cap = a.cap ? a.cap + (uint64_t)(a.fold ? a.fold[0] : 0) * a.upd : nullptr;
+    const bool cap_b = cap && ph == 0 && h % (a.H / a.G) == 0;   /* the CTA that records its group's B */
 
     float s[NPT];
 #pragma unroll
     for (int i = 0; i < NPT / 4; ++i) {
         const float4 v = reinterpret_cast<const float4 *>(S)[i];
         s[4 * i] = v.x; s[4 * i + 1] = v.y; s[4 * i + 2] = v.z; s[4 * i + 3] = v.w;
+    }
+    /* L339: the slot's pending DELTA rows (its last verify's kept rows, not yet committed) first -- the commit's own
+     * update, so the state is the bytes a commit would have left.  A verify call then stores that state back (its
+     * own rows never reach the pool); any other call stores the state after its rows, below. */
+    const int32_t pk = a.fold ? a.fold[2 + 2 * slot] : 0;
+    if (pk > 0) {
+        const float *U = a.fold_rows + (uint64_t)a.fold[1 + 2 * slot] * a.upd;
+        for (int32_t r = 0; r < pk; ++r, U += a.upd)
+            mamba2_apply_delta(s, U, h, ph * PC + pl, q, g, a.H, HP, GN);
+        if (cap) {
+#pragma unroll
+            for (int i = 0; i < NPT / 4; ++i)
+                reinterpret_cast<float4 *>(S)[i] = make_float4(s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]);
+        }
     }
     const float Dh = bf2f(a.D[h]);
 
@@ -179,7 +229,7 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
                 sc[j][n8 + 2 * k + 1] = bf2f((uint16_t)(cu[k] >> 16));
             }
             if (cap_b) {
-                float *U = a.cap + row * a.upd + HP + (uint64_t)g * N + n8;
+                float *U = cap + row * a.upd + HP + (uint64_t)g * N + n8;
 #pragma unroll
                 for (int k = 0; k < 8; ++k) U[k] = sdb[j][n8 + k];
             }
@@ -235,17 +285,17 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
             const float sum = __fadd_rn(__fadd_rn(part[j][0][pp], part[j][1][pp]), __fadd_rn(part[j][2][pp], part[j][3][pp]));
             const uint32_t col = h * P + ph * PC + pp;
             a.y[row * HP + col] = f2bf(__fmaf_rn(Dh, sx[j][pp], sum));
-            if (a.cap) a.cap[row * a.upd + col] = sx[j][pp];
+            if (cap) cap[row * a.upd + col] = sx[j][pp];
         }
-        if (a.cap && ph == 0 && tid < tn) {
-            float *U = a.cap + (uint64_t)(r0 + t0 + tid) * a.upd + HP + GN;
+        if (cap && ph == 0 && tid < tn) {
+            float *U = cap + (uint64_t)(r0 + t0 + tid) * a.upd + HP + GN;
             U[h] = sdt[tid];
             U[a.H + h] = sda[tid];
         }
         __syncthreads();   /* the staging buffers are rewritten by the next tile */
     }
 
-    if (!a.cap) {
+    if (!cap) {
 #pragma unroll
         for (int i = 0; i < NPT / 4; ++i)
             reinterpret_cast<float4 *>(S)[i] = make_float4(s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]);
@@ -274,20 +324,7 @@ mamba2_commit_kernel(float *__restrict__ ssm, const float *__restrict__ upd, uin
         const float4 v = reinterpret_cast<const float4 *>(S)[i];
         s[4 * i] = v.x; s[4 * i + 1] = v.y; s[4 * i + 2] = v.z; s[4 * i + 3] = v.w;
     }
-    for (uint32_t r = 0; r < keep; ++r) {
-        const float *U = upd + (uint64_t)r * upd_floats;
-        const float xv = U[h * P + p], dt = U[HP + GN + h], da = U[HP + GN + H + h];
-        const float4 *b4 = reinterpret_cast<const float4 *>(U + HP + (uint64_t)g * N + q * NPT);
-#pragma unroll
-        for (int i = 0; i < NPT / 4; ++i) {
-            const float4 b = b4[i];
-            float *si = &s[4 * i];
-            si[0] = __fmaf_rn(__fmul_rn(dt, b.x), xv, __fmul_rn(da, si[0]));
-            si[1] = __fmaf_rn(__fmul_rn(dt, b.y), xv, __fmul_rn(da, si[1]));
-            si[2] = __fmaf_rn(__fmul_rn(dt, b.z), xv, __fmul_rn(da, si[2]));
-            si[3] = __fmaf_rn(__fmul_rn(dt, b.w), xv, __fmul_rn(da, si[3]));
-        }
-    }
+    for (uint32_t r = 0; r < keep; ++r) mamba2_apply_delta(s, upd + (uint64_t)r * upd_floats, h, p, q, g, H, HP, GN);
 #pragma unroll
     for (int i = 0; i < NPT / 4; ++i)
         reinterpret_cast<float4 *>(S)[i] = make_float4(s[4 * i], s[4 * i + 1], s[4 * i + 2], s[4 * i + 3]);
@@ -435,6 +472,8 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
         return refuse("a verify captures both states (conv SNAPSHOT and SSM DELTA) or neither");
     if (c->ssm_capture && (!aligned16(c->ssm_capture) || !aligned16(c->conv_capture)))
         return refuse("the captures must be 16-byte aligned");
+    if ((c->ssm_fold == nullptr) != (c->ssm_fold_rows == nullptr) || (c->ssm_fold_rows && !aligned16(c->ssm_fold_rows)))
+        return refuse("the fold needs its table and its records (16-byte aligned) together");
     if (!c->scratch || !aligned16(c->scratch) || c->scratch_bytes < pulsar_mamba2_scratch_bytes(g, rows))
         return refuse("scratch missing, misaligned or short of pulsar_mamba2_scratch_bytes");
     {
@@ -485,6 +524,7 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     a.D = L->D;
     a.seq_first = c->seq_first; a.seq_slot = c->seq_slot;
     a.ssm = c->ssm_state; a.cap = c->ssm_capture; a.y = y;
+    a.fold = c->ssm_fold; a.fold_rows = c->ssm_fold_rows;
     a.H = H; a.G = g->n_groups; a.CC = CC; a.upd = (uint32_t)pulsar_mamba2_upd_floats(g);
     mamba2_scan_kernel<<<dim3(c->n_seqs, H, PS), NT, 0, stream>>>(a);
 

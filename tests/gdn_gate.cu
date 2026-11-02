@@ -18,6 +18,10 @@
  *                 and the reference with the GQA map tiled or the q scale
  *                 dropped must FAIL against the kernel.
  *   7. refusals   contract violations return -1 and launch nothing.
+ *   8. ragged runs + the verify capture + the commit at every keep; (L339) the FOLD: for every run and keep, a call
+ *                 that applies the pending rows (pulsar_gdn_call::rec_fold) == the commit then the call (output,
+ *                 both states), and a captured call that folds leaves the committed state and writes the records
+ *                 the same captured call writes from it, at the table's first row.
  *
  * The fixture is live: heavy-tailed inputs with outlier channels, decays from
  * ~0.5 to ~0.9999, random initial states; the log prints rms and median error
@@ -544,6 +548,84 @@ int main() {
               "bit-identical (%d differ)", n_keep, differ);
         check(pulsar_gdn_commit(R.d_rs, 1, dub, 0, 1, 0) != 0 && pulsar_gdn_commit(nullptr, 1, dub, 1, 1, 0) != 0,
               "the commit refuses keep 0 and a null state");
+        /* L339 the fold: slot 1's pending rows = run i's first `keep` stored updates (in dub) */
+        {
+            const int RS = Rig::SLOTS, wrow = 32;
+            int32_t *dfold = dalloc<int32_t>(1 + 2 * RS);
+            float *drec = dalloc<float>(UF * (wrow + 8)), *drec0 = dalloc<float>(UF * 8);
+            int bad_plain = 0, bad_cap = 0, cases = 0;
+            auto fold_tab = [&](int first_row, int keep) {
+                std::vector<int32_t> t(1 + 2 * RS, 0);
+                t[0] = wrow; t[1 + 2 * 1] = first_row; t[2 + 2 * 1] = keep;
+                h2d(dfold, t.data(), t.size());
+            };
+            const std::vector<int32_t> one3(3, 1);
+            for (size_t i = 0; i < lens.size(); i++)
+                for (int keep = 1; keep <= lens[i]; keep++) {
+                    /* the commit, then a plain 2-row call / a captured 3-row call */
+                    R.set_slot(1, cs_i[i], rs_i[i]);
+                    ok = pulsar_gdn_commit(R.d_rs, 1, dub + UF * first[i], keep, 1, 0) == 0;
+                    std::vector<float> csc, rsc; R.get_slot(1, csc, rsc);
+                    h2d(R.d_slot, one3.data(), 3);
+                    pulsar_gdn_call a = mk(300, false);
+                    a.n_seq = 1; a.seq_rows = 2;
+                    ok = ok && pulsar_gdn_forward(&w, &a, 0) == 0;
+                    CK(cudaDeviceSynchronize());
+                    const std::vector<float> ya = R.out(300, 2);
+                    std::vector<float> csa, rsa; R.get_slot(1, csa, rsa);
+                    R.set_slot(1, csc, rsc);
+                    pulsar_gdn_call ac = mk(310, true);
+                    ac.rec_upd = drec0; ac.n_seq = 1; ac.seq_rows = 3;
+                    ok = ok && pulsar_gdn_forward(&w, &ac, 0) == 0;
+                    CK(cudaDeviceSynchronize());
+                    const std::vector<float> yac = R.out(310, 3);
+                    std::vector<float> rec0(UF * 3); d2h(rec0.data(), drec0, rec0.size());
+                    /* the same two calls folding the pending rows instead */
+                    R.set_slot(1, cs_i[i], rs_i[i]);
+                    fold_tab(first[i], keep);
+                    pulsar_gdn_call b = mk(300, false);
+                    b.n_seq = 1; b.seq_rows = 2; b.rec_fold = dfold; b.rec_fold_rows = dub;
+                    ok = ok && pulsar_gdn_forward(&w, &b, 0) == 0;
+                    CK(cudaDeviceSynchronize());
+                    const std::vector<float> yb2 = R.out(300, 2);
+                    std::vector<float> csb2, rsb2; R.get_slot(1, csb2, rsb2);
+                    bad_plain += !ok || !same(ya, yb2) || !same(csa, csb2) || !same(rsa, rsb2);
+                    R.set_slot(1, cs_i[i], rs_i[i]);
+                    pulsar_gdn_call bc = mk(310, true);
+                    bc.rec_upd = drec; bc.n_seq = 1; bc.seq_rows = 3; bc.rec_fold = dfold; bc.rec_fold_rows = dub;
+                    ok = ok && pulsar_gdn_forward(&w, &bc, 0) == 0;
+                    CK(cudaDeviceSynchronize());
+                    const std::vector<float> ybc = R.out(310, 3);
+                    std::vector<float> csd, rsd; R.get_slot(1, csd, rsd);
+                    std::vector<float> rec1(UF * 3); d2h(rec1.data(), drec + UF * wrow, rec1.size());
+                    bad_cap += !ok || !same(yac, ybc) || !same(rsd, rsc) || !same(rec0, rec1);
+                    cases++;
+                }
+            check(bad_plain == 0, "fold: a call applying the pending rows == the commit then the call, every run and keep "
+                  "(%d cases; %d differ): output, conv state, recurrent state", cases, bad_plain);
+            check(bad_cap == 0, "fold under a capture: the committed state left, the records == the captured call's from "
+                  "it at the table's first row, the output equal (%d cases; %d differ)", cases, bad_cap);
+            /* negative control: no pending rows differs from the commit */
+            R.set_slot(1, cs_i[0], rs_i[0]);
+            fold_tab(first[0], 0);
+            pulsar_gdn_call nb = mk(300, false);
+            nb.n_seq = 1; nb.seq_rows = 2; nb.rec_fold = dfold; nb.rec_fold_rows = dub;
+            const int nrc = pulsar_gdn_forward(&w, &nb, 0);
+            CK(cudaDeviceSynchronize());
+            std::vector<float> csn, rsn; R.get_slot(1, csn, rsn);
+            R.set_slot(1, cs_i[0], rs_i[0]);
+            pulsar_gdn_commit(R.d_rs, 1, dub, lens[0], 1, 0);
+            pulsar_gdn_call na = mk(300, false);
+            na.n_seq = 1; na.seq_rows = 2;
+            pulsar_gdn_forward(&w, &na, 0);
+            CK(cudaDeviceSynchronize());
+            std::vector<float> csm, rsm; R.get_slot(1, csm, rsm);
+            check(nrc == 0 && !same(rsn, rsm), "fold negative control: a table with no pending rows != the commit then the call");
+            pulsar_gdn_call rf = mk(300, false);
+            rf.n_seq = 1; rf.seq_rows = 2; rf.rec_fold = dfold;
+            check(pulsar_gdn_forward(&w, &rf, 0) == -1, "refused: a fold table without its records");
+            cudaFree(dfold); cudaFree(drec); cudaFree(drec0);
+        }
         cudaFree(dfirst); cudaFree(dcr); cudaFree(dru); cudaFree(dub);
     }
 

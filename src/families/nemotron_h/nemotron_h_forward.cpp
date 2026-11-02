@@ -930,6 +930,11 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
     if (!ts || !tc) return failf("no Mamba-2 state", il);
     const rows_scratch R = rows_layout(q->max_rows);
     uint8_t *rt = (uint8_t *)dptr(q->scratch[ARENA_ROWS]);
+    /* L339: the DELTA fold (state_kinds.h THE FOLD) -- every call applies its slots' pending rows first */
+    const int32_t *fold = pulsar_state_fold_table(st->states);
+    const float *fold_rows = fold ? (const float *)pulsar_state_capture_rows(st->states, il, PULSAR_NEMOTRON_H_STATE_SSM)
+                                  : NULL;
+    if (fold && !fold_rows) return failf("a folding state with no Mamba-2 delta records", il);
     for (int call = 0; call < 2; call++) {
         const bool cap = call == 0;
         const uint32_t r0 = cap ? 0u : q->rows_cap, r1 = cap ? q->rows_cap : n;
@@ -950,6 +955,8 @@ bool mamba(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) 
         c.ld_dt = md.in;
         c.conv_state = (uint16_t *)dptr(tc);
         c.ssm_state = (float *)dptr(ts);
+        c.ssm_fold = fold;
+        c.ssm_fold_rows = fold_rows;
         if (cap) {
             c.conv_capture = (uint16_t *)pulsar_state_capture_rows(st->states, il, PULSAR_NEMOTRON_H_STATE_CONV);
             c.ssm_capture = (float *)pulsar_state_capture_rows(st->states, il, PULSAR_NEMOTRON_H_STATE_SSM);

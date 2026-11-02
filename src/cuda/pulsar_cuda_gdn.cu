@@ -265,6 +265,16 @@ gdn_conv_rows_kernel(const float *__restrict__ qkv, int ld_qkv, int seq_rows, co
  * distributed shared memory and every CTA sums them in rank order.  The CTA's
  * 32 columns are one MX block, so the E4M3 emission is the canonical warp
  * encoder. */
+/// One state element advanced by one stored update: S = fmaf(k^_k, delta_v, decay * S), the recurrence's own
+/// operation.  The recurrence, its fold of pending rows (L339) and the commit all run it, so a state advanced any of
+/// those ways is the same bytes.
+/// @param s   the element.
+/// @param k   k^ of its state row.
+/// @param d   delta of its column.
+/// @param dec the head's decay.
+/// @return the advanced element.
+__device__ __forceinline__ float gdn_delta_elem(float s, float k, float d, float dec) { return fmaf(k, d, dec * s); }
+
 /// Tokens staged in shared memory per kernel-2 tile.
 constexpr int T2 = 8;                        /* tokens staged per tile */
 /// Warps per kernel-2 CTA (256 threads).
@@ -311,7 +321,10 @@ struct gdn_no_cluster {
  *  @param seq_first  [n_seq + 1] ragged row offsets, or NULL.
  *  @param row_slot   per-row state slot (a sequence's first row's is its slot).
  *  @param rec_state  recurrent-state pool, Sh::REC_STATE floats per slot, [NV][DK][DV].
- *  @param rec_upd    verify only: out f32 [rows][Sh::UPD] update records, or NULL (then the state is written back).
+ *  @param rec_upd    verify only: out f32 [rows][Sh::UPD] update records (from row fold[0] with a fold table), or NULL
+ *                    (then the state is written back).
+ *  @param fold       L339 the fold table (pulsar_gdn_call::rec_fold), or NULL.
+ *  @param fold_rows  L339 the records its pending rows index (pulsar_gdn_call::rec_fold_rows).
  *  @param out_f32    out f32 [rows][Sh::VDIM], or NULL.
  *  @param out_bf16   out bf16 [rows][Sh::VDIM], or NULL.
  *  @param out_q      out MX E4M3 data [rows][Sh::VDIM], or NULL.
@@ -328,6 +341,8 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const int32_t *__restrict__ row_slot,
                       float *__restrict__ rec_state,
                       float *__restrict__ rec_upd,
+                      const int32_t *__restrict__ fold,
+                      const float *__restrict__ fold_rows,
                       float *__restrict__ out_f32,
                       __nv_bfloat16 *__restrict__ out_bf16,
                       __nv_fp8_e4m3 *__restrict__ out_q,
@@ -357,10 +372,28 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
     const int r0   = seq_first ? seq_first[seq] : seq * seq_rows;
     const int T    = seq_first ? seq_first[seq + 1] - r0 : seq_rows;
 
-    float *S = rec_state + (size_t)row_slot[r0] * Sh::REC_STATE + (size_t)h * DK * DV;
+    const int slot = row_slot[r0];
+    float *S = rec_state + (size_t)slot * Sh::REC_STATE + (size_t)h * DK * DV;
     float s[RPW];
     #pragma unroll
     for (int i = 0; i < RPW; i++) s[i] = S[(w * RPW + i) * DV + col];
+    /* L339: the call's records from the fold table's first row (the capture generation), else row 0; then the
+     * slot's pending rows (its last verify's kept rows, not yet committed) with the commit's own operation -- a
+     * verify call stores that state back at once (its own rows never reach the pool) */
+    if (rec_upd && fold) rec_upd += (size_t)fold[0] * Sh::UPD;
+    const int pk = fold ? fold[2 + 2 * slot] : 0;
+    if (pk > 0) {
+        const float *U = fold_rows + (size_t)fold[1 + 2 * slot] * Sh::UPD;
+        for (int r = 0; r < pk; r++, U += Sh::UPD) {
+            const float dec = U[Sh::U_DEC + h], d = U[h * DV + col];
+            #pragma unroll
+            for (int i = 0; i < RPW; i++) s[i] = gdn_delta_elem(s[i], U[Sh::U_K + kh * DK + w * RPW + i], d, dec);
+        }
+        if (rec_upd) {
+            #pragma unroll
+            for (int i = 0; i < RPW; i++) S[(w * RPW + i) * DV + col] = s[i];
+        }
+    }
 
     const float nw = __uint_as_float((uint32_t)norm_w[col] << 16);
     int par = 0, tpar = 0;
@@ -413,7 +446,7 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
             const float d = sbeta[j] * (vv - dec * acc.x);
             if (w == 0) so[j][lane] = fmaf(d, KQ, dec * acc.y);
             #pragma unroll
-            for (int i = 0; i < RPW; i++) s[i] = fmaf(kr[i], d, dec * s[i]);
+            for (int i = 0; i < RPW; i++) s[i] = gdn_delta_elem(s[i], kr[i], d, dec);
             if (rec_upd) {                                   /* L288: the row's update, for the commit */
                 float *U = rec_upd + (size_t)(r0 + t0 + j) * Sh::UPD;
                 if (w == 0) U[h * DV + col] = d;
@@ -486,10 +519,10 @@ gdn_commit_kernel(float *__restrict__ S, const float *__restrict__ upd, int keep
         const float *U = upd + (size_t)r * Sh::UPD;
         const float dec = U[Sh::U_DEC + h], kk = U[Sh::U_K + kh * DK + k];
         const float4 d = reinterpret_cast<const float4 *>(U + h * DV)[q];
-        s.x = fmaf(kk, d.x, dec * s.x);
-        s.y = fmaf(kk, d.y, dec * s.y);
-        s.z = fmaf(kk, d.z, dec * s.z);
-        s.w = fmaf(kk, d.w, dec * s.w);
+        s.x = gdn_delta_elem(s.x, kk, d.x, dec);
+        s.y = gdn_delta_elem(s.y, kk, d.y, dec);
+        s.z = gdn_delta_elem(s.z, kk, d.z, dec);
+        s.w = gdn_delta_elem(s.w, kk, d.w, dec);
     }
     *p = s;
 }
@@ -569,6 +602,8 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
     const int tiles = (c->seq_rows + T1 - 1) / T1;
     if ((c->conv_rows == nullptr) != (c->rec_upd == nullptr))
         return refuse("the verify capture needs both row buffers");
+    if ((c->rec_fold == nullptr) != (c->rec_fold_rows == nullptr) || (c->rec_fold_rows && !aligned16(c->rec_fold_rows)))
+        return refuse("the fold needs its table and its records (16-byte aligned) together");
     if (c->conv_rows && c->seq_rows > 1)
         gdn_conv_rows_kernel<TP><<<dim3((unsigned)(c->n_seq * (c->seq_rows - 1)), Sh::CONV_HEADS), 128, 0, stream>>>(
             c->qkv, c->ld_qkv, c->seq_rows, c->seq_first, c->row_slot, c->conv_state, c->conv_rows);
@@ -578,7 +613,7 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
         c->seq_rows, c->seq_first, c->row_slot, c->conv_state, qkvn, gb, tiles);
     gdn_recur_norm_kernel<TP><<<dim3((unsigned)c->n_seq, Sh::NV, VQ), 256, 0, stream>>>(
         qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->seq_first, c->row_slot, c->rec_state, c->rec_upd,
-        c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
+        c->rec_fold, c->rec_fold_rows, c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
         static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
