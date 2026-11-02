@@ -23,7 +23,10 @@
 //              rows (the MMA's M: rows past M are zero, so M = 1..16 is one
 //              kernel and a row's result cannot depend on the width).  Warp w
 //              issues its trellis words for k-tile w of every block of the
-//              range and its A tiles (cp.async from the prep planes) at entry.
+//              range at entry and reads its A fragments straight from the prep
+//              planes, one block ahead (L338: no shared-memory staging -- a
+//              warp's tiles are its own; staged, they held Turing to one CTA
+//              an SM).
 //              On the tensor cores at every width: the format's tile order is
 //              the mma.m16n8k16 B-fragment order (exllamav3 packed it that
 //              way): lane t of a warp owns positions 8t..8t+7 of a tile, i.e.
@@ -186,23 +189,26 @@ __device__ __forceinline__ const dense_proj &proj_at(const dense_set &P, int j) 
 __device__ __forceinline__ float pow2f(int e) { return __int_as_float((127 + e) << 23); }   /* e in [-126, 127] */
 
 
-/// Four 8x8 b16 matrices from shared memory into an MMA A fragment (ldmatrix .x4; p is this lane's row address).
-/// @param a  out: the four fragment registers
-/// @param p  this lane's 16-byte row address in shared memory
-__device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
+/** L338: one m16n8k16 A fragment of a prep plane straight from global memory -- lane (g = l/4, c = l%4) holds rows
+ *  g and g + 8 at k = 2c, 2c + 1 and 2c + 8, 2c + 9 of the 16-wide k-tile at k0 (the registers ldmatrix .x4 gave
+ *  from the staged tile: the same values in the same registers), rows at or past nr zero and not read.  A warp's A
+ *  tiles are its own (k-tile `warp` of each block), so nothing is staged in shared memory: on Turing (64 KB an SM)
+ *  the 40 KB of staged tiles held the GEMV to one CTA an SM. */
+/// @param a     out: the fragment
+/// @param plane the prep plane (hi or lo), fp16 [M][K]
+/// @param K     its row pitch
+/// @param k0    the k-tile's first column
+/// @param g     the lane's fragment row (lane / 4)
+/// @param c2    the lane's fragment column pair (2 * (lane % 4))
+/// @param nr    real rows
+__device__ __forceinline__ void a_frag(uint32_t (&a)[4], const __half *__restrict__ plane, int K, int k0, int g, int c2,
+                                       int nr) {
+    const __half *r0 = plane + (size_t)g * K + k0 + c2, *r1 = plane + (size_t)(g + 8) * K + k0 + c2;
+    a[0] = g < nr ? __ldg(reinterpret_cast<const unsigned *>(r0)) : 0u;
+    a[1] = g + 8 < nr ? __ldg(reinterpret_cast<const unsigned *>(r1)) : 0u;
+    a[2] = g < nr ? __ldg(reinterpret_cast<const unsigned *>(r0 + 8)) : 0u;
+    a[3] = g + 8 < nr ? __ldg(reinterpret_cast<const unsigned *>(r1 + 8)) : 0u;
 }
-
-
-/** A 16 x 16 fp16 tile in shared memory as 32 chunks of 8 halves: chunk
- *  (row, half) at 16-byte slot row * 2 + (half ^ bit 2 of row), so the 8 rows
- *  one ldmatrix 8x8 reads fall in 8 distinct 16-byte bank groups. */
-/// @param row   tile row 0..15
-/// @param half  which 8-half run of the row (0 or 1)
-/// @return      the chunk's 16-byte slot index, 0..31
-__device__ __forceinline__ int tile_chunk(int row, int half) { return row * 2 + (half ^ ((row >> 2) & 1)); }
 
 /** The PREP of one (row, 128-block), one warp: lane l owns k = 4l..4l+3 of the block (x the row's bf16 values
  *  there, su_p suh's).  hw / lw: the hi and lo fp16 pairs of the lane's four values; returns 2^-P. */
@@ -275,7 +281,8 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /// GEMV + EPILOGUE at rate K2 (2 x bits per weight).  Flat grid over the set's (n-tile, split) CTAs, block
 /// (32, 8): each CTA 32 outputs x one split's k-range (<= kMaxBlocks Hadamard blocks) x all M <= 16 rows; the last
 /// CTA of a 128-output block (on its counter) sums the splits in order, applies H128 and svh, writes y or yb.
-/// Static smem: 40 KB of A tiles (kWarps x kMaxBlocks x {hi, lo} x 16 x 16 fp16), reused for the reduction.
+/// Static smem: the cross-warp reduction, 16 KB (kWarps x 16 rows x 32 outputs f32); the A fragments come straight
+/// from the prep planes (a_frag), one block ahead.
 /// @param P   the projections of one rate (the prep planes carry the input)
 /// @param M   rows, 1..16
 /// @param K   input width
@@ -288,9 +295,7 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     const int N = p.N, S = p.S, ntiles = N / kOut;
     const int bx = cl % ntiles;                                   /* the CTA's 32-output tile */
     constexpr int W32 = exl3dev::Rate<K2>::words32;
-    constexpr int kTile = kRows * 16;                             /* halves per 16 x 16 A tile */
-    static_assert(kWarps * kRows * kOut * 4 <= kWarps * kMaxBlocks * 2 * kTile * 2, "the reduction view must fit the A slots");
-    __shared__ __align__(16) __half s_a[kWarps][kMaxBlocks][2][kTile];   /* per k-tile of each block: hi, lo */
+    __shared__ float s_red[kWarps][kRows][kOut];                  /* the cross-warp reduction */
     __shared__ float s_inv[kMaxBlocks][kRows];
     __shared__ bool s_last;
 
@@ -329,35 +334,21 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
         }
     }
 
-    /* the A tiles: tile (w, i) is k-tile w of block i of the range, rows past M zero */
-    {
-        /* warp w's own tiles from the prep planes (lane = chunk (row l/2, half l%2); rows past M zero) */
-        const int crow = lane >> 1, chalf = lane & 1;
-        const bool creal = crow < nr;
-#pragma unroll
-        for (int i = 0; i < kMaxBlocks; ++i) {
-            if (i < nb) {
-                const int kt = (b_lo + i) * 8 + warp;
-                const size_t src = (size_t)(creal ? crow : 0) * K + (size_t)kt * 16 + chalf * 8;
-                pulsar_cp_async16(&s_a[warp][i][0][tile_chunk(crow, chalf) * 8], p.hi + src, creal ? 16 : 0);
-                pulsar_cp_async16(&s_a[warp][i][1][tile_chunk(crow, chalf) * 8], p.lo + src, creal ? 16 : 0);
-            }
-        }
-        for (int t = tid; t < nr * nb; t += kOut * kWarps) {
-            const int m = t / nb, i = t - m * nb;
-            s_inv[i][m] = p.inv[(size_t)m * blocks + b_lo + i];
-        }
-        pulsar_cp_async_commit();
-        pulsar_cp_async_wait<0>();
+    /* the rows' inverse prescales of the range's blocks */
+    for (int t = tid; t < nr * nb; t += kOut * kWarps) {
+        const int m = t / nb, i = t - m * nb;
+        s_inv[i][m] = p.inv[(size_t)m * blocks + b_lo + i];
     }
+    /* block 0's A fragments (k-tile `warp`), the rest one block ahead in the loop */
+    const int c2 = (lane & 3) * 2;
+    uint32_t ahi[4], alo[4], nhi[4] = {0u, 0u, 0u, 0u}, nlo[4] = {0u, 0u, 0u, 0u};
+    a_frag(ahi, p.hi, K, (b_lo * 8 + warp) * 16, g, c2, nr);
+    a_frag(alo, p.lo, K, (b_lo * 8 + warp) * 16, g, c2, nr);
     __syncthreads();
 
-    /* 3. per k-tile: the A fragments (ldmatrix x4: lane l addresses row
-     * (l%8) + 8 (bit 3 of l), k half bit 4 of l), each B pair decoded once,
-     * two MMAs per n8 half into a fresh fragment, scaled back into the rows'
-     * accumulators.  Lane (g, c = lane%4) holds rows g, g + 8 and columns 2c,
-     * 2c + 1 of each n8 half. */
-    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, ahalf = (lane >> 4) & 1;
+    /* 3. per k-tile: the A fragments (a_frag), each B pair decoded once, two MMAs per n8 half into a fresh
+     * fragment, scaled back into the rows' accumulators.  Lane (g, c = lane%4) holds rows g, g + 8 and columns
+     * 2c, 2c + 1 of each n8 half. */
     float acc[2][2][4];
 #pragma unroll
     for (int j = 0; j < 2; ++j)
@@ -370,9 +361,10 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
         if (i < nb) {
             const float inv_a = g < nr ? s_inv[i][g] : 0.0f;
             const float inv_b = g + 8 < nr ? s_inv[i][g + 8] : 0.0f;
-            uint32_t ahi[4], alo[4];
-            ldmatrix_x4(ahi, &s_a[warp][i][0][tile_chunk(arow, ahalf) * 8]);
-            ldmatrix_x4(alo, &s_a[warp][i][1][tile_chunk(arow, ahalf) * 8]);
+            if (i + 1 < nb) {
+                a_frag(nhi, p.hi, K, ((b_lo + i + 1) * 8 + warp) * 16, g, c2, nr);
+                a_frag(nlo, p.lo, K, ((b_lo + i + 1) * 8 + warp) * 16, g, c2, nr);
+            }
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
 #pragma unroll
@@ -390,14 +382,12 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
                     acc[j][h][3] = fmaf(d[3], inv_b, acc[j][h][3]);
                 }
             }
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { ahi[e] = nhi[e]; alo[e] = nlo[e]; }
         }
     }
 
-    /* cross-warp reduction in warp order, one warp per row, over the A slots
-     * (every warp is past its last read of them), into the split's partial */
-    __syncthreads();
-    float *s_red = reinterpret_cast<float *>(&s_a[0][0][0][0]);   /* [warp][row][32 outputs] */
-    const int c2 = (lane & 3) * 2;
+    /* cross-warp reduction in warp order, one warp per row, into the split's partial */
 #pragma unroll
     for (int j = 0; j < 2; ++j)
 #pragma unroll
@@ -405,13 +395,13 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int rr = g + 8 * (e >> 1), col = j * 16 + h * 8 + c2 + (e & 1);
-                s_red[(warp * kRows + rr) * kOut + col] = acc[j][h][e];
+                s_red[warp][rr][col] = acc[j][h][e];
             }
     __syncthreads();
     for (int r = warp; r < nr; r += kWarps) {
         float z = 0.0f;
 #pragma unroll
-        for (int w = 0; w < kWarps; ++w) z += s_red[(w * kRows + r) * kOut + lane];
+        for (int w = 0; w < kWarps; ++w) z += s_red[w][r][lane];
         p.part[((size_t)split * (size_t)M + (size_t)r) * (size_t)N + (size_t)(bx * kOut + lane)] = z;
     }
 

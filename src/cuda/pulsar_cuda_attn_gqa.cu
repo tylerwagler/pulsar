@@ -23,7 +23,7 @@
  * the attention never reads a slot the same call overwrites. */
 #include "pulsar_cuda_attn_gqa.h"
 #include "pulsar_cuda_internal.h"
-#include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_pair_dev) */
+#include "pulsar_cuda_rope.cuh"   /* the NeoX bf16 rotation: ONE authority (rope_neox_bf16_cs_dev / _rotate_dev) */
 #include "pulsar_cuda_arch.cuh"
 
 #include <type_traits>
@@ -322,6 +322,8 @@ struct gqa_prep_table_args : gqa_prep_args {
  * A template, not a branch: the plain instantiation is the kernel it was. */
 /// Per row, one warp per head vector: q heads (norm, rope, times tau) into a.q, K heads (norm, rope) and V heads into
 /// the fresh KV rows in the row format.  Grid (n_rows, ceil((n_q + 2 n_kv) / 8)), 256 threads (8 warps = 8 jobs).
+/// L338: the CTA's row's bf16 cos / sin per pair first, into shared memory (one double cos / sin per thread at most),
+/// then every head rotates from them -- the same values the per-element evaluation gave.
 /// @tparam HD head_dim (64, 128, 256 or 512); lane l holds elements l + 32 j.
 /// @tparam A gqa_prep_args or gqa_prep_table_args.
 /// @param a the arguments.
@@ -332,6 +334,18 @@ __global__ void __launch_bounds__(256) gqa_prep_kernel(const A a) {
     const uint32_t row = blockIdx.x;
     const uint32_t job = blockIdx.y * 8u + (threadIdx.x >> 5);
     const uint32_t lane = threadIdx.x & 31u;
+    __shared__ float s_cos[HD / 2], s_sin[HD / 2];
+    const bool rope = a.rope_theta > 0.f;
+    if (rope) {
+        const uint32_t pos = a.rows[row].pos;
+        for (uint32_t pr = threadIdx.x; pr < HD / 2; pr += blockDim.x) {
+            float inv;
+            if constexpr (TABLE) inv = a.rope_inv[pr];
+            else inv = rope_neox_inv_freq_dev(pr, HD, a.rope_theta);
+            rope_neox_bf16_cs_dev(inv, pos, &s_cos[pr], &s_sin[pr]);
+        }
+        __syncthreads();
+    }
     if (job >= a.n_q + 2u * a.n_kv) return;
     const __nv_bfloat16 *src;
     const uint16_t *w = nullptr;
@@ -370,14 +384,12 @@ __global__ void __launch_bounds__(256) gqa_prep_kernel(const A a) {
         for (int j = 0; j < NJ; j++) x[j] = gqa_round(__fmul_rn(__fmul_rn(x[j], rstd), gqa_bf(w[lane + 32 * j])));
     }
     /* L298: the rope of q and k (never v) after the norm -- element lane + 32 j pairs with lane + 32 (j + NJ / 2) */
-    if (a.rope_theta > 0.f && job < a.n_q + a.n_kv) {
-        const uint32_t pos = a.rows[row].pos;
+    if (rope && job < a.n_q + a.n_kv) {
         #pragma unroll
         for (int j = 0; j < NJ / 2; j++) {
             float r0, r1;
             const uint32_t pr = lane + 32u * (uint32_t)j;
-            if constexpr (TABLE) rope_neox_bf16_pair_inv_dev(x[j], x[j + NJ / 2], a.rope_inv[pr], pos, &r0, &r1);
-            else rope_neox_bf16_pair_dev(x[j], x[j + NJ / 2], pr, HD, pos, a.rope_theta, &r0, &r1);
+            rope_neox_bf16_rotate_dev(x[j], x[j + NJ / 2], s_cos[pr], s_sin[pr], &r0, &r1);
             x[j] = r0;
             x[j + NJ / 2] = r1;
         }
