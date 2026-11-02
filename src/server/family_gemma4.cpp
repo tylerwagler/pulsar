@@ -5,9 +5,9 @@
  * effort level), the output parser the kit in vLLM's gemma4 reading (gemma4-chat-gate P1 / P2).
  *
  * What is not wired yet, each refused by name or left to the server's own refusal of a NULL hook (L338 T3b-2):
- *   - a required / named tool_choice (no forced-call seed / prefill), strict tools (the grammar shape has no call
- *     markup: Gemma's call arguments, `{key:<|"|>value<|"|>}`, are no xgrammar style), a tool loaded mid-conversation
- *     (no tool_defs_text);
+ *   - strict tools (the grammar shape has no call markup: Gemma's call arguments, `{key:<|"|>value<|"|>}`, are no
+ *     xgrammar style; a forced tool_choice is seeded with the call's opener, its arguments unconstrained), a tool
+ *     loaded mid-conversation (no tool_defs_text);
  *   - the suffix hooks (assistant_turn_sampled, tool_result_tail, tool_error_suffix) and tool memory
  *     (find_call_block): every turn is a full render, which the prefix cache matches as far as the bytes agree;
  *   - images (the family's vision front is not in the container), a tool message answering several calls at once.
@@ -103,11 +103,6 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
     if (!chat_openai_tools_json(c, r, &head_raw, err, errlen)) return false;
     const std::unique_ptr<char, void (*)(void *)> head(head_raw, free);
     r->has_tools = r->tools_json != NULL;
-    if ((c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED) && r->has_tools) {
-        snprintf(err, errlen, "gemma4: a required or named tool_choice is not wired for this family yet (no forced-call "
-                              "prefill, L338 T3b-2) -- send tool_choice \"auto\"");
-        return false;
-    }
     render_prelude(s, c, r);
     gemma4_msgs gm;
     if (!gemma4_messages(&c->msgs, &gm, err, errlen)) return false;
@@ -127,8 +122,36 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
         memcpy(r->prompt_spans, out.spans.data(), out.spans.size() * sizeof(chat_text_span));
     }
     r->prompt_text = server_xstrndup(out.text.data(), out.text.size());
+    /* L338 P4: a required call (OpenAI "required" or a named function, Anthropic "any" or "tool"): the turn is
+     * prefilled into an open call (gemma4_forced_call_seed) and the generation seeds its output with the same bytes */
+    if ((c->tool_choice == CHAT_TOOL_CHOICE_ANY || c->tool_choice == CHAT_TOOL_CHOICE_NAMED) && r->has_tools) {
+        r->force_tool_call = true;
+        if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
+    }
     if (e) pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
     return true;
+}
+
+/* L338 P4: the forced call's opener -- "<|tool_call>call:" (vLLM's reading of Gemma's call body), and for a named
+ * tool its name and the arguments' "{".  A call opens from the answer or from reasoning alike (it ends the
+ * reasoning: gemma4_chat.h), so the seed is the same with thinking on or off.  The arguments are the model's (the
+ * shape has no call markup to constrain them with). */
+/** server_family_ops::forced_call_seed for Gemma 4.
+ *  @param r the request (forced_tool_name)
+ *  @param out appended to: the seed bytes */
+void gemma4_forced_call_seed(const request *r, buf *out) {
+    buf_puts(out, "<|tool_call>call:");
+    if (r->forced_tool_name && r->forced_tool_name[0]) {
+        buf_puts(out, r->forced_tool_name);
+        buf_puts(out, "{");
+    }
+}
+
+/** server_family_ops::forced_call_prefill for Gemma 4: the prompt kept whole, the seed appended.
+ *  @param r the request
+ *  @param append receives the seed */
+void gemma4_forced_call_prefill(const request *r, const char *, size_t *, buf *append) {
+    gemma4_forced_call_seed(r, append);
 }
 
 /* the longest prefix two UNRELATED prompts share by template construction: <bos> (a system turn is not always
@@ -209,8 +232,8 @@ const server_family_ops k_family_gemma4 = {
     /* .assistant_turn_sampled = */ NULL,   /* T3b-2: every turn is a full render */
     /* .tool_result_tail      = */ NULL,
     /* .tool_error_suffix     = */ NULL,
-    /* .forced_call_seed      = */ NULL,    /* a forced tool_choice is refused in gemma4_render */
-    /* .forced_call_prefill   = */ NULL,
+    /* .forced_call_seed      = */ gemma4_forced_call_seed,      /* L338 P4 */
+    /* .forced_call_prefill   = */ gemma4_forced_call_prefill,
     /* .grammar               = */ &k_grammar_gemma4,   /* response formats; strict tools refused by name */
     /* .find_call_block       = */ NULL,
     /* .tool_defs_text        = */ NULL,

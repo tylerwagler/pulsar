@@ -4842,10 +4842,27 @@ static void test_gemma4_tools_and_refusals(void) {
                         "<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:"
                         "get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>"));
     request_free(&r);
-    /* a required call: no forced-call prefill for this family yet -- refused by name */
-    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"tool_choice\":\"required\"") + tools + "}";
-    TEST_ASSERT(!effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
-    TEST_ASSERT(strstr(err, "gemma4") != NULL && strstr(err, "tool_choice") != NULL);
+    /* L338 P4: a required call is prefilled into an open call -- the generation prompt kept, the opener appended
+     * (its name and the arguments' "{" for a named tool), the output seeded with it */
+    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\","
+                       "\"tool_choice\":\"required\"") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    TEST_ASSERT(r.force_tool_call);
+    {
+        /* the one declared tool: "required" names it (the request parse's rule for every family) */
+        const char *tail = "<|turn>model\n<|channel>thought\n<channel|><|tool_call>call:get_weather{";
+        const size_t n = strlen(r.prompt_text), m = strlen(tail);
+        TEST_ASSERT(n >= m && !strcmp(r.prompt_text + n - m, tail));
+    }
+    request_free(&r);
+    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\","
+                       "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}}") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    {
+        const char *tail = "<|tool_call>call:get_weather{";
+        const size_t n = strlen(r.prompt_text), m = strlen(tail);
+        TEST_ASSERT(r.force_tool_call && n >= m && !strcmp(r.prompt_text + n - m, tail));
+    }
     request_free(&r);
     chat_msgs msgs = {0};
     chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
