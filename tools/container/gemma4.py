@@ -380,8 +380,12 @@ def declared_shape(m, hshape):
 def admit(hf, m, fmt, name):
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
     allowed = {"native", native}
-    if m.role == "adapter" and fmt not in allowed:   # the runtime LoRA and the head read their F32 as stored
-        raise SystemExit(f"{name}: the adapter's tensors are written as stored ({native}), not {fmt}")
+    if m.role == "adapter" and fmt != "f16":        # the runtime LoRA's pairs: the fp16 tensor-core operand (L338)
+        raise SystemExit(f"{name}: the adapter's LoRA pairs are written f16 (the runtime LoRA's operand), not {fmt}")
+    if m.role == "adapter":
+        return
+    if m.role == "adapter_head" and fmt not in allowed:   # the decision head: its F32 as stored (read on the host)
+        raise SystemExit(f"{name}: the decision head is written as stored ({native}), not {fmt}")
     if m.role == "dense":
         allowed |= EXL3
         if m.layer is not None and _suffix(m) in MLP_STORED:

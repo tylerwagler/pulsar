@@ -54,4 +54,54 @@ int pulsar_f16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int row
 int pulsar_f16_rows_linear_h_launch(const void *w, const uint16_t *x_f16, int rows, int in, int out, float *y,
                                     bool prompt, cudaStream_t stream);
 
+/** L338: one projection's runtime LoRA: its device pair at the logical widths and its scale (the container's f16
+ *  pairs: A [r][in], B [out][r], 16-byte aligned; r, in and out multiples of 8). */
+typedef struct pulsar_rows_lora {
+    const void *A;    ///< device f16 [r][in]: lora_A
+    const void *B;    ///< device f16 [out][r]: lora_B
+    uint32_t r;       ///< the rank
+    uint32_t in;      ///< the input width (<= the input pitch)
+    uint32_t out;     ///< the output width (<= the output pitch)
+    float scale;      ///< alpha / r
+} pulsar_rows_lora;
+
+/** Rows pulsar_rows_lora_launch runs at a time (a call walks its rows in blocks of this many -- the fixed-algorithm
+ *  GEMM's bytes do not depend on the rows beside a row, so the blocks are the call whole), and so the rows its
+ *  workspace holds at most. */
+#define PULSAR_ROWS_LORA_BLOCK 256
+
+/** Workspace bytes pulsar_rows_lora_launch needs for `rows` rows (at most PULSAR_ROWS_LORA_BLOCK count) of the widest
+ *  LoRA (in, r, out). */
+/// @param rows rows.
+/// @param in   the widest input width.
+/// @param r    the widest rank.
+/// @param out  the widest output width.
+/// @return bytes (each piece 256-byte padded); 0 for a non-positive shape.
+size_t pulsar_rows_lora_workspace_bytes(int rows, int in, int r, int out);
+
+/** L338: a runtime LoRA on a linear's f32 output, on the fp16 tensor cores --
+ *    y[t][o] += scale * sum_j B[o][j] * (sum_k A[j][k] * x[t][k])     for t < n_rows marked (rows NULL = every row)
+ *  THE ARITHMETIC: x16 = f16(x * 2^P) per row (the arm's prep: exact for the bf16 values); T = x16 . A^T (f32, the
+ *  fixed-algorithm GEMM); T16 = f16(T * 2^Q) per row (Q puts the row's largest |T| just under 2^14: no overflow); U =
+ *  T16 . B^T (f32, the same GEMM); y += (scale * 2^-P * 2^-Q) * U -- the factor a product of powers of two times scale,
+ *  one f32 rounding into y.  So the error is f16's on T (the pairs are f16 as stored); PROMPT rows on the prompt class's
+ *  algorithm, DECODE rows in blocks of PULSAR_GPU_MNEUTRAL_ROWS_MAX on the decode class's: a row's bytes never depend
+ *  on how many rows share its call.  A row not marked is computed but not added (its bytes are the base linear's);
+ *  columns of y past `out` and of x past `in` are neither written nor read.
+ *  @return 0, -1 refused (named on stderr), -3 launch failure. */
+/// @param x        device bf16 input rows (ld_x apart; the linear's input)
+/// @param ld_x     x's row pitch in elements (>= in)
+/// @param n_rows   rows (>= 1)
+/// @param l        the LoRA
+/// @param y        device f32 output rows (ld_y apart), accumulated into
+/// @param ld_y     y's row pitch in elements (>= out)
+/// @param rows     device u8 [n_rows]: the rows the LoRA applies to (nonzero), or NULL = every row
+/// @param prompt   the rows are a prompt chunk (else decode rows)
+/// @param ws       device workspace
+/// @param ws_bytes its bytes (>= pulsar_rows_lora_workspace_bytes(n_rows, l->in, l->r, l->out))
+/// @param stream   the stream
+int pulsar_rows_lora_launch(const uint16_t *x, uint64_t ld_x, int n_rows, const pulsar_rows_lora *l, float *y,
+                            uint64_t ld_y, const uint8_t *rows, bool prompt, void *ws, size_t ws_bytes,
+                            cudaStream_t stream);
+
 #endif

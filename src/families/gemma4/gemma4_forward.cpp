@@ -46,6 +46,7 @@
 #include "cuda/pulsar_cuda_qwen.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
 #include "cuda/pulsar_cuda_router.h"
 #include "cuda/pulsar_cuda_rowops.h"
+#include "cuda/pulsar_cuda_f16_rows.h"   /* L338: the runtime LoRA (pulsar_rows_lora_launch) */
 
 #include <math.h>
 
@@ -240,7 +241,7 @@ rows_scratch rows_layout(uint32_t R) {
  *  qf / kf / vf f32 and qb / kb / vb bf16 the projections (kb also v's source on a global layer), vn bf16 the
  *  unweighted-normed v, ab bf16 the attention's output, of f32 / db bf16 the o_proj's, dn bf16 its post-norm; the
  *  dense arm's workspace; F1's workspace (the wider declaration's). */
-struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, dn, lora, lin, lin_bytes, gqa, gqa_bytes, total; };
+struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, dn, lora, lora_bytes, lin, lin_bytes, gqa, gqa_bytes, total; };
 /** @param R    the step's row capacity (max_rows)
  *  @param ctx  the pools' capacity in tokens (F1's workspace; 0 = sized for 1)
  *  @return the MIX arena's offsets and size */
@@ -263,7 +264,9 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     t.of = o; o += a256((uint64_t)R * E * 4u);
     t.db = o; o += a256((uint64_t)R * E * 2u);
     t.dn = o; o += a256((uint64_t)R * E * 2u);
-    t.lora = o; o += a256((uint64_t)R * PULSAR_GEMMA4_LORA_RANK_MAX * 4u);   /* L338 P2: the runtime LoRA's [R][r] */
+    t.lora = o;   /* L338: the runtime LoRA's workspace, its widest projection (q / o of a global layer) */
+    t.lora_bytes = pulsar_rows_lora_workspace_bytes((int)R, (int)umax(E, Q), PULSAR_GEMMA4_LORA_RANK_MAX, (int)umax(E, Q));
+    o += a256(t.lora_bytes);
     const int qkv[3] = {(int)Qw, (int)KVw, (int)KVw}, qk[2] = {(int)Qf, (int)KVf};
     t.lin = o;
     t.lin_bytes = umax(umax(multi_ws((int)E, 3, qkv, R), multi_ws((int)E, 2, qk, R)),
@@ -281,7 +284,7 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
 /** The FFN arena: xd / xm / xr bf16 the three normed inputs (dense MLP, experts, router); fo f32 the routed sum; e1 /
  *  e2 bf16 the dense MLP's and the experts' rows; d1 / d2 bf16 their post-norms; then the MoE block's carved
  *  workspace (router, routed, the dense MLP's buffers as the block's one shared expert). */
-struct ffn_scratch { uint64_t xd, xm, xr, fo, e1, e2, d1, d2, lora, u, moe_bytes, total; };
+struct ffn_scratch { uint64_t xd, xm, xr, fo, e1, e2, d1, d2, lora, lora_bytes, u, moe_bytes, total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the FFN arena's offsets and size */
 ffn_scratch ffn_layout(uint32_t R) {
@@ -292,7 +295,10 @@ ffn_scratch ffn_layout(uint32_t R) {
     for (uint64_t *x : {&f.xd, &f.xm, &f.xr}) { *x = o; o += a256((uint64_t)R * E * 2u); }
     f.fo = o; o += a256((uint64_t)R * E * 4u);
     for (uint64_t *x : {&f.e1, &f.e2, &f.d1, &f.d2}) { *x = o; o += a256((uint64_t)R * E * 2u); }
-    f.lora = o; o += a256((uint64_t)R * PULSAR_GEMMA4_LORA_RANK_MAX * 4u);   /* L338 P2: the dense MLP's LoRA [R][r] */
+    f.lora = o;   /* L338: the dense MLP's LoRA workspace (E -> n_ff -> E) */
+    f.lora_bytes = pulsar_rows_lora_workspace_bytes((int)R, (int)umax(E, s.n_ff), PULSAR_GEMMA4_LORA_RANK_MAX,
+                                                    (int)umax(E, s.n_ff));
+    o += a256(f.lora_bytes);
     const pulsar_moe_block_shape bs = moe_shape(s);
     f.u = o; f.moe_bytes = a256(pulsar_moe_block_workspace_bytes(&bs, (int)R)); o += f.moe_bytes;
     f.total = o;
@@ -724,22 +730,31 @@ bool embed(const pulsar_driver_step *st0) {
 /* ---- the runtime adapter (L338 P2) ---------------------------------------------------------------------------------- */
 
 /* one projection's LoRA on its f32 output, on the step's adapter rows (rows_scratch::ad) */
-/** @param st    the step (its model and adapter rows)
- *  @param l     the projection's pair
- *  @param x     the projection's bf16 input rows
- *  @param ld_x  their pitch
- *  @param in    the LoRA's input width
- *  @param y     the f32 output rows
- *  @param ld_y  their pitch
- *  @param out   the LoRA's output width
- *  @param ws    the f32 [rows][r] workspace
- *  @return true = launched */
+/** @param st        the step (its model, adapter rows and row kinds)
+ *  @param l         the projection's pair
+ *  @param x         the projection's bf16 input rows
+ *  @param ld_x      their pitch
+ *  @param in        the LoRA's input width
+ *  @param y         the f32 output rows
+ *  @param ld_y      their pitch
+ *  @param out       the LoRA's output width
+ *  @param ws        the LoRA's workspace
+ *  @param ws_bytes  its bytes
+ *  @return true = launched (each row-kind segment on its arm) */
 bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x, uint64_t ld_x, uint32_t in, float *y,
-               uint64_t ld_y, uint32_t out, float *ws) {
-    const float *A = (const float *)wp(st, l.a, "gemma4 lora_A"), *B = (const float *)wp(st, l.b, "gemma4 lora_B");
+               uint64_t ld_y, uint32_t out, void *ws, uint64_t ws_bytes) {
+    pulsar_rows_lora d{};
+    d.A = wp(st, l.a, "gemma4 lora_A");
+    d.B = wp(st, l.b, "gemma4 lora_B");
+    d.r = st->w->lora_r;
+    d.in = in;
+    d.out = out;
+    d.scale = st->w->lora_scale;
     const uint8_t *rows = (const uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).ad;
-    return A && B && pulsar_rows_lora_launch(x, ld_x, st->n_rows, in, A, st->w->lora_r, B, out, st->w->lora_scale, y,
-                                             ld_y, ws, rows, 0) == 0;
+    return d.A && d.B && arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
+        return pulsar_rows_lora_launch(x + (size_t)r0 * ld_x, ld_x, (int)m, &d, y + (size_t)r0 * ld_y, ld_y, rows + r0,
+                                       prompt, ws, ws_bytes, 0) == 0;
+    });
 }
 
 /* ---- the attention ------------------------------------------------------------------------------------------------- */
@@ -773,10 +788,10 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
         /* L338 P2: the adapter's LoRAs on the f32 projections, then their bf16 rows again (a plain row re-rounds to the
          * same bits); on a global layer k's carries into v (K = V: v is k_proj's output) */
         if (q->step_adapter) {
-            float *ws = (float *)(base + M.lora);
             const pulsar_gemma4_lora *lp[3] = {&L.lora_q, &L.lora_k, &L.lora_v};
             for (int j = 0; j < (full ? 2 : 3); j++)
-                if (!lora_rows(st, *lp[j], xa, E, E, y[j], (uint64_t)outs[j], (uint32_t)outs[j], ws) ||
+                if (!lora_rows(st, *lp[j], xa, E, E, y[j], (uint64_t)outs[j], (uint32_t)outs[j], base + M.lora,
+                               M.lora_bytes) ||
                     !emit(y[j], yb16[j], n, (uint32_t)outs[j]))
                     return failf("the q / k / v LoRAs refused", il);
         }
@@ -805,7 +820,7 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     uint16_t *yb16[1] = {db};
     if (!step_linears(st, 1, t, (int)Q, outs, what, ab, y, yb16, base + M.lin, M.lin_bytes))
         return failf("the o_proj refused", il);
-    if (q->step_adapter && (!lora_rows(st, L.lora_o, ab, Q, Q, y[0], E, E, (float *)(base + M.lora)) ||
+    if (q->step_adapter && (!lora_rows(st, L.lora_o, ab, Q, Q, y[0], E, E, base + M.lora, M.lora_bytes) ||
                             !emit(y[0], db, n, E)))   /* L338 P2 */
         return failf("the o_proj LoRA refused", il);
     return norm(db, (const uint16_t *)wp(st, L.attn_post_norm, "gemma4 post_attention_layernorm"),
@@ -848,8 +863,8 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
         const pulsar_gemma4_lora *src[3] = {&L.lora_gate, &L.lora_up, &L.lora_down};
         pulsar_rows_lora *dst[3] = {&lg, &lu, &ld};
         for (int j = 0; j < 3; j++) {
-            dst[j]->A = (const float *)wp(st, src[j]->a, "gemma4 mlp lora_A");
-            dst[j]->B = (const float *)wp(st, src[j]->b, "gemma4 mlp lora_B");
+            dst[j]->A = wp(st, src[j]->a, "gemma4 mlp lora_A");
+            dst[j]->B = wp(st, src[j]->b, "gemma4 mlp lora_B");
             dst[j]->r = st->w->lora_r;
             dst[j]->in = j < 2 ? E : s.n_ff;
             dst[j]->out = j < 2 ? s.n_ff : E;
@@ -864,7 +879,8 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
             qd.lora_up = &lu;
             qd.lora_down = &ld;
             qd.lora_rows = ad_rows + r0;
-            qd.lora_ws = (float *)(base + F.lora);
+            qd.lora_ws = base + F.lora;
+            qd.lora_ws_bytes = F.lora_bytes;
         }
         qd.act = PULSAR_FFN_ACT_GEGLU_TANH;
         qd.scale = NULL;

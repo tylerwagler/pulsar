@@ -816,8 +816,10 @@ rowops-gate: tests/rowops_gate
 	./tests/rowops_gate
 # L338: the runtime LoRA primitive (pulsar_rows_lora_launch) against the f64 reference at Gemma 4's shapes; row
 # independence, determinism, the padded pitches untouched, refusals.  Model-free.
-tests/lora_rows_gate: tests/lora_rows_gate.cu src/cuda/pulsar_cuda_rowops.o src/cuda/pulsar_cuda_rowops.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lora_rows_gate.cu src/cuda/pulsar_cuda_rowops.o
+tests/lora_rows_gate: tests/lora_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o src/cuda/pulsar_cuda_lt_fixed.o \
+                      src/cuda/pulsar_cuda_f16_rows.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lora_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o \
+	    src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 .PHONY: lora-rows-gate
 lora-rows-gate: tests/lora_rows_gate
 	./tests/lora_rows_gate

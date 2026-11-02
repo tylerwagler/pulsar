@@ -17,7 +17,8 @@ model's logical widths -- the dense MLP at 2112, not the pack's stored 2176: the
 the head is [slots, hidden] + [slots] with slots = judge_config's num_slots and hidden = the target's.
 
 The container: shard `adapter`; names `adapter.layers.N.<the target's HF suffix>.lora_{A,B}.weight`,
-`adapter.head.weight` / `.bias`; recipe role `adapter` (native F32); bind records (role <target bind role>_lora_a /
+`adapter.head.weight` / `.bias`; recipe roles `adapter` (the LoRA pairs: f16, the engine's tensor-core operand -- the
+F32 source rounded once, refused past f16's range) and `adapter_head` (the head: native F32, read on the host); bind records (role <target bind role>_lora_a /
 _lora_b, block layers, layer N) and (role decision_head / decision_head_bias); kv `pulsar.adapter` = KIND,
 `pulsar.adapter.lora_r`, `pulsar.adapter.lora_alpha`; side files judge_config.json, calibration_gold.json and
 adapter_config.json as shipped.
@@ -138,7 +139,7 @@ class Adapter:
         for src, cname, s, bind in (("proj.weight", ADAPTER + "head.weight", [slots, target.hidden], "decision_head"),
                                     ("proj.bias", ADAPTER + "head.bias", [slots], "decision_head_bias")):
             want[cname] = (self.head, src, "F32", s, Mapped(cname, cname, "adapter", "adapter", None, None, None, False,
-                                                            role="adapter", bind=(("role", bind),)))
+                                                            role="adapter_head", bind=(("role", bind),)))
         for reader, label in ((self.lora, "adapter_model.safetensors"), (self.head, "head.safetensors")):
             have = set(reader.names())
             expect = {s for rd, s, *_ in want.values() if rd is reader}

@@ -360,19 +360,23 @@ def main():
         print("the JEV adapter (--adapter jev):")
         ad = os.path.join(tmp, "jev")
         aw = make_adapter(ad, np.random.default_rng(9))
-        rjev = recipe(tmp, "k4-jev", ROWS_K4 + [{"role": "adapter", "format": "native"}])
+        rjev = recipe(tmp, "k4-jev", ROWS_K4 + [{"role": "adapter", "format": "f16"},
+                                                 {"role": "adapter_head", "format": "native"}])
         oa = build_grade(tmp, "k4-jev", ["--hf", hf, "--exl3", pk, "--recipe", rjev, "--adapter", "jev", ad], n_files + 1,
                          n_side=len(SIDE) + 3)
         a_shards, a_decl, a_names, _a_exp, a_kv, _ = records(oa)
         last = a_shards[-1]
         lora = [n for n in a_names if n.startswith("adapter.layers.")]
-        ok_bytes = all(entry_bytes(oa, last, n) == b for n, b in aw.items())
+        want = {n: (np.frombuffer(b, dtype="<f4").astype("<f2").tobytes() if n.startswith("adapter.layers.") else b)
+                for n, b in aw.items()}
+        ok_bytes = all(entry_bytes(oa, last, n) == b for n, b in want.items())
         check(len(lora) == 2 * (6 * L + 1) and all(n in header(os.path.join(oa, last))[0] for n in aw) and ok_bytes,
-              f"the adapter shard holds every LoRA pair ({len(lora)} tensors: no v on the global layer) and the head, "
-              "bytes == the source's F32")
+              f"the adapter shard holds every LoRA pair ({len(lora)} tensors: no v on the global layer) as f16 (the F32 "
+              "source rounded to nearest even) and the head, bytes == the source's F32")
         q0 = a_decl["adapter.layers.0.self_attn.q_proj.lora_A.weight"]
         b1 = a_decl["adapter.layers.1.mlp.down_proj.lora_B.weight"]
-        check(q0["role"] == "attn_q_lora_a" and q0["layer"] == 0 and q0["block"] == "layers" and q0["layout"] == "f32"
+        check(q0["role"] == "attn_q_lora_a" and q0["layer"] == 0 and q0["block"] == "layers" and q0["layout"] == "f16"
+              and a_decl["adapter.head.weight"]["layout"] == "f32"
               and q0["dims_ne"] == [H, R] and b1["role"] == "ffn_down_lora_b" and b1["dims_ne"] == [R, H]
               and a_decl["adapter.layers.0.mlp.gate_proj.lora_B.weight"]["dims_ne"] == [R, FF]
               and a_decl["adapter.head.weight"]["role"] == "decision_head"
@@ -407,6 +411,11 @@ def main():
         ok, _ = run("plan", "--hf", hf, "--exl3", pk, "--recipe", rjev, "--adapter", "other", ad, expect_fail=True,
                     contains="reads ['jev']")
         check(ok, "refused: an adapter kind the builder does not read")
+        rnat = recipe(tmp, "k4-jev-native", ROWS_K4 + [{"role": "adapter", "format": "native"},
+                                                       {"role": "adapter_head", "format": "native"}])
+        ok, _ = run("plan", "--hf", hf, "--exl3", pk, "--recipe", rnat, "--adapter", "jev", ad, expect_fail=True,
+                    contains="written f16")
+        check(ok, "refused: LoRA pairs in any format but f16")
 
         print("refusals:")
 

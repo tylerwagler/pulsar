@@ -27,8 +27,10 @@ const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULS
 const pulsar_role_admit A_EXP_GATE_UP = {0, true, PULSAR_ROLE_EXPERT_GATE_UP, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 /// A routed down stack at bf16 rows.
 const pulsar_role_admit A_EXP_DOWN = {0, true, PULSAR_ROLE_EXPERT_DOWN, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
-/// L338 P2: the adapter's tensors, read as stored: f32 only.
+/// L338 P2: the decision head, read as stored: f32 only (the host reads it).
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+/// L338: the LoRA pairs: f16 only (the runtime LoRA's tensor-core operand; the builder writes them so).
+const pulsar_role_admit A_F16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F16), false, PULSAR_ROLE_DENSE, 0};
 
 /** L338 P2: one projection's LoRA pair at its logical widths: A [r][in] (ne in, r), B [out][r] (ne r, out).
  *  @param b      the open binder
@@ -43,8 +45,8 @@ void bind_lora(pulsar_role_binder *b, const char *target, int32_t il, uint64_t r
     char ra[48], rb[48];
     snprintf(ra, sizeof(ra), "%s_lora_a", target);
     snprintf(rb, sizeof(rb), "%s_lora_b", target);
-    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, il), A_F32, 2, in, r);
-    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, il), A_F32, 2, r, out);
+    L->a = pulsar_role_bind(b, pulsar_role_in(ra, LAYERS, il), A_F16, 2, in, r);
+    L->b = pulsar_role_bind(b, pulsar_role_in(rb, LAYERS, il), A_F16, 2, r, out);
 }
 
 /** L338 P2: the adapter, when the container carries one (pulsar.adapter): its rank and scale from the kv, every

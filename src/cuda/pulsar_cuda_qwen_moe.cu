@@ -657,8 +657,8 @@ static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
 static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
     /* L338: a Linear's runtime LoRA on its f32 output, before anything reads it */
     auto lora = [&](const pulsar_rows_lora *l, const uint16_t *x, uint64_t ld_x, float *y, uint64_t ld_y) {
-        return !l ? 0 : pulsar_rows_lora_launch(x, ld_x, (uint32_t)T, l->in, l->A, l->r, l->B, l->out, l->scale, y, ld_y,
-                                                q->lora_ws, q->lora_rows, stream);
+        return !l ? 0 : pulsar_rows_lora_launch(x, ld_x, T, l, y, ld_y, q->lora_rows, q->up.prompt, q->lora_ws,
+                                                q->lora_ws_bytes, stream);
     };
     const int H = q->up.in, mid = q->up.out;
     int rc = q->act != PULSAR_FFN_ACT_RELU2 ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
