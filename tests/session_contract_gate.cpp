@@ -970,6 +970,9 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
     std::vector<uint8_t> out;
     const pulsar_state_set *ss = s->states;
     if (!ss) return out;
+    /* L339: the bank's state is its tensors with its pending delta rows applied (state_kinds.h THE FOLD) -- a reader
+     * outside a trunk step flushes first */
+    if (!pulsar_state_fold_flush(s->states, b) || !pulsar_gpu_synchronize()) return out;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
