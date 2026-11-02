@@ -197,16 +197,33 @@ int main() {
     uint32_t *sink;
     CK(cudaMalloc(&sink, 64));
 
-    if (getenv("GQA_BENCH_GEMMA")) {   /* L338: the wide heads' verify, by decode group */
-        printf("gemma4 verify (flash-decoding, DRAM-cold): layer, ctx, rows -> us/call allowing decode groups 1 / 2 / 4 "
-               "(the call runs at the group its shape picks, at most that)\n");
+    if (const char *one = getenv("GQA_BENCH_CASE")) {   /* L338: one Gemma case (a profiler's target): w,ctx,rows,group */
+        int w = 0, group = 1;
+        unsigned ctx = 0, rows = 0;
+        if (sscanf(one, "%d,%u,%u,%d", &w, &ctx, &rows, &group) != 4 || ctx < rows || rows == 0) {
+            fprintf(stderr, "GQA_BENCH_CASE=window(0|1),ctx,rows,group\n");
+            return 2;
+        }
+        printf("  %s ctx %u %u rows group %d: %.1f us\n", w ? "window" : "global", ctx, rows, group,
+               time_gemma(w != 0, ctx, rows, group) * 1e3);
+        return 0;
+    }
+    if (getenv("GQA_BENCH_GEMMA")) {   /* L338: the wide heads' flash-decoding, every CTA shape (rows x heads) */
+        printf("gemma4 flash-decoding (DRAM-cold): layer, ctx, rows -> us/call by CTA shape rows x heads (forced); "
+               "'pick' = the launch's own\n");
+        const int shapes[4][2] = {{1, 1}, {1, 2}, {1, 4}, {2, 2}};
         for (int w = 1; w >= 0; w--)
-            for (uint32_t ctx : {512u, 1024u, 2048u, 8192u, 32768u})
-                for (uint32_t rows : {2u, 3u, 4u, 6u, 8u, 12u, 16u}) {
-                    const double g1 = time_gemma(w, ctx, rows, 1), g2 = time_gemma(w, ctx, rows, 2),
-                                 g4 = time_gemma(w, ctx, rows, 4);
-                    printf("  %-6s ctx %5u %2u rows: %7.1f  %7.1f (%+4.0f%%)  %7.1f (%+4.0f%%) us\n", w ? "window" : "global",
-                           ctx, rows, g1 * 1e3, g2 * 1e3, 100.0 * (g2 - g1) / g1, g4 * 1e3, 100.0 * (g4 - g1) / g1);
+            for (uint32_t ctx : {512u, 2048u, 8192u, 32768u})
+                for (uint32_t rows : {1u, 2u, 4u, 8u, 16u}) {
+                    printf("  %-6s ctx %5u %2u rows:", w ? "window" : "global", ctx, rows);
+                    for (const auto &sh : shapes) {
+                        if (w && sh[1] > 2) continue;                       /* G = 2 */
+                        if ((uint32_t)sh[0] > rows) continue;
+                        pulsar_gqa_decode_force(sh[0], sh[1]);
+                        printf("  %dx%d %7.1f", sh[0], sh[1], time_gemma(w, ctx, rows, 4) * 1e3);
+                    }
+                    pulsar_gqa_decode_force(0, 0);
+                    printf("  pick %7.1f\n", time_gemma(w, ctx, rows, 4) * 1e3);
                 }
         return 0;
     }

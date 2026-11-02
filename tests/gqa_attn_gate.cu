@@ -543,21 +543,27 @@ static void run_case(Case &C) {
         std::vector<Out> v = run_schedule(C, B, 0, N0, {N0});
         bool ok = v.size() == N0;
         uint32_t p = N0;
-        std::vector<Out> v_runs;   /* every run's rows, in order (the decode-group comparison below) */
+        std::vector<Out> v_runs;   /* every run's rows, in order (the CTA-shape comparison below) */
+        if (g_flashdec) pulsar_gqa_decode_force(1, 1);   /* the reference: one row x one head a CTA */
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
             ok = ok && o.size() == k && dec_diff(pre, o, p) == UINT32_MAX;   /* decode rows (g_flashdec: graded) */
             v_runs.insert(v_runs.end(), o.begin(), o.end());
             p += k;
         }
+        pulsar_gqa_decode_force(0, 0);
         check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
               "%s", N0, g_flashdec ? "graded (decode rows: flash-decoding), pools bit-exact" : "bit-exact");
-        /* L338: the same runs with a verify's decode groups (2, 4 rows a CTA, one sequence's keys loaded once) ==
-         * one row a CTA, byte for byte */
-        for (int grp : {2, 4}) {
+        /* L338: the same runs at every flash-decoding CTA shape (rows x heads of a KV head: one sequence's keys loaded
+         * once for its rows, a KV head's keys once for its heads) == one row x one head a CTA, byte for byte */
+        const int shapes[4][2] = {{1, 2}, {1, 4}, {2, 2}, {0, 0}};
+        const uint32_t G = C.R.n_q / C.R.n_kv;
+        for (const auto &sh : shapes) {
+            if (!g_flashdec || (sh[1] && G % (uint32_t)sh[1] != 0u)) continue;
             Seq Bg = seq_new(C, 1);
             run_schedule(C, Bg, 0, N0, {N0});
-            g_decode_group = grp;
+            pulsar_gqa_decode_force(sh[0], sh[1]);
+            g_decode_group = 4;
             bool gok = true;
             uint32_t q = N0, k0 = 0;
             for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
@@ -568,8 +574,11 @@ static void run_case(Case &C) {
                 k0 += k;
             }
             g_decode_group = 1;
-            check(gok && pools_equal(C, B, Bg, N), "verify at decode group %d: every run's rows byte-identical to one "
-                  "row a CTA, pools bit-exact", grp);
+            pulsar_gqa_decode_force(0, 0);
+            if (sh[0]) check(gok && pools_equal(C, B, Bg, N), "verify at a CTA of %d row(s) x %d head(s): every run's rows "
+                             "byte-identical to one x one, pools bit-exact", sh[0], sh[1]);
+            else check(gok && pools_equal(C, B, Bg, N), "verify at the launch's own CTA shape (a verify's group of 4): "
+                       "byte-identical to one x one, pools bit-exact");
             seq_free(Bg);
         }
         seq_free(B);
@@ -630,12 +639,13 @@ static void run_case(Case &C) {
             }
             std::vector<Out> bat4;
             g_decode_call = true;
-            g_decode_group = 4;
+            pulsar_gqa_decode_force(2, 2);
             bool gok = run_call(C, zs, rows, &bat4) == 0 && bat4.size() == bat.size();
-            g_decode_group = 1;
+            pulsar_gqa_decode_force(0, 0);
             g_decode_call = false;
             for (uint32_t s = 0; gok && s < NS; s++) gok = same(bat4[s], bat[s]);
-            check(gok, "batching at decode group 4 (16 sequences, no keys shared): == one row a CTA, bit-exact");
+            check(gok, "batching at a CTA of 2 rows x 2 heads (16 sequences, no keys shared): == the launch's own shape, "
+                  "bit-exact");
             for (uint32_t s = 0; s < NS; s++) seq_free(Z[s]);
         }
         /* the folded schedule: sequence 0 runs 70 rows, 1..5 one row each */

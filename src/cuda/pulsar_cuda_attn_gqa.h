@@ -172,11 +172,20 @@ typedef struct {
     int           decode_rows;
     /** L338: the most rows a flash-decoding CTA may attend together (0 or 1 = one a CTA; 2; 4) -- the caller's: 4 when
      *  consecutive rows are one sequence's (a verify's), whose keys a group then loads once for all of them.  The call
-     *  runs at the group the layer's shape and its row count measure best, at most this.  A row's bytes are the same at
+     *  runs at the CTA shape (rows x a KV head's query heads) its layer, chunks and row count measure best, at most
+     *  this many rows.  A row's bytes are the same at
      *  any group (each row's arithmetic is the one-row CTA's); rows of different sequences in a group each load their
      *  own keys. */
     int           decode_group;
 } pulsar_gqa_io;
+
+/** L338: an instrument's forced flash-decoding CTA shape -- `rows` rows x `heads` query heads of one KV head (1 x 1,
+ *  1 x 2, 1 x 4, 2 x 2: the pick's shapes; a call whose layer's G the heads do not divide refuses); 0, 0 = the
+ *  launch's own pick.  The bytes are the same at every shape (gqa_attn_gate); the engine never calls it.
+ *  @param rows  rows a CTA
+ *  @param heads query heads a CTA
+ *  @return 0, -1 not an instantiated shape */
+int pulsar_gqa_decode_force(int rows, int heads);
 
 /** Bytes of one token's KV row for this layer (every KV head, K and V). */
 /// @param layer the layer's declaration.
