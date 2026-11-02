@@ -40,19 +40,21 @@ const pulsar_nemotron_h_vision_shape PULSAR_NEMOTRON_H_VISION_SHAPE = {
 
 namespace {
 
-const char *const OWNER = "nemotron_h vision";
-constexpr uint32_t CHUNK = 2048;       /* the tower's Linear row chunk */
-constexpr uint32_t PROJ_CHUNK = 512;   /* the projector's (its fc1 stage is 20480 wide) */
-constexpr uint32_t LLM_WIDTH = 4096;
+constexpr uint32_t CHUNK = 2048;       ///< the tower's Linear row chunk
+constexpr uint32_t PROJ_CHUNK = 512;   ///< the projector's (its fc1 stage is 20480 wide)
+constexpr uint32_t LLM_WIDTH = 4096;   ///< the language model's embedding width: an LLM row's bf16 values
 
+/// A tower fact's container type.
 enum vk { K_U32, K_F32 };
+/** One nemotron_h_vision.* fact the reader knows. */
 struct vkey {
-    const char *key;
-    vk kind;
-    size_t off;
+    const char *key;   ///< the container key
+    vk kind;           ///< its type
+    size_t off;        ///< its field's byte offset in pulsar_nemotron_h_vision_shape
 };
 #define U(k, f) {"nemotron_h_vision." k, K_U32, offsetof(pulsar_nemotron_h_vision_shape, f)}
 #define F(k, f) {"nemotron_h_vision." k, K_F32, offsetof(pulsar_nemotron_h_vision_shape, f)}
+/// Every tower fact, each pinned to PULSAR_NEMOTRON_H_VISION_SHAPE's field.
 const vkey k_keys[] = {
     U("vit.width", width), U("vit.depth", depth), U("vit.heads", heads), U("vit.head_dim", head_dim),
     U("vit.mlp", mlp), U("vit.patch", patch), U("vit.prefix", prefix), U("vit.pos_grid", pos_grid),
@@ -64,6 +66,10 @@ const vkey k_keys[] = {
 #undef U
 #undef F
 
+/** Say a load refusal ("nemotron_h vision: <fmt with key> -- refusing") and record it (pulsar_load_refuse). */
+/// @param fmt the reason, a printf format with one %s
+/// @param key its argument
+/// @return false
 bool refuse(const char *fmt, const char *key) {
     fprintf(stderr, "pulsar: " NHV);
     fprintf(stderr, fmt, key);
@@ -72,6 +78,10 @@ bool refuse(const char *fmt, const char *key) {
     return false;
 }
 
+/** Read the nemotron_h_vision.* facts: every known one present and equal to the profile's, no unknown one. */
+/// @param m the model
+/// @param[out] s the shape (the profile's values)
+/// @return false when refused (said)
 bool read_shape(const pulsar_model *m, pulsar_nemotron_h_vision_shape *s) {
     *s = PULSAR_NEMOTRON_H_VISION_SHAPE;
     bool ok = true;
@@ -103,10 +113,15 @@ bool read_shape(const pulsar_model *m, pulsar_nemotron_h_vision_shape *s) {
     return ok;
 }
 
+/// Admits a plain BF16 tensor (positions, class tokens, proj_norm).
 const pulsar_role_admit A_BF16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_BF16), false, PULSAR_ROLE_DENSE, 0};
+/// Admits a plain f32 tensor (LayerNorm weights, biases).
 const pulsar_role_admit A_F32 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F32), false, PULSAR_ROLE_DENSE, 0};
+/// Admits a Linear the bf16 rows front door reads.
 const pulsar_role_admit A_LINEAR = {0, true, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_ROWS_BF16)};
 
+/// @param b a bf16 value
+/// @return it widened to f32
 float bf16f(uint16_t b) {
     const uint32_t u = (uint32_t)b << 16;
     float f;
@@ -174,9 +189,12 @@ bool pulsar_nemotron_h_vision_tokens(pulsar_nemotron_h_vision *v, const bpe_toke
 
 enum vbuf { V_PATCH, V_RES, V_XN, V_QKV, V_ATT, V_MLP, V_STAGE, V_LWS, V_COUNT };
 
+/** The tower's device scratch, one buffer per vbuf: V_PATCH bf16 [max_patches][768], V_RES f32 [n_max][width], V_XN /
+ *  V_QKV / V_ATT the encoder's rows (reused by the projector), V_MLP / V_STAGE the projector's chunk, V_LWS the rows
+ *  front door's workspace. */
 struct pulsar_nemotron_h_vision_run {
-    pulsar_gpu_tensor *t[V_COUNT];
-    uint64_t bytes[V_COUNT];
+    pulsar_gpu_tensor *t[V_COUNT];   ///< the buffers, indexed by vbuf
+    uint64_t bytes[V_COUNT];         ///< their sizes in bytes
     uint32_t n_max;   ///< prefix + the largest tile's patches
 };
 
@@ -241,15 +259,31 @@ bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_
 
 namespace {
 
+/// @param t a device buffer
+/// @return its device pointer as a T *
 template <class T = void>
 T *dp(const pulsar_gpu_tensor *t) { return (T *)pulsar_gpu_tensor_device_ptr(t); }
 
+/// Write "nemotron_h vision: <what>" to `err` (NULL = not reported).
+/// @param err the refusal's text
+/// @param errlen the size of `err`
+/// @param what the refusal
+/// @return false
 bool vfail(char *err, size_t errlen, const char *what) {
     if (err) snprintf(err, errlen, NHV "%s", what);
     return false;
 }
 
-/* stage [rows][out] f32 = x (bf16 rows) times t */
+/** stage [rows][out] f32 = x (bf16 rows) times t */
+/// @param m the model
+/// @param r the scratch (its stage and workspace)
+/// @param t the Linear's weight [in -> out]
+/// @param in its input width
+/// @param out its output width
+/// @param x the bf16 rows [rows][in], device
+/// @param rows the rows (at most the chunk)
+/// @param what the caller's name for it (reported on a refusal)
+/// @return false when refused
 bool lin(const pulsar_model *m, const pulsar_nemotron_h_vision_run *r, const pulsar_tensor *t, int in, int out,
          const uint16_t *x, uint32_t rows, const char *what) {
     pulsar_rows_linear l;
@@ -258,6 +292,7 @@ bool lin(const pulsar_model *m, const pulsar_nemotron_h_vision_run *r, const pul
                0;
 }
 
+/// @return CLOCK_MONOTONIC in milliseconds
 double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -350,18 +385,33 @@ bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotro
 
 namespace {
 
+/// @param e the engine
+/// @return its bound tower, or NULL when none is
 const pulsar_nemotron_h_vision *vision_of(const pulsar_engine *e) {
     const pulsar_nemotron_h_model *w = pulsar_nemotron_h_of(e);
     return w && w->vision.present ? &w->vision : NULL;
 }
 
+/// @param e the engine
+/// @return the `<image>` id, or -1 when no tower is bound
 int32_t image_id(const pulsar_engine *e) {
     const pulsar_nemotron_h_vision *v = vision_of(e);
     return v ? v->image_id : -1;
 }
 
+/// pulsar_family_vision::is_sentinel: `<image>` is the block token.
+/// @param e the engine
+/// @param id a token id
+/// @return true when `id` is `<image>` and a tower is bound
 bool is_sentinel(const pulsar_engine *e, int32_t id) { return image_id(e) >= 0 && id == image_id(e); }
 
+/// pulsar_family_vision::block_extent: a block is a maximal run of `<image>`.
+/// @param e the engine
+/// @param ids the token ids
+/// @param n their count
+/// @param start the index asked about
+/// @param[out] len the run's length
+/// @return true when ids[start] begins a run
 bool block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, int *len) {
     const int32_t t = image_id(e);
     if (t < 0 || !ids || start < 0 || start >= n || ids[start] != t || (start > 0 && ids[start - 1] == t)) return false;
@@ -371,13 +421,36 @@ bool block_extent(const pulsar_engine *e, const int32_t *ids, int n, int start, 
     return true;
 }
 
+/// pulsar_family_vision::placeholder_id: `<image>`, which the expansion replaces with the block.
+/// @param e the engine
+/// @return the `<image>` id, or -1
 int placeholder_id(const pulsar_engine *e) { return image_id(e); }
 
 /* the tile of an image, decoded once per image per process (keyed by content: the expansion and the licence ask) */
+/** One cached tile: the image's content hash and size, its tile in patches. */
 struct tile_entry { uint64_t key; size_t len; uint32_t wp, hp; };
+/** @var tile_entry::key
+ *  the image's content hash (pulsar_image_content_hash)
+ *  @var tile_entry::len
+ *  the encoded image's size in bytes
+ *  @var tile_entry::wp
+ *  the tile's width in patches
+ *  @var tile_entry::hp
+ *  the tile's height in patches */
+/// The tile cache: 16 entries, replaced round-robin once full.
 tile_entry g_tile[16];
+/** @var g_tile_n
+ *  entries in use
+ *  @var g_tile_next
+ *  the round-robin counter (the next slot is g_tile_next % 16) */
 int g_tile_n = 0, g_tile_next = 0;
 
+/// An image's tile, from the cache or by decoding it.
+/// @param v the tower
+/// @param img the image
+/// @param[out] wp the tile's width in patches
+/// @param[out] hp the tile's height in patches
+/// @return false when the image does not decode or has no tile within max_patches
 bool tile_of(const pulsar_nemotron_h_vision *v, const pulsar_image_ref *img, uint32_t *wp, uint32_t *hp) {
     const uint64_t key = pulsar_image_content_hash(img);
     for (int i = 0; i < g_tile_n; i++)
@@ -397,6 +470,13 @@ bool tile_of(const pulsar_nemotron_h_vision *v, const pulsar_image_ref *img, uin
     return true;
 }
 
+/// pulsar_family_vision::expand: (wp hp / merge^2) `<image>` ids, one per LLM row.
+/// @param e the engine
+/// @param img the image
+/// @param out receives the block's ids (appended)
+/// @param err receives the reason on false
+/// @param errlen size of `err`
+/// @return false when the image cannot be decoded or tiled
 bool expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *out, char *err, size_t errlen) {
     const pulsar_nemotron_h_vision *v = vision_of(e);
     uint32_t wp = 0, hp = 0;
@@ -409,8 +489,22 @@ bool expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *
     return true;
 }
 
+/// pulsar_family_vision::row_width.
+/// @return LLM_WIDTH
 uint32_t row_width(const pulsar_engine *) { return LLM_WIDTH; }
 
+/// pulsar_family_vision::block_rows: the projector's rows, one per `<image>` of the block.
+/// @param e the engine
+/// @param img the image
+/// @param block_len the block's length (must equal the tower's row count)
+/// @param tower the cached tower output, or NULL to run the tower
+/// @param n_tower its rows
+/// @param[out] tower_out the fresh tower output when `tower` is NULL (malloc'd; the core caches and frees it)
+/// @param[out] n_tower_out its rows
+/// @param out receives bf16 [block_len][LLM_WIDTH]
+/// @param err receives the reason on false
+/// @param errlen size of `err`
+/// @return false when no tower is bound, the tower refused, or the block's length is not the tower's
 bool block_rows(const pulsar_engine *e, const pulsar_image_ref *img, const int32_t *, int block_len,
                 const uint16_t *tower, int n_tower, uint16_t **tower_out, int *n_tower_out, uint16_t *out, char *err,
                 size_t errlen) {

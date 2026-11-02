@@ -9,20 +9,35 @@
 
 namespace {
 
+/** One pulsar_vit_encode call's context: the model, the operand format, the buffers and the error sink. */
 struct vit_ctx {
-    const pulsar_model *m;
-    pulsar_rows_out fmt;
-    const pulsar_vit_bufs &b;
-    char *err;
-    size_t errlen;
+    const pulsar_model *m;      ///< the model the weights belong to
+    pulsar_rows_out fmt;        ///< the operand format (f16 or bf16 rows)
+    const pulsar_vit_bufs &b;   ///< the device buffers
+    char *err;                  ///< the refusal's text (NULL = not reported)
+    size_t errlen;              ///< the size of `err`
+    /// Write "vit: <what>" to `err`.
+    /// @param what the refusal
+    /// @return false
     bool fail(const char *what) {
         if (err) snprintf(err, errlen, "vit: %s", what);
         return false;
     }
+    /// An f32 weight's device pointer.
+    /// @param t the tensor
+    /// @param what the caller's name for it (reported on a refusal)
+    /// @return the device pointer
     const float *fp(const pulsar_tensor *t, const char *what) {
         return (const float *)pulsar_weight_device_ptr(m, t, what);
     }
-    /* stage [rows][out] f32 = x [rows][in] times t, on the operand format's arm */
+    /** stage [rows][out] f32 = x [rows][in] times t, on the operand format's arm */
+    /// @param t the Linear's weight [in -> out]
+    /// @param in its input width
+    /// @param out its output width
+    /// @param x the rows, operand format [rows][in], device
+    /// @param rows the rows (at most the chunk)
+    /// @param what the caller's name for it (reported on a refusal)
+    /// @return false when refused (said in `err`)
     bool lin(const pulsar_tensor *t, int in, int out, const uint16_t *x, uint32_t rows, const char *what) {
         pulsar_rows_linear l;
         if (!pulsar_linear_rows_ref(m, t, in, out, true, what, &l)) return fail(what);

@@ -394,9 +394,14 @@ static const server_effort_map k_effort_qwen = {
     NULL, qwen_effort_default_level, /*think_mode_level=*/false};
 
 
-/* L268 (L331: every family with images): a message's content without the parser's image markers
- * (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the offsets, not the spelling, are the authority) and where each image
- * sits in what is left. */
+/** L268 (L331: every family with images): a message's content without the parser's image markers
+ *  (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the offsets, not the spelling, are the authority) and where each
+ *  image sits in what is left. */
+/// @param m      the message
+/// @param out    receives the stripped content and each image's byte offset in it (appended)
+/// @param err    receives the reason on false
+/// @param errlen size of `err`
+/// @return false + err when an image's marker is not at its offset
 bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err, size_t errlen) {
     if (!chat_msg_image_offsets_check(m, err, errlen)) return false;
     const char *c = m->content ? m->content : "";

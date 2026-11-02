@@ -5134,6 +5134,12 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst
  *  resize of a processor that runs torch on the image's uint8 values (Nemotron 3.5 Super VL's).  Returns malloc'd f32
  *  planes [3][dst_h][dst_w] (a widened copy when the size is unchanged), NULL on failure.  Within an f32 ulp of torch
  *  (vision.cpp, where the arithmetic is spelled out). */
+/// @param rgb RGB8 [h][w]
+/// @param w source width
+/// @param h source height
+/// @param dst_w destination width
+/// @param dst_h destination height
+/// @return the resized f32 planes (caller frees), or NULL
 float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, int dst_h);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);

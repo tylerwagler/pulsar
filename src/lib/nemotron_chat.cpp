@@ -380,8 +380,17 @@ bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t e
  * the text between images client data, each image the processor's expansion of the template's `<image>` (its block
  * expanded later by the engine's image front), a "\n" before an image that follows text not ending in one, and the
  * per-message number "<image k>" when there are several. */
+/// What one image renders as: the processor's expansion of the template's `<image>` (the image front's
+/// placeholder_text).
 const char kImageLiteral[] = "<img><image></img>";
 
+/** Write message `m`'s content with its images placed (above).
+ *  @param w      the render's writer
+ *  @param m      the message
+ *  @param i      its index in the conversation (named in a refusal)
+ *  @param err    receives the reason on false
+ *  @param errlen size of `err`
+ *  @return false + err when the text spells `<image>` beside images (image_marker_in_text) */
 bool write_content(writer &w, const nemotron_msg_in &m, int i, char *err, size_t errlen) {
     const std::string c = m.content ? m.content : "";
     if (m.n_images <= 0) {
@@ -389,7 +398,7 @@ bool write_content(writer &w, const nemotron_msg_in &m, int i, char *err, size_t
         return true;
     }
     if (c.find("<image>") != std::string::npos)
-        return refuse(err, errlen, "image_marker_in_text",
+        return chat_refuse(err, errlen, "image_marker_in_text",
                       "message %d spells <image> beside its %d image(s): the template would place the images at the "
                       "text's marker, and client text stays text", i, m.n_images);
     size_t at = 0;
@@ -517,7 +526,7 @@ bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *p
         const nemotron_msg_in &m = msgs[i];
         const char *role = m.role ? m.role : "";
         if (!strcmp(role, "assistant") && m.n_images > 0)
-            return refuse(err, errlen, "image_position", "message %d (assistant) carries an image", i);
+            return chat_refuse(err, errlen, "image_position", "message %d (assistant) carries an image", i);
         if (!strcmp(role, "assistant")) {
             if (!write_assistant(w, m, i < last_user, i, err, errlen)) return false;
         } else if (!strcmp(role, "user") || !strcmp(role, "system")) {

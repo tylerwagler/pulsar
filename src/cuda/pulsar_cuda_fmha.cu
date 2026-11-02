@@ -26,6 +26,22 @@ static_assert(!AttentionBF16::kNeedsOutputAccumulatorBuffer, "the output stays i
 /// @return true when p is 16-byte aligned.
 bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 
+/** Check the call against the kernel's limits and launch one `Attention` instance over the sequence. */
+/// @param what     the instance's name in a refusal ("f16" / "bf16")
+/// @param q        device query rows (the instance's scalar), head h at column h * head_dim
+/// @param ld_q     q row pitch in elements (a multiple of 8)
+/// @param k        device key rows, same head layout
+/// @param ld_k     k row pitch in elements
+/// @param v        device value rows, same head layout
+/// @param ld_v     v row pitch in elements
+/// @param n_rows   tokens in the sequence (every row attends every row)
+/// @param n_heads  heads
+/// @param head_dim per-head width (a multiple of 8, at most 128)
+/// @param scale    softmax scale on q . k
+/// @param y        device output rows, same head layout
+/// @param ld_y     y row pitch in elements
+/// @param stream   stream to launch on
+/// @return 0, -1 refused (named on stderr), -3 launch failure
 template <class Attention>
 int launch(const char *what, const uint16_t *q, uint64_t ld_q, const uint16_t *k, uint64_t ld_k, const uint16_t *v,
            uint64_t ld_v, uint32_t n_rows, uint32_t n_heads, uint32_t head_dim, float scale, uint16_t *y, uint64_t ld_y,

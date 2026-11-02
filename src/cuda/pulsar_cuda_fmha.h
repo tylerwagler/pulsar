@@ -45,6 +45,20 @@ int pulsar_fmha_f16_launch(const uint16_t *q, uint64_t ld_q, const uint16_t *k, 
                            uint64_t ld_y, cudaStream_t stream);
 
 /** L331: the same over bf16 rows (q / k / v and y bf16), on the bf16 tensor cores: -1 refused below sm_80. */
+/// @param q        device bf16 query rows, head h at column h * head_dim
+/// @param ld_q     q row pitch in elements (a multiple of 8)
+/// @param k        device bf16 key rows, same head layout
+/// @param ld_k     k row pitch in elements
+/// @param v        device bf16 value rows, same head layout
+/// @param ld_v     v row pitch in elements
+/// @param n_rows   tokens in the sequence (every row attends every row)
+/// @param n_heads  heads
+/// @param head_dim per-head width (a multiple of 8, at most 128)
+/// @param scale    softmax scale on q . k
+/// @param y        device bf16 output rows, same head layout
+/// @param ld_y     y row pitch in elements
+/// @param stream   stream to launch on
+/// @return 0, -1 refused (named on stderr; also below sm_80), -3 launch failure
 int pulsar_fmha_bf16_launch(const uint16_t *q, uint64_t ld_q, const uint16_t *k, uint64_t ld_k, const uint16_t *v,
                             uint64_t ld_v, uint32_t n_rows, uint32_t n_heads, uint32_t head_dim, float scale, uint16_t *y,
                             uint64_t ld_y, cudaStream_t stream);

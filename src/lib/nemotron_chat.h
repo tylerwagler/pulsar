@@ -94,6 +94,7 @@ struct nemotron_msg_in {
     /** L331: the byte offsets in `content` (ascending) where the message's images sit -- the template's
      *  render_content writes each there (nemotron_chat_render, "IMAGES").  NULL / 0 = none. */
     const uint32_t *image_at;
+    /// Number of entries in `image_at`.
     int n_images;
 };
 

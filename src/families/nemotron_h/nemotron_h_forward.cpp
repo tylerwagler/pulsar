@@ -871,8 +871,14 @@ bool embed(const pulsar_driver_step *st0) {
            fail("the embedding refused");
 }
 
-/* L331: a prompt chunk's image rows over the embeddings of their `<image>` ids (HF's masked_scatter): the residual
- * rows as the embed wrote them, one stream */
+/** L331: a prompt chunk's image rows over the embeddings of their `<image>` ids (HF's masked_scatter): the residual
+ *  rows as the embed wrote them, one stream
+ *  @param st0      the step (its residual)
+ *  @param rows     n_rows host rows, bf16 [n_rows][n_embd]
+ *  @param n_rows   rows to write
+ *  @param row0     the chunk row the first lands at
+ *  @param n_tokens the chunk's rows
+ *  @return true = written; false = refused (said) */
 bool image_rows(const pulsar_driver_step *st0, const uint16_t *rows, uint32_t n_rows, uint32_t row0, uint32_t n_tokens) {
     const nh_step *st = S(st0);
     return pulsar_image_write_stream_rows(st->res, rows, n_rows, row0, n_tokens, st->w->shape.n_embd, 1) ||

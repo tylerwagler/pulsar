@@ -576,6 +576,9 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h,
  * filter's polynomial always, the accumulation when the pass UPsamples -- a downsampling pass accumulates unfused
  * (measured on x86 torch 2.15: the weights bit-exact only with the filter's fmas, the upsampled and downsampled values
  * bit-exact only so; nemotron-vision-pixel-gate pins it against tests/nemotron_vision_goldens.py's processor). */
+/** Keys' cubic convolution kernel (a = -0.5) with torch's fused multiply-adds. */
+/// @param x the tap's distance from the centre, in input samples (scaled by invscale)
+/// @return the tap's unnormalised weight
 static float torch_cubic_aa(float x) {
     const float a = -0.5f;
     x = fabsf(x);
@@ -584,7 +587,13 @@ static float torch_cubic_aa(float x) {
     return 0.0f;
 }
 
-/* One axis's taps: xmin[o], n[o] and weights w[o * max + j]. */
+/** One axis's taps: xmin[o], n[o] and weights w[o * max + j]. */
+/// @param in the axis's input size
+/// @param out its output size
+/// @param[out] xmin_out malloc'd [out]: each output's first input index
+/// @param[out] n_out malloc'd [out]: each output's tap count
+/// @param[out] w_out malloc'd [out][max]: each output's normalised weights
+/// @return max, the taps' row stride (0 on an allocation failure; nothing is returned then)
 static int torch_aa_taps(int in, int out, int **xmin_out, int **n_out, float **w_out) {
     const float scale = (float)in / (float)out;
     const float support = scale >= 1.0f ? (float)(2.0 * (double)scale) : 2.0f;
@@ -621,7 +630,14 @@ static int torch_aa_taps(int in, int out, int **xmin_out, int **n_out, float **w
     return max;
 }
 
-/* planes [c][h][w_in] -> [c][h][w_out] (axis 0: along w) or [c][h_in][w] -> [c][h_out][w] (axis 1: along h). */
+/** planes [c][h][w_in] -> [c][h][w_out] (axis 0: along w) or [c][h_in][w] -> [c][h_out][w] (axis 1: along h). */
+/// @param src f32 planes [c][h][w]
+/// @param c planes
+/// @param h the source height
+/// @param w the source width
+/// @param axis 0 = resize the width, 1 = the height
+/// @param out the resized axis's size
+/// @return the malloc'd result (caller frees), or NULL
 static float *torch_aa_pass(const float *src, int c, int h, int w, int axis, int out) {
     const int in = axis == 0 ? w : h;
     int *xmin = NULL, *n = NULL;
