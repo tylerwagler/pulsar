@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <utility>
 
 /* Device-pass capability tiers (L321): the ONE place a kernel asks which instructions its compile target has.
  *
@@ -201,3 +202,52 @@ inline bool pulsar_cuda_smem_opt_in(const void *func, int (&set)[PULSAR_CUDA_DEV
 /// @param major a compute-capability major.
 /// @return true when it has mma.sync kind::mxf8f6f4.block_scale (the sm_12x family).
 static inline bool pulsar_cuda_block_scale_mma(int major) { return major == 12; }
+
+/* L340 (after TensorFold d93002949, FlashInfer 80ece849c): programmatic dependent launch.  A kernel launched with
+ * pulsar_launch_pdl may start while the kernel before it on the stream is still running; everything it does before
+ * pulsar_pdl_wait() must not read what that kernel writes (nor write what it reads) -- weights are the use: their
+ * loads go in flight under the producer's tail.  pulsar_pdl_trigger() lets the dependent launch before this grid ends.
+ * Byte-exact by construction: the same kernels and the same math, only the overlap.  sm_90+; on an older device the
+ * host never sets the attribute, the launch is serialised as any other, and the wait is already satisfied -- so the
+ * device bodies below are empty there, which is the same semantics, not a second path. */
+#ifdef __CUDACC__
+/// Wait until the grid this one depends on (the previous kernel on the stream) has completed and its writes are
+/// visible.  A no-op when launched without pulsar_launch_pdl.
+__device__ __forceinline__ void pulsar_pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
+}
+/// Let the kernel launched after this one with pulsar_launch_pdl start (it still waits in pulsar_pdl_wait for this
+/// grid's completion before reading its output).
+__device__ __forceinline__ void pulsar_pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+#endif
+}
+/// @brief Launch `kernel` so it may overlap the stream's previous kernel (programmatic stream serialisation, sm_90+;
+/// an ordinary launch on an older device).  The kernel must call pulsar_pdl_wait() before it reads that kernel's
+/// output.
+/// @param kernel  the __global__ function
+/// @param grid    grid
+/// @param block   block
+/// @param smem    dynamic shared memory bytes
+/// @param stream  the stream
+/// @param args    the kernel's arguments
+/// @return the launch's cudaError_t
+template <typename... KArgs, typename... Args>
+inline cudaError_t pulsar_launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
+                                     Args &&...args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pulsar_cuda_device_major() >= 9 ? 1u : 0u;
+    return cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
+}
+#endif
