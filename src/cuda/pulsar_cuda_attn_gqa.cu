@@ -1194,7 +1194,9 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
     const bool bias = L->rel_extent > 0u;
     if constexpr (HD > 128) {   /* L338: the wide heads (no bias, gate or block: refused at the declaration) */
         const dim3 grid(fold ? 1u : grid_chunks, L->n_kv * (HD / GQA_WIDE_D), n_tiles);
-        if (decode && !fold && n_tiles == n_rows) {   /* L338: decode rows, a row a tile: flash-decoding (the combine below) */
+        if (decode && !fold) {   /* L338: decode / verify rows (never a prompt's): flash-decoding, a CTA a row (the combine
+                                  * below) -- a verify's rows and a plain decode's are then the same arm's bytes, so
+                                  * speculation never changes the output */
             const dim3 dgrid(grid_chunks, L->n_q, n_rows);
             if (L->kv_fmt == PULSAR_GQA_KV_E4M3) gqa_decode_kernel<HD, true><<<dgrid, GQA_DEC_THREADS, 0, st>>>(aa);
             else                                 gqa_decode_kernel<HD, false><<<dgrid, GQA_DEC_THREADS, 0, st>>>(aa);

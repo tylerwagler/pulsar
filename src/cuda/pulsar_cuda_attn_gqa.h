@@ -165,9 +165,10 @@ typedef struct {
     void         *workspace;  /**< device, >= pulsar_gqa_workspace_bytes */
     /** Size of `workspace`, bytes. */
     uint64_t      workspace_bytes;
-    /** L338: 1 = every row is a DECODE row (the caller's row kind: not a prompt chunk, not a verify run) -- a wide-head
-     *  (256, 512) call of one row a tile then takes the flash-decoding arm (f32 on the CUDA cores: not the MMA tile's
-     *  bytes); 0 = the MMA tile, whose bytes a prompt cut anywhere keeps. */
+    /** L338: 1 = every row is a DECODE row (the caller's row kind: a decode step's or a verify's, never a prompt
+     *  chunk's) -- a wide-head (256, 512) call under the folded width then takes the flash-decoding arm (f32 on the
+     *  CUDA cores: not the MMA tile's bytes; a row's bytes the same whatever rides with it, so a verified row is the
+     *  plain decode's); 0 = the MMA tile, whose bytes a prompt cut anywhere keeps. */
     int           decode_rows;
 } pulsar_gqa_io;
 

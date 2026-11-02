@@ -47,6 +47,7 @@
 #include "cuda/pulsar_cuda_router.h"
 #include "cuda/pulsar_cuda_rowops.h"
 #include "cuda/pulsar_cuda_f16_rows.h"   /* L338: the runtime LoRA (pulsar_rows_lora_launch) */
+#include "engine/spec_block.h"            /* L338 P3: the block drafter's taps and state */
 
 #include <math.h>
 
@@ -493,9 +494,11 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
  *  @param s  the session; its family state is freed */
 void destroy(pulsar_session *s) { state_free(ST(s)); }
 
-/** pulsar_driver_ops::verifies: no drafter yet (L338 P3), so no verify capture.
- *  @return false */
-bool verifies(const pulsar_session *) { return false; }
+/** pulsar_driver_ops::verifies (L338 P3): the session verifies when the block drafter is loaded (the rings carry the
+ *  verify's rows: state_kinds.h RING).
+ *  @param s  the session
+ *  @return true with a drafter */
+bool verifies(const pulsar_session *s) { return W(s->engine)->block != NULL; }
 
 /** pulsar_driver_ops::trunk.
  *  @param s  the session
@@ -981,9 +984,11 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
     if (!ffn(st, il, fbase, F)) return false;
     /* h = bf16(bf16(h + ffn) * layer_scalar), and the next reader's norm into xa */
     const uint16_t *nn = next_norm(st, il), *ls = (const uint16_t *)wp(st, L.layer_scalar, "gemma4 layer_scalar");
-    return (nn && ls && pulsar_rows_add_scale_launch(h, E, (const uint16_t *)(fbase + F.e1), E, n, E, ls, nn, s.rms_eps,
-                                                     xa, E, 0) == 0) ||
-           failf("the layer's scaled residual add refused", il);
+    if (!(nn && ls && pulsar_rows_add_scale_launch(h, E, (const uint16_t *)(fbase + F.e1), E, n, E, ls, nn, s.rms_eps,
+                                                   xa, E, 0) == 0))
+        return failf("the layer's scaled residual add refused", il);
+    /* L338 P3: the block drafter's tap -- HF decoder layer il's output, the scaled residual (a no-op untapped) */
+    return pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_FFN, h, E, n) || failf("the drafter tap refused", il);
 }
 
 /** pulsar_driver_ops::head: step rows [row0, row0 + n) of xa (output_norm of h) -> the EXL3 head (the decode arm at
@@ -1094,6 +1099,7 @@ void pulsar_gemma4_state_plan(pulsar_engine *e) {
     p->n_trunk = lp->n_layer;
     p->n_slots = lp->n_layer;
     p->session = 0;
+    if (e->block_drafter) pulsar_block_drafter_plan(e, p);   /* L338 P3: the drafter's context rings */
 }
 
 const pulsar_driver_ops PULSAR_GEMMA4_DRIVER = {
@@ -1107,7 +1113,7 @@ const pulsar_driver_ops PULSAR_GEMMA4_DRIVER = {
     /* .block         = */ {NULL, NULL, NULL, NULL, block},   /* by pulsar_layer_kind: BLOCKS */
     /* .head          = */ head,
     /* .step_end      = */ step_end,
-    /* .absorb        = */ NULL,   /* no drafter lane yet (L338 P3: DFlash) */
+    /* .absorb        = */ pulsar_drafter_lane_absorb,   /* L338 P3: the block lane's lockstep (none: nothing) */
     /* .mtp           = */ NULL,
     /* .rope          = */ NULL,   /* text positions */
     /* .image_rows    = */ NULL,   /* text only */

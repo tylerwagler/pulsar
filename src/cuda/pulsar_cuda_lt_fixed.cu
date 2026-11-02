@@ -211,8 +211,11 @@ int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const voi
     const uint16_t *ap = static_cast<const uint16_t *>(a);   /* fp16 elements */
     const void *a_cols = a_layout_id == PULSAR_LT_A_KN ? (const void *)(ap + n_off) : (const void *)(ap + (size_t)n_off * K);
     const float one = 1.0f, zero = 0.0f;
+    /* L338: stream 0 here is the per-thread default stream (the engine builds --default-stream per-thread); cuBLAS,
+     * built apart, would read 0 as the LEGACY stream -- outside a captured step's stream (status 14 under capture) */
+    const cudaStream_t s = stream ? stream : cudaStreamPerThread;
     const cublasStatus_t st = cublasLtMatmul(g_lt, sh->op, &one, a_cols, c->la, x, c->lb, &zero, d, c->ld, d, c->ld,
-                                             &sh->algo, g_ws, kWs, stream);
+                                             &sh->algo, g_ws, kWs, s);
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "%s: cuBLAS GEMM failed (%d) -- refusing\n", tag, (int)st);
         return -3;

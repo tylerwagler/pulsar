@@ -56,6 +56,7 @@ import os
 from dataclasses import dataclass, field, replace
 
 import adapters as AD
+import drafters as DR
 import entries as EN
 import exl3_rates
 import kv as KV
@@ -337,6 +338,19 @@ def with_adapter(hf, kind, path):
     return AD.with_adapter(hf, kind, path, AD.Target(sh.hidden, sh.n_layer, shapes))
 
 
+DRAFTERS = ("dflash",)
+
+
+def with_drafter(hf, kind, path):
+    """build.py --drafter KIND DIR (L338 P3): the checkpoint view carrying z-lab's plain DFlash drafter (drafters.py),
+    checked against this target's hidden width, vocabulary and block count.  It reads the target's embedding and its
+    head as the container holds them (the engine binds both): nothing derived."""
+    if kind not in DRAFTERS:
+        raise SystemExit(f"--drafter {kind}: the Gemma 4 build reads {list(DRAFTERS)}")
+    sh = hf.decl
+    return DR.with_drafter(hf, kind, path, DR.Target(sh.hidden, sh.vocab, sh.n_layer))
+
+
 def map_hf(name: str, shape: Shape) -> Mapped | None:
     return shape.table.get(name)
 
@@ -358,7 +372,9 @@ def shape(hf, ctx):
 
 def shard_order(shape):
     adapter = any(m.shard == "adapter" for m in shape.table.values())
-    return ["vision"] + [f"layers.{i}" for i in range(shape.n_layer)] + ["top"] + (["adapter"] if adapter else [])
+    drafter = any(m.shard == "drafter" for m in shape.table.values())
+    return (["vision"] + [f"layers.{i}" for i in range(shape.n_layer)] + ["top"] + (["adapter"] if adapter else [])
+            + (["drafter"] if drafter else []))
 
 
 def _suffix(m):
@@ -380,6 +396,11 @@ def declared_shape(m, hshape):
 def admit(hf, m, fmt, name):
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
     allowed = {"native", native}
+    if m.shard == "drafter":                         # L338 P3: the block drafter's Linears f16 (Turing), the rest as stored
+        allowed = {"drafter_linear": {"f16"}, "drafter_native": {"native"}}[m.role]
+        if fmt not in allowed:
+            raise SystemExit(f"{name}: the drafter's {m.role} tensor is written {sorted(allowed)}, not {fmt}")
+        return
     if m.role == "adapter" and fmt != "f16":        # the runtime LoRA's pairs: the fp16 tensor-core operand (L338)
         raise SystemExit(f"{name}: the adapter's LoRA pairs are written f16 (the runtime LoRA's operand), not {fmt}")
     if m.role == "adapter":
@@ -466,6 +487,10 @@ def build_kv(hf, ctx):
     kvs.append(("pulsar.source.hf", "string", os.path.basename(os.path.normpath(hf.dir))))
     if isinstance(hf, AD.WithAdapter):
         kvs += hf.adapter.kvs
+    dr = getattr(hf, "drafter", None)          # L338 P3 (through an adapter view too)
+    if isinstance(dr, DR.Drafter):
+        kvs += [("pulsar.drafter", "string", dr.kind)] + dr.kvs
+        kvs.append(("pulsar.source.drafter", "string", os.path.basename(os.path.normpath(dr.dir))))
     out = [KV.entry(k, t, v) for k, t, v in kvs]
     keys = [e["key"] for e in out]
     if len(set(keys)) != len(keys):

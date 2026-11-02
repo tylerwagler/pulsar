@@ -181,6 +181,10 @@ typedef struct {
     pulsar_tensor *decision_head;       ///< decision_head: f32 [slots][n_embd] (ne n_embd, slots), read on the host
     pulsar_tensor *decision_head_bias;  ///< decision_head_bias: f32 [slots]
     uint32_t decision_slots;            ///< the head's slots
+    /* L338 P3: the block drafter (pulsar.drafter in the container: z-lab's plain DFlash; spec_block.h) when the open
+     * loads it -- NULL: none in the container, or --drafter none */
+    struct pulsar_block_drafter *block; ///< owned (a plain record; free() is its teardown)
+    bool block_written;                 ///< the container carries a block drafter (loaded or not)
 } pulsar_gemma4_model;
 
 /** The family's tokenizer table and chat front (gemma4_tokenizer.cpp over src/lib/gemma4_chat). */

@@ -3,17 +3,28 @@
 /** @file gemma4_family.cpp
  *  @brief The Gemma 4 family descriptor: load, the engine facts, the session on the core row-step driver. */
 #include "gemma4.h"
+#include "engine/spec_block.h"
 #include "lib/bpe_tokenizer.h"
+
+#include <math.h>
+#include <string.h>
 
 namespace {
 
 /// The architecture name every refusal and announce line is prefixed with.
 const char *const ARCH = PULSAR_GEMMA4_ARCH;
 
-/** pulsar_family::unload: free the tokenizer and the family state load allocated (safe after a partial load).
+/** pulsar_family::unload: free the tokenizer, the block drafter's record (L338 P3: a plain record, free() is its
+ *  teardown) and the family state load allocated, and clear the engine's block-drafter pointer (safe after a partial
+ *  load).
  *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
-    if (e->family_state) bpe_tokenizer_free(((pulsar_gemma4_model *)e->family_state)->tok);
+    if (e->family_state) {
+        bpe_tokenizer_free(((pulsar_gemma4_model *)e->family_state)->tok);
+        free(((pulsar_gemma4_model *)e->family_state)->block);
+    }
+    e->block_drafter = NULL;
+    e->drafter_ops = NULL;
     free(e->family_state);
     e->family_state = NULL;
 }
@@ -25,11 +36,6 @@ void unload(pulsar_engine *e) {
  *  @return true = loaded; false = refused (said, and counted through pulsar_load_refuse) */
 bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the options that name another family's feature refuse here, by name, rather than being ignored */
-    if (opt->drafter && opt->drafter[0]) {
-        fprintf(stderr, "pulsar: %s: --drafter %s: this family's container holds no drafter to choose; refusing\n", ARCH,
-                opt->drafter);
-        return false;
-    }
     if (opt->expert_overlay && opt->expert_overlay[0]) {
         fprintf(stderr, "pulsar: %s: --expert-overlay is a DeepSeek routed-expert tool; refusing\n", ARCH);
         return false;
@@ -52,6 +58,47 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
         return false;
     }
     pulsar_gemma4_plan(&w->shape, &e->plan);
+    /* L338 P3: the block drafter the container holds (z-lab's plain DFlash), loaded unless --drafter none; --drafter
+     * names nothing else here */
+    {
+        const char *kind = pulsar_block_drafter_kind_of(&e->model);
+        if (!kind) return false;
+        w->block_written = kind[0] != 0;
+        const char *want = opt->drafter && opt->drafter[0] ? opt->drafter : NULL;
+        if (want && strcmp(want, "none") && (!w->block_written || strcmp(want, kind))) {
+            fprintf(stderr, "pulsar: %s: --drafter %s: the container holds %s%s -- refusing\n", ARCH, want,
+                    w->block_written ? "the block drafter " : "no drafter", w->block_written ? kind : "");
+            return false;
+        }
+        if (w->block_written && !(want && !strcmp(want, "none"))) {
+            w->block = (pulsar_block_drafter *)xcalloc(1, sizeof(*w->block));
+            pulsar_block_drafter *d = w->block;
+            if (!pulsar_block_drafter_read(&e->model, d)) return false;
+            if (d->head_kind != PULSAR_BLOCK_HEAD_PLAIN || d->hidden != w->shape.n_embd ||
+                d->vocab != w->shape.n_vocab) {
+                fprintf(stderr, "pulsar: %s: the drafter (%s, hidden %u, vocabulary %u) is not a plain DFlash over "
+                                "this target's %u / %u -- refusing\n", ARCH, d->kind, d->hidden, d->vocab,
+                        w->shape.n_embd, w->shape.n_vocab);
+                return false;
+            }
+            /* the taps: HF decoder layer i's output = the residual after layer i's scaled add (its last sublayer) */
+            for (uint32_t j = 0; j < d->n_taps; j++) {
+                if (d->tap_block[j] >= w->shape.n_layer) {
+                    fprintf(stderr, "pulsar: %s: the drafter taps layer %u of a %u-layer target -- refusing\n", ARCH,
+                            d->tap_block[j], w->shape.n_layer);
+                    return false;
+                }
+                d->tap_layer[j] = d->tap_block[j];
+                d->tap_sub[j] = PULSAR_BLOCK_TAP_FFN;
+            }
+            /* E5: the target's embedding scale, bf16(sqrt(hidden)) (gemma4_forward.cpp head_decl), nearest even */
+            const float r = sqrtf((float)w->shape.n_embd);
+            uint32_t u;
+            memcpy(&u, &r, 4);
+            u = (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
+            memcpy(&d->embed_scale, &u, 4);
+        }
+    }
     /* stage 2: the whole-artifact scans every family's load runs (a type no reader takes, a NaN E8M0 scale, a
      * non-finite EXL3 scale) */
     weights_reject_unsupported_types(&e->model);
@@ -69,6 +116,14 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     }
     /* stage 4: the tokenizer beside the shards */
     if (!pulsar_gemma4_load_tokenizer(w, opt->model_path)) return false;
+    /* L338 P3: the drafter behind the round API -- the target's embedding and EXL3 head (PLAIN binds none of its own) */
+    if (w->block) {
+        w->block->embed = w->embed;
+        w->block->head = w->head;
+        w->block->head_rows = w->shape.n_vocab;
+    }
+    e->block_drafter = w->block;
+    e->drafter_ops = w->block ? &w->block->ops : NULL;
     /* the session's declared state and the digest its disk segments are keyed by: the directory's names, types and
      * sizes */
     pulsar_gemma4_state_plan(e);
@@ -142,7 +197,10 @@ int model_id(const pulsar_engine *) { return 7; }
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
 /** pulsar_family::drafter: none is loaded (L338 P3 brings the DFlash block drafter).
  *  @return PULSAR_DRAFTER_NONE */
-pulsar_drafter_kind drafter(pulsar_engine *) { return PULSAR_DRAFTER_NONE; }
+pulsar_drafter_kind drafter(pulsar_engine *e) {
+    const pulsar_gemma4_model *w = (const pulsar_gemma4_model *)e->family_state;
+    return w && w->block ? PULSAR_DRAFTER_BLOCK : PULSAR_DRAFTER_NONE;
+}
 /* the routed experts' tier in EXL3's value space (family.h quant_bits): 20 + the highest rate in half bits */
 /** pulsar_family::quant_bits: the highest EXL3 rate over the routed expert stacks.
  *  @param e  the engine
@@ -170,7 +228,8 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .arch         = */ PULSAR_GEMMA4_ARCH,
     /* .name         = */ "Gemma 4",
     /* .caps         = */ PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                          PULSAR_FAMILY_CAP_PAYLOAD,   /* the tokenizer + chat front (L338 T3); SPEC (P3) next */
+                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC,   /* the tokenizer + chat front (L338
+                           * T3); SPEC: the driver's verify target under the block drafter (P3) */
     /* .load         = */ load,
     /* .after_gpu    = */ after_gpu,
     /* .logits_width = */ logits_width,
@@ -183,7 +242,7 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .tp_shape     = */ NULL,   /* no CAP_TP: the open refuses tensor parallelism before it would ask */
     /* .drafter      = */ drafter,
     /* .quant_bits   = */ quant_bits,
-    /* .spec         = */ NULL,
+    /* .spec         = */ &PULSAR_DRIVER_SPEC_TARGET,   /* L338 P3: the core driver's verify target (step_driver.cpp) */
     /* .session      = */ &k_session_ops,
     /* .tokenizer    = */ &PULSAR_GEMMA4_TOKENIZER,   /* gemma4_tokenizer.cpp (the shared BPE engine's SentencePiece-BPE
                                                      row + src/lib/gemma4_chat's front) */

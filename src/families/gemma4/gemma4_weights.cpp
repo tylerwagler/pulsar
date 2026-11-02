@@ -11,6 +11,7 @@
 /** @file gemma4_weights.cpp
  *  @brief Gemma 4's weights: every tensor bound by role, its format admitted and priced. */
 #include "gemma4.h"
+#include "engine/spec_block.h"   /* L338 P3: the block drafter's bind */
 
 namespace {
 
@@ -150,6 +151,14 @@ bool pulsar_gemma4_bind(const pulsar_model *m, pulsar_gemma4_model *w) {
     w->head = pulsar_role_bind(b, pulsar_role_top("head"), A_LINEAR, 2, s->n_embd, s->n_vocab);
     for (uint32_t il = 0; il < s->n_layer; il++) bind_layer(b, s, (int32_t)il, &w->layer[il]);
     bind_adapter(m, b, w);
+    /* L338 P3: the block drafter (block `drafter`) when the open loaded it, else unloaded */
+    if (w->block) {
+        (void)pulsar_block_drafter_bind(b, w->block);
+    } else if (w->block_written) {
+        const uint64_t n = pulsar_role_binder_unload(b, "drafter");
+        fprintf(stderr, "pulsar: %s: the block drafter (%llu tensors) is not loaded (--drafter none)\n", OWNER,
+                (unsigned long long)n);
+    }
     /* the census: every directory entry declared, every byte priced (the extras refused by name) */
     return pulsar_role_binder_close(b, &w->census);
 }

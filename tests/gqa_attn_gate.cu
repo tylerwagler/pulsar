@@ -171,8 +171,8 @@ static uint64_t g_ws_bytes = 0;
 /* L296 perf: 0 = pulsar_gqa_forward; else the two halves -- pulsar_gqa_plan bounded at g_bound, the descriptors
  * uploaded here, pulsar_gqa_launch (what a captured step does) */
 static uint32_t g_bound = 0;
-/* L338: the next calls' rows are DECODE rows (pulsar_gqa_io::decode_rows): run_schedule's {1} schedules and the
- * batched decode of 16 sequences -- a prompt's one-row chunk stays a prompt chunk */
+/* L338: the next calls' rows are DECODE rows (pulsar_gqa_io::decode_rows): run_schedule's one-width schedules up to
+ * 16 rows (decodes, verifies) and the batched decode of 16 sequences -- a prompt's chunks stay prompt chunks */
 static bool g_decode_call = false;
 /* f(i) for i in [0, n) on up to 16 host threads */
 template <class F> static void par_for(uint32_t n, F f) {
@@ -263,7 +263,7 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
 /* a run of consecutive rows of one sequence in calls of the given sizes (the last repeats) */
 static std::vector<Out> run_schedule(const Case &C, Seq &s, uint32_t p0, uint32_t p1, const std::vector<uint32_t> &sizes) {
     const bool was = g_decode_call;
-    g_decode_call = sizes.size() == 1 && sizes[0] == 1u;   /* one row a call: decode rows */
+    g_decode_call = sizes.size() == 1 && sizes[0] <= 16u;   /* a decode / verify width a call: decode rows */
     struct restore { bool w; ~restore() { g_decode_call = w; } } r_{was};
     std::vector<Out> all;
     std::vector<Seq *> v{&s};
@@ -542,11 +542,11 @@ static void run_case(Case &C) {
         uint32_t p = N0;
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
-            ok = ok && o.size() == k && (k == 1u ? dec_diff(pre, o, p) : first_diff(pre, o, p)) == UINT32_MAX;
+            ok = ok && o.size() == k && dec_diff(pre, o, p) == UINT32_MAX;   /* decode rows (g_flashdec: graded) */
             p += k;
         }
         check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
-              "bit-exact%s", N0, g_flashdec ? " (the closing one-row call graded: flash-decoding)" : "");
+              "%s", N0, g_flashdec ? "graded (decode rows: flash-decoding), pools bit-exact" : "bit-exact");
         seq_free(B);
     }
     /* 5. rollback of a junk verify */
@@ -602,7 +602,7 @@ static void run_case(Case &C) {
         for (uint32_t s = 1; s < 6; s++) rows.push_back({s, len[s] + 1u});
         ok = run_call(C, xs, rows, &bat) == 0;
         std::vector<Out> r0 = run_schedule(C, Y[0], len[0] + 1u, len[0] + 71u, {7});
-        for (uint32_t i = 0; i < 70 && ok; i++) ok = same(r0[i], bat[i]);
+        for (uint32_t i = 0; i < 70 && ok; i++) ok = dec_match(r0[i], bat[i]);   /* 7-row calls: decode rows */
         for (uint32_t s = 1; s < 6 && ok; s++) {
             std::vector<Out> one = run_schedule(C, Y[s], len[s] + 1, len[s] + 2, {1});
             ok = one.size() == 1 && dec_match(one[0], bat[70 + s - 1]);

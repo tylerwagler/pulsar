@@ -10,6 +10,7 @@
  * (E4: the core driver's table covers the plan, the window ring + global pool state, the caps); the tokenizer table.  The forward itself is
  * graded on the GPU by the core driver's forward gate + tests/gemma4_grade.py.  Exit 0 = every check passed. */
 #include "families/gemma4/gemma4.h"
+#include "engine/spec_block.h"   /* L338 P3: the block drafter's declaration */
 #include "engine/exl3_trellis.h"
 
 #include <stdarg.h>
@@ -109,7 +110,22 @@ int main(int argc, char **argv) {
     check(pulsar_engine_model_id(e) == 7, "disk-KV model id %d", pulsar_engine_model_id(e));
     check(pulsar_engine_has_tokenizer(e) && pulsar_engine_chat_format(e) == PULSAR_CHAT_GEMMA4,
           "the chat front: CAP_CHAT, the Gemma 4 renderer");
-    check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE, "no drafter runs");
+    /* L338 P3: the block drafter runs exactly when the container declares one (z-lab's plain DFlash) */
+    const pulsar_gemma4_model *gw = (const pulsar_gemma4_model *)e->family_state;
+    const pulsar_block_drafter *bd = e->block_drafter;
+    if (gw->block_written) {
+        bool taps_ok = bd && bd->n_taps > 0;
+        for (uint32_t j = 0; taps_ok && j < bd->n_taps; j++)
+            taps_ok = bd->tap_layer[j] == bd->tap_block[j] && bd->tap_sub[j] == PULSAR_BLOCK_TAP_FFN;
+        check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK && bd && bd->head_kind == PULSAR_BLOCK_HEAD_PLAIN &&
+                  bd->conv_taps == 0 && bd->head == gw->head && bd->embed == gw->embed && bd->embed_scale == 53.0f &&
+                  bd->softcap == 30.0f && bd->full_layers != 0 && taps_ok && e->drafter_ops == &bd->ops,
+              "the block drafter runs: %s, plain head over the target's EXL3 head and embedding (x%g), soft-cap %g, "
+              "%u taps after each layer's scaled add", bd ? bd->kind : "-", bd ? (double)bd->embed_scale : 0.0,
+              bd ? (double)bd->softcap : 0.0, bd ? bd->n_taps : 0u);
+    } else {
+        check(pulsar_engine_drafter(e) == PULSAR_DRAFTER_NONE && !bd, "no drafter runs (none in the container)");
+    }
     /* the tokenizer table (gemma4_tokenizer.cpp; tokenization itself is gemma4-chat-gate's, graded against HF) */
     pulsar_tokens hello = {0};
     const bool tok_ok = pulsar_tokenize_text(e, "Hello world", &hello) && hello.len == 2;
@@ -138,23 +154,27 @@ int main(int argc, char **argv) {
           miss ? miss : "nothing missing");
     const pulsar_state_plan *sp = &e->state_plan;
     const pulsar_state_decl &win = sp->decl[PULSAR_GEMMA4_STATE_KV_WIN], &full = sp->decl[PULSAR_GEMMA4_STATE_KV_FULL];
-    bool state_ok = sp->n_decl == PULSAR_GEMMA4_STATE_COUNT && sp->split_invariant && sp->resume_grid > 0 &&
+    const uint32_t dn = bd ? (bd->full_layers ? 2u : 1u) : 0u, dl = bd ? bd->n_layer : 0u;   /* the drafter's rings */
+    bool state_ok = sp->n_decl == PULSAR_GEMMA4_STATE_COUNT + dn && sp->split_invariant && sp->resume_grid > 0 &&
                     win.kind == PULSAR_STATE_RING && win.capture == PULSAR_STATE_CAPTURE_NONE && win.tokens == s->window &&
                     win.bytes == 2ull * s->swa_n_head_kv * s->swa_head_dim * 2u &&
                     full.kind == PULSAR_STATE_POOL && full.capture == PULSAR_STATE_CAPTURE_NONE && full.tokens == 1u &&
                     full.bytes == 2ull * s->n_head_kv * s->head_dim * 2u &&
-                    sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer;
+                    sp->n_trunk == s->n_layer && sp->n_slots == s->n_layer + dl;
     for (uint32_t il = 0; state_ok && il < s->n_layer; il++)
         state_ok = sp->slot[il] == 1u << (pulsar_gemma4_is_full(s, il) ? PULSAR_GEMMA4_STATE_KV_FULL
                                                                         : PULSAR_GEMMA4_STATE_KV_WIN);
+    for (uint32_t l = 0; state_ok && bd && l < bd->n_layer; l++)
+        state_ok = sp->slot[s->n_layer + l] == 1u << (((bd->full_layers >> l) & 1u) ? bd->decl_kv_full : bd->decl_kv);
     check(state_ok, "the declared state: kv_win RING %u keys x %llu B a window layer, kv_full POOL %llu B a token a "
-          "global layer", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes);
+          "global layer%s", win.tokens, (unsigned long long)win.bytes, (unsigned long long)full.bytes,
+          bd ? "; the drafter's draft_kv RING (+ draft_kv_full for its full layer) a drafter layer" : "");
     check(e->family->caps == (PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                              PULSAR_FAMILY_CAP_PAYLOAD) &&
-              e->family->banks == &PULSAR_BANK_OPS_DECLARED && e->family->spec == NULL &&
-              e->family->driver->absorb == NULL && e->family->driver->mtp == NULL,
-          "caps 0x%x (chat, banks, segments, payload: the driver's session over the declared state; no spec, TP or "
-          "images yet)", e->family->caps);
+                              PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC) &&
+              e->family->banks == &PULSAR_BANK_OPS_DECLARED && e->family->spec == &PULSAR_DRIVER_SPEC_TARGET &&
+              e->family->driver->absorb == pulsar_drafter_lane_absorb && e->family->driver->mtp == NULL,
+          "caps 0x%x (chat, banks, segments, payload, spec: the driver's session over the declared state, its verify "
+          "target, the block lane's absorb; no TP or images yet)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "GEMMA4-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
     return n_fail ? 1 : 0;

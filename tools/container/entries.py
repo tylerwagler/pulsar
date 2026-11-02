@@ -40,7 +40,7 @@ def dense(hf, name: str, layout: str, dshape: list, mxfp8_mode: str = "rederive"
         for d in hshape:
             n_el *= d
         return {"dtype": "I32", "shape": list(dshape), "nbytes": 4 * n_el, "src": ("produce", PR.spec(prod, [name]))}
-    if prod == "f16_from_f32":   # elementwise: any rank, the declared shape the (permuted) source's elements
+    if prod in ("f16_from_f32", "f16_from_bf16"):   # elementwise: any rank, the declared shape the (permuted) source's
         nbytes = PR.bytes_for(layout, list(reversed(dshape)))
         n_el = 1
         for d in hshape:
