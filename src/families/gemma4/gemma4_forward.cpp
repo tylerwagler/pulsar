@@ -5,22 +5,24 @@
  *
  *   embed      E5   pulsar_head_embed_launch: the gather times bf16(sqrt(hidden)) = 53 (embed_scale) -> h (bf16)
  *   per layer  (pulsar_layer_desc: window or full attention, PULSAR_FFN_DENSE_MOE)
- *       xa = rmsnorm(h) * input_layernorm      (layer 0; then the previous layer's last add-scale)       row ops
+ *       xa = rmsnorm(h) * input_layernorm      (layer 0; then the previous layer's FFN tail)            row ops
  *     attention: q | k [| v] = bf16(xa W)       (one multi launch; a global layer has no v_proj: K = V)  rows front door
  *               v = rmsnorm_noweight(v_proj out, or k_proj out on a global layer), per KV head      row ops (ones w)
  *               a = GQA(q, k, v): qk RMSNorm (weights), rope (window: NeoX 1e4; global: the proportional table,
  *                   64 of 256 pairs at 1e6^(-2p/512), the rest 0), scale 1, window 1024 / full     F1 (the wide heads)
- *               delta = bf16(a W_o);  dn = rmsnorm(delta) * post_attention_layernorm
- *               h += dn  [; xd = rmsnorm(h) * pre_feedforward_layernorm, the same launch]           row ops
- *     FFN:      xm = rmsnorm(h) * pre_feedforward_layernorm_2;  xr = rmsnorm(h) * router.scale       row ops
- *               d1 = rmsnorm(bf16(down(gelu_tanh(gate xd) * up xd))) * post_feedforward_layernorm_1  the rows shared
+ *               delta = bf16(a W_o)
+ *               h += rmsnorm(delta) * post_attention_layernorm; then of the new h, one launch:      norm-add-norms
+ *                   xd = rmsnorm(h) * pre_feedforward_layernorm, xm = ... * pre_feedforward_layernorm_2,
+ *                   xr = ... * router.scale
+ *     FFN:      d1 = rmsnorm(bf16(down(gelu_tanh(gate xd) * up xd))) * post_feedforward_layernorm_1  the rows shared
  *                   (the dense MLP: the MoE block's shared-expert machinery, its own input and norm)  producer, GeGLU
  *               router: bf16 logits of xr x hidden^-1/2 (logit_scale), softmax, top-8 of 128, sum
  *                   renormalised, x per_expert_scale (expert_scale)                                  F2
  *               d2 = rmsnorm(bf16(sum_k w_k down_k(gelu_tanh(gate_k xm) * up_k xm))) * post_ffn_ln_2  rows MoE front
  *                                                                                                     door, EXL3 pair
- *               s = rmsnorm(bf16(d1 + d2)) * post_feedforward_layernorm                             row ops
- *               h = bf16(bf16(h + s) * layer_scalar)  [; xa = rmsnorm(h) * the next reader's norm]  add-scale
+ *               s = rmsnorm(bf16(d1 + d2)) * post_feedforward_layernorm
+ *               h = bf16(bf16(h + s) * layer_scalar);  xa = rmsnorm(h) * the next reader's norm
+ *                   (d1's and d2's norms, s and h: one launch from the two f32 branch outputs)       sum2-norm-add
  *   head       xa (output_norm) -> the pack's EXL3 head -> E5 finish: soft-cap 30 (tanh(x / 30) * 30)
  *
  * HF's Gemma4TextDecoderLayer (modeling_gemma4.py) is the order; every sublayer output, norm and add rounds to bf16
@@ -240,9 +242,10 @@ rows_scratch rows_layout(uint32_t R) {
 
 /** The MIX arena (attention), sized for the wider of the two layer kinds:
  *  qf / kf / vf f32 and qb / kb / vb bf16 the projections (kb also v's source on a global layer), vn bf16 the
- *  unweighted-normed v, ab bf16 the attention's output, of f32 / db bf16 the o_proj's, dn bf16 its post-norm; the
+ *  unweighted-normed v, ab bf16 the attention's output, of f32 / db bf16 the o_proj's (its post-norm rides the
+ *  residual add); the
  *  dense arm's workspace; F1's workspace (the wider declaration's). */
-struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, dn, lora, lora_bytes, lin, lin_bytes, gqa, gqa_bytes, total; };
+struct mix_scratch { uint64_t qf, kf, vf, qb, kb, vb, vn, ab, of, db, lora, lora_bytes, lin, lin_bytes, gqa, gqa_bytes, total; };
 /** @param R    the step's row capacity (max_rows)
  *  @param ctx  the pools' capacity in tokens (F1's workspace; 0 = sized for 1)
  *  @return the MIX arena's offsets and size */
@@ -264,7 +267,6 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     t.ab = o; o += a256((uint64_t)R * Q * 2u);
     t.of = o; o += a256((uint64_t)R * E * 4u);
     t.db = o; o += a256((uint64_t)R * E * 2u);
-    t.dn = o; o += a256((uint64_t)R * E * 2u);
     t.lora = o;   /* L338: the runtime LoRA's workspace, its widest projection (q / o of a global layer) */
     t.lora_bytes = pulsar_rows_lora_workspace_bytes((int)R, (int)umax(E, Q), PULSAR_GEMMA4_LORA_RANK_MAX, (int)umax(E, Q));
     o += a256(t.lora_bytes);
@@ -282,10 +284,10 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     return t;
 }
 
-/** The FFN arena: xd / xm / xr bf16 the three normed inputs (dense MLP, experts, router); fo f32 the routed sum; e1 /
- *  e2 bf16 the dense MLP's and the experts' rows; d1 / d2 bf16 their post-norms; then the MoE block's carved
- *  workspace (router, routed, the dense MLP's buffers as the block's one shared expert). */
-struct ffn_scratch { uint64_t xd, xm, xr, fo, e1, e2, d1, d2, lora, lora_bytes, u, moe_bytes, total; };
+/** The FFN arena: xd / xm / xr bf16 the three normed inputs (dense MLP, experts, router); fo f32 the routed sum; the
+ *  dense MLP's LoRA workspace; then the MoE block's carved workspace (router, routed, the dense MLP's buffers as the
+ *  block's one shared expert -- its f32 rows, ys, the tail's other branch). */
+struct ffn_scratch { uint64_t xd, xm, xr, fo, lora, lora_bytes, u, moe_bytes, total; };
 /** @param R  the step's row capacity (max_rows)
  *  @return the FFN arena's offsets and size */
 ffn_scratch ffn_layout(uint32_t R) {
@@ -295,7 +297,6 @@ ffn_scratch ffn_layout(uint32_t R) {
     uint64_t o = 0;
     for (uint64_t *x : {&f.xd, &f.xm, &f.xr}) { *x = o; o += a256((uint64_t)R * E * 2u); }
     f.fo = o; o += a256((uint64_t)R * E * 4u);
-    for (uint64_t *x : {&f.e1, &f.e2, &f.d1, &f.d2}) { *x = o; o += a256((uint64_t)R * E * 2u); }
     f.lora = o;   /* L338: the dense MLP's LoRA workspace (E -> n_ff -> E) */
     f.lora_bytes = pulsar_rows_lora_workspace_bytes((int)R, (int)umax(E, s.n_ff), PULSAR_GEMMA4_LORA_RANK_MAX,
                                                     (int)umax(E, s.n_ff));
@@ -762,13 +763,13 @@ bool lora_rows(const g4_step *st, const pulsar_gemma4_lora &l, const uint16_t *x
 
 /* ---- the attention ------------------------------------------------------------------------------------------------- */
 
-/* xa -> M.dn: q | k [| v], v's unweighted norm (v_proj's, or k_proj's on a global layer: K = V), F1, o_proj, its
- * post-norm */
+/* xa -> M.db: q | k [| v], v's unweighted norm (v_proj's, or k_proj's on a global layer: K = V), F1, o_proj (its
+ * post-norm rides the residual add) */
 /** @param st    the step
  *  @param il    the layer
  *  @param base  the MIX arena's device base
  *  @param M     the MIX arena's layout
- *  @return true = launched (the normed delta in M.dn); false = refused (said) */
+ *  @return true = launched (o_proj's bf16 rows in M.db); false = refused (said) */
 bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch &M) {
     g4_state *q = st->st;
     const pulsar_gemma4_shape &s = st->w->shape;
@@ -827,35 +828,38 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     if (q->step_adapter && (!lora_rows(st, L.lora_o, ab, Q, Q, y[0], E, E, base + M.lora, M.lora_bytes) ||
                             !emit(y[0], db, n, E)))   /* L338 P2 */
         return failf("the o_proj LoRA refused", il);
-    return norm(db, (const uint16_t *)wp(st, L.attn_post_norm, "gemma4 post_attention_layernorm"),
-                (uint16_t *)(base + M.dn), n, E) ||
-           failf("the post-attention norm refused", il);
+    return true;   /* its post-norm rides the residual add (block: pulsar_rows_norm_add_norms_launch) */
+}
+
+/* the norm whatever reads h after layer il applies: layer il + 1's input_layernorm, or output_norm (the head's) */
+/** @param st  the step
+ *  @param il  a layer
+ *  @return the device weight, or NULL */
+const uint16_t *next_norm(const g4_step *st, uint32_t il) {
+    if (il + 1u < st->plan->n_layer)
+        return (const uint16_t *)wp(st, st->w->layer[il + 1u].attn_norm, "gemma4 input_layernorm");
+    return (const uint16_t *)wp(st, st->w->output_norm, "gemma4 norm");
 }
 
 /* ---- the FFN: the dense MLP and the routed experts side by side ----------------------------------------------------- */
 
-/* F.xd (the dense MLP's input, written by the attention's add) and h -> F.d1 + F.d2 summed and normed into F.e1:
- * the dense GeGLU MLP and its post-norm, the router on xr, the routed GeGLU experts on xm and their post-norm, the sum
- * and its norm */
+/* F.xd / F.xm / F.xr (the three normed inputs, written by the attention's add) -> h: the dense GeGLU MLP on xd, the
+ * router on xr, the routed GeGLU experts on xm, then the tail in one pass (each branch's post-norm, their sum's norm,
+ * the layer's scaled residual add, the next reader's norm into xa) */
 /** @param st    the step
  *  @param il    the layer
  *  @param base  the FFN arena's device base
  *  @param F     the FFN arena's layout
- *  @return true = launched (post_feedforward_layernorm(d1 + d2) in F.e1); false = refused (said) */
+ *  @return true = launched (h updated, the next reader's norm of it in xa); false = refused (said) */
 bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
     const pulsar_gemma4_shape &s = st->w->shape;
     const pulsar_gemma4_block &L = st->w->layer[il];
     const uint32_t n = st->n_rows, E = s.n_embd, K = s.n_expert_used;
     const int Fd = (int)pulsar_gemma4_ff_stored(&s);
-    const uint16_t *h = (const uint16_t *)dptr(st->st->h);
-    uint16_t *xd = (uint16_t *)(base + F.xd), *xm = (uint16_t *)(base + F.xm), *xr = (uint16_t *)(base + F.xr);
-    uint16_t *e1 = (uint16_t *)(base + F.e1), *e2 = (uint16_t *)(base + F.e2);
-    uint16_t *d1 = (uint16_t *)(base + F.d1), *d2 = (uint16_t *)(base + F.d2);
+    const uint16_t *xd = (const uint16_t *)(base + F.xd), *xm = (const uint16_t *)(base + F.xm),
+                   *xr = (const uint16_t *)(base + F.xr);
     float *fo = (float *)(base + F.fo);
-    /* the experts' and the router's inputs (the dense MLP's, xd, came with the attention's add) */
-    if (!norm(h, (const uint16_t *)wp(st, L.moe_pre_norm, "gemma4 pre_feedforward_layernorm_2"), xm, n, E) ||
-        !norm(h, (const uint16_t *)wp(st, L.router_scale, "gemma4 router.scale"), xr, n, E))
-        return failf("the FFN input norms refused", il);
+    /* the three inputs xd / xm / xr came with the attention's add (block) */
     const pulsar_moe_block_shape bs = moe_shape(s);
     pulsar_moe_block_parts parts;
     if (pulsar_moe_block_carve(&bs, (int)n, base + F.u, F.moe_bytes, &parts) != 0) return failf("the MoE workspace", il);
@@ -899,9 +903,7 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
                pulsar_linear_rows_ref(st->model, L.ffn_down, Fd, (int)E, prompt, "gemma4 mlp down", &qd.down) &&
                pulsar_rows_moe_shared_ys_launch(&qd, xd + (size_t)r0 * E, (int)rows, 0) == 0;
     });
-    if (!dense_ok || !emit(parts.ys, e1, n, E) ||
-        !norm(e1, (const uint16_t *)wp(st, L.ffn_post_norm_1, "gemma4 post_feedforward_layernorm_1"), d1, n, E))
-        return failf("the dense MLP refused", il);
+    if (!dense_ok) return failf("the dense MLP refused", il);
     /* the router: bf16 logits of xr (x hidden^-1/2), softmax, top-8, renormalised, x per_expert_scale */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
@@ -933,26 +935,20 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
             return pulsar_moe_routed_rows(&c);
         }))
         return failf("the routed experts refused", il);
-    if (!emit(fo, e2, n, E) ||
-        !norm(e2, (const uint16_t *)wp(st, L.ffn_post_norm_2, "gemma4 post_feedforward_layernorm_2"), d2, n, E))
-        return failf("the routed experts' norm refused", il);
-    /* d1 += d2 (one rounding), and post_feedforward_layernorm of the sum into e1 */
+    /* the tail, one pass a row: each branch's bf16 rows and post-norm, their sum and its norm, h = bf16(bf16(h + it)
+     * * layer_scalar), and the next reader's norm into xa (layer il + 1's input_layernorm, or the head's) */
+    const uint16_t *w1 = (const uint16_t *)wp(st, L.ffn_post_norm_1, "gemma4 post_feedforward_layernorm_1");
+    const uint16_t *w2 = (const uint16_t *)wp(st, L.ffn_post_norm_2, "gemma4 post_feedforward_layernorm_2");
     const uint16_t *pn = (const uint16_t *)wp(st, L.ffn_post_norm, "gemma4 post_feedforward_layernorm");
-    return (pn && pulsar_rows_add_launch(d1, E, d2, E, n, E, pn, s.rms_eps, e1, E, 0) == 0) ||
-           failf("the FFN sum's norm refused", il);
+    const uint16_t *nn = next_norm(st, il), *ls = (const uint16_t *)wp(st, L.layer_scalar, "gemma4 layer_scalar");
+    uint16_t *hm = (uint16_t *)dptr(st->st->h), *xa = (uint16_t *)dptr(st->st->xa);
+    return (w1 && w2 && pn && nn && ls &&
+            pulsar_rows_sum2_norm_add_launch(parts.ys, E, w1, fo, E, w2, pn, hm, E, ls, nn, xa, E, n, E, s.rms_eps,
+                                             0) == 0) ||
+           failf("the FFN tail (post-norms, sum, scaled residual add) refused", il);
 }
 
 /* ---- the layer --------------------------------------------------------------------------------------------------- */
-
-/* the norm whatever reads h after layer il applies: layer il + 1's input_layernorm, or output_norm (the head's) */
-/** @param st  the step
- *  @param il  a layer
- *  @return the device weight, or NULL */
-const uint16_t *next_norm(const g4_step *st, uint32_t il) {
-    if (il + 1u < st->plan->n_layer)
-        return (const uint16_t *)wp(st, st->w->layer[il + 1u].attn_norm, "gemma4 input_layernorm");
-    return (const uint16_t *)wp(st, st->w->output_norm, "gemma4 norm");
-}
 
 /** pulsar_driver_ops::block[PULSAR_LAYER_BLOCKS]: one layer -- attention, then the FFN, each added to h; the last add
  *  scales h by layer_scalar and writes the next reader's norm into xa (layer 0 norms the embedding first).
@@ -974,19 +970,22 @@ bool block(const pulsar_driver_step *st0, uint32_t il) {
     const mix_scratch M = mix_layout(q->max_rows, st->states->ctx);
     uint8_t *mbase = (uint8_t *)dptr(q->scratch[ARENA_MIX]);
     if (!attention(st, il, mbase, M)) return false;
-    /* h += post_attention_layernorm(delta), and the dense MLP's pre-norm of the new h in the same launch */
+    /* h += post_attention_layernorm(o_proj), and the FFN's three input norms of the new h (the dense MLP's, the
+     * experts', the router's) in the same launch */
     const ffn_scratch F = ffn_layout(q->max_rows);
     uint8_t *fbase = (uint8_t *)dptr(q->scratch[ARENA_FFN]);
-    const uint16_t *pre = (const uint16_t *)wp(st, L.ffn_pre_norm, "gemma4 pre_feedforward_layernorm");
-    if (!pre || pulsar_rows_add_launch(h, E, (const uint16_t *)(mbase + M.dn), E, n, E, pre, s.rms_eps,
-                                       (uint16_t *)(fbase + F.xd), E, 0) != 0)
+    const uint16_t *post = (const uint16_t *)wp(st, L.attn_post_norm, "gemma4 post_attention_layernorm");
+    const uint16_t *const w3[3] = {(const uint16_t *)wp(st, L.ffn_pre_norm, "gemma4 pre_feedforward_layernorm"),
+                                   (const uint16_t *)wp(st, L.moe_pre_norm, "gemma4 pre_feedforward_layernorm_2"),
+                                   (const uint16_t *)wp(st, L.router_scale, "gemma4 router.scale")};
+    uint16_t *const y3[3] = {(uint16_t *)(fbase + F.xd), (uint16_t *)(fbase + F.xm), (uint16_t *)(fbase + F.xr)};
+    const uint64_t ld3[3] = {E, E, E};
+    if (!post || !w3[0] || !w3[1] || !w3[2] ||
+        pulsar_rows_norm_add_norms_launch((const uint16_t *)(mbase + M.db), E, post, h, E, n, E, w3, y3, ld3,
+                                          s.rms_eps, 0) != 0)
         return failf("the attention's residual add refused", il);
+    /* the FFN, ending in h = bf16(bf16(h + ffn) * layer_scalar) and the next reader's norm into xa */
     if (!ffn(st, il, fbase, F)) return false;
-    /* h = bf16(bf16(h + ffn) * layer_scalar), and the next reader's norm into xa */
-    const uint16_t *nn = next_norm(st, il), *ls = (const uint16_t *)wp(st, L.layer_scalar, "gemma4 layer_scalar");
-    if (!(nn && ls && pulsar_rows_add_scale_launch(h, E, (const uint16_t *)(fbase + F.e1), E, n, E, ls, nn, s.rms_eps,
-                                                   xa, E, 0) == 0))
-        return failf("the layer's scaled residual add refused", il);
     /* L338 P3: the block drafter's tap -- HF decoder layer il's output, the scaled residual (a no-op untapped) */
     return pulsar_block_tap(q, il, PULSAR_BLOCK_TAP_FFN, h, E, n) || failf("the drafter tap refused", il);
 }

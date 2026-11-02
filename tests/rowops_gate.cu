@@ -9,6 +9,7 @@
  *                the ROUNDED residual (vLLM's add_rmsnorm); the add alone leaves y untouched.
  *   3. emit      bf16(x) and bf16(x * s) for an f32 and a bf16 scalar, bit-exact; strided rows; the slack untouched.
  *   4. rows      a row's bytes are the same alone, in a batch of 300, and repeated (no batch dependence).
+ *   5. chains    (L338) the fused norm-add-norms and sum2-norm-add, byte-identical to the unfused ops they replace.
  * Then refusals. */
 #include "cuda/pulsar_cuda_rowops.h"
 #include "sconv_ref.h"   /* sref_f2bf / sref_bf2f: the bf16 conversions the block gates share */
@@ -201,40 +202,71 @@ static void part_add(uint32_t width, uint32_t rows) {
     CK(cudaFree(dr)); CK(cudaFree(dd)); CK(cudaFree(dw)); CK(cudaFree(dy)); CK(cudaFree(dr2)); CK(cudaFree(dy2));
 }
 
-/* L338: the scaled add -- res = bf16(bf16(res + delta) * s), then the next norm of the scaled row (Gemma 4's
- * layer_scalar at a layer's end, fused with the next layer's input norm) */
-static void part_add_scale(uint32_t width, uint32_t rows) {
-    Rng g(width * 11 + rows);
+/* L338: the fused chains, byte for byte the unfused ops they replace, run on the same device:
+ *   norm-add-norms  res += rmsnorm(x) * w_x, then up to three norms of the updated row == rows_rmsnorm, rows_add (with
+ *                   the first norm), rows_rmsnorm (the others);
+ *   sum2-norm-add   rows_emit + rows_rmsnorm of two f32 branches, rows_add of the two with the sum's norm, the scaled
+ *                   add (bf16(bf16(res + t) * s), its host replica) and rows_rmsnorm of the scaled row. */
+static void part_chains(uint32_t width, uint32_t rows, bool three) {
+    Rng g(width * 13 + rows);
     const float eps = 1e-6f;
-    std::vector<uint16_t> res = rand_bf16(g, (size_t)rows * width, 2.0), d = rand_bf16(g, (size_t)rows * width, 0.5),
-                          w = rand_bf16(g, width, 0.3), ypre((size_t)rows * width, 0x1234u);
-    const uint16_t sb = sref_f2bf(0.4375f);   /* a layer_scalar-like bf16 scalar */
-    uint16_t *dr = dev(res), *dd = dev(d), *dw = dev(w), *dy = dev(ypre), *ds = dev(std::vector<uint16_t>{sb});
-    check(pulsar_rows_add_scale_launch(dr, width, dd, width, rows, width, ds, dw, eps, dy, width, 0) == 0,
-          "add-scale + norm launched");
-    const std::vector<uint16_t> r2 = host(dr, res.size()), y = host(dy, ypre.size());
-    uint64_t ok = 0, norm_exact = 0, off1 = 0;
-    std::vector<uint16_t> rep(width);
-    for (uint32_t r = 0; r < rows; r++) {
-        for (uint32_t c = 0; c < width; c++) {
-            const size_t i = (size_t)r * width + c;
-            const uint16_t sum = sref_f2bf(sref_bf2f(res[i]) + sref_bf2f(d[i]));
-            ok += r2[i] == sref_f2bf(sref_bf2f(sum) * sref_bf2f(sb));
-        }
-        replica_norm(&r2[(size_t)r * width], w.data(), width, eps, rep.data());
-        for (uint32_t c = 0; c < width; c++) {
-            norm_exact += y[(size_t)r * width + c] == rep[c];
-            off1 += bf_ulps(y[(size_t)r * width + c], rep[c]) > 1;
-        }
-    }
-    const uint64_t n = (uint64_t)rows * width;
-    check(ok == n, "add-scale %ux%u: res == bf16(bf16(res + delta) * s) on every element (%llu of %llu)", rows, width,
-          (unsigned long long)ok, (unsigned long long)n);
-    check(off1 == 0 && norm_exact * 1000 >= n * 999, "add-scale's norm %ux%u: %.4f%% == the replica on the SCALED row, "
-          "none past 1 ulp", rows, width, 100.0 * norm_exact / n);
-    check(pulsar_rows_add_scale_launch(dr, width, dd, width, rows, width, nullptr, dw, eps, dy, width, 0) == -1,
-          "add-scale: no scale -- refused");
-    CK(cudaFree(dr)); CK(cudaFree(dd)); CK(cudaFree(dw)); CK(cudaFree(dy)); CK(cudaFree(ds));
+    const size_t N = (size_t)rows * width;
+    std::vector<uint16_t> x = rand_bf16(g, N, 1.5), res = rand_bf16(g, N, 2.0), wx = rand_bf16(g, width, 0.4),
+                          w0 = rand_bf16(g, width, 0.3), w1 = rand_bf16(g, width, 0.7), w2 = rand_bf16(g, width, 1.1),
+                          z(N, 0x1234u);
+    /* the unfused reference */
+    uint16_t *dx = dev(x), *dres = dev(res), *dwx = dev(wx), *dw0 = dev(w0), *dw1 = dev(w1), *dw2 = dev(w2);
+    uint16_t *dn = dev(z), *ry0 = dev(z), *ry1 = dev(z), *ry2 = dev(z);
+    check(pulsar_rows_rmsnorm_launch(dx, width, rows, width, dwx, eps, dn, width, 0) == 0 &&
+          pulsar_rows_add_launch(dres, width, dn, width, rows, width, dw0, eps, ry0, width, 0) == 0 &&
+          (!three || (pulsar_rows_rmsnorm_launch(dres, width, rows, width, dw1, eps, ry1, width, 0) == 0 &&
+                      pulsar_rows_rmsnorm_launch(dres, width, rows, width, dw2, eps, ry2, width, 0) == 0)),
+          "norm-add-norms %ux%u: the unfused reference launched", rows, width);
+    const std::vector<uint16_t> r_res = host(dres, N), r0 = host(ry0, N), r1 = host(ry1, N), r2 = host(ry2, N);
+    /* fused */
+    uint16_t *fres = dev(res), *fy0 = dev(z), *fy1 = dev(z), *fy2 = dev(z);
+    const uint16_t *const w[3] = {dw0, three ? dw1 : nullptr, three ? dw2 : nullptr};
+    uint16_t *const y[3] = {fy0, fy1, fy2};
+    const uint64_t ld[3] = {width, width, width};
+    check(pulsar_rows_norm_add_norms_launch(dx, width, dwx, fres, width, rows, width, w, y, ld, eps, 0) == 0,
+          "norm-add-norms %ux%u (%s): launched", rows, width, three ? "three norms" : "one norm");
+    const std::vector<uint16_t> f_res = host(fres, N), f0 = host(fy0, N), f1 = host(fy1, N), f2 = host(fy2, N);
+    check(f_res == r_res && f0 == r0 && (three ? (f1 == r1 && f2 == r2) : (f1 == z && f2 == z)),
+          "norm-add-norms %ux%u: res and every norm byte-identical to the unfused ops%s", rows, width,
+          three ? "" : " (the unused outputs untouched)");
+    /* sum2-norm-add */
+    std::vector<float> a(N), b(N);
+    for (auto &v : a) v = (float)(g.n() * 4.0);
+    for (auto &v : b) v = (float)(g.n() * 0.7);
+    const uint16_t sb = sref_f2bf(0.4375f);
+    float *da_ = dev(a), *db_ = dev(b);
+    uint16_t *ea = dev(z), *eb = dev(z), *na = dev(z), *nb = dev(z), *t = dev(z), *ds = dev(std::vector<uint16_t>{sb});
+    uint16_t *ryn = dev(z), *ref_res = dev(res);
+    check(pulsar_rows_emit_bf16_launch(da_, width, rows, width, nullptr, PULSAR_ROWS_SCALE_NONE, ea, width, 0) == 0 &&
+          pulsar_rows_rmsnorm_launch(ea, width, rows, width, dw0, eps, na, width, 0) == 0 &&
+          pulsar_rows_emit_bf16_launch(db_, width, rows, width, nullptr, PULSAR_ROWS_SCALE_NONE, eb, width, 0) == 0 &&
+          pulsar_rows_rmsnorm_launch(eb, width, rows, width, dw1, eps, nb, width, 0) == 0 &&
+          pulsar_rows_add_launch(na, width, nb, width, rows, width, dw2, eps, t, width, 0) == 0,
+          "sum2-norm-add %ux%u: the unfused reference launched", rows, width);
+    const std::vector<uint16_t> th = host(t, N);
+    std::vector<uint16_t> want_res(N);
+    for (size_t i = 0; i < N; i++)
+        want_res[i] = sref_f2bf(sref_bf2f(sref_f2bf(sref_bf2f(res[i]) + sref_bf2f(th[i]))) * sref_bf2f(sb));
+    CK(cudaMemcpy(ref_res, want_res.data(), N * 2, cudaMemcpyHostToDevice));
+    check(pulsar_rows_rmsnorm_launch(ref_res, width, rows, width, dwx, eps, ryn, width, 0) == 0,
+          "sum2-norm-add %ux%u: the reference's last norm launched", rows, width);
+    const std::vector<uint16_t> want_y = host(ryn, N);
+    uint16_t *sres = dev(res), *sy = dev(z);
+    check(pulsar_rows_sum2_norm_add_launch(da_, width, dw0, db_, width, dw1, dw2, sres, width, ds, dwx, sy, width, rows,
+                                           width, eps, 0) == 0,
+          "sum2-norm-add %ux%u: launched", rows, width);
+    check(host(sres, N) == want_res && host(sy, N) == want_y,
+          "sum2-norm-add %ux%u: the scaled residual and its norm byte-identical to the unfused ops", rows, width);
+    for (void *p : {(void *)dx, (void *)dres, (void *)dwx, (void *)dw0, (void *)dw1, (void *)dw2, (void *)dn,
+                    (void *)ry0, (void *)ry1, (void *)ry2, (void *)fres, (void *)fy0, (void *)fy1, (void *)fy2,
+                    (void *)da_, (void *)db_, (void *)ea, (void *)eb, (void *)na, (void *)nb, (void *)t, (void *)ds,
+                    (void *)ryn, (void *)ref_res, (void *)sres, (void *)sy})
+        CK(cudaFree(p));
 }
 
 static void part_emit() {
@@ -287,6 +319,16 @@ static void part_refusals() {
           "emit: kind F32 with no scalar");
     check(pulsar_rows_emit_bf16_launch(f, 66, 1, 64, nullptr, PULSAR_ROWS_SCALE_NONE, d, 64, 0) == -1,
           "emit: ld_x not a multiple of 4");
+    {
+        const uint16_t *const w[3] = {d, nullptr, nullptr};
+        uint16_t *const y[3] = {d + 65536, nullptr, nullptr};
+        const uint64_t ld[3] = {8200, 0, 0};
+        check(pulsar_rows_norm_add_norms_launch(d, 8200, d, d + 131072, 8200, 1, 8200, w, y, ld, 1e-6f, 0) == -1,
+              "norm-add-norms: a width past 8192");
+        check(pulsar_rows_sum2_norm_add_launch(f, 64, d, f + 4096, 64, d, d, d + 4096, 64, nullptr, d, d + 8192, 64, 1,
+                                               64, 1e-6f, 0) == -1,
+              "sum2-norm-add: no scale");
+    }
     CK(cudaFree(d));
     CK(cudaFree(f));
 }
@@ -296,7 +338,10 @@ int main() {
     part_norm(4096, 300);
     part_norm(1024, 17);
     part_add(4096, 129);
-    part_add_scale(2816, 37);   /* L338: Gemma 4's width */
+    part_chains(2816, 37, true);   /* L338: Gemma 4's width */
+    part_chains(2816, 1, true);
+    part_chains(8192, 5, true);    /* the widest a thread's held chunks cover */
+    part_chains(64, 3, false);
     part_emit();
     part_refusals();
     printf(g_fail ? "ROWOPS GATE FAIL\n" : "ROWOPS GATE PASS\n");
