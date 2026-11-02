@@ -2234,6 +2234,11 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
  *  @param draft_ms the drafting, ms */
 void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
                                         double host_ms, double draft_ms);
+/** L338: the depth the round in progress runs at -- its live banks' mean frontier, tokens; 0 = the profile's.  Every
+ *  price the round takes (the verify pick, the round selection, a drafter's keep) and its observation read it.
+ *  @param e the engine (no curve: nothing)
+ *  @param depth tokens */
+void pulsar_engine_verify_curve_depth(pulsar_engine *e, uint32_t depth);
 /** The verify pick: of m drafts with survivals `surv` sorted DESCENDING, how many a round of n_seqs base rows
  *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold).  The SERVER'S
  *  pick: on a tensor-parallel group it runs on the leader, on the leader's curve (L315), and its choice reaches the
@@ -2261,8 +2266,11 @@ typedef struct {
     bool cached;                                  ///< loaded from the disk cache (else profiled by this process)
     uint32_t rows_max;                            ///< the widest verify step
     float base_ms[33];                            ///< [r]: the profiled r-row verify forward, ms (1..rows_max)
-    bool slope_valid;                             ///< the online correction has a number
-    float slope_ms;                               ///< its residual per row (applied as max(0, slope))
+    bool line_valid;                              ///< the online correction has a line at the current depth
+    float line_a_ms;                              ///< its fixed residual past the profile, ms
+    float line_b_ms;                              ///< its residual a row, ms
+    uint32_t depth;                               ///< the depth it prices at (0 = the profile's), tokens
+    uint32_t profile_depth;                       ///< the profile's depth, tokens
     float host_ms;                                ///< the round's recent wall outside the forward and drafting
     float draft_ms;                               ///< the round's recent drafting wall
     uint64_t observed;                            ///< rounds observed

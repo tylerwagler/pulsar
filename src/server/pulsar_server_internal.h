@@ -1888,6 +1888,7 @@ typedef struct {
     uint32_t probe_n0;    ///< that lane's step count when the probe began
     uint32_t held_n0;     ///< `lane`'s step count when it was chosen or last weighed (hold and re-probe count from it)
     int meas_n;           ///< the decoder count the measured prices below are for
+    int meas_depth;       ///< L338: the depth band they are for (lane_depth_band: a new band drops them)
     double meas_tok[PULSAR_LANE_COUNT];        ///< EW tokens a step committed there, per pulsar_decode_lane
     double meas_ms[PULSAR_LANE_COUNT];         ///< EW wall of those steps, ms
     uint32_t meas_steps[PULSAR_LANE_COUNT];    ///< steps measured there

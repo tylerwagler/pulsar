@@ -3670,17 +3670,18 @@ static void test_l179_spec_pick_rows(void) {
     l179_spec_pick_rows_at((int)PULSAR_SPEC_LOGITS_ROWS);
 }
 
-/* L301 -- the verify curve's online correction (DeepInfer's ForwardRuntimeEstimator): the forward's residual per
- * row against the profile, the median per row count over the median of those, robust to a stray round; the
+/* L301 -- the verify curve's online correction (DeepInfer's ForwardRuntimeEstimator): the forward's residual
+ * against the profile, the median per row count and the line through those medians, robust to a stray round; the
  * round's wall outside the forward and its drafting by the median of the last rounds at that bank count.  The pick
- * prices with the corrected round. */
+ * prices with the corrected round.  L338: by depth -- a deep round's line is its own, an unseen depth borrows the
+ * nearest. */
 static void test_l301_verify_curve_correction(void) {
     double base[PULSAR_SPEC_LOGITS_ROWS + 1];
     l301_staircase(base, PULSAR_SPEC_LOGITS_ROWS);
     pulsar_engine *e = l301_engine(base, PULSAR_SPEC_LOGITS_ROWS);
     pulsar_verify_curve_view v;
     pulsar_engine_verify_curve_view(e, &v);
-    TEST_ASSERT(v.valid && !v.slope_valid && v.rows_max == PULSAR_SPEC_LOGITS_ROWS && v.base_ms[17] > v.base_ms[16]);
+    TEST_ASSERT(v.valid && !v.line_valid && v.rows_max == PULSAR_SPEC_LOGITS_ROWS && v.base_ms[17] > v.base_ms[16]);
     /* rounds at 4 decoders over 4..12 rows: the forward 0.5 ms a row past the profile, one in 7 a 200 ms stall */
     for (uint32_t i = 0; i < 400; i++) {
         const uint32_t rows = 4u + i % 9u;
@@ -3688,7 +3689,7 @@ static void test_l301_verify_curve_correction(void) {
         pulsar_engine_verify_curve_observe(e, 4u, rows, fwd, 6.0 + (i % 2u), 3.0);
     }
     pulsar_engine_verify_curve_view(e, &v);
-    TEST_ASSERT(v.slope_valid && fabsf(v.slope_ms - 0.5f) < 1e-3f);
+    TEST_ASSERT(v.line_valid && fabsf(v.line_a_ms) < 1e-3f && fabsf(v.line_b_ms - 0.5f) < 1e-3f);
     TEST_ASSERT(v.observed == 400u && v.draft_ms == 3.0f && v.host_ms >= 6.0f && v.host_ms <= 7.0f);
     /* the pick on the corrected round: the brute force over base + 0.5 r + host + draft at 4 banks */
     float surv[PULSAR_SESSION_POOL_CAP][16];
@@ -3703,6 +3704,33 @@ static void test_l301_verify_curve_correction(void) {
     int got = 0;
     for (int i = 0; i < 4; i++) got += k_alloc[i];
     TEST_ASSERT(got == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, round_ms));
+    /* L338: rounds at 20K tokens: the forward 3 ms + 8 ms a row past the profile, the stalls again */
+    pulsar_engine_verify_curve_depth(e, 20000u);
+    for (uint32_t i = 0; i < 400; i++) {
+        const uint32_t rows = 4u + i % 9u;
+        const double fwd = base[rows] + 3.0 + 8.0 * rows + (i % 7u == 3u ? 200.0 : 0.0);
+        pulsar_engine_verify_curve_observe(e, 4u, rows, fwd, 6.0 + (i % 2u), 3.0);
+    }
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.line_valid && v.depth == 20000u && fabsf(v.line_a_ms - 3.0f) < 1e-3f &&
+                fabsf(v.line_b_ms - 8.0f) < 1e-3f);
+    double deep_ms[PULSAR_SPEC_LOGITS_ROWS + 1];
+    for (uint32_t r = 1; r <= PULSAR_SPEC_LOGITS_ROWS; r++) deep_ms[r] = base[r] + 3.0 + 8.0 * r + v.host_ms + 3.0;
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
+    int deep = 0;
+    for (int i = 0; i < 4; i++) deep += k_alloc[i];
+    TEST_ASSERT(deep == (int)l301_brute(surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, deep_ms) && deep < got);
+    /* an unseen depth (100K) prices on the nearest bucket's line (20K's); the profile's depth keeps its own */
+    pulsar_engine_verify_curve_depth(e, 100000u);
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.line_valid && fabsf(v.line_b_ms - 8.0f) < 1e-3f);
+    pulsar_engine_verify_curve_depth(e, 0u);
+    pulsar_engine_verify_curve_view(e, &v);
+    TEST_ASSERT(v.line_valid && fabsf(v.line_b_ms - 0.5f) < 1e-3f);
+    (void)spec_pick_rows(e, surv, npend, 4, 4, (int)PULSAR_SPEC_LOGITS_ROWS, k_alloc, &overflow);
+    int shallow = 0;
+    for (int i = 0; i < 4; i++) shallow += k_alloc[i];
+    TEST_ASSERT(shallow == got);
     l301_engine_free(e);
 }
 
@@ -3744,7 +3772,7 @@ static void test_l315_tp_pick(void) {
                                                                           5.0, 2.0);
     pulsar_verify_curve_view v;
     pulsar_engine_verify_curve_view(e, &v);
-    TEST_ASSERT(v.observed == 40u && v.slope_valid);
+    TEST_ASSERT(v.observed == 40u && v.line_valid);
     /* a drafter's keep on every rank: the budget alone (a priced keep cuts these 0.3-confidence drafts) */
     pulsar_session *s = (pulsar_session *)calloc(1, sizeof(pulsar_session));
     s->engine = e;
