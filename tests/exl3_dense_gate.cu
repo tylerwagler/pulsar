@@ -20,8 +20,9 @@
  *      accumulation order; the median proves the fixture is not degenerate);
  *   2. M = 1, 2, 4, 8 are BIT-IDENTICAL to the same rows of the M = 16 run (a
  *      row's bytes do not depend on the batch width -- the decode-row contract); L288 C1: so are DECODE rows past
- *      16 (M = 17, 32 and the shape's widest: 16-row GEMV blocks in turn) -- every 16-row
- *      block bit for bit a launch of those rows alone, and graded against the double reference;
+ *      16 (M = 17, 32 and the shape's widest: 16-row passes in one launch up to 32 rows, L341, and 32-row launches
+ *      in turn past that) -- every 16-row block bit for bit a launch of those rows alone, and graded against the
+ *      double reference;
  *   3. prefill: prompt chunks of M = 40 / 97 / 300 at several shapes -- the prefill GEMM (one fp16 operand plane):
  *      every output within the fp16-operand envelope (exl3t_fp16_operand_bound) plus f32 order;
  *   4. mutations: one flipped trellis bit must move outputs, and a sign-flipped

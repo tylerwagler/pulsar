@@ -19,9 +19,11 @@
 //              4-CTA cluster through distributed shared memory was 1.5-8x
 //              slower still).
 //   2. GEMV + EPILOGUE  A CTA owns 32 outputs (two n-tiles), one split's
-//              k-range of at most kMaxBlocks Hadamard blocks, and all M <= 16
-//              rows (the MMA's M: rows past M are zero, so M = 1..16 is one
-//              kernel and a row's result cannot depend on the width).  Warp w
+//              k-range of at most kMaxBlocks Hadamard blocks, and all M <=
+//              kMaxRows rows in 16-row passes (the MMA's M: rows past a pass's
+//              are zero, so every pass is the arithmetic a 16-row launch of its
+//              rows has and a row's result cannot depend on the width; L341:
+//              the passes share the trellis words, read once).  Warp w
 //              issues its trellis words for k-tile w of every block of the
 //              range and its A tiles (cp.async from the prep planes) at entry.
 //              On the tensor cores at every width: the format's tile order is
@@ -67,6 +69,9 @@ constexpr int kOut       = 32;   ///< outputs per CTA = two n-tiles
 constexpr int kWarps     = 8;    ///< a Hadamard block's 8 k-tiles, one per warp
 constexpr int kMaxBlocks = 5;    ///< Hadamard blocks per CTA k-range, at most = k-tiles per warp
 constexpr int kRows      = 16;   ///< the MMA's M: every row block is 16 rows
+/** L341: rows one GEMV launch carries -- kRows-row passes over the CTA's trellis words, read once (the verify width,
+ *  PULSAR_SPEC_ROW_BUDGET: a wide verify of 17..32 rows read the weight twice as two launches). */
+constexpr int kMaxRows   = 2 * kRows;
 /** CTAs the split count aims the grid at, at least: GB10 is 48 SMs, and a
  *  256-thread CTA of this kernel fits two per SM. */
 constexpr int kTargetCtas = 288;
@@ -285,11 +290,11 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /* 2. GEMV + EPILOGUE.  A flat grid over the set's projections (dense_set): CTA (x, split) of projection j owns
  * its outputs 32x..32x+31 and the split's k-range. */
 /// GEMV + EPILOGUE at rate K2 (2 x bits per weight).  Flat grid over the set's (n-tile, split) CTAs, block
-/// (32, 8): each CTA 32 outputs x one split's k-range (<= kMaxBlocks Hadamard blocks) x all M <= 16 rows; the last
+/// (32, 8): each CTA 32 outputs x one split's k-range (<= kMaxBlocks Hadamard blocks) x all M <= kMaxRows rows; the last
 /// CTA of a 128-output block (on its counter) sums the splits in order, applies H128 and svh, writes y or yb.
 /// Static smem: 40 KB of A tiles (kWarps x kMaxBlocks x {hi, lo} x 16 x 16 fp16), reused for the reduction.
 /// @param P   the projections of one rate (the prep planes carry the input)
-/// @param M   rows, 1..16
+/// @param M   rows, 1..kMaxRows (L341: kRows-row passes over the words read once)
 /// @param K   input width
 template <int K2>
 __global__ void __launch_bounds__(kOut * kWarps)
@@ -311,7 +316,6 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     const int tid    = warp * kOut + lane;
     const int ntn    = N >> 4;
     const int split  = cl / ntiles;
-    const int nr     = M;                                         /* 1..kRows */
     const int blocks = K >> 7;
     const int b_lo   = (int)((int64_t)split * blocks / S);
     const int nb     = (int)((int64_t)(split + 1) * blocks / S) - b_lo;   /* 1..kMaxBlocks */
@@ -341,93 +345,100 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
         }
     }
 
-    /* the A tiles: tile (w, i) is k-tile w of block i of the range, rows past M zero */
-    {
-        /* warp w's own tiles from the prep planes (lane = chunk (row l/2, half l%2); rows past M zero) */
-        const int crow = lane >> 1, chalf = lane & 1;
-        const bool creal = crow < nr;
-#pragma unroll
+    /* L341: the passes -- rows r0..r0+15 each, every one exactly the arithmetic a 16-row launch of those rows has
+     * (its A tiles staged, the same MMAs, the same fmaf order over the blocks, the same warp-order reduction into
+     * its rows of the split's partial); only the trellis words above are read once for all of them. */
+    for (int r0 = 0; r0 < M; r0 += kRows) {
+        const int nr = M - r0 < kRows ? M - r0 : kRows;              /* 1..kRows */
+        /* the A tiles: tile (w, i) is k-tile w of block i of the range, rows past the pass's zero */
+        {
+            /* warp w's own tiles from the prep planes (lane = chunk (row l/2, half l%2); rows past M zero) */
+            const int crow = lane >> 1, chalf = lane & 1;
+            const bool creal = crow < nr;
+    #pragma unroll
+            for (int i = 0; i < kMaxBlocks; ++i) {
+                if (i < nb) {
+                    const int kt = (b_lo + i) * 8 + warp;
+                    const size_t src = (size_t)(r0 + (creal ? crow : 0)) * K + (size_t)kt * 16 + chalf * 8;
+                    cp_async16(&s_a[warp][i][0][tile_chunk(crow, chalf) * 8], p.hi + src, creal ? 16 : 0);
+                    cp_async16(&s_a[warp][i][1][tile_chunk(crow, chalf) * 8], p.lo + src, creal ? 16 : 0);
+                }
+            }
+            for (int t = tid; t < nr * nb; t += kOut * kWarps) {
+                const int m = t / nb, i = t - m * nb;
+                s_inv[i][m] = p.inv[(size_t)(r0 + m) * blocks + b_lo + i];
+            }
+    #if PULSAR_SM80
+            asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
+    #else
+            __trap();
+    #endif
+        }
+        __syncthreads();
+
+        /* 3. per k-tile: the A fragments (ldmatrix x4: lane l addresses row
+         * (l%8) + 8 (bit 3 of l), k half bit 4 of l), each B pair decoded once,
+         * two MMAs per n8 half into a fresh fragment, scaled back into the rows'
+         * accumulators.  Lane (g, c = lane%4) holds rows g, g + 8 and columns 2c,
+         * 2c + 1 of each n8 half. */
+        const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, ahalf = (lane >> 4) & 1;
+        float acc[2][2][4];
+    #pragma unroll
+        for (int j = 0; j < 2; ++j)
+    #pragma unroll
+            for (int h = 0; h < 2; ++h)
+    #pragma unroll
+                for (int e = 0; e < 4; ++e) acc[j][h][e] = 0.0f;
+    #pragma unroll
         for (int i = 0; i < kMaxBlocks; ++i) {
             if (i < nb) {
-                const int kt = (b_lo + i) * 8 + warp;
-                const size_t src = (size_t)(creal ? crow : 0) * K + (size_t)kt * 16 + chalf * 8;
-                cp_async16(&s_a[warp][i][0][tile_chunk(crow, chalf) * 8], p.hi + src, creal ? 16 : 0);
-                cp_async16(&s_a[warp][i][1][tile_chunk(crow, chalf) * 8], p.lo + src, creal ? 16 : 0);
-            }
-        }
-        for (int t = tid; t < nr * nb; t += kOut * kWarps) {
-            const int m = t / nb, i = t - m * nb;
-            s_inv[i][m] = p.inv[(size_t)m * blocks + b_lo + i];
-        }
-#if PULSAR_SM80
-        asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::: "memory");
-#else
-        __trap();
-#endif
-    }
-    __syncthreads();
-
-    /* 3. per k-tile: the A fragments (ldmatrix x4: lane l addresses row
-     * (l%8) + 8 (bit 3 of l), k half bit 4 of l), each B pair decoded once,
-     * two MMAs per n8 half into a fresh fragment, scaled back into the rows'
-     * accumulators.  Lane (g, c = lane%4) holds rows g, g + 8 and columns 2c,
-     * 2c + 1 of each n8 half. */
-    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8, ahalf = (lane >> 4) & 1;
-    float acc[2][2][4];
-#pragma unroll
-    for (int j = 0; j < 2; ++j)
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) acc[j][h][e] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < kMaxBlocks; ++i) {
-        if (i < nb) {
-            const float inv_a = g < nr ? s_inv[i][g] : 0.0f;
-            const float inv_b = g + 8 < nr ? s_inv[i][g + 8] : 0.0f;
-            uint32_t ahi[4], alo[4];
-            ldmatrix_x4(ahi, &s_a[warp][i][0][tile_chunk(arow, ahalf) * 8]);
-            ldmatrix_x4(alo, &s_a[warp][i][1][tile_chunk(arow, ahalf) * 8]);
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-#pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    uint32_t st[4];
-                    exl3dev::run4_split<K2>(EXL3_RUN4_JOIN(wd[i][j][h][0], wd[i][j][h][1], sh[h]), 8 * lane + 4 * h, st);
-                    const uint32_t b0 = exl3dev::mul1_pair(st[0], st[1]);   /* k rows 2c, 2c+1 */
-                    const uint32_t b1 = exl3dev::mul1_pair(st[2], st[3]);   /* k rows 2c+8, 2c+9 */
-                    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    pulsar_mma_f16_16816(d, ahi, b0, b1);
-                    pulsar_mma_f16_16816(d, alo, b0, b1);
-                    acc[j][h][0] = fmaf(d[0], inv_a, acc[j][h][0]);
-                    acc[j][h][1] = fmaf(d[1], inv_a, acc[j][h][1]);
-                    acc[j][h][2] = fmaf(d[2], inv_b, acc[j][h][2]);
-                    acc[j][h][3] = fmaf(d[3], inv_b, acc[j][h][3]);
+                const float inv_a = g < nr ? s_inv[i][g] : 0.0f;
+                const float inv_b = g + 8 < nr ? s_inv[i][g + 8] : 0.0f;
+                uint32_t ahi[4], alo[4];
+                ldmatrix_x4(ahi, &s_a[warp][i][0][tile_chunk(arow, ahalf) * 8]);
+                ldmatrix_x4(alo, &s_a[warp][i][1][tile_chunk(arow, ahalf) * 8]);
+    #pragma unroll
+                for (int j = 0; j < 2; ++j) {
+    #pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        uint32_t st[4];
+                        exl3dev::run4_split<K2>(EXL3_RUN4_JOIN(wd[i][j][h][0], wd[i][j][h][1], sh[h]), 8 * lane + 4 * h, st);
+                        const uint32_t b0 = exl3dev::mul1_pair(st[0], st[1]);   /* k rows 2c, 2c+1 */
+                        const uint32_t b1 = exl3dev::mul1_pair(st[2], st[3]);   /* k rows 2c+8, 2c+9 */
+                        float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        pulsar_mma_f16_16816(d, ahi, b0, b1);
+                        pulsar_mma_f16_16816(d, alo, b0, b1);
+                        acc[j][h][0] = fmaf(d[0], inv_a, acc[j][h][0]);
+                        acc[j][h][1] = fmaf(d[1], inv_a, acc[j][h][1]);
+                        acc[j][h][2] = fmaf(d[2], inv_b, acc[j][h][2]);
+                        acc[j][h][3] = fmaf(d[3], inv_b, acc[j][h][3]);
+                    }
                 }
             }
         }
-    }
 
-    /* cross-warp reduction in warp order, one warp per row, over the A slots
-     * (every warp is past its last read of them), into the split's partial */
-    __syncthreads();
-    float *s_red = reinterpret_cast<float *>(&s_a[0][0][0][0]);   /* [warp][row][32 outputs] */
-    const int c2 = (lane & 3) * 2;
-#pragma unroll
-    for (int j = 0; j < 2; ++j)
-#pragma unroll
-        for (int h = 0; h < 2; ++h)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int rr = g + 8 * (e >> 1), col = j * 16 + h * 8 + c2 + (e & 1);
-                s_red[(warp * kRows + rr) * kOut + col] = acc[j][h][e];
-            }
-    __syncthreads();
-    for (int r = warp; r < nr; r += kWarps) {
-        float z = 0.0f;
-#pragma unroll
-        for (int w = 0; w < kWarps; ++w) z += s_red[(w * kRows + r) * kOut + lane];
-        p.part[((size_t)split * (size_t)M + (size_t)r) * (size_t)N + (size_t)(bx * kOut + lane)] = z;
+        /* cross-warp reduction in warp order, one warp per row, over the A slots
+         * (every warp is past its last read of them), into the split's partial */
+        __syncthreads();
+        float *s_red = reinterpret_cast<float *>(&s_a[0][0][0][0]);   /* [warp][row][32 outputs] */
+        const int c2 = (lane & 3) * 2;
+    #pragma unroll
+        for (int j = 0; j < 2; ++j)
+    #pragma unroll
+            for (int h = 0; h < 2; ++h)
+    #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int rr = g + 8 * (e >> 1), col = j * 16 + h * 8 + c2 + (e & 1);
+                    s_red[(warp * kRows + rr) * kOut + col] = acc[j][h][e];
+                }
+        __syncthreads();
+        for (int r = warp; r < nr; r += kWarps) {
+            float z = 0.0f;
+    #pragma unroll
+            for (int w = 0; w < kWarps; ++w) z += s_red[(w * kRows + r) * kOut + lane];
+            p.part[((size_t)split * (size_t)M + (size_t)(r0 + r)) * (size_t)N + (size_t)(bx * kOut + lane)] = z;
+        }
+        __syncthreads();   /* L341: every warp is past its reads of s_red before the next pass stages into it */
     }
 
     /* 4. the last of the 128-output block's 4 x S CTAs finishes it: splits in split order, H128, svh */
@@ -439,7 +450,7 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     if (!s_last) return;
     __threadfence();
     const int n0 = ob * 128 + lane * 4;
-    for (int m = warp; m < nr; m += kWarps) {
+    for (int m = warp; m < M; m += kWarps) {
         float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int s = 0; s < S; ++s) {
             const float4 v = __ldcg(reinterpret_cast<const float4 *>(p.part + ((size_t)s * (size_t)M + (size_t)m) * (size_t)N + n0));
@@ -490,7 +501,7 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param block   (kOut, kWarps, 1)
 /// @param stream  the launch stream
 /// @param P       the set's projections, all at rate k2
-/// @param M       rows, 1..16
+/// @param M       rows, 1..kMaxRows
 /// @param K       input width
 void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M, int K) {
     switch (k2) {
@@ -503,9 +514,9 @@ void gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t strea
     }
 }
 
-/* One projection's workspace bytes at (M <= kRows, K, N), 16-byte aligned so the next one's starts aligned. */
-/// One projection's workspace bytes at (M <= kRows, K, stored N), rounded up to 16.
-/// @param M  rows, <= kRows
+/* One projection's workspace bytes at (M <= kMaxRows, K, N), 16-byte aligned so the next one's starts aligned. */
+/// One projection's workspace bytes at (M <= kMaxRows, K, stored N), rounded up to 16.
+/// @param M  rows, <= kMaxRows
 /// @param K  input width
 /// @param N  stored output width
 /// @return   bytes
@@ -527,8 +538,8 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
     size_t b = 0;
     for (int j = 0; j < n; ++j) {
         if (ds4_exl3_dense_splits(K, p[j].N) == 0) return 0;
-        /* M > kRows: 16-row blocks in turn (decode rows); the partials are the stored width's */
-        b += proj_ws_bytes(M < kRows ? M : kRows, K, (int)exl3_out_stored((uint64_t)p[j].N));
+        /* M > kMaxRows: kMaxRows-row launches in turn (decode rows); the partials are the stored width's */
+        b += proj_ws_bytes(M < kMaxRows ? M : kMaxRows, K, (int)exl3_out_stored((uint64_t)p[j].N));
     }
     return b;
 }
@@ -598,23 +609,23 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
                             "(prompt chunks run)\n", tag, pulsar_cuda_device_major());
         return -1;
     }
-    if (M > kRows) {
-        /* L288 C1: decode rows past the MMA's 16 (a wide verify) run the GEMV a 16-row block at a time -- each block
-         * the call it is alone, so every row is the bytes a one-row decode gives at ANY width.  The GEMM above lost
-         * here: it decodes the whole weight to fp16 for a handful of rows (+11 ms a 32-row Qwen verify, L288 C1).
-         * The blocks reuse the workspace in stream order (each block's prep follows the last one's GEMV). */
+    if (M > kMaxRows) {
+        /* L288 C1: decode rows past one launch's kMaxRows run kMaxRows-row launches in turn -- each the call it is
+         * alone, so every row is the bytes a one-row decode gives at ANY width (within a launch the kRows-row passes
+         * keep that, L341).  The GEMM above lost here: it decodes the whole weight to fp16 for a handful of rows
+         * (+11 ms a 32-row Qwen verify, L288 C1).  The launches reuse the workspace in stream order. */
         static bool announced = false;
         if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
-            fprintf(stderr, "pulsar: EXL3 dense decode rows past %d run as %d-row GEMV blocks (first call: M=%d K=%d)\n",
-                    kRows, kRows, M, K);
-        for (int r0 = 0; r0 < M; r0 += kRows) {
+            fprintf(stderr, "pulsar: EXL3 dense decode rows past %d run as %d-row GEMV launches (first call: M=%d K=%d)\n",
+                    kMaxRows, kMaxRows, M, K);
+        for (int r0 = 0; r0 < M; r0 += kMaxRows) {
             ds4_exl3_dense_proj q[kMaxProj];
             for (int j = 0; j < n; ++j) {
                 q[j] = p[j];
                 if (p[j].y) q[j].y = p[j].y + (size_t)r0 * p[j].N;
                 if (p[j].yb) q[j].yb = p[j].yb + (size_t)r0 * p[j].N;
             }
-            const int m = M - r0 < kRows ? M - r0 : kRows;
+            const int m = M - r0 < kMaxRows ? M - r0 : kMaxRows;
             const int rc = ds4_exl3_dense_multi_launch(q, n, static_cast<const __nv_bfloat16 *>(xb) + (size_t)r0 * K, m, K,
                                                        workspace, workspace_bytes, stream, false);
             if (rc) return rc;
@@ -664,6 +675,12 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
             fprintf(stderr, "pulsar: EXL3 dense multi launch = one prep + one GEMV per rate over up to %d projections of "
                             "one input (first call: %d at K=%d, M=%d)\n", kMaxProj, n, K, M);
+    }
+    if (M > kRows) {
+        static bool announced = false;
+        if (!__atomic_exchange_n(&announced, true, __ATOMIC_RELAXED))
+            fprintf(stderr, "pulsar: EXL3 dense decode rows past %d run as %d-row passes over trellis words read once "
+                            "(L341; first call: M=%d K=%d)\n", kRows, kRows, M, K);
     }
     /* ONE GEMV per rate among them, in the order the projections were given */
     bool done[kMaxProj] = {};
