@@ -7,6 +7,8 @@
 #include <string>
 
 #include <atomic>
+#include <climits>
+#include <cmath>
 
 
 
@@ -451,11 +453,12 @@ void request_free(request *r) {
 
 
 /// @brief Read a thinking control: null (unchanged), a bool, or an object whose "type" is "enabled" /
-/// "disabled"; any other value is skipped.
+/// "disabled" and whose "budget_tokens" (L344) is an integer; any other value is skipped.
 /// @param p the cursor; advanced past the value
 /// @param thinking_enabled set when the value says on or off
-/// @return false on malformed JSON
-bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+/// @param budget_tokens receives "budget_tokens" when the object carries one (else untouched); NULL: skipped
+/// @return false on malformed JSON (a "budget_tokens" that is not an integer included)
+bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -480,6 +483,14 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (budget_tokens && !strcmp(key, "budget_tokens")) {
+            /* an integer, sign kept (json_int truncates 1.5 and folds -5 to 0): the caller refuses < 1 by value */
+            double v = 0.0;
+            if (!json_number(p, &v) || !(v == floor(v)) || v < (double)INT_MIN + 1.0 || v > (double)INT_MAX) {
+                free(key);
+                return false;
+            }
+            *budget_tokens = (int)v;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;

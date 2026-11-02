@@ -938,6 +938,10 @@ typedef struct request {
     /** The family's level from its effort map (L295 F5: Qwen's qwen_effort, Inkling's hundredths; a DeepSeek
      *  level is its think_mode); written by chat_resolve_thinking, read by family->render. */
     int family_effort;
+    /** L344: the reasoning budget (Anthropic thinking.budget_tokens), tokens; 0 = none.  A decode whose open
+     *  reasoning block reaches it draws the family's close token next (gen_think_close_row); set by
+     *  chat_resolve_thinking only with thinking on and a family with one close token. */
+    int think_budget;
     /** L251: the request's tools array in OpenAI's shape (JSON text) for a family that renders it as JSON
      * and reads arguments by its schema (Qwen's template and output parser); owned, NULL = no tools. */
     char *tools_json;
@@ -3584,6 +3588,16 @@ struct gen_state {
     double last_decode_log_t;          ///< wall time of the last decode log line, for interval rates
     int last_decode_log_completion;    ///< token count at that line, for interval rates
     thinking_state thinking;           ///< reasoning-block tracking (the stop-string scan waits outside it)
+    /** L344: reasoning tokens emitted against request::think_budget, across attempts (a tool-error retry spends
+     *  the request's one budget, as completion_total does max_tokens). */
+    int think_tokens;
+    /** L344: this attempt's reasoning block has closed -- latched: a literal \<think\> in the answer flips
+     *  `thinking.inside` back, but the budget governs only the block the turn opened with. */
+    bool think_closed;
+    /** L344: the forced-close mask rows (gen_think_masks), rows x think_rows_words; owned, grown on demand. */
+    uint32_t *think_rows;
+    /// L344: uint32_t words think_rows holds
+    size_t think_rows_cap;
     bool spec_enabled;          ///< speculative decoding is active for this request
     /** L303: the request's grammar gate for this decode attempt (constrain.cpp); NULL = unconstrained. */
     struct constrain_gate *gate;
@@ -3774,7 +3788,17 @@ const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *order
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
 void request_free(request *r);
-bool parse_thinking_control_value(const char **p, bool *thinking_enabled);
+bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
+/** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
+int think_close_row(int budget, bool open, int think_tokens, int close, const int *toks, int n, int off);
+/** L344: lay the forced-close mask rows, pure (server_sched.cpp). */
+void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, const uint32_t *gram, int gram_rows);
+/** L344: the draw at which the thinking budget closes the reasoning block (server_sched.cpp). */
+int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off);
+/** L344: mask rows forcing the close token at one row (server_sched.cpp). */
+const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows);
+/** L344: uint32_t words in one sampler mask row. */
+size_t gen_think_mask_words(const server *s);
 const char *server_model_id_from_engine(pulsar_engine *engine);
 /* Advertised model id ("id"/"root"/metrics): the built-in id derived from the
  * loaded GGUF shape. */
@@ -4003,9 +4027,11 @@ typedef struct chat_effort_ask {
     int thinking;   ///< -1 not sent, 0 off, 1 on (thinking / think / enable_thinking / the kwargs)
     int level;      ///< -1 no name sent; else the row of the effort-name table
     int value;      ///< an integer effort 1..100 (level -1 then); 0 = none sent
+    int budget;     ///< L344: Anthropic thinking.budget_tokens, >= 1; 0 = none sent
 } chat_effort_ask;
 /** Read the controls in arrival order (a later one replaces an earlier one's value).  false + err:
- *  a name outside the table, an integer outside 1..100, a chat_template_kwargs key no template takes. */
+ *  a name outside the table, an integer outside 1..100, a chat_template_kwargs key no template takes, a
+ *  thinking.budget_tokens under 1 (L344). */
 /// @param controls  the request's controls, in arrival order
 /// @param n         how many
 /// @param a         receives the resolved ask

@@ -2316,10 +2316,10 @@ static void test_effort_names_one_table(void) {
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(!enabled);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, NULL));
     TEST_ASSERT(enabled);
 
     chat_control oc = {"output_config", server_xstrdup("{\"effort\":\"max\",\"other\":true}")};
@@ -2328,6 +2328,82 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(chat_effort_ask_read(&oc, 1, &a, err, sizeof err));
     TEST_ASSERT(a.level >= 0 && !strcmp(k_effort_names[a.level], "max"));
     free(oc.raw);
+}
+
+/* L344: thinking.budget_tokens is read (it was skipped), replaced by a later thinking control, and refused under 1
+ * with its reason; a non-integer is malformed JSON. */
+static void test_l344_thinking_budget_parse(void) {
+    bool on = false;
+    int budget = -7;
+    const char *t = "{\"type\":\"enabled\",\"budget_tokens\":2048}";
+    TEST_ASSERT(parse_thinking_control_value(&t, &on, &budget) && on && budget == 2048 && *t == '\0');
+    t = "{\"budget_tokens\":512,\"type\":\"enabled\"}";
+    TEST_ASSERT(parse_thinking_control_value(&t, &on, &budget) && budget == 512);
+    budget = -7;
+    t = "{\"type\":\"enabled\"}";
+    TEST_ASSERT(parse_thinking_control_value(&t, &on, &budget) && budget == -7);   /* absent: untouched */
+    t = "{\"type\":\"enabled\",\"budget_tokens\":\"lots\"}";
+    TEST_ASSERT(!parse_thinking_control_value(&t, &on, &budget));
+    t = "{\"type\":\"enabled\",\"budget_tokens\":1.5}";
+    TEST_ASSERT(!parse_thinking_control_value(&t, &on, &budget));
+
+    chat_effort_ask a;
+    char err[160];
+    chat_control c[2] = {{"thinking", server_xstrdup("{\"type\":\"enabled\",\"budget_tokens\":4096}")},
+                         {"thinking", server_xstrdup("{\"type\":\"adaptive\"}")}};
+    TEST_ASSERT(chat_effort_ask_read(c, 1, &a, err, sizeof err) && a.thinking == 1 && a.budget == 4096);
+    TEST_ASSERT(chat_effort_ask_read(c, 2, &a, err, sizeof err) && a.thinking == 1 && a.budget == 0);   /* replaced */
+    chat_control none = {"reasoning_effort", server_xstrdup("\"high\"")};
+    TEST_ASSERT(chat_effort_ask_read(&none, 1, &a, err, sizeof err) && a.budget == 0);
+    static const char *const bad[] = {"{\"type\":\"enabled\",\"budget_tokens\":0}",
+                                      "{\"type\":\"enabled\",\"budget_tokens\":-5}"};
+    for (const char *b : bad) {
+        chat_control x = {"thinking", server_xstrdup(b)};
+        err[0] = '\0';
+        TEST_ASSERT(!chat_effort_ask_read(&x, 1, &a, err, sizeof err));
+        TEST_ASSERT(strstr(err, "thinking.budget_tokens must be a positive integer") != NULL);
+        free(x.raw);
+    }
+    free(c[0].raw);
+    free(c[1].raw);
+    free(none.raw);
+}
+
+/* L344: the forced row.  A plain draw (no round tokens) is forced once the budget is spent; a spec round's row i
+ * follows its first i + off tokens, so the row where budget runs out is forced -- unless a pending token closed
+ * the block first.  The mask row allows the close token alone; the others stay the grammar's or unconstrained. */
+static void test_l344_thinking_budget_close_row(void) {
+    const int close = 77;
+    /* plain: due at the budget, not before; no budget / closed block: never */
+    TEST_ASSERT(think_close_row(100, true, 99, close, NULL, 0, 0) == -1);
+    TEST_ASSERT(think_close_row(100, true, 100, close, NULL, 0, 0) == 0);
+    TEST_ASSERT(think_close_row(100, true, 140, close, NULL, 0, 0) == 0);   /* a retry over budget: at once */
+    TEST_ASSERT(think_close_row(0, true, 5000, close, NULL, 0, 0) == -1);
+    TEST_ASSERT(think_close_row(100, false, 100, close, NULL, 0, 0) == -1);
+    /* a round with the base unsent (off 1): toks = base + 3 drafts, rows 0..3 */
+    const int r1[] = {5, 6, 7, 8};
+    TEST_ASSERT(think_close_row(100, true, 96, close, r1, 4, 1) == 3);   /* 96 + base + 3 drafts = 100 at row 3 */
+    TEST_ASSERT(think_close_row(100, true, 98, close, r1, 4, 1) == 1);
+    TEST_ASSERT(think_close_row(100, true, 99, close, r1, 4, 1) == 0);   /* the base is the budget's last */
+    TEST_ASSERT(think_close_row(100, true, 90, close, r1, 4, 1) == -1);  /* not within the round */
+    /* the base already streamed (off 0): toks = 3 drafts, rows 0..3 */
+    TEST_ASSERT(think_close_row(100, true, 98, close, r1 + 1, 3, 0) == 2);
+    TEST_ASSERT(think_close_row(100, true, 100, close, r1 + 1, 3, 0) == 0);
+    /* a draft closes the block before the budget row: nothing forced past it */
+    const int r2[] = {5, close, 7, 8};
+    TEST_ASSERT(think_close_row(100, true, 97, close, r2, 4, 1) == -1);
+    TEST_ASSERT(think_close_row(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
+
+    /* the rows: 3 rows of 4 words, row 1 forced; grammar rows copied where given, the rest unconstrained */
+    const size_t W = 4;
+    uint32_t out[3 * W], gram[2 * W];
+    for (size_t i = 0; i < 2 * W; i++) gram[i] = 0x0f0f0f0fu + (uint32_t)i;
+    think_masks_lay(out, W, 1, 3, close, gram, 2);
+    TEST_ASSERT(!memcmp(out, gram, W * sizeof(uint32_t)));
+    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == (size_t)close / 32u ? 1u << (close % 32) : 0u));
+    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[2 * W + w] == 0xffffffffu);
+    think_masks_lay(out, W, 0, 1, 0, NULL, 0);
+    TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
 /* L335: a malformed effort string or a non-bool thinking switch refuses WITH its reason (both left err empty, so the
@@ -12129,6 +12205,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_effort_names_one_table();
     test_api_thinking_controls_parse();
+    test_l344_thinking_budget_parse();
+    test_l344_thinking_budget_close_row();
     test_effort_controls_name_their_error();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefixes();
