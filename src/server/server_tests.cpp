@@ -6748,41 +6748,79 @@ static void test_l310_restore_vs_recompute(void) {
 
     /* the read cost: nothing before the first load; one load prices every byte at its own rate, cached or not */
     const uint64_t MiB = 1ull << 20;
+    const double T0 = 100.0;   /* one clock reading: no relaxation (L342) in these cases */
     kv_read_cost rc;
     memset(&rc, 0, sizeof rc);
     double ms = -1.0;
-    TEST_ASSERT(!kv_read_cost_ms(&rc, 100 * MiB, 0, &ms) && ms == 0.0);
-    kv_read_cost_observe(&rc, 1024 * MiB, 0, 0.0);   /* a zero-time or empty load is no observation */
-    kv_read_cost_observe(&rc, 0, 0, 5.0);
+    TEST_ASSERT(!kv_read_cost_ms(&rc, 100 * MiB, 0, T0, &ms) && ms == 0.0);
+    kv_read_cost_observe(&rc, 1024 * MiB, 0, 0.0, T0);   /* a zero-time or empty load is no observation */
+    kv_read_cost_observe(&rc, 0, 0, 5.0, T0);
     TEST_ASSERT(rc.loads == 0u);
-    kv_read_cost_observe(&rc, 2048 * MiB, 0, 1000.0);
-    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 0, &ms) && fabs(ms - 500.0) < 1e-6);
-    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 1024 * MiB, &ms) && fabs(ms - 500.0) < 1e-6);
-    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 4096 * MiB, &ms) && fabs(ms - 500.0) < 1e-6);   /* cached <= bytes */
+    kv_read_cost_observe(&rc, 2048 * MiB, 0, 1000.0, T0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 0, T0, &ms) && fabs(ms - 500.0) < 1e-6);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 1024 * MiB, T0, &ms) && fabs(ms - 500.0) < 1e-6);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 1024 * MiB, 4096 * MiB, T0, &ms) && fabs(ms - 500.0) < 1e-6);   /* cached <= bytes */
     /* loads that tell them apart: disk 500 ms a GiB, page cache 100 */
     for (int i = 0; i < 40; i++) {
         const uint64_t b = (uint64_t)(512 + 256 * (i % 5)) * MiB, c = (uint64_t)(i % 3) * b / 2u;
-        kv_read_cost_observe(&rc, b, c, ((double)(b - c) * 500.0 + (double)c * 100.0) / (double)(1024 * MiB));
+        kv_read_cost_observe(&rc, b, c, ((double)(b - c) * 500.0 + (double)c * 100.0) / (double)(1024 * MiB), T0);
     }
     TEST_ASSERT(fabs(rc.cold_ms_per_gib - 500.0) < 1.0 && fabs(rc.cached_ms_per_gib - 100.0) < 1.0);
-    TEST_ASSERT(kv_read_cost_ms(&rc, 3072 * MiB, 2048 * MiB, &ms) && fabs(ms - 700.0) < 3.0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 3072 * MiB, 2048 * MiB, T0, &ms) && fabs(ms - 700.0) < 3.0);
 
     /* L320's loads, replayed (MiB; the cached share as the earlier loads of the same segments leave it) */
     memset(&rc, 0, sizeof rc);
-    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), 0, 365.4);                       /* 17:35, cold */
-    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), (uint64_t)(362.6 * MiB), 177.0);   /* 18:07, the same chain */
+    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), 0, 365.4, T0);                       /* 17:35, cold */
+    kv_read_cost_observe(&rc, (uint64_t)(362.6 * MiB), (uint64_t)(362.6 * MiB), 177.0, T0);   /* 18:07, the same chain */
     double t49 = 0.0;
-    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), &t49));
+    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), T0, &t49));
     TEST_ASSERT(kv_restore_decide(6400, true, t49, true, 7000.0) == KV_RESTORE_RECOMPUTE);   /* it took 7.1 s */
-    kv_read_cost_observe(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), 7077.7);
+    kv_read_cost_observe(&rc, (uint64_t)(8735.3 * MiB), (uint64_t)(362.6 * MiB), 7077.7, T0);
     double t53 = 0.0;
-    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(9728.0 * MiB), (uint64_t)(8735.3 * MiB), &t53));
+    TEST_ASSERT(kv_read_cost_ms(&rc, (uint64_t)(9728.0 * MiB), (uint64_t)(8735.3 * MiB), T0, &t53));
     TEST_ASSERT(t53 < 6000.0 && kv_restore_decide(11264, true, t53, true, 12000.0) == KV_RESTORE_LOAD);
     /* the single rate it replaces (each load's bytes per ms, weight 1/8) priced 18:53 past half the prefill */
     double rate = 362.6 * MiB / 365.4;
     rate += (362.6 * MiB / 177.0 - rate) / 8.0;
     rate += (8735.3 * MiB / 7077.7 - rate) / 8.0;
     TEST_ASSERT(9728.0 * MiB / rate > 6000.0);
+
+    /* L342: one slow load (disk contention) must not freeze the verdict.  Only a load measures the read, and a slow
+     * estimate prices every chain to RECOMPUTE, so no load ever came to correct it.  Each cost's gap above its best now
+     * halves every KV_READ_RELAX_SEC without a load; a running load holds it; the fit's sums are untouched. */
+    memset(&rc, 0, sizeof rc);
+    const uint64_t GiB = 1024 * MiB;
+    kv_read_cost_observe(&rc, GiB, 0, 500.0, 100.0);      /* the disk at its usual 2 GB/s */
+    kv_read_cost_observe(&rc, GiB, 0, 20000.0, 101.0);    /* one read under contention */
+    const double slow = rc.cold_ms_per_gib;
+    TEST_ASSERT(slow > 10000.0 && fabs(rc.best_cold_ms_per_gib - 500.0) < 1e-6);
+    double t = 0.0;
+    TEST_ASSERT(kv_read_cost_ms(&rc, 8 * GiB, 0, 101.0, &t) && fabs(t - 8.0 * slow) < 1e-6);
+    TEST_ASSERT(kv_restore_decide(40000, true, t, true, 12000.0) == KV_RESTORE_RECOMPUTE);
+    /* one interval later the gap has halved -- still recompute */
+    TEST_ASSERT(kv_read_cost_ms(&rc, 8 * GiB, 0, 101.0 + KV_READ_RELAX_SEC, &t));
+    TEST_ASSERT(fabs(t - 8.0 * (500.0 + (slow - 500.0) * 0.5)) < 1e-6);
+    TEST_ASSERT(kv_restore_decide(40000, true, t, true, 12000.0) == KV_RESTORE_RECOMPUTE);
+    /* a minute idle: the price is back near the disk's best and the chain loads (before L342: recompute forever) */
+    TEST_ASSERT(kv_read_cost_ms(&rc, 8 * GiB, 0, 161.0, &t) && t < 6000.0);
+    TEST_ASSERT(kv_restore_decide(40000, true, t, true, 12000.0) == KV_RESTORE_LOAD);
+    TEST_ASSERT(rc.cold_ms_per_gib == slow);              /* the price relaxed, the fit did not */
+    /* a load running (begun or sliced) holds the price at the fit */
+    kv_read_cost_touch(&rc, 161.0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 8 * GiB, 0, 161.0, &t) && fabs(t - 8.0 * slow) < 1e-6);
+    kv_read_cost_touch(&rc, 150.0);                       /* the clock never runs backwards */
+    TEST_ASSERT(rc.last_sec == 161.0);
+    /* the probe was slow again (the device really is slow): priced slow at once, probed again an interval or so on */
+    kv_read_cost_observe(&rc, 8 * GiB, 0, 8.0 * 20000.0, 170.0);
+    TEST_ASSERT(kv_read_cost_ms(&rc, 8 * GiB, 0, 170.0, &t));
+    TEST_ASSERT(kv_restore_decide(40000, true, t, true, 12000.0) == KV_RESTORE_RECOMPUTE);
+    /* the probe was fast (contention over): the fit moves toward it and the best is the floor it relaxes to */
+    memset(&rc, 0, sizeof rc);
+    kv_read_cost_observe(&rc, GiB, 0, 20000.0, 100.0);    /* the first load was the slow one */
+    TEST_ASSERT(fabs(rc.best_cold_ms_per_gib - 20000.0) < 1e-6);   /* no faster rate known: nothing to relax toward */
+    TEST_ASSERT(kv_read_cost_ms(&rc, GiB, 0, 1000.0, &t) && fabs(t - 20000.0) < 1e-3);
+    kv_read_cost_observe(&rc, GiB, 0, 500.0, 1000.0);
+    TEST_ASSERT(rc.best_cold_ms_per_gib == rc.cold_ms_per_gib && rc.cold_ms_per_gib < 20000.0);
 }
 
 
