@@ -672,25 +672,6 @@
    "n_images": 1
   },
   {
-   "name": "text spelling <image> beside an image",
-   "messages": [
-    {
-     "role": "user",
-     "content": [
-      {
-       "type": "text",
-       "text": "see <image> here"
-      },
-      {
-       "type": "image"
-      }
-     ]
-    }
-   ],
-   "effort": "default",
-   "refusal": "image_marker_in_text"
-  },
-  {
    "name": "an image in an assistant turn",
    "messages": [
     {

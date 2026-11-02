@@ -23,13 +23,13 @@
  * 1, per message), then the literal "<img><image></img>" outside client data (the engine's image front expands its
  * `<image>` into the tile's block).  Images render in system, user and tool messages (render_content is the content
  * of every turn); an assistant turn with an image is refused (image_position: a sampled turn never holds one, so its
- * replay could not compose).  A message whose text spells "<image>" beside image parts is refused
- * (image_marker_in_text): the template would drop the image parts and the processor fill the CLIENT's spelling, and
- * client text spelling a marker stays text here (L223).
+ * replay could not compose).  A message whose text spells "<image>" beside image parts renders as any other: the text
+ * stays text (L223) and each image goes where its part was -- a departure from the template, which would drop the
+ * image parts and let the processor fill the CLIENT's spelling (Tyler 2026-11-02: accept, not refuse).
  * Refusals, by name: no_messages; tools_not_array; tool_name_missing; tool_arguments_not_json (a call's arguments
  * text does not parse); tool_arguments_not_object (it parses to a non-object: the template's |items raises);
  * raw_calls_without_calls; prompt_too_large; reasoning_without_thinking (the sampled-turn writer only);
- * image_position; image_marker_in_text.
+ * image_position.
  *
  * EFFORT.  The template knows three levels: thinking off (enable_thinking=false: the generation prompt closes an
  * empty think block), medium (medium_effort: the last user message's suffix) and high (its default).

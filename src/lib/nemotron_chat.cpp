@@ -384,23 +384,16 @@ bool write_calls(writer &w, const nemotron_msg_in &m, int i, char *err, size_t e
 /// placeholder_text).
 const char kImageLiteral[] = "<img><image></img>";
 
-/** Write message `m`'s content with its images placed (above).
- *  @param w      the render's writer
- *  @param m      the message
- *  @param i      its index in the conversation (named in a refusal)
- *  @param err    receives the reason on false
- *  @param errlen size of `err`
- *  @return false + err when the text spells `<image>` beside images (image_marker_in_text) */
-bool write_content(writer &w, const nemotron_msg_in &m, int i, char *err, size_t errlen) {
+/** Write message `m`'s content with its images placed (above).  Client text that spells `<image>` beside images stays
+ *  text (L223): an image goes where its part was, never at a marker the client typed.
+ *  @param w the render's writer
+ *  @param m the message */
+void write_content(writer &w, const nemotron_msg_in &m) {
     const std::string c = m.content ? m.content : "";
     if (m.n_images <= 0) {
         w.client(c);
-        return true;
+        return;
     }
-    if (c.find("<image>") != std::string::npos)
-        return chat_refuse(err, errlen, "image_marker_in_text",
-                      "message %d spells <image> beside its %d image(s): the template would place the images at the "
-                      "text's marker, and client text stays text", i, m.n_images);
     size_t at = 0;
     bool after_text = false;
     char last = 0;   /* the content so far's last byte (render_content's content_ns.val) */
@@ -423,7 +416,6 @@ bool write_content(writer &w, const nemotron_msg_in &m, int i, char *err, size_t
         after_text = false;
     }
     if (c.size() > at) w.client(c.substr(at));
-    return true;
 }
 
 /* The assistant's content as the template builds it: "<think>\n" + reasoning + "</think>" + content when the
@@ -533,14 +525,14 @@ bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *p
             w.lit("<|im_start|>");
             w.lit(role);
             w.lit("\n");
-            if (!write_content(w, m, i, err, errlen)) return false;
+            write_content(w, m);
             if (!strcmp(role, "user") && i == last_user && effort == NEMOTRON_EFFORT_MEDIUM) w.lit(kMediumSuffix);
             w.lit("<|im_end|>\n");
         } else if (!strcmp(role, "tool")) {
             const char *before = i ? msgs[i - 1].role : prev;
             if (before && strcmp(before, "tool")) w.lit("<|im_start|>user\n");
             w.lit("<tool_response>\n");
-            if (!write_content(w, m, i, err, errlen)) return false;
+            write_content(w, m);
             w.lit("\n</tool_response>\n");
             const bool last = i + 1 == n;
             if (last || strcmp(msgs[i + 1].role ? msgs[i + 1].role : "", "tool")) w.lit("<|im_end|>\n");
@@ -548,7 +540,7 @@ bool write_messages(writer &w, const nemotron_msg_in *msgs, int n, const char *p
             w.lit("<|im_start|>");
             w.lit(role);   /* the API's role word: the template writes it, not client text */
             w.lit("\n");
-            if (!write_content(w, m, i, err, errlen)) return false;
+            write_content(w, m);
             w.lit("<|im_end|>\n");
         }
     }
@@ -584,7 +576,7 @@ bool nemotron_chat_render(const nemotron_render_in &in, nemotron_render_out *out
     const nemotron_msg_in *loop = in.msgs + (first_system ? 1 : 0);
     const int n = in.n_msgs - (first_system ? 1 : 0);
     w.lit("<|im_start|>system\n");
-    if (first_system && !write_content(w, in.msgs[0], 0, err, errlen)) return false;
+    if (first_system) write_content(w, in.msgs[0]);
     if (in.tools_json && !tools.a.empty()) {
         if (!system.empty() || (first_system && in.msgs[0].n_images > 0)) w.lit("\n\n");
         write_tools(w, tools);

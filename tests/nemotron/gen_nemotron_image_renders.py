@@ -55,9 +55,10 @@ CASES = [
                                 {"role": "assistant", "content": "", "tool_calls": [CALL]},
                                 {"role": "tool", "tool_call_id": "c1", "content": [T("Here:"), IMG]}], "default"),
 ]
+# Text spelling "<image>" beside image parts is NOT here: pulsar keeps it text and places each image where its part
+# was (Tyler 2026-11-02), where the template would drop the parts and fill the client's spelling -- a departure no HF
+# render can grade; src/server/server_tests.cpp asserts pulsar's render of it.
 REFUSALS = [
-    ("text spelling <image> beside an image", [{"role": "user", "content": [T("see <image> here"), IMG]}],
-     "image_marker_in_text"),
     ("an image in an assistant turn", [{"role": "user", "content": "hi"},
                                        {"role": "assistant", "content": [T("look"), IMG]},
                                        {"role": "user", "content": "ok"}], "image_position"),

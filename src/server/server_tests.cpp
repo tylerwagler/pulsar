@@ -4761,20 +4761,41 @@ static void test_nemotron_refusals(void) {
         request_free(&r);
         chat_conversation_free(&c);
     }
-    for (int k = 0; k < 2; k++) {
+    /* L331 (Tyler 2026-11-02): text spelling "<image>" beside an image stays text -- the typed marker inside a client
+     * span, the image's literal where its part was, outside every span */
+    {
         chat_msgs msgs = {0};
-        if (k == 0) {
-            chat_msgs_push(&msgs, qwen_test_image_msg("user", "see <image> here ", ""));
-        } else {
-            chat_msgs_push(&msgs, qwen_test_msg("user", "hi"));
-            chat_msgs_push(&msgs, qwen_test_image_msg("assistant", "look ", ""));
-            chat_msgs_push(&msgs, qwen_test_msg("user", "ok"));
+        chat_msgs_push(&msgs, qwen_test_image_msg("user", "see <image> here ", ""));
+        chat_conversation c = {};
+        c.msgs = msgs;
+        test_request_init(&r, REQ_CHAT, 16);
+        TEST_ASSERT(render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
+        const char *want = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nsee <image> here \n<img><image></img>"
+                           "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        TEST_ASSERT(r.prompt_text && !strcmp(r.prompt_text, want));
+        const char *typed = r.prompt_text ? strstr(r.prompt_text, "see <image>") : NULL;
+        const char *lit = r.prompt_text ? strstr(r.prompt_text, "<img><image></img>") : NULL;
+        bool typed_in = false, lit_out = lit != NULL;
+        for (uint32_t i = 0; typed && lit && i < r.prompt_n_spans; i++) {
+            const uint32_t t0 = (uint32_t)(typed - r.prompt_text) + 4u, l0 = (uint32_t)(lit - r.prompt_text);
+            typed_in |= r.prompt_spans[i].lo <= t0 && r.prompt_spans[i].hi >= t0 + 7u;
+            lit_out &= !(r.prompt_spans[i].lo < l0 + 18u && r.prompt_spans[i].hi > l0);
         }
+        TEST_ASSERT(typed_in && lit_out);
+        request_free(&r);
+        chat_conversation_free(&c);
+    }
+    /* an image in an assistant turn: refused by name (a sampled turn never holds one) */
+    {
+        chat_msgs msgs = {0};
+        chat_msgs_push(&msgs, qwen_test_msg("user", "hi"));
+        chat_msgs_push(&msgs, qwen_test_image_msg("assistant", "look ", ""));
+        chat_msgs_push(&msgs, qwen_test_msg("user", "ok"));
         chat_conversation c = {};
         c.msgs = msgs;
         test_request_init(&r, REQ_CHAT, 16);
         TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_NEMOTRON_H, NULL, &c, &r, err, sizeof err));
-        TEST_ASSERT(strstr(err, k == 0 ? "image_marker_in_text" : "image_position") != NULL);
+        TEST_ASSERT(strstr(err, "image_position") != NULL);
         request_free(&r);
         chat_conversation_free(&c);
     }
