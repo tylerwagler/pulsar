@@ -34,7 +34,7 @@
  *   general.architecture = "nemotron_h";
  *   nemotron_h.<key>   llm_config verbatim (kv.config_kvs), except time_step_limit, written as
  *                      nemotron_h.time_step_limit.min (0) + .max_inf (true) -- the builder refuses any other;
- *   pulsar.mtp_present (the container holds the drafter), pulsar.vision_present (false in v1).
+ *   pulsar.mtp_present (the container holds the drafter), pulsar.vision_present (the tower: section 2b, L331).
  *   Every tensor carries a bind record: role (+ block `layers` / `mtp`, layer = the PULSAR layer, index).  Linears
  *   are stored [in, out] in ne order; the conv [kernel, channels]; routed experts are pulsar.experts stacks
  *   [in, out, n_expert] (up: latent -> ff, down: ff -> latent).
@@ -48,6 +48,9 @@
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
 #include "engine/spec_block.h"
+#include "engine/vit_encoder.h"
+
+#include <vector>
 
 /// The `general.architecture` value this family claims.
 #define PULSAR_NEMOTRON_H_ARCH "nemotron_h"
@@ -93,6 +96,7 @@ typedef struct {
     uint64_t moe_layers;       ///< bit il: layer il has the MoE (else its mixer alone)
     uint32_t n_mtp;            ///< num_nextn_predict_layers (0 or 1: one {attention, MoE} module)
     bool mtp_written;          ///< pulsar.mtp_present: the container holds the drafter
+    bool vision_written;       ///< L331 pulsar.vision_present: the container holds the vision tower
     bool block_written;        ///< L298 pulsar.drafter = "lilicorr": the container holds the LiLiCorr block drafter
     /** L298: HF block b's place in the plan -- pulsar layer block_layer[b], its mixer (PULSAR_BLOCK_TAP_MIXER) or its
      *  MoE (PULSAR_BLOCK_TAP_FFN): where a block drafter's tap after block b reads the residual */
@@ -154,6 +158,198 @@ typedef struct {
     pulsar_tensor *out_norm;         ///< draft_out_norm [n_embd] (final_layernorm)
 } pulsar_nemotron_h_draft;
 
+/* ---- 2b. The vision tower (L331; nemotron_h_vision.cpp, nemotron_h_image.cpp) ---------------------------------------
+ *
+ * THE MODEL (the checkpoint's modeling_radio.py + modeling_nemotron_h_omni.py, image_processing_nemotron_h_omni.py):
+ *   image   decode (PNG / JPEG, the engine's codec), the processor's tile: (w_p, h_p) patches inside
+ *           [min_patches, max_patches] with the aspect ratio, each side even (pulsar_nemotron_h_tile); torch's
+ *           antialiased bicubic to 16 w_p x 16 h_p when the size changes (vision_torch_bicubic_aa_rgb); (p / 255 - mean)
+ *           / std in f32; bf16 (the tower's dtype); 16 x 16 patches, element c * 256 + y * 16 + x
+ *   tower   C-RADIO ViT-H/16: res = [10 cls / register tokens | patch Linear 768 -> 1280 (no bias) + CPE positions]
+ *           (the 128 x 128 table bilinear-resized to M x M, M = max(h_p, w_p), the top-left h_p x w_p crop); 32 timm
+ *           blocks (engine/vit_encoder.h: 16 heads of 80, MLP 5120, LayerNorm 1e-6)
+ *   project the 10 prefix rows dropped; vision_final_layernorm (LayerNorm 1e-6: the checkpoint's own path -- L331);
+ *           pixel shuffle 2x2 (LLM row (i, j) = patches (2i, 2j), (2i, 2j+1), (2i+1, 2j), (2i+1, 2j+1), 4 x 1280);
+ *           mlp1 = RMSNorm(5120, 1e-5) -> Linear 5120 -> 20480 -> relu^2 -> Linear 20480 -> 4096 (no biases)
+ *   prompt  `<img>` + (h_p w_p / 4) x `<image>` + `</img>`; the BLOCK is the run of `<image>`; NoPE: no positions.
+ * The patches run in MERGE-BLOCK order (llm row (i, j), then a, b): the ViT has no relative position, so its rows are
+ * a permutation of the reference's, and the pixel shuffle is then a view.
+ *
+ * THE CONTAINER: pulsar.vision_present true, the facts under nemotron_h_vision.* (pinned to the profile below), the
+ * tensors by bind record -- the ViT's as Parse's (vit_patch, vit_cls, vit_pos at the top; vit_norm1 .. vit_fc2_bias in
+ * block `vit`), the projector's vit_final_norm(_bias), proj_norm, proj_fc1, proj_fc2: Linears and the positions /
+ * class tokens / proj_norm BF16 as stored, every LayerNorm weight and bias f32 (the shared row ops' operand). */
+/// The ViT blocks the tower holds (the profile's depth).
+#define PULSAR_NEMOTRON_H_VIT_DEPTH 32u
+
+/** The tower's pinned facts (nemotron_h_vision.*), every one equal to PULSAR_NEMOTRON_H_VISION_SHAPE's.  The
+ *  profile's values are in parentheses. */
+typedef struct {
+    /** @var pulsar_nemotron_h_vision_shape::width
+     *  vit.width (1280): the ViT's residual width
+     *  @var pulsar_nemotron_h_vision_shape::depth
+     *  vit.depth (32): the ViT's blocks
+     *  @var pulsar_nemotron_h_vision_shape::heads
+     *  vit.heads (16): the ViT's attention heads
+     *  @var pulsar_nemotron_h_vision_shape::head_dim
+     *  vit.head_dim (80)
+     *  @var pulsar_nemotron_h_vision_shape::mlp
+     *  vit.mlp (5120): the ViT MLP's inner width (fc1's output)
+     *  @var pulsar_nemotron_h_vision_shape::patch
+     *  vit.patch (16): a patch's side in pixels; a patch row is 3 * patch * patch (768) values
+     *  @var pulsar_nemotron_h_vision_shape::prefix
+     *  vit.prefix (10): the cls / register rows before the patches (dropped before the projector)
+     *  @var pulsar_nemotron_h_vision_shape::pos_grid
+     *  vit.pos_grid (128): the CPE position table's side, in patches */
+    uint32_t width, depth, heads, head_dim, mlp, patch, prefix, pos_grid;
+    /// vit.norm_eps (1e-6): the ViT LayerNorms' epsilon (the final LayerNorm's too)
+    float eps;
+    /** @var pulsar_nemotron_h_vision_shape::merge
+     *  proj.merge (2): the pixel shuffle's side; merge x merge patches make one LLM row
+     *  @var pulsar_nemotron_h_vision_shape::proj_hidden
+     *  proj.hidden (20480): mlp1's inner width (fc1's output) */
+    uint32_t merge, proj_hidden;
+    /// proj.norm_eps (1e-5): mlp1's RMSNorm epsilon
+    float proj_eps;
+    /** @var pulsar_nemotron_h_vision_shape::min_patches
+     *  image.min_patches (1024): the tile's lower patch budget (a smaller image is scaled up to it)
+     *  @var pulsar_nemotron_h_vision_shape::max_patches
+     *  image.max_patches (13312): the per-image patch budget; no tile exceeds it */
+    uint32_t min_patches, max_patches;
+    /** @var pulsar_nemotron_h_vision_shape::mean
+     *  image.mean.0..2: the per-channel (R, G, B) normalisation mean, on p / 255
+     *  @var pulsar_nemotron_h_vision_shape::std
+     *  image.std.0..2: the per-channel normalisation standard deviation */
+    float mean[3], std[3];
+} pulsar_nemotron_h_vision_shape;
+
+/// The one profile (C-RADIO ViT-H/16 + mlp1), the values every container fact must equal.
+extern const pulsar_nemotron_h_vision_shape PULSAR_NEMOTRON_H_VISION_SHAPE;
+
+struct pulsar_nemotron_h_vision_run;
+
+/** The tower's tensors and its state (bound when the container holds it). */
+typedef struct {
+    bool present;                    ///< the container holds the tower (pulsar.vision_present) and it bound
+    pulsar_nemotron_h_vision_shape shape;   ///< the container's pinned facts
+    /** @var pulsar_nemotron_h_vision::patch
+     *  vit_patch: the patch embedding Linear [768 -> width], BF16, no bias
+     *  @var pulsar_nemotron_h_vision::cls
+     *  vit_cls: the prefix (cls / register) rows, BF16 [prefix][width]
+     *  @var pulsar_nemotron_h_vision::pos
+     *  vit_pos: the CPE position table, BF16 [pos_grid * pos_grid][width] */
+    pulsar_tensor *patch, *cls, *pos;
+    pulsar_vit_block vit[PULSAR_NEMOTRON_H_VIT_DEPTH];   ///< the ViT blocks (block `vit`, layer il)
+    /** @var pulsar_nemotron_h_vision::final_norm
+     *  vit_final_norm: vision_final_layernorm's weight, f32 [width]
+     *  @var pulsar_nemotron_h_vision::final_norm_b
+     *  vit_final_norm_bias: its bias, f32 [width]
+     *  @var pulsar_nemotron_h_vision::proj_norm
+     *  proj_norm: mlp1's RMSNorm weight, BF16 [width * merge * merge]
+     *  @var pulsar_nemotron_h_vision::proj_fc1
+     *  proj_fc1: mlp1's first Linear [width * merge * merge -> proj_hidden], no bias
+     *  @var pulsar_nemotron_h_vision::proj_fc2
+     *  proj_fc2: mlp1's second Linear [proj_hidden -> 4096], no bias */
+    pulsar_tensor *final_norm, *final_norm_b, *proj_norm, *proj_fc1, *proj_fc2;
+    /** @var pulsar_nemotron_h_vision::image_id
+     *  `<image>`: the block's token, one per LLM row
+     *  @var pulsar_nemotron_h_vision::start_id
+     *  `<img>`: opens an image
+     *  @var pulsar_nemotron_h_vision::end_id
+     *  `</img>`: closes it (all three the tokenizer's added tokens) */
+    int32_t image_id, start_id, end_id;
+    std::vector<float> pos_field;    ///< the position table, host f32 [pos_grid][pos_grid][width]
+    std::vector<float> cls_rows;     ///< the prefix rows, host f32 [prefix][width]
+    struct pulsar_nemotron_h_vision_run *run;   ///< the device scratch (pulsar_nemotron_h_vision_run_create), or NULL
+} pulsar_nemotron_h_vision;
+
+/** The processor's tile for a w x h image: (*wp, *hp) patches -- _compute_target_patches at the per-image budget
+ *  (max_patches), each side even. */
+/// @param s the tower's shape (patch, merge, the patch budgets)
+/// @param w the image's width in pixels
+/// @param h the image's height in pixels
+/// @param[out] wp the tile's width in patches (0 when the image has no tile)
+/// @param[out] hp the tile's height in patches (0 when the image has no tile)
+void pulsar_nemotron_h_tile(const pulsar_nemotron_h_vision_shape *s, int w, int h, uint32_t *wp, uint32_t *hp);
+
+/** One image ready for the tower. */
+typedef struct {
+    /** @var pulsar_nemotron_h_image::wp
+     *  the tile's width in patches
+     *  @var pulsar_nemotron_h_image::hp
+     *  the tile's height in patches */
+    uint32_t wp, hp;
+    std::vector<float> pixels;       ///< the processor's pixel_values, f32 [3][16 hp][16 wp]
+    std::vector<uint16_t> patches;   ///< bf16 [wp hp][768], merge-block order
+} pulsar_nemotron_h_image;
+
+/** Decode, tile, resize, normalise, patch.  false + `err` on an image the tower does not take. */
+/// @param s the tower's shape
+/// @param bytes the encoded image (PNG or JPEG)
+/// @param len its size in bytes
+/// @param[out] img the prepared image
+/// @param[out] err the refusal's text
+/// @param errlen the size of `err`
+/// @return true when `img` is ready for the tower
+bool pulsar_nemotron_h_image_prepare(const pulsar_nemotron_h_vision_shape *s, const uint8_t *bytes, size_t len,
+                                     pulsar_nemotron_h_image *img, char *err, size_t errlen);
+/** The CPE position rows of a wp x hp tile, f32 [wp hp][width] in merge-block order, from the table. */
+/// @param s the tower's shape
+/// @param field the position table, host f32 [pos_grid][pos_grid][width] (pulsar_nemotron_h_vision::pos_field)
+/// @param wp the tile's width in patches
+/// @param hp the tile's height in patches
+/// @param[out] out the position rows
+void pulsar_nemotron_h_positions(const pulsar_nemotron_h_vision_shape *s, const std::vector<float> &field, uint32_t wp,
+                                 uint32_t hp, std::vector<float> *out);
+/** Patch row index (merge-block order) of raster patch (r, c) in a wp-wide tile. */
+/// @param r the patch's row
+/// @param c the patch's column
+/// @param wp the tile's width in patches (even)
+/// @return the patch's row in the tower's merge-block order
+static inline uint32_t pulsar_nemotron_h_patch_slot(uint32_t r, uint32_t c, uint32_t wp) {
+    return (((r / 2u) * (wp / 2u) + c / 2u) * 4u) + (r % 2u) * 2u + (c % 2u);
+}
+
+/** Read the tower's facts and bind its tensors (when pulsar.vision_present); the tokenizer's image tokens.  false =
+ *  refused (said). */
+/// @param m the model
+/// @param b the role binder
+/// @param[out] v the tower; v->present says whether it bound
+/// @return false when refused
+bool pulsar_nemotron_h_vision_bind(const pulsar_model *m, pulsar_role_binder *b, pulsar_nemotron_h_vision *v);
+/** Look up the image tokens `<image>`, `<img>`, `</img>` among the tokenizer's added tokens into v->image_id,
+ *  v->start_id, v->end_id.  false = one is missing (said). */
+/// @param v the tower
+/// @param tok the model's tokenizer
+/// @return false when a token is missing
+bool pulsar_nemotron_h_vision_tokens(pulsar_nemotron_h_vision *v, const struct bpe_tokenizer *tok);
+/** The tower's device scratch (after the GPU is up), sized for the largest tile.  false = refused. */
+/// @param m the model
+/// @param v the bound tower (a no-op when it is absent or the scratch exists)
+/// @return false when refused (v->run may hold a partial scratch; pulsar_nemotron_h_vision_run_free releases it)
+bool pulsar_nemotron_h_vision_run_create(const pulsar_model *m, pulsar_nemotron_h_vision *v);
+/** Free the tower's device scratch and clear v->run (NULL `v` or no scratch: a no-op). */
+/// @param v the tower
+void pulsar_nemotron_h_vision_run_free(pulsar_nemotron_h_vision *v);
+/** One image's LLM rows: bf16 [*n_rows][4096] (malloc'd).  `dbg` (optional): the tower's residual after the last block,
+ *  f32 [prefix + patches][width], raster order of the patches (the gate's stage).  false + `err`. */
+/// @param m the model
+/// @param v the bound tower with its scratch
+/// @param bytes the encoded image (PNG or JPEG)
+/// @param len its size in bytes
+/// @param[out] rows the LLM rows (malloc'd; the caller frees)
+/// @param[out] n_rows their count (wp hp / merge^2)
+/// @param[out] dbg optional (NULL = none): the residual after the last block
+/// @param[out] err the refusal's text
+/// @param errlen the size of `err`
+/// @return false when refused
+bool pulsar_nemotron_h_vision_encode(const pulsar_model *m, const pulsar_nemotron_h_vision *v, const uint8_t *bytes,
+                                     size_t len, uint16_t **rows, int *n_rows, std::vector<float> *dbg, char *err,
+                                     size_t errlen);
+
+/** The family's image front (family.h pulsar_family_vision). */
+extern const pulsar_family_vision PULSAR_NEMOTRON_H_IMAGE_FRONT;
+
 /** The family's state (pulsar_engine::family_state). */
 typedef struct {
     /// The loaded, checked shape (pulsar_nemotron_h_read_shape).
@@ -165,6 +361,8 @@ typedef struct {
     pulsar_nemotron_h_block layer[PULSAR_FAMILY_MAX_LAYER];
     /// The MTP module; bound only when the container holds it and the open selected it (drafting), else all NULL.
     pulsar_nemotron_h_draft mtp;
+    /** L331: the vision tower (present when the container holds it; else images are refused by name). */
+    pulsar_nemotron_h_vision vision;
     /** What the binding priced (role_bind.h): every byte the core stages, by role. */
     pulsar_role_census census;
     /** N9: the MTP module drafts (the container holds it and the open selected it): the engine's drafter is

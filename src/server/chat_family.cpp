@@ -414,22 +414,15 @@ static const server_effort_map k_effort_qwen = {
     NULL, qwen_effort_default_level, /*think_mode_level=*/false};
 
 
-/* L268: a message's content without the parser's image markers (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the
- * offsets, not the spelling, are the authority) and where each image sits in what is left. */
-/** One message's text with its image placeholders removed (qwen_strip_image_markers). */
-struct qwen_msg_images {
-    /** The content without the placeholders. */
-    std::string content;
-    /** Per image, in order: its byte offset into `content`. */
-    std::vector<uint32_t> at;
-};
-
-/// @param m    the message (its content and image_ph_off)
-/// @param out  receives the stripped content and the images' offsets
-/// @param err     receives the reason on false
-/// @param errlen  size of `err`
-/// @return false + err when an image's offset fails chat_msg_image_offsets_check
-static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, char *err, size_t errlen) {
+/** L268 (L331: every family with images): a message's content without the parser's image markers
+ *  (PULSAR_IMAGE_PLACEHOLDER at image_ph_off -- the offsets, not the spelling, are the authority) and where each
+ *  image sits in what is left. */
+/// @param m      the message
+/// @param out    receives the stripped content and each image's byte offset in it (appended)
+/// @param err    receives the reason on false
+/// @param errlen size of `err`
+/// @return false + err when an image's marker is not at its offset
+bool chat_strip_image_markers(const chat_msg *m, chat_msg_images *out, char *err, size_t errlen) {
     if (!chat_msg_image_offsets_check(m, err, errlen)) return false;
     const char *c = m->content ? m->content : "";
     const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
@@ -462,10 +455,10 @@ static bool qwen_strip_image_markers(const chat_msg *m, qwen_msg_images *out, ch
 /// @return false + err on a misplaced image marker
 static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vector<qwen_msg_in> *qm,
                           std::vector<std::vector<qwen_tool_call_in>> *qc, std::vector<std::string> *notes,
-                          std::vector<qwen_msg_images> *imgs, char *err, size_t errlen) {
+                          std::vector<chat_msg_images> *imgs, char *err, size_t errlen) {
     qc->assign((size_t)msgs->len, {});
     notes->assign((size_t)msgs->len, std::string());
-    imgs->assign((size_t)msgs->len, qwen_msg_images());
+    imgs->assign((size_t)msgs->len, chat_msg_images());
     for (int pass = 0; pass < 2; pass++) {
         for (int i = start; i < msgs->len; i++) {
             const chat_msg *m = &msgs->v[i];
@@ -473,7 +466,7 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
             if (tail && m->system_field) continue;
             /* L268: images render as the template's vision literal here and in a live tail alike; the server places a
              * tail's new images on the live history (image_continuation_place, every family) */
-            if (m->images_len > 0 && !qwen_strip_image_markers(m, &(*imgs)[(size_t)i], err, errlen)) return false;
+            if (m->images_len > 0 && !chat_strip_image_markers(m, &(*imgs)[(size_t)i], err, errlen)) return false;
             for (int k = 0; k < m->calls.len; k++)
                 (*qc)[(size_t)i].push_back({m->calls.v[k].name, m->calls.v[k].arguments});
             if (!strcmp(m->role, "system") && (tail || !qm->empty())) {
@@ -481,7 +474,7 @@ static bool qwen_messages(const chat_msgs *msgs, int start, bool tail, std::vect
                 qm->push_back({"user", (*notes)[(size_t)i].c_str(), NULL, NULL, 0, NULL});
                 continue;
             }
-            const qwen_msg_images &mi = (*imgs)[(size_t)i];
+            const chat_msg_images &mi = (*imgs)[(size_t)i];
             qm->push_back({m->role, m->images_len > 0 ? mi.content.c_str() : m->content, m->reasoning,
                            (*qc)[(size_t)i].empty() ? NULL : (*qc)[(size_t)i].data(), m->calls.len,
                            m->calls.raw_calls, mi.at.empty() ? NULL : mi.at.data(), (int)mi.at.size()});
@@ -685,7 +678,7 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     std::vector<qwen_msg_in> qm;
     std::vector<std::vector<qwen_tool_call_in>> qc;
     std::vector<std::string> notes;
-    std::vector<qwen_msg_images> imgs;
+    std::vector<chat_msg_images> imgs;
     if (!qwen_messages(&c->msgs, 0, false, &qm, &qc, &notes, &imgs, err, errlen)) return false;
     qwen_render_out out;
     if (!qwen_chat_render({qm.data(), (int)qm.size(), head.get(), qe, true}, &out, err, errlen)) return false;
@@ -750,7 +743,7 @@ static char *qwen_tool_result_tail(const request *r, const chat_msgs *msgs, int 
     std::vector<qwen_msg_in> qm;
     std::vector<std::vector<qwen_tool_call_in>> qc;
     std::vector<std::string> notes;
-    std::vector<qwen_msg_images> imgs;
+    std::vector<chat_msg_images> imgs;
     char err[200];
     qwen_render_out out;
     if (!qwen_messages(msgs, start, true, &qm, &qc, &notes, &imgs, err, sizeof err) ||

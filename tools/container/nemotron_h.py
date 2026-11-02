@@ -5,8 +5,8 @@ language model a NemotronHForCausalLM under `llm_config`) -> pulsar's container.
 Sources (no GGUF anywhere, L247):
   --hf     the BF16 Omni checkpoint: the authority for the config and every tensor.  Its language-model tensors sit
            under `language_model.` (`backbone.layers.B.`, `backbone.embeddings`, `backbone.norm_f`, `lm_head`, `mtp.`);
-           the vision tower (`vision_model.`, `vision_projector.`, `mlp1.`) is consumed by name and written nowhere in
-           v1 (plan 121 decision 3: text first).
+           the vision tower (`vision_model.`, `vision_projector.`, `mlp1.`, L331) is written by the recipe's `vision`
+           / `vision_norm` rows or omitted whole by them (see "the vision tower" below).
   --exl3   an exllamav3 pack of the same checkpoint (exllamav3 1.6's NemotronH adapter: Linear keys = the HF names
            minus `language_model.` and `.weight`, e.g. `backbone.layers.1.mixer.experts.7.up_proj`): every Linear --
            the Mamba in / out projections, attention, the latent fc1 / fc2, the shared expert, the routed experts
@@ -46,16 +46,27 @@ The container:
   * layouts: bf16 / f32 native; exl3m_k* for a dense Linear, a routed expert-projection or the head from an EXL3
     pack (the rate per engine arm, exl3_rates.admit); mxfp8_lt for a dense Linear or the head from BF16.  The conv1d weight is declared [channels, kernel] (the HF [channels, 1, kernel]
     minus its unit dim; the same bytes).
-  * shards: `vision` (primary: pulsar.kv only -- no tower in v1), `layers.0..L-1` (pulsar layers), `top` (embed,
+  * shards: `vision` (primary: pulsar.kv, and the tower when written -- L331), `layers.0..L-1` (pulsar layers), `top` (embed,
     norm_f, head), `drafter` with --drafter, `mtp.0..N-1` when the recipe writes the MTP module (all of it or none;
     never beside --drafter: one drafter per container).
   * pulsar.kv: general.architecture = "nemotron_h"; llm_config verbatim under `nemotron_h.` (kv.config_kvs) except
     time_step_limit, which the declaration pins to [0, inf] and writes as `nemotron_h.time_step_limit.min` (f32 0)
     + `nemotron_h.time_step_limit.max_inf` (true); the builder's facts under `pulsar.*` (mtp_present, drafter --
-    "lilicorr" or "" --, vision_present false); with --drafter the drafter config under `lilicorr.*` and
-    pulsar.source.drafter.
+    "lilicorr" or "" --, vision_present); with the tower its facts under `nemotron_h_vision.*`; with --drafter the
+    drafter config under `lilicorr.*` and pulsar.source.drafter.
   * nvfp4 (the drafter's ModelOpt Linears): one U8 entry per Linear, named `X.weight`, declared [in, out] -- the
     nibbles, the 128x4-tiled E4M3 scales, the f32 global scale (producers.nvfp4).
+  * the vision tower (L331; the engine's declaration is src/families/nemotron_h/nemotron_h.h section 2b): C-RADIO
+    ViT-H/16 + the projector, BF16 as stored, in the `vision` shard.  Bind records: vit_patch, vit_cls, vit_pos (the
+    [1, G*G, D] table declared [G*G, D]), vit_final_norm(_bias), proj_norm (mlp1.0), proj_fc1 (mlp1.1), proj_fc2
+    (mlp1.3) at the top; per ViT block (block `vit`, layer i) vit_norm1 .. vit_fc2_bias -- the role words Parse's
+    tower binds.  The LayerNorm weights and every bias are recipe role `vision_norm`, written f32 (f32_from_bf16:
+    the shared row ops read f32), everything else role `vision`, written as stored.  Consumed by name and written
+    nowhere: the video embedder (video is not served), the input conditioner (the processor normalises; its mean /
+    std are checked against the config's), summary_idxs (the summary is not used).  The recipe writes all of it or
+    omits all of it (pulsar.vision_present).  The facts the engine pins (nemotron_h_vision.*) are read from the config,
+    each switch the tower's code assumes checked first (qkv bias, GELU MLP, no SwiGLU, no LayerScale, no drop path,
+    pixel-shuffle v2 at ratio 0.5, the final LayerNorm present because the language model has MTP).
   * side files (emit --all writes, verify --all checks byte-equal): tokenizer.json, tokenizer_config.json,
     chat_template.jinja, generation_config.json (eos_token_id [2, 11]: the stop ids) and config.json, as shipped.
 """
@@ -84,7 +95,8 @@ GATE_UP_PARTS = ("up_proj",)    # up-only experts: the "gate / up" layout check 
 LM = "language_model."
 BACKBONE = LM + "backbone."
 MTP = LM + "mtp."
-VISION_PREFIXES = ("vision_model.", "vision_projector.", "mlp1.")   # consumed by name in v1
+VISION_PREFIXES = ("vision_model.", "vision_projector.", "mlp1.")
+RADIO = "vision_model.radio_model."
 EXL3 = set(exl3_rates.K2)
 MIXERS = ("mamba", "attention")
 
@@ -193,6 +205,8 @@ class Shape:
     recipe: str = ""
     mtp: bool = False           # the recipe writes the drafter
     drafter: str = ""           # the drafter input written (--drafter): "" or "lilicorr"
+    vision: tuple = ()          # L331: the tower's facts ((key, kind, value), ...), declare_vision
+    vision_written: bool = False   # the recipe writes the tower
     table: dict = field(default=None, compare=False, repr=False)   # {name: Mapped} (map_hf answers here)
 
     @property
@@ -211,7 +225,7 @@ class Shape:
         kinds = "".join(("M" if m == "mamba" else "*") + ("E" if e is not None else "-") for m, _b, e in self.layers)
         return (f"nemotron_h: {self.n_blocks} blocks -> {self.n_layer} layers [{kinds}], {self.n_expert} experts "
                 f"top-{self.top_k} on a {self.latent} latent + 1 shared, mtp {self.n_mtp}"
-                f"{' written' if self.mtp else ' not written'}, drafter {self.drafter or 'none'}, vision not written (v1), "
+                f"{' written' if self.mtp else ' not written'}, drafter {self.drafter or 'none'}, vision {'written' if self.vision_written else 'not written'}, "
                 f"recipe {self.recipe}")
 
 
@@ -255,10 +269,99 @@ def declare(top: dict) -> Shape:
                          f"{sh.ssm[0]} heads not a multiple of {sh.ssm[3]} groups")
     if not 0 < sh.top_k <= sh.n_expert:
         raise SystemExit(f"config.json llm_config: top-{sh.top_k} of {sh.n_expert}")
+    sh = replace(sh, vision=declare_vision(top, sh.hidden, n_mtp))
     if n_mtp and len(sh.mtp_layers) != 1:
         raise SystemExit(f"config.json llm_config.mtp_layers_block_type {mtp_types}: one {{mixer, moe}} layer "
                          f"(the declaration's drafter)")
     return sh
+
+
+def declare_vision(top: dict, llm_hidden: int, n_mtp: int):
+    """The tower's facts from config.json (the engine pins each to its profile), every switch the tower's code assumes
+    checked first."""
+    v = _need(top, "vision_config", "the top level")
+    w = "vision_config"
+    for k, want in (("model_type", "radio"), ("qkv_bias", True), ("use_swiglu_ffn", False), ("hidden_act", "gelu"),
+                    ("layerscale_value", 1.0), ("drop_path_rate", 0.0)):
+        _assume(v, k, want, w)
+    for k, want in (("downsample_ratio", 0.5), ("ps_version", "v2")):
+        _assume(top, k, want, "the top level")
+    D = int(_need(v, "hidden_size", w))
+    if int(_need(top, "vit_hidden_size", "the top level")) != D:
+        raise SystemExit("config.json: vit_hidden_size != vision_config.hidden_size")
+    if not n_mtp:
+        raise SystemExit("config.json: no MTP module, so no vision_final_layernorm (modeling_nemotron_h_omni.py "
+                         "builds it only with MTP); the declaration has the norm -- refusing")
+    heads, P = int(_need(v, "num_attention_heads", w)), int(_need(v, "patch_size", w))
+    mlp = D * float(_need(v, "mlp_ratio", w))
+    if D % heads or mlp != int(mlp) or int(_need(v, "max_img_size", w)) % P:
+        raise SystemExit(f"config.json vision_config: {heads} heads over {D}, MLP {mlp}, max_img_size not a patch "
+                         f"multiple")
+    mean, std = list(_need(v, "norm_mean", w)), list(_need(v, "norm_std", w))
+    facts = [("vit.width", "u32", D), ("vit.depth", "u32", int(_need(v, "num_hidden_layers", w))),
+             ("vit.heads", "u32", heads), ("vit.head_dim", "u32", D // heads), ("vit.mlp", "u32", int(mlp)),
+             ("vit.patch", "u32", P),
+             ("vit.prefix", "u32", int(_need(v, "num_cls_tokens", w)) + int(_need(v, "num_registers", w))),
+             ("vit.pos_grid", "u32", int(_need(v, "max_img_size", w)) // P),
+             ("vit.norm_eps", "f32", float(_need(v, "layer_norm_eps", w))),
+             ("proj.merge", "u32", 2), ("proj.hidden", "u32", int(_need(top, "projector_hidden_size", "the top level"))),
+             ("proj.norm_eps", "f32", 1e-5),   # NemotronH_Omni_Reasoning_V3MLP's RMSNorm default (no config key)
+             ("image.min_patches", "u32", int(_need(v, "min_num_patches", w))),
+             ("image.max_patches", "u32", int(_need(v, "max_num_patches", w)))]
+    facts += [(f"image.mean.{i}", "f32", float(x)) for i, x in enumerate(mean)]
+    facts += [(f"image.std.{i}", "f32", float(x)) for i, x in enumerate(std)]
+    if len(mean) != 3 or len(std) != 3:
+        raise SystemExit("config.json vision_config: norm_mean / norm_std are 3 channels")
+    return tuple(facts) + (("_llm_hidden", "u32", llm_hidden),)
+
+
+def _vfact(sh: Shape, key: str):
+    return next(v for k, _t, v in sh.vision if k == key)
+
+
+def vision_expected(sh: Shape):
+    """{HF name: (dtype, shape, Mapped)} of the tower: what is written (shard `vision`) and what is consumed by name."""
+    D, L, M, P, G = (_vfact(sh, k) for k in ("vit.width", "vit.depth", "vit.mlp", "vit.patch", "vit.pos_grid"))
+    NP, H, S = _vfact(sh, "vit.prefix"), _vfact(sh, "proj.hidden"), 4 * _vfact(sh, "vit.width")
+    out = {}
+
+    def add(name, dtype, shape, bind, role, layer=None):
+        rec = (("role", bind),) + ((("block", "vit"), ("layer", layer)) if layer is not None else ())
+        out[name] = (dtype, shape, Mapped(name, name, "vision", "vision", layer, None, None, False, role=role,
+                                          bind=rec))
+
+    def skip(name, dtype, shape):
+        out[name] = (dtype, shape, Mapped(name, name, "vision", "vision", None, None, None, False, emit=False,
+                                          role="vision"))
+    pg = RADIO + "model.patch_generator."
+    add(pg + "embedder.weight", "BF16", [D, 3 * P * P], "vit_patch", "vision")
+    add(pg + "cls_token.token", "BF16", [NP, D], "vit_cls", "vision")
+    add(pg + "pos_embed", "BF16", [1, G * G, D], "vit_pos", "vision")
+    skip(pg + "video_embedder.weight", "BF16", [D, 2 * 3 * P * P])
+    skip(RADIO + "input_conditioner.norm_mean", "F32", [3, 1, 1])
+    skip(RADIO + "input_conditioner.norm_std", "F32", [3, 1, 1])
+    skip("vision_model.summary_idxs", "I64", [2])
+    for i in range(L):
+        b = f"{RADIO}model.blocks.{i}."
+        for s, shp, bind, role in (("norm1.weight", [D], "vit_norm1", "vision_norm"),
+                                   ("norm1.bias", [D], "vit_norm1_bias", "vision_norm"),
+                                   ("attn.qkv.weight", [3 * D, D], "vit_qkv", "vision"),
+                                   ("attn.qkv.bias", [3 * D], "vit_qkv_bias", "vision_norm"),
+                                   ("attn.proj.weight", [D, D], "vit_proj", "vision"),
+                                   ("attn.proj.bias", [D], "vit_proj_bias", "vision_norm"),
+                                   ("norm2.weight", [D], "vit_norm2", "vision_norm"),
+                                   ("norm2.bias", [D], "vit_norm2_bias", "vision_norm"),
+                                   ("mlp.fc1.weight", [M, D], "vit_fc1", "vision"),
+                                   ("mlp.fc1.bias", [M], "vit_fc1_bias", "vision_norm"),
+                                   ("mlp.fc2.weight", [D, M], "vit_fc2", "vision"),
+                                   ("mlp.fc2.bias", [D], "vit_fc2_bias", "vision_norm")):
+            add(b + s, "BF16", shp, bind, role, i)
+    add("vision_projector.vision_final_layernorm.weight", "BF16", [D], "vit_final_norm", "vision_norm")
+    add("vision_projector.vision_final_layernorm.bias", "BF16", [D], "vit_final_norm_bias", "vision_norm")
+    add("mlp1.0.weight", "BF16", [S], "proj_norm", "vision")
+    add("mlp1.1.weight", "BF16", [H, S], "proj_fc1", "vision")
+    add("mlp1.3.weight", "BF16", [_vfact(sh, "_llm_hidden"), H], "proj_fc2", "vision")
+    return out
 
 
 def _mixer_table(sh: Shape, kind: str):
@@ -337,12 +440,9 @@ def expected(sh: Shape):
 
 def table(hf, decl: Shape):
     """{name: Mapped} for every HF tensor, checked both ways and dtype / shape against the declaration."""
-    want = expected(decl)
+    want = {**expected(decl), **vision_expected(decl)}
     mapped, unknown, wrong = {}, [], []
     for n in hf.names():
-        if n.startswith(VISION_PREFIXES):
-            mapped[n] = Mapped(n, n, "vision", "vision", None, None, None, False, emit=False, role="vision")
-            continue
         if n not in want:
             unknown.append(n)
             continue
@@ -424,6 +524,30 @@ class PackView:
         return self.pack.linear(self.key(key), k, n, rates)
 
 
+def _vision_written(hf, recipe):
+    """The recipe writes the whole tower or none of it (pulsar.vision_present)."""
+    res = recipe.resolve(hf.mapped)
+    fm = {n: f for n, (f, _s) in res.items() if hf.mapped[n].family == "vision"}
+    omitted = {n for n, f in fm.items() if f in R.CONSUMED}
+    if omitted and len(omitted) != len(fm):
+        raise SystemExit(f"{recipe.path}: writes part of the vision tower and omits {sorted(omitted)[0]} -- all of it "
+                         f"or none")
+    if not fm:
+        raise SystemExit(f"{recipe.path}: no row for the vision tower (roles vision / vision_norm: native / f32, or "
+                         f"omit)")
+    return not omitted
+
+
+def _check_conditioner(hf):
+    """The checkpoint's input conditioner is the processor's normalisation: the same mean / std as the config's."""
+    import numpy as np
+    v = hf.config["top_level"]["vision_config"]
+    for k in ("norm_mean", "norm_std"):
+        got = np.frombuffer(hf.raw(f"{RADIO}input_conditioner.{k}"), dtype="<f4")
+        if not np.array_equal(got, np.asarray(v[k], dtype=np.float32)):
+            raise SystemExit(f"{RADIO}input_conditioner.{k} {got.tolist()} != vision_config.{k} {v[k]}")
+
+
 def shape(hf, ctx):
     src = ctx.sources.get("exl3")
     if src is not None and not isinstance(src, PackView):
@@ -437,7 +561,10 @@ def shape(hf, ctx):
     if drafter and mtp:
         raise SystemExit(f"--drafter {drafter}: {ctx.recipe.path} writes the MTP module too; a container carries one "
                          f"drafter -- omit the MTP rows (format-maps/nemotron_h-k4-lilicorr.json)")
-    return replace(hf.decl, recipe=ctx.recipe.name, mtp=mtp, drafter=drafter, table=hf.mapped)
+    vision = _vision_written(hf, ctx.recipe)
+    if vision:
+        _check_conditioner(hf)
+    return replace(hf.decl, recipe=ctx.recipe.name, mtp=mtp, drafter=drafter, vision_written=vision, table=hf.mapped)
 
 
 def shard_order(shape):
@@ -454,6 +581,11 @@ def declared_shape(m, hshape):
         if one != 1:
             raise SystemExit(f"{m.container_name}: conv1d {hshape}, expected [channels, 1, kernel]")
         return [c, k]
+    if dict(m.bind).get("role") == "vit_pos":   # L331: the [1, G*G, D] table minus its unit dim
+        one, gg, d = hshape
+        if one != 1:
+            raise SystemExit(f"{m.container_name}: pos_embed {hshape}, expected [1, positions, width]")
+        return [gg, d]
     if m.role == "drafter_quantized":           # NVFP4: the LOGICAL [out, in] of the U8 [out, in/2] nibble plane
         return list(PR.matrix_dims("U8+nvfp4", hshape))
     return list(hshape)
@@ -470,6 +602,12 @@ def admit(hf, m, fmt, name):
                              f"not {fmt}")
         return
     native = PR.NATIVE_LAYOUT.get(hf.dtype(name))
+    if m.role in ("vision", "vision_norm"):     # L331: the tower as stored, its LayerNorm / bias vectors f32; or omitted
+        allowed = {"native", native, "omit"} if m.role == "vision" else {"f32", "omit"}
+        if fmt not in allowed:
+            raise SystemExit(f"{name}: the Nemotron-H loader binds this {m.role} tensor as "
+                             f"{sorted(a for a in allowed if a)}, not {fmt}")
+        return
     allowed = {"native", native}
     if m.role in ("dense", "shared_expert", "head"):
         allowed |= EXL3 | {"mxfp8_lt"}
@@ -545,7 +683,9 @@ def build_kv(hf, ctx):
             ("pulsar.recipe.sha256", "string", ctx.recipe.sha256 or ""),
             ("pulsar.mtp_present", "bool", ctx.shape.mtp),
             ("pulsar.drafter", "string", ctx.shape.drafter),
-            ("pulsar.vision_present", "bool", False)]
+            ("pulsar.vision_present", "bool", ctx.shape.vision_written)]
+    if ctx.shape.vision_written:
+        kvs += [(f"nemotron_h_vision.{k}", t, v) for k, t, v in ctx.shape.vision if not k.startswith("_")]
     if ctx.shape.drafter:
         kvs += hf.drafter.kvs
     src = ctx.sources.get("exl3")
