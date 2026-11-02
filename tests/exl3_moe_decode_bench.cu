@@ -14,6 +14,8 @@
  *
  *   qwenp the same with turboderp's split gate / up stacks (td305: K3 experts)
  *   nemo  Nemotron 3.5 Super's latent MoE: 512 experts, top-22, up-only relu^2 1024 -> 2688 -> 1024, bf16 rows
+ *   gemma (L338) Gemma 4 26B-A4B: 128 experts, top-8, 2816 -> split gate + up 768 (the pack's stored width; 704
+ *         logical) -> 2816, bf16 rows
  *
  * usage: [EXL3_BENCH_PROMPT=1] [EXL3_BENCH_SHARED=k2] [EXL3_BENCH_DUMP=file] ./tests/exl3_moe_decode_bench qwen|qwenp|nemo|v4|v41 k2_gate_up k2_down
  *        keep S:R [S:R ...]
@@ -96,16 +98,18 @@ static stack make_stack(int K, int N, int k2, int E, uint32_t seed) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 6) {
-        fprintf(stderr, "usage: %s qwen|qwenp|nemo|v4|v41 k2_gate_up k2_down keep S:R [S:R ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s qwen|qwenp|nemo|gemma|v4|v41 k2_gate_up k2_down keep S:R [S:R ...]\n", argv[0]);
         return 2;
     }
     /* qwen: our fused gate_up quant (U-e4-d5); qwenp: turboderp's split gate / up packs (td305) */
     const bool nemo = !strcmp(argv[1], "nemo");   /* bf16 rows like Qwen; up-only relu^2 experts */
-    const bool qwenp = !strcmp(argv[1], "qwenp"), qwen = nemo || qwenp || !strcmp(argv[1], "qwen"),
+    const bool gemma = !strcmp(argv[1], "gemma");  /* bf16 rows, split gate / up like qwenp */
+    const bool qwenp = gemma || !strcmp(argv[1], "qwenp"), qwen = nemo || qwenp || !strcmp(argv[1], "qwen"),
                v41 = !strcmp(argv[1], "v41");
     const bool fused = qwen && !qwenp && !nemo;
-    const int H = nemo ? 1024 : qwen ? 2560 : v41 ? 5120 : 4096, MID = nemo ? 2688 : qwen ? 640 : v41 ? 2304 : 2048;
-    const int E = qwen ? 512 : v41 ? 384 : 256, TOPK = nemo ? 22 : qwen ? 10 : 6;
+    const int H = gemma ? 2816 : nemo ? 1024 : qwen ? 2560 : v41 ? 5120 : 4096,
+              MID = gemma ? 768 : nemo ? 2688 : qwen ? 640 : v41 ? 2304 : 2048;
+    const int E = gemma ? 128 : qwen ? 512 : v41 ? 384 : 256, TOPK = gemma ? 8 : nemo ? 22 : qwen ? 10 : 6;
     const int k2gu = atoi(argv[2]), k2d = atoi(argv[3]);
     const double keep = atof(argv[4]);
     std::vector<std::pair<int, int>> widths;
