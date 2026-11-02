@@ -187,6 +187,13 @@ typedef struct {
  *  @return 0, -1 not an instantiated shape */
 int pulsar_gqa_decode_force(int rows, int heads);
 
+/** L338: an instrument's forced decode arm for the wide heads' decode rows -- 0 the launch's pick, 1 flash-decoding
+ *  (its shape: pulsar_gqa_decode_force), 2 the tensor-core arm (a layer it cannot run refuses).  The engine never
+ *  calls it.
+ *  @param arm 0, 1 or 2
+ *  @return 0, -1 out of range */
+int pulsar_gqa_decode_arm_force(int arm);
+
 /** Bytes of one token's KV row for this layer (every KV head, K and V). */
 /// @param layer the layer's declaration.
 /// @return n_kv * 2 * head_dim * (1 for E4M3, 2 for BF16) bytes.

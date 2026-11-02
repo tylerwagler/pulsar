@@ -544,7 +544,10 @@ static void run_case(Case &C) {
         bool ok = v.size() == N0;
         uint32_t p = N0;
         std::vector<Out> v_runs;   /* every run's rows, in order (the CTA-shape comparison below) */
-        if (g_flashdec) pulsar_gqa_decode_force(1, 1);   /* the reference: one row x one head a CTA */
+        if (g_flashdec) {   /* the reference: flash-decoding, one row x one head a CTA */
+            pulsar_gqa_decode_arm_force(1);
+            pulsar_gqa_decode_force(1, 1);
+        }
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
             ok = ok && o.size() == k && dec_diff(pre, o, p) == UINT32_MAX;   /* decode rows (g_flashdec: graded) */
@@ -552,6 +555,7 @@ static void run_case(Case &C) {
             p += k;
         }
         pulsar_gqa_decode_force(0, 0);
+        pulsar_gqa_decode_arm_force(0);
         check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
               "%s", N0, g_flashdec ? "graded (decode rows: flash-decoding), pools bit-exact" : "bit-exact");
         /* L338: the same runs at every flash-decoding CTA shape (rows x heads of a KV head: one sequence's keys loaded
@@ -563,6 +567,7 @@ static void run_case(Case &C) {
             Seq Bg = seq_new(C, 1);
             run_schedule(C, Bg, 0, N0, {N0});
             pulsar_gqa_decode_force(sh[0], sh[1]);
+            pulsar_gqa_decode_arm_force(1);   /* the flash arm's shapes (its own pick at {0, 0}) */
             g_decode_group = 4;
             bool gok = true;
             uint32_t q = N0, k0 = 0;
@@ -575,11 +580,47 @@ static void run_case(Case &C) {
             }
             g_decode_group = 1;
             pulsar_gqa_decode_force(0, 0);
+            pulsar_gqa_decode_arm_force(0);
             if (sh[0]) check(gok && pools_equal(C, B, Bg, N), "verify at a CTA of %d row(s) x %d head(s): every run's rows "
                              "byte-identical to one x one, pools bit-exact", sh[0], sh[1]);
-            else check(gok && pools_equal(C, B, Bg, N), "verify at the launch's own CTA shape (a verify's group of 4): "
-                       "byte-identical to one x one, pools bit-exact");
+            else check(gok && pools_equal(C, B, Bg, N), "verify at flash-decoding's own CTA shape (a verify's group of "
+                       "4): byte-identical to one x one, pools bit-exact");
             seq_free(Bg);
+        }
+        /* L338: the tensor-core decode arm (a G = 8k layer): every verify run's rows byte-identical to the same rows
+         * decoded one at a time on it (a verify's rows and a plain decode's are its bytes alike), graded against the
+         * flash-decoding reference, pools bit-exact */
+        if (g_flashdec && G % 8u == 0u) {
+            Seq Bm = seq_new(C, 1), Bd = seq_new(C, 1);
+            run_schedule(C, Bm, 0, N0, {N0});
+            run_schedule(C, Bd, 0, N0, {N0});
+            pulsar_gqa_decode_arm_force(2);
+            g_decode_group = 4;
+            bool same_ok = true, graded = true;
+            uint32_t q = N0, k0 = 0;
+            for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
+                std::vector<Out> o = run_schedule(C, Bm, q, q + k, {k});
+                std::vector<Out> d1;
+                for (uint32_t i = 0; i < k; i++) {
+                    std::vector<Out> one = run_schedule(C, Bd, q + i, q + i + 1, {1});
+                    d1.insert(d1.end(), one.begin(), one.end());
+                }
+                same_ok = same_ok && o.size() == k && d1.size() == k;
+                for (uint32_t i = 0; same_ok && i < k; i++) {
+                    same_ok = same(o[i], d1[i]);
+                    graded = graded && close_rows(o[i], v_runs[k0 + i]);
+                }
+                q += k;
+                k0 += k;
+            }
+            g_decode_group = 1;
+            pulsar_gqa_decode_arm_force(0);
+            check(same_ok && pools_equal(C, B, Bm, N) && pools_equal(C, Bm, Bd, N),
+                  "verify on the tensor-core decode arm: every run's rows byte-identical to the same rows decoded one at "
+                  "a time, pools bit-exact");
+            check(graded, "the tensor-core decode arm's rows within 2^-12 of each row's max of flash-decoding's");
+            seq_free(Bm);
+            seq_free(Bd);
         }
         seq_free(B);
     }

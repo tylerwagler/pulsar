@@ -168,7 +168,9 @@ static double time_gemma(bool window, uint32_t ctx, uint32_t rows, int group) {
     pulsar_gqa_io io{};
     io.q = {in, ld, HD}; io.k = {in + NQ * HD, ld, HD}; io.v = {in + (NQ + NKV) * HD, ld, HD};
     io.out_bf16 = out; io.ld_out = NQ * HD; io.workspace = ws; io.workspace_bytes = wsb;
-    io.decode_rows = 1; io.decode_group = group;
+    io.decode_rows = getenv("GQA_BENCH_MMA") ? 0 : 1;   /* GQA_BENCH_MMA: the MMA tile arm (the prompt rows') instead */
+    if (const char *arm = getenv("GQA_BENCH_ARM")) pulsar_gqa_decode_arm_force(atoi(arm));   /* 1 flash, 2 MMA decode */
+    io.decode_group = group;
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     double ms_total = 0;

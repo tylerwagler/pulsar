@@ -1155,6 +1155,214 @@ __global__ void __launch_bounds__(GQA_DEC_THREADS) gqa_decode_kernel(const gqa_a
     }
 }
 
+/* ---- L338: the decode rows of a wide GQA (G a multiple of 8: Gemma's global layers) on the tensor cores ----------- */
+/// Threads of the MMA decode CTA (8 warps: 32 keys each to score, 1/8 of the dims each in P V).
+constexpr uint32_t GQA_DMMA_THREADS = 256u;
+/// Query vectors a MMA decode CTA attends: one row x 8 heads of one KV head (the MMA's n).
+constexpr uint32_t GQA_DMMA_NV = 8u;
+/// Keys a V tile holds (one m16n8k16 k step).
+constexpr uint32_t GQA_DMMA_VT = 16u;
+/// One row x 8 query heads of one KV head x one GQA_CHUNK-key chunk into the split schedule's partials, on the
+/// tensor cores: S^T = K Q^T (the keys the MMA's m, the 8 heads its n -- no padding), the online softmax per head in
+/// base 2 (the chunk's max and sum, fixed-order: the thread's keys, the xor-shuffle over its quad's lanes, the warps
+/// in order), then O^T = V^T P^T with P split hi + lo bf16 (gqa_split2: P to ~2^-16) and V through 16-key smem
+/// tiles (ldmatrix .trans).  K is read straight from the pool: each thread 32 contiguous bytes of a key row a
+/// 64-dim group, its A fragments those bytes in order -- the head dim's order inside the dot product is the
+/// fragment's, Q's B fragments read in the same order.  On sm_75 the bf16 operands widen to fp16 exactly
+/// (gqa_mma).  Not the flash-decoding arm's bytes (graded, L338: "take the speed"); a row's bytes are its own --
+/// each head is an MMA column of its own, the chunks and the warps' keys fixed -- so a verify's rows and a plain
+/// decode's are the same arm's bytes.  Grid (n_q / 8, grid_chunks, n_rows), 128 threads.  BF16 KV rows.
+/// @tparam HD head_dim (a multiple of 64, at most 512).
+/// @param a the arguments (part / ml written; out untouched -- the combine writes it).
+template <int HD>
+__global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const gqa_args a) {
+    constexpr int NV = (int)GQA_DMMA_NV, KEYS = (int)GQA_CHUNK, NW = (int)(GQA_DMMA_THREADS / 32u);
+    constexpr int KPW = KEYS / NW;                /* keys a warp scores: 32 */
+    constexpr int MT = KPW / 16;                  /* its m tiles */
+    constexpr int QG = HD / 64;                   /* 64-dim groups of the dot product */
+    constexpr int VT = (int)GQA_DMMA_VT, VP = HD + 8;   /* V tile keys, its smem pitch (conflict-free ldmatrix) */
+    constexpr int DW = HD / NW, DT = DW / 16;     /* P V: dims a warp owns, its m tiles */
+    constexpr int VL = VT * HD / 8 / (int)GQA_DMMA_THREADS;   /* 16-byte V loads a thread a tile */
+    static_assert(HD % 64 == 0 && HD <= 512 && KPW % 16 == 0 && DW % 16 == 0 && VL >= 1 &&
+                      VL * (int)GQA_DMMA_THREADS == VT * HD / 8, "the MMA decode's tiling");
+    __shared__ __align__(16) __nv_bfloat16 sq[NV][HD];
+    __shared__ float sp[NV][KEYS];
+    __shared__ __align__(16) __nv_bfloat16 sv[VT][VP];
+    __shared__ float sred[NW][NV];
+    __shared__ float sM[NV], sL[NV];
+    const uint32_t row = blockIdx.z, h0 = blockIdx.x * (uint32_t)NV, kc = blockIdx.y;
+    const uint32_t tid = threadIdx.x, w = tid >> 5, lane = tid & 31u, gq = lane >> 2, t = lane & 3u;
+    const gqa_row R = a.rows[row];
+    const uint32_t ch = R.chunk0 + kc;
+    if (ch > R.hi / GQA_CHUNK) return;            /* past the row's last chunk (a bounded grid) */
+    const uint32_t x0 = ch * GQA_CHUNK, g = h0 / a.G;
+    const uint32_t koff = g * HD * 2u, voff = (a.n_kv + g) * HD * 2u;
+    for (uint32_t i = tid; i < (uint32_t)(NV * HD / 8); i += GQA_DMMA_THREADS) {
+        const uint32_t n = i / (uint32_t)(HD / 8), c = i % (uint32_t)(HD / 8);
+        reinterpret_cast<uint4 *>(sq[n])[c] =
+            reinterpret_cast<const uint4 *>(a.q + ((uint64_t)row * a.n_q + h0 + n) * HD)[c];
+    }
+    auto rec_of = [&](uint32_t x) -> const uint8_t * {
+        return x >= R.p0 ? a.fresh + (uint64_t)(R.fresh0 + (x - R.p0)) * a.token_bytes
+                         : R.cache + (uint64_t)(R.ring ? x % R.cap : x) * a.token_bytes;
+    };
+    auto valid = [&](uint32_t x) { return x >= R.lo && x <= R.hi; };
+    __syncthreads();
+    /* 1. S^T = K Q^T: warp w the keys [KPW w, KPW w + KPW), m tile mt its keys 16 mt + (gq, gq + 8) */
+    float S[MT][4];
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) S[m][e] = 0.f;
+    const uint32_t kb = w * (uint32_t)KPW;
+#pragma unroll 1
+    for (int q = 0; q < QG; q++) {
+        const uint4 *qp = reinterpret_cast<const uint4 *>(&sq[gq][64 * q + 16 * (int)t]);
+        const uint4 qa = qp[0], qb = qp[1];
+        const uint32_t qw[8] = {qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w};
+#pragma unroll
+        for (int m = 0; m < MT; m++) {
+            uint32_t k0[8], k1[8];
+            const uint32_t xa = x0 + kb + 16u * (uint32_t)m + gq, xb = xa + 8u;
+            const size_t off = koff + (size_t)(64 * q + 16 * (int)t) * 2u;
+            uint4 a0 = make_uint4(0u, 0u, 0u, 0u), a1 = a0, b0 = a0, b1 = a0;
+            if (valid(xa)) {
+                const uint4 *p = reinterpret_cast<const uint4 *>(rec_of(xa) + off);
+                a0 = p[0];
+                a1 = p[1];
+            }
+            if (valid(xb)) {
+                const uint4 *p = reinterpret_cast<const uint4 *>(rec_of(xb) + off);
+                b0 = p[0];
+                b1 = p[1];
+            }
+            k0[0] = a0.x; k0[1] = a0.y; k0[2] = a0.z; k0[3] = a0.w; k0[4] = a1.x; k0[5] = a1.y; k0[6] = a1.z; k0[7] = a1.w;
+            k1[0] = b0.x; k1[1] = b0.y; k1[2] = b0.z; k1[3] = b0.w; k1[4] = b1.x; k1[5] = b1.y; k1[6] = b1.z; k1[7] = b1.w;
+#pragma unroll
+            for (int jj = 0; jj < 4; jj++)
+                gqa_mma(S[m], k0[2 * jj], k1[2 * jj], k0[2 * jj + 1], k1[2 * jj + 1], qw[2 * jj], qw[2 * jj + 1]);
+        }
+    }
+    /* 2. each head's chunk max and sum: the thread's heads 2t, 2t + 1 over its 2 MT keys, the quad lanes, the warps */
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const uint32_t x = x0 + kb + 16u * (uint32_t)m + gq + (e >= 2 ? 8u : 0u);
+            S[m][e] = valid(x) ? __fmul_rn(__fmul_rn(S[m][e], a.scale), GQA_LOG2E) : -INFINITY;
+            if (e & 1) mx1 = fmaxf(mx1, S[m][e]);
+            else       mx0 = fmaxf(mx0, S[m][e]);
+        }
+#pragma unroll
+    for (int o = 4; o < 32; o <<= 1) {
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o));
+    }
+    if (gq == 0u) {
+        sred[w][2u * t] = mx0;
+        sred[w][2u * t + 1u] = mx1;
+    }
+    __syncthreads();
+    float M0 = -INFINITY, M1 = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < NW; i++) {
+        M0 = fmaxf(M0, sred[i][2u * t]);
+        M1 = fmaxf(M1, sred[i][2u * t + 1u]);
+    }
+    if (M0 == -INFINITY) return;                  /* no key of the row here (uniform: one row, every head alike) */
+    float l0 = 0.f, l1 = 0.f;
+#pragma unroll
+    for (int m = 0; m < MT; m++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const float M = (e & 1) ? M1 : M0;
+            const float p = S[m][e] == -INFINITY ? 0.f : exp2f(__fsub_rn(S[m][e], M));
+            const uint32_t key = kb + 16u * (uint32_t)m + gq + (e >= 2 ? 8u : 0u);
+            sp[2u * t + (uint32_t)(e & 1)][key] = p;
+            if (e & 1) l1 = __fadd_rn(l1, p);
+            else       l0 = __fadd_rn(l0, p);
+        }
+#pragma unroll
+    for (int o = 4; o < 32; o <<= 1) {
+        l0 = __fadd_rn(l0, __shfl_xor_sync(0xffffffffu, l0, o));
+        l1 = __fadd_rn(l1, __shfl_xor_sync(0xffffffffu, l1, o));
+    }
+    __syncthreads();                              /* sred's max reads are done */
+    if (gq == 0u) {
+        sred[w][2u * t] = l0;
+        sred[w][2u * t + 1u] = l1;
+    }
+    __syncthreads();
+    if (w == 0u && gq == 0u) {
+        float L0 = 0.f, L1 = 0.f;
+#pragma unroll
+        for (int i = 0; i < NW; i++) {
+            L0 = __fadd_rn(L0, sred[i][2u * t]);
+            L1 = __fadd_rn(L1, sred[i][2u * t + 1u]);
+        }
+        sM[2u * t] = M0; sM[2u * t + 1u] = M1;
+        sL[2u * t] = L0; sL[2u * t + 1u] = L1;
+    }
+    /* 3. O^T = V^T P^T: warp w the dims [DW w, DW w + DW), 16-key V tiles through smem -- the next tile's loads in
+     *    flight (registers) while this one's MMAs run */
+    float acc[DT][4];
+#pragma unroll
+    for (int d = 0; d < DT; d++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) acc[d][e] = 0.f;
+    const uint32_t lk = (lane & 7u) + 8u * (lane >> 4), ld8 = 8u * ((lane >> 3) & 1u);   /* this lane's ldmatrix row */
+    uint4 vr[VL];
+    auto v_load = [&](int kt) {
+#pragma unroll
+        for (int j = 0; j < VL; j++) {
+            const uint32_t i = tid + (uint32_t)j * GQA_DMMA_THREADS;
+            const uint32_t key = i / (uint32_t)(HD / 8), c = i % (uint32_t)(HD / 8), x = x0 + (uint32_t)(kt * VT) + key;
+            vr[j] = valid(x) ? reinterpret_cast<const uint4 *>(rec_of(x) + voff)[c] : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    v_load(0);
+#pragma unroll 1
+    for (int kt = 0; kt < KEYS / VT; kt++) {
+        __syncthreads();                          /* sp written (first tile); the last tile's ldmatrix reads done */
+#pragma unroll
+        for (int j = 0; j < VL; j++) {
+            const uint32_t i = tid + (uint32_t)j * GQA_DMMA_THREADS;
+            reinterpret_cast<uint4 *>(&sv[i / (uint32_t)(HD / 8)][0])[i % (uint32_t)(HD / 8)] = vr[j];
+        }
+        __syncthreads();
+        if (kt + 1 < KEYS / VT) v_load(kt + 1);
+        const uint32_t kk = (uint32_t)(kt * VT);
+        uint32_t hi0, lo0, hi1, lo1;
+        gqa_split2(sp[gq][kk + 2u * t], sp[gq][kk + 2u * t + 1u], hi0, lo0);
+        gqa_split2(sp[gq][kk + 8u + 2u * t], sp[gq][kk + 8u + 2u * t + 1u], hi1, lo1);
+#pragma unroll
+        for (int d = 0; d < DT; d++) {
+            uint32_t r[4];
+            gqa_ldsm4t(r, &sv[lk][w * (uint32_t)DW + 16u * (uint32_t)d + ld8]);
+            gqa_mma(acc[d], r[0], r[1], r[2], r[3], hi0, hi1);
+            gqa_mma(acc[d], r[0], r[1], r[2], r[3], lo0, lo1);
+        }
+    }
+    /* the partials: acc[d] holds dims (DW w + 16 d + gq [+ 8]) x heads (2t, 2t + 1) */
+#pragma unroll
+    for (int d = 0; d < DT; d++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const uint32_t n = 2u * t + (uint32_t)(e & 1), dim = w * (uint32_t)DW + 16u * (uint32_t)d + gq + (e >= 2 ? 8u : 0u);
+            const uint64_t slot = ((uint64_t)row * a.n_q + h0 + n) * a.max_chunks + kc;
+            a.part[slot * HD + dim] = acc[d][e];
+        }
+    __syncthreads();                              /* sM / sL written */
+    if (tid < (uint32_t)NV) {
+        const uint64_t slot = ((uint64_t)row * a.n_q + h0 + tid) * a.max_chunks + kc;
+        a.ml[slot] = make_float2(sM[tid], sL[tid]);
+    }
+}
+
+/// An instrument's forced decode arm (pulsar_gqa_decode_arm_force): 0 the pick's, 1 flash-decoding, 2 the MMA arm.
+int g_dec_arm_force = 0;
+
 /// A flash-decoding CTA's shape: rows x query heads of one KV head.
 struct gqa_dec_shape {
     uint32_t rb;   ///< rows (1, 2, 4)
@@ -1347,13 +1555,14 @@ pulsar_shape_once g_gqa_announce;
 /// @param fold the folded schedule.
 /// @param decode the rows are decode rows (the wide heads' flash-decoding arm).
 /// @param shape the flash-decoding CTA's rows and heads (gqa_dec_pick).
+/// @param mma_dec the decode rows take the MMA arm (gqa_decode_mma_kernel) instead.
 /// @param st the stream.
 /// @param ws the workspace carve (rows, fresh).
 /// @return 0, or -3 on a launch failure.
 template <int HD>
 int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa, uint32_t n_rows,
-               uint32_t n_tiles, uint32_t grid_chunks, bool fold, bool decode, gqa_dec_shape shape, cudaStream_t st,
-               const gqa_ws &ws) {
+               uint32_t n_tiles, uint32_t grid_chunks, bool fold, bool decode, gqa_dec_shape shape, bool mma_dec,
+               cudaStream_t st, const gqa_ws &ws) {
     const uint32_t jobs = L->n_q + 2u * L->n_kv;
     if (L->rope_inv_freq) {
         gqa_prep_table_args ta;
@@ -1369,10 +1578,14 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
         if (decode && !fold) {   /* L338: decode / verify rows (never a prompt's): flash-decoding, a CTA a row (the combine
                                   * below) -- a verify's rows and a plain decode's are then the same arm's bytes, so
                                   * speculation never changes the output */
-            const uint32_t rb = shape.rb, hb = shape.hb;   /* pulsar_gqa_launch's pick */
-            const dim3 dgrid(L->n_q / hb, grid_chunks, (n_rows + rb - 1u) / rb);
-            if (L->kv_fmt == PULSAR_GQA_KV_E4M3) gqa_decode_dispatch<HD, true>(rb, hb, dgrid, aa, n_rows, st);
-            else                                 gqa_decode_dispatch<HD, false>(rb, hb, dgrid, aa, n_rows, st);
+            if (mma_dec) {   /* L338: a wide GQA's decode rows on the tensor cores (pulsar_gqa_launch's pick) */
+                gqa_decode_mma_kernel<HD><<<dim3(L->n_q / GQA_DMMA_NV, grid_chunks, n_rows), GQA_DMMA_THREADS, 0, st>>>(aa);
+            } else {
+                const uint32_t rb = shape.rb, hb = shape.hb;   /* pulsar_gqa_launch's pick */
+                const dim3 dgrid(L->n_q / hb, grid_chunks, (n_rows + rb - 1u) / rb);
+                if (L->kv_fmt == PULSAR_GQA_KV_E4M3) gqa_decode_dispatch<HD, true>(rb, hb, dgrid, aa, n_rows, st);
+                else                                 gqa_decode_dispatch<HD, false>(rb, hb, dgrid, aa, n_rows, st);
+            }
         } else if (L->kv_fmt == PULSAR_GQA_KV_E4M3) {
             if (fold) gqa_attn_wide_kernel<HD, true, true><<<grid, 128, 0, st>>>(aa);
             else      gqa_attn_wide_kernel<HD, false, true><<<grid, 128, 0, st>>>(aa);
@@ -1632,11 +1845,19 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
     const gqa_dec_shape shape = gqa_dec_pick(G, L->n_q, call->grid_chunks, n_rows,
                                              io->decode_group <= 1 ? 1u : (uint32_t)io->decode_group);
     if (G % shape.hb != 0u) return gqa_refuse("a forced decode shape whose heads do not divide the layer's G");
+    /* L338: a wide GQA's decode rows (G a multiple of 8, BF16 rows) on the tensor cores -- a function of the layer
+     * alone: a row's arm (its bytes) may not depend on its call's rows or bound, or a verify's rows and a plain
+     * decode's would differ.  Measured on the RTX 5000 (gqa_attn_bench GQA_BENCH_ARM, the global layer, one row):
+     * 86 vs flash-decoding's 87 us at 512 keys, 91 vs 135 at 2K, 165 vs 337 at 8K, 451 vs 984 at 32K.  An
+     * instrument may force either arm. */
+    const bool mma_ok = HD % 64u == 0u && HD <= 512u && G % GQA_DMMA_NV == 0u && L->kv_fmt == PULSAR_GQA_KV_BF16;
+    if (g_dec_arm_force == 2 && !mma_ok) return gqa_refuse("the MMA decode arm forced on a layer it does not run");
+    const bool mma_dec = io->decode_rows != 0 && call->fold == 0 && mma_ok && g_dec_arm_force != 1;
     switch (HD) {
-    case 512u: return gqa_launch<512>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, st, ws);
-    case 256u: return gqa_launch<256>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, st, ws);
-    case 128u: return gqa_launch<128>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, st, ws);
-    default:   return gqa_launch<64>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, st, ws);
+    case 512u: return gqa_launch<512>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
+    case 256u: return gqa_launch<256>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
+    case 128u: return gqa_launch<128>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
+    default:   return gqa_launch<64>(L, pa, aa, n_rows, call->n_tiles, call->grid_chunks, fold, io->decode_rows != 0, shape, mma_dec, st, ws);
     }
 }
 
@@ -1742,5 +1963,15 @@ int pulsar_gqa_decode_force(int rows, int heads) {
         return -1;
     }
     g_dec_force = {(uint32_t)rows, (uint32_t)heads};
+    return 0;
+}
+
+int pulsar_gqa_decode_arm_force(int arm) {
+    if (arm < 0 || arm > 2) {
+        fprintf(stderr, "pulsar: gqa decode arm force: %d is not 0 (the pick), 1 (flash-decoding) or 2 (MMA) -- refusing\n",
+                arm);
+        return -1;
+    }
+    g_dec_arm_force = arm;
     return 0;
 }
