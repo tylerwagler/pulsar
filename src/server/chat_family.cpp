@@ -19,6 +19,7 @@
 #include "../lib/qwen_chat.h"
 
 #include <algorithm>
+#include <climits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -206,6 +207,7 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
     a->thinking = -1;
     a->level = -1;
     a->value = 0;
+    a->budget = 0;
     for (int i = 0; i < n; i++) {
         const char *k = controls[i].key;
         const char *q = controls[i].raw;
@@ -215,8 +217,15 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
             /* Anthropic's {"type": "enabled" | "disabled"} or a bool; null is not sent */
             if (!json_lit(&q, "null")) {
                 bool on = a->thinking != 0;
-                ok = parse_thinking_control_value(&q, &on);
+                int budget = INT_MIN;   /* L344: INT_MIN = the control carries no budget_tokens */
+                ok = parse_thinking_control_value(&q, &on, &budget);
                 a->thinking = on ? 1 : 0;
+                /* the budget this control carries replaces an earlier one's (absent: none) */
+                a->budget = budget == INT_MIN ? 0 : budget;
+                if (ok && budget != INT_MIN && budget < 1) {
+                    snprintf(err, errlen, "thinking.budget_tokens must be a positive integer, got %d", budget);
+                    return false;
+                }
             }
         } else if (!strcmp(k, "think") || !strcmp(k, "enable_thinking")) {
             ok = thinking_bool(&q, k, a, err, errlen);
@@ -293,7 +302,18 @@ static bool chat_resolve_thinking(pulsar_engine *e, const chat_conversation *c, 
     const server_effort_map *m = r->family->effort;
     r->think_mode = PULSAR_THINK_NONE;
     r->family_effort = m->named[k_effort_row_none];
+    r->think_budget = 0;
     if (!on) return true;
+    /* L344: a budget closes the block with the family's ONE close token; a family without one refuses it.  A
+     * render with no engine (the parse/render tests) has no decode to budget and no tokenizer to ask. */
+    if (a.budget > 0) {
+        if (e && pulsar_token_think_close(e) < 0) {
+            snprintf(err, errlen, "thinking.budget_tokens: this model's reasoning has no single close token to end "
+                                  "it with; send thinking without a budget");
+            return false;
+        }
+        r->think_budget = a.budget;
+    }
     const int level = a.level >= 0 ? m->named[a.level]
                       : a.value   ? (m->integer ? m->integer(a.value) : m->named[effort_row_nearest(a.value)])
                                   : m->default_level(e);

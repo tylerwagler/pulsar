@@ -1854,8 +1854,115 @@ static bool gen_draw_req(server *s, gen_state *g, float temp, int top_k, float t
         mask->resize(gen_constrain_words(s));
         if (!gen_constrain_mask(s, g, mask->data())) return false;
     }
+    /* L344: the budget spent -- this draw is the close token */
+    if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
+        const uint32_t *f = gen_think_masks(s, g, 0, 1, live ? mask->data() : NULL, live ? 1 : 0);
+        if (!f) return false;
+        mask->assign(f, f + gen_think_mask_words(s));
+        *d = pulsar_row_draw{temp, top_k, top_p, min_p, &g->rng, false, mask->data()};
+        return true;
+    }
     *d = pulsar_row_draw{temp, top_k, top_p, min_p, &g->rng, false, live ? mask->data() : NULL};
     return true;
+}
+
+/// @param s the server
+/// @return uint32_t words in one sampler mask row (pulsar_engine_logits_width bits)
+size_t gen_think_mask_words(const server *s) {
+    return ((size_t)pulsar_engine_logits_width(s->engine) + 31u) / 32u;
+}
+
+/* L344 (after Flare 902c88e): the thinking budget.  A decode whose open reasoning block has spent
+ * request::think_budget draws the family's close token next -- through a mask row that allows only it, so the token
+ * goes the way every draw goes (the sampler, the gate, gen_emit_token's stream / usage / history, a spec round's
+ * accept walk) and a draft that disagrees is rejected as any refused draft is.  Inside the block the grammar gate
+ * masks nothing (its THINK phase), so the forced row never meets a grammar row. */
+
+/// @brief The draw at which the budget closes the block, pure: row i follows the round's first i + `off` tokens
+/// (`toks`; off = 1 when toks[0] is a base not yet emitted -- gen_constrain_round's rows).  Rows past a pending
+/// token that closes the block itself are never forced.
+/// @param budget        request::think_budget (0: none)
+/// @param open          the attempt's block is open (inside it, not latched closed)
+/// @param think_tokens  reasoning tokens emitted so far
+/// @param close         the family's close token
+/// @param toks          the round's tokens not yet emitted, in order (may be NULL when n is 0)
+/// @param n             how many
+/// @param off           1 when toks[0] is the base (row 0 follows it), else 0
+/// @return the row to force, or -1 (no budget, block closed, or the budget not reached within the round)
+int think_close_row(int budget, bool open, int think_tokens, int close, const int *toks, int n, int off) {
+    if (budget <= 0 || !open) return -1;
+    const int rows = n - off + 1;
+    for (int i = 0; i < rows; i++) {
+        const int pre = i + off;   /* the round's tokens before row i */
+        if (pre > 0 && toks[pre - 1] == close) return -1;
+        if (think_tokens + pre >= budget) return i;
+    }
+    return -1;
+}
+
+/// @brief think_close_row for a slot's generation.
+/// @param s     the server (its engine's close token)
+/// @param g     the slot's generation
+/// @param toks  the round's tokens not yet emitted, in order (may be NULL when n is 0)
+/// @param n     how many
+/// @param off   1 when toks[0] is the base, else 0
+/// @return the row to force, or -1
+int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off) {
+    const int budget = g->j->req.think_budget;
+    if (budget <= 0) return -1;
+    return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
+                           pulsar_token_think_close(s->engine), toks, n, off);
+}
+
+/// @brief Lay `rows` mask rows of `W` words into `out`: each the grammar's (`gram`, `gram_rows` of them) or
+/// unconstrained, row `row` the token `close` alone.  Pure.
+/// @param out        receives rows x W words
+/// @param W          words a row
+/// @param row        the forced row, < rows
+/// @param rows       rows to lay
+/// @param close      the token row `row` allows
+/// @param gram       the grammar's rows (NULL: none)
+/// @param gram_rows  rows in `gram`
+void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, const uint32_t *gram, int gram_rows) {
+    for (int i = 0; i < rows; i++) {
+        uint32_t *r = out + (size_t)i * W;
+        if (gram && i < gram_rows) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
+        else memset(r, 0xff, W * sizeof(uint32_t));
+    }
+    uint32_t *f = out + (size_t)row * W;
+    memset(f, 0, W * sizeof(uint32_t));
+    f[(uint32_t)close >> 5] = 1u << ((uint32_t)close & 31u);
+}
+
+/// @brief Mask rows for a round whose row `row` is forced to the close token: `rows` rows, each the grammar's
+/// (`gram`, `gram_rows` of them) or unconstrained, row `row` the close token alone.  The rows live in the slot's
+/// gen_state (one round's, as the gate's own) until its next call.
+/// @param s          the server
+/// @param g          the slot's generation (owns the rows)
+/// @param row        the forced row, < rows
+/// @param rows       rows to lay
+/// @param gram       the grammar's rows (NULL: none)
+/// @param gram_rows  rows in `gram`
+/// @return the rows (rows x the engine's mask width); NULL with g->err set when a grammar row is another width
+const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows) {
+    const size_t W = gen_think_mask_words(s);
+    const int close = pulsar_token_think_close(s->engine);
+    if (close < 0 || (size_t)close >= W * 32u) {   /* chat_resolve_thinking refused a budget without one */
+        snprintf(g->err, sizeof g->err, "thinking budget: the model has no close token in the sampler's rows");
+        return NULL;
+    }
+    if (gram && gen_constrain_words(s) != W) {
+        snprintf(g->err, sizeof g->err, "thinking budget: the grammar's mask rows are %u words, the sampler's %zu",
+                 (unsigned)gen_constrain_words(s), W);
+        return NULL;
+    }
+    const size_t need = (size_t)rows * W;
+    if (g->think_rows_cap < need) {
+        g->think_rows = (uint32_t *)server_xrealloc(g->think_rows, need * sizeof(uint32_t));
+        g->think_rows_cap = need;
+    }
+    think_masks_lay(g->think_rows, W, row, rows, close, gram, gram_rows);
+    return g->think_rows;
 }
 
 /* the slot's draw from the pool session's live row.  -1 with g->err set: the sampler refused the row, or the
@@ -3706,6 +3813,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     continue;
                 }
             }
+            /* L344: the budget spent -- a fresh base is the close token (a carry was drawn under its row's mask) */
+            if (gen_think_close_row(s, g, NULL, 0, 0) == 0) {
+                st->masks = gen_think_masks(s, g, 0, 1, st->masks, st->masks ? 1 : 0);
+                st->mask_rows = 1u;
+                if (!st->masks) {
+                    g->finish = "error";
+                    g->phase = GEN_FINISH;
+                    continue;
+                }
+            }
             st->max_tokens = g->max_tokens - g->completion;
             /* accepted_cap = allocated K + the base token: round_begin's own
              * trim (K <= accepted_cap-1) enforces the allocation, and its
@@ -3941,6 +4058,22 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                     constrain_failed[q] = true;
                 } else {
                     st->mask_rows = (uint32_t)mr;
+                    /* L344: the row where the budget runs out draws the close token */
+                    const int off = base_sent[q] ? 0 : 1;
+                    const int fr_row = gen_think_close_row(s, g, toks, nt, off);
+                    if (fr_row >= 0) {
+                        const int rows = nt - off + 1;
+                        const uint32_t *t = gen_think_masks(s, g, fr_row, rows, mr > 0 ? st->masks : NULL, mr);
+                        if (t) {
+                            st->masks = t;
+                            st->mask_rows = (uint32_t)rows;
+                        } else {   /* as a grammar failure: rows-less masks make the round undo itself */
+                            static const uint32_t no_rows = 0;
+                            st->masks = &no_rows;
+                            st->mask_rows = 0u;
+                            constrain_failed[q] = true;
+                        }
+                    }
                 }
             }
             st->rng = &g->rng;
