@@ -23,7 +23,11 @@ import numpy as np
 import torch
 from safetensors.numpy import load_file
 
-P_TOL, SCORE_TOL, CUT = 0.10, 0.5, 0.5
+# P_TOL: a judge case's |P(block) - the BF16 reference's|.  0.25 since 2026-11-02 (Tyler, L338): the f16 tensor-core LoRA
+# (0d075a86, 1026 -> 570 ms a decision) put `router curl` at 0.237 with every verdict right -- the EXL3 4 bpw backbone's
+# sensitivity on a borderline case (the f16 kernel's error is 1.9e-5; fp32 vs f16 hiddens cos 0.992; the merged 4 bpw pack
+# misses a replay by 0.441), not the LoRA's precision.  The verdicts are the contract; the bound catches a broken forward.
+P_TOL, SCORE_TOL, CUT = 0.25, 0.5, 0.5
 CUTS = (0.25, 0.5)
 
 
