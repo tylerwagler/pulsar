@@ -375,6 +375,11 @@ bool constrain_plan_build(pulsar_engine *e, server *s, const chat_conversation *
                  want_answer ? "response_format" : "strict tools", r->family->name);
         return false;
     }
+    if (want_calls && !sh->call_trigger) {   /* L338: a shape for response formats only (Gemma 4's) */
+        snprintf(err, errlen, "%s: the %s family's grammar shape has no tool-call markup (L338)",
+                 forced ? "a required or named tool_choice" : "strict tools", r->family->name);
+        return false;
+    }
     if (e && pulsar_engine_is_tp(e)) {
         snprintf(err, errlen, "%s: constrained decoding does not cross a tensor-parallel pair (L303)",
                  want_answer ? "response_format" : "strict tools");

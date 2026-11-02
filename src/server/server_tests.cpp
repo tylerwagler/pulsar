@@ -4028,6 +4028,9 @@ static void test_l303_response_format_answer(void) {
          "{\"n\": 42}"},
         {PULSAR_CHAT_INKLING, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}",
          "<|content_thinking|>hmm<|end_message|><|message_model|><|content_text|>", "{\"n\": 42}<|end_message|>"},
+        /* L338 P4: Gemma 4, thinking off -- the prompt closed the thought channel, the answer is the first byte */
+        {PULSAR_CHAT_GEMMA4, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\"" L303_RF
+         "}", "", "{\"n\": 42}"},
     };
     for (const fcase &fc : cases) {
         job j;
@@ -4068,6 +4071,14 @@ static void test_l303_response_format_answer(void) {
                               "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
                               "\"regex\",\"pattern\":\"(\"}}", &j.req, err, sizeof err));
     TEST_ASSERT(strstr(err, "response_format") != NULL);
+    /* L338 P4: Gemma 4's shape has no call markup -- strict tools are refused by name, never left unconstrained */
+    {
+        job jg;
+        memset(&jg, 0, sizeof jg);
+        TEST_ASSERT(!l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, L303_BODY(",\"reasoning_effort\":\"none\""),
+                                  &jg.req, err, sizeof err));
+        TEST_ASSERT(strstr(err, "no tool-call markup") != NULL);
+    }
     l303_server_free(&srv);
 #undef L303_RF
 }
@@ -4755,6 +4766,36 @@ static void test_nemotron_refusals(void) {
 
 /* The effort map: thinking on unless asked off (the server's one rule) -- on writes <|think|> in a system turn, off
  * closes an empty thought channel in the generation prompt; every named effort but none is on (one level). */
+/* L338 P4 -- --reasoning: a request that sends no thinking control takes the server's default (llama-server's
+ * --reasoning off, which the gate's Gemma clients were written against); any control the request sends wins. */
+static void test_l338_reasoning_default(void) {
+    static server srv;
+    memset(&srv, 0, sizeof srv);
+    srv.family_no_engine = server_family_for_format(PULSAR_CHAT_GEMMA4);
+    auto run = [&](int dflt, const char *extra, bool want_on) {
+        srv.reasoning_default = dflt;
+        char body[256], err[256];
+        snprintf(body, sizeof body, EFFORT_BODY("%s"), extra);
+        request r;
+        test_request_init(&r, REQ_CHAT, 16);
+        chat_conversation c;
+        memset(&c, 0, sizeof c);
+        err[0] = 0;
+        const bool ok = parse_chat_conversation_openai(body, &c, &r, err, sizeof err) &&
+                        render_chat_conversation(NULL, PULSAR_CHAT_GEMMA4, &srv, &c, &r, err, sizeof err);
+        chat_conversation_free(&c);
+        TEST_ASSERT(ok);
+        TEST_ASSERT(ok && (r.think_mode != PULSAR_THINK_NONE) == want_on);
+        request_free(&r);
+    };
+    run(0, "", true);                                                   /* unset: the family's default */
+    run(1, "", false);                                                  /* --reasoning off */
+    run(1, ",\"reasoning_effort\":\"high\"", true);                   /* an effort asked for */
+    run(1, ",\"chat_template_kwargs\":{\"enable_thinking\":true}", true);
+    run(2, "", true);                                                   /* --reasoning on */
+    run(2, ",\"reasoning_effort\":\"none\"", false);
+}
+
 static void test_gemma4_effort_map(void) {
     char err[256];
     request r;
@@ -12315,6 +12356,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_nemotron_raw_calls_replay_and_key();
     test_nemotron_refusals();
     test_gemma4_effort_map();
+    test_l338_reasoning_default();
     test_gemma4_tools_and_refusals();
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();

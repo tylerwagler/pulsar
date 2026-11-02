@@ -649,6 +649,7 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
     };
     c.judge_banks = -1;   /* L338 P2.4: one reserved bank when the container carries an adapter */
+    c.reasoning_default = -1;   /* L338 P4: the family's default unless --reasoning */
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
@@ -677,12 +678,21 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--drafter")) {
             c.engine.drafter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reasoning")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "on")) c.reasoning_default = 1;
+            else if (!strcmp(v, "off")) c.reasoning_default = 0;
+            else {
+                fprintf(stderr, "pulsar-server: --reasoning takes on or off\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--judge-banks")) {
-            c.judge_banks = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-            if (c.judge_banks < 0 || c.judge_banks > 1) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (strcmp(v, "0") && strcmp(v, "1")) {
                 fprintf(stderr, "pulsar-server: --judge-banks takes 0 or 1\n");
                 exit(2);
             }
+            c.judge_banks = v[0] - '0';
         } else if (!strcmp(arg, "--rope-yarn")) {
             c.engine.rope_yarn_factor = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 1.0f, 64.0f);
         } else if (!strcmp(arg, "--spec-depth")) {
@@ -1201,6 +1211,10 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    s.reasoning_default = cfg.reasoning_default < 0 ? 0 : cfg.reasoning_default + 1;   /* L338 P4: --reasoning */
+    if (s.reasoning_default)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: --reasoning %s: a request that sends no thinking control %s",
+                   cfg.reasoning_default ? "on" : "off", cfg.reasoning_default ? "thinks" : "does not think");
     /* L338 P2.4: the judge's reserved bank -- the pool's last, past the chat pool (no chat slot is it).  The chat
      * pool keeps at least two banks (a pool); a smaller one serves no judge. */
     int judge_bank = -1;

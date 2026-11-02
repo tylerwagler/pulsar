@@ -789,7 +789,7 @@ typedef struct server_grammar_shape {
     const char *answer_open;    ///< the bytes that open the answer ("</think>"; Inkling "<|content_text|>")
     bool answer_at_think_close; ///< answer_open is the reasoning close: a turn outside reasoning starts there
     const char *answer_close;   ///< after the answer, before the stop ("" or "<|end_message|>")
-    const char *call_trigger;   ///< opens the turn's calls ("<tool_call>", DSML's calls tag, ...)
+    const char *call_trigger;   ///< opens the turn's calls ("<tool_call>", DSML's calls tag, ...); NULL = no call markup (response formats only: strict tools refused)
     const char *block_head;     ///< after the trigger, before the first call
     const char *name_open;      ///< before a call's name
     const char *name_close;     ///< after it, before the arguments
@@ -1972,6 +1972,9 @@ struct server {
     /** L338 P2.4: the /v1/systemone judge -- its reserved bank (past pool_banks: no chat slot is it), its decision
      *  head and calibration, its queue (under mu); NULL = no judge.  Owned (systemone.cpp). */
     struct server_judge *judge;
+    /** L338 P4: thinking when a request sends no thinking control (--reasoning): 0 the family's default (on) -- what a
+     *  zeroed server holds --, 1 off, 2 on.  Read-only after startup. */
+    int reasoning_default;
     /// every token's bytes, indexed by token id (built with `grammar`; owned, freed at shutdown)
     std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
@@ -3694,6 +3697,8 @@ typedef struct {
     /** L338 P2.4: banks reserved for /v1/systemone (the runtime adapter's judge): -1 = one when the container carries
      *  an adapter, 0 = none; at most 1 (the pool's last bank) */
     int judge_banks;
+    /** L338 P4: --reasoning on|off -- thinking when a request sends no control; -1 = unset (the family's default) */
+    int reasoning_default;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -4041,7 +4046,8 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
 /// @param err     receives the client error on false
 /// @param errlen  size of `err`
 /// @return false for a contradictory ask
-bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen);
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, int server_default, bool *on, char *err,
+                              size_t errlen);
 
 /** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
  * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's

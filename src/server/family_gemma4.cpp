@@ -5,8 +5,9 @@
  * effort level), the output parser the kit in vLLM's gemma4 reading (gemma4-chat-gate P1 / P2).
  *
  * What is not wired yet, each refused by name or left to the server's own refusal of a NULL hook (L338 T3b-2):
- *   - a required / named tool_choice (no forced-call seed / prefill), a response format or strict tools (no grammar
- *     shape), a tool loaded mid-conversation (no tool_defs_text);
+ *   - a required / named tool_choice (no forced-call seed / prefill), strict tools (the grammar shape has no call
+ *     markup: Gemma's call arguments, `{key:<|"|>value<|"|>}`, are no xgrammar style), a tool loaded mid-conversation
+ *     (no tool_defs_text);
  *   - the suffix hooks (assistant_turn_sampled, tool_result_tail, tool_error_suffix) and tool memory
  *     (find_call_block): every turn is a full render, which the prefix cache matches as far as the bytes agree;
  *   - images (the family's vision front is not in the container), a tool message answering several calls at once.
@@ -179,6 +180,24 @@ const server_output_parser_ops k_parser_gemma4 = {
 
 }  // namespace
 
+/* L338 P4: the response formats' shape -- the answer opens where the thought channel closes (thinking off, the
+ * prompt already closed it: "<|channel>thought\n<channel|>"), Qwen's arrangement around "</think>"; no call markup
+ * (strict tools refused by name, constrain_plan_build). */
+/** Gemma 4's grammar shape (server_family_ops::grammar): response formats only. */
+static const server_grammar_shape k_grammar_gemma4 = {
+    /* .answer_open           = */ "<channel|>",
+    /* .answer_at_think_close = */ true,
+    /* .answer_close          = */ "",
+    /* .call_trigger          = */ NULL,   /* no call markup: strict tools refused */
+    /* .block_head            = */ "",
+    /* .name_open             = */ "",
+    /* .name_close            = */ "",
+    /* .style                 = */ NULL,
+    /* .call_close            = */ "",
+    /* .repeat                = */ false,
+    /* .block_tail            = */ "",
+};
+
 const server_family_ops k_family_gemma4 = {
     /* .name                  = */ "Gemma 4",
     /* .format                = */ PULSAR_CHAT_GEMMA4,
@@ -192,7 +211,7 @@ const server_family_ops k_family_gemma4 = {
     /* .tool_error_suffix     = */ NULL,
     /* .forced_call_seed      = */ NULL,    /* a forced tool_choice is refused in gemma4_render */
     /* .forced_call_prefill   = */ NULL,
-    /* .grammar               = */ NULL,    /* response formats and strict tools refused by the server, by name */
+    /* .grammar               = */ &k_grammar_gemma4,   /* response formats; strict tools refused by name */
     /* .find_call_block       = */ NULL,
     /* .tool_defs_text        = */ NULL,
 };
