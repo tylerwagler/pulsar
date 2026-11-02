@@ -171,6 +171,9 @@ static uint64_t g_ws_bytes = 0;
 /* L296 perf: 0 = pulsar_gqa_forward; else the two halves -- pulsar_gqa_plan bounded at g_bound, the descriptors
  * uploaded here, pulsar_gqa_launch (what a captured step does) */
 static uint32_t g_bound = 0;
+/* L338: the next calls' rows are DECODE rows (pulsar_gqa_io::decode_rows): run_schedule's {1} schedules and the
+ * batched decode of 16 sequences -- a prompt's one-row chunk stays a prompt chunk */
+static bool g_decode_call = false;
 /* f(i) for i in [0, n) on up to 16 host threads */
 template <class F> static void par_for(uint32_t n, F f) {
     const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
@@ -211,6 +214,7 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
     std::vector<pulsar_gqa_seq> ss(seqs.size());
     for (size_t i = 0; i < seqs.size(); i++) ss[i] = {seqs[i]->kv, seqs[i]->bytes, seqs[i]->cap};
     pulsar_gqa_io io{};
+    io.decode_rows = g_decode_call ? 1 : 0;   /* L338: the call's row kind (run_schedule's one-row decodes) */
     io.q = {d_in, C.ld, C.R.hd};
     io.k = {d_in + C.off_k, C.ld, C.R.hd};
     io.v = {d_in + C.off_v, C.ld, C.R.hd};
@@ -258,6 +262,9 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
 
 /* a run of consecutive rows of one sequence in calls of the given sizes (the last repeats) */
 static std::vector<Out> run_schedule(const Case &C, Seq &s, uint32_t p0, uint32_t p1, const std::vector<uint32_t> &sizes) {
+    const bool was = g_decode_call;
+    g_decode_call = sizes.size() == 1 && sizes[0] == 1u;   /* one row a call: decode rows */
+    struct restore { bool w; ~restore() { g_decode_call = w; } } r_{was};
     std::vector<Out> all;
     std::vector<Seq *> v{&s};
     uint32_t p = p0, k = 0;
@@ -305,6 +312,27 @@ static bool same(const Out &a, const Out &b) {
 }
 static uint32_t first_diff(const std::vector<Out> &a, const std::vector<Out> &b, uint32_t off_b = 0) {
     for (uint32_t i = 0; i < b.size(); i++) if (!same(a[off_b + i], b[i])) return i;
+    return UINT32_MAX;
+}
+/* L338: the wide heads' (256, 512) decode-shaped calls run the flash-decoding arm (gqa_decode_kernel: the scores and
+ * P V on the CUDA cores in f32), not the MMA tile's bytes -- Tyler 2026-11-02 took the speed over decode == prefill
+ * bytes for them.  Where a check compares that arm with the MMA tile's it is graded: every element of the f32 tap
+ * within 2^-12 of the row's largest |value| (f32 accumulation in another order: ~1e-6), and the decode rows are graded
+ * against the reference on the prefill's bars.  Every other head width keeps its bit-exact checks. */
+static bool g_flashdec = false;
+static bool close_rows(const Out &a, const Out &b) {
+    if (a.tap.size() != b.tap.size()) return false;
+    float mx = 0.f, d = 0.f;
+    for (size_t i = 0; i < a.tap.size(); i++) {
+        mx = std::max(mx, std::fabs(a.tap[i]));
+        d = std::max(d, std::fabs(a.tap[i] - b.tap[i]));
+    }
+    return d <= mx * (1.0f / 4096.0f);
+}
+/* the decode arm's rows against the MMA tile's: bit-exact, or (g_flashdec) close_rows */
+static bool dec_match(const Out &a, const Out &b) { return g_flashdec ? close_rows(a, b) : same(a, b); }
+static uint32_t dec_diff(const std::vector<Out> &a, const std::vector<Out> &b, uint32_t off_b = 0) {
+    for (uint32_t i = 0; i < b.size(); i++) if (!dec_match(a[off_b + i], b[i])) return i;
     return UINT32_MAX;
 }
 static bool pools_equal(const Case &C, const Seq &a, const Seq &b, uint32_t upto) {
@@ -445,6 +473,7 @@ static void run_case(Case &C) {
            C.R.gate ? "on" : "off", C.R.rope_theta, C.R.e4m3 ? "E4M3" : "BF16",
            (unsigned long long)pulsar_gqa_kv_token_bytes(&C.L), C.N);
     const uint32_t N = C.N;
+    g_flashdec = C.R.hd > 128u;
     History H;
     history_build(C, 1, N, H);
 
@@ -465,10 +494,20 @@ static void run_case(Case &C) {
     {
         Seq B = seq_new(C, 1);
         std::vector<Out> dec = run_schedule(C, B, 0, N, {1});
-        const uint32_t d = first_diff(pre, dec);
+        const uint32_t d = dec_diff(pre, dec);
         check(dec.size() == N && d == UINT32_MAX && pools_equal(C, A, B, N),
-              "decode: %u one-row calls == the prefill (out, tap, pool), bit-exact%s", N,
+              "decode: %u one-row calls == the prefill (out, tap, pool), %s%s", N,
+              g_flashdec ? "the flash-decoding arm: tap within 2^-12 of the row's max, pools bit-exact" : "bit-exact",
               d == UINT32_MAX ? "" : " -- first difference at a row");
+        if (g_flashdec && dec.size() == N) {
+            std::vector<const Out *> gd(N);
+            for (uint32_t p = 0; p < N; p++) gd[p] = &dec[p];
+            const Grade GD = grade(C, H, all, gd);
+            check(GD.fro <= bar_fro(C) && GD.max <= bar_max(C) && GD.eq >= BAR_EQ,
+                  "fidelity (one-row decodes on the flash-decoding arm, %u rows, graded): fro %.2e (bar %.0e), max %.2e "
+                  "(bar %.0e), bf16 out == bf16(ref) %.4f (bar %.2f)", N, GD.fro, bar_fro(C), GD.max, bar_max(C), GD.eq,
+                  BAR_EQ);
+        }
         seq_free(B);
     }
     /* 2b. L296 perf: the bounded halves (plan at a bound past every position, launch from uploaded descriptors) --
@@ -479,10 +518,10 @@ static void run_case(Case &C) {
         std::vector<Out> dec = run_schedule(C, B, 0, N, {1});
         std::vector<Out> ch = run_schedule(C, D, 0, N, {1, 37, 64, 63, 200});
         g_bound = 0;
-        check(dec.size() == N && first_diff(pre, dec) == UINT32_MAX && pools_equal(C, A, B, N) && ch.size() == N &&
+        check(dec.size() == N && dec_diff(pre, dec) == UINT32_MAX && pools_equal(C, A, B, N) && ch.size() == N &&
               first_diff(pre, ch) == UINT32_MAX && pools_equal(C, A, D, N),
               "bounded (ctx_bound %u): one-row calls and calls of 1, 37, 64, 63, 200 rows planned + launched == the "
-              "forward's prefill, bit-exact", N + 300u);
+              "forward's prefill, %s", N + 300u, g_flashdec ? "the one-row calls graded (flash-decoding)" : "bit-exact");
         seq_free(B);
         seq_free(D);
     }
@@ -503,10 +542,11 @@ static void run_case(Case &C) {
         uint32_t p = N0;
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
-            ok = ok && o.size() == k && first_diff(pre, o, p) == UINT32_MAX;
+            ok = ok && o.size() == k && (k == 1u ? dec_diff(pre, o, p) : first_diff(pre, o, p)) == UINT32_MAX;
             p += k;
         }
-        check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, bit-exact", N0);
+        check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
+              "bit-exact%s", N0, g_flashdec ? " (the closing one-row call graded: flash-decoding)" : "");
         seq_free(B);
     }
     /* 5. rollback of a junk verify */
@@ -522,7 +562,9 @@ static void run_case(Case &C) {
             for (uint32_t i = 0; i < 6; i++) rows.push_back({0u, N0 + i});
             run_call(C, v, rows, nullptr, true);                     /* the junk verify ... */
             std::vector<Out> o = run_schedule(C, B, N0, N, {3, 1}); /* ... rolled back to N0 */
-            const bool match = o.size() == N - N0 && first_diff(pre, o, N0) == UINT32_MAX;
+            bool match = o.size() == N - N0;   /* the 3-row call bit-exact; the one-row calls after it dec_match */
+            for (uint32_t i = 0; match && i < o.size(); i++)
+                match = i < 3u ? same(pre[N0 + i], o[i]) : dec_match(pre[N0 + i], o[i]);
             if (pass == 0) check(match, "rollback: a 6-row junk verify, rolled back, == the prefill (ring of %u = window - 1 + 16), bit-exact", C.cap);
             else check(!match, "rollback negative control: on a ring of exactly the window (%u) the same rollback differs", C.cap);
             seq_free(B);
@@ -545,7 +587,9 @@ static void run_case(Case &C) {
         std::vector<std::pair<uint32_t, uint32_t>> rows;
         for (uint32_t s = 0; s < NS; s++) { xs.push_back(&X[s]); rows.push_back({s, len[s]}); }
         std::vector<Out> bat;
+        g_decode_call = true;    /* one decode row of each of 16 sequences */
         ok = run_call(C, xs, rows, &bat) == 0;
+        g_decode_call = false;
         for (uint32_t s = 0; s < NS && ok; s++) {
             std::vector<Out> one = run_schedule(C, Y[s], len[s], len[s] + 1, {1});
             ok = one.size() == 1 && same(one[0], bat[s]);
@@ -561,7 +605,7 @@ static void run_case(Case &C) {
         for (uint32_t i = 0; i < 70 && ok; i++) ok = same(r0[i], bat[i]);
         for (uint32_t s = 1; s < 6 && ok; s++) {
             std::vector<Out> one = run_schedule(C, Y[s], len[s] + 1, len[s] + 2, {1});
-            ok = one.size() == 1 && same(one[0], bat[70 + s - 1]);
+            ok = one.size() == 1 && dec_match(one[0], bat[70 + s - 1]);
         }
         check(ok, "batching: a 70-row run + 5 decode rows in one (folded) call == each alone in 7-row / 1-row calls, bit-exact");
         for (uint32_t s = 0; s < NS; s++) { seq_free(X[s]); seq_free(Y[s]); }

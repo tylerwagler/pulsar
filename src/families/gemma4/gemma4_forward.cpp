@@ -811,6 +811,7 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     io.ld_out = Q;
     io.workspace = base + M.gqa;
     io.workspace_bytes = M.gqa_bytes;
+    io.decode_rows = st->n_dec == n ? 1 : 0;   /* L338: a step of decode rows only: the wide heads' flash-decoding */
     if (pulsar_gqa_launch(&G1, &q->attn_call[il], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[il], &io, 0) != 0)
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
