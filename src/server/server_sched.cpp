@@ -160,24 +160,25 @@ uint64_t server_mem_available_bytes(void) {
 KvBytes server::guard_budget() {
     const double now = server_now_sec();
     if (guard_avail_at == 0.0 || now - guard_avail_at >= 0.25) {
-        guard_avail = KvBytes{server_mem_available_bytes()};
+        guard_avail = KvBytes{server_guard_avail_bytes(guard_discrete)};
         guard_avail_at = now;
     }
     const KvBytes live =
         server_guard_touched_budget(guard_kv_budget, guard_eager_bytes, pulsar_session_touched_kv_bytes(sess),
-                                    guard_avail);
+                                    guard_avail, guard_floor);
     const KvBytes b = live < guard_touched_ceiling ? live : guard_touched_ceiling;
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
     const KvBytes step{512ull << 20};
     if ((b > guard_budget_said ? b - guard_budget_said : guard_budget_said - b) >= step) {
         const double gib = 1024.0 * 1024.0 * 1024.0;
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: guard: live touched-KV budget %.2f GiB (ceiling %.2f; touched %.2f + MemAvailable "
+                   "pulsar-server: guard: live touched-KV budget %.2f GiB (ceiling %.2f; touched %.2f + %s "
                    "%.2f − floor %.2f)%s",
                    (double)b.raw() / gib, (double)guard_touched_ceiling.raw() / gib,
-                   (double)pulsar_session_touched_kv_bytes(sess).raw() / gib, (double)guard_avail.raw() / gib,
-                   (double)server_mem_floor().raw() / gib,
-                   guard_avail != KvBytes{} ? "" : " -- MemAvailable unreadable: fail closed");
+                   (double)pulsar_session_touched_kv_bytes(sess).raw() / gib,
+                   guard_discrete ? "device free" : "MemAvailable", (double)guard_avail.raw() / gib,
+                   (double)guard_floor.raw() / gib,
+                   guard_avail != KvBytes{} ? "" : " -- the headroom reading is unreadable: fail closed");
         guard_budget_said = b;
     }
     return b;

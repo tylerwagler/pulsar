@@ -136,11 +136,19 @@ bool server::kv_tool_map_measure_locked(const char *text,
     auto *s = this;
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
+    /* L338: a family without find_call_block keeps no tool memory (Gemma 4: every turn is a full render), so its
+     * segments carry no tool map.  Before, the disk KV cache called the NULL hook on Gemma's first persisted chunk. */
+    const auto find_call_block = server_tool_family(s)->find_call_block;
+    if (!find_call_block) {
+        if (count_out) *count_out = 0;
+        if (bytes_out) *bytes_out = 0;
+        return true;
+    }
     uint64_t scan = ++s->tool_mem.scan_clock;
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = server_tool_family(s)->find_call_block(p, &end);
+        const char *start = find_call_block(p, &end);
         if (!start || !end) break;
         tool_memory_block *b =
             tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));

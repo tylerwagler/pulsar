@@ -7583,6 +7583,27 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 
 
 
+/* L338: Gemma 4 declares no find_call_block (no tool memory); its persisted segments carry no tool map, where the
+ * disk KV cache used to call the NULL hook and crash on the first chunk (CT 130, 2026-11-02). */
+static void test_kv_tool_map_family_without_tool_memory(void) {
+    server s = {0};
+    s.family_no_engine = server_family_for_format(PULSAR_CHAT_GEMMA4);
+    TEST_ASSERT(s.family_no_engine->find_call_block == NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    const char *text = "<|turn>model\n<|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|>";
+    s.tool_memory_put("call_1", text);
+    uint64_t bytes = 1;
+    TEST_ASSERT(s.kv_tool_map_serialized_size(text, &bytes) && bytes == 0);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t written = 1;
+    TEST_ASSERT(s.kv_tool_map_write(fp, text, &written) && written == 0);
+    TEST_ASSERT(ftell(fp) == 0);
+    fclose(fp);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -7981,26 +8002,26 @@ static void test_guard_touched_budget_is_physical(void) {
     const uint64_t GiB = 1024ull * MiB;
     const uint64_t F = PULSAR_SERVER_MEM_FLOOR_BYTES;
     const uint64_t avail = 9400ull * MiB, budget = 41257ull * MiB, eager = 31990ull * MiB;   /* 9.18 / 40.29 / 31.24 */
-    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail));
+    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail), server_mem_floor());
     TEST_ASSERT(c == kvb(avail - F));                /* the headroom binds, not the ledger's 9.05 GiB */
     TEST_ASSERT(c < kvb(budget - eager));
     /* pages the warmup touched are already out of MemAvailable: they count toward the ceiling */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail)) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail), server_mem_floor()) ==
                 kvb(avail - F + 1 * GiB));
     /* a roomy box: the ledger's share binds */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB)) == kvb(budget - eager));
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB), server_mem_floor()) == kvb(budget - eager));
     /* no headroom, or /proc/meminfo unreadable: 0 (startup refuses rather than run the pool unguarded) */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail)) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail), server_mem_floor()) ==
                 KvBytes::max());   /* no wrap */
     /* the invariant over a sweep */
     for (uint64_t a = F + 1; a < 40 * GiB; a += 777 * MiB)
         for (uint64_t t = 0; t < 8 * GiB; t += 1531 * MiB)
             for (uint64_t b = 0; b < 64 * GiB; b += 2999 * MiB) {
-                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a)).raw();
+                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a), server_mem_floor()).raw();
                 TEST_ASSERT(ceil <= t || a - (ceil - t) >= F);
             }
 }
@@ -11634,8 +11655,8 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
     TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
     /* the guard's ceiling keeps the derived floor free */
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB)) == kvb(3 * MiB));
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
     /* headroom: unreadable MemAvailable (0) is never room; no wrap */
     TEST_ASSERT(!server_headroom_admits(kvb(0), kvb(0), kvb(0)));
     TEST_ASSERT(server_headroom_admits(kvb(5), kvb(2), kvb(3)));
@@ -11664,6 +11685,7 @@ static void test_guard_budget_reads_live_memavailable(void) {
     s.guard_touched_ceiling = kvb(5 * GiB);     /* cut at warmup: MemAvailable was floor + 5 GiB */
     s.guard_budget_said = kvb(5 * GiB);         /* no line for the cases below that stay put */
     s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
+    s.guard_floor = server_mem_floor();
     s.guard_avail = kvb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));   /* the live headroom binds */
     s.guard_avail = kvb(F + 20 * GiB);          /* memory came back: never above the startup ceiling */
@@ -11672,6 +11694,41 @@ static void test_guard_budget_reads_live_memavailable(void) {
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     s.guard_avail = KvBytes{};                  /* unreadable: fail closed */
     TEST_ASSERT(s.guard_budget() == KvBytes{});
+}
+
+/* L338: a discrete card's guard reads the device and keeps PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES of it free; the
+ * ledger's share does not cap it.  The shape is CT 130's RTX 6000 (Gemma 4, 3 banks x 40960, 2026-11-02): budget 5.00,
+ * eager 4.96, touched 0.08 and 2.2 GiB of the device free post-warmup -- the host formula left 0.04 GiB. */
+static void test_guard_discrete_reads_the_device(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t GiB = 1024ull * MiB;
+    const KvBytes floor = server_guard_floor(true);
+    TEST_ASSERT(floor == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_guard_floor(false) == server_mem_floor());
+    const uint64_t budget = 5120ull * MiB, eager = 5079ull * MiB, touched = 82ull * MiB, dev_free = 2253ull * MiB;
+    /* the host formula's ledger binds at 0.04 GiB: what refused every judge prompt */
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(touched), kvb(dev_free), floor) ==
+                kvb(budget - eager));
+    /* the discrete ceiling: touched + device free − floor (the startup passes no ledger) */
+    const KvBytes c = server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(touched), kvb(dev_free), floor);
+    TEST_ASSERT(c == kvb(touched + dev_free - PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(c > kvb(35724ull * 20ull * 1024ull));   /* the 35.7K-token prompt's KV fits beside the warm banks */
+    /* at the floor, or unreadable: nothing more may be touched */
+    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), floor, floor) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), KvBytes{}, floor) == KvBytes{});
+    /* the live budget reads the device when the guard is discrete, and stays under the startup ceiling */
+    server s;
+    memset(&s, 0, sizeof s);
+    s.guard_enabled = true;
+    s.guard_discrete = true;
+    s.guard_floor = floor;
+    s.guard_kv_budget = KvBytes::max();
+    s.guard_eager_bytes = kvb(eager);
+    s.guard_touched_ceiling = c;
+    s.guard_budget_said = c;
+    s.guard_avail_at = server_now_sec();
+    s.guard_avail = kvb(floor.raw() + 1 * GiB);   /* 1.2 GiB went to something else: the live reading binds */
+    TEST_ASSERT(s.guard_budget() == kvb(1 * GiB));
 }
 
 /* 2026-10-29: a persist MemAvailable cannot cover over the floor is skipped -- counted and said, nothing written,
@@ -12248,6 +12305,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
+    test_guard_discrete_reads_the_device();
     test_persist_skipped_under_the_floor();
     test_prefill_mem_step_tries_remedies_first();
     test_stall_watchdog_rules();
@@ -12390,6 +12448,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_kv_tool_map_family_without_tool_memory();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();

@@ -1678,6 +1678,13 @@ static inline uint64_t server_discrete_margin_bytes(uint64_t total_bytes) {
 /// The process's measured steady-state overhead the admission budget reserves, bytes.
 #define PULSAR_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
+/* L338: what a discrete card's guard keeps free of its device memory.  The live budget re-reads cudaMemGetInfo every
+ * 0.25 s, so memory the runtime takes after warmup (cuBLASLt workspaces, lazily captured graphs) shrinks the room KV
+ * may take by itself; the floor covers what grows between two readings and a step's transient allocations.  Measured
+ * on the RTX 6000 (Gemma 4, 3 banks x 40960, the P4 parity suite incl. a 35.7K-token prompt and the judge): the device
+ * grew 820 MiB of which 698 MiB were that prompt's KV, ~120 MiB else. */
+#define PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES (512ull * 1024ull * 1024ull)
+
 /* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
  * kernel/OS breathing room ONLY — the last-resort backstop for when other
  * accounting is wrong. It deliberately does NOT cover any process overhead:
@@ -2035,7 +2042,9 @@ struct server {
     KvBytes      guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
     KvBytes      guard_kv_budget;        ///< the ledger budget the ceiling was cut from
     KvBytes      guard_eager_bytes;      ///< eager floor already resident
-    KvBytes      guard_avail;            ///< the MemAvailable reading the live budget last used
+    KvBytes      guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
+    KvBytes      guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
+    bool         guard_discrete;         ///< L338: the KV is a discrete card's: the readings are the device's
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
@@ -4489,11 +4498,25 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
-/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor); 0 when MemAvailable is at
- * or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the
- * post-warmup MemAvailable; the guard's live budget (server::guard_budget) the current one. */
+/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
+ * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
+ * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
+ * (server_guard_avail_bytes, server_guard_floor). */
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes);
+                                    KvBytes avail_bytes, KvBytes floor);
+/* L338: the guard's headroom on a DISCRETE card.  Its demand-paged KV lands in the card's own memory, so the reading
+ * is the device's free memory (cudaMemGetInfo, exact there) above PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, and the
+ * ledger's share (budget − eager) does not cap it: on a discrete card the budget is free-after-weights less the
+ * startup margin (server_discrete_margin_bytes), a pre-warmup estimate the post-warmup reading replaces -- on the RTX
+ * 6000 at 3 banks x 40960 it left budget 5.00 − eager 4.96 = 0.04 GiB with 2.2 GiB of the device free, and every
+ * prompt over ~2K tokens was refused (2026-11-02, CT 130).  GB10's unified memory keeps MemAvailable, the host floor
+ * and the ledger's share. */
+/// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
+/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
+uint64_t server_guard_avail_bytes(bool discrete);
+/// @param discrete as server_guard_avail_bytes
+/// @return the floor that reading keeps free
+KvBytes server_guard_floor(bool discrete);
 
 /* ==== The memory floor (2026-10-29 production hang) ========================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had

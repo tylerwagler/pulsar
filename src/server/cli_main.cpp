@@ -409,11 +409,11 @@ uint64_t server_persist_host_bytes(int tokens) {
 /// @param kv_budget_bytes the ledger's budget
 /// @param eager_bytes the eager floor already resident
 /// @param touched_bytes the KV resident now
-/// @param avail_bytes MemAvailable now (0 = unreadable)
-/// @return the resident-KV budget in bytes; 0 when MemAvailable is at or under the floor
+/// @param avail_bytes the headroom reading now, MemAvailable or the device's free memory (0 = unreadable)
+/// @param floor the floor that reading keeps free (server_guard_floor)
+/// @return the resident-KV budget in bytes; 0 when the reading is at or under the floor
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes) {
-    const KvBytes floor = server_mem_floor();
+                                    KvBytes avail_bytes, KvBytes floor) {
     if (avail_bytes <= floor) return KvBytes{};
     const KvBytes ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : KvBytes{};
     const KvBytes headroom = avail_bytes - floor;
@@ -422,6 +422,17 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
 }
 
 
+
+uint64_t server_guard_avail_bytes(bool discrete) {
+    if (!discrete) return server_mem_available_bytes();
+    uint64_t free_b = 0, total_b = 0;
+    pulsar_gpu_mem_info(&free_b, &total_b);
+    return free_b;
+}
+
+KvBytes server_guard_floor(bool discrete) {
+    return discrete ? KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES} : server_mem_floor();
+}
 
 void server::close_resources() {
     auto *s = this;
@@ -1123,6 +1134,7 @@ int main(int argc, char **argv) {
     }
     uint64_t kv_budget_final = kv_budget;
     uint64_t warm_avail = 0;   /* L319: the touched-KV ceiling's measurement (below) */
+    uint64_t warm_dev_free = 0;   /* L338: its discrete-card reading, the device's free memory at the same point */
     KvBytes warm_touched{};
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
@@ -1144,6 +1156,7 @@ int main(int argc, char **argv) {
         const uint64_t avail_now = server_mem_available_bytes();
         warm_avail = avail_now;
         warm_touched = touched_now;
+        if (pulsar_gpu_integrated() == 0) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
         if (avail_now > 0) {
             const uint64_t floor = server_mem_floor().raw();
             const uint64_t headroom = avail_now > floor ? avail_now - floor : 0;
@@ -1337,7 +1350,11 @@ int main(int argc, char **argv) {
      * lowers the budget for the memory-safety smoke so the guard fires at modest
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
-        uint64_t budget = kv_budget_final;
+        /* L338: a discrete card's guard reads the device (server_guard_avail_bytes), and the ledger's share does not
+         * cap it unless the test hook below sets a budget. */
+        s.guard_discrete = (pulsar_gpu_integrated() == 0);
+        s.guard_floor = server_guard_floor(s.guard_discrete);
+        uint64_t budget = s.guard_discrete ? UINT64_MAX : kv_budget_final;
         /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
          * tools/tp2-l264 -- the spill/restore through the segment chain has no
          * other way to fire at a test's fills). */
@@ -1356,28 +1373,39 @@ int main(int argc, char **argv) {
          * would grow until the box runs dry.  2026-10-29: every guard decision reads the LIVE budget under this
          * ceiling (server::guard_budget). */
         s.guard_kv_budget = KvBytes{budget};
-        s.guard_touched_ceiling =
-            server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched, KvBytes{warm_avail});
+        const uint64_t guard_warm_avail = s.guard_discrete ? warm_dev_free : warm_avail;
+        s.guard_touched_ceiling = server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched,
+                                                              KvBytes{guard_warm_avail}, s.guard_floor);
         s.guard_enabled = (s.guard_touched_ceiling > KvBytes{});
         const double gib = 1024.0 * 1024.0 * 1024.0;
         if (!s.guard_enabled) {
             server_log(PULSAR_LOG_ERROR,
-                       "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (MemAvailable "
-                       "%.2f GiB post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
+                       "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (%s %.2f GiB "
+                       "post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
                        "PULSAR_MSEQ_BANKS (L319)",
-                       s.pool_banks, (double)warm_avail / gib, (double)server_mem_floor().raw() / gib,
+                       s.pool_banks, s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       (double)s.guard_floor.raw() / gib,
                        (double)budget / gib, (double)s.guard_eager_bytes.raw() / gib);
             pulsar_session_free(session);
             pulsar_engine_close(engine);
             return 1;
         }
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
-                   "%.2f, touched %.2f + MemAvailable %.2f − floor %.2f post-warmup); every decision reads the live "
-                   "budget under it (touched + MemAvailable − floor now); spills persist to the disk KV cache",
-                   (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
-                   (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib, (double)warm_avail / gib,
-                   (double)server_mem_floor().raw() / gib);
+        if (s.guard_discrete && budget == UINT64_MAX)
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: Tier-2 2b guard ENABLED (discrete GPU): touched ceiling %.2f GiB = touched %.2f "
+                       "+ device free %.2f − floor %.2f post-warmup; every decision reads the live budget under it "
+                       "(touched + device free − floor now); spills persist to the disk KV cache",
+                       (double)s.guard_touched_ceiling.raw() / gib, (double)warm_touched.raw() / gib,
+                       (double)guard_warm_avail / gib, (double)s.guard_floor.raw() / gib);
+        else
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
+                       "%.2f, touched %.2f + %s %.2f − floor %.2f post-warmup); every decision reads the live "
+                       "budget under it (touched + %s − floor now); spills persist to the disk KV cache",
+                       (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
+                       (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib,
+                       s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       (double)s.guard_floor.raw() / gib, s.guard_discrete ? "device free" : "MemAvailable");
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
