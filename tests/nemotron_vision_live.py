@@ -10,8 +10,10 @@ thinking off at temperature 0; each check passes when the answer NAMES the conte
   V5  a wide banner, black on white "7"  "7"      (an extreme aspect: 1200 x 150 px)
   V6  two images in one message, numbered <image 1> / <image 2>: "which one is red" -> "first" / "1"
   V7  the prefix cache with an image (the core's image identity): the conversation extended after an image answer
-      resumes PAST the image block (cached tokens >= the first prompt's, the image's block among them); the same
-      text with a DIFFERENT image does not resume past the image's start (cached < the block's start + its length)
+      resumes PAST the image block -- from the first prompt's last resume-grid point (128), which the long text after
+      the image puts past the block; reuse is licensed only at a grid point at or above an image block (prompt-end
+      records keep no image identity, prefill_loop.cpp L289), as tests/pulsar_test.cpp's image-reuse case states; the
+      same text with a DIFFERENT image does not resume past the image's start
   V8  an Anthropic tool_result screenshot (the agent shape): the disc's colour, "red"
 --refuse: the model is a container WITHOUT the tower -- every image request is refused 400, by name ("no vision tower").
 
@@ -156,21 +158,23 @@ class NemotronVisionLive(Leg):
                                              "one word."}], ["first", "1"])
 
     def v7(self):
-        q = {"type": "text", "text": "Describe the colour of the circle in one word."}
+        grid = 128   # Nemotron-H's resume grid (nemotron_h_forward.cpp kResumeGrid)
+        ctx = "Some context about this drawing. " + "It was produced by a short program that paints shapes. " * 24
+        q = {"type": "text", "text": ctx + "Describe the colour of the circle in one word."}
         a = disc(col=(220, 20, 20))
         t1, j1, _ = self.ask([url_part(a), q])
         p1 = j1["usage"]["prompt_tokens"]
         hist = [{"role": "user", "content": [url_part(a), q]}, {"role": "assistant", "content": t1}]
         t2, j2, _ = self.ask([{"type": "text", "text": "And what shape is it? One word."}], history=hist)
         c2 = cached_tokens(j2.get("usage")) or 0
-        self.g.check(c2 >= p1 - 8 and "circle" in t2.lower(),
-                     "V7 the same image resumes past its block: cached %d of the first prompt's %d -> %r" % (c2, p1,
-                                                                                                         t2[:60]))
+        want = p1 // grid * grid   # the first prompt's last grid point
+        self.g.check(want >= 384 and c2 >= want and "circle" in t2.lower(),
+                     "V7 the same image resumes past its block: cached %d (the first prompt's last grid point %d of "
+                     "%d) -> %r" % (c2, want, p1, t2[:60]))
         b = disc(col=(30, 60, 210))
         t3, j3, _ = self.ask([url_part(b), q])
         c3 = cached_tokens(j3.get("usage")) or 0
-        blk = p1 - 30   # the image block alone is >= 256 of the first prompt's tokens; the text around it < 30
-        self.g.check(c3 < p1 - 256 and c3 <= p1 - blk + 30 and "blue" in t3.lower(),
+        self.g.check(c3 < grid and "blue" in t3.lower(),
                      "V7 a different image does not resume past its start: cached %d (prompt %d) -> %r" % (c3, p1,
                                                                                                         t3[:60]))
 
