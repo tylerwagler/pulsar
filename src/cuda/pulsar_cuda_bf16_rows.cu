@@ -160,11 +160,12 @@ __device__ __forceinline__ void rows_tile(const __nv_bfloat16 *__restrict__ W, i
 /// @param in input width (a multiple of 64).
 /// @param X the rows, bf16 [nr][in], 16-byte aligned.
 /// @param nr rows.
-/// @param Y the output, f32 [nr][out].
+/// @param Y the output, f32 [nr][out], or NULL.
+/// @param Yb the output rounded to bf16 [nr][out], or NULL.
 template <int NT, int U>
 __global__ void __launch_bounds__(32 * kDenseWarps)
 bf16_rows_dense_kernel(const __nv_bfloat16 *__restrict__ W, int out, int in, const __nv_bfloat16 *__restrict__ X,
-                       int nr, float *__restrict__ Y) {
+                       int nr, float *__restrict__ Y, __nv_bfloat16 *__restrict__ Yb) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
     const int r0 = ((int)blockIdx.x * kDenseWarps + warp) * 16 + g, r1 = r0 + 8;
     const bool v0 = r0 < out, v1 = r1 < out;
@@ -230,7 +231,10 @@ bf16_rows_dense_kernel(const __nv_bfloat16 *__restrict__ W, int out, int in, con
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const int t = 8 * j + 2 * c + (e & 1), row = e < 2 ? r0 : r1;
-            if (t < nr && (e < 2 ? v0 : v1)) Y[(size_t)t * out + row] = acc[j][e];
+            if (t < nr && (e < 2 ? v0 : v1)) {
+                if (Y) Y[(size_t)t * out + row] = acc[j][e];
+                if (Yb) Yb[(size_t)t * out + row] = __float2bfloat16_rn(acc[j][e]);   /* rows_emit's rounding */
+            }
         }
 }
 
@@ -333,12 +337,12 @@ bool aligned16(const void *p) { return ((uintptr_t)p & 15u) == 0; }
 } // namespace
 
 int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
-                                   bool prompt, cudaStream_t stream) {
+                                   uint16_t *y_bf16, bool prompt, cudaStream_t stream) {
     PULSAR_REQUIRE_CC(80, "the bf16 rows linear (bf16 m16n8k16 / cuBLASLt bf16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
-    if (!w || !x_bf16 || !y || rows <= 0 || in <= 0 || out <= 0 || in % 64 || !aligned16(w) || !aligned16(x_bf16) ||
-        !aligned16(y)) {
-        fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64 and 16-byte aligned "
-                        "weight, rows and output -- refusing\n", in, out, rows);
+    if (!w || !x_bf16 || (!y && !y_bf16) || (prompt && (!y || y_bf16)) || rows <= 0 || in <= 0 || out <= 0 || in % 64 ||
+        !aligned16(w) || !aligned16(x_bf16) || (y && !aligned16(y)) || (y_bf16 && !aligned16(y_bf16))) {
+        fprintf(stderr, "pulsar: BF16 linear (bf16 rows): %d -> %d at %d rows needs in %% 64, 16-byte aligned weight, "
+                        "rows and outputs, and an output (a prompt chunk: f32 only) -- refusing\n", in, out, rows);
         return -1;
     }
     if (prompt) {
@@ -366,11 +370,13 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
     for (int r0 = 0; r0 < rows; r0 += PULSAR_BF16_ROWS_DECODE_MAX) {
         const int m = rows - r0 < PULSAR_BF16_ROWS_DECODE_MAX ? rows - r0 : PULSAR_BF16_ROWS_DECODE_MAX;
         if (m > 8)
-            bf16_rows_dense_kernel<2, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(W, out, in, X + (size_t)r0 * in, m,
-                                                                                     y + (size_t)r0 * out);
+            bf16_rows_dense_kernel<2, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
+                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
+                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
         else
-            bf16_rows_dense_kernel<1, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(W, out, in, X + (size_t)r0 * in, m,
-                                                                                     y + (size_t)r0 * out);
+            bf16_rows_dense_kernel<1, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
+                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
+                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
     }
     return launch_ok("dense") ? 0 : -3;
 }

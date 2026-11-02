@@ -324,7 +324,7 @@ static void section_bench(void) {
                 return (double)t[t.size() / 2];
             };
             const double tn = med([&] { pulsar_nvfp4_rows_linear_launch(dW, dX, M, f.in, f.out, dY, nullptr, 0); });
-            const double tb = med([&] { pulsar_bf16_rows_linear_launch(dB, dX, M, f.in, f.out, dY, false, 0); });
+            const double tb = med([&] { pulsar_bf16_rows_linear_launch(dB, dX, M, f.in, f.out, dY, nullptr, false, 0); });
             printf("  %-16s %6d %7d  %3d  %10.1f %8.1f   %10.1f %8.1f   %5.2fx\n", sh.what, f.in, f.out, M, tn,
                    (double)f.blob.size() / tn / 1e3, tb, (double)f.out * f.in * 2 / tb / 1e3, tb / tn);
             if (f.out == 12288) {   /* the drafter's gate + up: one multi launch (the same weight twice: cold anyway) */

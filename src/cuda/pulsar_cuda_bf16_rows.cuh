@@ -33,19 +33,22 @@
 #define PULSAR_BF16_ROWS_DECODE_MAX 16
 
 /** y [rows][out] f32 = W x for a bf16 weight W [out][in] (row-major, the container's [in, out] ne order) and bf16
- *  rows x [rows][in].  w, x and y 16-byte aligned, in % 64 == 0.  `prompt`: a prompt chunk (the fixed-order GEMM at
- *  every width).  Refuses (-1) on a contract violation. */
+ *  rows x [rows][in].  w, x and the outputs 16-byte aligned, in % 64 == 0.  `prompt`: a prompt chunk (the fixed-order
+ *  GEMM at every width).  Decode rows may write f32 (y), bf16 (y_bf16: the f32 sum rounded to nearest in the
+ *  epilogue, L339) or both; a prompt chunk writes y only (y_bf16 must be NULL).  Refuses (-1) on a contract
+ *  violation. */
 /// @param w the weight, bf16 [out][in], device.
 /// @param x_bf16 the rows, bf16 [rows][in], device.
 /// @param rows rows.
 /// @param in input width.
 /// @param out output width.
-/// @param y the output, f32 [rows][out], device.
+/// @param y the output, f32 [rows][out], device, or NULL (decode rows with y_bf16).
+/// @param y_bf16 the output as bf16 [rows][out], device, or NULL.
 /// @param prompt the rows are a prompt chunk.
 /// @param stream the stream.
 /// @return 0, -1 refused (named on stderr), -3 launch failure.
 int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int rows, int in, int out, float *y,
-                                   bool prompt, cudaStream_t stream);
+                                   uint16_t *y_bf16, bool prompt, cudaStream_t stream);
 
 /** The fixed-order cuBLASLt bf16 GEMM over raw bf16 rows (pulsar_cuda_matmul.cu): y [rows][out] f32.  1 on success. */
 /// @param y the output, f32 [rows][out_dim].

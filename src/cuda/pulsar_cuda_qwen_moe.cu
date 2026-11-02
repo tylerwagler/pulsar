@@ -272,7 +272,7 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
         if (l->nvfp4) return pulsar_nvfp4_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, nullptr, stream);
         if (l->f16) return pulsar_f16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, ws, ws_bytes,
                                                          stream);
-        return pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, l->prompt, stream);
+        return pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, y, nullptr, l->prompt, stream);
     }
     if (l->k2 == 0) {                       /* the recipe's mxfp8_lt dense tier */
         if (!l->sf) {
@@ -324,7 +324,8 @@ extern "C" size_t pulsar_rows_linear_multi_workspace_bytes(const pulsar_rows_lin
 }
 
 /* The multi launch, f32 outputs y (yb NULL) or bf16 rows yb with y[j] the f32 staging of the arms that have no bf16
- * epilogue (L296 dec2): the EXL3 decode GEMV emits yb itself; every other arm writes y[j] and the front door emits. */
+ * epilogue (L296 dec2): the EXL3 decode GEMV, the nvfp4 kernel and (L339) the BF16 decode kernel emit yb themselves;
+ * every other arm writes y[j] and the front door emits. */
 /** @param ls       [n] the Linears
  *  @param n        Linears, 1 .. DS4_EXL3_DENSE_MAX_PROJ
  *  @param x_bf16   device bf16 [rows][in] shared input
@@ -378,6 +379,11 @@ static int rows_multi(const pulsar_rows_linear *const *ls, int n, const uint16_t
     for (int j = 0; j < n; ++j) {   /* the mxfp8_lt / BF16 tiers, one by one (their own arms) */
         const pulsar_rows_linear *l = ls[j];
         if (l->nvfp4) continue;
+        if (yb && l->bf16 && !l->prompt) {   /* L339: the BF16 decode kernel's epilogue emits the bf16 rows */
+            if (pulsar_bf16_rows_linear_launch(l->w, x_bf16, rows, l->in, l->out, nullptr, yb[j], false, stream) != 0)
+                return -1;
+            continue;
+        }
         if (!l->k2 && pulsar_rows_linear_launch(l, x_bf16, rows, y[j], ws, ws_bytes, stream) != 0) return -1;
         if (yb && (!l->k2 || l->prompt) &&
             pulsar_rows_emit_bf16_launch(y[j], (uint64_t)l->out, (uint32_t)rows, (uint32_t)l->out, NULL,
