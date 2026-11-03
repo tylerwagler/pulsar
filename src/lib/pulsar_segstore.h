@@ -41,6 +41,8 @@
  * or pending): (0) a restore point that is not flagged and not on a branch point (a key with >= 2 children); (1) a
  * dominated leaf; (2) any other leaf, LRU; (3) a flagged or branch-point restore point.  A leaf's restore point so
  * always goes before the leaf.  The dominated rule applies only to a leaf without a restore point (so unflagged).
+ * An older end of a chain keeps its restore point when the chain goes on (a later branch resumes there -- an edited or
+ * regenerated turn); retention alone makes room: class (0) takes the unflagged ones first, the oldest first.
  *
  * L347 I3a (plans/124 D9): the RAM TIER.  With a pool attached (pulsar_segstore_set_ram), images are pool blocks; with
  * `retain` the image of every written file stays as its entry's RAM copy (residency: disk, or disk and RAM -- an entry
@@ -51,11 +53,10 @@
  * host, where host RAM is the GPU's) an image lives only while it is written or read.
  *
  * L347 I3b (plans/124 D7, D10): PINNED anchors and restore pins.  A restore point flagged PULSAR_SEGSTORE_RP_PINNED (a
- * judge's preamble, X-Pulsar-KV: pin-anchor) is never evicted from the disk or the RAM tier and never dropped as
- * superseded -- and so neither is any segment of its chain (its key's rows go only after its restore point, its
+ * judge's preamble, X-Pulsar-KV: pin-anchor) is never evicted from the disk or the RAM tier -- and so neither is any segment of its chain (its key's rows go only after its restore point, its
  * ancestors are not leaves).  A pin is taken away (logged, counted) only when the store needs room and nothing else
  * may go, or when the pinned anchors hold more than their budget (pulsar_segstore_set_pinned_max): the least recently
- * used first.  Apart from that, pulsar_segstore_pin holds a key against eviction and superseded drops while a restore
+ * used first.  Apart from that, pulsar_segstore_pin holds a key against eviction while a restore
  * reads its chain (the same count as a write in flight's parent). */
 
 #include <stdbool.h>
@@ -75,7 +76,7 @@
 #define PULSAR_SEGSTORE_RP_ANCHOR 1u
 /// Restore point flag (L347 I2): written at a periodic grid point (pulsar_kvchain_rp_periodic)
 #define PULSAR_SEGSTORE_RP_PERIODIC 2u
-/// Restore point flag (L347 I3b): a pinned anchor -- never evicted (disk or RAM), never superseded; its chain neither.
+/// Restore point flag (L347 I3b): a pinned anchor -- never evicted (disk or RAM); its chain neither.
 /// The header's flags word holds it (no layout change, so the .rp version stays)
 #define PULSAR_SEGSTORE_RP_PINNED 4u
 /// L347 I3a: a key's segment file (pulsar_segstore_map_part, pulsar_segstore_job_kind)
@@ -324,14 +325,6 @@ uint64_t pulsar_segstore_job_payload_bytes(const pulsar_segstore_job *job);
 /// @param job the job
 /// @return where its trailer goes in the image, NULL when it has none
 uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job);
-/** L347 I3a: mark a chain end's restore point job: its commit drops the restore points it supersedes
- *  (pulsar_segstore_drop_superseded_rps) -- once it is indexed, so a write that fails drops nothing.
- *  @param job a restore point job */
-void pulsar_segstore_job_supersede(pulsar_segstore_job *job);
-/** L347 I3a: how many restore points chain ends' commits have dropped as superseded, ever (a persist reads the change).
- *  @param st the store, or NULL (0)
- *  @return the count */
-uint64_t pulsar_segstore_superseded_count(const pulsar_segstore *st);
 /** L347 I3a: a segment file's bytes (header, text, payload, trailer).
  *  @param text_len      its text's bytes
  *  @param payload_bytes its payload's bytes
@@ -378,14 +371,6 @@ bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp
  *  @param flags PULSAR_SEGSTORE_RP_* to add
  *  @return true when the key has a restore point and its header took the flags */
 bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t flags);
-/** L347 I2: drop the restore points a chain end at `key` supersedes -- the earlier ends of the same chain: every
- *  ancestor's, and every leaf sibling's along the way whose text is a byte prefix of the chain's (an older tail of
- *  the same conversation) -- except a flagged one (anchor, periodic), a branch point's (a key with >= 2 children)
- *  and a key pinned or pending.  The segments stay.
- *  @param st  the store
- *  @param key 40 hex chars of the chain's end (stored)
- *  @return the number of restore points dropped */
-int pulsar_segstore_drop_superseded_rps(pulsar_segstore *st, const char key[41]);
 /** L347 I2: does the store hold the rows of text[0, len)?  True when a stored chain's text runs through byte `len`:
  *  one ends exactly there, or its next segment's own text starts with the rest of `text` (a tail written by an earlier
  *  request that went on past `len`; its text is read from its file only when the first bytes the index caches
@@ -502,7 +487,7 @@ void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_traile
 /// @return the number of keys
 /** Every key, 40 hex chars each, concatenated (caller frees); the count returned. */
 int pulsar_segstore_keys(pulsar_segstore *st, char **keys);
-/** L347 I3b: hold `key` against eviction and superseded drops -- a restore reading its chain -- until as many
+/** L347 I3b: hold `key` against eviction -- a restore reading its chain -- until as many
  *  pulsar_segstore_unpin.  The key need not be stored (an unpin of a dropped key only ends the count).
  *  @param st  the store, or NULL (no-op)
  *  @param key 40 hex chars */

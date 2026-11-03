@@ -385,6 +385,9 @@ Format (`src/lib/pulsar_segstore.h`, `src/lib/pulsar_kvchain.h`):
   dominated by a longer sibling, then the least recently used. Without
   `--kv-disk-space-mb` there is no budget. Pinned anchors are never evicted
   while anything else can go.
+  A chain that goes on keeps the restore points at its older ends, since an
+  edited or regenerated turn branches from one of them; restore points that
+  are not flagged (anchor, periodic) go first, the oldest first.
 
 ### The `X-Pulsar-KV` request header
 
@@ -396,7 +399,7 @@ An unknown token is refused with a 400 that names it.
 | Token | Effect |
 | --- | --- |
 | `read-only` | The request writes nothing to the disk KV cache: no rows, no restore points, no anchor (unless `pin-anchor` is also given). Its bank's history then writes nothing when it is later evicted, spilled, abandoned or saved at shutdown, until a request without `read-only` takes the bank. Restores still read the cache. |
-| `pin-anchor` | The request's anchor (the chat preamble up to the last user message before the first assistant turn, aligned down to the resume grid) is written on its first sighting if the store holds no restore point there, and pinned. A restore point already stored there is pinned instead. A pinned anchor and its chain are never evicted from the RAM tier or the disk and never dropped as superseded. A pin is lost only when the store needs room and nothing else can go, or past `--kv-pinned-max-mb`. |
+| `pin-anchor` | The request's anchor (the chat preamble up to the last user message before the first assistant turn, aligned down to the resume grid) is written on its first sighting if the store holds no restore point there, and pinned. A restore point already stored there is pinned instead. A pinned anchor and its chain are never evicted from the RAM tier or the disk. A pin is lost only when the store needs room and nothing else can go, or past `--kv-pinned-max-mb`. |
 
 A judge that sends the same preamble on every call uses
 `X-Pulsar-KV: read-only, pin-anchor`: each call restores the pinned preamble and

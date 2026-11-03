@@ -839,12 +839,12 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, what, &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
-    if (r.written || r.rp_written || r.rp_dropped)
+    if (r.written || r.rp_written)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB; %d restore "
-                   "points, %.1f MiB; copied out, written behind; %d superseded dropped) in %.1f ms",
+                   "points, %.1f MiB; copied out, written behind) in %.1f ms",
                    reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), r.rp_written,
-                   (double)r.rp_bytes / (1024.0 * 1024.0), r.rp_dropped, (server_now_sec() - t0) * 1000.0);
+                   (double)r.rp_bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
     if (r.no_room) {
         s->count_metric(&s->m_persist_no_room);
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache persist reason=%s: the %.0f MiB host pool had no room "
@@ -1046,8 +1046,7 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
 /* L347 I3b (plans/124 D7): a failure costs at most a miss.
  *
  * - The chain is PINNED in the store for the restore's life (kv_restore_begin .. kv_restore_end): the writer's
- *   commits and the persists of other banks between its slices neither evict it nor drop its restore point as
- *   superseded.
+ *   commits and the persists of other banks between its slices never evict it (nor its restore point).
  * - A failure drops only on a CONTENT fault, and only what the fault invalidates (pulsar_kvchain.h); a TRANSIENT one
  *   (no RAM room, the bank, the device, a TP rank's copy) drops nothing.
  * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and any

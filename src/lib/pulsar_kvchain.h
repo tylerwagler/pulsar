@@ -31,9 +31,9 @@
  *   point at the chain's end, flagged an anchor;
  *   and, whatever it asked, a periodic restore point at each grid point it passes
  *   that pulsar_kvchain_rp_periodic names, when the bank holds its checkpoint there
- *   (pulsar_kvchain_place_rps).  A new restore point at the chain's end drops the
- *   ones it supersedes once it is indexed (pulsar_segstore_job_supersede).  L347
- *   I3a: every file -- segment or restore point -- is COPIED OUT on the calling
+ *   (pulsar_kvchain_place_rps).  Older restore points stay when the chain goes on
+ *   (a branch from an older end resumes there); the store's eviction takes the
+ *   unflagged ones first, the oldest first.  L347 I3a: every file -- segment or restore point -- is COPIED OUT on the calling
  *   thread into its image (pulsar_session_copy_out_*: an event-fenced copy, the
  *   bank moves on) and handed to the writer (pulsar_kvchain_writer), which seals,
  *   writes and commits it.  The
@@ -121,9 +121,6 @@ typedef struct {
     uint64_t bytes;     ///< payload + trailer bytes copied out
     uint64_t rp_bytes;  ///< L347: bytes of the restore points this persist copied out (chain end and periodic; 0: none)
     int rp_written;     ///< L347 I2: how many restore points it handed to the writer
-    /// L347 I2 / I3a: how many superseded restore points were dropped while it ran (a chain end's commit drops them:
-    /// at once with the inline writer, when the background writer's job commits otherwise)
-    int rp_dropped;
     /// L347 I3a: a file could not be copied out: the store's RAM pool had no room and nothing in flight could make it
     /// (a spill that sees this does not free its bank)
     bool no_room;
@@ -178,9 +175,8 @@ typedef struct {
  *  last is the chain's end): a periodic one (PULSAR_SEGSTORE_RP_PERIODIC) at each link pulsar_kvchain_rp_periodic
  *  names, and with PULSAR_KVCHAIN_RP in `what` one at the chain's end (PULSAR_SEGSTORE_RP_ANCHOR with
  *  PULSAR_KVCHAIN_ANCHOR) -- each where `src` holds a checkpoint, one write per key (a key that has one gains the
- *  flags), copied out and handed to `writer`.  A restore point newly written at the chain's end drops those it
- *  supersedes when it commits (pulsar_segstore_job_supersede).  Counts into r (rp_bytes, rp_written, rp_dropped,
- *  no_room); the first failure is r->err (when it is empty).
+ *  flags), copied out and handed to `writer`.  Older restore points of the chain stay (eviction takes the unflagged ones
+ *  first, the oldest first).  Counts into r (rp_bytes, rp_written, no_room); the first failure is r->err (when it is empty).
  *  @param st     the store
  *  @param links  the chain's segments this persist passed, ascending
  *  @param n      how many
@@ -332,7 +328,7 @@ int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_
 /// @return as pulsar_kvchain_verify_slice_with
 int pulsar_kvchain_verify_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
                                 int *next, int k, char *err, size_t errlen);
-/** L347 I3b: hold every segment of `chain` against eviction and superseded drops (pulsar_segstore_pin) while a restore
+/** L347 I3b: hold every segment of `chain` against eviction (pulsar_segstore_pin) while a restore
  *  reads it, or end that hold -- one call each way.
  *  @param st    the store
  *  @param chain the chain

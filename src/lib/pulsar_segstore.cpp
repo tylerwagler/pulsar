@@ -87,7 +87,7 @@ struct pulsar_segstore {
     /// L338: keys being written (reserved, not committed): a second reserve of one writes nothing
     std::unordered_set<std::string> pending;
     /// L338: parents of the writes in flight, the restore point jobs' keys and (L347 I3b) the chains being restored
-    /// (pulsar_segstore_pin), with their count: eviction and the superseded drops never take one
+    /// (pulsar_segstore_pin), with their count: eviction never takes one
     std::unordered_map<std::string, int> pinned;
     /** L347 I3a: a file's image in host memory -- the file's bytes from offset 0, padded to the O_DIRECT granule. */
     struct image {
@@ -99,7 +99,6 @@ struct pulsar_segstore {
         uint64_t bytes = 0;   ///< its .rp file's bytes
         uint32_t flags = 0;   ///< its PULSAR_SEGSTORE_RP_* flags
         image img;            ///< L347 I3a: its image, kept as the entry's RAM copy at the segment's commit (retain)
-        bool supersede = false;   ///< L347 I3a: a chain end's: it drops the ones it supersedes once its segment commits
     };
     /// L347: restore points written for pending keys, moved onto the entry at its commit (or removed with a failed one)
     std::unordered_map<std::string, pending_point> pending_rp;
@@ -123,8 +122,6 @@ struct pulsar_segstore {
     static std::string hold_name(const std::string &key, bool rp) { return rp ? key + ".rp" : key; }
     /// L347 I3a: restore point writes in flight (pulsar_segstore_reserve_rp): key -> flags joined while it flies
     std::unordered_map<std::string, uint32_t> rp_jobs;
-    /// L347 I3a: restore points dropped as superseded by a chain end's commit, ever (pulsar_segstore_superseded_count)
-    uint64_t superseded = 0;
     /// L347 I3b: the PULSAR_SEGSTORE_RP_PINNED anchors' budget, bytes (pulsar_segstore_set_pinned_max; 0 = unbounded)
     uint64_t pinned_max = 0;
     /// L347 I3b: pins taken away, ever: over the budget, or the store out of room (pulsar_segstore_pins_released)
@@ -430,7 +427,7 @@ struct pulsar_segstore {
         return ch == children.end() ? 0u : ch->second.size();
     }
     /* L347 I2 (D5): the eviction classes, lowest first -- (0) a restore point neither flagged nor on a branch point (a
-     * dead end's or a superseded one's: big, and a restore from it is the cheapest thing to lose); (1) a dominated leaf
+     * dead end's or an older end of a chain: big, and a restore from it is the cheapest thing to lose); (1) a dominated leaf
      * (L323; only a leaf without a restore point, so never a flagged one); (2) any other leaf; (3) a flagged (anchor,
      * periodic) or branch-point restore point: where restores of many requests start.  -1: not a candidate (a segment
      * with children and no restore point; L347 I3b: a PINNED anchor's restore point, and so its rows). */
@@ -809,7 +806,6 @@ struct pulsar_segstore_job {
     uint64_t payload_bytes;  ///< the payload's bytes (its last 8 are its digest, sealed by job_write)
     uint64_t trailer_bytes;  ///< the trailer's bytes (0 = none; rows only)
     uint32_t flags;          ///< the restore point's PULSAR_SEGSTORE_RP_* flags as its header carries them (rp only)
-    bool supersede;          ///< a chain end's restore point: its commit drops those it supersedes (rp only)
     uint64_t need;           ///< the file's bytes
     pulsar_segstore::image img;   ///< the file's image
     std::string final_path;  ///< `<dir>/<key>.seg` or `.rp`
@@ -878,7 +874,6 @@ int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_
     j->payload_bytes = payload_bytes;
     j->trailer_bytes = trailer_bytes;
     j->flags = 0;
-    j->supersede = false;
     j->need = need;
     j->img = img;
     j->final_path = st->path(key);
@@ -963,7 +958,6 @@ int pulsar_segstore_reserve_rp(pulsar_segstore *st, const char key[41], uint64_t
     j->payload_bytes = rp_bytes;
     j->trailer_bytes = 0;
     j->flags = joined;
-    j->supersede = false;
     j->need = need;
     j->img = img;
     j->final_path = st->rp_path(j->key);
@@ -994,10 +988,6 @@ uint64_t pulsar_segstore_job_payload_bytes(const pulsar_segstore_job *job) { ret
 uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job) {
     return job->trailer_bytes ? job->img.p + job->payload_off + job->payload_bytes : nullptr;
 }
-
-void pulsar_segstore_job_supersede(pulsar_segstore_job *job) { job->supersede = true; }
-
-uint64_t pulsar_segstore_superseded_count(const pulsar_segstore *st) { return st ? st->superseded : 0u; }
 
 uint64_t pulsar_segstore_seg_file_bytes(uint64_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes) {
     return HDR + text_len + payload_bytes + trailer_bytes;
@@ -1090,7 +1080,6 @@ static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool writte
         it->second.rp_bytes = job->need;
         it->second.rp_flags = kept;
         st->img_keep(st->ram_rp, key, job->img);
-        if (job->supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
         if (kept & PULSAR_SEGSTORE_RP_PINNED) {   /* L347 I3b */
             it->second.last_used = (uint64_t)time(nullptr);
             st->enforce_pinned_max();
@@ -1102,7 +1091,6 @@ static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool writte
         pp.bytes = job->need;
         pp.flags = kept;
         pp.img = job->img;
-        pp.supersede = job->supersede;
         st->used += job->need;
         return true;
     }
@@ -1163,7 +1151,6 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         st->refresh_dominated(e.parent);
         st->img_keep(st->ram_rows, key, job->img);
         if (rp.bytes) st->img_keep(st->ram_rp, key, rp.img);
-        if (rp.bytes && rp.supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
         if (rp.bytes && (rp.flags & PULSAR_SEGSTORE_RP_PINNED)) st->enforce_pinned_max();   /* L347 I3b */
         indexed = true;
     }
@@ -1226,46 +1213,6 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
         st->enforce_pinned_max();
     }
     return true;
-}
-
-int pulsar_segstore_drop_superseded_rps(pulsar_segstore *st, const char key[41]) {
-    if (!st) return 0;
-    std::string cur(key, 40);
-    if (!st->segs.count(cur)) return 0;
-    /* may this key's restore point go?  Not flagged, not a branch point, no write in flight */
-    auto droppable = [st](const std::string &k) {
-        const pulsar_segstore_seg &e = st->segs[k];
-        return e.rp_bytes > 0u && e.rp_flags == 0u && st->n_children(k) < 2u && !st->pinned.count(k) &&
-               !st->pending.count(k) && !st->rp_jobs.count(k);
-    };
-    int dropped = 0;
-    for (;;) {
-        const std::string parent = st->segs[cur].parent;
-        /* an older tail of this conversation under the same parent: a leaf whose text is a byte prefix of cur's (so
-         * dominated, the index's cheap test first; then the texts) */
-        std::string cur_text;
-        bool have_cur = false;
-        auto sib = st->children.find(parent);
-        if (sib != st->children.end())
-            for (const std::string &c : sib->second) {
-                const pulsar_segstore_seg &e = st->segs[c];
-                if (c == cur || !e.dominated || st->n_children(c) != 0u || !droppable(c) ||
-                    e.text_len >= st->segs[cur].text_len)
-                    continue;
-                if (!have_cur && !(have_cur = st->read_text(cur, &cur_text))) break;
-                std::string t;
-                if (!st->read_text(c, &t) || memcmp(t.data(), cur_text.data(), t.size()) != 0) continue;
-                st->drop_rp_of(st->segs[c], "superseded by a later end of its chain");
-                dropped++;
-            }
-        if (parent.empty()) break;
-        if (droppable(parent)) {
-            st->drop_rp_of(st->segs[parent], "superseded by a later end of its chain");
-            dropped++;
-        }
-        cur = parent;
-    }
-    return dropped;
 }
 
 bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, bool *rp_at_len) {

@@ -108,12 +108,11 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
  *  @param src    where the state at G comes from
  *  @param link   the segment ending at G (stored, or being written)
  *  @param flags  its PULSAR_SEGSTORE_RP_* flags
- *  @param end    it is the chain's end: its commit drops the restore points it supersedes
  *  @param writer where it goes
  *  @param r      counters updated on a write; `r->err` set on failure
  *  @return true when the store holds (or is writing) the restore point, or `src` holds no checkpoint at G */
 bool kvchain_put_rp(pulsar_segstore *st, const pulsar_kvchain_rp_source *src, const pulsar_kvchain_link &link,
-                    uint32_t flags, bool end, const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r) {
+                    uint32_t flags, const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r) {
     pulsar_segstore_seg had;
     if (pulsar_segstore_get(st, link.key, &had) && had.rp_bytes > 0u) {
         if (pulsar_segstore_flag_rp(st, link.key, flags)) return true;
@@ -131,7 +130,6 @@ bool kvchain_put_rp(pulsar_segstore *st, const pulsar_kvchain_rp_source *src, co
         (void)pulsar_segstore_commit(st, job, false);
         return false;
     }
-    if (end) pulsar_segstore_job_supersede(job);
     writer->submit(writer->ud, job);
     r->rp_bytes += bytes;
     r->rp_written++;
@@ -183,7 +181,6 @@ bool pulsar_kvchain_rp_periodic(int G, int grid) {
 void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
                               const pulsar_kvchain_rp_source *src, const pulsar_kvchain_writer *writer,
                               pulsar_kvchain_persist_result *r) {
-    const uint64_t dropped0 = pulsar_segstore_superseded_count(st);
     for (int i = 0; i < n; i++) {
         const bool end = i == n - 1 && (what & PULSAR_KVCHAIN_RP);
         uint32_t flags = pulsar_kvchain_rp_periodic(links[i].G, grid) ? PULSAR_SEGSTORE_RP_PERIODIC : 0u;
@@ -192,13 +189,12 @@ void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *li
         if (!end && flags == 0u) continue;
         pulsar_kvchain_persist_result one;
         memset(&one, 0, sizeof one);
-        const bool ok = kvchain_put_rp(st, src, links[i], flags, end, writer, &one);
+        const bool ok = kvchain_put_rp(st, src, links[i], flags, writer, &one);
         r->rp_bytes += one.rp_bytes;
         r->rp_written += one.rp_written;
         r->no_room = r->no_room || one.no_room;
         if (!ok && !r->err[0]) memcpy(r->err, one.err, sizeof(r->err));
     }
-    r->rp_dropped += (int)(pulsar_segstore_superseded_count(st) - dropped0);
 }
 
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
