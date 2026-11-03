@@ -1522,7 +1522,10 @@ void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = server_xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        req.raw_body = server_xstrndup(hr.body, hr.body_len);
+        req.hints = hr.hints;   /* L249 D */
+    }
     if (ok && hr.kv_flags) {   /* L347 I3b: counted; said once per distinct token set */
         req.kv_flags = hr.kv_flags;
         pthread_mutex_lock(&s->mu);
@@ -1535,9 +1538,6 @@ void *client_main(void *arg) {
         if (first)
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache: requests carry X-Pulsar-KV: %s (first on %s; said "
                        "once per token set)", kv_header_words(req.kv_flags), hr.path);
-    if (ok) {
-        req.raw_body = server_xstrndup(hr.body, hr.body_len);
-        req.hints = hr.hints;
     }
     if (ok && s->capture) {
         /* L216 --capture-requests: the accepted body verbatim, one JSON line. */
