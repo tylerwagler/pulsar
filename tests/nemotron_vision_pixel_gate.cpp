@@ -7,8 +7,10 @@
  *      LLM tokens (0 tolerance)
  *   P  the pixels (pulsar_nemotron_h_image_prepare: the engine's codec, torch's antialiased bicubic, the
  *      normalisation): the tile's size; the bf16 values the tower reads bit-exact where the golden carries them all,
- *      the f32 sample bit-exact everywhere (PIX_F32_ULPS / PIX_BF16_FLIPS 0: the resize reproduces the contraction
- *      of torch's build, vision.cpp; a torch built otherwise would move by an ulp, and the gate says so); the patches
+ *      the f32 sample bit-exact on x86-64 (PIX_F32_ULPS / PIX_BF16_FLIPS 0: the resize reproduces the contraction
+ *      of torch's x86 build, vision.cpp; a torch built otherwise would move by an ulp, and the gate says so); on other
+ *      architectures graded at the tower's bf16 (the sampled values round to torch's bf16, one-step flips <= 1e-3,
+ *      and lie within 64 f32 ulps: the compiler there fuses other multiply-adds, L331); the patches
  *      in merge-block order == the pixels
  *   C  the CPE position rows (pulsar_nemotron_h_positions) == modeling_radio's own interpolation, on the golden's
  *      synthetic table, every value within POS_REL of the reference (torch's channels-last bilinear kernel sums the
@@ -28,8 +30,19 @@
 
 #include <vector>
 
-#define PIX_F32_ULPS 0          /* bit-exact: the resize reproduces torch's contraction (vision.cpp) */
+#if defined(__x86_64__)
+/* the goldens' own architecture: bit-exact -- the build contracts the resize's multiply-adds as torch's x86 kernels do */
+#define PIX_F32_ULPS 0          /* every sampled f32 value */
 #define PIX_BF16_FLIPS 0.0      /* and so every bf16 value the tower reads */
+#else
+/* L331 (2026-11-02): elsewhere the compiler fuses other multiply-adds than torch's x86 AVX2 kernels did, and no
+ * per-expression rule reproduces x86's choices (tried: -ffp-contract=off plus explicit fmaf moved the drift, never
+ * removed it).  Graded where the tower reads: a sampled value rounds to torch's bf16 (one-step flips <= 1e-3 of the
+ * samples, none further) and stays within 64 f32 ulps -- aarch64 GB10 measured <= 58 on the two largest downscales,
+ * 0 bf16 values off on every image whose bf16 the goldens store */
+#define PIX_F32_ULPS 64
+#define PIX_BF16_FLIPS 1e-3
+#endif
 #define POS_REL 1e-6            /* the positions: relative to the table's scale (0.5) */
 
 static int g_fail = 0, g_checks = 0;
@@ -112,10 +125,16 @@ int main(int argc, char **argv) {
             if (g != want_bf16[i]) (abs((int)g - (int)want_bf16[i]) == 1 ? flips : worse)++;
         }
         int64_t max_ulp = 0;
+        size_t s_flips = 0, s_worse = 0;   /* the sampled values at the tower's precision */
         for (size_t k = 0; k < sample.size(); k++) {
             const int64_t u = ulps(img.pixels[k * stride], sample[k]);
             if (u > max_ulp) max_ulp = u;
+            const uint16_t g = bf16_of(img.pixels[k * stride]), t = bf16_of(sample[k]);
+            if (g != t) (abs((int)g - (int)t) == 1 ? s_flips : s_worse)++;
         }
+        CHECK(s_worse == 0 && (double)s_flips <= PIX_BF16_FLIPS * (double)sample.size(),
+              "pixels %u: %zu sampled values round to a bf16 one step from torch's (limit %.0e of %zu), %zu further", c,
+              s_flips, PIX_BF16_FLIPS, sample.size(), s_worse);
         CHECK(worse == 0 && (double)flips <= PIX_BF16_FLIPS * (double)n,
               "pixels %u: %zu bf16 values one step off (limit %.0e of %zu), %zu further", c, flips, PIX_BF16_FLIPS, n,
               worse);
@@ -133,8 +152,8 @@ int main(int argc, char **argv) {
                                        bf16_of(img.pixels[((size_t)ch * H + r * 16 + y) * W + col * 16 + x]);
             }
         CHECK(patch_ok, "pixels %u: a patch element is not its pixel (merge-block order)", c);
-        printf("P pixels %u: %ux%u px, %u tokens; bf16 %s (%zu one step off), f32 sample max %lld ulps\n", c, W, H, ntok,
-               full ? "graded" : "not stored", flips, (long long)max_ulp);
+        printf("P pixels %u: %ux%u px, %u tokens; bf16 %s (%zu one step off), f32 sample max %lld ulps, sample bf16 %zu "
+               "one step off\n", c, W, H, ntok, full ? "graded" : "not stored", flips, (long long)max_ulp, s_flips);
     }
     /* C: the CPE positions on the synthetic table */
     {
