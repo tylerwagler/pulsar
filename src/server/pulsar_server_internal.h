@@ -1179,6 +1179,18 @@ extern const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS];
  *  @param t the trigger
  *  @return its PULSAR_KVCHAIN_* request */
 unsigned kv_persist_writes(kv_persist_trigger t);
+/** L347: is a chain end's restore point worth writing at a loss?  Only one the restore rule would load: `gain` tokens
+ *  past the history's deepest stored restore point, whose re-prefill (`prefill_ms`) costs more than twice the read of
+ *  the restore point and the rows past that point (`read_ms`).  Unmeasured or unpriced: written (the load measures).
+ *  A one-shot judge call (~200 tokens past its anchor) writes none: 78 such 238 MiB writes cost the evicting requests
+ *  215-380 ms each in window 51 (2026-11-03). */
+/// @param gain       tokens past the deepest stored restore point
+/// @param measured   the read meter has a fit
+/// @param read_ms    its price for the restore point + the rows past that point
+/// @param priced     the prefill fit priced the gain
+/// @param prefill_ms that price
+/// @return true when the restore point is to be written
+bool kv_rp_worth(uint32_t gain, bool measured, double read_ms, bool priced, double prefill_ms);
 
 /// The segment store (src/lib/pulsar_segstore.h).
 typedef struct pulsar_segstore pulsar_segstore;
@@ -2407,6 +2419,10 @@ struct server {
     /// @param sl         the slot whose bank is installed (unused beyond that precondition)
     /// @param why        the trigger: what is written and the log word
     /// @param chain_end  receives the stored chain's end position in tokens (0: none); may be NULL
+    /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point at a loss when
+     *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @return the PULSAR_KVCHAIN_*
+     *  mask */
+    unsigned kv_rp_writes_for_loss(kv_persist_trigger why);
     int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr);
     /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
      *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.

@@ -675,6 +675,48 @@ int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t er
 }
 }  // namespace
 
+bool kv_rp_worth(uint32_t gain, bool measured, double read_ms, bool priced, double prefill_ms) {
+    if (gain == 0u) return false;                 /* the chain already has its state there */
+    if (!measured || !priced) return true;        /* unknown: write it, and the load that follows measures */
+    return read_ms < 0.5 * prefill_ms;            /* kv_restore_decide's rule: only a point it would load */
+}
+
+unsigned server::kv_rp_writes_for_loss(kv_persist_trigger why) {
+    auto *s = this;
+    unsigned what = kv_persist_writes(why);
+    if (!(what & PULSAR_KVCHAIN_RP) || (what & PULSAR_KVCHAIN_ANCHOR)) return what;
+    const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
+    const TokPos end_pos = toks ? pulsar_session_persist_end(s->sess) : TokPos{0};
+    if (end_pos.is_none() || end_pos.raw() <= 0) return what;
+    const int E = pulsar_session_checkpoint_best(s->sess, end_pos).raw();
+    if (E <= 0) return what;
+    /* the deepest restore point already stored on this history (an anchor, a periodic point, an earlier end) */
+    pulsar_tokens head = *toks;
+    head.len = E;
+    size_t len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
+    kv_chain_hit hit;
+    const int D = text ? kv_cache_find(text, NULL, 0, &hit) : 0;
+    free(text);
+    const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
+    uint64_t rp = pulsar_session_restore_point_bytes(s->sess, TokPos{E});
+    uint64_t state = 0;
+    const uint64_t rows = gain ? pulsar_session_segment_bytes(s->sess, TokPos{D}, TokPos{E}, &state) : 0u;
+    double read_ms = 0.0, prefill_ms = 0.0;
+    pthread_mutex_lock(&s->mu);
+    const bool measured = kv_read_cost_ms(&s->kv.meter.read, rp + rows, 0, server_now_sec(), &read_ms);
+    pthread_mutex_unlock(&s->mu);
+    const int cap = pulsar_session_prefill_cap(s->sess).raw();
+    const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D, cap > 0 ? (uint32_t)cap : 0u,
+                                                         &prefill_ms);
+    if (kv_rp_worth(gain, measured, read_ms, priced, prefill_ms)) return what;
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: kv cache %s: no restore point at %d: %u tokens past the stored one at %d re-prefill in "
+               "%.1f ms, cheaper than its read (%.1f ms)", kv_persist_trigger_names[why], E, gain, D, prefill_ms,
+               read_ms);
+    return what & ~PULSAR_KVCHAIN_RP;
+}
+
 int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end) {
     auto *s = this;
     const char *reason = kv_persist_trigger_names[why];
@@ -716,8 +758,9 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     const pulsar_kvchain_writer writer = { s->kv.writer, kv_writer_admit, kv_writer_submit };
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, kv_persist_writes(why), &tool_maps,
-                           &writer, &r);
+    /* L347: a loss writes the chain end's restore point only where kv_restore_decide would load it */
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, kv_rp_writes_for_loss(why),
+                           &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
     if (r.written || r.rp_written || r.rp_dropped)

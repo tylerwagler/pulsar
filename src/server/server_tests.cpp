@@ -7781,6 +7781,13 @@ static bool l347_seg_at(pulsar_segstore *st, int G, pulsar_segstore_seg *out) {
  * is flagged so. */
 static void test_l347_i2_trigger_table(void) {
     TEST_ASSERT(kv_persist_writes(KV_PERSIST_CONTINUED) == 0u);
+    /* L347: a loss writes its restore point only where the restore rule would load it */
+    TEST_ASSERT(!kv_rp_worth(0u, true, 10.0, true, 1000.0));       /* the chain already has its state there */
+    TEST_ASSERT(kv_rp_worth(200u, false, 0.0, true, 60.0));        /* unmeasured: write, the load measures */
+    TEST_ASSERT(kv_rp_worth(200u, true, 150.0, false, 0.0));       /* unpriced: write */
+    TEST_ASSERT(!kv_rp_worth(200u, true, 150.0, true, 60.0));      /* the judge: 200 tokens past its anchor */
+    TEST_ASSERT(kv_rp_worth(7800u, true, 180.0, true, 2400.0));    /* a 7.8K chat: its read wins */
+    TEST_ASSERT(!kv_rp_worth(800u, true, 150.0, true, 300.0));     /* exactly 2x: not under half -- no */
     TEST_ASSERT(kv_persist_writes(KV_PERSIST_PROMPT) == PULSAR_KVCHAIN_TAIL);
     TEST_ASSERT(kv_persist_writes(KV_PERSIST_TERMINAL) == PULSAR_KVCHAIN_TAIL);
     const kv_persist_trigger loss[] = { KV_PERSIST_EVICT, KV_PERSIST_SPILL, KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
