@@ -117,7 +117,7 @@ bool judge_num(const pyjson_value *v, double *out) {
 }
 
 /// Append a JSON string as Python's json.dumps writes it with ensure_ascii (the default): the short escapes, other
-/// controls and every non-ASCII codepoint as \uXXXX (UTF-16, surrogate pairs past the BMP).
+/// controls and every non-ASCII codepoint as \\uXXXX (UTF-16, surrogate pairs past the BMP).
 /// @param s UTF-8 text
 /// @param out the literal is appended here
 void judge_dump_ascii(const std::string &s, std::string *out) {
@@ -296,6 +296,9 @@ void server_judge_close(server *s) {
     s->judge = NULL;
 }
 
+/// A judge job waits (read under s->mu).
+/// @param s the server
+/// @return true when the worker has judge work
 bool server_judge_queued(const server *s) { return s->judge && s->judge->head; }
 
 bool server_judge_step(server *s) {

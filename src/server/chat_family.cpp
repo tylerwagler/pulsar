@@ -292,6 +292,7 @@ bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, int s
  * integer the map's integer reading (or the nearest preset's column), nothing sent the template's default;
  * thinking off is the "none" column. */
 /// @param e  the engine (the template default's source)
+/// @param s  the server (its --reasoning default; NULL = unset)
 /// @param c  the conversation (its thinking / effort controls)
 /// @param r  the request: receives think_mode and family_effort
 /// @param err     receives the reason on false

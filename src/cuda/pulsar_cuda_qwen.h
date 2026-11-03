@@ -406,10 +406,15 @@ typedef struct pulsar_rows_moe_shared {
     void *ws;                            /**< the dense arm's workspace, pulsar_rows_moe_shared_ws_bytes */
     /// Bytes at `ws`.
     size_t ws_bytes;
-    /** L338: a runtime LoRA on each Linear (pulsar_cuda_f16_rows.h, the fp16 tensor cores), added to its f32 output
+    /** @var lora_gate
+     *  L338: a runtime LoRA on each Linear (pulsar_cuda_f16_rows.h, the fp16 tensor cores), added to its f32 output
      *  before the activation's producer / the caller's emit, on the rows `lora_rows` marks (NULL = every row) -- all
      *  three NULL = none; each on its Linear's row kind (`prompt`).  Only pulsar_rows_moe_shared_launch / _ys_launch
-     *  take it; a riding shared expert with one is refused. */
+     *  take it; a riding shared expert with one is refused.
+     *  @var lora_up
+     *  The up Linear's runtime LoRA, or NULL.
+     *  @var lora_down
+     *  The down Linear's runtime LoRA, or NULL. */
     const struct pulsar_rows_lora *lora_gate, *lora_up, *lora_down;
     const uint8_t *lora_rows;            /**< device u8 [T]: the rows the LoRAs apply to, or NULL = every row */
     void *lora_ws;                       /**< the LoRAs' workspace (with any LoRA): pulsar_rows_lora_workspace_bytes */

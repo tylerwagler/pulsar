@@ -113,7 +113,7 @@ void pulsar_gemma4_plan(const pulsar_gemma4_shape *s, pulsar_layer_plan *plan);
  *  workspace holds max_rows x this many f32); a container's larger rank is refused at load. */
 #define PULSAR_GEMMA4_LORA_RANK_MAX 64u
 
-/** L338 P2: one targeted projection's LoRA pair (adapters.py: adapter.layers.N.<proj>.lora_{A,B}), applied at runtime
+/** L338 P2: one targeted projection's LoRA pair (adapters.py: `adapter.layers.N.<proj>.lora_{A,B}`), applied at runtime
  *  as y += scale * B (A x) at the projection's LOGICAL widths -- A f32 [r][in] (ne in, r), B f32 [out][r] (ne r, out);
  *  both NULL when the container carries no adapter or the layer has no such projection. */
 typedef struct {

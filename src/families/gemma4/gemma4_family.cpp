@@ -195,8 +195,9 @@ int model_id(const pulsar_engine *) { return 7; }
  *  @param e  the engine
  *  @return the shape's max_context (max_position_embeddings), in tokens */
 uint64_t trained_context(const pulsar_engine *e) { return model_of(e)->shape.max_context; }
-/** pulsar_family::drafter: none is loaded (L338 P3 brings the DFlash block drafter).
- *  @return PULSAR_DRAFTER_NONE */
+/** pulsar_family::drafter: the DFlash block drafter when the container carries one (L338 P3).
+ *  @param e  the engine
+ *  @return PULSAR_DRAFTER_BLOCK with a block drafter loaded, else PULSAR_DRAFTER_NONE */
 pulsar_drafter_kind drafter(pulsar_engine *e) {
     const pulsar_gemma4_model *w = (const pulsar_gemma4_model *)e->family_state;
     return w && w->block ? PULSAR_DRAFTER_BLOCK : PULSAR_DRAFTER_NONE;
