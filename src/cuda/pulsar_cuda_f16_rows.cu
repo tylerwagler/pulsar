@@ -25,6 +25,14 @@ size_t up256(size_t b) { return (b + 255u) & ~(size_t)255u; }
 /// @return 2^p, built from the exponent bits.
 __device__ __forceinline__ float pow2(int p) { return __int_as_float((p + 127) << 23); }
 
+/// @param v an element.
+/// @return v as f32.
+__device__ __forceinline__ float as_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+/// @param v an element.
+/// @return v.
+__device__ __forceinline__ float as_f32(float v) { return v; }
+/* L338: the source's element type (bf16 rows, or the runtime LoRA's f32 intermediate) and its row pitch are
+ * parameters; the arithmetic is the one the arm had */
 /* one CTA per row: the row's amax, then the scaled f16 plane and the row's inverse scale */
 /// Grid M (one CTA per row), kThreads threads: xh[m] = f16(x[m] * 2^p), p putting the row's largest |value| just
 /// under 2^kHiExp; inv[m] = 2^-p.
@@ -34,14 +42,6 @@ __device__ __forceinline__ float pow2(int p) { return __int_as_float((p + 127) <
 /// @param xh out: the scaled rows, f16 [M][K].
 /// @param inv out: each row's inverse scale, f32 [M].
 /// @param K row width.
-/// @param v an element.
-/// @return v as f32.
-__device__ __forceinline__ float as_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
-/// @param v an element.
-/// @return v.
-__device__ __forceinline__ float as_f32(float v) { return v; }
-/* L338: the source's element type (bf16 rows, or the runtime LoRA's f32 intermediate) and its row pitch are
- * parameters; the arithmetic is the one the arm had */
 template <class T>
 __global__ void __launch_bounds__(kThreads)
 prep_kernel(const T *__restrict__ x, size_t ld_x, __half *__restrict__ xh, float *__restrict__ inv, int K) {

@@ -35,7 +35,7 @@ const pulsar_role_admit A_F16 = {PULSAR_ROLE_PLAIN(PULSAR_TENSOR_F16), false, PU
 
 /** L338 P2: one projection's LoRA pair at its logical widths: A [r][in] (ne in, r), B [out][r] (ne r, out).
  *  @param b      the open binder
- *  @param target the projection's bind role (attn_q ...): the pair is <target>_lora_a / _lora_b
+ *  @param target the projection's bind role (attn_q ...): the pair is `<target>_lora_a` / `_lora_b`
  *  @param il     the layer
  *  @param r      the rank
  *  @param in     the projection's logical input width
