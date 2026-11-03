@@ -203,15 +203,18 @@ static int worker_ack_live(pulsar_engine *e, uint64_t sid, int rc, pulsar_sessio
     return -1;
 }
 
-/* L264 S4e: this rank's copy of a disk KV segment the leader's store names. */
+/* L264 S4e: this rank's copy of a disk KV segment the leader's store names; L347: its restore point is
+ * `<path>.rp` beside it. */
 /// @param e      the worker engine (its tp_kv_dir)
 /// @param key    the segment key (40 characters)
-/// @param out    receives `<tp_kv_dir>/<key>.tpseg`
+/// @param part   PULSAR_TP_SEGMENT_PART_ROWS (the segment) or _RESTORE_POINT
+/// @param out    receives `<tp_kv_dir>/<key>.tpseg`, or `<tp_kv_dir>/<key>.tpseg.rp` for the restore point
 /// @param outlen bytes of `out`
 /// @return false without a kv dir, on a malformed key, or when the path does not fit
-static bool worker_segment_path(pulsar_engine *e, const char *key, char *out, size_t outlen) {
+static bool worker_segment_path(pulsar_engine *e, const char *key, uint32_t part, char *out, size_t outlen) {
     if (!e->tp_kv_dir || !pulsar_tp_segment_key_ok(key)) return false;
-    const int w = snprintf(out, outlen, "%s/%.40s.tpseg", e->tp_kv_dir, key);
+    const int w = snprintf(out, outlen, "%s/%.40s.tpseg%s", e->tp_kv_dir, key,
+                           part == PULSAR_TP_SEGMENT_PART_RESTORE_POINT ? ".rp" : "");
     return w > 0 && (size_t)w < outlen;
 }
 
@@ -234,16 +237,18 @@ static bool worker_mkdir_p(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-/* The installed bank's segment [G_prev, G), durably: tmp + fsync + rename, and
- * out of the page cache (L261). */
+/* The installed bank's segment [G_prev, G) (part 0) or its restore point at G (part 1, L347), durably: tmp + fsync +
+ * rename, and out of the page cache (L261). */
 /// @param s      the session
-/// @param path   the segment's path
-/// @param G_prev the span's start, in tokens
+/// @param path   the file's path (worker_segment_path of the same part)
+/// @param part   PULSAR_TP_SEGMENT_PART_ROWS or _RESTORE_POINT
+/// @param G_prev the span's start, in tokens (part 0)
 /// @param G      the span's end, in tokens
 /// @param err    receives the failure
 /// @param errlen bytes of `err`
 /// @return true when the file is in place (the temp file removed otherwise)
-static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev, int G, char *err, size_t errlen) {
+static bool worker_segment_save(pulsar_session *s, const char *path, uint32_t part, int G_prev, int G, char *err,
+                                size_t errlen) {
     char tmp[4700];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
     FILE *fp = fopen(tmp, "wb");
@@ -252,8 +257,10 @@ static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev,
         return false;
     }
     err[0] = '\0';
-    bool ok = s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen) == 0 &&
-              fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    const int rc = part == PULSAR_TP_SEGMENT_PART_RESTORE_POINT
+                       ? s->save_restore_point(fp, (uint32_t)G, err, errlen)
+                       : s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
+    bool ok = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
     if (ok) pulsar_writeback_drop_file(fp);
     const int saved_errno = errno;
     if (fclose(fp) != 0) ok = false;
@@ -266,7 +273,8 @@ static bool worker_segment_save(pulsar_session *s, const char *path, int G_prev,
 }
 
 /* Load this rank's copy and reach the state the leader states: the same span
- * end and the same history digest. */
+ * end and the same history digest.  L347: the chain's last segment reads this
+ * rank's restore point too (`<path>.rp`). */
 /// @param s      the session
 /// @param path   the segment's path
 /// @param cmd    the leader's segment command (its span end, digest and last flag)
@@ -280,11 +288,26 @@ static bool worker_segment_load(pulsar_session *s, const char *path, const pulsa
         snprintf(err, errlen, "no copy %.400s: %s", path, strerror(errno));
         return false;
     }
+    FILE *rp = NULL;
+    struct stat rst;
+    if (cmd->last != 0) {
+        char rp_path[4700];
+        snprintf(rp_path, sizeof(rp_path), "%s.rp", path);
+        rp = fopen(rp_path, "rb");
+        if (!rp || fstat(fileno(rp), &rst) != 0) {
+            snprintf(err, errlen, "no restore point %.400s: %s", rp_path, strerror(errno));
+            if (rp) fclose(rp);
+            fclose(fp);
+            return false;
+        }
+    }
     struct stat st;
     uint32_t G = 0;
     err[0] = '\0';
     bool ok = fstat(fileno(fp), &st) == 0 &&
-              s->load_segment(fp, (uint64_t)st.st_size, cmd->last != 0, &G, err, errlen) == 0;
+              s->load_segment(fp, (uint64_t)st.st_size, cmd->last != 0, rp, rp ? (uint64_t)rst.st_size : 0u, &G, err,
+                              errlen) == 0;
+    if (rp) fclose(rp);
     fclose(fp);
     if (ok && ((int)G != cmd->G || pulsar_session_checkpoint_digest(s) != cmd->digest)) {
         snprintf(err, errlen, "the copy loaded to %u (digest %016llx); the leader stands at %d (digest %016llx)",
@@ -311,9 +334,9 @@ static void worker_segment_reconcile(pulsar_engine *e, const char *keys, uint32_
         const char *name = de->d_name;
         const size_t len = strlen(name);
         bool keep = false;
-        if (len == 46 && !strcmp(name + 40, ".tpseg")) {
+        if ((len == 46 && !strcmp(name + 40, ".tpseg")) || (len == 49 && !strcmp(name + 40, ".tpseg.rp"))) {
             for (uint32_t i = 0; i < n_keys && !keep; i++) keep = !memcmp(keys + (size_t)i * 40u, name, 40);
-        } else if (!strstr(name, ".tpseg.tmp.")) {
+        } else if (!strstr(name, ".tpseg.tmp.") && !strstr(name, ".tpseg.rp.tmp.")) {
             continue;   /* not ours */
         }
         if (keep) { kept++; continue; }
@@ -813,10 +836,11 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (worker_refused(e, c, "kv segment save", &slot, ferr, sizeof(ferr))) {
             status = -1;   /* a refusal (the ranks diverged), not a miss */
             fprintf(stderr, "pulsar: tp worker: kv segment save refused: %s\n", ferr);
-        } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
+        } else if (!worker_segment_path(e, c->segment.key, c->segment.part, path, sizeof(path))) {
             fprintf(stderr, "pulsar: tp worker: kv segment save refused: no segment directory on this rank "
                             "(pulsar_engine_options.tp_kv_dir)\n");
-        } else if (!worker_segment_save(slot->s, path, c->segment.G_prev, c->segment.G, ferr, sizeof(ferr))) {
+        } else if (!worker_segment_save(slot->s, path, c->segment.part, c->segment.G_prev, c->segment.G, ferr,
+                                        sizeof(ferr))) {
             fprintf(stderr, "pulsar: tp worker: kv segment save failed: %s\n", ferr);
         } else {
             status = 0;
@@ -832,7 +856,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         if (worker_refused(e, c, "kv segment load", &slot, ferr, sizeof(ferr))) {
             status = -1;   /* a refusal (the ranks diverged), not a miss */
             fprintf(stderr, "pulsar: tp worker: kv segment load refused: %s\n", ferr);
-        } else if (!worker_segment_path(e, c->segment.key, path, sizeof(path))) {
+        } else if (!worker_segment_path(e, c->segment.key, PULSAR_TP_SEGMENT_PART_ROWS, path, sizeof(path))) {
             fprintf(stderr, "pulsar: tp worker: kv segment load refused: no segment directory on this rank\n");
         } else if (!worker_segment_load(slot->s, path, &c->segment, ferr, sizeof(ferr))) {
             fprintf(stderr, "pulsar: tp worker: kv segment load miss (%.40s): %s\n", c->segment.key, ferr);
@@ -842,9 +866,14 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         return worker_ack(e, c->session_id, status, err, errlen);
     }
     case PULSAR_TP_FRAME_SEGMENT_DROP: {
-        /* void: a copy the leader's store no longer names. */
+        /* void: a copy the leader's store no longer names (part 0: the segment and its restore point; part 1, L347:
+         * the restore point alone). */
         char path[4600];
-        if (worker_segment_path(e, c->segment.key, path, sizeof(path))) (void)unlink(path);
+        if (worker_segment_path(e, c->segment.key, PULSAR_TP_SEGMENT_PART_RESTORE_POINT, path, sizeof(path)))
+            (void)unlink(path);
+        if (c->segment.part == PULSAR_TP_SEGMENT_PART_ROWS &&
+            worker_segment_path(e, c->segment.key, PULSAR_TP_SEGMENT_PART_ROWS, path, sizeof(path)))
+            (void)unlink(path);
         return 1;
     }
     case PULSAR_TP_FRAME_SEGMENT_RECONCILE:

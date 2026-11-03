@@ -6,8 +6,8 @@
 /* L264 S4: the server's disk KV cache as a content-addressed SEGMENT store.
  *
  * A segment holds one stretch of a conversation's KV: the engine's segment
- * payload (pulsar_session_save_segment: rows [G_prev, G) and the grid checkpoint
- * at G) plus the rendered text of those tokens.  Its key is
+ * payload (pulsar_session_save_segment: rows [G_prev, G)) plus the rendered
+ * text of those tokens.  Its key is
  *     sha1(parent_key || text)          (parent_key "" for a root, G_prev 0)
  * so a key names the WHOLE text from position 0 to its G, and two conversations
  * that share a prefix share its segments.  A lookup walks the chains from the
@@ -23,10 +23,13 @@
  * a sibling's (the same conversation's older tail, superseded by a later tail or
  * by the grid segment that covers it) -- then the least recently used.
  *
- * L323: a payload may end in an optional STATE part (the engine's checkpoint at
- * G, pulsar_session_segment_bytes); the index records its size, so a lookup can
- * ask for a chain that ends where a state is stored and a load can price "every
- * segment's rows + the last one's state" without opening a file. */
+ * L347: the state at a segment's end G lives apart, in the key's RESTORE POINT
+ * <dir>/<key>.rp = fixed header + the engine's restore point
+ * (pulsar_session_save_restore_point).  The index records its file's size
+ * (rp_bytes), so a lookup can ask for a chain that ends at a restore point and
+ * a load can price "every segment's rows + the last one's restore point"
+ * without opening a file.  The budget counts both files; eviction takes a
+ * victim leaf's restore point before the leaf. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,8 +37,12 @@
 
 /// Magic of a .seg file's header: "PSG1".
 #define PULSAR_SEGSTORE_MAGIC   0x31475350u   /* "PSG1" */
-/// Store format version; v2 (L323) carries the payload's state bytes in the header.  Older versions are removed at open.
-#define PULSAR_SEGSTORE_VERSION 2u            /* v2 (L323): the header carries the payload's state bytes */
+/// Store format version; v3 (L347): rows-only payloads, the state in the key's .rp.  Older versions are removed at open.
+#define PULSAR_SEGSTORE_VERSION 3u            /* v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp */
+/// Magic of a .rp file's header: "PRP1" (L347).
+#define PULSAR_SEGSTORE_RP_MAGIC   0x31505250u   /* "PRP1" */
+/// Restore point file format version (L347).  Older versions are removed at open.
+#define PULSAR_SEGSTORE_RP_VERSION 1u
 /// Header flag: a trailer follows the payload.
 #define PULSAR_SEGSTORE_FLAG_TRAILER 1u       /* a trailer follows the payload */
 
@@ -51,9 +58,9 @@ typedef struct {
     uint32_t G_prev, G;       ///< token span
     uint64_t text_end;        ///< bytes of chain text from position 0 to G (index-derived)
     uint64_t text_len;        ///< this segment's own text bytes
-    /// Engine payload bytes (rows + optional state), pulsar_session_save_segment's output
+    /// Engine payload bytes (rows only, L347), pulsar_session_save_segment's output
     uint64_t payload_bytes;
-    uint64_t state_bytes;     ///< L323: the payload's trailing state part (0 = rows only, no state at G)
+    uint64_t rp_bytes;        ///< L347: bytes of the key's .rp file, the restore point at G (0 = none)
     /// Optional trailer bytes after the payload (0 = none)
     uint64_t trailer_bytes;
     /// The whole .seg file: header + text + payload + trailer; what the budget counts
@@ -65,11 +72,11 @@ typedef struct {
 } pulsar_segstore_seg;
 
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
- *  `state`: the last segment carries a state. */
+ *  `state`: the last segment has a restore point (L347). */
 typedef struct {
     /// In tokens: the chain's end G must be a multiple of it (0 = any end)
     uint32_t grid;
-    /// The last segment must carry a state part (state_bytes > 0)
+    /// The last segment must have a restore point (rp_bytes > 0)
     bool state;
 } pulsar_segstore_end;
 
@@ -116,7 +123,7 @@ static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t rout
 }
 
 /// @param dir          the store directory (created when missing; must be writable)
-/// @param budget_bytes byte budget for the .seg files; 0 = unbounded
+/// @param budget_bytes byte budget for the .seg and .rp files; 0 = unbounded
 /// @param identity     pulsar_segstore_identity of the writer; segments of another identity are skipped
 /// @param log          message sink, or NULL
 /// @param log_ud       context for `log`
@@ -168,7 +175,6 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
 /// @param text          the segment's own rendered text
 /// @param text_len      bytes of `text`
 /// @param payload_bytes bytes write_payload will write
-/// @param state_bytes   of those, the payload's trailing state part (0 = rows only)
 /// @param write_payload writes the payload
 /// @param trailer_bytes bytes write_trailer will write (0 = none)
 /// @param write_trailer writes the trailer, or NULL with trailer_bytes 0
@@ -181,12 +187,10 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
  * makes room first by evicting leaves -- never the parent.  The key is derived
  * from parent and text here, so a caller cannot store a segment under the
  * wrong name.  The written key is returned in key_out.  The same key twice is one
- * segment: a put of a stored key writes nothing -- unless the stored copy has no
- * state and this one does (`state_bytes`, the payload's trailing part), which
- * replaces it in place (same key, same children). */
+ * segment: a put of a stored key writes nothing. */
 bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G,
                          const char *text, size_t text_len,
-                         uint64_t payload_bytes, uint64_t state_bytes, pulsar_segstore_write_fn write_payload,
+                         uint64_t payload_bytes, pulsar_segstore_write_fn write_payload,
                          uint64_t trailer_bytes, pulsar_segstore_write_fn write_trailer,
                          void *ud, char key_out[41], char *err, size_t errlen);
 
@@ -204,7 +208,6 @@ typedef struct pulsar_segstore_job pulsar_segstore_job;
 /// @param text          the segment's own rendered text (copied)
 /// @param text_len      bytes of `text`
 /// @param payload_bytes bytes the payload writer will write
-/// @param state_bytes   of those, the payload's trailing state part (0 = rows only)
 /// @param trailer_bytes bytes the trailer writer will write (0 = none)
 /// @param key_out       receives the segment's key
 /// @param job_out       receives the job on 1, NULL otherwise
@@ -212,8 +215,8 @@ typedef struct pulsar_segstore_job pulsar_segstore_job;
 /// @param errlen        size of `err`
 /// @return 1: a job to write and commit; 0: the store holds (or is writing) what this write would; -1: refused
 int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
-                            size_t text_len, uint64_t payload_bytes, uint64_t state_bytes, uint64_t trailer_bytes,
-                            char key_out[41], pulsar_segstore_job **job_out, char *err, size_t errlen);
+                            size_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
+                            pulsar_segstore_job **job_out, char *err, size_t errlen);
 /// @param job           the job (pulsar_segstore_reserve)
 /// @param write_payload writes exactly the job's payload bytes
 /// @param write_trailer writes exactly its trailer bytes (NULL when it has none)
@@ -244,6 +247,33 @@ const char *pulsar_segstore_job_text(const pulsar_segstore_job *job);
 /// @return the file's bytes
 uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job);
 
+/** L347: write the restore point of stored segment `key` (the state at its G) as `<dir>/<key>.rp`, durably (tmp +
+ *  rename, like a segment), replacing one it has.  Makes room first by evicting (never `key` itself); the budget counts
+ *  the file.  A key still being written (reserved, not committed) takes it too: the restore point joins the segment at
+ *  its commit, and is removed if the segment's write fails.
+ *  @param st       the store
+ *  @param key      40 hex chars of a stored (or pending) segment
+ *  @param rp_bytes bytes write_rp will write (the engine's restore point)
+ *  @param write_rp writes them
+ *  @param ud       context for write_rp
+ *  @param err      receives a reason on failure
+ *  @param errlen   size of `err`
+ *  @return true when the restore point is in place (false leaves any older one as it was) */
+bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes,
+                            pulsar_segstore_write_fn write_rp, void *ud, char *err, size_t errlen);
+/** L347: open a segment's restore point for reading, positioned at the engine's restore point.
+ *  @param st    the store
+ *  @param key   40 hex chars
+ *  @param bytes receives the restore point's size (the file past its header), or NULL
+ *  @return the open file (caller fcloses), NULL when the key is not stored, has no restore point, or its file does not
+ *          read back as indexed */
+FILE *pulsar_segstore_open_rp(pulsar_segstore *st, const char key[41], uint64_t *bytes);
+/** L347: remove a segment's restore point (the segment stays).  The removed hook is called with `rp_only`.
+ *  @param st  the store
+ *  @param key 40 hex chars
+ *  @return true when there was one to remove */
+bool pulsar_segstore_drop_rp(pulsar_segstore *st, const char key[41]);
+
 /// @param st            the store
 /// @param key           40 hex chars
 /// @param payload_bytes receives the payload's size, or NULL
@@ -261,22 +291,26 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
 /// @param key         40 hex chars
 /// @param payload_len payload bytes to probe, from the payload's start
 /// @param trailer     also probe the trailer
+/// @param rp          also probe the restore point file (L347; nothing when it has none)
 /// @return bytes of that range resident in the page cache
-/** L327: how many bytes of a segment's first `payload_len` payload bytes (and, with `trailer`, of its trailer) are in
- *  the page cache now (mincore; 0 for a key not stored or a file that will not map) -- a read of them costs memory
- *  bandwidth, not the disk's. */
-uint64_t pulsar_segstore_cached_bytes(pulsar_segstore *st, const char key[41], uint64_t payload_len, bool trailer);
+/** L327: how many bytes of a segment's first `payload_len` payload bytes (and, with `trailer`, of its trailer; with
+ *  `rp`, of its restore point file) are in the page cache now (mincore; 0 for a key not stored or a file that will not
+ *  map) -- a read of them costs memory bandwidth, not the disk's. */
+uint64_t pulsar_segstore_cached_bytes(pulsar_segstore *st, const char key[41], uint64_t payload_len, bool trailer,
+                                      bool rp);
 /// @param st    the store
 /// @param chain the chain's entries, as pulsar_segstore_lookup returned them
 /// @param n     entries in `chain`
 /** Record a use of every segment of a chain (hit count + last_used). */
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** Called with every key the store removes (drop, release, eviction, an orphan
- *  pruned at open) -- the TP leader tells its workers to delete their copies.
+ *  pruned at open) -- the TP leader tells its workers to delete their copies --
+ *  and (L347, `rp_only`) with every restore point removed apart from its segment.
  *  Set it before anything can be removed; NULL to clear. */
-/** @param ud  the context given to pulsar_segstore_set_removed_hook
- *  @param key the removed key, 40 hex chars */
-typedef void (*pulsar_segstore_removed_fn)(void *ud, const char key[41]);
+/** @param ud      the context given to pulsar_segstore_set_removed_hook
+ *  @param key     the removed key, 40 hex chars
+ *  @param rp_only only the key's restore point went (false: the segment and its restore point) */
+typedef void (*pulsar_segstore_removed_fn)(void *ud, const char key[41], bool rp_only);
 /** Set (or clear, fn NULL) the hook called with every key the store removes.
  *  @param st the store, or NULL (no-op)
  *  @param fn the hook
@@ -284,7 +318,7 @@ typedef void (*pulsar_segstore_removed_fn)(void *ud, const char key[41]);
 void pulsar_segstore_set_removed_hook(pulsar_segstore *st, pulsar_segstore_removed_fn fn, void *ud);
 /// @param st  the store
 /// @param key 40 hex chars of the segment to remove with its subtree
-/** Remove a segment and every segment below it (a payload that would not load). */
+/** Remove a segment and every segment below it, restore points included (a payload that would not load). */
 void pulsar_segstore_drop(pulsar_segstore *st, const char key[41]);
 /// @param st   the store
 /// @param tip  the chain's leaf key
@@ -319,7 +353,7 @@ void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_traile
 /** Every key, 40 hex chars each, concatenated (caller frees); the count returned. */
 int pulsar_segstore_keys(pulsar_segstore *st, char **keys);
 /// @param st the store, or NULL (0)
-/// @return bytes of the .seg files the store holds
+/// @return bytes of the .seg and .rp files the store holds
 /** Bytes the store holds, and the count of segments. */
 uint64_t pulsar_segstore_used_bytes(const pulsar_segstore *st);
 /** The number of segments the store holds.

@@ -316,25 +316,21 @@ static int payload_read_tensor_span(payload_io *io, pulsar_gpu_tensor *tensor,
 
 
 /* ===== L264 S4 / L265: disk segments ====================================
- * One segment = tokens [G_prev, G), every append-only POOL's rows for those
- * positions, and -- when the installed bank holds it -- the grid checkpoint at G
- * (pulsar.h, pulsar_session_save_segment).  What the pools and the slot are is
- * the model's (kv_state.h); this framing is not.  The header pins the model's
- * layout by a digest of what makes the bytes readable -- the state model's
- * name, its grid, the slot size and every pool's granularity and row width --
- * so a segment written under another layout is refused, never misread.
+ * One segment = tokens [G_prev, G) and every append-only POOL's rows for those
+ * positions (pulsar.h, pulsar_session_save_segment).  What the pools and the slot
+ * are is the model's (kv_state.h); this framing is not.  The header pins the
+ * model's layout by a digest of what makes the bytes readable -- the state
+ * model's name, its grid, the slot size and every pool's granularity and row
+ * width -- so a segment written under another layout is refused, never misread.
  *
- * L323 (v6): the state is OPTIONAL and comes LAST, behind its own digest.  The
- * stream is the header (word 8: the state flag), the tokens, the image records,
- * the pool rows, the rows' digest, then -- when flagged -- the slot and the
- * state's digest.  A chain load reads the rows of every segment and the state of
- * its last one only (pulsar_session_load_segment's `last`): restoring a point
- * needs ONE state, the nearest stored one at or below it, and a recurrent
- * family's state is ~133 MiB against ~13 KiB a token of rows (Qwen3.8 FN, L320). */
+ * L347 (v7): a segment is ROWS ONLY.  The stream is the header (word 8: flags,
+ * none defined, 0), the tokens, the image records, the pool rows and the rows'
+ * digest.  The state at G -- the grid checkpoint's slot -- is a RESTORE POINT, a
+ * payload of its own (pulsar_session_save_restore_point, below) stored beside the
+ * segment under the same key: a chain load reads the rows of every segment and
+ * one restore point, its last segment's. */
 /** u32 words of a segment's header. */
 #define SEGMENT_U32_FIELDS 9u
-/** Header flag (word 8): the segment carries the state at G. */
-#define SEGMENT_FLAG_STATE 1u
 /* L281 (v3): after the span's tokens, the image blocks lying wholly inside the span -- a u32 count, then per block
  * u32 start, u32 end, u64 content (two u32) -- so a chain carries rows past an image together with WHICH image they
  * are (image_identity.cpp).  A span boundary is never inside a block (segment_cut_ok; a checkpoint never is), so
@@ -474,44 +470,35 @@ static bool segment_cut_ok(const pulsar_session *s, uint32_t G) {
     return true;
 }
 
-/* L323: does a segment ending at G carry the state there?  The ONE predicate a save, its size and the store's
- * pricing read: the installed bank holds its grid checkpoint at G. */
-/// @param st   the store
-/// @param bank the installed bank
-/// @param G    the segment's end, in tokens
-/// @return true when the bank holds a grid checkpoint at G
-static bool segment_has_state(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t off = 0;
-    return pulsar_ckpt_locate(st, bank, G, &slab, &off);
-}
-
-/* The state part of a segment: the slot and its digest (0 for a rows-only segment). */
-/// @param st    the store (its slot size)
-/// @param state the segment carries the state
-/// @return bytes
-static uint64_t segment_state_bytes_for(const pulsar_ckpt_store *st, bool state) {
-    return state ? st->slot_bytes + sizeof(uint64_t) : 0u;
-}
-
-/* the bytes of a segment over [G_prev, G) carrying `n_images` image records, and the state at G when `state`.  Only
- * the current version loads: older segments are refused and the chain rewrites itself (on-disk KV carries no
- * back-compat, Tyler 2026-10-13). */
+/* the bytes of a segment over [G_prev, G) carrying `n_images` image records.  Only the current version loads: older
+ * segments are refused and the chain rewrites itself (on-disk KV carries no back-compat, Tyler 2026-10-13). */
 /// @param st       the store
 /// @param G_prev   the span's start
 /// @param G        the span's end
 /// @param n_images image records carried
-/// @param state    the state at G carried
 /// @return the segment's size in bytes
-static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images, bool state) {
+static uint64_t segment_bytes_for(pulsar_ckpt_store *st, uint32_t G_prev, uint32_t G, uint32_t n_images) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t bytes = (uint64_t)SEGMENT_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)(G - G_prev) * sizeof(uint32_t);
     bytes += sizeof(uint32_t) + (uint64_t)n_images * SEGMENT_IMAGE_U32 * sizeof(uint32_t);
     bytes += pools_span_bytes(pools, n, G_prev, G);
-    bytes += sizeof(uint64_t);   /* the rows' digest */
-    return bytes + segment_state_bytes_for(st, state);
+    return bytes + sizeof(uint64_t);   /* the rows' digest */
+}
+
+/* ===== L347: restore points ===============================================
+ * The state at a grid point G: the installed bank's checkpoint slot at G, the
+ * one thing a chain's load restores besides rows (pulsar.h,
+ * pulsar_session_save_restore_point).  The stream is the header -- magic
+ * "SRP1", version, the segment layout digest (lo, hi), the slot size, the
+ * resume grid, G, flags (none defined, 0) -- the slot, and the digest of both. */
+/** u32 words of a restore point's header. */
+#define RESTORE_POINT_U32_FIELDS 8u
+
+/** The bytes of a restore point: header, slot, digest.  @param st the store (its slot size)  @return bytes */
+static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
+    return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes + sizeof(uint64_t);
 }
 
 /* L281: a stored segment's image records, read from its payload's head without loading it.  The bytes are the
@@ -539,12 +526,58 @@ uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *st
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
     if (state_bytes) *state_bytes = 0u;
     if (!segment_span_ok(st, G_prev, G) || !segment_cut_ok(this, G_prev) || !segment_cut_ok(this, G)) return 0;
-    const bool state = segment_has_state(st, pulsar_session_live_bank(this), G);
-    if (state_bytes) *state_bytes = segment_state_bytes_for(st, state);
+    if (state_bytes) *state_bytes = restore_point_bytes(G);
     const pulsar_image_block *first = NULL;
     uint32_t n_img = 0;
     if (!segment_images(this, G_prev, G, &first, &n_img)) return 0;
-    return segment_bytes_for(st, G_prev, G, n_img, state);
+    return segment_bytes_for(st, G_prev, G, n_img);
+}
+
+uint64_t pulsar_session::restore_point_bytes(uint32_t G) {
+    pulsar_ckpt_store *st = pulsar_session_kv_store(this);
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t off = 0;
+    if (G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, pulsar_session_live_bank(this), G, &slab, &off))
+        return 0;
+    return restore_point_bytes_for(st);
+}
+
+int pulsar_session::save_restore_point(FILE *fp, uint32_t G, char *err, size_t errlen) {
+    pulsar_ckpt_store *st = pulsar_session_kv_store(this);
+    const uint32_t bank = pulsar_session_live_bank(this);
+    pulsar_gpu_tensor *slab = NULL;
+    uint64_t slot_off = 0;
+    if (!fp || G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, bank, G, &slab, &slot_off)) {
+        payload_set_err(err, errlen, "save restore point: the installed bank holds no checkpoint there");
+        return 1;
+    }
+    pulsar_stall_mark("restore point save: device drain");
+    if (pulsar_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "save restore point: failed to synchronize accelerator");
+        return 1;
+    }
+    payload_io io;
+    io.fp = fp;
+    payload_digest_init(&io.digest);
+    pulsar_writeback_init(&io.wb, fp);
+    const uint64_t layout = segment_layout_digest(st, bank);
+    const uint32_t header[RESTORE_POINT_U32_FIELDS] = {
+        PULSAR_SESSION_RESTORE_POINT_MAGIC, PULSAR_SESSION_RESTORE_POINT_VERSION,
+        (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G, 0u,
+    };
+    for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++)
+        if (payload_write_u32(&io, header[i], err, errlen) != 0) return 1;
+    pulsar_stall_mark("restore point save: state slot to disk");
+    if (payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, io_buf, PULSAR_SESSION_IO_CHUNK, err,
+                                  errlen) != 0)
+        return 1;
+    const uint64_t dg = payload_digest_final(&io.digest);
+    if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
+        payload_set_err(err, errlen, "save restore point: failed to write its digest");
+        return 1;
+    }
+    pulsar_writeback_finish(&io.wb);
+    return 0;
 }
 
 int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *err, size_t errlen) {
@@ -563,10 +596,6 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
         payload_set_err(err, errlen, "save segment: an image block lies across the span's edge");
         return 1;
     }
-    /* L323: the state at G rides along when the bank holds its checkpoint there (segment_has_state) */
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    const bool state = pulsar_ckpt_locate(st, bank, G, &slab, &slot_off);
     pulsar_stall_mark("segment save: device drain");
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "save segment: failed to synchronize accelerator");
@@ -580,7 +609,7 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     const uint32_t header[SEGMENT_U32_FIELDS] = {
         PULSAR_SESSION_SEGMENT_MAGIC, PULSAR_SESSION_SEGMENT_VERSION,
         (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G_prev, G,
-        state ? SEGMENT_FLAG_STATE : 0u,
+        0u,
     };
     for (uint32_t i = 0; i < SEGMENT_U32_FIELDS; i++)
         if (payload_write_u32(&io, header[i], err, errlen) != 0) return 1;
@@ -599,33 +628,63 @@ int pulsar_session::save_segment(FILE *fp, uint32_t G_prev, uint32_t G, char *er
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     pulsar_stall_mark("segment save: pool rows to disk");
-    int rc = pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen);
-    /* the rows' digest closes the part every load reads; the state part, when present, has its own */
-    for (int part = 0; rc == 0 && part < (state ? 2 : 1); part++) {
-        if (part == 1) {
-            pulsar_stall_mark("segment save: state slot to disk");
-            payload_digest_init(&io.digest);
-            rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
-                                           errlen);
-            if (rc != 0) break;
-        }
-        const uint64_t dg = payload_digest_final(&io.digest);
-        if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
-            payload_set_err(err, errlen, "save segment: failed to write a digest");
-            rc = 1;
-        }
+    if (pools_span_io(&io, pools, n, G_prev, G, true, buf, NULL, err, errlen) != 0) return 1;
+    const uint64_t dg = payload_digest_final(&io.digest);
+    if (fwrite(&dg, 1, sizeof(dg), fp) != sizeof(dg)) {
+        payload_set_err(err, errlen, "save segment: failed to write its digest");
+        return 1;
     }
-    if (rc != 0) return rc;
     pulsar_writeback_finish(&io.wb);
     return 0;
 }
 
-int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen) {
+/* L347: read and check a restore point's header for the segment ending at G (the slot follows on `io`). */
+/// @param io        the restore point's stream, at its first byte
+/// @param remaining its bytes left, decremented
+/// @param st        the store
+/// @param bank      the installed bank
+/// @param G         the chain's end: the restore point must be the state there
+/// @param err       receives the refusal
+/// @param errlen    bytes of `err`
+/// @return 0, or 1 on a short read or a header that is not this layout's restore point at G
+static int restore_point_header_read(payload_io *io, uint64_t *remaining, pulsar_ckpt_store *st, uint32_t bank,
+                                     uint32_t G, char *err, size_t errlen) {
+    uint32_t h[RESTORE_POINT_U32_FIELDS];
+    for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++)
+        if (payload_read_u32(io, &h[i], remaining, err, errlen) != 0) return 1;
+    if (h[0] != PULSAR_SESSION_RESTORE_POINT_MAGIC || h[1] != PULSAR_SESSION_RESTORE_POINT_VERSION) {
+        payload_set_err(err, errlen, "load segment: unsupported restore point version");
+        return 1;
+    }
+    const uint64_t layout = segment_layout_digest(st, bank);
+    if (h[2] != (uint32_t)layout || h[3] != (uint32_t)(layout >> 32) || h[4] != (uint32_t)st->slot_bytes ||
+        h[5] != st->ops->resume_grid) {
+        payload_set_err(err, errlen, "load segment: restore point written for a different state layout");
+        return 1;
+    }
+    if (h[6] != G) {
+        payload_set_err(err, errlen, "load segment: the restore point is not the state at the segment's end");
+        return 1;
+    }
+    if (h[7] != 0u) {
+        payload_set_err(err, errlen, "load segment: unknown restore point flags");
+        return 1;
+    }
+    return 0;
+}
+
+int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, FILE *rp_fp, uint64_t rp_bytes, uint32_t *G_out,
+                                 char *err, size_t errlen) {
     auto *s = this;
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const uint32_t bank = pulsar_session_live_bank(s);
     if (G_out) *G_out = 0u;
     if (!fp) { payload_set_err(err, errlen, "load segment: no stream"); return 1; }
+    if (last != (rp_fp != NULL)) {
+        payload_set_err(err, errlen, last ? "load segment: the chain's last segment has no restore point to restore"
+                                          : "load segment: a restore point given for a segment that is not the last");
+        return 1;
+    }
     payload_io io;
     io.fp = fp;
     payload_digest_init(&io.digest);
@@ -687,22 +746,32 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
             return 1;
         }
     }
-    /* L323: the state flag; the chain's last segment must carry the state its load restores */
-    if ((h[8] & ~SEGMENT_FLAG_STATE) != 0u) {
+    if (h[8] != 0u) {
         token_vec_free(&toks);
         payload_set_err(err, errlen, "load segment: unknown header flags");
         return 1;
     }
-    const bool state = (h[8] & SEGMENT_FLAG_STATE) != 0u;
-    if (last && !state) {
-        token_vec_free(&toks);
-        payload_set_err(err, errlen, "load segment: the chain's last segment carries no state to restore");
-        return 1;
-    }
-    if (bytes != segment_bytes_for(st, G_prev, G, n_img, state)) {
+    if (bytes != segment_bytes_for(st, G_prev, G, n_img)) {
         token_vec_free(&toks);
         payload_set_err(err, errlen, "load segment: size does not match its span");
         return 1;
+    }
+    /* L347: the chain's last segment restores the state at G from its restore point: checked before any device write */
+    payload_io rp_io;
+    rp_io.fp = rp_fp;
+    payload_digest_init(&rp_io.digest);
+    pulsar_writeback_init(&rp_io.wb, NULL);
+    uint64_t rp_remaining = rp_bytes;
+    if (last) {
+        if (rp_bytes != restore_point_bytes_for(st)) {
+            token_vec_free(&toks);
+            payload_set_err(err, errlen, "load segment: the restore point's size does not match the state layout");
+            return 1;
+        }
+        if (restore_point_header_read(&rp_io, &rp_remaining, st, bank, G, err, errlen) != 0) {
+            token_vec_free(&toks);
+            return 1;
+        }
     }
     if (pulsar_gpu_synchronize() == 0) {
         token_vec_free(&toks);
@@ -722,31 +791,30 @@ int pulsar_session::load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     pulsar_stall_mark("segment load: disk to pool rows");
-    int rc = pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen);
-    /* the rows' digest; then, for the chain's last segment, its state and the state's digest (an earlier segment's
-     * state is not read: the load restores one) */
-    for (int part = 0; rc == 0 && part < (last ? 2 : 1); part++) {
-        if (part == 1) {
-            payload_digest_init(&io.digest);
-            rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
-                                          &remaining, err, errlen);
-            if (rc != 0) break;
-        }
-        uint64_t stored_dg = 0;
-        const uint64_t after = part == 0 ? segment_state_bytes_for(st, state) : 0u;
-        if (remaining != sizeof(uint64_t) + after || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||
-            stored_dg != payload_digest_final(&io.digest)) {
-            payload_set_err(err, errlen, "load segment: digest mismatch (corrupt segment)");
-            rc = 1;
-        }
-        remaining -= sizeof(uint64_t);
+    if (pools_span_io(&io, pools, n, G_prev, G, false, buf, &remaining, err, errlen) != 0) return fail();
+    uint64_t stored_dg = 0;
+    if (remaining != sizeof(uint64_t) || fread(&stored_dg, 1, sizeof(stored_dg), fp) != sizeof(stored_dg) ||
+        stored_dg != payload_digest_final(&io.digest)) {
+        payload_set_err(err, errlen, "load segment: digest mismatch (corrupt segment)");
+        return fail();
     }
-    if (rc != 0) return fail();
+    /* L347: the chain's last segment -- the state at G from its restore point, behind the restore point's digest */
+    if (last) {
+        pulsar_stall_mark("segment load: restore point to the checkpoint slot");
+        if (payload_read_tensor_span(&rp_io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
+                                     &rp_remaining, err, errlen) != 0)
+            return fail();
+        if (rp_remaining != sizeof(uint64_t) || fread(&stored_dg, 1, sizeof(stored_dg), rp_fp) != sizeof(stored_dg) ||
+            stored_dg != payload_digest_final(&rp_io.digest)) {
+            payload_set_err(err, errlen, "load segment: digest mismatch (corrupt restore point)");
+            return fail();
+        }
+    }
     if (pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "load segment: failed to synchronize accelerator after the copy");
         return fail();
     }
-    /* Commit: the history, the frontier, then the last segment's checkpoint (after the frontier write, which could
+    /* Commit: the history, the frontier, then the restore point's checkpoint (after the frontier write, which could
      * otherwise drop it).  The lanes and window describe no position yet -- stale until the last segment restores
      * its checkpoint. */
     for (int i = 0; i < toks.len; i++) token_vec_push(&s->checkpoint, toks.v[i]);

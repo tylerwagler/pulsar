@@ -787,8 +787,9 @@ static server_config parse_options(int argc, char **argv) {
 /* L264 S4e: the segment store's removal hook on a TP leader. */
 /// @param ud the engine
 /// @param key the removed segment's key (40 hex digits + NUL)
-static void kv_segment_removed(void *ud, const char key[41]) {
-    pulsar_engine_segment_dropped((pulsar_engine *)ud, key);
+/// @param rp_only only its restore point was removed (L347)
+static void kv_segment_removed(void *ud, const char key[41], bool rp_only) {
+    pulsar_engine_segment_dropped((pulsar_engine *)ud, key, rp_only ? 1 : 0);
 }
 
 /// @brief pulsar-server: parse the options, open the engine (an encoder or parser engine, or several -m, serves through encode_serve), size and warm the pool, open the disk KV cache, run

@@ -134,10 +134,13 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(ok, "banks 1 and 2 prefilled G: %s", err);
 
     /* the spill: bank 1 installed, its chain persisted, its carry saved, bank 0 installed */
-    FILE *seg = tmpfile();
+    FILE *seg = tmpfile(), *rp = tmpfile();   /* L347: the restore point at G apart */
     const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{G}, NULL) : 0;
-    ok = ok && seg && pulsar_session_bank_state_restore(s, 1) && pulsar_session_checkpoint_best(s, TokPos{G}).raw() == G &&
-         pulsar_session_save_segment(s, seg, TokPos{0}, TokPos{G}, NULL, err, sizeof(err)) == 0;
+    ok = ok && seg && rp && pulsar_session_bank_state_restore(s, 1) &&
+         pulsar_session_checkpoint_best(s, TokPos{G}).raw() == G &&
+         pulsar_session_save_segment(s, seg, TokPos{0}, TokPos{G}, NULL, err, sizeof(err)) == 0 &&
+         pulsar_session_save_restore_point(s, rp, TokPos{G}, NULL, err, sizeof(err)) == 0;
+    const uint64_t rp_bytes = ok ? pulsar_session_restore_point_bytes(s, TokPos{G}) : 0;
     if (ok) pulsar_session_bank_state_save(s, 1);
     ok = ok && pulsar_session_bank_state_restore(s, 0);
     CHECK(ok, "bank 1 persisted as [0, %d) (%.1f MiB): %s", G, seg_bytes / 1048576.0, err);
@@ -174,8 +177,10 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(backed && !pulsar_session_bank_is_evicted(s, 1), "R2 alloc_physical re-backs bank 1 (and again: idempotent)");
     TokPos g{0};
     if (seg) rewind(seg);
+    if (rp) rewind(rp);
     const bool loaded = backed && pulsar_session_bank_state_restore(s, 1) &&
-                        pulsar_session_load_segment(s, seg, seg_bytes, true, &g, NULL, err, sizeof(err)) == 0;
+                        pulsar_session_load_segment(s, seg, seg_bytes, true, rp, rp_bytes, &g, NULL, err,
+                                                    sizeof(err)) == 0;
     CHECK(loaded && g.raw() == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
           "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g.raw(),
           pulsar_session_bank_touched_kv_bytes(s, 1).raw() / 1048576.0, err);
@@ -201,6 +206,7 @@ int GATE_ENTRY(int argc, char **argv) {
           "(first diff at step %d, max |diff| %.3g)", first_diff, worst);
 
     if (seg) fclose(seg);
+    if (rp) fclose(rp);
     pulsar_session_free(s);
     pulsar_tokens_free(&all);
     gate_engine_close(e);

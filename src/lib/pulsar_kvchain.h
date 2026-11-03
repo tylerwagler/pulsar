@@ -15,23 +15,25 @@
  * wherever their turns ended.  A tail is never a parent: the next persist of a
  * longer history writes the grid segment that covers it and a new tail, and the
  * store evicts the superseded tail first (a dominated leaf, pulsar_segstore.h).
- * A grid segment carries the state at its end when the bank holds that
- * checkpoint (else rows only); a tail always does (it ends at a checkpoint).
  * Before L323 the cuts were wherever the writer's checkpoints fell, so copies
  * deduped only when cut alike, and every segment carried the ~133 MiB state.
+ * L347: a segment is rows only; the state at a chain's end is the end key's
+ * RESTORE POINT (pulsar_segstore_put_rp), written when a persist closes.
  *
  * persist: extend the deepest grid-ended chain the store already holds for the
  *   installed bank's history by the grid segments past it up to the bank's
  *   deepest checkpoint, so a write costs only the new tokens (a segment the store
- *   has is not written again).  A closing persist (prompt end, evict, spill) also
- *   writes the tail to that checkpoint; a persist on progress stops at the last
- *   grid point.  The stored chain is this history only if the bank's own tokens
- *   up to its end render to exactly its text (same bytes at the same position,
- *   the L115 rule); otherwise a fresh chain starts at the root.
+ *   has is not written again).  A closing persist (prompt end, evict, spill,
+ *   abandon, shutdown) also writes the tail to that checkpoint and the restore
+ *   point at the chain's end (synchronously, through the store); a persist on
+ *   progress stops at the last grid point and writes no restore point.  The
+ *   stored chain is this history only if the bank's own tokens up to its end
+ *   render to exactly its text (same bytes at the same position, the L115 rule);
+ *   otherwise a fresh chain starts at the root.
  * restore: load the deepest chain whose text is a byte prefix of `text` and whose
- *   last segment carries a state -- every segment's rows, the last one's state --
- *   so the bank stands live at the nearest stored state at or below the request's
- *   divergence and the sync prefills the rest.  A segment that will not load is
+ *   last segment has a restore point -- every segment's rows, the last one's
+ *   restore point -- so the bank stands live at the nearest stored restore point
+ *   at or below the request's divergence and the sync prefills the rest.  A segment that will not load is
  *   dropped with everything below it, and so is a chain whose text and tokens
  *   disagree at the boundary (L196), so the next persist rewrites it.
  *
@@ -63,8 +65,9 @@ typedef struct {
 } pulsar_kvchain_trailer;
 
 /** L338: where a persist's segments go once staged -- the server's background writer.  A segment is staged on the
- *  calling thread (its rows and state copied out of the bank, which moves on), then written elsewhere and committed
- *  back on the store's thread (pulsar_segstore_reserve / _job_write / _commit). */
+ *  calling thread (its rows copied out of the bank, which moves on), then written elsewhere and committed back on the
+ *  store's thread (pulsar_segstore_reserve / _job_write / _commit).  L347: restore points are not staged (I1): a
+ *  closing persist writes the chain end's through pulsar_segstore_put_rp itself. */
 typedef struct {
     /// context for both hooks
     void *ud;
@@ -88,6 +91,7 @@ typedef struct {
     int written;        ///< new segments, staged and handed to the writer (L338: committed later, on its thread)
     int end;            ///< the chain's end after the write (0: none)
     uint64_t bytes;     ///< payload + trailer bytes staged
+    uint64_t rp_bytes;  ///< L347: the restore point written at the chain's end (0: none written by this persist)
     char key[41];       ///< the chain's last key ("" when none)
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
@@ -113,14 +117,15 @@ int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int
 
 /** Persist the installed bank's history (see above), never past
  *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  `close`: end the
- *  chain with the tail to the deepest grid checkpoint (pulsar_kvchain_segment_ends).  A grid point an image block
+ *  chain with the tail to the deepest grid checkpoint (pulsar_kvchain_segment_ends) and leave the restore point at the
+ *  chain's end (L347).  A grid point an image block
  *  lies across is not a cut (the segment runs on to the next one).  Nothing is written when the deepest grid
  *  checkpoint is below `min_tokens`.  Returns `written` (segments the store did not hold). */
 /// @param st         the store
 /// @param e          the engine
 /// @param s          the session whose installed bank is persisted
 /// @param min_tokens write nothing when the deepest grid checkpoint is below this
-/// @param close      end the chain with the tail (prompt end, evict, spill)
+/// @param close      end the chain with the tail and its restore point (prompt end, evict, spill, abandon, shutdown)
 /// @param trailer    the per-segment trailer, or NULL for none
 /// @param writer     where the staged segments go (required)
 /// @param out        receives what the persist did, or NULL
@@ -130,8 +135,8 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
                            pulsar_kvchain_persist_result *out);
 
 /** L310: the chain a restore of `text` would load, without loading it -- the deepest whose text is a byte prefix of
- *  `text` ending at a stored state, cut at the request's images exactly as pulsar_kvchain_restore cuts it (and back
- *  to the last state at or below the cut) -- into `chain` (root first), and *bytes what a load reads
+ *  `text` ending at a restore point, cut at the request's images exactly as pulsar_kvchain_restore cuts it (and back
+ *  to the last restore point at or below the cut) -- into `chain` (root first), and *bytes what a load reads
  *  (pulsar_kvchain_load_bytes).  Returns its length; 0 when there is none or it ends below `min_tokens`.  `err` says
  *  why a stored chain was cut short. */
 /// @param st           the store
@@ -149,8 +154,8 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
 int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, const uint64_t *image_hashes,
                         int n_images, int min_tokens, pulsar_segstore_seg *chain, int cap, uint64_t *bytes, char *err,
                         size_t errlen);
-/** L323: the bytes a load of `chain` (n segments) reads -- every segment's rows and trailer, the last one's state too
- *  -- the read pulsar_kvchain_find prices against the prefill it saves. */
+/** L323: the bytes a load of `chain` (n segments) reads -- every segment's rows and trailer, the last one's restore
+ *  point file too (L347) -- the read pulsar_kvchain_find prices against the prefill it saves. */
 /// @param chain the chain, root first
 /// @param n     its segment count
 /// @return bytes a load of it reads
@@ -161,27 +166,30 @@ uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n);
 /// @param n     its segment count
 /// @return bytes of those parts resident in the page cache
 uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
-/** L330: what a load of segment `i` of `chain` (n segments) reads: its rows and trailer, and its state when it is the
- *  last (pulsar_kvchain_load_bytes is the sum over the chain). */
+/** L330: what a load of segment `i` of `chain` (n segments) reads: its rows and trailer, and its restore point file
+ *  when it is the last (pulsar_kvchain_load_bytes is the sum over the chain). */
 /// @param chain the chain, root first
 /// @param n     its segment count
 /// @param i     the segment's index in `chain`
 /// @return bytes a load of segment `i` reads
 uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i);
 /** L330: one segment's load into whatever `ud` names (pulsar_session_load_segment's contract: `last` restores the
- *  segment's state; 0 = loaded, *G the position it stands at). */
-/// @param ud     the loader's context
-/// @param fp     the segment's payload, positioned at its first byte
-/// @param bytes  the payload's size
-/// @param last   restore the segment's state too (the chain's last segment)
-/// @param G      receives the position the bank stands at, or NULL
-/// @param key    the segment's key
-/// @param err    receives a reason on failure
-/// @param errlen size of `err`
-typedef int (*pulsar_kvchain_segment_loader)(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key,
-                                             char *err, size_t errlen);
+ *  state at the segment's end from its restore point; 0 = loaded, *G the position it stands at). */
+/// @param ud       the loader's context
+/// @param fp       the segment's payload, positioned at its first byte
+/// @param bytes    the payload's size
+/// @param last     restore the state at its end too (the chain's last segment)
+/// @param rp       L347: the segment's restore point (pulsar_segstore_open_rp) when `last`, else NULL
+/// @param rp_bytes its size (0 when not `last`)
+/// @param G        receives the position the bank stands at, or NULL
+/// @param key      the segment's key
+/// @param err      receives a reason on failure
+/// @param errlen   size of `err`
+typedef int (*pulsar_kvchain_segment_loader)(void *ud, FILE *fp, uint64_t bytes, bool last, FILE *rp,
+                                             uint64_t rp_bytes, int *G, const char *key, char *err, size_t errlen);
 /** L330: load the next slice of a chain -- segments [*next, *next + k) of the `n` pulsar_kvchain_find returned, cut at
- *  the chain's end -- in order through `load`, advancing *next past each segment loaded.  The whole chain in one slice
+ *  the chain's end -- in order through `load` (the chain's last segment with its restore point, L347), advancing
+ *  *next past each segment loaded.  The whole chain in one slice
  *  is the one-shot load (pulsar_kvchain_load); the server reads a long chain a slice per worker turn.  1 when a segment
  *  would not load: it is dropped from the store (and so is everything below it, by key) and `err` says which; *next
  *  stays at it.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank

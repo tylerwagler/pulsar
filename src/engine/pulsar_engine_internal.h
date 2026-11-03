@@ -3541,9 +3541,20 @@ struct pulsar_session {
     /** L264 S4 disk segments (pulsar.h, pulsar_session_save_segment). */
     /// @param G_prev       the segment's first grid position (tokens; may be 0)
     /// @param G            the segment's end grid position
-    /// @param state_bytes  out (may be NULL): the trailing state part's bytes, 0 = rows only
+    /// @param state_bytes  out (may be NULL): the bytes of the restore point at G (restore_point_bytes), 0 = none
     /// @return the bytes save_segment() writes, or 0 when [G_prev, G) is not a segment span.
     uint64_t segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes);
+    /// L347: the bytes save_restore_point() writes at G (pulsar_session_restore_point_bytes's local body).
+    /// @param G  the grid position
+    /// @return the restore point's bytes, 0 when the installed bank holds no checkpoint at G
+    uint64_t restore_point_bytes(uint32_t G);
+    /// L347: write the restore point at G to `fp` (pulsar_session_save_restore_point's local body).
+    /// @param fp      the open output stream
+    /// @param G       the grid position the installed bank holds a checkpoint at
+    /// @param err     failure message buffer
+    /// @param errlen  its size
+    /// @return 0 on success, 1 on a refusal or I/O failure (err filled).
+    int save_restore_point(FILE *fp, uint32_t G, char *err, size_t errlen);
     /// Write the segment [G_prev, G) to `fp` (pulsar_session_save_segment's local body).
     /// @param fp      the open output stream
     /// @param G_prev  the segment's first grid position (tokens)
@@ -3556,11 +3567,14 @@ struct pulsar_session {
     /// @param fp      the open input stream, at the segment
     /// @param bytes   the segment's length
     /// @param last    the chain's last segment: only it restores the state at its G
+    /// @param rp_fp   L347: the open restore point at G when `last`, else NULL
+    /// @param rp_bytes its length (0 when not `last`)
     /// @param G_out   out: the segment's end grid position (0 on failure)
     /// @param err     failure message buffer
     /// @param errlen  its size
     /// @return 0 on success, 1 on a refusal or I/O failure (err filled).
-    int load_segment(FILE *fp, uint64_t bytes, bool last, uint32_t *G_out, char *err, size_t errlen);
+    int load_segment(FILE *fp, uint64_t bytes, bool last, FILE *rp_fp, uint64_t rp_bytes, uint32_t *G_out, char *err,
+                     size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */
     /// @param snap    receives the owned blob (pulsar_session_snapshot_free)
     /// @param err     failure message buffer

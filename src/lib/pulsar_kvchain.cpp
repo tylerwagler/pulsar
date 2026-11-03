@@ -10,9 +10,9 @@
 
 namespace {
 /** Stage `bytes` written by `fill` into a malloc'd buffer (a memory stream over it).
+ *  @tparam F    a callable `int(FILE *)`
  *  @param bytes the exact count `fill` writes
  *  @param fill  writes them to its stream; 0 on success, else a message in err
- *  @param ud    context for `fill`
  *  @param out   receives the buffer (NULL on failure)
  *  @param err   receives a reason on failure
  *  @param errlen bytes at err
@@ -57,9 +57,8 @@ pulsar_tokens view(const pulsar_tokens *t, int from, int to) {
 enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
 /* Store the bank's segment [G_prev, G) under `parent` (its key into key_out).  PUT_NO_CUT: [G_prev, G) is not a
  * segment span (an image block lies across G); PUT_FAILED: `r->err` says why.  A segment the store holds is not
- * written again -- the same key -- unless the store's copy lacks the state this bank holds at G (the reserve
- * replaces it in place), nor one being written; only a write counts in r.  L338: the segment is staged here and
- * written by `writer` (pulsar_kvchain_writer). */
+ * written again -- the same key -- nor one being written; only a write counts in r.  L338: the segment is staged here
+ * and written by `writer` (pulsar_kvchain_writer). */
 /** Store one segment of the bank (see the comment above).
  *  @param st the segment store
  *  @param e the engine, for rendering the span's text
@@ -76,8 +75,7 @@ enum put_rc { PUT_FAILED, PUT_NO_CUT, PUT_STORED };
 put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, const pulsar_tokens *toks,
                    const char *parent, int G_prev, int G, const pulsar_kvchain_trailer *trailer,
                    const pulsar_kvchain_writer *writer, pulsar_kvchain_persist_result *r, char key_out[41]) {
-    uint64_t state_bytes = 0;
-    const uint64_t payload = pulsar_session_segment_bytes(s, TokPos{G_prev}, TokPos{G}, &state_bytes);
+    const uint64_t payload = pulsar_session_segment_bytes(s, TokPos{G_prev}, TokPos{G}, NULL);
     if (payload == 0) return PUT_NO_CUT;
     const pulsar_tokens span = view(toks, G_prev, G);
     size_t text_len = 0;
@@ -89,13 +87,13 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
     pulsar_segstore_job *job = NULL;
-    const int rc = pulsar_segstore_reserve(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload,
-                                           state_bytes, tbytes, key_out, &job, r->err, sizeof(r->err));
+    const int rc = pulsar_segstore_reserve(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload, tbytes,
+                                           key_out, &job, r->err, sizeof(r->err));
     if (rc <= 0) {   /* held or being written (0), or refused (-1, err) */
         free(text);
         return rc == 0 ? PUT_STORED : PUT_FAILED;
     }
-    /* L338: the bank's rows and state at G are copied out now (the bank moves on); the file is the writer's */
+    /* L338: the bank's rows are copied out now (the bank moves on); the file is the writer's */
     uint8_t *pbuf = NULL, *tbuf = NULL;
     bool ok = writer->admit(writer->ud, payload + tbytes);
     if (!ok)
@@ -119,11 +117,38 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     r->bytes += payload + tbytes;
     return PUT_STORED;
 }
+/* L347: the restore point of the chain's end `key` at G -- the bank's checkpoint there -- written through the store
+ * now (pulsar_segstore_put_rp; `key` may still be the writer's), unless the store has it.  False: `r->err` says why. */
+/** Store the restore point at a persisted chain's end (see above).
+ *  @param st  the segment store
+ *  @param s   the session whose installed bank holds the checkpoint at G
+ *  @param key the key of the segment ending at G (stored, or being written)
+ *  @param G   the chain's end
+ *  @param r   counters updated on a write; `r->err` set on failure
+ *  @return true when the store holds (or now has) the restore point, or the bank holds no checkpoint at G */
+bool kvchain_put_rp(pulsar_segstore *st, pulsar_session *s, const char key[41], int G,
+                    pulsar_kvchain_persist_result *r) {
+    pulsar_segstore_seg had;
+    if (pulsar_segstore_get(st, key, &had) && had.rp_bytes > 0u) return true;   /* the same key: the same state */
+    const uint64_t bytes = pulsar_session_restore_point_bytes(s, TokPos{G});
+    if (bytes == 0u) return true;
+    struct ctx { pulsar_session *s; int G; const char *key; } c = { s, G, key };
+    if (!pulsar_segstore_put_rp(st, key, bytes, [](FILE *fp, void *ud, char *err, size_t errlen) {
+            const ctx *x = (const ctx *)ud;
+            return pulsar_session_save_restore_point(x->s, fp, TokPos{x->G}, x->key, err, errlen);
+        }, &c, r->err, sizeof(r->err)))
+        return false;
+    r->rp_bytes = bytes;
+    return true;
+}
 }  // namespace
 
 namespace {
 /** A staged buffer as a pulsar_segstore_write_fn's ud. */
-struct staged_bytes { const uint8_t *p; uint64_t n; };
+struct staged_bytes {
+    const uint8_t *p;   ///< the bytes
+    uint64_t n;         ///< their count
+};
 /** pulsar_segstore_write_fn over a staged_bytes.  @param fp the file  @param ud the staged_bytes  @param err reason
  *  @param errlen bytes at err  @return 0 when every byte was written */
 int write_staged(FILE *fp, void *ud, char *err, size_t errlen) {
@@ -214,21 +239,11 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
             if (upto_len == chain[c - 1].text_end) {
                 memcpy(parent, chain[c - 1].key, 41);
                 prev = (int)chain[c - 1].G;
-                /* a stored segment of it without the state this bank holds at its end gets it, in place (the same
-                 * key), so a branch parting in the cell above resumes there and not a cell lower */
-                for (int i = 0; i < c; i++) {
-                    const TokPos Gi{(int)chain[i].G};
-                    if (chain[i].state_bytes || pulsar_session_checkpoint_best(s, Gi) != Gi)
-                        continue;
-                    char key[41];
-                    if (kvchain_put(st, e, s, toks, i ? chain[i - 1].key : "", (int)chain[i].G_prev, (int)chain[i].G,
-                                    trailer, writer, &r, key) == PUT_FAILED) break;
-                }
             }
         }
     }
     int ends[PULSAR_KVCHAIN_MAX];
-    const int m = r.err[0] ? 0 : pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, PULSAR_KVCHAIN_MAX);
+    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, PULSAR_KVCHAIN_MAX);
     for (int k = 0; k < m; k++) {
         char key[41];
         const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, writer, &r, key);
@@ -242,6 +257,13 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     }
     r.end = prev;
     memcpy(r.key, parent, 41);
+    /* L347: a closing persist leaves a restore point at the chain's end, when the bank holds its checkpoint there --
+     * also where the write stopped short (its error is kept: the first one says why the chain is short) */
+    if (close && prev > 0) {
+        pulsar_kvchain_persist_result rp_r = r;
+        if (!kvchain_put_rp(st, s, parent, prev, &rp_r) && !r.err[0]) memcpy(r.err, rp_r.err, sizeof(r.err));
+        r.rp_bytes = rp_r.rp_bytes;
+    }
     if (out) *out = r;
     return r.written;
 }
@@ -280,7 +302,7 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
             }
         }
     }
-    while (n > 0 && chain[n - 1].state_bytes == 0) n--;   /* L323: back to the last state below an image cut */
+    while (n > 0 && chain[n - 1].rp_bytes == 0) n--;   /* L347: back to the last restore point below an image cut */
     if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
     if (bytes) *bytes = pulsar_kvchain_load_bytes(chain, n);
     return n;
@@ -295,13 +317,12 @@ uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n) {
 uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n) {
     uint64_t bytes = 0;
     for (int i = 0; i < n; i++)
-        bytes += pulsar_segstore_cached_bytes(st, chain[i].key,
-                                              chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u), true);
+        bytes += pulsar_segstore_cached_bytes(st, chain[i].key, chain[i].payload_bytes, true, i == n - 1);
     return bytes;
 }
 
 uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i) {
-    return chain[i].payload_bytes - (i < n - 1 ? chain[i].state_bytes : 0u) + chain[i].trailer_bytes;
+    return chain[i].payload_bytes + chain[i].trailer_bytes + (i == n - 1 ? chain[i].rp_bytes : 0u);
 }
 
 int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
@@ -314,11 +335,15 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
     }
     const int end = *next + k < n ? *next + k : n;
     for (int i = *next; i < end; i++) {
-        uint64_t pb = 0;
+        uint64_t pb = 0, rb = 0;
+        const bool last = i == n - 1;
         FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
-        char lerr[256] = "segment file unreadable";
+        FILE *rp = fp && last ? pulsar_segstore_open_rp(st, chain[i].key, &rb) : NULL;   /* L347: the state at its G */
+        char lerr[256];
+        snprintf(lerr, sizeof lerr, "%s", !fp ? "segment file unreadable" : "restore point file unreadable");
         int G = 0;
-        const int rc = fp ? load(ud, fp, pb, i == n - 1, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
+        const int rc = fp && (!last || rp) ? load(ud, fp, pb, last, rp, rb, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
+        if (rp) fclose(rp);
         if (fp) fclose(fp);
         if (rc != 0) {
             if (err && errlen)
@@ -333,19 +358,22 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
 }
 
 /** The pulsar_kvchain_segment_loader that loads into a session's installed bank (pulsar_session_load_segment).
- *  @param ud     the pulsar_session
- *  @param fp     the segment's payload, positioned at its first byte
- *  @param bytes  the payload's size
- *  @param last   restore the segment's state too
- *  @param G      receives the position the bank stands at, or NULL
- *  @param key    the segment's key
- *  @param err    receives a reason on failure
- *  @param errlen size of `err`
+ *  @param ud       the pulsar_session
+ *  @param fp       the segment's payload, positioned at its first byte
+ *  @param bytes    the payload's size
+ *  @param last     restore the state at the segment's end too
+ *  @param rp       the restore point at its end when `last`, else NULL
+ *  @param rp_bytes its size
+ *  @param G        receives the position the bank stands at, or NULL
+ *  @param key      the segment's key
+ *  @param err      receives a reason on failure
+ *  @param errlen   size of `err`
  *  @return pulsar_session_load_segment's status: 0 = loaded */
-static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, int *G, const char *key, char *err,
-                                  size_t errlen) {
+static int session_segment_loader(void *ud, FILE *fp, uint64_t bytes, bool last, FILE *rp, uint64_t rp_bytes, int *G,
+                                  const char *key, char *err, size_t errlen) {
     TokPos at{0};
-    const int rc = pulsar_session_load_segment((pulsar_session *)ud, fp, bytes, last, G ? &at : NULL, key, err, errlen);
+    const int rc = pulsar_session_load_segment((pulsar_session *)ud, fp, bytes, last, rp, rp_bytes, G ? &at : NULL, key,
+                                               err, errlen);
     if (G) *G = at.raw();
     return rc;
 }

@@ -210,8 +210,9 @@ int main(int argc, char **argv) {
     const uint32_t grid = 128;
     const int k = 262144 + 1000 + 37;
     const std::string f1 = dir + "/l280-seg1.bin", f2 = dir + "/l280-seg2.bin", fp_ = dir + "/l280-payload.bin";
+    const std::string frp = dir + "/l280-seg2.rp";   /* L347: the restore point at the chain's end */
     int Gk = 0, GD = 0;
-    uint64_t b1 = 0, b2 = 0;
+    uint64_t b1 = 0, b2 = 0, brp = 0;
     {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL;
@@ -230,13 +231,17 @@ int main(int argc, char **argv) {
               "C1 sync(P[0:%d]) then sync(P[0:%d]): %.1f s; checkpoints kept at %d and %d %s", k, D, t1 - t0, Gk, GD,
               err);
         FILE *a = ok ? fopen(f1.c_str(), "wb") : NULL, *b = ok ? fopen(f2.c_str(), "wb") : NULL;
+        FILE *r = ok ? fopen(frp.c_str(), "wb") : NULL;
         b1 = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{Gk}, NULL) : 0;
         b2 = ok ? pulsar_session_segment_bytes(s, TokPos{Gk}, TokPos{GD}, NULL) : 0;
+        brp = ok ? pulsar_session_restore_point_bytes(s, TokPos{GD}) : 0;
         const double t2 = now_s();
-        ok = ok && a && b && pulsar_session_save_segment(s, a, TokPos{0}, TokPos{Gk}, NULL, err, sizeof err) == 0 &&
-             pulsar_session_save_segment(s, b, TokPos{Gk}, TokPos{GD}, NULL, err, sizeof err) == 0;
+        ok = ok && a && b && r && pulsar_session_save_segment(s, a, TokPos{0}, TokPos{Gk}, NULL, err, sizeof err) == 0 &&
+             pulsar_session_save_segment(s, b, TokPos{Gk}, TokPos{GD}, NULL, err, sizeof err) == 0 &&
+             pulsar_session_save_restore_point(s, r, TokPos{GD}, NULL, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
+        if (r) fclose(r);
         CHECK(ok, "C4 saved [0, %d) %.2f GiB and [%d, %d) %.2f GiB in %.1f s %s", Gk, b1 / 1073741824.0, Gk, GD,
               b2 / 1073741824.0, now_s() - t2, err);
         std::vector<std::vector<float>> got;
@@ -252,14 +257,15 @@ int main(int argc, char **argv) {
         pulsar_engine_set_bank_pool(1);
         pulsar_session *s = NULL, *x = NULL;
         pulsar_tokens P = {(int *)ids.data(), D, D};
-        FILE *a = fopen(f1.c_str(), "rb"), *b = fopen(f2.c_str(), "rb");
+        FILE *a = fopen(f1.c_str(), "rb"), *b = fopen(f2.c_str(), "rb"), *r = fopen(frp.c_str(), "rb");
         TokPos g1{0}, g2{0};
         const double t0 = now_s();
-        bool ok = a && b && pulsar_session_create(&s, e, ctx) == 0 &&
-                  pulsar_session_load_segment(s, a, b1, false, &g1, NULL, err, sizeof err) == 0 &&
-                  pulsar_session_load_segment(s, b, b2, true, &g2, NULL, err, sizeof err) == 0;
+        bool ok = a && b && r && pulsar_session_create(&s, e, ctx) == 0 &&
+                  pulsar_session_load_segment(s, a, b1, false, NULL, 0, &g1, NULL, err, sizeof err) == 0 &&
+                  pulsar_session_load_segment(s, b, b2, true, r, brp, &g2, NULL, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
+        if (r) fclose(r);
         CHECK(ok && g1.raw() == Gk && g2.raw() == GD, "C4 a fresh session loaded the chain to %d in %.1f s %s", g2.raw(),
               now_s() - t0, err);
         std::vector<std::vector<float>> got;
@@ -323,6 +329,7 @@ int main(int argc, char **argv) {
     }
     remove(f1.c_str());
     remove(f2.c_str());
+    remove(frp.c_str());
     remove(fp_.c_str());
     pulsar_engine_close(e);
     printf("\nqwen-deep-probe: %s (%d failed)\n", g_fail ? "FAIL" : "PASS", g_fail);

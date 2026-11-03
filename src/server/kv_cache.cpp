@@ -313,26 +313,27 @@ static void kv_seg_log(void *ud, const char *msg) {
 
 /** One staged segment: the reserved job and its bytes (owned). */
 struct kv_write_item {
-    pulsar_segstore_job *job;
-    uint8_t *payload;
-    uint64_t payload_len;
-    uint8_t *trailer;
-    uint64_t trailer_len;
+    pulsar_segstore_job *job;   ///< the reserved job (pulsar_segstore_reserve); committed on the store's thread
+    uint8_t *payload;           ///< the staged payload (malloc'd)
+    uint64_t payload_len;       ///< its bytes
+    uint8_t *trailer;           ///< the staged trailer (malloc'd), or NULL
+    uint64_t trailer_len;       ///< its bytes
     double staged_at;      ///< server_now_sec at submit
     double written_ms;     ///< the file write's wall time
-    bool ok;
-    char err[256];
+    bool ok;                    ///< the file write succeeded
+    char err[256];              ///< why it did not
 };
 
+/** The background segment writer: one thread, a queue of staged segments, the written ones awaiting their commit. */
 struct kv_writer {
-    pthread_t th;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    pthread_t th;               ///< the writer thread (kv_writer_main)
+    pthread_mutex_t mu;         ///< guards everything below
+    pthread_cond_t cv;          ///< signalled on a submit, a finished write and the stop
     std::deque<kv_write_item> queue;   ///< staged, not yet written
     std::deque<kv_write_item> done;    ///< written (or failed), not yet committed
     uint64_t staged = 0;               ///< payload + trailer bytes in `queue` and the item being written
     bool busy = false;                 ///< the thread is writing an item
-    bool stop = false;
+    bool stop = false;                 ///< the close asked the thread to drain and exit
 };
 
 namespace {
@@ -687,11 +688,12 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
     pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, close, &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
-    if (r.written)
+    if (r.written || r.rp_bytes)
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB) staged in "
-                   "%.1f ms, written in the background",
-                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (server_now_sec() - t0) * 1000.0);
+                   "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB, staged and "
+                   "written in the background; restore point %.1f MiB written) in %.1f ms",
+                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (double)r.rp_bytes / (1024.0 * 1024.0),
+                   (server_now_sec() - t0) * 1000.0);
     if (chain_end) *chain_end = r.end;
     return r.written;
 }
@@ -891,7 +893,7 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
     for (int i = 0; i < hit->n; i++) {
         const pulsar_segstore_seg *g = &hit->chain[i];
         const uint64_t bytes = pulsar_kvchain_segment_load_bytes(hit->chain, hit->n, i);
-        const uint64_t cached = pulsar_segstore_cached_bytes(s->kv.st, g->key, bytes - g->trailer_bytes, true);
+        const uint64_t cached = pulsar_segstore_cached_bytes(s->kv.st, g->key, g->payload_bytes, true, i == hit->n - 1);
         double ms = 0.0;
         pthread_mutex_lock(&s->mu);
         const bool measured = kv_read_cost_ms(&s->kv.meter.read, bytes, cached, server_now_sec(), &ms);
