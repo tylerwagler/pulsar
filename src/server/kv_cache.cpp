@@ -761,6 +761,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                            reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor().raw() / gib,
                            avail ? "" : " (MemAvailable unreadable)", skipped);
             }
+            if (no_room) *no_room = true;   /* nothing was stored: a spill must not free the bank (L347) */
             return 0;
         }
     }
@@ -788,7 +789,9 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                    "--kv-ram-mb)", reason, (double)pulsar_kvpool_size(s->kv.ram) / (1024.0 * 1024.0));
     }
     if (chain_end) *chain_end = r.end;
-    if (no_room) *no_room = r.no_room;
+    /* L347: a spill frees its bank only when the history is stored: no host pool room, or any persist error (the
+     * store full, a write refused), keeps the bank resident */
+    if (no_room) *no_room = r.no_room || r.err[0] != '\0';
     return r.written;
 }
 

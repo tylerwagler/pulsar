@@ -2454,8 +2454,9 @@ struct server {
     /// @param sl         the slot whose bank is installed (unused beyond that precondition)
     /// @param why        the trigger: what is written and the log word
     /// @param chain_end  receives the stored chain's end position in tokens (0: none); may be NULL
-    /// @param no_room    L347 I3a: receives whether a file could not be copied out for want of host pool room (a spill
-    ///                   that sees it keeps its bank); may be NULL
+    /// @param no_room    L347: receives whether the history is NOT stored -- no host pool room for a copy-out, the
+    ///                   memory floor skipped the persist, or the persist failed (a spill that sees it keeps its bank);
+    ///                   may be NULL
     int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
     /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point at a loss when
      *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @return the PULSAR_KVCHAIN_*
