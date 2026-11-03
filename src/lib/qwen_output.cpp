@@ -14,6 +14,10 @@ const out_grammar &qwen_output_grammar(void) {
         /* .markers     = */ {"</think>", "<tool_call>", "</tool_call>"},
         /* .transitions = */ {
             {OUT_REASONING, THINK_END, OUT_CONTENT, 0},
+            /* a stray </think> after the reasoning: dropped, as Nemotron's grammar drops it (one behaviour across
+             * families).  It was content text; a forced close (L344's thinking budget) makes a model that was still
+             * reasoning write its own close in the answer, and the tag reached the client (gpuq #581). */
+            {OUT_CONTENT, THINK_END, OUT_CONTENT, 0},
             {OUT_CONTENT, CALL_OPEN, OUT_CALL, 0},
             {OUT_CALL, CALL_CLOSE, OUT_CONTENT, 0},
         },

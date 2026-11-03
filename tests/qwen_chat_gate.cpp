@@ -466,6 +466,8 @@ static void p2_units(void) {
          "text after </function>"},
         {"unterminated_param", true, "</think><tool_call><function=f><parameter=s>x</function></tool_call>", "", "", "",
          "unterminated parameter value"},
+        {"stray_close_in_content", true, "r\n</think>\n\nstill thinking</think>\n\nThe answer.", "r",
+         "still thinking\n\nThe answer.", "", NULL},
         {"marker_text_in_reasoning", true, "I could <tool_call> here\n</think>\n\nno", "I could <tool_call> here", "no", "",
          NULL},
         {"partial_marker_at_end", true, "r</think>tail </thi", "r", "tail </thi", "", NULL},
