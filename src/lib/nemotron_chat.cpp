@@ -65,8 +65,8 @@ const char kToolsTail[] =
     "</IMPORTANT>";
 
 /* the shared kit's types under this file's names (chat_render_kit.h) */
-using piece = chat_piece;
-using writer = chat_writer;
+using piece = chat_piece;    ///< text plus its client-data spans (chat_piece)
+using writer = chat_writer;  ///< appends to the render's output, recording spans (chat_writer)
 
 /// Refuse a render too large for the 32-bit span map (chat_render_finish).
 /// @param out    the finished render

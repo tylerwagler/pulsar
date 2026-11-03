@@ -4455,6 +4455,8 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
  *  contradicts itself: false + err. */
 /// @param a       the ask
 /// @param model   the request's "model" (may be NULL)
+/// @param server_default  thinking when the request sends no control (--reasoning): 0 off, 1 on, -1 unset (the rule
+///                 above)
 /// @param on      receives whether thinking is on
 /// @param err     receives the client error on false
 /// @param errlen  size of `err`
@@ -4653,16 +4655,30 @@ bool http_response(int fd, int code, const char *type, const char *body);
 /* ---- L338 P2.4: /v1/systemone (systemone.cpp) ---- */
 /** Open the judge on reserved bank `bank`: the container's decision head, its judge_config.json and
  *  calibration_gold.json, the bank emptied with the adapter on.  Single-threaded startup.
+ *  @param s             the server (its engine; receives s->judge)
+ *  @param container_dir the container's directory (judge_config.json, calibration_gold.json)
+ *  @param bank          the reserved bank the judge runs on
+ *  @param err           receives the reason on false
+ *  @param errlen        size of `err`
  *  @return false (said in err) when the container cannot serve it */
 bool server_judge_open(struct server *s, const char *container_dir, int bank, char *err, size_t errlen);
-/** Free the judge (its queue drained by the worker before shutdown). */
+/** Free the judge (its queue drained by the worker before shutdown).
+ *  @param s the server (s->judge freed, NULL after) */
 void server_judge_close(struct server *s);
-/** A judge job waits (read under s->mu).  @return true when the worker has judge work */
+/** A judge job waits (read under s->mu).
+ *  @param s the server
+ *  @return true when the worker has judge work */
 bool server_judge_queued(const struct server *s);
 /** The worker's judge turn: one chunk of the current judge prompt on the reserved bank, its decision when the prompt
- *  is in.  @return true when it did work */
+ *  is in.
+ *  @param s the server
+ *  @return true when it did work */
 bool server_judge_step(struct server *s);
-/** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer. */
+/** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer.
+ *  @param s    the server
+ *  @param fd   the client socket (the answer is written here)
+ *  @param body the request body, JSON
+ *  @param len  bytes at `body` */
 void server_judge_http(struct server *s, int fd, const char *body, size_t len);
 bool http_error(int fd, int code, const char *msg);
 /* Retry-After for a retryable 503, by cause: the box is going away

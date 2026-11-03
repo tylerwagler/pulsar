@@ -246,7 +246,10 @@ typedef struct pulsar_block_drafter {
     /* the state plan's ids (pulsar_block_drafter_plan); decl_anchor only for a head that reads the anchor row
      * (LILICORR), else UINT32_MAX */
     /** @var pulsar_block_drafter::decl_anchor
-     *  The anchor row's decl (LILICORR only), else UINT32_MAX. */
+     *  The anchor row's decl (LILICORR only), else UINT32_MAX.
+     *  @var pulsar_block_drafter::decl_kv_full
+     *  The full (non-sliding) layers' K | V context ring decl (L338: the layers full_layers marks), UINT32_MAX =
+     *  none. */
     /// The state plan's decl of the per-layer K | V context ring (decl_kv_full: a full layer's, UINT32_MAX = none).
     uint32_t decl_kv, decl_anchor, decl_kv_full;
     /** The round API's drafter for this declaration (pulsar_block_drafter_read: PULSAR_BLOCK_DRAFTER_OPS at a chain of
