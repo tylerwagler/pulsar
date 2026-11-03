@@ -339,7 +339,7 @@ static bool worker_segment_load(pulsar_session *s, const char *path, const pulsa
     }
     uint32_t G = 0;
     bool ok = seg && (cmd->last == 0 || rp) &&
-              s->load_segment(seg, bytes, cmd->last != 0, rp, rp_bytes, &G, err, errlen) == 0;
+              s->load_segment(seg, bytes, cmd->last != 0, rp, rp_bytes, &G, err, errlen) == PULSAR_SEGMENT_OK;
     free(seg);
     free(rp);
     if (ok && ((int)G != cmd->G || pulsar_session_checkpoint_digest(s) != cmd->digest)) {
@@ -882,8 +882,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
     }
     case PULSAR_TP_FRAME_SEGMENT_LOAD: {
         /* The leader loaded first and states the result; a copy that cannot
-         * reach it is a MISS -- the leader invalidates every rank and drops the
-         * chain. */
+         * reach it is a MISS -- the leader invalidates every rank and keeps its
+         * own good segment (L347 I3b: a rank's miss is not the chain's fault). */
         int status = 1;
         char path[4600];
         if (worker_refused(e, c, "kv segment load", &slot, ferr, sizeof(ferr))) {

@@ -2233,25 +2233,36 @@ int pulsar_session_copy_out_restore_point(pulsar_session *s, TokPos G, const cha
                                                                                errlen); },
                             err, errlen);
 }
-int pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
-                                uint64_t rp_bytes, TokPos *G_out, const char *key, char *err, size_t errlen) {
+pulsar_segment_status pulsar_session_check_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                   const uint8_t *rp, uint64_t rp_bytes, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", PULSAR_SEGMENT_TRANSIENT);
+    if (!s) {
+        if (err) snprintf(err, errlen, "check segment: no session");
+        return PULSAR_SEGMENT_TRANSIENT;
+    }
+    return s->check_segment(seg, bytes, last, rp, rp_bytes, err, errlen);
+}
+pulsar_segment_status pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                  const uint8_t *rp, uint64_t rp_bytes, TokPos *G_out, const char *key,
+                                                  char *err, size_t errlen) {
     PULSAR_NVTX_FN();
-    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", 1);
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SEGMENTS, "disk KV segments", PULSAR_SEGMENT_TRANSIENT);
     if (G_out) *G_out = TokPos{0};
     if (!s) {
         if (err) snprintf(err, errlen, "load segment: no session");
-        return 1;
+        return PULSAR_SEGMENT_TRANSIENT;
     }
     pulsar_tp *tp = tp_mirror_target(s);
-    if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return 1;
+    /* L347 I3b: a refused mirror and a worker's miss are the group's, never the leader's bytes: transient */
+    if (tp && tp_segment_refused(s, tp, "kv segment load", key, err, errlen)) return PULSAR_SEGMENT_TRANSIENT;
     uint32_t G = 0;
     /* Load HERE first: the workers must reach the state this rank actually
      * ended in, so the frame carries the result, not the intent.  A local
      * failure never ships it -- the caller's mirrored invalidate brings every
      * rank to the same empty state.  L347: with `last` each worker reads its
      * own copy of the restore point too. */
-    const int own = s->load_segment(seg, bytes, last, rp, rp_bytes, &G, err, errlen);
-    if (own != 0 || !tp) {
+    const pulsar_segment_status own = s->load_segment(seg, bytes, last, rp, rp_bytes, &G, err, errlen);
+    if (own != PULSAR_SEGMENT_OK || !tp) {
         if (G_out) *G_out = TokPos{(int)G};
         return own;
     }
@@ -2260,25 +2271,25 @@ int pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t 
     c.last = last ? 1 : 0;
     c.digest = pulsar_session_checkpoint_digest(s);
     if (!tp_mirror_sent(tp, "kv segment load", pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_LOAD, &c),
-                        err, errlen)) return 1;
+                        err, errlen)) return PULSAR_SEGMENT_TRANSIENT;
     int peers = 0;
     char perr[256];
     perr[0] = '\0';
     if (!pulsar_tp_wait_command_status(tp, s->tp_session_id, "kv segment load", &peers, perr, sizeof(perr))) {
         pulsar_tp_mirror_fail_void(tp, "kv segment load", perr);
         if (err) snprintf(err, errlen, "tp: kv segment load: the workers' verdict could not be collected: %s", perr);
-        return 1;
+        return PULSAR_SEGMENT_TRANSIENT;
     }
     if (peers != 0) {
         /* A MISS: the copy is missing or reached another state.  Nothing is
-         * computed on it -- the caller invalidates every rank and drops the
-         * chain. */
+         * computed on it -- the caller invalidates every rank.  L347 I3b: the
+         * leader's own segment is good (it just loaded): the store keeps it. */
         if (err) snprintf(err, errlen, "tp: a worker has no matching copy of segment %.40s (its log names why) -- "
                               "a miss on every rank", key);
-        return 1;
+        return PULSAR_SEGMENT_TRANSIENT;
     }
     if (G_out) *G_out = TokPos{(int)G};
-    return 0;
+    return PULSAR_SEGMENT_OK;
 }
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session snapshots", 1); return s ? s->save_snapshot(snap, err, errlen) : 1; }
 int pulsar_session_load_snapshot(pulsar_session *s, const pulsar_session_snapshot *snap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_PAYLOAD, "session snapshots", 1); return s ? s->load_snapshot(snap, err, errlen) : 1; }

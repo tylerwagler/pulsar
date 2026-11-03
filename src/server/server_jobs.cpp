@@ -540,15 +540,13 @@ static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
  * after each pulsar_session_sync failure). Token vectors and the disk path are
  * freed centrally by gen_state_free. */
-void server::gen_prefill_fail(session_slot *sl, bool discard_loaded_entry) {
+void server::gen_prefill_fail(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    if (discard_loaded_entry) {
-        s->kv_cache_discard_failed_chain(g->disk_cache_path);
-    } else if (g->disk_cache_path) {
+    if (g->disk_cache_path) {
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept segment=%s (prefill ended: %s)",
                    g->disk_cache_path, g->err);
     }
@@ -591,7 +589,7 @@ void server::gen_prefill_abandon(session_slot *sl) {
             pthread_mutex_unlock(&s->mu);
         }
     }
-    s->gen_prefill_fail(sl, false);
+    s->gen_prefill_fail(sl);
 }
 
 
@@ -698,7 +696,8 @@ static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_histo
     gr->kind = GEN_RESTORE_SPILLED;
     gr->text = was->text;
     was->text = NULL;
-    s->kv_restore_begin(&gr->r, &gr->hit, 0, true);
+    gr->adopt_src = -1;
+    s->kv_restore_begin(&gr->r, &gr->hit, 0, true, false);   /* the bank came back empty: nothing to keep */
     gen_restore_start(sl, gr);
     return true;
 }
@@ -711,10 +710,12 @@ void server::gen_step_restore(session_slot *sl) {
     kv_restore *r = &gr->r;
     int rc;
     if (gen_client_disconnected(j->fd)) {
-        /* a cancel: the slices read so far describe no state (only the chain's last segment carries one) */
+        /* a cancel: the slices read so far describe no state (only the chain's last segment carries one); L347 I3b: a
+         * bank only checked against is as it was */
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during bank %u's disk restore (%d of %d "
-                   "segments read): the restore stops, the bank is invalidated", sl->bank, r->next, gr->hit.n);
-        pulsar_session_invalidate(s->sess);   /* the installed bank is this slot's (generate_job_step) */
+                   "segments read): the restore stops%s", sl->bank, r->next, gr->hit.n,
+                   r->touched ? ", the bank is invalidated" : "");
+        if (r->touched) pulsar_session_invalidate(s->sess);   /* the installed bank is this slot's (generate_job_step) */
         rc = -1;
     } else {
         rc = s->kv_restore_next(r);
@@ -723,6 +724,7 @@ void server::gen_step_restore(session_slot *sl) {
     g->restore = NULL;
     if (gr->kind == GEN_RESTORE_SPILLED) {
         const int G = rc > 0 ? s->kv_restore_finish(r, gr->text, NULL, 0, NULL, NULL, false) : 0;
+        s->kv_restore_end(r);
         pulsar_session_bank_state_save(s->sess, sl->bank);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: guard RESTORED bank %u from its segment chain to %d in %d slice%s (%.1f ms read, "
@@ -738,28 +740,84 @@ void server::gen_step_restore(session_slot *sl) {
                                                 &g->effective_prompt, &g->disk_cache_path,
                                                 j->req.api == API_RESPONSES)
                          : 0;
+    s->kv_restore_end(r);
+    /* L347 I3b (D7): a failed restore costs at most a miss -- the pick's best in-memory source: the bank's own history
+     * while the restore wrote nothing into it (it checked the chain first), else another bank's adopt, else 0 */
+    const bool bank_kept = !r->touched;
+    const int own = gr->own, adopt_src = gr->adopt_src;
     free(gr);
-    if (G > 0) {
-        res.cached = G;
-        res.resumed_at = TokPos{G};   /* the chain ends at G on the bank's own tokens */
-        res.disk_cached = G;
-        res.cache_source = "disk-text";
-        /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
-         * tokens, exactly what a cold server prefills (reuse == cold), instead of the suffix re-tokenized from
-         * the chain's byte boundary -- which is mid-text wherever a grid point falls.  Only a byte-only match
-         * (another spelling of the same bytes) syncs the stitched prompt. */
-        const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
-        bool own_tokens = loaded && loaded->len == G && G <= j->req.prompt.len;
-        for (int i = 0; own_tokens && i < G; i++) own_tokens = loaded->v[i] == j->req.prompt.v[i];
-        if (own_tokens) pulsar_tokens_free(&g->effective_prompt);
-        else res.prompt_for_sync = &g->effective_prompt;
-    } else {
-        res.cached = 0;   /* the load said why and left the bank invalid: the sync rebuilds it from 0 */
-        res.resumed_at = TokPos{0};
+    if (G <= 0) {
+        const int adopt_at = s->gen_adopt_depth(sl, adopt_src);   /* again: slices ran since the pick */
+        const resume_pick fb = server_failed_restore_pick(own, adopt_at, bank_kept);
+        if (!bank_kept) {
+            res.cached = 0;
+            res.resumed_at = TokPos{0};
+            res.cache_source = "none";
+        }
         res.disk_cached = 0;
-        res.cache_source = "none";
+        if (fb == RESUME_ADOPT) (void)s->gen_resume_adopt(sl, adopt_src, &res);
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u's disk restore failed: resumes from %s at %d (own %d%s, "
+                   "adopt %d)", sl->bank, fb == RESUME_ADOPT ? "an adopt" : res.cached > 0 ? "its own history" : "0",
+                   res.cached, own, bank_kept ? ", kept: the chain was checked before the load"
+                                              : ", lost: the load had written it", adopt_at);
+        s->gen_begin_plan(sl, &res);
+        return;
     }
+    res.cached = G;
+    res.resumed_at = TokPos{G};   /* the chain ends at G on the bank's own tokens */
+    res.disk_cached = G;
+    res.cache_source = "disk-text";
+    /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
+     * tokens, exactly what a cold server prefills (reuse == cold), instead of the suffix re-tokenized from
+     * the chain's byte boundary -- which is mid-text wherever a grid point falls.  Only a byte-only match
+     * (another spelling of the same bytes) syncs the stitched prompt. */
+    const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
+    bool own_tokens = loaded && loaded->len == G && G <= j->req.prompt.len;
+    for (int i = 0; own_tokens && i < G; i++) own_tokens = loaded->v[i] == j->req.prompt.v[i];
+    if (own_tokens) pulsar_tokens_free(&g->effective_prompt);
+    else res.prompt_for_sync = &g->effective_prompt;
     s->gen_begin_plan(sl, &res);
+}
+
+int server::gen_adopt_depth(const session_slot *sl, int src) {
+    auto *s = this;
+    const session_slot *o = NULL;
+    for (int i = 0; src >= 0 && i < s->n_slots; i++)
+        if ((int)s->slots[i].bank == src) o = &s->slots[i];
+    /* L330: nor a bank mid-restore -- its rows describe no state until its chain's last segment */
+    if (!o || o == sl || !o->provisioned || o->spilled || o->preempted || (o->gen && o->gen->phase == GEN_RESTORE))
+        return 0;
+    /* L334: ranked by the request's tokens o's history to its T holds (`served`), the currency of `own` and the
+     * prompt's length -- T itself is a position on o's history */
+    return pulsar_session_bank_adopt_score(s->sess, o->bank, &sl->gen->j->req.prompt).served.raw();
+}
+
+bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    char aerr[192] = "";
+    const double t_a = server_now_sec();
+    const pulsar_bank_adopt_result ad =
+        pulsar_session_bank_adopt(s->sess, (uint32_t)src, &j->req.prompt, aerr, sizeof(aerr));
+    if (ad.status == PULSAR_ADOPT_ADOPTED) {
+        /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
+        res->cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, ad.at).raw();
+        res->resumed_at = ad.at;
+        res->cache_source = "bank-adopt";
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
+                   sl->bank, src, ad.at.raw(), j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
+        return true;
+    }
+    if (ad.status == PULSAR_ADOPT_REFUSED) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank, src,
+                   aerr);
+        pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
+        res->cached = 0;
+        res->resumed_at = TokPos{0};
+        res->cache_source = "none";
+    }
+    return false;
 }
 
 /* Resolve the prompt against every cache layer and decide the prefill plan.
@@ -799,7 +857,7 @@ void server::gen_begin(session_slot *sl) {
     if (!s->bank_switch(sl->bank, &was)) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-        s->gen_prefill_fail(sl, false);
+        s->gen_prefill_fail(sl);
         return;
     }
     /* L330: a guard-spilled bank comes back EMPTY (bank_switch); its own history -- what a live continuation of it
@@ -962,20 +1020,13 @@ void server::gen_begin(session_slot *sl) {
      * exact frontier; nothing serves it deeper. */
     kv_chain_hit *disk_hit = NULL;   /* heap: PULSAR_KVCHAIN_MAX segments */
     resume_pick pick = RESUME_OWN;
-    int adopt_src = -1, adopt_at = 0, disk_at = 0, mem = 0;
+    int adopt_src = -1, adopt_at = 0, disk_at = 0, mem = 0, own = 0;
     if (prompt_for_sync == &j->req.prompt) {
-        const int own = cached > memory_resume ? cached : memory_resume;
+        own = cached > memory_resume ? cached : memory_resume;
         if (s->pool_banks > 1 && !image_request) {
             for (int i = 0; i < s->n_slots; i++) {
-                const session_slot *o = &s->slots[i];
-                /* L330: nor a bank mid-restore -- its rows describe no state until its chain's last segment */
-                if (o == sl || !o->provisioned || o->spilled || o->preempted ||
-                    (o->gen && o->gen->phase == GEN_RESTORE))
-                    continue;
-                /* L334: ranked by the request's tokens o's history to its T holds (`served`), the currency of
-                 * `own` and the prompt's length -- T itself is a position on o's history */
-                const int T = pulsar_session_bank_adopt_score(s->sess, o->bank, &j->req.prompt).served.raw();
-                if (T > adopt_at) { adopt_at = T; adopt_src = (int)o->bank; }
+                const int T = s->gen_adopt_depth(sl, (int)s->slots[i].bank);
+                if (T > adopt_at) { adopt_at = T; adopt_src = (int)s->slots[i].bank; }
             }
         }
         mem = server_resume_memory_depth(own, adopt_at);
@@ -1003,26 +1054,18 @@ void server::gen_begin(session_slot *sl) {
         if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
         s->kv_cache_persist(sl, KV_PERSIST_EVICT);
     }
+    /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
+     * every later persist of the bank reads its X-Pulsar-KV tokens */
+    sl->kv_flags = j->req.kv_flags;
     if (pick == RESUME_ADOPT) {
-        char aerr[192] = "";
-        const double t_a = server_now_sec();
-        const pulsar_bank_adopt_result ad =
-            pulsar_session_bank_adopt(s->sess, (uint32_t)adopt_src, &j->req.prompt, aerr, sizeof(aerr));
-        if (ad.status == PULSAR_ADOPT_ADOPTED) {
-            /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
-            cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, ad.at).raw();
-            resumed_at = ad.at;
-            cache_source = "bank-adopt";
-            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
-                       sl->bank, adopt_src, ad.at.raw(), j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
-        } else if (ad.status == PULSAR_ADOPT_REFUSED) {
-            server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank,
-                       adopt_src, aerr);
-            pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
-            cached = 0;
-            resumed_at = TokPos{0};
-            cache_source = "none";
-        }
+        gen_resolution ar = {};
+        ar.cached = cached;
+        ar.resumed_at = resumed_at;
+        ar.cache_source = cache_source;
+        (void)s->gen_resume_adopt(sl, adopt_src, &ar);
+        cached = ar.cached;
+        resumed_at = ar.resumed_at;
+        cache_source = ar.cache_source;
     } else if (pick == RESUME_DISK) {
         /* L330: the chain loads a slice of segments a worker turn (GEN_RESTORE), and the plan below runs once it is
          * in (gen_step_restore) */
@@ -1031,8 +1074,15 @@ void server::gen_begin(session_slot *sl) {
         gr->kind = GEN_RESTORE_RESUME;
         gr->hit = *disk_hit;
         free(disk_hit);
-        s->kv_restore_begin(&gr->r, &gr->hit, mem, true);
+        /* L347 I3b (D7): what the request resumes from if the restore fails -- the bank's own resolution (checked
+         * before the load writes the bank, so a content fault keeps it), and the adopt the pick weighed */
+        s->kv_restore_begin(&gr->r, &gr->hit, mem, true, own > 0);
+        gr->own = own;
+        gr->adopt_src = adopt_src;
         gr->res.prompt_for_sync = prompt_for_sync;
+        gr->res.cached = cached;
+        gr->res.resumed_at = resumed_at;
+        gr->res.cache_source = cache_source;
         gr->res.cache_diag = cache_diag;
         gen_restore_start(sl, gr);
         return;
@@ -1188,15 +1238,22 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
      * rows cover it and no restore point stands at the cut
      * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  A sync from
      * token 0 only: a request a restore point at the cut serves loads it (the
-     * resume pick, L318) and resumes at or past the cut. */
+     * resume pick, L318) and resumes at or past the cut.
+     * L347 I3b (D10, X-Pulsar-KV): a read-only request writes no anchor unless it says pin-anchor; a pin-anchor
+     * request pins the restore point the store holds at its cut (whatever it resumed from), else writes it on this,
+     * its FIRST sighting -- a read-only caller trickles no rows, so it could never see a second -- pinned. */
+    const unsigned kvf = j->req.kv_flags;
+    const bool pin_anchor = (kvf & KV_HDR_PIN_ANCHOR) != 0u;
     int cold_store_len = 0;
-    if (resumed_at == TokPos{0} &&   /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens)
+    if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens &&
+        (!(kvf & KV_HDR_READ_ONLY) || pin_anchor))
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers);
-        cold_store_len = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
-        if (cold_store_len >= prompt_for_sync->len) cold_store_len = 0;
+        int cut = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
+        if (cut >= prompt_for_sync->len) cut = 0;
+        if (pin_anchor && cut > 0 && s->kv_cache_pin_anchor(prompt_for_sync, cut)) cut = 0;   /* stored: pinned now */
+        /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
+        cold_store_len = resumed_at == TokPos{0} ? cut : 0;
     }
     /* An image request's cold phase covers the shared preamble only, and the
      * cut sits at or below the first user turn, so no image block begins
@@ -1220,8 +1277,10 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
                        inside, j->req.images[inside].start_pos, cold_store_len);
         cold_store_len = cut;
     }
-    /* L347 I2: the second sighting, last -- it renders the cut's text and walks the store */
-    if (cold_store_len > 0 && !s->kv_cache_anchor_due(prompt_for_sync, cold_store_len)) cold_store_len = 0;
+    /* L347 I2: the second sighting, last -- it renders the cut's text and walks the store (L347 I3b: a pin-anchor's
+     * first sighting writes: kv_cache_pin_anchor found no restore point at the cut) */
+    if (cold_store_len > 0 && !pin_anchor && !s->kv_cache_anchor_due(prompt_for_sync, cold_store_len))
+        cold_store_len = 0;
     g->cold_store_len = cold_store_len;
     /* The prompt the prefill phases sync, in later quanta (effective_prompt is g's own). */
     g->prompt_for_sync = prompt_for_sync;
@@ -1316,11 +1375,11 @@ void server::gen_step_prefill(session_slot *sl) {
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
         /* Interrupted without progress cannot be our cancel callback; fail
          * rather than risk a live-lock re-issuing the same sync forever. */
-        s->gen_prefill_fail(sl, false);
+        s->gen_prefill_fail(sl);
         return;
     }
     if (rc != 0) {
-        s->gen_prefill_fail(sl, true);
+        s->gen_prefill_fail(sl);
         return;
     }
 
@@ -2210,7 +2269,6 @@ void server::gen_state_free(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     if (!g) return;
-    (void)s;
     /* Callback safety: no gen_state pointer may remain installed anywhere. */
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
@@ -2223,7 +2281,10 @@ void server::gen_state_free(session_slot *sl) {
     pulsar_tokens_free(&g->effective_prompt);
     pulsar_tokens_free(&g->cold_prefix);
     pulsar_tokens_free(&g->batch_pending);
-    if (g->restore) free(g->restore->text);
+    if (g->restore) {   /* a job torn down mid-restore: the chain's pin goes with it (L347 I3b) */
+        s->kv_restore_end(&g->restore->r);
+        free(g->restore->text);
+    }
     free(g->restore);
     free(g->disk_cache_path);
     free(g->stop_sequence);

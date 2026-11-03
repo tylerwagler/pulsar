@@ -86,7 +86,8 @@ struct pulsar_segstore {
     uint64_t reserved = 0;
     /// L338: keys being written (reserved, not committed): a second reserve of one writes nothing
     std::unordered_set<std::string> pending;
-    /// L338: parents of the writes in flight, with their count: eviction never takes one
+    /// L338: parents of the writes in flight, the restore point jobs' keys and (L347 I3b) the chains being restored
+    /// (pulsar_segstore_pin), with their count: eviction and the superseded drops never take one
     std::unordered_map<std::string, int> pinned;
     /** L347 I3a: a file's image in host memory -- the file's bytes from offset 0, padded to the O_DIRECT granule. */
     struct image {
@@ -124,6 +125,10 @@ struct pulsar_segstore {
     std::unordered_map<std::string, uint32_t> rp_jobs;
     /// L347 I3a: restore points dropped as superseded by a chain end's commit, ever (pulsar_segstore_superseded_count)
     uint64_t superseded = 0;
+    /// L347 I3b: the PULSAR_SEGSTORE_RP_PINNED anchors' budget, bytes (pulsar_segstore_set_pinned_max; 0 = unbounded)
+    uint64_t pinned_max = 0;
+    /// L347 I3b: pins taken away, ever: over the budget, or the store out of room (pulsar_segstore_pins_released)
+    uint64_t pins_released = 0;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -253,8 +258,19 @@ struct pulsar_segstore {
      * point, (1) a dominated leaf's rows, (2) any other rows, (3) a flagged or branch-point restore point -- the least
      * recently used first within a class.  A copy that goes stays on disk: an entry is indexed only once its file is
      * written, so dropping its image loses nothing.  Never an image mapped for a load. */
+    /* L347 I3b: a PINNED anchor's restore point and its chain's rows are never evicted from RAM while anything else
+     * may go -- only when every other copy is gone (the pool smaller than the pinned budget), and then only the RAM
+     * copy (the files stay, the pins too). */
     /** Free one RAM copy by the order above.  @return false when none may go */
     bool ram_evict_one() {
+        const std::unordered_set<std::string> anchored = pinned_chain_keys();
+        for (int pass = 0; pass < 2; pass++)
+            if (ram_evict_one_pass(anchored, pass == 1)) return true;
+        return false;
+    }
+    /** One pass of ram_evict_one.  @param anchored pinned_chain_keys()  @param anchors_too a pinned anchor's copies may
+     *  go too  @return true when one copy went */
+    bool ram_evict_one_pass(const std::unordered_set<std::string> &anchored, bool anchors_too) {
         const std::string *victim = nullptr;
         bool victim_rp = false;
         int victim_class = 4;
@@ -263,6 +279,9 @@ struct pulsar_segstore {
             if (held.count(hold_name(k, rp))) return;
             auto it = segs.find(k);
             if (it == segs.end()) return;
+            if (!anchors_too && anchored.count(k) &&
+                (!rp || (it->second.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u))
+                return;
             const size_t kids = n_children(k);
             const int c = rp ? (it->second.rp_flags == 0u && kids < 2u ? 0 : 3)
                              : (it->second.dominated && kids == 0u ? 1 : 2);
@@ -414,12 +433,13 @@ struct pulsar_segstore {
      * dead end's or a superseded one's: big, and a restore from it is the cheapest thing to lose); (1) a dominated leaf
      * (L323; only a leaf without a restore point, so never a flagged one); (2) any other leaf; (3) a flagged (anchor,
      * periodic) or branch-point restore point: where restores of many requests start.  -1: not a candidate (a segment
-     * with children and no restore point). */
+     * with children and no restore point; L347 I3b: a PINNED anchor's restore point, and so its rows). */
     /** @param e      an index entry
      *  @param leaf   it has no children
      *  @param branch it has >= 2 children
      *  @return its eviction class (above), -1 for none */
     static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch) {
+        if (e.rp_bytes > 0u && (e.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u) return -1;   /* L347 I3b: pinned */
         if (e.rp_bytes > 0u) return e.rp_flags == 0u && !branch ? 0 : 3;
         if (!leaf) return -1;
         return e.dominated ? 1 : 2;
@@ -444,7 +464,8 @@ struct pulsar_segstore {
                 victim_class = c;
             }
         }
-        if (!victim) return false;
+        /* L347 I3b: nothing else may go -- the oldest-used pinned anchor loses its pin (and goes by the classes next) */
+        if (!victim) return unpin_oldest("the store needs room and nothing else may go", keep, keep2);
         const std::string k = victim->key;
         if (victim->rp_bytes > 0u) {
             drop_rp_of(segs[k], victim_class == 0 ? "store over budget"
@@ -456,6 +477,75 @@ struct pulsar_segstore {
         unlink_files(k);
         unlink_index(k);
         return true;
+    }
+    /** L347 I3b: set a stored restore point's flags, in its index entry, its file's header (in place) and its RAM copy.
+     *  @param e     the entry (rp_bytes > 0)
+     *  @param flags the PULSAR_SEGSTORE_RP_* flags it carries from now
+     *  @return false when the header could not be written (nothing changed) */
+    bool write_rp_flags(pulsar_segstore_seg &e, uint32_t flags) {
+        if (flags == e.rp_flags) return true;
+        FILE *fp = fopen(rp_path(e.key).c_str(), "r+b");
+        if (!fp) return false;
+        uint8_t b[4];
+        put32(b, flags);
+        const bool ok = fseek(fp, 12, SEEK_SET) == 0 && fwrite(b, 1, 4, fp) == 4;
+        const bool closed = fclose(fp) == 0;
+        if (!ok || !closed) return false;
+        e.rp_flags = flags;
+        auto ram = ram_rp.find(e.key);   /* L347 I3a: its RAM copy's header too */
+        if (ram != ram_rp.end()) memcpy(ram->second.p + 12, b, 4);
+        return true;
+    }
+    /** L347 I3b: every key a PINNED anchor holds: the anchor's key and its ancestors (its chain's rows).
+     *  @return the keys */
+    std::unordered_set<std::string> pinned_chain_keys() const {
+        std::unordered_set<std::string> keys;
+        for (auto &kv : segs) {
+            if (!(kv.second.rp_bytes > 0u && (kv.second.rp_flags & PULSAR_SEGSTORE_RP_PINNED))) continue;
+            for (std::string k = kv.first; !k.empty();) {
+                auto it = segs.find(k);
+                if (it == segs.end() || !keys.insert(k).second) break;   /* a chain met already holds the rest */
+                k = it->second.parent;
+            }
+        }
+        return keys;
+    }
+    /** L347 I3b: the bytes the PINNED anchors hold on disk: their restore points and every segment of their chains
+     *  (each once).  @param count receives how many anchors are pinned (NULL: not wanted)  @return the bytes */
+    uint64_t pinned_bytes(int *count) const {
+        uint64_t bytes = 0;
+        int n = 0;
+        for (const std::string &k : pinned_chain_keys()) {
+            const pulsar_segstore_seg &e = segs.at(k);
+            bytes += e.file_bytes;
+            if (e.rp_bytes > 0u && (e.rp_flags & PULSAR_SEGSTORE_RP_PINNED)) { bytes += e.rp_bytes; n++; }
+        }
+        if (count) *count = n;
+        return bytes;
+    }
+    /** L347 I3b: take the pin from the least recently used PINNED anchor (never `keep` / `keep2`), said in the log.
+     *  @param why   the log's reason
+     *  @param keep  a key to spare (NULL = none)
+     *  @param keep2 a second key to spare (NULL = none)
+     *  @return false when no anchor is pinned (or its header could not be written) */
+    bool unpin_oldest(const char *why, const char *keep, const char *keep2) {
+        pulsar_segstore_seg *victim = nullptr;
+        for (auto &kv : segs) {
+            if ((keep && kv.first == keep) || (keep2 && kv.first == keep2)) continue;
+            if (!(kv.second.rp_bytes > 0u && (kv.second.rp_flags & PULSAR_SEGSTORE_RP_PINNED))) continue;
+            if (!victim || kv.second.last_used < victim->last_used) victim = &kv.second;
+        }
+        if (!victim || !write_rp_flags(*victim, victim->rp_flags & ~PULSAR_SEGSTORE_RP_PINNED)) return false;
+        pins_released++;
+        logf("unpinned anchor %s at %u (%llu bytes, last used %llu): %s", victim->key, victim->G,
+             (unsigned long long)victim->rp_bytes, (unsigned long long)victim->last_used, why);
+        return true;
+    }
+    /** L347 I3b: hold the pinned anchors to pinned_max: while they hold more, the least recently used loses its pin. */
+    void enforce_pinned_max() {
+        while (pinned_max && pinned_bytes(nullptr) > pinned_max)
+            if (!unpin_oldest("the pinned anchors are over their budget (--kv-pinned-max-mb)", nullptr, nullptr))
+                break;
     }
 };
 
@@ -1001,6 +1091,10 @@ static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool writte
         it->second.rp_flags = kept;
         st->img_keep(st->ram_rp, key, job->img);
         if (job->supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
+        if (kept & PULSAR_SEGSTORE_RP_PINNED) {   /* L347 I3b */
+            it->second.last_used = (uint64_t)time(nullptr);
+            st->enforce_pinned_max();
+        }
         return true;
     }
     if (st->pending.count(key)) {   /* its segment is still being written: the restore point joins it at its commit */
@@ -1070,6 +1164,7 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         st->img_keep(st->ram_rows, key, job->img);
         if (rp.bytes) st->img_keep(st->ram_rp, key, rp.img);
         if (rp.bytes && rp.supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
+        if (rp.bytes && (rp.flags & PULSAR_SEGSTORE_RP_PINNED)) st->enforce_pinned_max();   /* L347 I3b */
         indexed = true;
     }
     if (!indexed) {
@@ -1124,18 +1219,12 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
     if (!st) return false;
     auto it = st->segs.find(std::string(key, 40));
     if (it == st->segs.end() || it->second.rp_bytes == 0u) return false;
-    const uint32_t joined = it->second.rp_flags | flags;
-    if (joined == it->second.rp_flags) return true;
-    FILE *fp = fopen(st->rp_path(it->first.c_str()).c_str(), "r+b");
-    if (!fp) return false;
-    uint8_t b[4];
-    put32(b, joined);
-    const bool ok = fseek(fp, 12, SEEK_SET) == 0 && fwrite(b, 1, 4, fp) == 4;
-    const bool closed = fclose(fp) == 0;
-    if (!ok || !closed) return false;
-    it->second.rp_flags = joined;
-    auto ram = st->ram_rp.find(it->first);   /* L347 I3a: its RAM copy's header too */
-    if (ram != st->ram_rp.end()) memcpy(ram->second.p + 12, b, 4);
+    const bool pinning = (flags & ~it->second.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u;
+    if (!st->write_rp_flags(it->second, it->second.rp_flags | flags)) return false;
+    if (pinning) {
+        it->second.last_used = (uint64_t)time(nullptr);   /* the newest pin is the last to lose it */
+        st->enforce_pinned_max();
+    }
     return true;
 }
 
@@ -1453,6 +1542,35 @@ int pulsar_segstore_keys(pulsar_segstore *st, char **keys) {
     *keys = out;
     return (int)i;
 }
+
+void pulsar_segstore_pin(pulsar_segstore *st, const char key[41]) {
+    if (st && key) st->pinned[std::string(key, 40)]++;
+}
+
+void pulsar_segstore_unpin(pulsar_segstore *st, const char key[41]) {
+    if (!st || !key) return;
+    auto p = st->pinned.find(std::string(key, 40));
+    if (p != st->pinned.end() && --p->second == 0) st->pinned.erase(p);
+}
+
+bool pulsar_segstore_is_pinned(const pulsar_segstore *st, const char key[41]) {
+    return st && key && st->pinned.count(std::string(key, 40)) != 0;
+}
+
+void pulsar_segstore_set_pinned_max(pulsar_segstore *st, uint64_t bytes) {
+    if (!st) return;
+    st->pinned_max = bytes;
+    st->enforce_pinned_max();
+}
+
+int pulsar_segstore_pinned_anchors(const pulsar_segstore *st, uint64_t *bytes) {
+    int n = 0;
+    const uint64_t b = st ? st->pinned_bytes(&n) : 0u;
+    if (bytes) *bytes = b;
+    return n;
+}
+
+uint64_t pulsar_segstore_pins_released(const pulsar_segstore *st) { return st ? st->pins_released : 0u; }
 
 uint64_t pulsar_segstore_used_bytes(const pulsar_segstore *st) { return st ? st->used : 0u; }
 int pulsar_segstore_count(const pulsar_segstore *st) { return st ? (int)st->segs.size() : 0; }

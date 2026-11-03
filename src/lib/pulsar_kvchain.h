@@ -43,9 +43,13 @@
  * restore: load the deepest chain whose text is a byte prefix of `text` and whose
  *   last segment has a restore point -- every segment's rows, the last one's
  *   restore point -- so the bank stands live at the nearest stored restore point
- *   at or below the request's divergence and the sync prefills the rest.  A segment that will not load is
- *   dropped with everything below it, and so is a chain whose text and tokens
- *   disagree at the boundary (L196), so the next persist rewrites it.
+ *   at or below the request's divergence and the sync prefills the rest.  A chain whose text and tokens disagree at
+ *   the boundary (L196) is dropped from its last segment, so the next persist rewrites it.  L347 I3b (plans/124 D7):
+ *   a part that will not load drops only what its fault invalidates -- a CONTENT fault (a part missing, unreadable,
+ *   of the wrong size or header, its digest wrong) in a segment's rows drops the key and everything below it, in a
+ *   restore point that restore point alone -- and a TRANSIENT failure (no RAM room, the bank, the device, a TP rank's
+ *   copy) drops nothing.  pulsar_kvchain_verify_slice checks every part's bytes before a load writes the bank, and
+ *   pulsar_kvchain_pin holds the chain against eviction while it is read.
  *
  * L281: a chain carries IMAGE rows.  An image block renders as its family's placeholder text (so a request carrying
  * the image finds the chain by the text it was rendered with), and each segment's payload carries the records of the
@@ -75,6 +79,8 @@
 #define PULSAR_KVCHAIN_RP 2u
 /// Which is a shared-prefix anchor (PULSAR_SEGSTORE_RP_ANCHOR); only with PULSAR_KVCHAIN_RP
 #define PULSAR_KVCHAIN_ANCHOR 4u
+/// L347 I3b: and a pinned one (PULSAR_SEGSTORE_RP_PINNED: X-Pulsar-KV pin-anchor); only with PULSAR_KVCHAIN_ANCHOR
+#define PULSAR_KVCHAIN_PIN 8u
 
 /** An optional per-segment trailer (the server's tool map).  `size` reports the
  *  trailer for a segment's text (0 bytes = none); `write` writes exactly it. */
@@ -248,8 +254,9 @@ uint64_t pulsar_kvchain_resident_bytes(pulsar_segstore *st, const pulsar_segstor
 /// @return bytes a load of segment `i` reads
 uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i);
 /** L330: one segment's load into whatever `ud` names (pulsar_session_load_segment's contract: `last` restores the
- *  state at the segment's end from its restore point; 0 = loaded, *G the position it stands at).  L347 I3a: from
- *  memory -- the parts as pulsar_segstore_map_part mapped them, digests already checked. */
+ *  state at the segment's end from its restore point; PULSAR_SEGMENT_OK = loaded, *G the position it stands at; L347
+ *  I3b: else the refusal's class).  L347 I3a: from memory -- the parts as pulsar_segstore_map_part mapped them,
+ *  digests already checked. */
 /// @param ud       the loader's context
 /// @param seg      the segment's payload
 /// @param bytes    the payload's size
@@ -260,16 +267,29 @@ uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int
 /// @param key      the segment's key
 /// @param err      receives a reason on failure
 /// @param errlen   size of `err`
-typedef int (*pulsar_kvchain_segment_loader)(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
-                                             const uint8_t *rp, uint64_t rp_bytes, int *G, const char *key, char *err,
-                                             size_t errlen);
+typedef pulsar_segment_status (*pulsar_kvchain_segment_loader)(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
+                                                               const uint8_t *rp, uint64_t rp_bytes, int *G,
+                                                               const char *key, char *err, size_t errlen);
+/** L347 I3b: one segment's check, nothing written (pulsar_session_check_segment's contract). */
+/// @param ud       the checker's context
+/// @param seg      the segment's payload
+/// @param bytes    the payload's size
+/// @param last     the chain's last segment (its restore point is checked too)
+/// @param rp       its restore point when `last`, else NULL
+/// @param rp_bytes its size (0 when not `last`)
+/// @param err      receives the fault
+/// @param errlen   size of `err`
+typedef pulsar_segment_status (*pulsar_kvchain_segment_checker)(void *ud, const uint8_t *seg, uint64_t bytes,
+                                                                bool last, const uint8_t *rp, uint64_t rp_bytes,
+                                                                char *err, size_t errlen);
 /** L330: load the next slice of a chain -- segments [*next, *next + k) of the `n` pulsar_kvchain_find returned, cut at
  *  the chain's end -- in order through `load` (the chain's last segment with its restore point, L347), advancing
  *  *next past each segment loaded.  The whole chain in one slice
- *  is the one-shot load (pulsar_kvchain_load); the server reads a long chain a slice per worker turn.  1 when a segment
- *  would not load: it is dropped from the store (and so is everything below it, by key) and `err` says which; *next
- *  stays at it.  L347 I3a (plans/124 D7): 2 when a part could not be READ now (no room in the RAM pool): a transient
- *  failure that drops nothing.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
+ *  is the one-shot load (pulsar_kvchain_load); the server reads a long chain a slice per worker turn.  1 on a content
+ *  fault: what it invalidates is dropped from the store (a segment's rows: it and everything below it, by key; a
+ *  restore point: it alone) and `err` says which; *next stays at it.  L347 I3a / I3b (plans/124 D7): 2 on a transient
+ *  failure (no room in the RAM pool to read a part now, the bank, the device, a TP rank's copy, a bad slice): nothing
+ *  is dropped.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
  *  stands at the next segment's start. */
 /// @param st     the store (a failed segment is dropped from it)
 /// @param chain  the chain pulsar_kvchain_find returned
@@ -280,9 +300,45 @@ typedef int (*pulsar_kvchain_segment_loader)(void *ud, const uint8_t *seg, uint6
 /// @param ud     context for `load`
 /// @param err    receives which segment failed
 /// @param errlen size of `err`
-/// @return 0 when the slice loaded, 1 on a bad slice or a segment that would not load, 2 on a transient read failure
+/// @return 0 when the slice loaded, 1 on a content fault (dropped), 2 on a transient failure (kept)
 int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
                                    pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen);
+/** L347 I3b: check the next slice of a chain before any of it is loaded -- segments [*next, *next + k): each part mapped
+ *  (from RAM, or read off disk and digest-checked) and its bytes checked by `check`, nothing written -- advancing *next
+ *  past each.  Faults as pulsar_kvchain_load_slice_with (1: content, dropped; 2: transient, kept).  A restore that runs
+ *  it over the whole chain first leaves the bank untouched by any content fault. */
+/// @param st     the store (a faulty part is dropped from it)
+/// @param chain  the chain pulsar_kvchain_find returned
+/// @param n      its segment count
+/// @param next   in: the first segment to check; out: past the last one checked
+/// @param k      segments in the slice (cut at the chain's end)
+/// @param check  the per-segment check
+/// @param ud     context for `check`
+/// @param err    receives which segment failed
+/// @param errlen size of `err`
+/// @return 0 when the slice checked, 1 on a content fault (dropped), 2 on a transient failure (kept)
+int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
+                                     pulsar_kvchain_segment_checker check, void *ud, char *err, size_t errlen);
+/** L347 I3b: pulsar_kvchain_verify_slice_with against the installed bank of `s` (pulsar_session_check_segment); the
+ *  bank is not touched. */
+/// @param st     the store
+/// @param s      the session whose installed bank's layout the bytes must be
+/// @param chain  the chain
+/// @param n      its segment count
+/// @param next   in: the first segment to check; out: past the last one checked
+/// @param k      segments in the slice
+/// @param err    receives which segment failed
+/// @param errlen size of `err`
+/// @return as pulsar_kvchain_verify_slice_with
+int pulsar_kvchain_verify_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
+                                int *next, int k, char *err, size_t errlen);
+/** L347 I3b: hold every segment of `chain` against eviction and superseded drops (pulsar_segstore_pin) while a restore
+ *  reads it, or end that hold -- one call each way.
+ *  @param st    the store
+ *  @param chain the chain
+ *  @param n     its segment count
+ *  @param pin   take the hold (true) or end it (false) */
+void pulsar_kvchain_pin(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, bool pin);
 /** pulsar_kvchain_load_slice_with into the installed bank of `s` (pulsar_session_load_segment); a failed slice leaves
  *  the bank invalidated. */
 /// @param st     the store

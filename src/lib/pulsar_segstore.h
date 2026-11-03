@@ -48,7 +48,15 @@
  * read off disk becomes its entry's RAM copy.  RAM copies are evicted to make room in the pool in the disk eviction's
  * order (an unflagged off-branch restore point, a dominated leaf's rows, other rows, a flagged or branch-point restore
  * point; LRU within a class), never a part mapped for a load; the file stays.  Without `retain` (a unified-memory
- * host, where host RAM is the GPU's) an image lives only while it is written or read. */
+ * host, where host RAM is the GPU's) an image lives only while it is written or read.
+ *
+ * L347 I3b (plans/124 D7, D10): PINNED anchors and restore pins.  A restore point flagged PULSAR_SEGSTORE_RP_PINNED (a
+ * judge's preamble, X-Pulsar-KV: pin-anchor) is never evicted from the disk or the RAM tier and never dropped as
+ * superseded -- and so neither is any segment of its chain (its key's rows go only after its restore point, its
+ * ancestors are not leaves).  A pin is taken away (logged, counted) only when the store needs room and nothing else
+ * may go, or when the pinned anchors hold more than their budget (pulsar_segstore_set_pinned_max): the least recently
+ * used first.  Apart from that, pulsar_segstore_pin holds a key against eviction and superseded drops while a restore
+ * reads its chain (the same count as a write in flight's parent). */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -67,6 +75,9 @@
 #define PULSAR_SEGSTORE_RP_ANCHOR 1u
 /// Restore point flag (L347 I2): written at a periodic grid point (pulsar_kvchain_rp_periodic)
 #define PULSAR_SEGSTORE_RP_PERIODIC 2u
+/// Restore point flag (L347 I3b): a pinned anchor -- never evicted (disk or RAM), never superseded; its chain neither.
+/// The header's flags word holds it (no layout change, so the .rp version stays)
+#define PULSAR_SEGSTORE_RP_PINNED 4u
 /// L347 I3a: a key's segment file (pulsar_segstore_map_part, pulsar_segstore_job_kind)
 #define PULSAR_SEGSTORE_PART_ROWS 0
 /// L347 I3a: a key's restore point file
@@ -360,7 +371,8 @@ bool pulsar_segstore_ram_make_room(pulsar_segstore *st, uint64_t file_bytes);
 bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes, uint32_t flags,
                             pulsar_segstore_write_fn write_rp, void *ud, char *err, size_t errlen);
 /** L347 I2: join `flags` to the flags of stored segment `key`'s restore point, in its index entry and its file's
- *  header (in place: the state is the same).
+ *  header (in place: the state is the same).  L347 I3b: a new PULSAR_SEGSTORE_RP_PINNED marks it used now and holds
+ *  the pinned budget (pulsar_segstore_set_pinned_max).
  *  @param st    the store
  *  @param key   40 hex chars
  *  @param flags PULSAR_SEGSTORE_RP_* to add
@@ -395,7 +407,8 @@ bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, b
  *  @param from_disk receives whether the file was read (NULL: not wanted)
  *  @param err       receives the reason on failure
  *  @param errlen    size of `err`
- *  @return 0 mapped; 1 the part is not stored or its file is bad (drop it); 2 no room in the RAM pool to read it now */
+ *  @return 0 mapped; 1 the part is not stored, or its file is missing, unreadable or bad (a content fault: drop it);
+ *          2 no room in the RAM pool to read it now */
 int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, const uint8_t **payload,
                              uint64_t *bytes, bool *from_disk, char *err, size_t errlen);
 /** L347 I3a: end a pulsar_segstore_map_part (a lent image is freed).
@@ -489,6 +502,34 @@ void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_traile
 /// @return the number of keys
 /** Every key, 40 hex chars each, concatenated (caller frees); the count returned. */
 int pulsar_segstore_keys(pulsar_segstore *st, char **keys);
+/** L347 I3b: hold `key` against eviction and superseded drops -- a restore reading its chain -- until as many
+ *  pulsar_segstore_unpin.  The key need not be stored (an unpin of a dropped key only ends the count).
+ *  @param st  the store, or NULL (no-op)
+ *  @param key 40 hex chars */
+void pulsar_segstore_pin(pulsar_segstore *st, const char key[41]);
+/** L347 I3b: end one pulsar_segstore_pin.
+ *  @param st  the store, or NULL (no-op)
+ *  @param key 40 hex chars */
+void pulsar_segstore_unpin(pulsar_segstore *st, const char key[41]);
+/** L347 I3b: is `key` held (a restore's pin, a write in flight's parent, a restore point job's key)?
+ *  @param st  the store, or NULL (false)
+ *  @param key 40 hex chars
+ *  @return true while held */
+bool pulsar_segstore_is_pinned(const pulsar_segstore *st, const char key[41]);
+/** L347 I3b: the PINNED anchors' budget: past it the least recently used loses its pin (logged) -- now, and whenever an
+ *  anchor is pinned.  Counted: each anchor's restore point and every segment of its chain, once.
+ *  @param st    the store, or NULL (no-op)
+ *  @param bytes the budget (0 = unbounded) */
+void pulsar_segstore_set_pinned_max(pulsar_segstore *st, uint64_t bytes);
+/** L347 I3b: how many anchors are pinned, and the bytes they hold (as the budget counts them).
+ *  @param st    the store, or NULL (0)
+ *  @param bytes receives the bytes, or NULL
+ *  @return the pinned anchors */
+int pulsar_segstore_pinned_anchors(const pulsar_segstore *st, uint64_t *bytes);
+/** L347 I3b: pins taken away, ever (over the budget, or the store out of room).
+ *  @param st the store, or NULL (0)
+ *  @return the count */
+uint64_t pulsar_segstore_pins_released(const pulsar_segstore *st);
 /// @param st the store, or NULL (0)
 /// @return bytes of the .seg and .rp files the store holds
 /** Bytes the store holds, and the count of segments. */

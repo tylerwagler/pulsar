@@ -3565,6 +3565,18 @@ struct pulsar_session {
     /// @param errlen  its size
     /// @return 0 on success, 1 on a refusal or a copy failure (err filled).
     int copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, uint64_t bytes, char *err, size_t errlen);
+    /// L347 I3b: check one segment's (and with `last` its restore point's) bytes against the installed bank's layout,
+    /// nothing written (pulsar_session_check_segment's local body).
+    /// @param seg     the segment's bytes
+    /// @param bytes   the segment's length
+    /// @param last    the chain's last segment: its restore point is checked too
+    /// @param rp      the restore point at G when `last`, else NULL
+    /// @param rp_bytes its length (0 when not `last`)
+    /// @param err     failure message buffer
+    /// @param errlen  its size
+    /// @return PULSAR_SEGMENT_OK, or the fault's class (err filled).
+    pulsar_segment_status check_segment(const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
+                                        uint64_t rp_bytes, char *err, size_t errlen);
     /// Read one segment from memory into the installed bank (pulsar_session_load_segment's local body).
     /// @param seg     the segment's bytes
     /// @param bytes   the segment's length
@@ -3574,9 +3586,9 @@ struct pulsar_session {
     /// @param G_out   out: the segment's end grid position (0 on failure)
     /// @param err     failure message buffer
     /// @param errlen  its size
-    /// @return 0 on success, 1 on a refusal or a copy failure (err filled).
-    int load_segment(const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp, uint64_t rp_bytes,
-                     uint32_t *G_out, char *err, size_t errlen);
+    /// @return PULSAR_SEGMENT_OK, or the refusal's class (err filled; L347 I3b: content faults before any device write).
+    pulsar_segment_status load_segment(const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
+                                       uint64_t rp_bytes, uint32_t *G_out, char *err, size_t errlen);
     /** Capture the session into an owned in-memory blob. @return 0 on success. */
     /// @param snap    receives the owned blob (pulsar_session_snapshot_free)
     /// @param err     failure message buffer

@@ -4035,7 +4035,9 @@ static void test_api_err_null(void) {
     TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
     TEST_ASSERT(pulsar_session_copy_out_segment(NULL, TokPos{0}, TokPos{0}, NULL, NULL, 0, NULL, 64) == 1);
     TokPos G = TokPos{7};
-    TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, NULL, 0, &G, NULL, NULL, 64) == 1 && G == TokPos{0});
+    TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, NULL, 0, &G, NULL, NULL, 64) ==
+                    PULSAR_SEGMENT_TRANSIENT && G == TokPos{0});   /* L347 I3b: no session is not the bytes' fault */
+    TEST_ASSERT(pulsar_session_check_segment(NULL, NULL, 0, false, NULL, 0, NULL, 64) == PULSAR_SEGMENT_TRANSIENT);
     TEST_ASSERT(pulsar_session_copy_out_restore_point(NULL, TokPos{128}, NULL, NULL, 0, NULL, 64) == 1);
     TEST_ASSERT(pulsar_session_restore_point_bytes(NULL, TokPos{128}) == 0u);
 }

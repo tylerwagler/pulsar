@@ -8070,12 +8070,20 @@ static void test_l347_i3a_copy_out(void) {
     pulsar_gpu_host_free(host);
 }
 
+/** L347 I3b: kv_persist_writes for a bank without X-Pulsar-KV tokens (every such trigger writes).
+ *  @param t the trigger  @return its PULSAR_KVCHAIN_* request */
+static unsigned l347_writes(kv_persist_trigger t) {
+    unsigned what = ~0u;
+    TEST_ASSERT(kv_persist_writes(t, 0u, &what));
+    return what;
+}
+
 /* L347 I2 (1): what each trigger writes -- kv_persist_writes, the one table -- and what that request leaves in the
  * store: rows always (to the last grid point), the tail for every trigger but a progress one, a restore point at the
  * chain's end only where the history is about to be lost (evict / spill / abandon / shutdown) and at an anchor, which
  * is flagged so. */
 static void test_l347_i2_trigger_table(void) {
-    TEST_ASSERT(kv_persist_writes(KV_PERSIST_CONTINUED) == 0u);
+    TEST_ASSERT(l347_writes(KV_PERSIST_CONTINUED) == 0u);
     /* L347: a loss writes its restore point only where the restore rule would load it */
     TEST_ASSERT(!kv_rp_worth(0u, true, 10.0, true, 1000.0));       /* the chain already has its state there */
     TEST_ASSERT(kv_rp_worth(200u, false, 0.0, true, 60.0));        /* unmeasured: write, the load measures */
@@ -8083,11 +8091,11 @@ static void test_l347_i2_trigger_table(void) {
     TEST_ASSERT(!kv_rp_worth(200u, true, 150.0, true, 60.0));      /* the judge: 200 tokens past its anchor */
     TEST_ASSERT(kv_rp_worth(7800u, true, 180.0, true, 2400.0));    /* a 7.8K chat: its read wins */
     TEST_ASSERT(!kv_rp_worth(800u, true, 150.0, true, 300.0));     /* exactly 2x: not under half -- no */
-    TEST_ASSERT(kv_persist_writes(KV_PERSIST_PROMPT) == PULSAR_KVCHAIN_TAIL);
-    TEST_ASSERT(kv_persist_writes(KV_PERSIST_TERMINAL) == PULSAR_KVCHAIN_TAIL);
+    TEST_ASSERT(l347_writes(KV_PERSIST_PROMPT) == PULSAR_KVCHAIN_TAIL);
+    TEST_ASSERT(l347_writes(KV_PERSIST_TERMINAL) == PULSAR_KVCHAIN_TAIL);
     const kv_persist_trigger loss[] = { KV_PERSIST_EVICT, KV_PERSIST_SPILL, KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
-    for (kv_persist_trigger t : loss) TEST_ASSERT(kv_persist_writes(t) == (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP));
-    TEST_ASSERT(kv_persist_writes(KV_PERSIST_ANCHOR) ==
+    for (kv_persist_trigger t : loss) TEST_ASSERT(l347_writes(t) == (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP));
+    TEST_ASSERT(l347_writes(KV_PERSIST_ANCHOR) ==
                 (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR));
     for (int t = 0; t < KV_PERSIST_TRIGGERS; t++)
         TEST_ASSERT(kv_persist_trigger_names[t] && kv_persist_trigger_names[t][0]);
@@ -8099,7 +8107,7 @@ static void test_l347_i2_trigger_table(void) {
         TEST_ASSERT(dir != NULL);
         if (!dir) return;
         pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-        const unsigned what = kv_persist_writes((kv_persist_trigger)t);
+        const unsigned what = l347_writes((kv_persist_trigger)t);
         l347_ckpts ck;
         pulsar_kvchain_persist_result r;
         char tip[41];
@@ -8144,7 +8152,7 @@ static void test_l347_i2_periodic(void) {
     pulsar_kvchain_persist_result r;
     char tip[41];
     /* a prefill's progress past 32768: the rows, and the periodic restore point there */
-    TEST_ASSERT(l347_persist(st, 40000, 4096, kv_persist_writes(KV_PERSIST_CONTINUED), &ck, &r, tip) == 9);
+    TEST_ASSERT(l347_persist(st, 40000, 4096, l347_writes(KV_PERSIST_CONTINUED), &ck, &r, tip) == 9);
     TEST_ASSERT(r.rp_written == 1 && r.rp_bytes == L323_STATE);
     pulsar_segstore_seg g;
     TEST_ASSERT(l347_seg_at(st, 32768, &g) && g.rp_bytes > L323_STATE && g.rp_flags == PULSAR_SEGSTORE_RP_PERIODIC);
@@ -8153,7 +8161,7 @@ static void test_l347_i2_periodic(void) {
     /* the bank no longer holds a checkpoint at 65536: the persist passes it without one */
     ck.all = false;
     ck.held = { 70000 };
-    TEST_ASSERT(l347_persist(st, 70000, 4096, kv_persist_writes(KV_PERSIST_EVICT), &ck, &r, tip) == 9);
+    TEST_ASSERT(l347_persist(st, 70000, 4096, l347_writes(KV_PERSIST_EVICT), &ck, &r, tip) == 9);
     TEST_ASSERT(l347_seg_at(st, 65536, &g) && g.rp_bytes == 0u);
     TEST_ASSERT(l347_seg_at(st, 70000, &g) && g.rp_bytes > L323_STATE && g.rp_flags == 0u);
     TEST_ASSERT(r.rp_written == 1);
@@ -8164,7 +8172,7 @@ static void test_l347_i2_periodic(void) {
     dir = l323_tmpdir(tmpl2);
     st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
     ck.all = true;
-    TEST_ASSERT(l347_persist(st, 32768, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip) == 8);
+    TEST_ASSERT(l347_persist(st, 32768, 4096, l347_writes(KV_PERSIST_ANCHOR), &ck, &r, tip) == 8);
     TEST_ASSERT(r.rp_written == 1 && l347_seg_at(st, 32768, &g) &&
                 g.rp_flags == (PULSAR_SEGSTORE_RP_PERIODIC | PULSAR_SEGSTORE_RP_ANCHOR));
     /* a key that has one only gains flags (the same key is the same state): no second write */
@@ -8183,7 +8191,7 @@ static void test_l347_i2_superseded(void) {
     pulsar_kvchain_persist_result r;
     char tip[41];
     pulsar_segstore_seg g;
-    const unsigned evict = kv_persist_writes(KV_PERSIST_EVICT);
+    const unsigned evict = l347_writes(KV_PERSIST_EVICT);
     /* an older tail goes, an anchor stays */
     {
         char tmpl[] = "/tmp/pulsar-l347-sup.XXXXXX";
@@ -8191,7 +8199,7 @@ static void test_l347_i2_superseded(void) {
         TEST_ASSERT(dir != NULL);
         if (!dir) return;
         pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-        l347_persist(st, 5000, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);   /* [4096,5000) anchor */
+        l347_persist(st, 5000, 4096, l347_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);   /* [4096,5000) anchor */
         l347_persist(st, 9000, 4096, evict, &ck, &r, tip);                                  /* [8192,9000) */
         TEST_ASSERT(r.rp_written == 1 && r.rp_dropped == 0);
         TEST_ASSERT(l347_seg_at(st, 5000, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
@@ -8201,7 +8209,7 @@ static void test_l347_i2_superseded(void) {
         TEST_ASSERT(l347_seg_at(st, 5000, &g) && g.rp_bytes > 0u);        /* the anchor's: kept */
         TEST_ASSERT(l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
         /* a persist that writes no restore point drops nothing */
-        l347_persist(st, 13500, 4096, kv_persist_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
+        l347_persist(st, 13500, 4096, l347_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
         TEST_ASSERT(r.rp_written == 0 && r.rp_dropped == 0 && l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
         pulsar_segstore_close(st);
         l323_rmdir(dir);
@@ -8259,7 +8267,7 @@ static void test_l347_i2_second_sighting(void) {
     bool rp = true;
     TEST_ASSERT(!pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* empty store */
     /* the first request (preamble + its task) trickles its rows: one root tail [0,3000) */
-    l347_persist(st, 3000, 4096, kv_persist_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
+    l347_persist(st, 3000, 4096, l347_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
     TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* second sighting: due */
     /* a preamble that parts inside the cut is a first sighting; text past every stored row too */
     std::string other = anchor;
@@ -8270,7 +8278,7 @@ static void test_l347_i2_second_sighting(void) {
     longer += "more";
     TEST_ASSERT(!pulsar_segstore_covers(st, longer.data(), longer.size(), &rp));
     /* across a grid cell: rows [0,4096) + a tail run past an anchor at 5120 */
-    l347_persist(st, 6000, 4096, kv_persist_writes(KV_PERSIST_TERMINAL), &ck, &r, tip);
+    l347_persist(st, 6000, 4096, l347_writes(KV_PERSIST_TERMINAL), &ck, &r, tip);
     std::string deep;
     l323_text(0, 5120, &deep);
     TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), deep.size(), &rp) && !rp);
@@ -8283,7 +8291,7 @@ static void test_l347_i2_second_sighting(void) {
     late[anchor.size() - 3] = 'X';   /* parts after the first 256 bytes */
     TEST_ASSERT(!pulsar_segstore_covers(st, late.data(), late.size(), &rp));
     /* the anchor's own persist (the cold phase stopped at 2048): rows and its restore point -- not due again */
-    l347_persist(st, 2048, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);
+    l347_persist(st, 2048, 4096, l347_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);
     TEST_ASSERT(r.rp_written == 1);
     TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && rp);
     /* rows ending exactly at the cut without a restore point: due (the anchor's was evicted) */
@@ -11633,24 +11641,34 @@ static void test_l328_admission_decisions(void) {
 /* L330 -- the sliced disk restore, on a synthetic chain (the L323 fixtures: segment headers, rows, restore points).
  * A loader that records every segment it is handed into a byte "bank" stands for pulsar_session_load_segment: the
  * slices hand it the one-shot load's segments, in its order, with its `last` flags and (L347) the last one's restore
- * point, whatever the slice size -- so the bank's bytes are the one-shot's.  A failing segment stops the load there and drops the chain; a cancel between
- * slices (the server's: the client gone) keeps it stored.  The job's reservation holds the chain's room from bind. */
+ * point, whatever the slice size -- so the bank's bytes are the one-shot's.  A segment whose rows fault stops the load
+ * there and drops it and the chain below it (L347 I3b: only a content fault); a cancel between slices (the server's:
+ * the client gone) keeps it stored.  The job's reservation holds the chain's room from bind. */
 struct l330_bank {
     std::vector<uint8_t> bytes;   ///< every segment's payload, in load order
     std::string order;            ///< "G_prev-G[L] " per segment
     int pos = 0;                  ///< where the bank stands (the next segment must start here)
     int fail_at = -1;             ///< the segment G_prev to refuse (a corrupt segment)
+    /// L347 I3b: how it is refused (a content fault of its rows by default)
+    pulsar_segment_status fail_kind = PULSAR_SEGMENT_BAD_ROWS;
+    const char *fail_why = "digest mismatch (corrupt segment)";   ///< ... and the loader's words
 };
-static int l330_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp, uint64_t rp_bytes,
-                       int *G, const char *key, char *err, size_t errlen) {
+static pulsar_segment_status l330_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
+                                         uint64_t rp_bytes, int *G, const char *key, char *err, size_t errlen) {
     (void)key;
     l330_bank *b = (l330_bank *)ud;
-    if (last != (rp != NULL)) { snprintf(err, errlen, "a restore point %s", last ? "missing" : "for a non-last"); return 1; }
+    if (last != (rp != NULL)) {
+        snprintf(err, errlen, "a restore point %s", last ? "missing" : "for a non-last");
+        return PULSAR_SEGMENT_TRANSIENT;
+    }
     uint32_t h[9];
-    if (bytes < sizeof h) { snprintf(err, errlen, "short header"); return 1; }
+    if (bytes < sizeof h) { snprintf(err, errlen, "short header"); return PULSAR_SEGMENT_BAD_ROWS; }
     memcpy(h, seg, sizeof h);
-    if ((int)h[6] != b->pos) { snprintf(err, errlen, "bank stands at %d, segment starts at %u", b->pos, h[6]); return 1; }
-    if ((int)h[6] == b->fail_at) { snprintf(err, errlen, "digest mismatch (corrupt segment)"); return 1; }
+    if ((int)h[6] != b->pos) {
+        snprintf(err, errlen, "bank stands at %d, segment starts at %u", b->pos, h[6]);
+        return PULSAR_SEGMENT_TRANSIENT;
+    }
+    if ((int)h[6] == b->fail_at) { snprintf(err, errlen, "%s", b->fail_why); return b->fail_kind; }
     b->bytes.insert(b->bytes.end(), seg, seg + bytes);
     if (rp) b->bytes.insert(b->bytes.end(), rp, rp + rp_bytes);   /* L347: the state at G, from the restore point */
     char rec[48];
@@ -11658,7 +11676,7 @@ static int l330_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last, 
     b->order += rec;
     b->pos = (int)h[7];
     *G = (int)h[7];
-    return 0;
+    return PULSAR_SEGMENT_OK;
 }
 static void test_l330_sliced_restore(void) {
     char t[] = "/tmp/pulsar-l330.XXXXXX";
@@ -11710,11 +11728,11 @@ static void test_l330_sliced_restore(void) {
                                                        sizeof err) == 0);
         TEST_ASSERT(nx == n && mixed.bytes == one.bytes && mixed.order == one.order);
     }
-    /* a slice past the chain is refused by name, nothing read */
+    /* a slice past the chain is refused by name, nothing read (L347 I3b: a caller's error, nothing dropped) */
     {
         l330_bank none;
         int nx = n;
-        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 1, l330_loader, &none, err, sizeof err) == 1);
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, 1, l330_loader, &none, err, sizeof err) == 2);
         TEST_ASSERT(nx == n && none.bytes.empty() && strstr(err, "not inside"));
     }
     /* cancel mid-chain: the restore stops between slices -- the bank holds rows that describe no state (the server
@@ -12658,13 +12676,419 @@ static void test_persist_skipped_under_the_floor(void) {
     s.kv.enabled = true;                                 /* a store is configured ... */
     (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));      /* ... and no box has this much free */
     int end = -1;
-    TEST_ASSERT(s.kv_cache_persist(NULL, KV_PERSIST_CONTINUED, &end) == 0);
+    session_slot sl;   /* L347 I3b: a persist reads its slot's X-Pulsar-KV tokens (none here) */
+    memset(&sl, 0, sizeof sl);
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_CONTINUED, &end) == 0);
     TEST_ASSERT(end == 0);
     TEST_ASSERT(s.m_persist_skipped == 1);
-    TEST_ASSERT(s.kv_cache_persist(NULL, KV_PERSIST_PROMPT) == 0);
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_PROMPT) == 0);
     TEST_ASSERT(s.m_persist_skipped == 2);
     (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
+}
+
+/* ===== L347 I3b: a failure costs at most a miss; the judge reads a pinned preamble and writes nothing ========== */
+
+/* (1) X-Pulsar-KV: tokens split on commas, trimmed of spaces and tabs, matched case-insensitively, empty ones skipped;
+ * an unknown token is refused by name (every one, in order: the 400's text); several header lines join.  The head
+ * scan (read_http_request) finds every such line in any case and leaves the body alone. */
+static void test_l347_i3b_kv_header(void) {
+    unsigned f = 0;
+    char err[160] = "";
+    TEST_ASSERT(kv_header_parse("read-only", 9, &f, err, sizeof err) && f == KV_HDR_READ_ONLY && !err[0]);
+    const char *both = " Read-Only ,\tPIN-anchor , ";
+    f = 0;
+    TEST_ASSERT(kv_header_parse(both, strlen(both), &f, err, sizeof err) &&
+                f == (KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR));
+    f = 0;
+    TEST_ASSERT(kv_header_parse(",, pin-anchor,", 14, &f, err, sizeof err) && f == KV_HDR_PIN_ANCHOR);
+    f = 0;
+    TEST_ASSERT(kv_header_parse("  ", 2, &f, err, sizeof err) && f == 0u);
+    const char *bad = "read-only, bogus,pin-anchors";
+    f = 0;
+    TEST_ASSERT(!kv_header_parse(bad, strlen(bad), &f, err, sizeof err));
+    TEST_ASSERT(!strcmp(err, "X-Pulsar-KV: unknown tokens 'bogus', 'pin-anchors' (known: read-only, pin-anchor)"));
+    const char *spaced = "read-only pin-anchor";   /* no comma: one token */
+    TEST_ASSERT(!kv_header_parse(spaced, strlen(spaced), &f, err, sizeof err));
+    TEST_ASSERT(!strcmp(err, "X-Pulsar-KV: unknown token 'read-only pin-anchor' (known: read-only, pin-anchor)"));
+    TEST_ASSERT(!strcmp(kv_header_words(0u), "") && !strcmp(kv_header_words(KV_HDR_READ_ONLY), "read-only") &&
+                !strcmp(kv_header_words(KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR), "read-only, pin-anchor"));
+    const struct { const char *head; unsigned flags; const char *err; } cases[] = {
+        { "x-pulsar-kv: read-only\r\nX-PULSAR-KV:pin-anchor\r\n", KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR, "" },
+        { "X-Pulsar-KV: read-only, nope\r\n", KV_HDR_READ_ONLY,
+          "X-Pulsar-KV: unknown token 'nope' (known: read-only, pin-anchor)" },
+        { "X-Pulsar-KVX: read-only\r\n", 0u, "" },   /* another header's name */
+        { "", 0u, "" },
+    };
+    for (const auto &c : cases) {
+        int fds[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n";
+        req += c.head;
+        req += "Content-Length: 2\r\n\r\n{}";
+        TEST_ASSERT(write(fds[1], req.data(), req.size()) == (ssize_t)req.size());
+        shutdown(fds[1], SHUT_WR);
+        http_request hr = {};
+        TEST_ASSERT(read_http_request(fds[0], &hr));
+        TEST_ASSERT(hr.kv_flags == c.flags && !strcmp(hr.kv_err, c.err));
+        TEST_ASSERT(hr.body_len == 2 && hr.body && !strcmp(hr.body, "{}"));
+        http_request_free(&hr);
+        close(fds[0]);
+        close(fds[1]);
+    }
+}
+
+/* (2) read-only writes nothing, for every trigger -- but its pinned anchor -- and its BANK's history writes nothing at
+ * a later loss (evict, spill, abandon, shutdown: the slot's mark, kv_cache_persist) until a request without the token
+ * takes the bank; a spill of it may free the bank (nothing to keep).  pin-anchor alone writes as without it, its
+ * anchor pinned. */
+static void test_l347_i3b_read_only_writes_nothing(void) {
+    for (int t = 0; t < KV_PERSIST_TRIGGERS; t++) {
+        const kv_persist_trigger tr = (kv_persist_trigger)t;
+        const bool anchor = tr == KV_PERSIST_ANCHOR;
+        const unsigned plain = l347_writes(tr);
+        unsigned w = ~0u;
+        TEST_ASSERT(!kv_persist_writes(tr, KV_HDR_READ_ONLY, &w) && w == 0u);
+        w = ~0u;
+        TEST_ASSERT(kv_persist_writes(tr, KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR, &w) == anchor);
+        TEST_ASSERT(w == (anchor ? plain | PULSAR_KVCHAIN_PIN : 0u));
+        TEST_ASSERT(kv_persist_writes(tr, KV_HDR_PIN_ANCHOR, &w) && w == (anchor ? plain | PULSAR_KVCHAIN_PIN : plain));
+    }
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.kv.enabled = true;
+    /* the witness: a persist the mark lets through reaches the memory floor, which no box clears here */
+    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    sl.kv_flags = KV_HDR_READ_ONLY;
+    const kv_persist_trigger loss[] = { KV_PERSIST_EVICT, KV_PERSIST_SPILL, KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
+    for (kv_persist_trigger t : loss) {
+        bool no_room = true;
+        int end = -1;
+        TEST_ASSERT(s.kv_cache_persist(&sl, t, &end, &no_room) == 0 && !no_room && end == 0);
+    }
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_CONTINUED) == 0);
+    TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 0);
+    sl.kv_flags = 0u;   /* a request without the token took the bank: its history writes again */
+    bool no_room = false;
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
+    TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
+    (void)server_mem_floor_init(0, kvb(0));
+    pthread_mutex_destroy(&s.mu);
+}
+
+/** The store's log lines, for the pin tests.  @param ud a std::string  @param msg one line */
+static void l347_i3b_log(void *ud, const char *msg) {
+    *(std::string *)ud += msg;
+    *(std::string *)ud += "\n";
+}
+
+/* (3) pin-anchor: its anchor is written with the PINNED flag (with ANCHOR; the .rp header keeps it over a restart),
+ * a later chain end through it does not supersede it, and eviction never takes it -- nor its chain's rows -- while
+ * anything else may go; only then is the pin taken (said, counted) and it goes like any flagged point. */
+static void test_l347_i3b_pinned_anchor(void) {
+    char tmpl[] = "/tmp/pulsar-l347-pin.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    l347_ckpts ck;
+    pulsar_kvchain_persist_result r;
+    char tip[41];
+    unsigned w = 0;
+    TEST_ASSERT(kv_persist_writes(KV_PERSIST_ANCHOR, KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR, &w));
+    TEST_ASSERT(l347_persist(st, 2048, 4096, w, &ck, &r, tip) == 1 && r.rp_written == 1 && !r.err[0]);
+    pulsar_segstore_seg a;
+    TEST_ASSERT(l347_seg_at(st, 2048, &a) && a.rp_flags == (PULSAR_SEGSTORE_RP_ANCHOR | PULSAR_SEGSTORE_RP_PINNED));
+    uint64_t pb = 0;
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, &pb) == 1 && pb == a.file_bytes + a.rp_bytes);
+    /* a chain end through the anchor's text (a conversation that went on) supersedes earlier ends -- not the pin */
+    TEST_ASSERT(l347_persist(st, 6000, 4096, l347_writes(KV_PERSIST_EVICT), &ck, &r, tip) == 2);
+    TEST_ASSERT(l347_seg_at(st, 2048, &a) && a.rp_bytes > 0u && (a.rp_flags & PULSAR_SEGSTORE_RP_PINNED));
+    TEST_ASSERT(pulsar_segstore_drop_superseded_rps(st, tip) == 0 && l347_seg_at(st, 2048, &a) && a.rp_bytes > 0u);
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    /* a restart: the pin is in the header; a store just big enough, then a put of all but the anchor's room */
+    std::string log;
+    st = pulsar_segstore_open(dir, used, 7, l347_i3b_log, &log);
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, NULL) == 1);
+    char big[41], big2[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "the newcomer", used - pb - 400, 6, big));
+    TEST_ASSERT(l347_seg_at(st, 2048, &a) && a.rp_bytes > 0u && pulsar_segstore_count(st) == 2);
+    TEST_ASSERT(pulsar_segstore_pins_released(st) == 0u && !strstr(log.c_str(), "unpinned"));
+    /* nothing else may go: the pin is taken, said, and the anchor goes like any flagged point */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a bigger newcomer", used - 400, 7, big2));
+    TEST_ASSERT(pulsar_segstore_pins_released(st) == 1u && strstr(log.c_str(), "unpinned anchor"));
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, NULL) == 0 && !pulsar_segstore_contains(st, a.key));
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* (4) the RAM tier keeps a pinned anchor's copies -- its restore point and its rows -- under pool pressure while any
+ * other copy may go; only a pool the pins fill gives them up (the files and the pin stay). */
+static void test_l347_i3b_pinned_ram(void) {
+    char t[] = "/tmp/pulsar-l347-pinram.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    l347_ram ram(4);   /* four granules: every image here is one */
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(st && ram.pool);
+    if (!st || !ram.pool) { pulsar_segstore_close(st); l323_rmdir(dir); return; }
+    pulsar_segstore_set_ram(st, ram.pool, true);
+    char A[41], k[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "judge preamble", 2000, 1, A));
+    TEST_ASSERT(l347_put_rp(st, A, 128, PULSAR_SEGSTORE_RP_ANCHOR | PULSAR_SEGSTORE_RP_PINNED));
+    for (int i = 0; i < 6; i++) {
+        char text[32];
+        snprintf(text, sizeof text, "pressure %d", i);
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, text, 2000, (uint8_t)(2 + i), k));
+        TEST_ASSERT(pulsar_segstore_resident_bytes(st, A, true, true) ==
+                    2000u + pulsar_segstore_rp_file_bytes(L323_STATE));
+    }
+    pulsar_segstore_close(st);
+    /* a pool the pin fills: the next image takes a pinned copy (rows first), the file and the pin stay */
+    l347_ram tight(2);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    pulsar_segstore_set_ram(st, tight.pool, true);
+    TEST_ASSERT(l347_mapped_from_disk(st, A, PULSAR_SEGSTORE_PART_ROWS));   /* a restart: read in, resident again */
+    TEST_ASSERT(l347_mapped_from_disk(st, A, PULSAR_SEGSTORE_PART_RP));
+    TEST_ASSERT(pulsar_segstore_resident_bytes(st, A, true, true) > 0u);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "one more", 2000, 9, k));
+    TEST_ASSERT(pulsar_segstore_resident_bytes(st, A, true, false) == 0u &&
+                pulsar_segstore_resident_bytes(st, A, false, true) > 0u);
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, NULL) == 1 && l347_mapped_from_disk(st, A, PULSAR_SEGSTORE_PART_ROWS));
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* (5) the pinned budget (--kv-pinned-max-mb): past it the least recently used anchor loses its pin -- said, counted,
+ * its ANCHOR flag kept, the header rewritten (it holds over a restart) -- and the newer one keeps it. */
+static void test_l347_i3b_pinned_budget(void) {
+    char t[] = "/tmp/pulsar-l347-pinmax.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char A1[41], A2[41];
+    const uint32_t pin = PULSAR_SEGSTORE_RP_ANCHOR | PULSAR_SEGSTORE_RP_PINNED;
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "the old judge prompt", 2000, 1, A1) && l347_put_rp(st, A1, 128, pin));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "the new judge prompt", 2000, 2, A2) && l347_put_rp(st, A2, 128, pin));
+    uint64_t both = 0;
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, &both) == 2);
+    pulsar_segstore_close(st);
+    /* A1 used long ago (its header's last_used) */
+    {
+        std::string p = std::string(dir) + "/" + A1 + ".seg";
+        FILE *fp = fopen(p.c_str(), "r+b");
+        uint8_t le[8] = { 0xe8, 0x03, 0, 0, 0, 0, 0, 0 };   /* 1000 */
+        TEST_ASSERT(fp && fseek(fp, 144, SEEK_SET) == 0 && fwrite(le, 1, 8, fp) == 8);
+        if (fp) fclose(fp);
+    }
+    std::string log;
+    st = pulsar_segstore_open(dir, 0, 7, l347_i3b_log, &log);
+    pulsar_segstore_set_pinned_max(st, both / 2 + 1);
+    pulsar_segstore_seg g;
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, NULL) == 1 && pulsar_segstore_pins_released(st) == 1u);
+    TEST_ASSERT(pulsar_segstore_get(st, A1, &g) && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
+    TEST_ASSERT(pulsar_segstore_get(st, A2, &g) && g.rp_flags == pin);
+    TEST_ASSERT(strstr(log.c_str(), "unpinned anchor") && strstr(log.c_str(), A1));
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_get(st, A1, &g) && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
+    TEST_ASSERT(pulsar_segstore_pinned_anchors(st, NULL) == 1);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/** A checker (pulsar_kvchain_segment_checker) that counts what it is handed and refuses the segment at fail_at.
+ *  @return the refusal's class, or PULSAR_SEGMENT_OK */
+static pulsar_segment_status l347_i3b_checker(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
+                                              const uint8_t *rp, uint64_t rp_bytes, char *err, size_t errlen) {
+    (void)bytes; (void)rp_bytes;
+    l330_bank *b = (l330_bank *)ud;
+    if (last != (rp != NULL)) return PULSAR_SEGMENT_TRANSIENT;
+    uint32_t h[9];
+    memcpy(h, seg, sizeof h);
+    b->order += "c ";
+    if ((int)h[6] == b->fail_at) { snprintf(err, errlen, "%s", b->fail_why); return b->fail_kind; }
+    return PULSAR_SEGMENT_OK;
+}
+/** Flip one byte of a stored part's file on disk (past its header).  @param dir the store  @param key the key
+ *  @param ext ".seg" or ".rp"  @param at the byte  @return true when flipped */
+static bool l347_i3b_flip(const char *dir, const char *key, const char *ext, long at) {
+    const std::string p = std::string(dir) + "/" + key + ext;
+    FILE *fp = fopen(p.c_str(), "r+b");
+    if (!fp) return false;
+    int c = EOF;
+    const bool ok = fseek(fp, at, SEEK_SET) == 0 && (c = fgetc(fp)) != EOF && fseek(fp, at, SEEK_SET) == 0 &&
+                    fputc(c ^ 0x40, fp) != EOF;
+    fclose(fp);
+    return ok;
+}
+
+/* (6) the failure rules (plans/124 D7) on a chain [0,4096) .. [16384,20480) [20480,21000)+rp, [4096,8192)+rp:
+ * a TRANSIENT failure drops nothing; a content fault of a restore point (the loader's, a missing file, a flipped byte)
+ * drops that restore point alone -- its rows stay, the next find ends at the restore point before; a content fault of
+ * a segment's rows drops it and the chain below it; the check before the load (verify) catches a fault with nothing
+ * loaded; the chain is pinned for a restore's life (server::kv_restore_begin .. kv_restore_end): neither superseded
+ * nor evicted, and released after; and a failed restore resumes from the pick's best in-memory source. */
+static void test_l347_i3b_failure_rules(void) {
+    char t[] = "/tmp/pulsar-l347-fail.XXXXXX";
+    char *dir = l323_tmpdir(t);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char tip[41];
+    TEST_ASSERT(l323_persist(st, 8192, 4096, true, tip) == 2);
+    TEST_ASSERT(l323_persist(st, 21000, 4096, true, tip) == 4);
+    std::string req;
+    l323_text(0, 21000, &req);
+    req += "and the next turn";
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    char err[384];
+    auto find = [&]() {
+        uint64_t b = 0;
+        return pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, chain, PULSAR_KVCHAIN_MAX, &b, err,
+                                   sizeof err);
+    };
+    int n = find();
+    TEST_ASSERT(n == 6);
+    if (n != 6) { pulsar_segstore_close(st); l323_rmdir(dir); return; }
+    pulsar_segstore_seg g;
+    /* transient (no checkpoint slot, the device, a TP rank's copy): nothing dropped */
+    {
+        l330_bank b;
+        b.fail_at = 12288;
+        b.fail_kind = PULSAR_SEGMENT_TRANSIENT;
+        b.fail_why = "no grid-checkpoint slot";
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, n, l330_loader, &b, err, sizeof err) == 2);
+        TEST_ASSERT(nx == 3 && strstr(err, "kept"));
+        for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_get(st, chain[i].key, &g));
+        TEST_ASSERT(g.rp_bytes > 0u && find() == 6);
+    }
+    /* the loader says the chain end's restore point is bad: it alone goes; the rows stay; the next find ends at 8192 */
+    {
+        l330_bank b;
+        b.fail_at = 20480;
+        b.fail_kind = PULSAR_SEGMENT_BAD_RP;
+        b.fail_why = "restore point written for a different state layout";
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, n, l330_loader, &b, err, sizeof err) == 1);
+        TEST_ASSERT(nx == 5 && strstr(err, "rows kept"));
+        TEST_ASSERT(pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes == 0u);
+        uint64_t b2 = 0;
+        pulsar_segstore_seg c2[PULSAR_KVCHAIN_MAX];
+        TEST_ASSERT(pulsar_kvchain_find(st, req.data(), req.size(), NULL, 0, 0, c2, PULSAR_KVCHAIN_MAX, &b2, err,
+                                        sizeof err) == 2);
+    }
+    /* a missing restore point file: the same (unreadable is a content fault) */
+    TEST_ASSERT(l323_put_rp(st, chain[5].key, 21000) && find() == 6);
+    {
+        TEST_ASSERT(unlink((std::string(dir) + "/" + chain[5].key + ".rp").c_str()) == 0);
+        l330_bank b;
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, n, l330_loader, &b, err, sizeof err) == 1);
+        TEST_ASSERT(nx == 5 && pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes == 0u);
+    }
+    /* a flipped byte in a segment's rows (the digest): it and the chain below it go, the stretch above stays */
+    TEST_ASSERT(l323_put_rp(st, chain[5].key, 21000) && find() == 6);
+    {
+        TEST_ASSERT(l347_i3b_flip(dir, chain[3].key, ".seg", (long)(160 + chain[3].text_len + 64)));
+        l330_bank b;
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_load_slice_with(st, chain, n, &nx, n, l330_loader, &b, err, sizeof err) == 1);
+        TEST_ASSERT(nx == 3 && strstr(err, "digest") && strstr(err, "every segment below"));
+        TEST_ASSERT(!pulsar_segstore_contains(st, chain[3].key) && !pulsar_segstore_contains(st, chain[5].key));
+        TEST_ASSERT(pulsar_segstore_contains(st, chain[2].key));
+    }
+    /* the check before the load: every part read and checked, nothing loaded -- a fault is caught with the bank
+     * untouched, a transient one keeps everything */
+    TEST_ASSERT(l323_persist(st, 21000, 4096, true, tip) == 3);
+    n = find();
+    TEST_ASSERT(n == 6);
+    if (n != 6) { pulsar_segstore_close(st); l323_rmdir(dir); return; }
+    {
+        l330_bank ok;
+        int nx = 0;
+        TEST_ASSERT(pulsar_kvchain_verify_slice_with(st, chain, n, &nx, 2, l347_i3b_checker, &ok, err, sizeof err) == 0);
+        TEST_ASSERT(nx == 2);
+        TEST_ASSERT(pulsar_kvchain_verify_slice_with(st, chain, n, &nx, n, l347_i3b_checker, &ok, err, sizeof err) == 0);
+        TEST_ASSERT(nx == n && ok.order == "c c c c c c " && ok.bytes.empty() && ok.pos == 0);
+        l330_bank tr;
+        tr.fail_at = 4096;
+        tr.fail_kind = PULSAR_SEGMENT_TRANSIENT;
+        nx = 0;
+        TEST_ASSERT(pulsar_kvchain_verify_slice_with(st, chain, n, &nx, n, l347_i3b_checker, &tr, err, sizeof err) == 2);
+        TEST_ASSERT(nx == 1 && find() == 6);
+        TEST_ASSERT(l347_i3b_flip(dir, chain[5].key, ".rp", 64 + 100));   /* the end's restore point, past its header */
+        l330_bank bad;
+        nx = 0;
+        TEST_ASSERT(pulsar_kvchain_verify_slice_with(st, chain, n, &nx, n, l347_i3b_checker, &bad, err, sizeof err) == 1);
+        TEST_ASSERT(nx == 5 && bad.order == "c c c c c " && bad.bytes.empty());
+        TEST_ASSERT(pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes == 0u);
+    }
+    /* the pin: the restore's chain is held (server::kv_restore_begin) -- a later end through it does not supersede its
+     * restore point, eviction passes it by -- and released at kv_restore_end (once, whatever calls it) */
+    TEST_ASSERT(l323_put_rp(st, chain[5].key, 21000) && find() == 6);
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        s.kv.st = st;
+        kv_chain_hit *hit = (kv_chain_hit *)calloc(1, sizeof(kv_chain_hit));
+        TEST_ASSERT(hit != NULL);
+        if (hit) {
+            hit->n = n;
+            memcpy(hit->chain, chain, sizeof(pulsar_segstore_seg) * (size_t)n);
+            kv_restore r;
+            s.kv_restore_begin(&r, hit, 0, false, true);
+            for (int i = 0; i < n; i++) TEST_ASSERT(pulsar_segstore_is_pinned(st, chain[i].key));
+            l347_ckpts ck;
+            pulsar_kvchain_persist_result pr;
+            char tip2[41];
+            TEST_ASSERT(l347_persist(st, 25000, 4096, l347_writes(KV_PERSIST_EVICT), &ck, &pr, tip2) == 2);
+            TEST_ASSERT(pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes > 0u);   /* not superseded */
+            s.kv_restore_end(&r);
+            s.kv_restore_end(&r);   /* idempotent */
+            for (int i = 0; i < n; i++) TEST_ASSERT(!pulsar_segstore_is_pinned(st, chain[i].key));
+            TEST_ASSERT(pulsar_segstore_drop_superseded_rps(st, tip2) >= 1);   /* released: superseded now */
+            TEST_ASSERT(pulsar_segstore_get(st, chain[5].key, &g) && g.rp_bytes == 0u);
+            free(hit);
+        }
+        pthread_mutex_destroy(&s.mu);
+    }
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    /* eviction passes a pinned key by: a put that needs its room is refused while it is held, and evicts it after */
+    char t2[] = "/tmp/pulsar-l347-failev.XXXXXX";
+    dir = l323_tmpdir(t2);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char R[41], k[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a restoring chain", 2000, 1, R) && l323_put_rp(st, R, 128));
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    pulsar_segstore_pin(st, R);
+    TEST_ASSERT(!test_seg_put(st, "", 0, 128, "a newcomer", 2000, 2, k) && pulsar_segstore_get(st, R, &g) &&
+                g.rp_bytes > 0u);
+    pulsar_segstore_unpin(st, R);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a newcomer", 2000, 2, k) && !pulsar_segstore_contains(st, R));
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    /* where a failed restore resumes: the bank's own while the restore wrote nothing into it (it checked the chain
+     * first), else nothing of its own -- and another bank's adopt by the same rule as the pick */
+    const int gain = PULSAR_SERVER_ADOPT_MIN_GAIN;
+    TEST_ASSERT(server_failed_restore_pick(3000, 0, true) == RESUME_OWN);
+    TEST_ASSERT(server_failed_restore_pick(3000, 3000 + gain, true) == RESUME_OWN);
+    TEST_ASSERT(server_failed_restore_pick(3000, 3001 + gain, true) == RESUME_ADOPT);
+    TEST_ASSERT(server_failed_restore_pick(3000, 3000, false) == RESUME_ADOPT);   /* the bank was written: lost */
+    TEST_ASSERT(server_failed_restore_pick(3000, gain, false) == RESUME_OWN);     /* ...and no adopt worth it: 0 */
 }
 
 /* 2026-10-29 (gpuq #491): the per-chunk prefill re-check tries the guard's remedies before it refuses -- spill an
@@ -13428,6 +13852,12 @@ static void pulsar_server_unit_tests_run(void) {
     test_l347_i3a_odirect_roundtrip();
     test_l347_i3a_no_room();
     test_l347_i3a_copy_out();
+    test_l347_i3b_kv_header();
+    test_l347_i3b_read_only_writes_nothing();
+    test_l347_i3b_pinned_anchor();
+    test_l347_i3b_pinned_ram();
+    test_l347_i3b_pinned_budget();
+    test_l347_i3b_failure_rules();
     test_l264_segstore_eviction_and_hygiene();
     test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();

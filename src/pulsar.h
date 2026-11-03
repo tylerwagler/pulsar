@@ -2498,8 +2498,36 @@ int pulsar_session_copy_out_restore_point(pulsar_session *s, TokPos G, const cha
  *  @return 0, or nonzero */
 int pulsar_session_copy_out_segment(pulsar_session *s, TokPos G_prev, TokPos G, const char *key, uint8_t *dst,
                                     uint64_t bytes, char *err, size_t errlen);
+/** L347 I3b (plans/124 D7): what a refused segment load or check says about its bytes -- the one classification a
+ *  disk restore drops by.  A content fault is the stored bytes' (they will never load: the store drops that part); a
+ *  transient failure is the bank's, the device's or a TP rank's (the store keeps every byte). */
+typedef enum {
+    PULSAR_SEGMENT_OK = 0,          ///< loaded (checked)
+    PULSAR_SEGMENT_BAD_ROWS = 1,    ///< the segment's bytes are not a segment of this layout: drop the key's rows
+    PULSAR_SEGMENT_BAD_RP = 2,      ///< the restore point's bytes are not this layout's state at G: drop it alone
+    PULSAR_SEGMENT_TRANSIENT = 3,   ///< not the bytes' fault (the bank, the device, a TP rank's copy, a caller error)
+} pulsar_segment_status;
+/** L347 I3b: check one disk segment (and, with `last`, its restore point) against the installed bank's layout --
+ *  every check pulsar_session_load_segment makes of the bytes before its first device write, and nothing of the
+ *  bank's state (where it stands, its slots, the device): a restore runs it over the whole chain before the root
+ *  segment clears the bank, so a content fault leaves the bank as it was.  Off a TP group's leader too (each worker
+ *  checks its own copy at the load).  The digests are the reader's (the store checks them).
+ *  @param s the session
+ *  @param seg the segment's bytes
+ *  @param bytes its size
+ *  @param last the chain's last segment: its restore point is checked too
+ *  @param rp the restore point at G when `last` (required then), else NULL
+ *  @param rp_bytes its size (0 when not `last`)
+ *  @param err receives the fault
+ *  @param errlen bytes at err
+ *  @return PULSAR_SEGMENT_OK, _BAD_ROWS, _BAD_RP, or _TRANSIENT (no session, a caller error) */
+pulsar_segment_status pulsar_session_check_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                   const uint8_t *rp, uint64_t rp_bytes, char *err, size_t errlen);
 /** Load one disk segment from memory onto the installed bank (the load rule in the L264 S4 note above; the digests
- *  are not checked here).
+ *  are not checked here).  L347 I3b: a refusal is classified (pulsar_segment_status): every content check runs before
+ *  the first device write (pulsar_session_check_segment's), so a content fault leaves the bank as it was; a failure
+ *  after it (the bank not standing at the segment's start, no checkpoint slot, the device, a TP worker's miss) is
+ *  transient and leaves the bank holding nothing.
  *  @param s the session
  *  @param seg the segment's bytes (pinned memory for a true DMA)
  *  @param bytes its size
@@ -2510,9 +2538,10 @@ int pulsar_session_copy_out_segment(pulsar_session *s, TokPos G_prev, TokPos G, 
  *  @param key the store key (NULL off a TP group)
  *  @param err receives the refusal
  *  @param errlen bytes at err
- *  @return 0, or nonzero */
-int pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
-                                uint64_t rp_bytes, TokPos *G_out, const char *key, char *err, size_t errlen);
+ *  @return PULSAR_SEGMENT_OK, or the refusal's class */
+pulsar_segment_status pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                  const uint8_t *rp, uint64_t rp_bytes, TokPos *G_out, const char *key,
+                                                  char *err, size_t errlen);
 /** A store removed segment `key` (part 0: the segment and its restore point) or only its restore point (part 1,
  *  L347): the workers delete their copies (void; a no-op off a TP leader). */
 /** @param e the engine

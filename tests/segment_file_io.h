@@ -83,7 +83,7 @@ static inline int gate_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes,
     uint8_t *seg = gate_payload_read(fp, bytes, err, errlen);
     uint8_t *rp = seg && last ? gate_payload_read(rp_fp, rp_bytes, err, errlen) : NULL;
     const int rc = seg && (!last || rp)
-                       ? pulsar_session_load_segment(s, seg, bytes, last, rp, rp_bytes, G_out, NULL, err, errlen)
+                       ? (int)pulsar_session_load_segment(s, seg, bytes, last, rp, rp_bytes, G_out, NULL, err, errlen)
                        : 1;
     free(seg);
     free(rp);

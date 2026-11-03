@@ -3424,7 +3424,7 @@ bool server::fuse_prepare(session_slot *sl) {
     if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
                  (unsigned)sl->bank);
-        s->gen_prefill_fail(sl, false);
+        s->gen_prefill_fail(sl);
         return false;
     }
     const TokPos pos = pulsar_session_pos(pool);
@@ -3889,7 +3889,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int r = 0; r < n_fr; r++) {
                 gen_state *pg = fr[r].sl->gen;
                 snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
-                s->gen_prefill_fail(fr[r].sl, false);   /* shared by every rider: no one file is implicated */
+                s->gen_prefill_fail(fr[r].sl);
                 s->worker_finish_slot(fr[r].sl);        /* L282 */
             }
             for (int q = 0; q < m; q++) {
@@ -3929,7 +3929,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 pulsar_session_note_prefilled(pool, pg->prompt_for_sync->v + fr[r].p0, fr[r].k, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %u: the fused prompt chunk could not be recorded",
                          (unsigned)c->bank);
-                s->gen_prefill_fail(c, false);
+                s->gen_prefill_fail(c);
                 s->worker_finish_slot(c);   /* L282 (the bank stays assigned: the save below reads it) */
             } else {
                 /* The classic sync's per-chunk callback: slot progress for

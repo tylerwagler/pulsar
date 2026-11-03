@@ -750,6 +750,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-ram-mb")) {
             c.kv_ram_mb = parse_int_arg(need_arg(&i, argc, argv, arg), arg);   /* >= 1, else the start is refused */
+        } else if (!strcmp(arg, "--kv-pinned-max-mb")) {   /* L347 I3b: the pinned anchors' budget */
+            c.kv_cache.pinned_max_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

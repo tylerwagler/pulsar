@@ -947,6 +947,9 @@ typedef struct request {
     /** L303: the turn's grammars (a response format, strict or forced tool calls); NULL = unconstrained,
      *  today's path.  Owned. */
     constrain_plan *constrain;
+    /** L347 I3b: the request's X-Pulsar-KV tokens (KV_HDR_*; 0 without the header), set by client_main from the
+     *  head; the bank takes them when the request takes its history (session_slot::kv_flags). */
+    unsigned kv_flags;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -1154,10 +1157,37 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
 bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);
 
+/** L347 I3b: --kv-pinned-max-mb's default: the pinned anchors' budget, MiB (a Gemma 4 judge preamble is ~280 MiB). */
+#define KV_PINNED_MAX_MB_DEFAULT 2048
 /** L264 S4: the disk KV cache's placement policy. */
 typedef struct {
     int min_tokens;          ///< a conversation shorter than this is not persisted, nor restored, nor anchored
+    /// L347 I3b: the PINNED anchors' budget, MiB (--kv-pinned-max-mb; pulsar_segstore_set_pinned_max, 0 = unbounded)
+    uint64_t pinned_max_mb;
 } kv_cache_options;
+
+/** L347 I3b (plans/124 D10): the request header `X-Pulsar-KV`, comma-separated tokens, case-insensitive -- what a request
+ *  may do to the disk KV cache.  `read-only`: it writes nothing (no rows, no restore points, no anchor unless
+ *  `pin-anchor`), and its bank's history writes nothing at a later loss until a request without it takes the bank; it
+ *  still reads.  `pin-anchor`: its anchor is written on its FIRST sighting and pinned (PULSAR_SEGSTORE_RP_PINNED). */
+#define KV_HDR_READ_ONLY 1u
+/// `pin-anchor` (see KV_HDR_READ_ONLY)
+#define KV_HDR_PIN_ANCHOR 2u
+/// Every distinct token set (the bits above), for the once-per-set log line
+#define KV_HDR_SETS 4u
+/** L347 I3b: parse one `X-Pulsar-KV` value: tokens split on commas, spaces and tabs around them trimmed, empty ones
+ *  skipped, matched case-insensitively.  Pure.
+ *  @param v      the value (not NUL-terminated)
+ *  @param len    its bytes
+ *  @param flags  receives the KV_HDR_* bits (OR-ed in: several header lines join)
+ *  @param err    receives, on a refusal, the client's 400 text naming every unknown token
+ *  @param errlen bytes at err
+ *  @return false when a token is unknown */
+bool kv_header_parse(const char *v, size_t len, unsigned *flags, char *err, size_t errlen);
+/** L347 I3b: the tokens of `flags`, comma-separated ("" for none), for the log.
+ *  @param flags KV_HDR_* bits
+ *  @return a static string */
+const char *kv_header_words(unsigned flags);
 
 /** L347 I2: why a persist runs -- the one authority for what each writes (kv_persist_writes). */
 typedef enum {
@@ -1176,10 +1206,14 @@ extern const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS];
 /** L347 I2: what a persist for `t` writes (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR; rows up to the deepest grid point and
  *  the periodic restore points always).  Restore points are written where a restore starts: at the chain's end when
  *  the history is about to be lost (evict, spill, abandon, shutdown) and at an anchor -- never on the request path of
- *  a history that stays resident (continued, prompt, terminal: rows only).
- *  @param t the trigger
- *  @return its PULSAR_KVCHAIN_* request */
-unsigned kv_persist_writes(kv_persist_trigger t);
+ *  a history that stays resident (continued, prompt, terminal: rows only).  L347 I3b: `kv_flags` (the bank's
+ *  X-Pulsar-KV tokens, session_slot::kv_flags): a read-only history writes nothing for any trigger but its pinned
+ *  anchor; a pin-anchor's anchor is pinned (PULSAR_KVCHAIN_PIN).
+ *  @param t        the trigger
+ *  @param kv_flags KV_HDR_* bits
+ *  @param what     receives its PULSAR_KVCHAIN_* request (0 when it writes nothing)
+ *  @return false when the persist writes nothing at all */
+bool kv_persist_writes(kv_persist_trigger t, unsigned kv_flags, unsigned *what);
 /** L347: is a chain end's restore point worth writing at a loss?  Only one the restore rule would load: `gain` tokens
  *  past the history's deepest stored restore point, whose re-prefill (`prefill_ms`) costs more than twice the read of
  *  the restore point and the rows past that point (`read_ms`).  Unmeasured or unpriced: written (the load measures).
@@ -1306,6 +1340,14 @@ int server_resume_memory_depth(int own, int adopt);
 /// @param disk_verdict  the chain's restore verdict
 /// @return the pick
 resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict disk_verdict);
+/** L347 I3b (plans/124 D7): where a request whose disk restore failed resumes -- the pick without the disk: the bank's
+ *  own depth while the restore wrote nothing into it (`bank_kept`: it checked the chain first), else nothing of its
+ *  own; or another bank's adopt by the same rule (server_resume_memory_depth).  Never RESUME_DISK.  Pure.
+ *  @param own       what the bank's own state served at the pick
+ *  @param adopt     what the best other bank serves now
+ *  @param bank_kept the restore never wrote the bank
+ *  @return RESUME_OWN or RESUME_ADOPT */
+resume_pick server_failed_restore_pick(int own, int adopt, bool bank_kept);
 
 /** L329 (a): the shared-prefix wait (after TensorFold #1321).  Requests that arrive together on a NEW shared prefix
  *  (Claude Code's subagent fan-out: a dozen requests within seconds over one ~20-25k-token preamble) all bound at
@@ -1885,6 +1927,11 @@ typedef struct session_slot {
      * so a continuation can never match another slot's frontier. */
     live_tool_state responses_live;      ///< Responses call-id binding at this slot's frontier
     live_tool_state anthropic_live;      ///< Anthropic tool_use binding at this slot's frontier
+    /** L347 I3b: the X-Pulsar-KV tokens (KV_HDR_*) of the request whose history the bank holds -- the one authority
+     *  every persist of the bank reads (kv_persist_writes): set when a job takes the bank's history (gen_begin, after
+     *  the old history's own persist), so a read-only history writes nothing at a later evict / spill / abandon /
+     *  shutdown until a request without it takes the bank. */
+    unsigned     kv_flags;
 } session_slot;
 
 /* Forward declarations / relocated types referenced by struct server's member
@@ -2303,6 +2350,17 @@ struct server {
     KvBytes  m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
     KvBytes  m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
     uint64_t m_persist_skipped;   ///< disk-KV persists skipped: MemAvailable could not cover them over the floor
+    /// L347 I3b: requests that carried X-Pulsar-KV read-only, and pin-anchor (client threads, under mu)
+    uint64_t m_kv_read_only_requests;
+    uint64_t m_kv_pin_anchor_requests;   ///< L347 I3b: ... pin-anchor
+    unsigned kv_header_sets_logged;      ///< L347 I3b: the token sets (bit = KV_HDR_* value) already logged, under mu
+    /// L347 I3b: disk-KV persists that wrote nothing because the bank's history is read-only (X-Pulsar-KV)
+    uint64_t m_persist_read_only;
+    /// L347 I3b: failed disk restores by class: [0] a content fault (what it invalidates dropped), [1] transient (kept)
+    uint64_t m_restore_faults[2];
+    int      m_kv_pinned_anchors;   ///< L347 I3b: the store's PINNED anchors, published (kv_cache_publish_pins)
+    uint64_t m_kv_pinned_bytes;     ///< L347 I3b: ... the bytes they hold
+    uint64_t m_kv_pins_released;    ///< L347 I3b: ... pins taken away, ever
     /// L347 I3a: disk-KV persists that left a file unwritten: the host pool had no room for its copy-out
     uint64_t m_persist_no_room;
     /// L347 I3a: guard spills refused because their copy-out found no room in the host pool (the bank stayed resident)
@@ -2451,7 +2509,7 @@ struct server {
      * (kv_persist_writes: the tail to the bank's deepest grid checkpoint, the
      * restore point there).  *chain_end (when given): where the stored chain ends
      * after the write (0: none).  @return segments written (0: nothing new, or disabled). */
-    /// @param sl         the slot whose bank is installed (unused beyond that precondition)
+    /// @param sl         the slot whose bank is installed (L347 I3b: its kv_flags say what the history may write)
     /// @param why        the trigger: what is written and the log word
     /// @param chain_end  receives the stored chain's end position in tokens (0: none); may be NULL
     /// @param no_room    L347: receives whether the history is NOT stored -- no host pool room for a copy-out, the
@@ -2459,9 +2517,10 @@ struct server {
     ///                   may be NULL
     int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
     /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point at a loss when
-     *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @return the PULSAR_KVCHAIN_*
-     *  mask */
-    unsigned kv_rp_writes_for_loss(kv_persist_trigger why);
+     *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @param kv_flags the bank's
+     *  X-Pulsar-KV tokens (L347 I3b)  @param what receives the PULSAR_KVCHAIN_* mask  @return false when nothing is
+     *  written (a read-only history) */
+    bool kv_rp_writes_for_loss(kv_persist_trigger why, unsigned kv_flags, unsigned *what);
 
     /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
      *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.
@@ -2470,6 +2529,15 @@ struct server {
      *  @param cut    the anchor cut (kv_cache_anchor_cut)
      *  @return true when the anchor is due */
     bool kv_cache_anchor_due(const pulsar_tokens *prompt, int cut);
+    /** L347 I3b (X-Pulsar-KV pin-anchor): a restore point the store holds exactly at `prompt`[0, cut) is flagged
+     *  PINNED (said once, when it was not).
+     *  @param prompt the request's tokens
+     *  @param cut    the anchor cut (kv_cache_anchor_cut)
+     *  @return true when such a restore point exists (pinned now) -- no anchor write is due */
+    bool kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut);
+    /** L347 I3b: publish the store's pinned anchors for /metrics (the store is the worker's; send_metrics reads the
+     *  copies under mu).  Worker thread. */
+    void kv_cache_publish_pins();
     warn_limiter persist_skip_warn;   ///< the persist-skipped line, rate-limited (each skip is counted)
     /** The guard's live touched-KV budget: server_guard_touched_budget over the CURRENT MemAvailable (re-read at most
      *  every 0.25 s) and touched KV, never above the startup ceiling -- so memory nobody accounts for (host heap,
@@ -2540,15 +2608,23 @@ struct server {
                       uint32_t prompt_n_spans, int base, pulsar_tokens *effective_prompt, char **loaded_key_out,
                       bool responses_protocol);
     /** L330: start a load of `hit` (nothing read yet); `sliced` prices each segment's read for
-     *  server_restore_slice_segments (a one-shot load reads the chain as one slice and needs none). */
+     *  server_restore_slice_segments (a one-shot load reads the chain as one slice and needs none).  L347 I3b: the
+     *  chain is pinned in the store (pulsar_kvchain_pin) until kv_restore_end. */
     /// @param r       the restore to start (caller-owned; keeps a pointer to `hit`, which must outlive it)
     /// @param hit     the chain to load
     /// @param base    where the bank's own state resumes, in tokens (clamped at 0)
     /// @param sliced  price each segment's read for sliced loading
-    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced);
+    /// @param verify  L347 I3b: check every part of the chain before the first load writes the bank (the bank holds a
+    ///                history the request would resume from if the restore fails)
+    void kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced, bool verify);
+    /** L347 I3b: end a restore begun by kv_restore_begin, loaded or not: the chain's pin is released (idempotent).
+     *  @param r the restore */
+    void kv_restore_end(kv_restore *r);
     /** L330: read the next `k` segments of r's chain into the installed bank (a worker stall: timed, counted on
-     *  /metrics).  @return 1 when the chain is in, 0 when segments remain, -1 when a segment would not load (it is
-     *  dropped, the bank invalid -- what a failed one-shot load leaves). */
+     *  /metrics).  L347 I3b: with `verify`, the first slices CHECK the chain (pulsar_kvchain_verify_slice: nothing
+     *  written) and only then load it.  @return 1 when the chain is in, 0 when segments remain, -1 on a failure
+     *  (r->fault: a content fault drops what it invalidates, a transient one nothing; r->touched: the bank was written
+     *  and is now invalid -- else it is as it was). */
     /// @param r  the restore in progress (r->next advances past the segments read)
     /// @param k  segments to read this slice
     int kv_restore_slice(kv_restore *r, int k);
@@ -2571,9 +2647,6 @@ struct server {
     /// @param responses_protocol  the request is a Responses one
     int kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
                           pulsar_tokens *effective_prompt, char **loaded_key_out, bool responses_protocol);
-    /** A chain whose restore the prefill then failed on: drop its last segment. */
-    /// @param key  the loaded chain's last segment key (NULL: nothing to drop)
-    void kv_cache_discard_failed_chain(const char *key);
     /** Tool-output-only Responses continuation.
      * Some clients send just the new tool outputs after a tool call.  There is no
      * long visible prefix to match in that shape; the call_id itself is the
@@ -2706,14 +2779,28 @@ struct server {
     void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
     /** Shared failure epilogue for both prefill phases (the old duplicated blocks
      * after each pulsar_session_sync failure). Token vectors and the disk path are
-     * freed centrally by gen_state_free.  `discard_loaded_entry`: the engine refused
-     * the prefill on top of a snapshot this request loaded from disk, so that file is
-     * suspect and is unlinked.  Every other failure -- a client disconnect, a bank
-     * restore, a fused forward shared with other slots -- keeps the file (L261).
+     * freed centrally by gen_state_free.  The disk chain this request loaded is kept
+     * whatever failed (L347 I3b, plans/124 D7: a chain is dropped only on a content
+     * fault, and a loaded one passed its digests and its checks; a refused prefill
+     * on top of it says nothing about its bytes -- before, it was dropped then).
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
-    /// @param discard_loaded_entry  drop the disk chain this request loaded (the engine refused the prefill on it)
-    void gen_prefill_fail(session_slot *sl, bool discard_loaded_entry);
+    void gen_prefill_fail(session_slot *sl);
+    /** L318 / L347 I3b: what bank `src`'s published state serves of the slot's request (its tokens held to the state's
+     *  T, pulsar_session_bank_adopt_score), 0 when it may not be adopted from (not resident, spilled, preempted,
+     *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.
+     *  @param sl  the slot whose job resumes
+     *  @param src the bank (-1: none)
+     *  @return the request's tokens it serves */
+    int gen_adopt_depth(const session_slot *sl, int src);
+    /** L318 / L347 I3b: copy bank `src`'s published state into the slot's installed bank (the caller picked it) and say
+     *  where the sync then resumes in `res` (cached, resumed_at, cache_source; a refused adopt leaves the bank invalid
+     *  and `res` at 0).
+     *  @param sl  the slot whose job resumes (its bank installed)
+     *  @param src the bank to copy from
+     *  @param res the resolution to update
+     *  @return true when the bank adopted */
+    bool gen_resume_adopt(session_slot *sl, int src, gen_resolution *res);
     /** L318: the prefill's client hung up (both lanes' one abandon).  The computed prefix is persisted first -- the
      * chain closed at the bank's deepest grid checkpoint, the last grid point the prefill reached -- so the re-send
      * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
@@ -3440,6 +3527,12 @@ typedef struct kv_restore {
     double read_ms;            ///< the slices' own wall time: the read the meter observes
     double slice_max_ms;       ///< the longest slice -- the longest the worker stood still for this restore
     int slices;                ///< slices read
+    /// L347 I3b: check every part before the first load (kv_restore_begin's `verify`)
+    bool verify;
+    int verified;              ///< L347 I3b: segments checked so far (with `verify`)
+    bool touched;              ///< L347 I3b: a load slice ran: the bank's own history is gone
+    int fault;                 ///< L347 I3b: the failure's pulsar_kvchain slice code (1 content, 2 transient; 0 none)
+    bool pinned;               ///< L347 I3b: the chain is pinned in the store (until kv_restore_end)
     /** each segment's predicted read (the read meter's at the restore's start; < 0 while it has measured no load) --
      *  what server_restore_slice_segments sizes the slices by */
     double pred_ms[PULSAR_KVCHAIN_MAX];
@@ -3474,6 +3567,10 @@ typedef enum {
 /** L330: a job's restore in progress (gen_state::restore). */
 struct gen_restore {
     gen_restore_kind kind;   ///< what completes it
+    /** L347 I3b (D7): the resume pick's in-memory sources, for a failed restore (GEN_RESTORE_RESUME): the bank's own
+     *  depth (`res` holds its resolution) and the best other bank's */
+    int own;
+    int adopt_src;           ///< the bank adopt would copy from (-1: none)
     kv_chain_hit hit;        ///< the chain
     kv_restore r;            ///< its load
     gen_resolution res;      ///< GEN_RESTORE_RESUME: the resolution the plan continues
@@ -3772,6 +3869,8 @@ typedef struct {
     char path[256];    ///< request path, NUL-terminated
     char *body;        ///< request body, owned; NULL when there is none
     size_t body_len;   ///< body length in bytes
+    unsigned kv_flags; ///< L347 I3b: the X-Pulsar-KV tokens (KV_HDR_*), every such header line joined
+    char kv_err[160];  ///< L347 I3b: why an X-Pulsar-KV header was refused ("" when it was not): the 400's text
 } http_request;
 
 /** Argument handed to a client thread at spawn: the server and the socket it

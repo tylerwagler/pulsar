@@ -15,11 +15,12 @@
 
 
 
-/// @brief The default checkpoint policy: min_tokens 512.
+/// @brief The default checkpoint policy: min_tokens 512, the pinned anchors' budget KV_PINNED_MAX_MB_DEFAULT.
 /// @return the options
 kv_cache_options kv_cache_default_options(void) {
     kv_cache_options o = {};
     o.min_tokens = 512;
+    o.pinned_max_mb = KV_PINNED_MAX_MB_DEFAULT;
     return o;
 }
 
@@ -27,19 +28,25 @@ const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS] = {
     "continued", "prompt", "terminal", "evict", "spill", "abandoned", "shutdown", "anchor",
 };
 
-unsigned kv_persist_writes(kv_persist_trigger t) {
+bool kv_persist_writes(kv_persist_trigger t, unsigned kv_flags, unsigned *what) {
+    *what = 0u;
+    const bool pin = t == KV_PERSIST_ANCHOR && (kv_flags & KV_HDR_PIN_ANCHOR) != 0u;
+    /* L347 I3b (D10): a read-only history writes nothing -- its pinned anchor alone */
+    if ((kv_flags & KV_HDR_READ_ONLY) && !pin) return false;
     switch (t) {
-    case KV_PERSIST_CONTINUED: return 0u;
+    case KV_PERSIST_CONTINUED: break;
     case KV_PERSIST_PROMPT:
-    case KV_PERSIST_TERMINAL: return PULSAR_KVCHAIN_TAIL;
+    case KV_PERSIST_TERMINAL: *what = PULSAR_KVCHAIN_TAIL; break;
     case KV_PERSIST_EVICT:
     case KV_PERSIST_SPILL:
     case KV_PERSIST_ABANDONED:
-    case KV_PERSIST_SHUTDOWN: return PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP;
-    case KV_PERSIST_ANCHOR: return PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR;
-    case KV_PERSIST_TRIGGERS: break;
+    case KV_PERSIST_SHUTDOWN: *what = PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP; break;
+    case KV_PERSIST_ANCHOR:
+        *what = PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR | (pin ? PULSAR_KVCHAIN_PIN : 0u);
+        break;
+    case KV_PERSIST_TRIGGERS: return false;
     }
-    return 0u;
+    return true;
 }
 
 
@@ -489,6 +496,7 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint3
         return false;
     }
     pulsar_segstore_set_ram(kc->st, kc->ram, ram.retain);
+    pulsar_segstore_set_pinned_max(kc->st, opt.pinned_max_mb << 20);   /* L347 I3b */
     kv_writer *w = new kv_writer();
     w->kc = kc;
     pthread_mutex_init(&w->mu, NULL);
@@ -662,6 +670,43 @@ bool server::kv_cache_anchor_due(const pulsar_tokens *prompt, int cut) {
     return covered && !rp_at_cut;
 }
 
+bool server::kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut) {
+    if (!kv.enabled || !kv.st || cut <= 0 || cut > prompt->len) return false;
+    (void)kv_cache_commit_written(&kv);
+    pulsar_tokens head;
+    memset(&head, 0, sizeof head);
+    head.v = prompt->v;
+    head.len = head.cap = cut;
+    size_t len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
+    if (!text) return false;
+    /* the deepest stored chain with a restore point inside the anchor's text: one ending exactly at the cut is it */
+    const pulsar_segstore_end at_rp = { 0u, true };
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    const int n = pulsar_segstore_lookup(kv.st, text, len, &at_rp, chain, PULSAR_KVCHAIN_MAX);
+    free(text);
+    if (n == 0 || chain[n - 1].text_end != len || (int)chain[n - 1].G != cut) return false;
+    if (!(chain[n - 1].rp_flags & PULSAR_SEGSTORE_RP_PINNED)) {
+        const bool ok = pulsar_segstore_flag_rp(kv.st, chain[n - 1].key, PULSAR_SEGSTORE_RP_PINNED);
+        server_log(ok ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache anchor at %d (%.12s) %s "
+                   "(X-Pulsar-KV pin-anchor)", cut, chain[n - 1].key, ok ? "pinned" : "could not be pinned");
+        kv_cache_publish_pins();
+    }
+    return true;
+}
+
+void server::kv_cache_publish_pins() {
+    if (!kv.enabled || !kv.st) return;
+    uint64_t bytes = 0;
+    const int n = pulsar_segstore_pinned_anchors(kv.st, &bytes);
+    const uint64_t released = pulsar_segstore_pins_released(kv.st);
+    pthread_mutex_lock(&mu);
+    m_kv_pinned_anchors = n;
+    m_kv_pinned_bytes = bytes;
+    m_kv_pins_released = released;
+    pthread_mutex_unlock(&mu);
+}
+
 namespace {
 /** pulsar_kvchain_trailer::size: the tool-map trailer a segment of `text` carries.
  *  @param ud the server
@@ -692,15 +737,15 @@ bool kv_rp_worth(uint32_t gain, bool measured, double read_ms, bool priced, doub
     return read_ms < 0.5 * prefill_ms;            /* kv_restore_decide's rule: only a point it would load */
 }
 
-unsigned server::kv_rp_writes_for_loss(kv_persist_trigger why) {
+bool server::kv_rp_writes_for_loss(kv_persist_trigger why, unsigned kv_flags, unsigned *what) {
     auto *s = this;
-    unsigned what = kv_persist_writes(why);
-    if (!(what & PULSAR_KVCHAIN_RP) || (what & PULSAR_KVCHAIN_ANCHOR)) return what;
+    if (!kv_persist_writes(why, kv_flags, what)) return false;
+    if (!(*what & PULSAR_KVCHAIN_RP) || (*what & PULSAR_KVCHAIN_ANCHOR)) return true;
     const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
     const TokPos end_pos = toks ? pulsar_session_persist_end(s->sess) : TokPos{0};
-    if (end_pos.is_none() || end_pos.raw() <= 0) return what;
+    if (end_pos.is_none() || end_pos.raw() <= 0) return true;
     const int E = pulsar_session_checkpoint_best(s->sess, end_pos).raw();
-    if (E <= 0) return what;
+    if (E <= 0) return true;
     /* the deepest restore point already stored on this history (an anchor, a periodic point, an earlier end) */
     pulsar_tokens head = *toks;
     head.len = E;
@@ -720,21 +765,31 @@ unsigned server::kv_rp_writes_for_loss(kv_persist_trigger why) {
     const int cap = pulsar_session_prefill_cap(s->sess).raw();
     const bool priced = gain && pulsar_engine_prefill_ms(s->engine, gain, (uint32_t)D, cap > 0 ? (uint32_t)cap : 0u,
                                                          &prefill_ms);
-    if (kv_rp_worth(gain, measured, read_ms, priced, prefill_ms)) return what;
+    if (kv_rp_worth(gain, measured, read_ms, priced, prefill_ms)) return true;
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache %s: no restore point at %d: %u tokens past the stored one at %d re-prefill in "
                "%.1f ms, cheaper than its read (%.1f ms)", kv_persist_trigger_names[why], E, gain, D, prefill_ms,
                read_ms);
-    return what & ~PULSAR_KVCHAIN_RP;
+    *what &= ~PULSAR_KVCHAIN_RP;
+    return true;
 }
 
 int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end, bool *no_room) {
     auto *s = this;
     const char *reason = kv_persist_trigger_names[why];
-    (void)sl;   /* the caller installed the slot's bank */
     if (chain_end) *chain_end = 0;
     if (no_room) *no_room = false;
     if (!s->kv.enabled) return 0;
+    /* L347 I3b (D10): the bank's history is read-only (X-Pulsar-KV): nothing is written for it -- its pinned anchor
+     * alone -- and a spill of it may free the bank (the history is disposable by the request's word) */
+    unsigned what_probe = 0;
+    if (!kv_persist_writes(why, sl->kv_flags, &what_probe)) {
+        s->count_metric(&s->m_persist_read_only);
+        if (kv_persist_writes(why, 0u, &what_probe) && (what_probe & PULSAR_KVCHAIN_RP))   /* a loss: said */
+            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache persist reason=%s: bank %u's history is read-only "
+                       "(X-Pulsar-KV) -- nothing written", reason, sl->bank);
+        return 0;
+    }
     /* A "continued" store fires from the prefill's progress callback; on a TP
      * group that is inside the mirrored sync, where the workers read only
      * chunk verdicts.  The prompt-end store after it persists the same
@@ -772,8 +827,9 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     const pulsar_kvchain_writer writer = { s->kv.writer, kv_writer_wait_room, kv_writer_submit };
     pulsar_kvchain_persist_result r;
     /* L347: a loss writes the chain end's restore point only where kv_restore_decide would load it */
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, kv_rp_writes_for_loss(why),
-                           &tool_maps, &writer, &r);
+    unsigned what = 0;
+    (void)kv_rp_writes_for_loss(why, sl->kv_flags, &what);   /* writes: kv_persist_writes said so above */
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, what, &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
     if (r.written || r.rp_written || r.rp_dropped)
@@ -788,6 +844,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                    "for a copy-out and nothing in flight could make it -- that file is not written (raise "
                    "--kv-ram-mb)", reason, (double)pulsar_kvpool_size(s->kv.ram) / (1024.0 * 1024.0));
     }
+    if (r.written || r.rp_written) s->kv_cache_publish_pins();   /* L347 I3b: a write may have made room by a pin */
     if (chain_end) *chain_end = r.end;
     /* L347: a spill frees its bank only when the history is stored: no host pool room, or any persist error (the
      * store full, a write refused), keeps the bank resident */
@@ -890,13 +947,17 @@ resume_pick server_resume_pick(int own, int adopt, int disk, kv_restore_verdict 
     return mem > own ? RESUME_ADOPT : RESUME_OWN;
 }
 
+resume_pick server_failed_restore_pick(int own, int adopt, bool bank_kept) {
+    return server_resume_pick(bank_kept ? own : 0, adopt, 0, KV_RESTORE_RECOMPUTE);
+}
+
 int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit) {
     auto *s = this;
     hit->n = 0;
     hit->bytes = 0;
     hit->cached = 0;
     if (!s->kv.enabled || !prompt_text) return 0;
-    (void)kv_cache_commit_written(&s->kv);   /* L338: segments the writer finished since the last look */
+    if (kv_cache_commit_written(&s->kv) > 0) s->kv_cache_publish_pins();   /* L338; L347 I3b: a pinned anchor's */
     char err[384];
     hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
                                  s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));
@@ -975,7 +1036,24 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
     return k;
 }
 
-void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced) {
+/* L347 I3b (plans/124 D7): a failure costs at most a miss.
+ *
+ * - The chain is PINNED in the store for the restore's life (kv_restore_begin .. kv_restore_end): the writer's
+ *   commits and the persists of other banks between its slices neither evict it nor drop its restore point as
+ *   superseded.
+ * - A failure drops only on a CONTENT fault, and only what the fault invalidates (pulsar_kvchain.h); a TRANSIENT one
+ *   (no RAM room, the bank, the device, a TP rank's copy) drops nothing.
+ * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and any
+ *   later failure leaves it holding nothing (pulsar_session_load_segment).  So when the bank holds a history the
+ *   request would otherwise resume from (`verify`: the pick's own depth > 0), the restore first CHECKS the whole chain
+ *   -- every part read (RAM or disk, digest-checked by the store) and its bytes checked against the bank's layout
+ *   (pulsar_kvchain_verify_slice), a slice per worker turn like the load -- and writes nothing until every part
+ *   passed: a content fault then leaves the bank as it was, and the request resumes from it.  The cost: on a host
+ *   without the RAM tier the chain is read twice (the check's read is not kept); with it, the check's read becomes
+ *   the RAM copy the load reads.  A failure after the first write (a transient one) leaves the bank invalid: the
+ *   request then resumes from another bank's adopt if one serves, else from 0 (server::gen_step_restore). */
+
+void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, bool sliced, bool verify) {
     auto *s = this;
     r->hit = hit;
     r->next = 0;
@@ -983,6 +1061,12 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
     r->read_ms = 0.0;
     r->slice_max_ms = 0.0;
     r->slices = 0;
+    r->verify = verify;
+    r->verified = 0;
+    r->touched = false;
+    r->fault = 0;
+    pulsar_kvchain_pin(s->kv.st, hit->chain, hit->n, true);
+    r->pinned = true;
     pthread_mutex_lock(&s->mu);
     kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342: a load is running: hold the relaxation */
     pthread_mutex_unlock(&s->mu);
@@ -1000,11 +1084,28 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
     }
 }
 
+void server::kv_restore_end(kv_restore *r) {
+    if (!r->pinned) return;
+    pulsar_kvchain_pin(kv.st, r->hit->chain, r->hit->n, false);
+    r->pinned = false;
+}
+
+/// @brief L347 I3b: the segment a restore's next slice starts at -- the next to check, while it checks.
+/// @param r  the restore
+/// @return the segment's index in the chain
+static int kv_restore_at(const kv_restore *r) {
+    return r->verify && r->verified < r->hit->n ? r->verified : r->next;
+}
+
 int server::kv_restore_slice(kv_restore *r, int k) {
     auto *s = this;
     const double t0 = server_now_sec();
     char err[384];
-    const int rc = pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    const bool checking = r->verify && r->verified < r->hit->n;
+    if (!checking) r->touched = true;   /* the load writes the bank from its first segment on */
+    const int rc = checking
+        ? pulsar_kvchain_verify_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->verified, k, err, sizeof err)
+        : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
     const double ms = (server_now_sec() - t0) * 1000.0;
     r->read_ms += ms;
     r->slices++;
@@ -1015,7 +1116,10 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     if (ms > s->m_restore_stall_max_ms) s->m_restore_stall_max_ms = ms;
     pthread_mutex_unlock(&s->mu);
     if (rc != 0) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
+        r->fault = rc;
+        s->count_metric(&s->m_restore_faults[rc == 1 ? 0 : 1]);
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s%s", err,
+                   r->touched ? "" : " (the bank is untouched: checked before the load)");
         return -1;
     }
     return r->next >= r->hit->n ? 1 : 0;
@@ -1038,11 +1142,11 @@ int server::kv_restore_next(kv_restore *r) {
     double target_ms = (double)s->restore_slice_ms;
     if (s->restore_slice_ms <= 0) {
         const int cap = pulsar_session_prefill_cap(s->sess).raw();
-        const uint32_t depth = r->hit->chain[r->next].G_prev;
+        const uint32_t depth = r->hit->chain[kv_restore_at(r)].G_prev;
         if (cap <= 0 || !pulsar_engine_prefill_ms(s->engine, (uint32_t)cap, depth, (uint32_t)cap, &target_ms))
             target_ms = 0.0;
     }
-    return kv_restore_slice(r, server_restore_slice_segments(r->pred_ms, r->next, r->hit->n, target_ms));
+    return kv_restore_slice(r, server_restore_slice_segments(r->pred_ms, kv_restore_at(r), r->hit->n, target_ms));
 }
 
 int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
@@ -1098,17 +1202,14 @@ int server::kv_cache_load(const kv_chain_hit *hit, const char *prompt_text, cons
      * completion inside its quantum like the sync it serves -- and reads only what L310 prices under half the
      * prefill it saves, so the read never stalls longer than that sync would) */
     kv_restore r;
-    kv_restore_begin(&r, hit, base, false);
-    if (kv_restore_slice(&r, hit->n) != 1) return 0;
-    return kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt, loaded_key_out,
-                             responses_protocol);
-}
-
-void server::kv_cache_discard_failed_chain(const char *key) {
-    auto *s = this;
-    if (!key || !s->kv.enabled) return;
-    pulsar_segstore_drop(s->kv.st, key);
-    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache discarded reason=prefill-failed segment=%s", key);
+    kv_restore_begin(&r, hit, base, false, base > 0);   /* L347 I3b: checked first when the bank serves some of it */
+    int rc = 0;
+    while (rc == 0) rc = kv_restore_slice(&r, hit->n);   /* the check (when it runs), then the load */
+    const int G = rc == 1 ? kv_restore_finish(&r, prompt_text, prompt_spans, prompt_n_spans, effective_prompt,
+                                              loaded_key_out, responses_protocol)
+                          : 0;
+    kv_restore_end(&r);
+    return G;
 }
 
 void server::kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs) {

@@ -8,6 +8,8 @@
 #include "pulsar_gpu.h"   /* tensor census for the reconciliation gauge */
 #include "tp/pulsar_tp.h" /* the /health tp block reads the NODE records */
 
+#include <string>
+
 
 
 /// Free a request's body and zero it.
@@ -72,6 +74,68 @@ static long content_length(const char *h, size_t n) {
 
 
 
+/* ===== L347 I3b (plans/124 D10): the X-Pulsar-KV request header ===== */
+
+bool kv_header_parse(const char *v, size_t len, unsigned *flags, char *err, size_t errlen) {
+    static const struct { const char *word; unsigned bit; } known[] = {
+        { "read-only", KV_HDR_READ_ONLY }, { "pin-anchor", KV_HDR_PIN_ANCHOR },
+    };
+    std::string unknown;
+    int n_unknown = 0;
+    for (size_t i = 0; i <= len;) {
+        size_t j = i;
+        while (j < len && v[j] != ',') j++;
+        size_t a = i, b = j;
+        while (a < b && (v[a] == ' ' || v[a] == '\t')) a++;
+        while (b > a && (v[b - 1] == ' ' || v[b - 1] == '\t')) b--;
+        if (b > a) {   /* an empty element (",," or a trailing comma) is no token */
+            bool hit = false;
+            for (const auto &k : known)
+                if (strlen(k.word) == b - a && strncasecmp(v + a, k.word, b - a) == 0) {
+                    *flags |= k.bit;
+                    hit = true;
+                }
+            if (!hit) {
+                unknown += n_unknown++ ? ", '" : "'";
+                unknown.append(v + a, b - a);
+                unknown += "'";
+            }
+        }
+        i = j + 1;
+    }
+    if (n_unknown == 0) return true;
+    snprintf(err, errlen, "X-Pulsar-KV: unknown token%s %s (known: read-only, pin-anchor)", n_unknown == 1 ? "" : "s",
+             unknown.c_str());
+    return false;
+}
+
+const char *kv_header_words(unsigned flags) {
+    static const char *const words[KV_HDR_SETS] = { "", "read-only", "pin-anchor", "read-only, pin-anchor" };
+    return words[flags & (KV_HDR_SETS - 1u)];
+}
+
+/// L347 I3b: every X-Pulsar-KV line of the request head, joined into r->kv_flags; the first refusal into r->kv_err.
+/// @param h  the request head
+/// @param n  bytes at `h`
+/// @param r  the request being read
+static void kv_header_scan(const char *h, size_t n, http_request *r) {
+    static const char name[] = "X-Pulsar-KV:";
+    const size_t name_len = sizeof name - 1;
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= name_len && strncasecmp(line, name, name_len) == 0) {
+            char err[sizeof r->kv_err];
+            if (!kv_header_parse(line + name_len, len - name_len, &r->kv_flags, err, sizeof err) && !r->kv_err[0])
+                memcpy(r->kv_err, err, sizeof err);
+        }
+        if (p < end) p++;
+    }
+}
+
 bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -106,6 +170,7 @@ bool read_http_request(int fd, http_request *r) {
     q = strchr(r->path, '?');
     if (q) *q = '\0';
 
+    kv_header_scan(b.ptr, (size_t)hend, r);   /* L347 I3b */
     long clen;
     clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -533,6 +598,14 @@ bool server::send_metrics(int fd) {
     const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
     const unsigned long long persist_no_room = (unsigned long long)s->m_persist_no_room;   /* L347 I3a */
     const unsigned long long spill_no_room = (unsigned long long)s->m_spill_no_room;
+    const unsigned long long kv_ro_requests = (unsigned long long)s->m_kv_read_only_requests;    /* L347 I3b */
+    const unsigned long long kv_pin_requests = (unsigned long long)s->m_kv_pin_anchor_requests;
+    const unsigned long long persist_read_only = (unsigned long long)s->m_persist_read_only;
+    const unsigned long long restore_faults[2] = { (unsigned long long)s->m_restore_faults[0],
+                                                   (unsigned long long)s->m_restore_faults[1] };
+    const int kv_pinned_anchors = s->m_kv_pinned_anchors;
+    const unsigned long long kv_pinned_bytes = (unsigned long long)s->m_kv_pinned_bytes;
+    const unsigned long long kv_pins_released = (unsigned long long)s->m_kv_pins_released;
     const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
@@ -1037,6 +1110,31 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_spill_no_room_total Guard spills refused because their copy-out found no room in the host pool (the bank stayed resident).\n");
     buf_puts(&b, "# TYPE pulsar:kv_spill_no_room_total counter\n");
     buf_printf(&b, "pulsar:kv_spill_no_room_total %llu\n", spill_no_room);
+    /* L347 I3b: X-Pulsar-KV (read-only requests, pinned anchors) and the restore failure rules */
+    buf_puts(&b, "# HELP pulsar:kv_header_requests_total Requests carrying an X-Pulsar-KV token, by token.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_header_requests_total counter\n");
+    buf_printf(&b, "pulsar:kv_header_requests_total{token=\"read-only\"} %llu\n", kv_ro_requests);
+    buf_printf(&b, "pulsar:kv_header_requests_total{token=\"pin-anchor\"} %llu\n", kv_pin_requests);
+    buf_puts(&b, "# HELP pulsar:kv_persist_read_only_total Disk-KV persists that wrote nothing: the bank's history is "
+                 "read-only (X-Pulsar-KV).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_persist_read_only_total counter\n");
+    buf_printf(&b, "pulsar:kv_persist_read_only_total %llu\n", persist_read_only);
+    buf_puts(&b, "# HELP pulsar:kv_pinned_anchors Pinned anchors in the disk KV store (X-Pulsar-KV pin-anchor).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_pinned_anchors gauge\n");
+    buf_printf(&b, "pulsar:kv_pinned_anchors %d\n", kv_pinned_anchors);
+    buf_puts(&b, "# HELP pulsar:kv_pinned_bytes Bytes the pinned anchors hold: their restore points and chains "
+                 "(--kv-pinned-max-mb).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_pinned_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_pinned_bytes %llu\n", kv_pinned_bytes);
+    buf_puts(&b, "# HELP pulsar:kv_pins_released_total Anchor pins taken away: over --kv-pinned-max-mb, or the store "
+                 "out of room.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_pins_released_total counter\n");
+    buf_printf(&b, "pulsar:kv_pins_released_total %llu\n", kv_pins_released);
+    buf_puts(&b, "# HELP pulsar:kv_restore_failures_total Failed disk chain restores, by fault: content (what it "
+                 "invalidates dropped) or transient (nothing dropped).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_restore_failures_total counter\n");
+    buf_printf(&b, "pulsar:kv_restore_failures_total{fault=\"content\"} %llu\n", restore_faults[0]);
+    buf_printf(&b, "pulsar:kv_restore_failures_total{fault=\"transient\"} %llu\n", restore_faults[1]);
     buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
     buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);
@@ -1358,6 +1456,17 @@ void *client_main(void *arg) {
         goto done;
     }
 
+    /* L347 I3b: an X-Pulsar-KV header with a token this server does not know is refused on every generation surface,
+     * naming the token, before the body is parsed */
+    if (hr.kv_err[0] && !strcmp(hr.method, "POST") &&
+        (!strcmp(hr.path, "/v1/messages") || !strcmp(hr.path, "/v1/chat/completions") ||
+         !strcmp(hr.path, "/v1/responses") || !strcmp(hr.path, "/v1/completions"))) {
+        if (!strcmp(hr.path, "/v1/messages")) http_error_anthropic(fd, 400, hr.kv_err);
+        else http_error(fd, 400, hr.kv_err);
+        http_request_free(&hr);
+        goto done;
+    }
+
     request req;
     char err[160];
     bool ok;
@@ -1383,6 +1492,19 @@ void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = server_xstrndup(hr.body, hr.body_len);
+    if (ok && hr.kv_flags) {   /* L347 I3b: counted; said once per distinct token set */
+        req.kv_flags = hr.kv_flags;
+        pthread_mutex_lock(&s->mu);
+        if (req.kv_flags & KV_HDR_READ_ONLY) s->m_kv_read_only_requests++;
+        if (req.kv_flags & KV_HDR_PIN_ANCHOR) s->m_kv_pin_anchor_requests++;
+        const unsigned bit = 1u << req.kv_flags;
+        const bool first = (s->kv_header_sets_logged & bit) == 0u;
+        s->kv_header_sets_logged |= bit;
+        pthread_mutex_unlock(&s->mu);
+        if (first)
+            server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache: requests carry X-Pulsar-KV: %s (first on %s; said "
+                       "once per token set)", kv_header_words(req.kv_flags), hr.path);
+    }
     if (ok && s->capture) {
         /* L216 --capture-requests: the accepted body verbatim, one JSON line. */
         pthread_mutex_lock(&s->capture_mu);

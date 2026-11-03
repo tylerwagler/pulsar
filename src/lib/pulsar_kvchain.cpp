@@ -188,6 +188,7 @@ void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *li
         const bool end = i == n - 1 && (what & PULSAR_KVCHAIN_RP);
         uint32_t flags = pulsar_kvchain_rp_periodic(links[i].G, grid) ? PULSAR_SEGSTORE_RP_PERIODIC : 0u;
         if (end && (what & PULSAR_KVCHAIN_ANCHOR)) flags |= PULSAR_SEGSTORE_RP_ANCHOR;
+        if (end && (what & PULSAR_KVCHAIN_PIN)) flags |= PULSAR_SEGSTORE_RP_PINNED;   /* L347 I3b */
         if (!end && flags == 0u) continue;
         pulsar_kvchain_persist_result one;
         memset(&one, 0, sizeof one);
@@ -212,6 +213,11 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
     }
     if ((what & PULSAR_KVCHAIN_ANCHOR) && !(what & PULSAR_KVCHAIN_RP)) {
         snprintf(r.err, sizeof(r.err), "persist: an anchor is a restore point (PULSAR_KVCHAIN_ANCHOR without _RP)");
+        if (out) *out = r;
+        return 0;
+    }
+    if ((what & PULSAR_KVCHAIN_PIN) && !(what & PULSAR_KVCHAIN_ANCHOR)) {   /* L347 I3b */
+        snprintf(r.err, sizeof(r.err), "persist: only an anchor is pinned (PULSAR_KVCHAIN_PIN without _ANCHOR)");
         if (out) *out = r;
         return 0;
     }
@@ -343,14 +349,90 @@ uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int
     return chain[i].payload_bytes + chain[i].trailer_bytes + (i == n - 1 ? chain[i].rp_bytes : 0u);
 }
 
+namespace {
+/* L347 I3b (plans/124 D7): a content fault drops only what it invalidates -- a segment's rows take the key and every
+ * key below it (no chain through it can load); a restore point takes itself alone (the rows stay, for a chain that
+ * ends further on).  Anything else drops nothing. */
+/** Drop what a fault of segment `e` invalidates (nothing for a transient failure).
+ *  @param st  the store
+ *  @param e   the segment
+ *  @param why PULSAR_SEGMENT_BAD_ROWS, _BAD_RP or _TRANSIENT
+ *  @return the slice functions' code: 1 (dropped) or 2 (transient, kept) */
+int kvchain_fault(pulsar_segstore *st, const pulsar_segstore_seg &e, pulsar_segment_status why) {
+    if (why == PULSAR_SEGMENT_BAD_ROWS) pulsar_segstore_drop(st, e.key);
+    else if (why == PULSAR_SEGMENT_BAD_RP) (void)pulsar_segstore_drop_rp(st, e.key);
+    return why == PULSAR_SEGMENT_TRANSIENT ? 2 : 1;
+}
+/** What a fault drops, for the message.  @param why the fault  @return a phrase */
+const char *kvchain_fault_word(pulsar_segment_status why) {
+    return why == PULSAR_SEGMENT_BAD_ROWS ? "dropped with every segment below it"
+         : why == PULSAR_SEGMENT_BAD_RP   ? "its restore point dropped, its rows kept"
+                                          : "kept (not the stored bytes' fault)";
+}
+/** Map segment `i` of the chain (its rows, and its restore point when it is the last): the parts' bytes from RAM or
+ *  read off disk, digest-checked by the store.  The caller unmaps them (kvchain_unmap) when this returns OK.
+ *  @param st the store  @param chain the chain  @param n its length  @param i the segment
+ *  @param seg receives the rows  @param pb their size  @param rp receives the restore point (last only)
+ *  @param rb its size  @param err receives the reason  @param errlen bytes at err
+ *  @return PULSAR_SEGMENT_OK; _BAD_ROWS / _BAD_RP (a part missing, unreadable or bad); _TRANSIENT (no RAM room now) */
+pulsar_segment_status kvchain_map(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int i,
+                                  const uint8_t **seg, uint64_t *pb, const uint8_t **rp, uint64_t *rb, char *err,
+                                  size_t errlen) {
+    *seg = *rp = NULL;
+    *pb = *rb = 0;
+    const int mrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS, seg, pb, NULL, err, errlen);
+    if (mrc != 0) return mrc == 2 ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS;
+    if (i != n - 1) return PULSAR_SEGMENT_OK;
+    const int rrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_RP, rp, rb, NULL, err, errlen);
+    if (rrc == 0) return PULSAR_SEGMENT_OK;
+    pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS);
+    return rrc == 2 ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_RP;
+}
+/** End a kvchain_map that returned OK.  @param st the store  @param chain the chain  @param n its length
+ *  @param i the segment */
+void kvchain_unmap(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int i) {
+    pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS);
+    if (i == n - 1) pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_RP);
+}
+/** The slice functions' argument check.  @param st the store  @param n the chain's length  @param next the slice's
+ *  first segment  @param k its length  @param err receives the reason  @param errlen bytes at err
+ *  @return true when [*next, *next + k) is a slice of the chain */
+bool kvchain_slice_ok(const pulsar_segstore *st, int n, const int *next, int k, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
+    if (st && next && *next >= 0 && *next < n && k > 0) return true;
+    if (err && errlen)
+        snprintf(err, errlen, "chain slice [%d, +%d) is not inside a chain of %d", next ? *next : -1, k, n);
+    return false;
+}
+}  // namespace
+
+int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
+                                     pulsar_kvchain_segment_checker check, void *ud, char *err, size_t errlen) {
+    if (!kvchain_slice_ok(st, n, next, k, err, errlen)) return 2;
+    const int end = *next + k < n ? *next + k : n;
+    for (int i = *next; i < end; i++) {
+        const uint8_t *seg = NULL, *rp = NULL;
+        uint64_t pb = 0, rb = 0;
+        char lerr[256] = "";
+        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, lerr, sizeof lerr);
+        if (why == PULSAR_SEGMENT_OK) {
+            why = check(ud, seg, pb, i == n - 1, rp, rb, lerr, sizeof lerr);
+            kvchain_unmap(st, chain, n, i);
+        }
+        if (why != PULSAR_SEGMENT_OK) {
+            if (err && errlen)
+                snprintf(err, errlen, "segment %s [%u,%u) failed its check before the load (%s) -- %s", chain[i].key,
+                         chain[i].G_prev, chain[i].G, lerr, kvchain_fault_word(why));
+            return kvchain_fault(st, chain[i], why);
+        }
+        *next = i + 1;
+    }
+    return 0;
+}
+
 int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
                                    pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen) {
-    if (err && errlen) err[0] = '\0';
-    if (!st || !next || *next < 0 || *next >= n || k <= 0) {
-        if (err && errlen) snprintf(err, errlen, "chain slice [%d, +%d) is not inside a chain of %d", next ? *next : -1,
-                                    k, n);
-        return 1;
-    }
+    if (!kvchain_slice_ok(st, n, next, k, err, errlen)) return 2;
     const int end = *next + k < n ? *next + k : n;
     for (int i = *next; i < end; i++) {
         const bool last = i == n - 1;
@@ -358,34 +440,42 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
         uint64_t pb = 0, rb = 0;
         char lerr[256] = "";
         /* L347 I3a: each part from its RAM copy, or read off disk and digest-checked by the store */
-        int mrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS, &seg, &pb, NULL, lerr,
-                                           sizeof lerr);
-        if (mrc == 0 && last) {
-            mrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_RP, &rp, &rb, NULL, lerr, sizeof lerr);
-            if (mrc != 0) pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS);
-        }
-        if (mrc == 2) {   /* no room to read it now: transient, nothing dropped */
-            if (err && errlen)
-                snprintf(err, errlen, "segment %s [%u,%u) could not be read now (%s) -- kept", chain[i].key,
-                         chain[i].G_prev, chain[i].G, lerr);
-            return 2;
-        }
+        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, lerr, sizeof lerr);
         int G = 0;
-        const int rc = mrc == 0 ? load(ud, seg, pb, last, rp, rb, &G, chain[i].key, lerr, sizeof(lerr)) : 1;
-        if (mrc == 0) {
-            pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS);
-            if (last) pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_RP);
+        if (why == PULSAR_SEGMENT_OK) {
+            why = load(ud, seg, pb, last, rp, rb, &G, chain[i].key, lerr, sizeof(lerr));
+            kvchain_unmap(st, chain, n, i);
         }
-        if (rc != 0) {
+        if (why != PULSAR_SEGMENT_OK) {
             if (err && errlen)
-                snprintf(err, errlen, "segment %s [%u,%u) failed to load (%s) -- dropped with its chain",
-                         chain[i].key, chain[i].G_prev, chain[i].G, lerr);
-            pulsar_segstore_drop(st, chain[i].key);
-            return 1;
+                snprintf(err, errlen, "segment %s [%u,%u) failed to load (%s) -- %s", chain[i].key, chain[i].G_prev,
+                         chain[i].G, lerr, kvchain_fault_word(why));
+            return kvchain_fault(st, chain[i], why);
         }
         *next = i + 1;
     }
     return 0;
+}
+
+void pulsar_kvchain_pin(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, bool pin) {
+    for (int i = 0; i < n; i++) {
+        if (pin) pulsar_segstore_pin(st, chain[i].key);
+        else pulsar_segstore_unpin(st, chain[i].key);
+    }
+}
+
+/** The pulsar_kvchain_segment_checker over a session's installed bank (pulsar_session_check_segment).
+ *  @param ud the pulsar_session  @param seg the segment's payload  @param bytes its size  @param last the chain's last
+ *  @param rp its restore point when `last`  @param rp_bytes its size  @param err receives the fault
+ *  @param errlen size of `err`  @return pulsar_session_check_segment's status */
+static pulsar_segment_status session_segment_checker(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
+                                                     const uint8_t *rp, uint64_t rp_bytes, char *err, size_t errlen) {
+    return pulsar_session_check_segment((pulsar_session *)ud, seg, bytes, last, rp, rp_bytes, err, errlen);
+}
+
+int pulsar_kvchain_verify_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
+                                int *next, int k, char *err, size_t errlen) {
+    return pulsar_kvchain_verify_slice_with(st, chain, n, next, k, session_segment_checker, s, err, errlen);
 }
 
 /** The pulsar_kvchain_segment_loader that loads into a session's installed bank (pulsar_session_load_segment).
@@ -399,12 +489,13 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
  *  @param key      the segment's key
  *  @param err      receives a reason on failure
  *  @param errlen   size of `err`
- *  @return pulsar_session_load_segment's status: 0 = loaded */
-static int session_segment_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last, const uint8_t *rp,
-                                  uint64_t rp_bytes, int *G, const char *key, char *err, size_t errlen) {
+ *  @return pulsar_session_load_segment's status */
+static pulsar_segment_status session_segment_loader(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
+                                                    const uint8_t *rp, uint64_t rp_bytes, int *G, const char *key,
+                                                    char *err, size_t errlen) {
     TokPos at{0};
-    const int rc = pulsar_session_load_segment((pulsar_session *)ud, seg, bytes, last, rp, rp_bytes, G ? &at : NULL,
-                                               key, err, errlen);
+    const pulsar_segment_status rc = pulsar_session_load_segment((pulsar_session *)ud, seg, bytes, last, rp, rp_bytes,
+                                                                 G ? &at : NULL, key, err, errlen);
     if (G) *G = at.raw();
     return rc;
 }
