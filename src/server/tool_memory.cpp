@@ -622,7 +622,8 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
-        if (calls->len == 0 || calls->raw_calls) continue;
+        /* L337: a call whose input context editing cleared renders from its edited arguments, not the sampled bytes */
+        if (calls->len == 0 || calls->raw_calls || calls->inputs_cleared) continue;
         tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
         bool exact = true;

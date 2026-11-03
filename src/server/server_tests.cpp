@@ -1513,7 +1513,13 @@ static void test_stream_heartbeat_only_fires_when_silent(void) {
     gen_state g;
     memset(&g, 0, sizeof(g));
     slot_writer_init(&g.writer, sv[0]);
-    g.anthropic_live.active = true;
+    /* L249 D: the beat follows the open stream (its head sent), whatever has been projected on it yet */
+    job j;
+    memset(&j, 0, sizeof j);
+    j.req.api = API_ANTHROPIC;
+    j.req.stream = true;
+    g.j = &j;
+    g.progress.headers_sent = true;
 
     /* Clock unarmed (nothing ever sent): no beat — we do not know the client
      * is idle rather than simply not started. */
@@ -1548,11 +1554,16 @@ static void test_stream_heartbeat_openai_uses_sse_comment(void) {
     memset(&g, 0, sizeof(g));
     slot_writer_init(&g.writer, sv[0]);
     g.writer.last_write_ms = 1;
+    job j;
+    memset(&j, 0, sizeof j);
+    j.req.api = API_OPENAI;
+    g.j = &j;
+    g.progress.headers_sent = true;
 
-    /* No stream projection active (non-streaming request): never beat. */
+    /* A non-streaming request: never beat. */
     TEST_ASSERT(!gen_stream_heartbeat(&g));
 
-    g.openai_live.active = true;
+    j.req.stream = true;
     TEST_ASSERT(gen_stream_heartbeat(&g));
 
     shutdown(sv[0], SHUT_WR);
@@ -5134,6 +5145,514 @@ static void test_anthropic_turn_render_is_stable_across_the_next_user_turn(void)
         free(a);
         free(b);
     }
+}
+
+/* L249 D: per-turn effort.  Claude Code sends the effort for a turn as a role:"system" entry with empty content and
+ * output_config.effort.  The entry renders nothing (it is dropped), and its effort is the reply's when it took
+ * effect -- directly after a user turn with new input, or before the next one -- exactly as the request-level
+ * output_config.effort would be; placed after an assistant turn with only tool results behind it, it waits. */
+static void anthropic_test_render_effort(const char *body, pulsar_chat_format fmt, std::string *text, int *effort,
+                                         pulsar_think_mode *mode) {
+    request r;
+    test_request_init(&r, REQ_CHAT, 256);
+    chat_conversation c = {};
+    char err[300] = "";
+    const bool ok = parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err) &&
+                    render_chat_conversation(NULL, fmt, NULL, &c, &r, err, sizeof err);
+    if (!ok) fprintf(stderr, "anthropic render refused: %s\n", err);
+    TEST_ASSERT(ok);
+    *text = ok && r.prompt_text ? r.prompt_text : "";
+    *effort = r.family_effort;
+    *mode = r.think_mode;
+    chat_conversation_free(&c);
+    request_free(&r);
+}
+
+static void test_anthropic_per_turn_effort(void) {
+    const std::string head =
+        "{\"model\":\"m\",\"max_tokens\":64,\"thinking\":{\"type\":\"adaptive\"},\"system\":\"Be terse.\",";
+    const std::string turn1 =
+        "{\"role\":\"user\",\"content\":\"Plan a migration.\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"1. Export. 2. Import.\"}]},";
+    const std::string last = "{\"role\":\"user\",\"content\":\"Summarize the plan.\"}";
+    const std::string low_entry = "{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"low\"}},";
+    const std::string plain = head + "\"messages\":[" + turn1 + last + "]}";
+    const std::string top_low = head + "\"output_config\":{\"effort\":\"low\"},\"messages\":[" + turn1 + last + "]}";
+    /* between the assistant turn and the next user turn: from that turn on */
+    const std::string before_user = head + "\"messages\":[" + turn1 + low_entry + last + "]}";
+    /* directly after the user turn it answers */
+    const std::string after_user = head + "\"messages\":[" + turn1 + last + "," +
+                                   low_entry.substr(0, low_entry.size() - 1) + "]}";
+    /* a later entry overrides the request level */
+    const std::string over_top = head + "\"output_config\":{\"effort\":\"max\"},\"messages\":[" + turn1 + low_entry +
+                                 last + "]}";
+    /* an empty system entry with no effort: dropped, nothing else changes */
+    const std::string empty_entry = head + "\"messages\":[" + turn1 + "{\"role\":\"system\",\"content\":[]}," + last +
+                                    "]}";
+    /* in a tool loop: after the call's result only, it waits for the next user turn with new input */
+    const std::string tool_head =
+        head + "\"tools\":[{\"name\":\"bash\",\"description\":\"Run.\",\"input_schema\":{\"type\":\"object\","
+               "\"properties\":{\"command\":{\"type\":\"string\"}}}}],\"messages\":[" + turn1.substr(0, turn1.find("{\"role\":\"assistant\"")) +
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":"
+        "{\"command\":\"ls\"}}]},";
+    const std::string tool_tail =
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"a\"}]}";
+    const std::string loop_plain = tool_head + tool_tail + "]}";
+    const std::string loop_waits = tool_head + low_entry + tool_tail + "]}";
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4};
+    bool some_family_moves = false;
+    for (pulsar_chat_format fmt : fmts) {
+        std::string t_plain, t_top, t;
+        int e_plain = 0, e_top = 0, e = 0;
+        pulsar_think_mode m_plain, m_top, m;
+        anthropic_test_render_effort(plain.c_str(), fmt, &t_plain, &e_plain, &m_plain);
+        anthropic_test_render_effort(top_low.c_str(), fmt, &t_top, &e_top, &m_top);
+        some_family_moves = some_family_moves || e_top != e_plain || t_top != t_plain;
+        for (const std::string *b : {&before_user, &after_user, &over_top}) {
+            anthropic_test_render_effort(b->c_str(), fmt, &t, &e, &m);
+            TEST_ASSERT(t == t_top && e == e_top && m == m_top);
+        }
+        anthropic_test_render_effort(empty_entry.c_str(), fmt, &t, &e, &m);
+        TEST_ASSERT(t == t_plain && e == e_plain && m == m_plain);
+        std::string t_loop;
+        int e_loop = 0;
+        pulsar_think_mode m_loop;
+        anthropic_test_render_effort(loop_plain.c_str(), fmt, &t_loop, &e_loop, &m_loop);
+        anthropic_test_render_effort(loop_waits.c_str(), fmt, &t, &e, &m);
+        TEST_ASSERT(t == t_loop && e == e_loop && m == m_loop);
+    }
+    /* the test means something: low is not the default effort on at least one family */
+    TEST_ASSERT(some_family_moves);
+    /* a bad effort name on an entry in effect is refused like the request-level one */
+    {
+        const std::string bad = head + "\"messages\":[" + turn1 +
+                                "{\"role\":\"system\",\"content\":[],\"output_config\":{\"effort\":\"huge\"}}," + last +
+                                "]}";
+        request r;
+        test_request_init(&r, REQ_CHAT, 256);
+        chat_conversation c = {};
+        char err[300] = "";
+        const bool ok = parse_chat_conversation_anthropic(bad.c_str(), &c, &r, err, sizeof err) &&
+                        render_chat_conversation(NULL, PULSAR_CHAT_QWEN, NULL, &c, &r, err, sizeof err);
+        TEST_ASSERT(!ok && strstr(err, "output_config.effort"));
+        chat_conversation_free(&c);
+        request_free(&r);
+    }
+}
+
+static bool test_seg_put(pulsar_segstore *st, const char *parent, uint32_t a, uint32_t b, const char *text,
+                         uint64_t n, uint8_t fill, char key[41]);   /* the L264 segstore tests' helper, below */
+
+/* ---- L337: Anthropic context editing (context_edit.cpp) --------------------------------------------------------- */
+
+/* A three-call tool loop with thinking on every assistant turn: toolu_1 bash, toolu_2 read, toolu_3 bash, each result
+ * and input carrying a marker the assertions look for.  `cm` is the context_management member ("" = none). */
+static std::string ctx_test_body(const std::string &cm) {
+    std::string b =
+        "{\"model\":\"m\",\"max_tokens\":64,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024},"
+        "\"system\":\"Be terse.\",\"tools\":["
+        "{\"name\":\"bash\",\"description\":\"Run.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"command\":{\"type\":\"string\"}}}},"
+        "{\"name\":\"read\",\"description\":\"Read.\",\"input_schema\":{\"type\":\"object\","
+        "\"properties\":{\"path\":{\"type\":\"string\"}}}}],\"messages\":["
+        "{\"role\":\"user\",\"content\":\"Look around.\"},";
+    const char *calls[3][5] = {
+        {"THINK_ONE", "toolu_1", "bash", "{\"command\":\"ls /dir_one\"}", "RESULT_ONE"},
+        {"THINK_TWO", "toolu_2", "read", "{\"path\":\"/file_two\"}", "RESULT_TWO"},
+        {"THINK_THREE", "toolu_3", "bash", "{\"command\":\"ls /dir_three\"}", "RESULT_THREE"},
+    };
+    for (int i = 0; i < 3; i++) {
+        b += std::string("{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"") + calls[i][0] +
+             "\",\"signature\":\"sig\"},{\"type\":\"tool_use\",\"id\":\"" + calls[i][1] + "\",\"name\":\"" +
+             calls[i][2] + "\",\"input\":" + calls[i][3] + "}]},";
+        b += std::string("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"") + calls[i][1] +
+             "\",\"content\":\"" + calls[i][4] + " " + std::string(200, 'x') + "\"}]}";
+        if (i < 2) b += ",";
+    }
+    b += "]";
+    if (!cm.empty()) b += ",\"context_management\":" + cm;
+    return b + "}";
+}
+
+/// The request a body renders to (no engine: the prompt's size is its bytes); false + err on a refusal.
+static bool ctx_test_render(const std::string &body, pulsar_chat_format fmt, server *s, request *r, char *err,
+                            size_t errlen) {
+    err[0] = '\0';
+    return parse_anthropic_request_render(NULL, fmt, s, body.c_str(), 256, r, err, errlen);
+}
+
+static std::string ctx_text(const request *r) { return r->prompt_text ? r->prompt_text : ""; }
+
+static size_t ctx_common_prefix(const std::string &a, const std::string &b) {
+    size_t n = 0;
+    while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+    return n;
+}
+
+/* Parse: the accepted shapes and every refusal, in the Messages API's wording. */
+static void test_l337_context_management_parse(void) {
+    struct { const char *cm; const char *want; } bad[] = {
+        {"{\"edits\":[{\"type\":\"clear_everything\"}]}", "does not match any of the expected tags"},
+        {"{\"edits\":[{\"type\":\"compact_20260112\"}]}", "compact_20260112"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"},{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]}",
+         "must be the first edit"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"},{\"type\":\"clear_tool_uses_20250919\"}]}",
+         "may appear once"},
+        {"{\"edits\":[],\"strategy\":1}", "context_management.strategy: Extra inputs are not permitted"},
+        {"{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\",\"value\":0}}]}",
+         "context_management.edits.0.keep.value"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"turns\",\"value\":3}}]}",
+         "context_management.edits.0.trigger.type"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"clear_tool_inputs\":\"yes\"}]}",
+         "context_management.edits.0.clear_tool_inputs"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"keep\":{\"type\":\"tool_uses\",\"value\":1.5}}]}",
+         "context_management.edits.0.keep.value"},
+        {"{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"keeep\":1}]}",
+         "context_management.edits.0.keeep: Extra inputs are not permitted"},
+        {"{\"edits\":{}}", "context_management.edits: Input should be a valid list"},
+        {"{\"edits\":[{\"keep\":\"all\"}]}", "context_management.edits.0.type: Field required"},
+    };
+    for (const auto &c : bad) {
+        request r;
+        char err[300];
+        const bool ok = ctx_test_render(ctx_test_body(c.cm), PULSAR_CHAT_QWEN, NULL, &r, err, sizeof err);
+        if (ok || !strstr(err, c.want)) fprintf(stderr, "L337 parse: %s -> ok=%d err=%s\n", c.cm, ok, err);
+        TEST_ASSERT(!ok && strstr(err, c.want) != NULL);
+    }
+    /* the accepted spellings parse to the defaults the API documents */
+    {
+        const std::string body = ctx_test_body(
+            "{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"all\"}},"
+            "{\"type\":\"clear_tool_uses_20250919\",\"exclude_tools\":[\"read\",\"web\"],"
+            "\"clear_tool_inputs\":[\"bash\"],\"clear_at_least\":{\"type\":\"input_tokens\",\"value\":5}}]}");
+        chat_conversation c = {};
+        request r;
+        test_request_init(&r, REQ_CHAT, 64);
+        char err[300] = "";
+        TEST_ASSERT(parse_chat_conversation_anthropic(body.c_str(), &c, &r, err, sizeof err));
+        TEST_ASSERT(r.ctx_mgmt && c.n_ctx_edits == 2);
+        if (c.n_ctx_edits == 2) {
+            TEST_ASSERT(c.ctx_edits[0].kind == CTX_EDIT_CLEAR_THINKING && c.ctx_edits[0].keep == -1);
+            const ctx_edit *t = &c.ctx_edits[1];
+            TEST_ASSERT(t->kind == CTX_EDIT_CLEAR_TOOL_USES && !t->trigger_tool_uses && t->trigger == 100000 &&
+                        t->keep == 3 && t->clear_at_least == 5 && t->clear_inputs);
+            TEST_ASSERT(t->exclude && !strcmp(t->exclude, "read\nweb\n"));
+            TEST_ASSERT(t->clear_inputs_only && !strcmp(t->clear_inputs_only, "bash\n"));
+        }
+        chat_conversation_free(&c);
+        request_free(&r);
+    }
+    /* null is no context management at all; {} and an empty list are context management with no edits */
+    for (const char *cm : {"null", "{}", "{\"edits\":[]}", "{\"edits\":null}"}) {
+        request r;
+        char err[300];
+        TEST_ASSERT(ctx_test_render(ctx_test_body(cm), PULSAR_CHAT_QWEN, NULL, &r, err, sizeof err));
+        TEST_ASSERT(r.ctx_mgmt == (strcmp(cm, "null") != 0) && r.n_ctx_applied == 0 && !r.ctx_edited);
+        request_free(&r);
+    }
+}
+
+/* Every family: the no-op cases render byte-identically to the body without context_management (and to the
+ * pre-L337 path, parse then render), and each edit clears what the spec says, measured, never estimated. */
+static void test_l337_context_edits_every_family(void) {
+    const pulsar_chat_format fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_DS4_V41, PULSAR_CHAT_DS4_V4,
+                                       PULSAR_CHAT_INKLING, PULSAR_CHAT_NEMOTRON_H};
+    const char *const notice = "[tool result cleared to save context]";
+    bool some_thinking_rendered = false;
+    for (pulsar_chat_format fmt : fmts) {
+        char err[300];
+        request base;
+        const bool base_ok = ctx_test_render(ctx_test_body(""), fmt, NULL, &base, err, sizeof err);
+        if (!base_ok) fprintf(stderr, "L337: fmt %d refused the plain body: %s\n", (int)fmt, err);
+        TEST_ASSERT(base_ok);
+        if (!base_ok) continue;
+        const std::string bt = ctx_text(&base);
+        TEST_ASSERT(!base.ctx_mgmt && base.n_ctx_applied == 0);
+        TEST_ASSERT(bt.find("RESULT_ONE") != std::string::npos && bt.find("/dir_one") != std::string::npos);
+        /* the pre-L337 path: the protocol parse, then the family's render */
+        {
+            request old;
+            test_request_init(&old, REQ_CHAT, 256);
+            chat_conversation c = {};
+            const bool ok = parse_chat_conversation_anthropic(ctx_test_body("").c_str(), &c, &old, err, sizeof err) &&
+                            render_chat_conversation(NULL, fmt, NULL, &c, &old, err, sizeof err);
+            TEST_ASSERT(ok && ctx_text(&old) == bt && old.prompt_n_spans == base.prompt_n_spans);
+            for (uint32_t i = 0; ok && i < old.prompt_n_spans && i < base.prompt_n_spans; i++)
+                TEST_ASSERT(old.prompt_spans[i].lo == base.prompt_spans[i].lo &&
+                            old.prompt_spans[i].hi == base.prompt_spans[i].hi);
+            chat_conversation_free(&c);
+            request_free(&old);
+        }
+        /* no-ops: Claude Code's every-request keep "all", the default trigger not reached, a tool_uses trigger not
+         * exceeded, a clear_at_least no clear can meet */
+        const char *noops[] = {
+            "{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\"}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\",\"value\":3}}]}",
+            "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\",\"value\":1},"
+            "\"keep\":{\"type\":\"tool_uses\",\"value\":0},\"clear_at_least\":{\"type\":\"input_tokens\","
+            "\"value\":1000000}}]}",
+        };
+        for (const char *cm : noops) {
+            request r;
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            TEST_ASSERT(ctx_text(&r) == bt && r.ctx_mgmt && r.n_ctx_applied == 0 && !r.ctx_edited);
+            TEST_ASSERT(r.ctx_original_tokens == (int)bt.size());
+            TEST_ASSERT(r.anthropic_live_call_ids.len == base.anthropic_live_call_ids.len);
+            request_free(&r);
+        }
+        /* clear_tool_uses past a tool_uses trigger, keep 1: toolu_1 and toolu_2 cleared, their calls kept */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":2},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_TWO") == std::string::npos);
+            TEST_ASSERT(t.find("RESULT_THREE") != std::string::npos && count_substr(t.c_str(), notice) == 2);
+            TEST_ASSERT(t.find("/dir_one") != std::string::npos && t.find("/file_two") != std::string::npos);
+            TEST_ASSERT(r.ctx_edited && r.n_ctx_applied == 1);
+            TEST_ASSERT(r.ctx_applied[0].kind == CTX_EDIT_CLEAR_TOOL_USES && r.ctx_applied[0].cleared == 2);
+            TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens == (int)bt.size() - (int)t.size());
+            TEST_ASSERT(r.ctx_original_tokens == (int)bt.size());
+            /* the edited render leaves the unedited one at or before the first cleared result: no prefix of the
+             * unedited render past it is the edited request's */
+            TEST_ASSERT(ctx_common_prefix(bt, t) <= bt.find("RESULT_ONE"));
+            /* the live binding is the unedited history's: an edited request carries no live continuation */
+            TEST_ASSERT(r.anthropic_live_call_ids.len == 0 && r.anthropic_live_suffix_text == NULL);
+            request_free(&r);
+        }
+        /* an input_tokens trigger is the unedited prompt's size: just under it clears, at it does not */
+        for (int delta : {-1, 0}) {
+            char cm[300];
+            snprintf(cm, sizeof cm,
+                     "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"input_tokens\","
+                     "\"value\":%d}}]}", (int)bt.size() + delta);
+            request r;
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            /* keep defaults to 3: three uses, nothing to clear either way -- then keep 0 through clear_at_least 0 */
+            TEST_ASSERT(r.n_ctx_applied == 0 && ctx_text(&r) == bt);
+            request_free(&r);
+            snprintf(cm, sizeof cm,
+                     "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"input_tokens\","
+                     "\"value\":%d},\"keep\":{\"type\":\"tool_uses\",\"value\":0}}]}", (int)bt.size() + delta);
+            TEST_ASSERT(ctx_test_render(ctx_test_body(cm), fmt, NULL, &r, err, sizeof err));
+            TEST_ASSERT(r.n_ctx_applied == (delta < 0 ? 1 : 0));
+            TEST_ASSERT(delta < 0 ? count_substr(r.prompt_text, notice) == 3 : ctx_text(&r) == bt);
+            request_free(&r);
+        }
+        /* exclude_tools: read's result is never cleared, nor counted against keep */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":0},\"exclude_tools\":[\"read\"]}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_THREE") == std::string::npos);
+            TEST_ASSERT(t.find("RESULT_TWO") != std::string::npos);
+            TEST_ASSERT(r.n_ctx_applied == 1 && r.ctx_applied[0].cleared == 2);
+            request_free(&r);
+        }
+        /* clear_tool_inputs: every cleared call's input, or only the named tools' */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":true}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("/dir_one") == std::string::npos && t.find("/file_two") == std::string::npos);
+            TEST_ASSERT(t.find("/dir_three") != std::string::npos);
+            request_free(&r);
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":[\"read\"]}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            t = ctx_text(&r);
+            TEST_ASSERT(t.find("/dir_one") != std::string::npos && t.find("/file_two") == std::string::npos);
+            request_free(&r);
+        }
+        /* clear_thinking keep 1: the two older thinking turns go (from the prompt when the family renders them) */
+        const bool renders_old_thinking = bt.find("THINK_ONE") != std::string::npos;
+        some_thinking_rendered = some_thinking_rendered || renders_old_thinking;
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\","
+                              "\"value\":1}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(t.find("THINK_ONE") == std::string::npos && t.find("THINK_TWO") == std::string::npos);
+            TEST_ASSERT((t.find("THINK_THREE") != std::string::npos) == (bt.find("THINK_THREE") != std::string::npos));
+            TEST_ASSERT(r.n_ctx_applied == 1 && r.ctx_applied[0].kind == CTX_EDIT_CLEAR_THINKING &&
+                        r.ctx_applied[0].cleared == 2);
+            TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens == (int)bt.size() - (int)t.size());
+            /* a family that never renders an older turn's reasoning: the turns are cleared, the prompt (and its live
+             * binding) is the one as sent */
+            TEST_ASSERT(r.ctx_edited == (t != bt));
+            if (!renders_old_thinking) TEST_ASSERT(t == bt && r.anthropic_live_call_ids.len == base.anthropic_live_call_ids.len);
+            request_free(&r);
+        }
+        /* both, thinking first: reported in request order, each measured on top of the one before */
+        {
+            request r;
+            TEST_ASSERT(ctx_test_render(
+                ctx_test_body("{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":{\"type\":\"thinking_turns\","
+                              "\"value\":1}},{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":2}}]}"),
+                fmt, NULL, &r, err, sizeof err));
+            const std::string t = ctx_text(&r);
+            TEST_ASSERT(r.n_ctx_applied == 2);
+            if (r.n_ctx_applied == 2) {
+                TEST_ASSERT(r.ctx_applied[0].kind == CTX_EDIT_CLEAR_THINKING && r.ctx_applied[0].cleared == 2);
+                TEST_ASSERT(r.ctx_applied[1].kind == CTX_EDIT_CLEAR_TOOL_USES && r.ctx_applied[1].cleared == 1);
+                TEST_ASSERT(r.ctx_applied[0].cleared_input_tokens + r.ctx_applied[1].cleared_input_tokens ==
+                            (int)bt.size() - (int)t.size());
+            }
+            TEST_ASSERT(t.find("RESULT_ONE") == std::string::npos && t.find("RESULT_TWO") != std::string::npos);
+            request_free(&r);
+        }
+        request_free(&base);
+    }
+    /* the thinking assertions meant something on at least one family */
+    TEST_ASSERT(some_thinking_rendered);
+}
+
+/* Tool memory: a cleared input renders from its edited arguments, never from the sampled bytes the memory holds for
+ * the call (which carry the original input); a call whose input stays keeps its exact replay. */
+static void test_l337_cleared_inputs_skip_tool_memory(void) {
+    const char *sampled =
+        "\n\n" PULSAR_TOOL_CALLS_START "\n"
+        "<｜DSML｜ invoke name=\"bash\">\n"
+        "<｜DSML｜ parameter name=\"command\" string=\"true\">SAMPLED_MARK</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n" PULSAR_TOOL_CALLS_END;
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.tool_memory_put("toolu_1", sampled);
+    char err[300];
+    request r;
+    TEST_ASSERT(ctx_test_render(ctx_test_body(""), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") != NULL);   /* the exact replay */
+    request_free(&r);
+    const char *keep_inputs = "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                              "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}";
+    TEST_ASSERT(ctx_test_render(ctx_test_body(keep_inputs), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") != NULL && strstr(r.prompt_text, "RESULT_ONE") == NULL);
+    request_free(&r);
+    const char *clear_inputs = "{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                               "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1},\"clear_tool_inputs\":true}]}";
+    TEST_ASSERT(ctx_test_render(ctx_test_body(clear_inputs), PULSAR_CHAT_DS4_V41, &s, &r, err, sizeof err));
+    TEST_ASSERT(strstr(r.prompt_text, "SAMPLED_MARK") == NULL && strstr(r.prompt_text, "/dir_one") == NULL);
+    request_free(&r);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* The disk KV chain keys on the rendered text, and the rendered text is the edited one: a chain stored for the
+ * unedited conversation serves an edited request no deeper than the bytes the two share. */
+static void test_l337_disk_chain_keys_on_the_edited_render(void) {
+    char err[300];
+    request base, ed;
+    TEST_ASSERT(ctx_test_render(ctx_test_body(""), PULSAR_CHAT_QWEN, NULL, &base, err, sizeof err));
+    TEST_ASSERT(ctx_test_render(
+        ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                      "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}"),
+        PULSAR_CHAT_QWEN, NULL, &ed, err, sizeof err));
+    const std::string bt = ctx_text(&base), et = ctx_text(&ed);
+    const size_t cp = ctx_common_prefix(bt, et);
+    TEST_ASSERT(cp > 0 && cp < bt.size() && cp < et.size());
+    char tmpl[] = "/tmp/pulsar-l337-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    pulsar_segstore *st = dir ? pulsar_segstore_open(dir, 0, 7, NULL, NULL) : NULL;
+    TEST_ASSERT(st != NULL);
+    if (st) {
+        /* the unedited conversation's chain: a segment inside the shared bytes, one across the divergence, the rest */
+        const uint32_t a = (uint32_t)(cp / 2), b = (uint32_t)(cp + (bt.size() - cp) / 2), n = (uint32_t)bt.size();
+        char k0[41], k1[41], k2[41];
+        TEST_ASSERT(test_seg_put(st, "", 0, a, bt.substr(0, a).c_str(), 64, 0x11, k0));
+        TEST_ASSERT(test_seg_put(st, k0, a, b, bt.substr(a, b - a).c_str(), 64, 0x22, k1));
+        TEST_ASSERT(test_seg_put(st, k1, b, n, bt.substr(b).c_str(), 64, 0x33, k2));
+        pulsar_segstore_seg chain[8];
+        TEST_ASSERT(pulsar_segstore_lookup(st, bt.c_str(), bt.size(), NULL, chain, 8) == 3);
+        const int m = pulsar_segstore_lookup(st, et.c_str(), et.size(), NULL, chain, 8);
+        TEST_ASSERT(m == 1 && chain[0].text_end <= cp);
+        pulsar_segstore_close(st);
+    }
+    if (dir) {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        TEST_ASSERT(system(cmd) == 0);
+    }
+    request_free(&base);
+    request_free(&ed);
+}
+
+/* The response: context_management.applied_edits in the message body and in the final message_delta, an empty list
+ * when the request asked and nothing was cleared, absent when it did not ask. */
+static void test_l337_applied_edits_in_both_response_shapes(void) {
+    request r;
+    test_request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    buf b = {0};
+    append_ctx_management_json(&b, &r);
+    TEST_ASSERT(b.len == 0);
+    r.ctx_mgmt = true;
+    append_ctx_management_json(&b, &r);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, ",\"context_management\":{\"applied_edits\":[]}"));
+    buf_free(&b);
+    r.n_ctx_applied = 2;
+    r.ctx_applied[0] = {CTX_EDIT_CLEAR_THINKING, 3, 150};
+    r.ctx_applied[1] = {CTX_EDIT_CLEAR_TOOL_USES, 8, 5000};
+    const char *want = "\"context_management\":{\"applied_edits\":["
+                       "{\"type\":\"clear_thinking_20251015\",\"cleared_thinking_turns\":3,\"cleared_input_tokens\":150},"
+                       "{\"type\":\"clear_tool_uses_20250919\",\"cleared_tool_uses\":8,\"cleared_input_tokens\":5000}]}";
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_final_response(sv[0], &r, "msg_ctx", "OK", NULL, NULL, "stop", NULL, 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, want) != NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    r.stream = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_ctx", 10, &st));
+    deepseek_stream_walk w;
+    deepseek_stream_walk_init(&w, &r);
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_ctx", &st, &w, "OK", 2, NULL, "stop", NULL, 3));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    const std::string delta = std::string("\"usage\":{\"output_tokens\":3},") + want + "}";
+    TEST_ASSERT(out && strstr(out, delta.c_str()) != NULL);
+    TEST_ASSERT(out && count_substr(out, "context_management") == 1);   /* message_delta only, not message_start */
+    free(out);
+    deepseek_stream_walk_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* a request without context_management: neither shape mentions it */
+    r.ctx_mgmt = false;
+    r.n_ctx_applied = 0;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_ctx", 10, &st));
+    deepseek_stream_walk_init(&w, &r);
+    TEST_ASSERT(t_anthropic_finish(sv[0], &r, "msg_ctx", &st, &w, "OK", 2, NULL, "stop", NULL, 3));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "context_management") == NULL &&
+                strstr(out, "\"usage\":{\"output_tokens\":3}}") != NULL);
+    free(out);
+    deepseek_stream_walk_free(&w);
+    close(sv[0]);
+    close(sv[1]);
+    request_free(&r);
 }
 
 /* The live side of the same identity: a Qwen tool turn ends at the stop token, and whether the KV holds it is the
@@ -9174,6 +9693,92 @@ static void test_session_eviction_ledger_math(void) {
  * and protected slots skipped, ties broken by smallest committed bytes
  * (cheapest to bring back). Pure host-field selection — no session is ever
  * touched. */
+/* L249 D: Claude Code's gateway hint headers.  The front door reads them from the request head (names any case,
+ * printable values, x-claude-code-compaction makes the request a compaction whatever its class); a compaction marks
+ * its session's banks dead -- evicted first, never persisted, taken before a fresh bank -- and a job bound to one
+ * replaces or revives it. */
+static void test_hint_headers_parse(void) {
+    client_hints h = {};
+    auto line = [&](const char *l) { client_hints_read_line(&h, l, strlen(l)); };
+    line("Content-Type: application/json\r");
+    TEST_ASSERT(h.cls == REQ_CLASS_NONE && !h.session[0]);
+    line("X-Claude-Code-Session-Id:  3f2a-77 \r");
+    line("x-claude-code-agent-id: agent-1");
+    line("x-claude-code-parent-agent-id: agent-0");
+    line("x-claude-code-prompt-id: 9c1e");
+    line("x-claude-code-request-class: Main");
+    TEST_ASSERT(!strcmp(h.session, "3f2a-77") && !strcmp(h.agent, "agent-1") && !strcmp(h.parent_agent, "agent-0") &&
+                !strcmp(h.prompt, "9c1e") && h.cls == REQ_CLASS_MAIN);
+    line("x-claude-code-request-class: auxiliary");
+    TEST_ASSERT(h.cls == REQ_CLASS_AUXILIARY);
+    line("x-claude-code-request-class: brand-new-class");
+    TEST_ASSERT(h.cls == REQ_CLASS_OTHER);
+    line("x-claude-code-context-compacted: auto");
+    TEST_ASSERT(!strcmp(h.context_compacted, "auto") && h.cls == REQ_CLASS_OTHER);
+    line("x-claude-code-request-class: auxiliary");
+    line("x-claude-code-compaction: manual");
+    TEST_ASSERT(!strcmp(h.compaction, "manual") && h.cls == REQ_CLASS_COMPACTION);
+    line("x-claude-code-request-class: main");   /* the compaction mark holds whatever order the lines come in */
+    TEST_ASSERT(h.cls == REQ_CLASS_COMPACTION);
+    /* a value with a non-printable byte is not taken; a long id is cut to fit */
+    client_hints g = {};
+    const char bad[] = "x-claude-code-session-id: a\x01b";
+    client_hints_read_line(&g, bad, sizeof bad - 1);
+    TEST_ASSERT(!g.session[0]);
+    const std::string longid = "x-claude-code-session-id: " + std::string(200, 'z');
+    client_hints_read_line(&g, longid.c_str(), longid.size());
+    TEST_ASSERT(strlen(g.session) == PULSAR_HINT_ID_MAX - 1);
+    TEST_ASSERT(!strcmp(k_request_class_names[REQ_CLASS_AUXILIARY], "auxiliary") &&
+                !strcmp(k_request_class_names[REQ_CLASS_NONE], "none"));
+    /* through the front door's reader */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char req[] = "POST /v1/messages HTTP/1.1\r\nHost: x\r\nx-claude-code-session-id: s-1\r\n"
+                       "x-claude-code-request-class: compaction\r\nContent-Length: 2\r\n\r\n{}";
+    TEST_ASSERT(write(sv[1], req, sizeof req - 1) == (ssize_t)(sizeof req - 1));
+    http_request hr = {};
+    TEST_ASSERT(read_http_request(sv[0], &hr));
+    TEST_ASSERT(!strcmp(hr.hints.session, "s-1") && hr.hints.cls == REQ_CLASS_COMPACTION && hr.body_len == 2);
+    http_request_free(&hr);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_hint_compaction_marks_dead(void) {
+    /* the persist rule: a dead prefix is never stored but by a shutdown or a guard spill (whose restore reads it);
+     * a compaction job's own prompt stores are skipped, the history it displaces ("evict") is not */
+    TEST_ASSERT(server_hint_persist_skips(true, false, "evict") && server_hint_persist_skips(true, false, "prompt"));
+    TEST_ASSERT(!server_hint_persist_skips(true, false, "shutdown") && !server_hint_persist_skips(true, false, "spill"));
+    TEST_ASSERT(server_hint_persist_skips(false, true, "continued") && server_hint_persist_skips(false, true, "prompt"));
+    TEST_ASSERT(!server_hint_persist_skips(false, true, "evict") && !server_hint_persist_skips(false, false, "prompt"));
+
+    server *s = (server *)calloc(1, sizeof(server));
+    pthread_mutex_init(&s->mu, NULL);
+    s->n_slots = 4;
+    for (int i = 0; i < 4; i++) {
+        s->slots[i].provisioned = true;
+        s->slots[i].bank = (uint32_t)i;
+        s->slots[i].last_serviced_us = 100 + (uint64_t)i;
+    }
+    snprintf(s->slots[1].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[2].hint_session, PULSAR_HINT_ID_MAX, "sess-a");
+    snprintf(s->slots[3].hint_session, PULSAR_HINT_ID_MAX, "sess-b");
+    s->slots[2].active_job = (struct job *)s;   /* busy: its job decides, not the hint */
+    TEST_ASSERT(s->hint_dead_bank() == NULL);
+    TEST_ASSERT(s->hint_mark_dead("") == 0 && s->hint_mark_dead("sess-x") == 0);
+    TEST_ASSERT(s->hint_mark_dead("sess-a") == 1 && s->slots[1].hint_dead && !s->slots[2].hint_dead &&
+                !s->slots[3].hint_dead);
+    TEST_ASSERT(s->hint_mark_dead("sess-a") == 0 && s->m_hint_dead_banks == 1);   /* counted once */
+    TEST_ASSERT(s->hint_dead_bank() == &s->slots[1]);
+    /* the dead bank is the make-room eviction's first victim, ahead of the LRU (slot 0 is older) */
+    bool dom[PULSAR_SESSION_POOL_CAP] = {};
+    for (int i = 0; i < 4; i++) dom[i] = s->slots[i].hint_dead;
+    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, dom) == 1);
+    TEST_ASSERT(server_evict_pick_victim(s->slots, 4, NULL, true, NULL) == 0);
+    pthread_mutex_destroy(&s->mu);
+    free(s);
+}
+
 static void test_session_eviction_victim_selection(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     session_slot slots[PULSAR_SESSION_POOL_CAP];
@@ -9631,6 +10236,110 @@ static void test_slot_route_trivial_match_decision(void) {
  * send_all() routes through a slot_writer — writes that do not fit the socket
  * buffer defer instead of blocking, and flushes deliver every byte in order.
  * The wire stream must be identical to the blocking path. */
+/* L249 D: the early stream.  A streaming job that waits for the worker gets the SSE head and the protocol's keepalive
+ * from its client thread once it has waited a heartbeat interval, then a beat an interval; nothing once the worker
+ * claims the socket.  A bound job's heartbeat opens the stream the same way.  An error after the stream opened is an
+ * error event with the status's type (overloaded_error for a capacity refusal); before, the HTTP error carries
+ * Retry-After. */
+static std::string early_drain(int fd) {
+    std::string out;
+    char tmp[4096];
+    ssize_t n;
+    while ((n = recv(fd, tmp, sizeof tmp, MSG_DONTWAIT)) > 0) out.append(tmp, (size_t)n);
+    return out;
+}
+
+static void test_early_stream_keepalive(void) {
+    signal(SIGPIPE, SIG_IGN);
+    const double iv = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    for (api_style api : {API_ANTHROPIC, API_OPENAI}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        set_client_socket_nonblocking(sv[0]);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = api;
+        j.req.stream = true;
+        pthread_mutex_init(&j.mu, NULL);
+        j.accepted_at = 100.0;
+        const char *beat = api == API_ANTHROPIC ? "event: ping\ndata: {\"type\": \"ping\"}\n\n" : ": ping\n\n";
+        job_early_keepalive(&j, 100.0 + iv / 2);   /* not waited an interval yet */
+        TEST_ASSERT(early_drain(sv[1]).empty() && !j.sse_early);
+        job_early_keepalive(&j, 100.0 + iv);
+        TEST_ASSERT(early_drain(sv[1]) == std::string(k_sse_head) + beat && j.sse_early);
+        job_early_keepalive(&j, 100.0 + iv * 1.5);   /* the next beat is an interval away */
+        TEST_ASSERT(early_drain(sv[1]).empty());
+        job_early_keepalive(&j, 100.0 + iv * 2);
+        TEST_ASSERT(early_drain(sv[1]) == beat);
+        bool dead = true;
+        TEST_ASSERT(job_claim_writes(&j, &dead) && !dead);
+        job_early_keepalive(&j, 100.0 + iv * 10);   /* the worker's now */
+        TEST_ASSERT(early_drain(sv[1]).empty());
+        /* the capacity refusal after the stream opened: an error event of the status's type */
+        TEST_ASSERT(job_reply_error(&j, true, 503, "not enough KV memory"));
+        const std::string ev = early_drain(sv[1]);
+        TEST_ASSERT(ev.rfind("event: error\ndata: ", 0) == 0);
+        TEST_ASSERT(ev.find(api == API_ANTHROPIC ? "\"type\":\"overloaded_error\"" : "\"type\":\"server_error\"") !=
+                    std::string::npos);
+        /* a non-streaming job never opens a stream */
+        job k;
+        memset(&k, 0, sizeof k);
+        k.fd = sv[0];
+        k.req.api = api;
+        job_early_keepalive(&k, 1e9);
+        TEST_ASSERT(early_drain(sv[1]).empty() && !k.sse_early);
+        pthread_mutex_destroy(&j.mu);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    /* before the stream opened: the HTTP error, Anthropic's typed by status and retryable for capacity */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = API_ANTHROPIC;
+        TEST_ASSERT(job_reply_error(&j, false, 503, "busy"));
+        TEST_ASSERT(job_reply_error(&j, false, 500, "broke"));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(out && strstr(out, "HTTP/1.1 503") && strstr(out, "Retry-After: ") &&
+                    strstr(out, "\"type\":\"overloaded_error\"") && strstr(out, "\"type\":\"api_error\""));
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    /* a bound job the worker has written nothing for: its heartbeat opens the stream, then beats an interval */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        set_client_socket_nonblocking(sv[0]);
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        j.req.api = API_ANTHROPIC;
+        j.req.stream = true;
+        j.accepted_at = server_now_sec();
+        gen_state *g = (gen_state *)calloc(1, sizeof(gen_state));
+        g->j = &j;
+        slot_writer_init(&g->writer, sv[0]);
+        TEST_ASSERT(!gen_stream_heartbeat(g));   /* accepted just now */
+        j.accepted_at -= iv;
+        TEST_ASSERT(gen_stream_heartbeat(g) && g->progress.headers_sent);
+        TEST_ASSERT(early_drain(sv[1]) == std::string(k_sse_head) + "event: ping\ndata: {\"type\": \"ping\"}\n\n");
+        TEST_ASSERT(!gen_stream_heartbeat(g));   /* the next beat is an interval away */
+        j.req.stream = false;                     /* a non-streaming job: never */
+        g->progress.headers_sent = false;
+        TEST_ASSERT(!gen_stream_heartbeat(g));
+        slot_writer_free(&g->writer);
+        free(g);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_slot_writer_defers_and_preserves_order(void) {
     signal(SIGPIPE, SIG_IGN);
     int sv[2];
@@ -13806,6 +14515,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_guard_touched_budget_is_physical();
     test_session_eviction_ledger_math();
     test_session_eviction_victim_selection();
+    test_hint_headers_parse();
+    test_hint_compaction_marks_dead();
     test_slot_route_trivial_match_decision();
     test_l264_route_in_place();
     test_l275_route_turn_anchor();
@@ -13816,6 +14527,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l325_deferred_tool_in_place();
     test_l326_responses_tool_search_in_place();
     test_slot_writer_defers_and_preserves_order();
+    test_early_stream_keepalive();
     test_slot_writer_stall_times_out();
     test_unterminated_think_stays_off_content();
     test_request_defaults_use_min_p_filtering();
@@ -13921,6 +14633,12 @@ static void pulsar_server_unit_tests_run(void) {
     test_gemma4_tools_and_refusals();
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
+    test_anthropic_per_turn_effort();
+    test_l337_context_management_parse();
+    test_l337_context_edits_every_family();
+    test_l337_cleared_inputs_skip_tool_memory();
+    test_l337_disk_chain_keys_on_the_edited_render();
+    test_l337_applied_edits_in_both_response_shapes();
     test_live_tail_joins_before_a_committed_stop();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();

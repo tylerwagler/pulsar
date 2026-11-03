@@ -26,6 +26,7 @@
 #include "../src/server/prompt_render.cpp"
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
+#include "../src/server/context_edit.cpp"
 #include "../src/server/family_inkling.cpp"
 #include "../src/server/family_nemotron_h.cpp"
 #include "../src/server/family_gemma4.cpp"

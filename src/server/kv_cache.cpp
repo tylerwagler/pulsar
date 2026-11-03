@@ -790,11 +790,24 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                        "(X-Pulsar-KV) -- nothing written", reason, sl->bank);
         return 0;
     }
+    /* L249 D: a dead prefix (its session compacted) or a compaction request's prompt is not worth a disk copy */
+    if (server_hint_persist_skips(sl->hint_dead, sl->active_job && sl->active_job->req.hints.cls == REQ_CLASS_COMPACTION,
+                                  reason)) {
+        s->count_metric(&s->m_hint_persist_skipped);
+        return 0;
+    }
     /* A "continued" store fires from the prefill's progress callback; on a TP
      * group that is inside the mirrored sync, where the workers read only
      * chunk verdicts.  The prompt-end store after it persists the same
      * checkpoints. */
     if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
+    /* L249 D: a dead prefix (its session compacted) or a compaction request's prompt is not worth a disk copy */
+    if (sl && server_hint_persist_skips(sl->hint_dead,
+                                        sl->active_job && sl->active_job->req.hints.cls == REQ_CLASS_COMPACTION,
+                                        reason)) {
+        s->count_metric(&s->m_hint_persist_skipped);
+        return 0;
+    }
     /* 2026-10-29 (a production hang under memory pressure: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
      * only when MemAvailable covers what it can take -- its dirty-page window and the history's text renders (the
      * device reads stream through the session's pinned buffer, which allocates nothing) -- over the floor.  Else
