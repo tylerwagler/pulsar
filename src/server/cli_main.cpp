@@ -1114,6 +1114,18 @@ int main(int argc, char **argv) {
 
     /* Materialize the lazy first-generation CUDA working set BEFORE deriving
      * the admission budget or opening the listener (F1, task #32). */
+    /* L347 I3a: the disk cache's host pool -- the RAM tier on a discrete-GPU host, the copy-out ring on a unified one.
+     * Planned BEFORE the warmup (battery #590, server-kv-headroom-live on GB10): the pool is host memory the cache
+     * allocates (and touches) when it opens, after the post-warmup MemAvailable reading the admission budget and the 2b
+     * guard's ceiling are cut from -- so that reading charges it (kv_pool_charge below).  Uncharged, the 1 GiB ring came
+     * out of the guard's headroom and MemAvailable fell 1.02 GiB, below the floor. */
+    kv_ram_plan ram = {0, false};
+    {
+        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+        const uint64_t mem_total = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
+        kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
+    }
+    const uint64_t kv_pool_charge = cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u;   /* the host pool the cache opens with */
     if (!server_warmup_generation(engine, session, cfg.ctx_size)) {
         pulsar_session_free(session);
         pulsar_engine_close(engine);
@@ -1170,7 +1182,9 @@ int main(int argc, char **argv) {
         /* the KV figures leave the type system here: the measured budget is the untyped session-cost ledger's */
         const uint64_t untouched_va = (demand_va > touched_now ? demand_va - touched_now : KvBytes{}).raw();
         const uint64_t resident_now = session_actual > untouched_va ? session_actual - untouched_va : 0;
-        const uint64_t avail_now = server_mem_available_bytes();
+        /* L347: the disk cache's host pool, opened after this reading, is charged to it now */
+        const uint64_t avail_raw = server_mem_available_bytes();
+        const uint64_t avail_now = avail_raw > kv_pool_charge ? avail_raw - kv_pool_charge : 0u;
         warm_avail = avail_now;
         warm_touched = touched_now;
         if (discrete) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
@@ -1529,13 +1543,6 @@ int main(int argc, char **argv) {
                    "the anchor cold store and the last-turn routing anchor are off");
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
-    /* L347 I3a: the disk cache's host pool -- the RAM tier on a discrete-GPU host, the copy-out ring on a unified one */
-    kv_ram_plan ram = {0, false};
-    {
-        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
-        const uint64_t mem_total = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
-        kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
-    }
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                        pulsar_engine_kv_identity(engine),

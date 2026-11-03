@@ -35,8 +35,12 @@ bool kv_persist_writes(kv_persist_trigger t, unsigned kv_flags, unsigned *what) 
     if ((kv_flags & KV_HDR_READ_ONLY) && !pin) return false;
     switch (t) {
     case KV_PERSIST_CONTINUED: break;
+    /* L347 (battery #590): a prompt's and a turn's end ask for their restore point too -- only at a loss left a
+     * resident conversation with no state near its end, so a fresh bank (another request of it, an image chain) found
+     * nothing to resume from on disk; kv_rp_worth (kv_rp_writes_for_end) still writes it only where a load would win,
+     * so a one-shot call a few hundred tokens past its anchor writes none */
     case KV_PERSIST_PROMPT:
-    case KV_PERSIST_TERMINAL: *what = PULSAR_KVCHAIN_TAIL; break;
+    case KV_PERSIST_TERMINAL:
     case KV_PERSIST_EVICT:
     case KV_PERSIST_SPILL:
     case KV_PERSIST_ABANDONED:
@@ -486,6 +490,9 @@ bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint3
     /* L347 I3a: the pool, pinned once (a DMA target for the copy-out and a DMA source for a restore), sized at startup:
      * on a unified host its pages are the GPU's, so the guard and admission read them as taken (MemAvailable) */
     kc->ram_base = ram.bytes ? pulsar_gpu_host_alloc(ram.bytes) : NULL;
+    /* L347: touch every page now -- a unified host's allocator backs pages on first touch, and the pool must be out of
+     * MemAvailable before the warmup reading (cli_main opens the cache before it), not at the first copy-out */
+    if (kc->ram_base) memset(kc->ram_base, 0, (size_t)ram.bytes);
     kc->ram = kc->ram_base ? pulsar_kvpool_create(kc->ram_base, ram.bytes) : NULL;
     if (!kc->ram) {
         server_log(PULSAR_LOG_ERROR, "pulsar-server: kv cache: the %.0f MiB host pool (--kv-ram-mb) could not be %s",
@@ -737,7 +744,7 @@ bool kv_rp_worth(uint32_t gain, bool measured, double read_ms, bool priced, doub
     return read_ms < 0.5 * prefill_ms;            /* kv_restore_decide's rule: only a point it would load */
 }
 
-bool server::kv_rp_writes_for_loss(kv_persist_trigger why, unsigned kv_flags, unsigned *what) {
+bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, unsigned *what) {
     auto *s = this;
     if (!kv_persist_writes(why, kv_flags, what)) return false;
     if (!(*what & PULSAR_KVCHAIN_RP) || (*what & PULSAR_KVCHAIN_ANCHOR)) return true;
@@ -828,7 +835,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
     pulsar_kvchain_persist_result r;
     /* L347: a loss writes the chain end's restore point only where kv_restore_decide would load it */
     unsigned what = 0;
-    (void)kv_rp_writes_for_loss(why, sl->kv_flags, &what);   /* writes: kv_persist_writes said so above */
+    (void)kv_rp_writes_for_end(why, sl->kv_flags, &what);   /* writes: kv_persist_writes said so above */
     pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, what, &tool_maps, &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);

@@ -8091,9 +8091,9 @@ static void test_l347_i2_trigger_table(void) {
     TEST_ASSERT(!kv_rp_worth(200u, true, 150.0, true, 60.0));      /* the judge: 200 tokens past its anchor */
     TEST_ASSERT(kv_rp_worth(7800u, true, 180.0, true, 2400.0));    /* a 7.8K chat: its read wins */
     TEST_ASSERT(!kv_rp_worth(800u, true, 150.0, true, 300.0));     /* exactly 2x: not under half -- no */
-    TEST_ASSERT(l347_writes(KV_PERSIST_PROMPT) == PULSAR_KVCHAIN_TAIL);
-    TEST_ASSERT(l347_writes(KV_PERSIST_TERMINAL) == PULSAR_KVCHAIN_TAIL);
-    const kv_persist_trigger loss[] = { KV_PERSIST_EVICT, KV_PERSIST_SPILL, KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
+    /* battery #590: a prompt's and a turn's end ask for their restore point (kv_rp_worth still decides) */
+    const kv_persist_trigger loss[] = { KV_PERSIST_PROMPT, KV_PERSIST_TERMINAL, KV_PERSIST_EVICT, KV_PERSIST_SPILL,
+                                        KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
     for (kv_persist_trigger t : loss) TEST_ASSERT(l347_writes(t) == (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP));
     TEST_ASSERT(l347_writes(KV_PERSIST_ANCHOR) ==
                 (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR));
@@ -8209,7 +8209,7 @@ static void test_l347_i2_superseded(void) {
         TEST_ASSERT(l347_seg_at(st, 5000, &g) && g.rp_bytes > 0u);        /* the anchor's: kept */
         TEST_ASSERT(l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
         /* a persist that writes no restore point drops nothing */
-        l347_persist(st, 13500, 4096, l347_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
+        l347_persist(st, 13500, 4096, PULSAR_KVCHAIN_TAIL, &ck, &r, tip);   /* rows + tail, no restore point */
         TEST_ASSERT(r.rp_written == 0 && r.rp_dropped == 0 && l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
         pulsar_segstore_close(st);
         l323_rmdir(dir);

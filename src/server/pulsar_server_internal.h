@@ -2537,11 +2537,11 @@ struct server {
     ///                   memory floor skipped the persist, or the persist failed (a spill that sees it keeps its bank);
     ///                   may be NULL
     int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
-    /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point at a loss when
-     *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @param kv_flags the bank's
+    /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point when kv_rp_worth
+     *  says no (a prompt's or turn's end, or a loss; an anchor always writes its own).  @param why the trigger  @param kv_flags the bank's
      *  X-Pulsar-KV tokens (L347 I3b)  @param what receives the PULSAR_KVCHAIN_* mask  @return false when nothing is
      *  written (a read-only history) */
-    bool kv_rp_writes_for_loss(kv_persist_trigger why, unsigned kv_flags, unsigned *what);
+    bool kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, unsigned *what);
 
     /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
      *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.
