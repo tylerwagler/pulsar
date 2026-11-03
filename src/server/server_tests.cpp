@@ -8874,11 +8874,27 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
     TEST_ASSERT(server_kv_budget_bytes(PULSAR_SERVER_USABLE_BYTES) == 0);
-    /* L338: a discrete card's budget is its own free memory less the margin (the larger of 2 GiB and an eighth) */
-    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 24ull * GiB) == 6ull * GiB);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(3ull * GiB, 16ull * GiB) == 1ull * GiB);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 16ull * GiB) == 0);   /* no underflow */
-    TEST_ASSERT(server_discrete_margin_bytes(80ull * GiB) == 10ull * GiB);
+    /* L338 / L347 I4: a discrete card's budget is its own free memory less the margin -- a working set plus the guard's
+     * floor (the one reserve), the estimate at sizing */
+    const uint64_t Mi = 1024ull * 1024ull;
+    TEST_ASSERT(server_discrete_margin_bytes(0) == PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES);
+    TEST_ASSERT(server_discrete_margin_bytes(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) == 1536ull * Mi);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 1ull * GiB) == 9ull * GiB - 1536ull * Mi);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(1536ull * Mi, 1ull * GiB) == 0);   /* exactly the margin */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 1ull * GiB) == 0);      /* no underflow */
+    /* the RTX 6000 at startup (2026-11-02): 7.9 GiB free after the weights -> 6.4 GiB, was 5.0 at max(2, total / 8) */
+    const uint64_t free6000 = 7900ull * Mi;
+    TEST_ASSERT(server_kv_budget_discrete_bytes(free6000, PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) ==
+                free6000 - 1536ull * Mi);
+    /* the warmup's measured working set: free before the create, less free after the warmup, less the session's
+     * resident bytes; readings that show none are 0, never an underflow */
+    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) == 750ull * Mi);
+    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 3000ull * Mi, 4900ull * Mi) == 0);
+    TEST_ASSERT(server_discrete_working_set_bytes(2000ull * Mi, 3000ull * Mi, 0) == 0);
+    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) <=
+                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* the 6000's measured case starts */
+    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 1500ull * Mi, 4900ull * Mi) >
+                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* 1.5 GiB taken past the session: refused */
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
     TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));

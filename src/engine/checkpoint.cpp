@@ -12,7 +12,12 @@
  *
  * L289 / L311: the RECORDS -- a pool of exact-position states (the frontier walk at any T) every bank draws from: a
  * bank's prompt end and its last message endpoint.  The same validity rule; a record is replaced by the bank's next
- * one of its kind, else evicted least recently used when the pool is full. */
+ * one of its kind, else evicted least recently used when the pool is full.
+ *
+ * L347 I4: the slots and records live where pulsar_ckpt_host_tier puts them, decided once at alloc (kv_state.h,
+ * pulsar_ckpt_store::host).  Every copy between the state and a slot or record goes through ckpt_out / ckpt_in /
+ * ckpt_copy below, the only functions that read the placement; the device tier's arm of each is the copy the store
+ * made before I4. */
 #include "pulsar_engine_internal.h"
 #include "lib/pulsar_stall.h"
 
@@ -31,36 +36,199 @@ static uint64_t ckpt_end_bytes(const pulsar_ckpt_store *st) {
     return (front + 255u) & ~(uint64_t)255u;
 }
 
+/* ---- L347 I4: the host tier's tickets and copies ---------------------------------------------------------------
+ * The lane's ticket table: the staging buffers first, then every (bank, slot), then every record -- fixed indices, so
+ * a ticket names the bytes it guards for the store's life. */
+/** Tickets a host-tier store's lane holds. */
+#define CKPT_TICKETS (PULSAR_CKPT_STAGES + PULSAR_MSEQ_MAX * PULSAR_CKPT_SLOTS_MAX + PULSAR_CKPT_RECORDS_MAX)
+
+/// @param bank the bank
+/// @param s    the slot
+/// @return the ticket of host slot (bank, s)
+static uint32_t ckpt_ticket_slot(uint32_t bank, uint32_t s) {
+    return PULSAR_CKPT_STAGES + bank * PULSAR_CKPT_SLOTS_MAX + s;
+}
+
+/// @param st the store
+/// @param r  one of its records
+/// @return the record's ticket
+static uint32_t ckpt_ticket_rec(const pulsar_ckpt_store *st, const pulsar_ckpt_record *r) {
+    return PULSAR_CKPT_STAGES + PULSAR_MSEQ_MAX * PULSAR_CKPT_SLOTS_MAX + (uint32_t)(r - st->rec);
+}
+
+/** Where a slot's or a record's bytes are: one tier's half set, the other's NULL. */
+struct ckpt_place {
+    pulsar_gpu_tensor *slab;   ///< device tier: the tensor
+    uint64_t off;              ///< device tier: the byte offset in it
+    uint8_t *host;             ///< host tier: the pinned bytes
+    uint32_t ticket;           ///< host tier: the bytes' ticket
+    uint64_t bytes;            ///< the bytes a host-tier copy moves
+};
+
+/// @param st   the store
+/// @param bank the bank
+/// @param s    the slot
+/// @return where slot s of `bank` is
+static ckpt_place ckpt_slot_place(const pulsar_ckpt_store *st, uint32_t bank, uint32_t s) {
+    const uint64_t off = (uint64_t)s * st->slot_bytes;
+    if (st->host) return {NULL, 0, st->host_slab[bank] + off, ckpt_ticket_slot(bank, s), st->slot_bytes};
+    return {st->slab[bank], off, NULL, 0u, st->slot_bytes};
+}
+
+/// @param st the store
+/// @param r  one of its records
+/// @return where the record is
+static ckpt_place ckpt_rec_place(const pulsar_ckpt_store *st, const pulsar_ckpt_record *r) {
+    if (st->host) return {NULL, 0, r->host, ckpt_ticket_rec(st, r), r->cap};
+    return {r->slab, 0, NULL, 0u, r->cap};
+}
+
+/* Grow the host tier's staging buffers to `need` bytes (a record grew: a drafter loaded after the store).  The old
+ * buffers' last device -> host copies are waited for first; their free waits for the stream. */
+/// @param st   the store (host tier)
+/// @param need bytes a copy will move through a staging buffer
+/// @return false (said) on a failed ticket or allocation
+static bool ckpt_stage_fit(pulsar_ckpt_store *st, uint64_t need) {
+    if (st->stage_bytes >= need) return true;
+    for (uint32_t k = 0; k < PULSAR_CKPT_STAGES; k++) {
+        if (st->stage[k] && pulsar_gpu_lane_wait(st->lane, k) == 0) return false;
+        pulsar_gpu_tensor_free(st->stage[k]);
+        st->stage[k] = pulsar_gpu_tensor_alloc(need);
+        if (!st->stage[k]) {
+            fprintf(stderr, "pulsar: checkpoint staging buffer %u (%llu bytes, %s) allocation failed\n", k,
+                    (unsigned long long)need, st->ops->name);
+            st->stage_bytes = 0;
+            return false;
+        }
+    }
+    st->stage_bytes = need;
+    return true;
+}
+
+/* The installed bank's state at G -> `p` (`frontier`: the record walk).  Device tier: the walk into the slab on the
+ * session stream.  Host tier: the walk into the next staging buffer on the session stream -- once that buffer's last
+ * device -> host copy has read it, a wait queued on the stream, not the host -- then the lane copies the buffer to
+ * p.host behind whatever the session queues next, and records p's ticket and the buffer's.  The request goes on at
+ * once: whoever reads p later waits on p's ticket. */
+/// @param st       the store
+/// @param p        the destination
+/// @param frontier the record walk (false: the grid walk)
+/// @param G        the position, in tokens
+/// @return false on a failed walk or copy
+static bool ckpt_out(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, uint32_t G) {
+    if (!st->host) return st->ops->walk(st->state, 0, frontier, p.slab, p.off, G, NULL);
+    if (!ckpt_stage_fit(st, p.bytes)) return false;
+    const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
+    const uint32_t done[2] = {p.ticket, k};
+    return pulsar_gpu_lane_order(st->lane, k) != 0 &&
+           st->ops->walk(st->state, 0, frontier, st->stage[k], 0, G, NULL) &&
+           pulsar_gpu_lane_d2h(st->lane, st->stage[k], 0, p.host, p.bytes, done, 2u) != 0;
+}
+
+/* `p` -> the installed bank's state at G.  Device tier: the walk from the slab.  Host tier: the session stream waits
+ * for p's ticket (its capture) and the next staging buffer's (its last device -> host copy), copies p.host into the
+ * buffer and walks it in -- all queued, the host does not wait; *staged names the buffer, which holds p's bytes until
+ * the next copy takes it (ckpt_copy reads it). */
+/// @param st       the store
+/// @param p        the source
+/// @param frontier the record walk (false: the grid walk)
+/// @param G        the position, in tokens
+/// @param staged   receives the staging buffer used (host tier)
+/// @return false on a failed walk or copy
+static bool ckpt_in(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, uint32_t G, uint32_t *staged) {
+    if (!st->host) return st->ops->walk(st->state, 1, frontier, p.slab, p.off, G, NULL);
+    if (!ckpt_stage_fit(st, p.bytes)) return false;
+    const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
+    *staged = k;
+    return pulsar_gpu_lane_order(st->lane, k) != 0 &&
+           pulsar_gpu_lane_h2d(st->lane, st->stage[k], 0, p.host, p.bytes, p.ticket) != 0 &&
+           st->ops->walk(st->state, 1, frontier, st->stage[k], 0, G, NULL);
+}
+
+/* `src`'s bytes -> `dst`, right after a ckpt_in(src) that staged them in buffer `staged` (host tier: the lane copies
+ * the buffer out, as a capture does; device tier: a device copy on the session stream). */
+/// @param st     the store
+/// @param dst    the destination
+/// @param src    the source just walked in
+/// @param staged the staging buffer ckpt_in used (host tier)
+/// @return false on a failed copy
+static bool ckpt_copy(pulsar_ckpt_store *st, const ckpt_place &dst, const ckpt_place &src, uint32_t staged) {
+    if (!st->host) return pulsar_gpu_tensor_copy_async(dst.slab, dst.off, src.slab, src.off, src.bytes) != 0;
+    const uint32_t done[2] = {dst.ticket, staged};
+    return pulsar_gpu_lane_d2h(st->lane, st->stage[staged], 0, dst.host, src.bytes, done, 2u) != 0;
+}
+
+int pulsar_ckpt_host_tier(void) {
+    const int integrated = pulsar_gpu_integrated();
+    return integrated < 0 ? -1 : integrated == 0 ? 1 : 0;
+}
+
+uint64_t pulsar_ckpt_host_bytes(const pulsar_ckpt_store *st) {
+    if (!st->host) return 0u;
+    uint64_t bytes = 0;
+    for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++)
+        if (st->host_slab[b]) bytes += (uint64_t)st->ops->ckpt_slots * st->slot_bytes;
+    for (uint32_t i = 0; i < st->n_rec; i++)
+        if (st->rec[i].host) bytes += st->rec[i].cap;
+    return bytes;
+}
+
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks) {
+    const int tier = pulsar_ckpt_host_tier();
+    if (tier < 0) {
+        fprintf(stderr, "pulsar: grid checkpoints (%s): the device did not say whether its memory is the host's -- "
+                        "refusing to place them\n", ops->name);
+        return false;
+    }
+    return pulsar_ckpt_alloc_tier(st, ops, state, n_banks, tier == 1);
+}
+
+bool pulsar_ckpt_alloc_tier(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks,
+                            bool host) {
     if (n_banks < 1u) n_banks = 1u;
     if (n_banks > PULSAR_MSEQ_MAX || ops->ckpt_slots < 1u || ops->ckpt_slots > PULSAR_CKPT_SLOTS_MAX ||
         ops->resume_grid == 0u) return false;
     st->ops = ops;
     st->state = state;
+    st->host = host;
     uint64_t slot = 0;
     (void)ops->walk(state, -1, false, NULL, 0, ops->min_checkpoint(state), &slot);
     /* The batched copies want 256-B aligned starts; keep every slot on one. */
     st->slot_bytes = (slot + 255u) & ~(uint64_t)255u;
     memset(st->pos, 0, sizeof(st->pos));
+    const uint64_t end = ckpt_end_bytes(st);
+    /* A dry run (the session's price) prices the device memory alone: the host tier's staging buffers, not its pinned
+     * slabs, records or lane, which take no VRAM -- so a discrete card's per-bank price carries no checkpoint. */
+    const bool dry = pulsar_gpu_tensor_dry_active() != 0;
+    if (st->host) {
+        if (!ckpt_stage_fit(st, end > st->slot_bytes ? end : st->slot_bytes)) return false;
+        if (!dry && !(st->lane = pulsar_gpu_lane_create(CKPT_TICKETS))) {
+            fprintf(stderr, "pulsar: grid checkpoints (%s): the copy lane could not be created\n", ops->name);
+            return false;
+        }
+    }
+    const uint64_t slab_bytes = (uint64_t)ops->ckpt_slots * st->slot_bytes;
     for (uint32_t b = 0; b < n_banks; b++) {
-        st->slab[b] = pulsar_gpu_tensor_alloc((uint64_t)ops->ckpt_slots * st->slot_bytes);
-        if (!st->slab[b]) {
-            fprintf(stderr, "pulsar: grid checkpoint slab for bank %u (%u x %llu bytes, %s) allocation failed\n",
-                    b, ops->ckpt_slots, (unsigned long long)st->slot_bytes, ops->name);
+        const bool ok = st->host ? dry || (st->host_slab[b] = (uint8_t *)pulsar_gpu_host_alloc(slab_bytes)) != NULL
+                                 : (st->slab[b] = pulsar_gpu_tensor_alloc(slab_bytes)) != NULL;
+        if (!ok) {
+            fprintf(stderr, "pulsar: grid checkpoint slab for bank %u (%u x %llu bytes, %s, %s) allocation failed\n",
+                    b, ops->ckpt_slots, (unsigned long long)st->slot_bytes, ops->name,
+                    st->host ? "pinned host RAM" : "device");
             return false;
         }
     }
     /* L289 / L311: the record pool, allocated with the ladder so a session's dry run prices it */
-    const uint64_t end = ckpt_end_bytes(st);
     st->n_rec = pulsar_ckpt_records_for(n_banks);
     st->rec_clock = 0;
     for (uint32_t i = 0; i < st->n_rec; i++) {
         pulsar_ckpt_record *r = &st->rec[i];
         r->T = 0u;
-        r->slab = pulsar_gpu_tensor_alloc(end);
-        if (!r->slab) {
-            fprintf(stderr, "pulsar: record %u of %u (%llu bytes, %s) allocation failed\n", i, st->n_rec,
-                    (unsigned long long)end, ops->name);
+        const bool ok = st->host ? dry || (r->host = (uint8_t *)pulsar_gpu_host_alloc(end)) != NULL
+                                 : (r->slab = pulsar_gpu_tensor_alloc(end)) != NULL;
+        if (!ok) {
+            fprintf(stderr, "pulsar: record %u of %u (%llu bytes, %s, %s) allocation failed\n", i, st->n_rec,
+                    (unsigned long long)end, ops->name, st->host ? "pinned host RAM" : "device");
             return false;
         }
         r->cap = end;
@@ -69,13 +237,26 @@ bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, vo
 }
 
 void pulsar_ckpt_release(pulsar_ckpt_store *st) {
+    /* the host tier: every copy still touching a pinned byte or a staging buffer lands before anything is freed */
+    if (st->lane)
+        for (uint32_t t = 0; t < CKPT_TICKETS; t++) (void)pulsar_gpu_lane_wait(st->lane, t);
+    pulsar_gpu_lane_destroy(st->lane);
+    st->lane = NULL;
+    for (uint32_t k = 0; k < PULSAR_CKPT_STAGES; k++) {
+        pulsar_gpu_tensor_free(st->stage[k]);
+        st->stage[k] = NULL;
+    }
+    st->stage_bytes = 0;
     for (uint32_t b = 0; b < PULSAR_MSEQ_MAX; b++) {
         pulsar_gpu_tensor_free(st->slab[b]);
         st->slab[b] = NULL;
+        pulsar_gpu_host_free(st->host_slab[b]);
+        st->host_slab[b] = NULL;
     }
     for (uint32_t i = 0; i < PULSAR_CKPT_RECORDS_MAX; i++) {
         pulsar_ckpt_record *r = &st->rec[i];
         pulsar_gpu_tensor_free(r->slab);
+        pulsar_gpu_host_free(r->host);
         free(r->logits);
         free(r->tokens);
         memset(r, 0, sizeof(*r));
@@ -125,8 +306,21 @@ static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint3
  *  @param G    the grid point, in tokens
  *  @return true when it can */
 static bool ckpt_grid_ok(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
-    return bank < PULSAR_MSEQ_MAX && st->slab[bank] && G % st->ops->resume_grid == 0u &&
+    return bank < PULSAR_MSEQ_MAX && (st->host ? st->host_slab[bank] != NULL : st->slab[bank] != NULL) &&
+           G % st->ops->resume_grid == 0u &&
            G >= st->ops->min_checkpoint(st->state);
+}
+
+/* The slot of `bank` holding G; PULSAR_CKPT_SLOTS_MAX when none. */
+/// @param st   the store
+/// @param bank the bank
+/// @param G    the grid point, in tokens
+/// @return the slot index, or PULSAR_CKPT_SLOTS_MAX
+static uint32_t ckpt_find(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
+    if (bank >= PULSAR_MSEQ_MAX || G == 0u || !st->ops) return PULSAR_CKPT_SLOTS_MAX;
+    for (uint32_t k = 0; k < st->ops->ckpt_slots; k++)
+        if (st->pos[bank][k] == G) return k;
+    return PULSAR_CKPT_SLOTS_MAX;
 }
 
 /* Capture the installed `bank`'s state at grid point G (pulsar_ckpt_landed's).  False (said) on a violated
@@ -151,7 +345,7 @@ static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     const uint32_t s = ckpt_pick_slot(st, bank, G);
     pulsar_stall_mark("grid checkpoint capture");
     st->pos[bank][s] = 0u;   /* not a checkpoint until the copy is issued whole */
-    if (!st->ops->walk(st->state, 0, false, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
+    if (!ckpt_out(st, ckpt_slot_place(st, bank, s), false, G)) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u: copy failed\n", G, bank);
         return false;
     }
@@ -180,12 +374,10 @@ static void ckpt_records_drop_above(pulsar_ckpt_store *st, uint32_t bank, uint32
 }
 
 bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
-    if (bank >= PULSAR_MSEQ_MAX || G == 0u) return false;
-    uint32_t s = PULSAR_CKPT_SLOTS_MAX;
-    for (uint32_t k = 0; k < st->ops->ckpt_slots; k++) if (st->pos[bank][k] == G) s = k;
+    const uint32_t s = ckpt_find(st, bank, G);
     if (s == PULSAR_CKPT_SLOTS_MAX) return false;
-    if (!st->ops->prepare_restore(st->state, G) ||
-        !st->ops->walk(st->state, 1, false, st->slab[bank], (uint64_t)s * st->slot_bytes, G, NULL)) {
+    uint32_t staged = 0;
+    if (!st->ops->prepare_restore(st->state, G) || !ckpt_in(st, ckpt_slot_place(st, bank, s), false, G, &staged)) {
         fprintf(stderr, "pulsar: grid checkpoint restore to %u on bank %u: copy failed\n", G, bank);
         return false;
     }
@@ -228,10 +420,19 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckp
     r->T = 0u;   /* not a record until the copy is issued whole (an evicted LRU record is gone from here) */
     const uint64_t need = ckpt_end_bytes(st);
     if (r->cap < need) {   /* a drafter loaded after the store adds its rings to the frontier */
-        pulsar_gpu_tensor_free(r->slab);
-        r->slab = pulsar_gpu_tensor_alloc(need);
-        r->cap = r->slab ? need : 0u;
-        if (!r->slab) {
+        bool ok = true;
+        if (st->host) {   /* its last copy lands before its bytes go */
+            ok = pulsar_gpu_lane_wait(st->lane, ckpt_ticket_rec(st, r)) != 0;
+            pulsar_gpu_host_free(r->host);
+            r->host = ok ? (uint8_t *)pulsar_gpu_host_alloc(need) : NULL;
+            ok = r->host != NULL;
+        } else {
+            pulsar_gpu_tensor_free(r->slab);
+            r->slab = pulsar_gpu_tensor_alloc(need);
+            ok = r->slab != NULL;
+        }
+        r->cap = ok ? need : 0u;
+        if (!ok) {
             fprintf(stderr, "pulsar: record for bank %u (%llu bytes) allocation failed\n", bank,
                     (unsigned long long)need);
             return false;
@@ -256,7 +457,7 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckp
         r->tokens = (int32_t *)xmalloc((size_t)T * sizeof(int32_t));
         r->tokens_cap = T;
     }
-    if (!st->ops->walk(st->state, 0, true, r->slab, 0, T, NULL)) {
+    if (!ckpt_out(st, ckpt_rec_place(st, r), true, T)) {
         fprintf(stderr, "pulsar: record at %u on bank %u: copy failed\n", T, bank);
         return false;
     }
@@ -309,7 +510,8 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
     pulsar_ckpt_record *w = &st->rec[r - st->rec];
     /* the counters at T, prefilled to T (Qwen: the MTP layer's pending row at T - 1, its stage clean); the walk
      * brings every lane back */
-    if (!st->ops->install_frontier(st->state, T, T) || !st->ops->walk(st->state, 1, true, w->slab, 0, T, NULL)) {
+    uint32_t staged = 0;
+    if (!st->ops->install_frontier(st->state, T, T) || !ckpt_in(st, ckpt_rec_place(st, w), true, T, &staged)) {
         fprintf(stderr, "pulsar: record restore to %u on bank %u: copy failed\n", T, bank);
         w->T = 0u;
         return false;
@@ -329,15 +531,16 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
 
 bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r) {
     const char *why = NULL;
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t off = 0;
+    ckpt_place from = {};
     if (dst >= PULSAR_MSEQ_MAX || src >= PULSAR_MSEQ_MAX || dst == src || T == 0u || !st->ops->bank_pools)
         why = "not two banks of the pool";
     else if (r) {
         if (r < st->rec || r >= st->rec + st->n_rec || r->bank != src || r->T != T) why = "the record is not the source's at T";
-        else slab = r->slab;
-    } else if (!pulsar_ckpt_locate(st, src, T, &slab, &off)) {
-        why = "the source holds no grid checkpoint at T";
+        else from = ckpt_rec_place(st, r);
+    } else {
+        const uint32_t s = ckpt_find(st, src, T);
+        if (s == PULSAR_CKPT_SLOTS_MAX) why = "the source holds no grid checkpoint at T";
+        else from = ckpt_slot_place(st, src, s);
     }
     static pulsar_kv_pool sp[CKPT_ADOPT_POOLS], dp[CKPT_ADOPT_POOLS];   /* worker thread only, as every store op */
     uint32_t n = 0;
@@ -367,7 +570,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
         ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;
     }
-    ok = ok && st->ops->walk(st->state, 1, r != NULL, slab, off, T, NULL);
+    uint32_t staged = 0;
+    ok = ok && ckpt_in(st, from, r != NULL, T, &staged);
     if (!ok) {
         fprintf(stderr, "pulsar: adopting bank %u's state at %u into bank %u: copy failed\n", src, T, dst);
         return false;
@@ -375,12 +579,12 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
     st->ops->restored(st->state);
     /* and dst keeps the checkpoint it now stands at, so its own next resume finds it */
     if (!r) {
-        pulsar_gpu_tensor *ds = NULL;
-        uint64_t doff = 0;
-        uint32_t slot = 0;
-        if (pulsar_ckpt_claim(st, dst, T, &ds, &doff, &slot) &&
-            pulsar_gpu_tensor_copy_async(ds, doff, slab, off, st->slot_bytes) != 0)
-            pulsar_ckpt_commit(st, dst, slot, T);
+        /* a slot the device writes: no host wait for it (its earlier copies are ordered on the lane) */
+        if (ckpt_grid_ok(st, dst, T)) {
+            const uint32_t slot = ckpt_pick_slot(st, dst, T);
+            st->pos[dst][slot] = 0u;
+            if (ckpt_copy(st, ckpt_slot_place(st, dst, slot), from, staged)) pulsar_ckpt_commit(st, dst, slot, T);
+        }
     } else {
         /* L326: lending the record is a use of it -- stamped before dst's copy picks its slot, so neither that copy
          * nor the next capture evicts the record a bank was just served from (it was the LRU victim first) */
@@ -402,7 +606,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
                 w->tokens_cap = T;
             }
             memcpy(w->tokens, r->tokens, (size_t)T * sizeof(int32_t));
-            if (pulsar_gpu_tensor_copy_async(w->slab, 0, r->slab, 0, r->cap) != 0) {
+            if (ckpt_copy(st, ckpt_rec_place(st, w), from, staged)) {
                 w->bank = dst;
                 w->kind = r->kind;
                 w->used = ++st->rec_clock;
@@ -436,26 +640,53 @@ void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, uint32_t bank) {
     ckpt_records_drop_above(st, bank, 0u);
 }
 
-bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off) {
-    if (bank >= PULSAR_MSEQ_MAX || G == 0u) return false;
-    for (uint32_t k = 0; k < st->ops->ckpt_slots; k++) {
-        if (st->pos[bank][k] != G) continue;
-        *slab = st->slab[bank];
-        *off = (uint64_t)k * st->slot_bytes;
-        return true;
+/* A slot handed to the host (a reader or a writer): its place, after a host wait on its ticket on the host tier. */
+/// @param st   the store
+/// @param bank the bank
+/// @param s    the slot
+/// @param at   receives where its bytes are
+/// @return false (said) when its ticket failed
+static bool ckpt_hand_to_host(pulsar_ckpt_store *st, uint32_t bank, uint32_t s, pulsar_ckpt_slot_at *at) {
+    const ckpt_place p = ckpt_slot_place(st, bank, s);
+    if (st->host && pulsar_gpu_lane_wait(st->lane, p.ticket) == 0) {
+        fprintf(stderr, "pulsar: grid checkpoint slot %u of bank %u: its last copy failed\n", s, bank);
+        return false;
     }
-    return false;
+    *at = {p.slab, p.off, p.host, s};
+    return true;
 }
 
-bool pulsar_ckpt_claim(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_gpu_tensor **slab, uint64_t *off,
-                       uint32_t *slot) {
+bool pulsar_ckpt_holds(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
+    return ckpt_find(st, bank, G) != PULSAR_CKPT_SLOTS_MAX;
+}
+
+bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_ckpt_slot_at *at) {
+    const uint32_t s = ckpt_find(st, bank, G);
+    return s != PULSAR_CKPT_SLOTS_MAX && ckpt_hand_to_host(st, bank, s, at);
+}
+
+bool pulsar_ckpt_claim(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_ckpt_slot_at *at) {
     if (!ckpt_grid_ok(st, bank, G)) return false;
     const uint32_t k = ckpt_pick_slot(st, bank, G);
     st->pos[bank][k] = 0u;   /* filled by the caller, committed after */
-    *slab = st->slab[bank];
-    *off = (uint64_t)k * st->slot_bytes;
-    *slot = k;
-    return true;
+    return ckpt_hand_to_host(st, bank, k, at);
+}
+
+bool pulsar_ckpt_slot_get(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, void *dst) {
+    if (st->host) {
+        memcpy(dst, at->host, st->slot_bytes);
+        return true;
+    }
+    const pulsar_gpu_copy_span span = {at->slab, at->off, dst, st->slot_bytes};
+    return pulsar_gpu_copy_out(&span, 1u) != 0;
+}
+
+bool pulsar_ckpt_slot_put(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, const void *src) {
+    if (st->host) {
+        memcpy(at->host, src, st->slot_bytes);
+        return true;
+    }
+    return pulsar_gpu_tensor_write(at->slab, at->off, src, st->slot_bytes) != 0;
 }
 
 void pulsar_ckpt_commit(pulsar_ckpt_store *st, uint32_t bank, uint32_t slot, uint32_t G) {

@@ -4571,6 +4571,161 @@ static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint
     return 1u;
 }
 
+/* L347 I4: the checkpoint store's two tiers on a fake kv-state whose state is ONE device tensor (the walk copies it
+ * whole, both directions; captures every grid point), on a grid of 128. */
+struct ckpt_tier_state {
+    pulsar_gpu_tensor *t;   ///< the "state": what a walk copies
+    uint64_t n;             ///< its bytes
+};
+static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, uint32_t, uint64_t *bytes) {
+    const ckpt_tier_state *ts = (const ckpt_tier_state *)state;
+    if (dir < 0) {
+        *bytes = ts->n;
+        return true;
+    }
+    return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, off, ts->t, 0, ts->n)
+                     : pulsar_gpu_tensor_copy_async(ts->t, 0, slab, off, ts->n)) != 0;
+}
+static uint32_t tier_min_ckpt(void *) { return 128u; }
+static bool tier_noted(void *, uint32_t, bool *capture, char *, size_t) {
+    *capture = true;
+    return true;
+}
+/// @param ts the fake state
+/// @param v  the byte every state byte becomes (queued on this thread's stream, as a step's writes are)
+static void tier_fill(ckpt_tier_state *ts, std::vector<uint8_t> &host, uint8_t v) {
+    for (uint64_t i = 0; i < ts->n; i++) host[i] = (uint8_t)(v + i * 7u);
+    TEST_ASSERT(pulsar_gpu_tensor_write_async(ts->t, 0, host.data(), ts->n) == 1);
+}
+/// @return true when every byte of `got` is the fill of `v`
+static bool tier_is(const uint8_t *got, uint64_t n, uint8_t v) {
+    for (uint64_t i = 0; i < n; i++)
+        if (got[i] != (uint8_t)(v + i * 7u)) return false;
+    return true;
+}
+
+/* (1) pricing: under a dry run (the session's price) the device tier prices its slabs and records, the host tier only
+ * its PULSAR_CKPT_STAGES staging buffers -- a discrete card's per-bank price carries no checkpoint.  (2) THE placement:
+ * a discrete card's store is host-tier, an integrated one's (GB10) device-tier with no lane and no pinned byte.
+ * (3) each tier's round trip on this device: captures land (the reader waits for its slot's copy alone), a restore
+ * puts the state back, a slot captured again while its previous copy may be in flight holds the newer bytes, a claim
+ * waits before the host writes, a record captures and restores.  (3) skips, said, without a device. */
+static void test_ckpt_host_tier(void) {
+    static pulsar_kv_state_ops ops = {};
+    ops.name = "tier-fake";
+    ops.resume_grid = 128u;
+    ops.split_invariant = true;
+    ops.ckpt_slots = 2u;
+    ops.walk = tier_walk;
+    ops.min_checkpoint = tier_min_ckpt;
+    ops.stands_at = fake_true_why;
+    ops.holds = fake_true_at;
+    ops.prepare_restore = fake_true_at;
+    ops.restored = fake_restored;
+    ops.frontier_at = fake_true_why;
+    ops.install_frontier = fake_install;
+    ops.noted_at = tier_noted;
+    const uint64_t S = 1u << 20;   /* a slot and a record: the walk's bytes, already 256-aligned */
+    ckpt_tier_state dry_state = {NULL, S};
+    /* (1) */
+    uint64_t price[2][2] = {{0, 0}, {0, 0}};   /* [host][banks - 1] */
+    for (int host = 0; host < 2; host++)
+        for (uint32_t nb = 1; nb <= 2u; nb++) {
+            pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
+            pulsar_gpu_tensor_dry_begin();
+            TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &dry_state, nb, host != 0));
+            pulsar_gpu_tensor_dry_end(&price[host][nb - 1u], NULL);
+            TEST_ASSERT(st->lane == NULL && pulsar_ckpt_host_bytes(st) == 0u);   /* a price pins nothing */
+            pulsar_ckpt_release(st);
+            free(st);
+        }
+    TEST_ASSERT(price[0][0] == (2u * 1u + pulsar_ckpt_records_for(1)) * S);
+    TEST_ASSERT(price[0][1] == (2u * 2u + pulsar_ckpt_records_for(2)) * S);
+    TEST_ASSERT(price[1][0] == PULSAR_CKPT_STAGES * S && price[1][1] == PULSAR_CKPT_STAGES * S);   /* marginal 0 */
+    printf("  L347 I4 price: device tier %llu / %llu B (1 / 2 banks), host tier %llu / %llu B\n",
+           (unsigned long long)price[0][0], (unsigned long long)price[0][1], (unsigned long long)price[1][0],
+           (unsigned long long)price[1][1]);
+    /* (2) + (3) */
+    ckpt_tier_state ts = {pulsar_gpu_tensor_alloc(32u << 20), 32u << 20};
+    if (!ts.t || pulsar_ckpt_host_tier() < 0) {
+        printf("  [skip] L347 I4 tiers on a device: no device here\n");
+        pulsar_gpu_tensor_free(ts.t);
+        return;
+    }
+    const int integrated = pulsar_gpu_integrated();
+    TEST_ASSERT(pulsar_ckpt_host_tier() == (integrated == 0 ? 1 : 0));
+    {
+        pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
+        TEST_ASSERT(pulsar_ckpt_alloc(st, &ops, &ts, 2u));
+        if (integrated) {   /* GB10: the device tier, exactly as before I4 */
+            TEST_ASSERT(!st->host && st->lane == NULL && st->slab[0] && st->slab[1] && !st->host_slab[0] &&
+                        !st->stage[0] && st->rec[0].slab && !st->rec[0].host && pulsar_ckpt_host_bytes(st) == 0u);
+        } else {
+            TEST_ASSERT(st->host && st->lane && !st->slab[0] && st->host_slab[0] && st->host_slab[1] && st->stage[0] &&
+                        st->rec[0].host && !st->rec[0].slab &&
+                        pulsar_ckpt_host_bytes(st) == (2u * 2u + pulsar_ckpt_records_for(2)) * st->slot_bytes);
+        }
+        printf("  L347 I4 placement: %s GPU -> %s tier\n", integrated ? "integrated" : "discrete",
+               st->host ? "host" : "device");
+        pulsar_ckpt_release(st);
+        free(st);
+    }
+    const uint64_t n = ts.n;
+    std::vector<uint8_t> fill(n), got(n);
+    for (int host = 0; host < 2; host++) {
+        pulsar_ckpt_store *st = (pulsar_ckpt_store *)calloc(1, sizeof(pulsar_ckpt_store));
+        TEST_ASSERT(pulsar_ckpt_alloc_tier(st, &ops, &ts, 1u, host != 0) && st->slot_bytes == n);
+        pulsar_ckpt_slot_at at;
+        /* two captures, the second queued while the first's copy may still run */
+        tier_fill(&ts, fill, 1);
+        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 256));
+        int in_flight = st->host ? pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + 0u) : 0;
+        tier_fill(&ts, fill, 2);
+        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 384));
+        /* a host reader gets the bytes its capture copied, after waiting for that slot alone */
+        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 256, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+                    tier_is(got.data(), n, 1));
+        TEST_ASSERT(!st->host || pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + at.slot) == 0);
+        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 384, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+                    tier_is(got.data(), n, 2));
+        /* a restore puts the state back (and drops what is above) */
+        tier_fill(&ts, fill, 3);
+        TEST_ASSERT(pulsar_ckpt_restore(st, 0, 256) && !pulsar_ckpt_holds(st, 0, 384));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 1));
+        /* the same slot captured twice back to back: the newer bytes win (the reuse waits for the older copy) */
+        tier_fill(&ts, fill, 4);
+        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 512));
+        tier_fill(&ts, fill, 5);
+        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 512));
+        TEST_ASSERT(pulsar_ckpt_locate(st, 0, 512, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+                    tier_is(got.data(), n, 5));
+        /* a claim over a slot just captured waits for that copy, then the host writes it and a restore reads it */
+        tier_fill(&ts, fill, 6);
+        TEST_ASSERT(pulsar_ckpt_landed(st, 0, 640));
+        TEST_ASSERT(pulsar_ckpt_claim(st, 0, 768, &at));
+        for (uint64_t i = 0; i < n; i++) fill[i] = (uint8_t)(7u + i * 7u);
+        TEST_ASSERT(pulsar_ckpt_slot_put(st, &at, fill.data()));
+        pulsar_ckpt_commit(st, 0, at.slot, 768);
+        tier_fill(&ts, fill, 8);
+        TEST_ASSERT(pulsar_ckpt_restore(st, 0, 768));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 7));
+        /* a record: captured, the state overwritten, restored */
+        int toks[800];
+        for (int i = 0; i < 800; i++) toks[i] = i;
+        tier_fill(&ts, fill, 9);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 777, toks, NULL, 0));
+        tier_fill(&ts, fill, 10);
+        const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
+        TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0));
+        TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 9));
+        printf("  L347 I4 %s tier round trip OK (first capture %s when the next was queued)\n",
+               host ? "host" : "device", in_flight == 1 ? "still in flight" : "already landed");
+        pulsar_ckpt_release(st);
+        free(st);
+    }
+    pulsar_gpu_tensor_free(ts.t);
+}
+
 /* L329 (b2): the next-chunk read-ahead.  (1) THE rule (pulsar_read_ahead_plan): one chunk past the rows in flight,
  * nothing queued twice for the same tokens, nothing under half a chunk short of the end, a changed prompt drops the
  * old rows.  (2) The pool's background class on a synthetic row file: the bytes a gather returns are the file's, the
@@ -5123,6 +5278,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
+    {"--ckpt-host-tier", "ckpt-host-tier", "the checkpoint store's tiers: a dry price carries no host-tier checkpoint, a discrete card places them in pinned RAM and GB10 does not, each tier's capture / reader / reuse / claim / record round trip on this device (L347 I4)", test_ckpt_host_tier},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},
     {"--lib-image-identity", "lib-image-identity", "the core image identity: records per block, rewind keeps survivors, a chain persists past a block only with its record (L281)", test_lib_image_identity},

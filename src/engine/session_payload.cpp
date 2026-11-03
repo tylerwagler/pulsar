@@ -471,9 +471,7 @@ uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *st
 
 uint64_t pulsar_session::restore_point_bytes(uint32_t G) {
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t off = 0;
-    if (G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, pulsar_session_live_bank(this), G, &slab, &off))
+    if (G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_holds(st, pulsar_session_live_bank(this), G))
         return 0;
     return restore_point_bytes_for(st);
 }
@@ -532,9 +530,8 @@ struct mem_in {
 int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
     const uint32_t bank = pulsar_session_live_bank(this);
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    if (!dst || G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, bank, G, &slab, &slot_off)) {
+    pulsar_ckpt_slot_at at;
+    if (!dst || G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, bank, G, &at)) {
         payload_set_err(err, errlen, "copy-out restore point: the installed bank holds no checkpoint there");
         return 1;
     }
@@ -549,16 +546,18 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
         (uint32_t)layout, (uint32_t)(layout >> 32), (uint32_t)st->slot_bytes, st->ops->resume_grid, G, 0u,
     };
     for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++) o.u32(header[i]);
-    const pulsar_gpu_copy_span span = { slab, slot_off, o.take(st->slot_bytes), st->slot_bytes };
+    uint8_t *slot_dst = o.take(st->slot_bytes);
     uint8_t *dg = o.take(PULSAR_KVDIGEST_BYTES);
     if (!o.ok || o.at != bytes) {
         payload_set_err(err, errlen, "copy-out restore point: its layout overran the buffer");
         return 1;
     }
     memset(dg, 0, PULSAR_KVDIGEST_BYTES);   /* the writer's to seal */
+    /* L347 I4: on a discrete card the slot already IS host memory (its capture landed: pulsar_ckpt_locate waited for
+     * that one copy), so this is a memcpy; on GB10 the device copy-out */
     pulsar_stall_mark("restore point copy-out: state slot to host");
-    if (pulsar_gpu_copy_out(&span, 1) == 0) {
-        payload_set_err(err, errlen, "copy-out restore point: the device copy failed");
+    if (!pulsar_ckpt_slot_get(st, &at, slot_dst)) {
+        payload_set_err(err, errlen, "copy-out restore point: the slot copy failed");
         return 1;
     }
     return 0;
@@ -814,10 +813,8 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     /* L347 I3b: a failure here is the device's or the bank's (transient); the two layout checks below are the bytes'
      * (segment_parse already sized them, so they hold unless the pools disagree with the size rule) */
     auto fail = [&](pulsar_segment_status why) { segment_clear(s, st, bank); return why; };
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    uint32_t slot = 0;
-    if (last && !pulsar_ckpt_claim(st, bank, G, &slab, &slot_off, &slot)) {
+    pulsar_ckpt_slot_at at = {};
+    if (last && !pulsar_ckpt_claim(st, bank, G, &at)) {
         payload_set_err(err, errlen, "load segment: no grid-checkpoint slot");
         return fail(PULSAR_SEGMENT_TRANSIENT);
     }
@@ -851,7 +848,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
             payload_set_err(err, errlen, "load segment: the restore point's slot does not end at its digest");
             return fail(PULSAR_SEGMENT_BAD_RP);
         }
-        if (pulsar_gpu_tensor_write(slab, slot_off, slot_src, st->slot_bytes) == 0) {
+        if (!pulsar_ckpt_slot_put(st, &at, slot_src)) {
             payload_set_err(err, errlen, "load segment: restoring the restore point's slot failed");
             return fail(PULSAR_SEGMENT_TRANSIENT);
         }
@@ -862,7 +859,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     for (uint32_t p = 0; p < G - G_prev; p++) token_vec_push(&s->checkpoint, (int)payload_get_u32(v.toks + 4u * p));
     for (uint32_t i = 0; i < v.n_img; i++) s->live_images.b[s->live_images.n++] = v.imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, G);
-    if (last) pulsar_ckpt_commit(st, bank, slot, G);
+    if (last) pulsar_ckpt_commit(st, bank, at.slot, G);
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
@@ -1074,9 +1071,8 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     kvp_plan p;
     if (!kvp_plan_save(s, &p, err, errlen)) return 1;
     pulsar_ckpt_store *st = p.st;
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    if (p.G && !pulsar_ckpt_locate(st, p.bank, p.G, &slab, &slot_off)) {
+    pulsar_ckpt_slot_at at = {};
+    if (p.G && !pulsar_ckpt_locate(st, p.bank, p.G, &at)) {
         payload_set_err(err, errlen, "session payload: the resume checkpoint vanished while saving");
         return 1;
     }
@@ -1114,8 +1110,10 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     }
     if (rc == 0) rc = payload_write_bytes(&io, live, (uint64_t)p.width * sizeof(float), err, errlen);
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
-    if (rc == 0 && p.G)
-        rc = payload_write_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0 && p.G)   /* L347 I4: a host-tier slot is written from its pinned bytes */
+        rc = at.host ? payload_write_bytes(&io, at.host, st->slot_bytes, err, errlen)
+                     : payload_write_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, err,
+                                                 errlen);
     if (rc == 0) rc = payload_write_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, p.pools, p.n_pools, 0u, p.T, true, buf, NULL, err, errlen);
     pulsar_gpu_tensor_free(front);
@@ -1218,10 +1216,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     segment_clear(s, st, bank);
     pulsar_gpu_tensor *front = NULL;
     auto fail = [&]() { pulsar_gpu_tensor_free(front); segment_clear(s, st, bank); return drop(); };
-    pulsar_gpu_tensor *slab = NULL;
-    uint64_t slot_off = 0;
-    uint32_t slot = PULSAR_CKPT_SLOTS_MAX;
-    if (G && !pulsar_ckpt_claim(st, bank, G, &slab, &slot_off, &slot)) {
+    pulsar_ckpt_slot_at at = {};
+    if (G && !pulsar_ckpt_claim(st, bank, G, &at)) {
         payload_set_err(err, errlen, "session payload: no grid-checkpoint slot");
         return fail();
     }
@@ -1233,8 +1229,10 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     uint8_t *buf = s->io_buf;   /* pinned once at create (pulsar_session::io_buf) */
     int rc = 0;
-    if (G) rc = payload_read_tensor_span(&io, slab, slot_off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK, &remaining,
-                                         err, errlen);
+    if (G)   /* L347 I4: a host-tier slot is read into its pinned bytes */
+        rc = at.host ? payload_read_bytes(&io, at.host, st->slot_bytes, &remaining, err, errlen)
+                     : payload_read_tensor_span(&io, at.slab, at.off, st->slot_bytes, buf, PULSAR_SESSION_IO_CHUNK,
+                                                &remaining, err, errlen);
     if (rc == 0) rc = payload_read_tensor_span(&io, front, 0, fb, buf, PULSAR_SESSION_IO_CHUNK,
                                                &remaining, err, errlen);
     if (rc == 0) rc = pools_span_io(&io, pools, n, 0u, T, false, buf, &remaining, err, errlen);
@@ -1253,7 +1251,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     st->ops->restored(st->state);
     pulsar_gpu_tensor_free(front);
-    if (G) pulsar_ckpt_commit(st, bank, slot, G);
+    if (G) pulsar_ckpt_commit(st, bank, at.slot, G);
     token_vec_free(&s->checkpoint);
     s->checkpoint = toks;
     s->live_images = imgs;

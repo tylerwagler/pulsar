@@ -42,6 +42,10 @@
 
 /** The most checkpoint slots any model keeps per bank (the store's array bound). */
 #define PULSAR_CKPT_SLOTS_MAX 16u
+/** L347 I4: the device staging buffers a HOST-TIER store (pinned host slabs, a discrete card) cycles through -- the
+ *  most captures one prompt makes back to back (its last grid cut, its message endpoint, its prompt end), so none of
+ *  them waits for an earlier one's device -> host copy to free its staging buffer. */
+#define PULSAR_CKPT_STAGES 3u
 /** The most append-only row pools any model has (DeepSeek V4: <= 2 per layer). */
 #define PULSAR_KV_POOLS_MAX 128u
 
@@ -140,8 +144,9 @@ typedef struct pulsar_ckpt_record {
     /// what the record is: a prompt end or a message endpoint
     pulsar_ckpt_record_kind kind;
     uint64_t used;                     ///< the pool's clock at its capture or last restore (the eviction order)
-    struct pulsar_gpu_tensor *slab;    ///< the frontier walk's bytes
-    uint64_t cap;                      ///< slab's bytes (it grows when a drafter loads after the store)
+    struct pulsar_gpu_tensor *slab;    ///< the frontier walk's bytes (device tier; NULL on the host tier)
+    uint8_t *host;                     ///< L347 I4: the frontier walk's bytes, pinned (host tier; NULL on the device tier)
+    uint64_t cap;                      ///< the record's bytes (it grows when a drafter loads after the store)
     float *logits;                     ///< host, end_width floats: a prompt end's next-token row (NULL otherwise)
     /** host: the T token ids the record's state is the prefill of -- the match authority at a resume (a history
      *  rewound inside T's last compressor group and re-prefilled with other ids keeps the record's rows, not its
@@ -167,8 +172,25 @@ typedef struct pulsar_ckpt_store {
      *  NULL = no adapter.  An adapter bank's segments and payloads mix it into their layout digest, so a segment one
      *  bank wrote with the adapter is refused by a plain bank and the reverse (its K / V are another model's). */
     const uint8_t *bank_adapter;
-    /// per bank: ckpt_slots slots, slot s at s * slot_bytes (NULL = bank not allocated); owned
+    /// per bank: ckpt_slots slots, slot s at s * slot_bytes (NULL = bank not allocated, or the host tier); owned
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
+    /** L347 I4: the slabs' and records' PLACEMENT, decided once by pulsar_ckpt_alloc (pulsar_ckpt_host_tier): false =
+     *  device memory (GB10, where it is the host's anyway: slab[] and rec[].slab, every copy a device copy on the
+     *  session stream); true = pinned host RAM (a discrete card: host_slab[] and rec[].host).  On the host tier a
+     *  capture walks the state into a device STAGING buffer on the session stream (what today's device capture costs)
+     *  and the lane copies it device -> host behind the compute that follows; a restore copies host -> staging on the
+     *  session stream and walks it in.  Every host slot and record carries a TICKET on the lane, recorded after the
+     *  last copy that touched it: a reader or a host writer waits on that ticket alone (pulsar_ckpt_locate /
+     *  pulsar_ckpt_claim on the host, a restore on the stream), never on a capture it does not read. */
+    bool host;
+    /// host tier: per bank, ckpt_slots slots of slot_bytes, pinned (NULL = bank not allocated); owned
+    uint8_t *host_slab[PULSAR_MSEQ_MAX];
+    /// host tier: the staging buffers a capture / restore cycles through (device memory, priced with the session)
+    struct pulsar_gpu_tensor *stage[PULSAR_CKPT_STAGES];
+    uint64_t stage_bytes;                   ///< host tier: each staging buffer's bytes (>= slot_bytes, >= a record)
+    uint32_t stage_next;                    ///< host tier: the staging buffer the next copy takes (round robin)
+    /// host tier: the copy lane (pulsar_gpu.h); tickets per pulsar_ckpt_ticket_*.  NULL on the device tier
+    struct pulsar_gpu_lane *lane;
     /// bytes of one checkpoint slot (the grid walk's size, rounded up to 256)
     uint64_t slot_bytes;
     /// per bank, the grid point (tokens) each slot holds; 0 = empty
@@ -196,6 +218,16 @@ typedef struct pulsar_ckpt_store {
  *  @return false (said) on a bad count/grid or a failed allocation; what was allocated is left for
  *          pulsar_ckpt_release */
 bool pulsar_ckpt_alloc(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks);
+/** pulsar_ckpt_alloc with the placement given rather than asked of the device (pulsar_ckpt_host_tier): what
+ *  pulsar_ckpt_alloc runs, and how the tests price and exercise both tiers on one device.
+ *  @param st      the store to fill (zeroed by the caller)
+ *  @param ops     the model's kv-state answer; borrowed, must outlive the store
+ *  @param state   the model's state handed to every hook; borrowed
+ *  @param n_banks banks to allocate slabs for (0 is taken as 1), <= PULSAR_MSEQ_MAX
+ *  @param host    true: the host tier (pinned slabs and records, device staging, a copy lane); false: the device tier
+ *  @return as pulsar_ckpt_alloc */
+bool pulsar_ckpt_alloc_tier(pulsar_ckpt_store *st, const pulsar_kv_state_ops *ops, void *state, uint32_t n_banks,
+                            bool host);
 /** Free every slab, record and record buffer the store holds; safe on a partly allocated store.
  *  @param st the store */
 void pulsar_ckpt_release(pulsar_ckpt_store *st);
@@ -230,25 +262,49 @@ void pulsar_ckpt_frontier_lowered(pulsar_ckpt_store *st, uint32_t bank, uint32_t
 /// @param st   the store
 /// @param bank the bank
 void pulsar_ckpt_drop_bank(pulsar_ckpt_store *st, uint32_t bank);
-/** The slot holding G (a save reads it). */
+/** L347 I4: where a checkpoint slot's bytes are: the device tier's slab and offset, or the host tier's pinned bytes. */
+typedef struct pulsar_ckpt_slot_at {
+    struct pulsar_gpu_tensor *slab;   ///< device tier: the bank's slab (NULL on the host tier)
+    uint64_t off;                     ///< device tier: the slot's byte offset in `slab`
+    uint8_t *host;                    ///< host tier: the slot's slot_bytes, pinned (NULL on the device tier)
+    uint32_t slot;                    ///< the slot index (pulsar_ckpt_commit's)
+} pulsar_ckpt_slot_at;
+/** Does `bank` hold a checkpoint at G?  (No wait: a test of the store's index.)
+ *  @param st   the store
+ *  @param bank the bank
+ *  @param G    the grid point, in tokens
+ *  @return true when a slot of `bank` holds G */
+bool pulsar_ckpt_holds(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G);
+/** The slot holding G, for a HOST reader (a save, a restore point's copy-out): on the host tier it returns once the
+ *  slot's last copy (its capture) has landed -- a host wait on that slot's ticket alone. */
 /// @param st   the store
 /// @param bank the bank
 /// @param G    the grid point, in tokens (0 is never held)
-/// @param slab receives the bank's slab (borrowed)
-/// @param off  receives the slot's byte offset in `slab`
-/// @return false when no slot of `bank` holds G
-bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, struct pulsar_gpu_tensor **slab,
-                        uint64_t *off);
-/** A slot for an incoming G, emptied until pulsar_ckpt_commit marks it (a load writes it). */
+/// @param at   receives where the slot's bytes are
+/// @return false when no slot of `bank` holds G, or its ticket failed (said)
+bool pulsar_ckpt_locate(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_ckpt_slot_at *at);
+/** A slot for an incoming G, emptied until pulsar_ckpt_commit marks it (a load writes it).  On the host tier it
+ *  returns once every copy still touching the slot has landed (the host writes it next). */
 /// @param st   the store
 /// @param bank the bank
 /// @param G    the grid point the load will write, in tokens
-/// @param slab receives the bank's slab (borrowed)
-/// @param off  receives the slot's byte offset in `slab`
-/// @param slot receives the slot index, for pulsar_ckpt_commit
-/// @return false when G is not a grid point this store can hold for `bank`
-bool pulsar_ckpt_claim(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, struct pulsar_gpu_tensor **slab,
-                       uint64_t *off, uint32_t *slot);
+/// @param at   receives where the slot's bytes are, and its index
+/// @return false when G is not a grid point this store can hold for `bank`, or a ticket failed
+bool pulsar_ckpt_claim(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, pulsar_ckpt_slot_at *at);
+/** Copy a located slot's slot_bytes to host memory: the host tier's memcpy from its pinned bytes, the device tier's
+ *  copy-out (pulsar_gpu_copy_out: fenced after this thread's queued work).
+ *  @param st  the store
+ *  @param at  a slot pulsar_ckpt_locate returned
+ *  @param dst [slot_bytes] the destination
+ *  @return true when copied */
+bool pulsar_ckpt_slot_get(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, void *dst);
+/** Write a claimed slot's slot_bytes from host memory: the host tier's memcpy into its pinned bytes, the device tier's
+ *  host -> device write.
+ *  @param st  the store
+ *  @param at  a slot pulsar_ckpt_claim returned
+ *  @param src [slot_bytes] the source
+ *  @return true when written */
+bool pulsar_ckpt_slot_put(const pulsar_ckpt_store *st, const pulsar_ckpt_slot_at *at, const void *src);
 /** Mark slot `slot` of `bank` as holding G, after a pulsar_ckpt_claim and the write into it.  Out-of-range bank or
  *  slot: nothing.
  *  @param st   the store
@@ -256,6 +312,15 @@ bool pulsar_ckpt_claim(pulsar_ckpt_store *st, uint32_t bank, uint32_t G, struct 
  *  @param slot the slot pulsar_ckpt_claim returned
  *  @param G    the grid point now in the slot, in tokens */
 void pulsar_ckpt_commit(pulsar_ckpt_store *st, uint32_t bank, uint32_t slot, uint32_t G);
+/** L347 I4: THE placement decision: does this device's store keep its checkpoints in pinned host RAM?  A discrete
+ *  card does (its memory is not the host's: a slot in host RAM frees VRAM for KV); an integrated one (GB10) does not
+ *  (one memory: a host copy would only duplicate).  Read by pulsar_ckpt_alloc and by the server's admission line.
+ *  @return 1 host tier, 0 device tier, -1 when the device did not answer (the store refuses to allocate) */
+int pulsar_ckpt_host_tier(void);
+/** L347 I4: the pinned host bytes the store's checkpoints hold (0 on the device tier).
+ *  @param st the store
+ *  @return bytes */
+uint64_t pulsar_ckpt_host_bytes(const pulsar_ckpt_store *st);
 /** The grid G <= pos at which a resume of a history prefilled to `pos` starts. */
 /// @param st  the store (its ops' resume_grid)
 /// @param pos the prefilled history length, in tokens

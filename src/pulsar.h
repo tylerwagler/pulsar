@@ -683,6 +683,11 @@ KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q
 /** @param s the session
  *  @return GPU bytes the create allocated */
 uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
+/** L347 I4: the pinned host RAM the session's grid checkpoints and records live in -- a discrete card's (the store's
+ *  host tier); 0 on an integrated GPU (GB10), where they are device memory and in pulsar_session_resident_bytes.
+ *  @param s the session
+ *  @return pinned host bytes */
+uint64_t pulsar_session_ckpt_host_bytes(const pulsar_session *s);
 /** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
  * This competes with per-session KV for the unified-memory budget. */

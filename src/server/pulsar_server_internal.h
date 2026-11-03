@@ -1789,27 +1789,48 @@ typedef struct {
  *     constants are an upper bound rather than the load-bearing estimate.
  * Re-measure the constants when the measured/static gap logged at startup
  * ("session admission: measured budget") exceeds ~2 GiB. */
-/** L338: a discrete card's working set past its staged weights and its sessions' priced state -- cuBLAS workspaces,
- *  graph instantiation, scratch, the CUDA context's growth -- the larger of 2 GiB and an eighth of the card.  Measured
- *  on the 24 GB RTX 6000 (Gemma 4, 4 banks, after warmup): 21.9 GB in use against 19.8 priced (weights 14.4 + context
- *  0.3 + shared 1.89 + banks 3.24), a 2.1 GiB working set under the 3 GiB margin.
- *  @param total_bytes the device's memory
+/** L338: what a discrete card's guard keeps free of its device memory.  The live budget re-reads cudaMemGetInfo every
+ * 0.25 s, so memory the runtime takes after warmup (cuBLASLt workspaces, lazily captured graphs) shrinks the room KV
+ * may take by itself; the floor covers what grows between two readings and a step's transient allocations.  Measured
+ * on the RTX 6000 (Gemma 4, 3 banks x 40960, the P4 parity suite incl. a 35.7K-token prompt and the judge): the device
+ * grew 820 MiB of which 698 MiB were that prompt's KV, ~120 MiB else. */
+#define PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES (512ull * 1024ull * 1024ull)
+
+/** L347 I4: a discrete card's WORKING SET -- the device memory the process takes past its staged weights and its
+ * session's priced state: cuBLAS / cuBLASLt workspaces, the scratch arenas, the graph catalog, lazily loaded kernels,
+ * the allocator's rounding.  It materializes during the startup warmup, AFTER the banks are sized, so the order is:
+ *   1. sizing (pre-warmup): the margin is this estimate + the reserve (server_discrete_margin_bytes);
+ *   2. after the warmup the working set is MEASURED (server_discrete_working_set_bytes: the device's free memory
+ *      before the create less its free memory after the warmup less what of the session is resident), logged, and a
+ *      working set past the estimate refuses the start -- the banks were sized for room the process does not keep
+ *      (rule 9: refuse, never overcommit);
+ *   3. at run time the 2b guard (touched + device free - the reserve) is the backstop for what grows later.
+ * The estimate: measured on the 24 GB RTX 6000 (Gemma 4, 3 banks x 40960, 2026-11-02: free after the weights 7.9 GiB
+ * less the priced session 4.96 less 2.2 free after the warmup = 0.74 GiB), rounded up to 1 GiB.  It replaced the
+ * static max(2 GiB, an eighth of the card) -- 2.9 GiB there, ~2.2 of it idle. */
+#define PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES (1024ull * 1024ull * 1024ull)
+/** L338 / L347 I4: what admission keeps free of a discrete card past its weights and priced sessions: a working set
+ *  plus the guard's floor (PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, the one reserve).
+ *  @param working_set_bytes the working set: PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing
  *  @return the margin, bytes */
-static inline uint64_t server_discrete_margin_bytes(uint64_t total_bytes) {
-    const uint64_t eighth = total_bytes / 8u, two = 2ull * 1024ull * 1024ull * 1024ull;
-    return eighth > two ? eighth : two;
+static inline uint64_t server_discrete_margin_bytes(uint64_t working_set_bytes) {
+    return working_set_bytes + PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES;
+}
+/** L347 I4: the working set the warmup measured on a discrete card (0 when the readings say none).
+ *  @param free_before_create the device's free memory just before the session's create
+ *  @param free_after_warmup  its free memory after the warmup
+ *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA)
+ *  @return bytes */
+static inline uint64_t server_discrete_working_set_bytes(uint64_t free_before_create, uint64_t free_after_warmup,
+                                                         uint64_t session_resident) {
+    const uint64_t taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : 0;
+    return taken > session_resident ? taken - session_resident : 0;
 }
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 /// The process's measured steady-state overhead the admission budget reserves, bytes.
 #define PULSAR_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
 
-/* L338: what a discrete card's guard keeps free of its device memory.  The live budget re-reads cudaMemGetInfo every
- * 0.25 s, so memory the runtime takes after warmup (cuBLASLt workspaces, lazily captured graphs) shrinks the room KV
- * may take by itself; the floor covers what grows between two readings and a step's transient allocations.  Measured
- * on the RTX 6000 (Gemma 4, 3 banks x 40960, the P4 parity suite incl. a 35.7K-token prompt and the judge): the device
- * grew 820 MiB of which 698 MiB were that prompt's KV, ~120 MiB else. */
-#define PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES (512ull * 1024ull * 1024ull)
 
 /* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
  * kernel/OS breathing room ONLY — the last-resort backstop for when other

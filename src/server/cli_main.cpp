@@ -290,13 +290,13 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
 /* L338: a DISCRETE card's sessions live in its own memory, which server_kv_budget_bytes' constants (GB10's unified
  * 121 GiB and its process reserve) do not describe -- on a 24 GB RTX 6000 they budgeted 84.6 GiB, auto-sized 16
  * banks, and the create died out of device memory at bank 11.  There the budget is what the device has free once the
- * weights are staged, less server_discrete_margin_bytes (the working set that materializes after startup); the
- * post-warmup re-derivation still min()s it. */
-/// @param free_bytes  the device's free memory, the weights staged
-/// @param total_bytes the device's memory
+ * weights are staged, less server_discrete_margin_bytes of the working set (L347 I4: the estimate at sizing, checked
+ * against the warmup's measurement before the listener opens). */
+/// @param free_bytes        the device's free memory, the weights staged
+/// @param working_set_bytes the working set the margin keeps (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing)
 /// @return the session budget in bytes (0 when the margin exceeds what is free)
-static uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t total_bytes) {
-    const uint64_t margin = server_discrete_margin_bytes(total_bytes);
+static uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes) {
+    const uint64_t margin = server_discrete_margin_bytes(working_set_bytes);
     return free_bytes > margin ? free_bytes - margin : 0;
 }
 
@@ -308,7 +308,7 @@ static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
     if (pulsar_gpu_integrated() == 0) {
         uint64_t free_b = 0, total_b = 0;
         pulsar_gpu_mem_info(&free_b, &total_b);
-        return server_kv_budget_discrete_bytes(free_b, total_b);
+        return server_kv_budget_discrete_bytes(free_b, PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
     }
     return server_kv_budget_bytes(weights_resident_bytes);
 }
@@ -1051,10 +1051,14 @@ int main(int argc, char **argv) {
         pulsar_gpu_mem_info(&free_b, &total_b);
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: session admission: discrete GPU -- device %.1f GiB, free after the weights %.1f GiB "
-                   "(weights_resident=%.1f GiB), margin %.1f GiB, budget=%.1f GiB",
+                   "(weights_resident=%.1f GiB), margin %.2f GiB (working set estimate %.2f + reserve %.2f; checked "
+                   "against the warmup), budget=%.1f GiB",
                    (double)total_b / (1024.0 * 1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0 * 1024.0),
                    (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
-                   (double)server_discrete_margin_bytes(total_b) / (1024.0 * 1024.0 * 1024.0),
+                   (double)server_discrete_margin_bytes(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) /
+                       (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
                    (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
     } else {
         server_log(PULSAR_LOG_DEFAULT,
@@ -1080,6 +1084,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* L347 I4: the device's free memory before the create -- the warmup's working set is measured against it */
+    const bool discrete = pulsar_gpu_integrated() == 0;
+    uint64_t dev_free_before_create = 0;
+    if (discrete) {
+        uint64_t total_unused = 0;
+        pulsar_gpu_mem_info(&dev_free_before_create, &total_unused);
+    }
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg.ctx_size) != 0) {
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to create %s session",
@@ -1162,8 +1173,34 @@ int main(int argc, char **argv) {
         const uint64_t avail_now = server_mem_available_bytes();
         warm_avail = avail_now;
         warm_touched = touched_now;
-        if (pulsar_gpu_integrated() == 0) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
-        if (avail_now > 0) {
+        if (discrete) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
+        if (discrete) {
+            /* L347 I4: the card's working set, measured -- the KV budget is VRAM, which MemAvailable (the host's) does
+             * not describe.  Past the estimate the banks were sized with, the start is refused (rule 9). */
+            uint64_t dev_free_now = 0, total_unused = 0;
+            pulsar_gpu_mem_info(&dev_free_now, &total_unused);
+            const uint64_t ws = server_discrete_working_set_bytes(dev_free_before_create, dev_free_now, resident_now);
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            if (ws > PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) {
+                server_log(PULSAR_LOG_ERROR,
+                           "pulsar-server: refusing to start: the warmup's working set is %.2f GiB (device free %.2f "
+                           "GiB before the create, %.2f after the warmup, session resident %.2f) -- past the %.2f GiB "
+                           "estimate the banks were sized with (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES); lower "
+                           "--ctx or PULSAR_MSEQ_BANKS, or re-measure the estimate (L347 I4)",
+                           (double)ws / gib, (double)dev_free_before_create / gib, (double)dev_free_now / gib,
+                           (double)resident_now / gib, (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib);
+                pulsar_session_free(session);
+                pulsar_engine_close(engine);
+                return 1;
+            }
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: session admission: discrete GPU working set measured %.2f GiB (estimate %.2f; "
+                       "device free %.2f GiB before the create, %.2f after the warmup, session resident %.2f); budget "
+                       "%.2f GiB; the 2b guard (device free - %.2f GiB) is the run-time backstop",
+                       (double)ws / gib, (double)PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES / gib,
+                       (double)dev_free_before_create / gib, (double)dev_free_now / gib, (double)resident_now / gib,
+                       (double)kv_budget_final / gib, (double)PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES / gib);
+        } else if (avail_now > 0) {
             const uint64_t floor = server_mem_floor().raw();
             const uint64_t headroom = avail_now > floor ? avail_now - floor : 0;
             uint64_t measured = resident_now + headroom;
@@ -1336,13 +1373,21 @@ int main(int argc, char **argv) {
          * un-evictable squatter, and the compensating special cases each of
          * those needed. */
         s.kv_committed_bytes = 0;
+        /* L347 I4: where the checkpoints are (the store's placement): a discrete card's are pinned host RAM */
+        char ckpt_where[96];
+        const uint64_t ckpt_host = pulsar_session_ckpt_host_bytes(session);
+        if (ckpt_host)
+            snprintf(ckpt_where, sizeof ckpt_where, "in pinned host RAM (%.2f GiB), not in the price",
+                     (double)ckpt_host / (1024.0 * 1024.0 * 1024.0));
+        else
+            snprintf(ckpt_where, sizeof ckpt_where, "in device memory, in the price");
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: Tier-2 shared pool ACTIVE: %d banks, "
                    "unified batch decode (L118), per-bank marginal %.2f GiB "
-                   "(pool resident actual %.2f GiB)",
+                   "(pool resident actual %.2f GiB; grid checkpoints %s)",
                    pool_banks,
                    (double)s.bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
-                   (double)session_actual / (1024.0 * 1024.0 * 1024.0));
+                   (double)session_actual / (1024.0 * 1024.0 * 1024.0), ckpt_where);
     } else {
         s.kv_committed_bytes = session_actual;
         s.slots[0].est_cost_bytes = session_actual;
