@@ -131,17 +131,35 @@ bool http_error_retry(int fd, int code, const char *msg, int retry_after_s) {
  * unknown APIError instead of a typed InvalidRequestError. The
  * context-length path already emits this shape; every other 4xx on the
  * /v1/messages surface must too. */
-/// Send an error in Anthropic's envelope ({"type":"error","error":{...}}).
+/* L249 D: the Messages API's error type for a status -- what Claude Code's retry logic reads (an
+ * overloaded_error is retried with backoff, an invalid_request_error is not). */
+const char *anthropic_error_type(int code) {
+    switch (code) {
+    case 401: return "authentication_error";
+    case 403: return "permission_error";
+    case 404: return "not_found_error";
+    case 413: return "request_too_large";
+    case 429: return "rate_limit_error";
+    case 503:
+    case 529: return "overloaded_error";
+    default: return code >= 400 && code < 500 ? "invalid_request_error" : "api_error";
+    }
+}
+
+/// Send an error in Anthropic's envelope ({"type":"error","error":{...}}), its type the status's
+/// (anthropic_error_type); a capacity refusal (429 / 503 / 529) carries Retry-After and X-Should-Retry.
 /// @param fd    the client socket
 /// @param code  the HTTP status
 /// @param msg   the message
 /// @return false when a write failed
 bool http_error_anthropic(int fd, int code, const char *msg) {
     buf b = {0};
-    buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+    buf_printf(&b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", anthropic_error_type(code));
     json_escape(&b, msg);
     buf_puts(&b, "}}\n");
-    bool ok = http_response(fd, code, "application/json", b.ptr);
+    const bool retry = code == 429 || code == 503 || code == 529;
+    bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
+                    : http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -218,39 +236,50 @@ bool http_error_context_length_exceeded(int fd,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
+/// The SSE response head (pulsar_server_internal.h).
+extern const char k_sse_head[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n\r\n";
+
 /// Write the 200 text/event-stream response head that opens every SSE stream.
 /// @param fd  the client socket
 /// @return false when the write failed
 bool sse_headers(int fd) {
-    buf h = {0};
-    buf_puts(&h,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n");
-    buf_puts(&h, "Connection: close\r\n\r\n");
-    bool ok = send_all(fd, h.ptr, h.len);
-    buf_free(&h);
-    return ok;
+    return send_all(fd, k_sse_head, sizeof k_sse_head - 1);
+}
+
+/* Anthropic gets a REAL `ping` event: it is documented, and its SDK skips every ping event before parsing the
+ * stream (before message_start too).  OpenAI chat and Responses get an SSE comment, which every conformant SSE
+ * parser discards before it reaches application code (see gen_stream_heartbeat for why not response.in_progress). */
+const char *stream_keepalive_beat(const request *r) {
+    return r && r->api == API_ANTHROPIC ? "event: ping\ndata: {\"type\": \"ping\"}\n\n" : ": ping\n\n";
 }
 
 
 
-/// Send an error event in an open SSE stream (Anthropic's api_error envelope or OpenAI's server_error).
-/// @param fd   the client socket
-/// @param r    the request (selects the shape; may be NULL)
-/// @param msg  the message (NULL or empty: "internal server error")
+/// Send an error event in an open SSE stream: Anthropic's envelope with the status's type (anthropic_error_type:
+/// api_error for a 500, overloaded_error for a capacity refusal), or OpenAI's (server_error for a 5xx, else
+/// invalid_request_error).  The status the event stands for is the one the request would have had before the
+/// stream opened (L249 D: a stream may open while the request still waits for its bank).
+/// @param fd    the client socket
+/// @param r     the request (selects the shape; may be NULL)
+/// @param code  the HTTP status the error stands for
+/// @param msg   the message (NULL or empty: "internal server error")
 /// @return false when the write failed
-bool sse_error_event(int fd, const request *r, const char *msg) {
+bool sse_error_event(int fd, const request *r, int code, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
     buf b = {0};
     if (r && r->api == API_ANTHROPIC) {
-        buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
+        buf_printf(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":",
+                   anthropic_error_type(code));
         json_escape(&b, message);
         buf_puts(&b, "}}\n\n");
     } else {
         buf_puts(&b, "event: error\ndata: {\"error\":{\"message\":");
         json_escape(&b, message);
-        buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
+        buf_printf(&b, ",\"type\":\"%s\"}}\n\n", code >= 500 ? "server_error" : "invalid_request_error");
     }
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);

@@ -1087,6 +1087,7 @@ void anthropic_fold_tool_results(chat_msgs *msgs) {
                 tool_call tc = m->calls.v[t];
                 tool_calls_push(&f.calls, tc);
             }
+            f.calls.inputs_cleared = f.calls.inputs_cleared || m->calls.inputs_cleared;   /* L337 */
             free(m->calls.v);
             memset(&m->calls, 0, sizeof(m->calls));
             if (m->reasoning) {

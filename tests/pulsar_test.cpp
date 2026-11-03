@@ -5,6 +5,7 @@
 #include "../src/server/prompt_render.cpp"
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
+#include "../src/server/context_edit.cpp"
 #include "../src/server/family_inkling.cpp"
 #include "../src/server/family_nemotron_h.cpp"
 #include "../src/server/family_gemma4.cpp"
@@ -1863,6 +1864,48 @@ static void test_anthropic_count_tokens_parse(void) {
         128, &r, err, sizeof(err)));
     TEST_ASSERT(r.prompt.len > n_one);
     request_free(&r);
+
+    /* L337: context_management in tokens.  keep "all" counts exactly the body without it; a clear counts the edited
+     * prompt, reports the unedited one as original_input_tokens, its cleared_input_tokens is the difference, and the
+     * edited tokens leave the unedited ones no later than the first cleared result */
+    char err2[300];
+    request plain, all, ed;
+    TEST_ASSERT(parse_anthropic_request(engine, NULL, ctx_test_body("").c_str(), 128, &plain, err2, sizeof err2));
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        ctx_test_body("{\"edits\":[{\"type\":\"clear_thinking_20251015\",\"keep\":\"all\"}]}").c_str(), 128, &all,
+        err2, sizeof err2));
+    TEST_ASSERT(all.ctx_mgmt && all.n_ctx_applied == 0 && all.prompt.len == plain.prompt.len &&
+                !memcmp(all.prompt.v, plain.prompt.v, sizeof(int) * (size_t)plain.prompt.len) &&
+                all.ctx_original_tokens == plain.prompt.len);
+    TEST_ASSERT(parse_anthropic_request(engine, NULL,
+        ctx_test_body("{\"edits\":[{\"type\":\"clear_tool_uses_20250919\",\"trigger\":{\"type\":\"tool_uses\","
+                      "\"value\":1},\"keep\":{\"type\":\"tool_uses\",\"value\":1}}]}").c_str(), 128, &ed,
+        err2, sizeof err2));
+    TEST_ASSERT(ed.ctx_edited && ed.n_ctx_applied == 1 && ed.prompt.len < plain.prompt.len);
+    TEST_ASSERT(ed.ctx_original_tokens == plain.prompt.len &&
+                ed.ctx_applied[0].cleared_input_tokens == plain.prompt.len - ed.prompt.len);
+    int cp = 0;
+    while (cp < ed.prompt.len && cp < plain.prompt.len && ed.prompt.v[cp] == plain.prompt.v[cp]) cp++;
+    TEST_ASSERT(cp < ed.prompt.len && cp < plain.prompt.len);
+    /* the shared tokens end no later than the first cleared result: the render up to it, tokenized with its client
+     * spans as the server does, is at least as long as the shared run (one token of slack: BPE may merge across the
+     * cut) */
+    {
+        const char *at = strstr(plain.prompt_text, "RESULT_ONE");
+        const uint32_t cut = at ? (uint32_t)(at - plain.prompt_text) : 0;
+        std::string pre(plain.prompt_text, cut);
+        std::vector<pulsar_text_span> spans;
+        for (uint32_t i = 0; i < plain.prompt_n_spans; i++)
+            if (plain.prompt_spans[i].lo < cut)
+                spans.push_back({plain.prompt_spans[i].lo, std::min(plain.prompt_spans[i].hi, cut)});
+        pulsar_tokens head = {0};
+        pulsar_tokenize_rendered_chat_spans(engine, pre.c_str(), spans.data(), (uint32_t)spans.size(), &head);
+        TEST_ASSERT(at && head.len > 0 && cp <= head.len + 1);
+        pulsar_tokens_free(&head);
+    }
+    request_free(&plain);
+    request_free(&all);
+    request_free(&ed);
 }
 
 

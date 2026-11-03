@@ -325,6 +325,9 @@ typedef struct {
      * because reproducing a prefix requires the bytes the model actually
      * produced, not a re-serialisation of the parse. */
     char *raw_calls;
+    /** L337: context editing cleared one of these calls' inputs, so the sampled bytes tool memory holds no longer
+     *  describe them: the calls render from their (edited) arguments, never from remembered raw_calls. */
+    bool inputs_cleared;
 } tool_calls;
 
 /** How a replayed conversation's tool calls were resolved.
@@ -849,6 +852,80 @@ typedef struct constrain_plan constrain_plan;
 /// @param p  the plan (NULL: nothing)
 void constrain_plan_free(constrain_plan *p);
 
+/* ---- L337: Anthropic context editing (context_management.edits) ------------------------------------------------
+ * The edits are applied to the conversation BEFORE the family renders it, so the prompt -- and with it every prefix
+ * match, the disk chain keys and the live-continuation decision -- is the edited one.  Parsed by the Anthropic
+ * protocol half (api_parse.cpp), planned and applied by context_edit.cpp. */
+/// The context edits this server applies (BetaContextManagementConfig.edits).
+typedef enum {
+    CTX_EDIT_CLEAR_TOOL_USES = 0,  ///< clear_tool_uses_20250919: old tool results replaced by a notice
+    CTX_EDIT_CLEAR_THINKING,       ///< clear_thinking_20251015: reasoning of older assistant turns dropped
+} ctx_edit_kind;
+/// The most edits one request may carry (one of each kind: each type may appear once).
+#define PULSAR_CTX_EDITS_MAX 2
+/** One requested edit, defaults filled (the API's: trigger 100,000 input tokens, keep 3 tool uses, thinking "all"). */
+typedef struct {
+    ctx_edit_kind kind;          ///< which edit
+    bool trigger_tool_uses;      ///< clear_tool_uses: the trigger counts tool uses (else input tokens)
+    long trigger;                ///< clear_tool_uses: the prompt must EXCEED this to clear
+    int keep;                    ///< tool uses kept (clear_tool_uses); thinking turns kept, -1 = all (clear_thinking)
+    long clear_at_least;         ///< clear_tool_uses: input tokens a clear must remove or it is not applied (0: none)
+    char *exclude;               ///< clear_tool_uses: tool names never cleared, one per line, owned (NULL: none)
+    bool clear_inputs;           ///< clear_tool_uses: the cleared calls' inputs are cleared too
+    char *clear_inputs_only;     ///< ... only for these tool names, one per line, owned (NULL: every cleared call)
+} ctx_edit;
+/** What one applied edit cleared (BetaContextManagementResponse.applied_edits[]). */
+typedef struct {
+    ctx_edit_kind kind;          ///< which edit
+    int cleared;                 ///< tool uses (clear_tool_uses) or thinking turns (clear_thinking) cleared
+    int cleared_input_tokens;    ///< prompt tokens the edit removed: the render before it minus the render after
+} ctx_edit_applied;
+
+/* ---- L249 D: Claude Code's gateway hint headers -------------------------------------------------------------
+ * Sent when the client sets CLAUDE_CODE_GATEWAY_HINT_HEADERS=1 (the gate forwards every x-claude-code-* header
+ * unchanged).  Fixed vocabularies, ids and a random prompt UUID, never prompt text.  Read by the front door
+ * (read_http_request), carried on the request; the scheduler reads the session and the compaction marks (a dead
+ * prefix's bank: server::hint_mark_dead and its readers), /metrics counts the classes. */
+/** x-claude-code-request-class (x-claude-code-compaction makes a request COMPACTION whatever its class says). */
+typedef enum {
+    REQ_CLASS_NONE = 0,    ///< no header: a client without hints (every non-Claude-Code client)
+    REQ_CLASS_MAIN,        ///< a turn of the main conversation
+    REQ_CLASS_SUBAGENT,    ///< a turn of a subagent
+    REQ_CLASS_WORKFLOW,    ///< an agent running inside a workflow
+    REQ_CLASS_COMPACTION,  ///< the summarization request that compacts a conversation
+    REQ_CLASS_AUXILIARY,   ///< a side request: session titles, classifiers, summaries
+    REQ_CLASS_OTHER,       ///< a value this server does not know (a newer client)
+    REQ_CLASS_COUNT,       ///< array bound for the /metrics counters, not a class
+} request_class;
+/** The class names, /metrics label values, indexed by request_class. */
+extern const char *const k_request_class_names[REQ_CLASS_COUNT];
+/// Bytes kept of a hint id (session, agent, prompt); longer values are cut (ids are UUIDs).
+#define PULSAR_HINT_ID_MAX 80
+/** The hints one request carried; zero = none (memset-safe, nothing owned). */
+typedef struct {
+    request_class cls;                         ///< the request's class (NONE when the header is absent)
+    char session[PULSAR_HINT_ID_MAX];          ///< x-claude-code-session-id ("" = absent)
+    char agent[PULSAR_HINT_ID_MAX];            ///< x-claude-code-agent-id
+    char parent_agent[PULSAR_HINT_ID_MAX];     ///< x-claude-code-parent-agent-id
+    char prompt[PULSAR_HINT_ID_MAX];           ///< x-claude-code-prompt-id
+    char compaction[16];                       ///< x-claude-code-compaction: auto / manual / reactive ("" = absent)
+    char context_compacted[16];                ///< x-claude-code-context-compacted: the same values ("" = absent)
+} client_hints;
+/** Read one request-head line into the hints when it is one of the x-claude-code-* headers above (case-insensitive
+ *  names, printable ASCII values, surrounding blanks trimmed); any other line is left alone. */
+/// @param h     the hints
+/// @param line  the header line (no line end)
+/// @param len   bytes at `line`
+void client_hints_read_line(client_hints *h, const char *line, size_t len);
+/** Whether a disk-KV persist of a bank is skipped for a hint: the bank's history is dead (any reason but a shutdown
+ *  or a guard spill, whose restore reads the chain), or the bank runs a compaction's summarization request (its
+ *  prompt is the conversation that compaction retires: the continued / prompt / terminal stores). */
+/// @param dead        the bank's history is dead (session_slot::hint_dead)
+/// @param compaction  the bank's active job is a compaction request
+/// @param reason      the persist's reason
+/// @return true to skip it
+bool server_hint_persist_skips(bool dead, bool compaction, const char *reason);
+
 /** One parsed request, normalised across the three supported APIs.
  *
  * `kind` and `api` are separate on purpose: the same logical operation (a chat
@@ -966,6 +1043,17 @@ typedef struct request {
     /** L347 I3b: the request's X-Pulsar-KV tokens (KV_HDR_*; 0 without the header), set by client_main from the
      *  head; the bank takes them when the request takes its history (session_slot::kv_flags). */
     unsigned kv_flags;
+    /** L249 D: the gateway hint headers the request arrived with (none: zero). */
+    client_hints hints;
+    /** L337: the request carried context_management -- the response reports context_management.applied_edits
+     *  (an empty list when nothing was cleared). */
+    bool ctx_mgmt;
+    ctx_edit_applied ctx_applied[PULSAR_CTX_EDITS_MAX];  ///< L337: the edits applied, in request order
+    int n_ctx_applied;                                  ///< L337: entries in ctx_applied
+    int ctx_original_tokens;   ///< L337: the unedited render's prompt size (count_tokens' original_input_tokens)
+    /** L337: the prompt is not the render of the conversation as sent (an applied edit changed it): the slot's live
+     *  tool binding is neither continued nor recorded, since the client's next request may render it either way. */
+    bool ctx_edited;
 } request;
 
 /** One key/value pair from a parsed JSON object. */
@@ -1170,6 +1258,8 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
 bool slot_writer_flush(slot_writer *w);  ///< non-blocking best effort
 /* True when this writer has an armed clock and has been silent >= interval. */
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms);
+/** Start the writer's keepalive clock now (the socket carried bytes before the writer existed: L249 D). */
+void slot_writer_mark_written(slot_writer *w);
 bool slot_writer_drain(slot_writer *w);  ///< blocking, stall-timeout bounded
 void slot_writer_free(slot_writer *w);
 
@@ -1969,6 +2059,13 @@ typedef struct session_slot {
      *  the old history's own persist), so a read-only history writes nothing at a later evict / spill / abandon /
      *  shutdown until a request without it takes the bank. */
     unsigned     kv_flags;
+    /** L249 D: the x-claude-code-session-id of the conversation this bank holds ("" = none sent). */
+    char         hint_session[PULSAR_HINT_ID_MAX];
+    /** L249 D: the bank's history is a DEAD prefix -- its session compacted (the context-compacted hint), or it ran
+     *  the compaction's summarization request.  Evicted first and never persisted to the disk KV cache; a free
+     *  bank to take before a fresh one.  A hint, not an invalidation: a job that continues the history in place
+     *  revives it, and the prefix match decides as always. */
+    bool         hint_dead;
 } session_slot;
 
 /* Forward declarations / relocated types referenced by struct server's member
@@ -2402,6 +2499,11 @@ struct server {
     uint64_t m_persist_no_room;
     /// L347 I3a: guard spills refused because their copy-out found no room in the host pool (the bank stayed resident)
     uint64_t m_spill_no_room;
+    /** L249 D: requests accepted per x-claude-code-request-class (k_request_class_names; "none" = no header) */
+    uint64_t m_req_class[REQ_CLASS_COUNT];
+    uint64_t m_hint_dead_banks;      ///< L249 D: banks marked dead by a compaction (their prefix is no longer used)
+    uint64_t m_hint_persist_skipped; ///< L249 D: disk-KV persists skipped: a dead prefix, or a compaction's prompt
+    uint64_t m_hint_dead_reuse;      ///< L249 D: a dead bank taken instead of a fresh bank or an eviction
     uint64_t m_prefill_mem_refusals;  ///< prefills stopped mid-prompt: MemAvailable under the floor before a chunk
     KvBytes  m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
@@ -3132,6 +3234,15 @@ struct server {
      *  most resident pages); NULL when there is none. */
     /// @return the empty provisioned slot, or NULL (also off the bank pool)
     session_slot *empty_bank();
+    /** L249 D: mark dead the idle banks holding session `session` (its context was compacted: the prefix is no
+     *  longer used).  Counted in m_hint_dead_banks. */
+    /// @param session  the x-claude-code-session-id
+    /// @return banks newly marked
+    int hint_mark_dead(const char *session);
+    /** L249 D: an idle bank whose history is dead (the least recently serviced), to take before provisioning a
+     *  fresh bank or evicting a live one; NULL when there is none. */
+    /// @return the slot, or NULL
+    session_slot *hint_dead_bank();
     /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
      * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
      * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
@@ -3531,7 +3642,36 @@ struct job {
      *  freed address is not the leader). */
     uint64_t seq;
     prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
+    /** L249 D: the early stream.  A streaming request the worker has not started writing to gets its SSE head and
+     *  keepalives from its client thread once it has waited PULSAR_SERVER_HEARTBEAT_MS (queued for a bank, a slot,
+     *  a prefill it shares): a gateway in front (Cloudflare's ~100 s origin timeout) sees bytes from then on, not at
+     *  the first prefill chunk.  The worker claims the socket (job_claim_writes) before its first write; after that
+     *  the client thread writes nothing.  All under mu. */
+    double accepted_at;   ///< server_now_sec when the client thread enqueued it
+    bool worker_writes;   ///< the worker owns the socket's writes
+    bool sse_early;       ///< the client thread sent the SSE head (the stream is open)
+    bool sse_early_dead;  ///< an early write failed: the stream is dead
+    double early_last;    ///< server_now_sec of the last early write
 };
+/** Client thread, mu held, while the job waits: open the stream / send a keepalive when one is due (a streaming
+ *  request the worker has not claimed).  A write that does not go out whole marks the stream dead. */
+/// @param j    the job
+/// @param now  server_now_sec
+void job_early_keepalive(job *j, double now);
+/** Worker: take the socket's writes from the client thread (before the job's first write).  Returns whether the
+ *  stream is already open; `*dead` = an early write failed (nothing more can be written). */
+/// @param j     the job
+/// @param dead  receives whether the early stream died
+/// @return true when the client thread opened the stream
+bool job_claim_writes(job *j, bool *dead);
+/** Answer a job with an error in the shape its response is in: an error event when its stream is open (the type
+ *  the status would have had, anthropic_error_type), else the protocol's HTTP error (a 503 retryable). */
+/// @param j         the job
+/// @param sse_open  the job's SSE stream is open
+/// @param code      the HTTP status
+/// @param msg       the message
+/// @return false when the write failed
+bool job_reply_error(const job *j, bool sse_open, int code, const char *msg);
 
 
 /** A window of token ids around the point where a replayed prompt stopped
@@ -3918,6 +4058,7 @@ typedef struct {
     size_t body_len;   ///< body length in bytes
     unsigned kv_flags; ///< L347 I3b: the X-Pulsar-KV tokens (KV_HDR_*), every such header line joined
     char kv_err[160];  ///< L347 I3b: why an X-Pulsar-KV header was refused ("" when it was not): the 400's text
+    client_hints hints;  ///< L249 D: the x-claude-code-* hint headers
 } http_request;
 
 /** Argument handed to a client thread at spawn: the server and the socket it
@@ -4129,7 +4270,11 @@ bool chat_expand_tool_refs(struct chat_conversation *c, const struct request *r,
 /// @return the malloc'd JSON array, or NULL
 char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen);
 bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen);
+/** Read an Anthropic messages array into parts; empty role:"system" entries are dropped, and `turn_effort` (when
+ *  not NULL) receives the raw output_config of the system entry whose effort is in effect for the reply (L249 D's
+ *  per-turn effort; NULL: none). */
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen,
+                              char **turn_effort = NULL);
 /** An inline base64 `data:image/...;base64,` URL -> the encoded file's bytes (malloc'd, `*len_out` set), or NULL +
  *  `err` (a remote URL, another scheme, a malformed payload).  The one reader of inline images: the chat / Responses
  *  image blocks and /v1/parse (L321). */
@@ -4335,9 +4480,48 @@ typedef struct chat_conversation {
     chat_control *controls;         ///< thinking / effort controls in arrival order, owned
     int n_controls;                 ///< entries in controls
     response_format_spec response_format;  ///< L303: the answer's format (NONE = text)
+    /** L337: Anthropic's context_management.edits, in request order (context_edit.cpp applies them). */
+    ctx_edit ctx_edits[PULSAR_CTX_EDITS_MAX];
+    int n_ctx_edits;                ///< entries in ctx_edits
 } chat_conversation;
 
 void chat_conversation_free(chat_conversation *c);
+
+/* ---- L337: context editing (context_edit.cpp) ---- */
+/** Read Anthropic's context_management ({"edits": [...]} or null) into the conversation's edits; sets
+ *  request::ctx_mgmt.  false + err (the Messages API's wording): an unknown member or edit type, a malformed value,
+ *  compact_20260112 (server-side compaction is not implemented), a repeated type, clear_thinking not first. */
+/// @param p       the cursor, at the value (advanced past it)
+/// @param c       the conversation (ctx_edits appended)
+/// @param r       the request (ctx_mgmt set)
+/// @param err     receives the client error on false
+/// @param errlen  size of `err`
+/// @return false on a refused value
+bool ctx_management_parse(const char **p, chat_conversation *c, request *r, char *err, size_t errlen);
+/// Free the conversation's edits (chat_conversation_free calls it).
+/// @param c  the conversation
+void ctx_edits_free(chat_conversation *c);
+/** Parse and render an Anthropic Messages body with its context edits applied.  No edits, or none that clears
+ *  anything: ONE parse and render, the request as sent (byte-identical to a body without context_management).
+ *  Otherwise each edit that clears something is applied on top of the ones before it, rendered and measured; it
+ *  stays when its trigger is passed (input tokens: the unedited prompt's size) and it removes at least
+ *  clear_at_least, and the request is the last render kept.  request::ctx_applied reports what each removed.  The
+ *  size is the prompt's tokens; with no engine (the renderer tests) its bytes. */
+/// @param e           the engine (NULL: text only)
+/// @param fmt         the chat format to render in
+/// @param s           the server (may be NULL)
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on false)
+/// @param err         receives the reason on false
+/// @param errlen      size of `err`
+/// @return false when refused
+bool parse_anthropic_request_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body,
+                                    int def_tokens, request *r, char *err, size_t errlen);
+/** Append `,"context_management":{"applied_edits":[...]}` when the request carried context_management. */
+/// @param b  the JSON being built (a message object, or a message_delta event)
+/// @param r  the request
+void append_ctx_management_json(buf *b, const request *r);
 /** The raw JSON text of member `key` of object `obj` (malloc'd), or NULL when absent. */
 /// @param obj  the object's JSON text
 /// @param key  the member name
@@ -4489,6 +4673,11 @@ bool http_response_retry(int fd, int code, const char *type, const char *body,
                          int retry_after_s);
 bool http_error_retry(int fd, int code, const char *msg, int retry_after_s);
 bool http_error_anthropic(int fd, int code, const char *msg);
+/** The Messages API's error type for an HTTP status (overloaded_error for 503 / 529, rate_limit_error for 429,
+ *  invalid_request_error for other 4xx, api_error for 5xx). */
+/// @param code  the HTTP status
+/// @return the type's name (static)
+const char *anthropic_error_type(int code);
 bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen);
 /* ---- L303: the request's grammars and its gate (constrain.cpp) ---- */
 /** After the family's render: the request's response format and its strict or forced tool calls as compiled
@@ -4570,8 +4759,15 @@ bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size);
+/** The 200 text/event-stream response head every SSE stream opens with (sse_headers writes it). */
+extern const char k_sse_head[];
 bool sse_headers(int fd);
-bool sse_error_event(int fd, const request *r, const char *msg);
+/** The keepalive a stream of `r`'s protocol sends while it has nothing else to say: Anthropic's ping event (its
+ *  clients skip it, before message_start too), an SSE comment for the OpenAI surfaces. */
+/// @param r  the request
+/// @return the beat's bytes (static)
+const char *stream_keepalive_beat(const request *r);
+bool sse_error_event(int fd, const request *r, int code, const char *msg);
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish);
 int clamp_usage_tokens(int value, int max);
 /* The one shared sampling-knob parser every protocol surface routes through

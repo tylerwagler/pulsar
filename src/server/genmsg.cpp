@@ -144,6 +144,15 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
 
 
 
+/// @brief Start the writer's keepalive clock now: bytes went out on its socket before it existed (L249 D's early
+///        stream, written by the client thread).
+/// @param w  the writer
+void slot_writer_mark_written(slot_writer *w) {
+    w->last_write_ms = wall_ms();
+}
+
+
+
 /// @brief Whether the writer has sent nothing for `interval_ms` (false before its first write or after a failure).
 /// @param w            the writer (NULL: false)
 /// @param now_ms       the wall clock now, ms (wall_ms)
@@ -157,7 +166,8 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
 
 
 
-/* Surface-appropriate keepalive for a slot that has gone quiet mid-request.
+/* Surface-appropriate keepalive for a slot that has gone quiet mid-request
+ * (stream_keepalive_beat).
  *
  * Anthropic gets a REAL `ping` event: it is documented, and clients are told to
  * ignore unknown/ping events, so it costs nothing.
@@ -175,16 +185,18 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
 /// @param g  the request's generation state (NULL: false)
 /// @return true when a beat was sent; false when none was due, the request does not stream, or the write failed
 bool gen_stream_heartbeat(gen_state *g) {
-    if (!g) return false;
-    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
-
-    const char *beat = NULL;
-    if (g->anthropic_live.active) {
-        beat = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
-    } else if (g->responses_live.active || g->openai_live.active) {
-        beat = ": ping\n\n";
+    if (!g || !g->j || !g->j->req.stream || g->phase == GEN_DONE || g->progress.stream_failed) return false;
+    const char *beat = stream_keepalive_beat(&g->j->req);
+    if (!g->progress.headers_sent) {
+        /* L249 D: bound, but nothing written yet (a restore, an admission wait, a long first chunk): the stream
+         * opens once the request has waited a beat since it was accepted, the SSE head and a beat at once -- the
+         * pre-bind wait has the client thread's early stream (job_early_keepalive) */
+        if (server_now_sec() - g->j->accepted_at < PULSAR_SERVER_HEARTBEAT_MS / 1000.0) return false;
+        g->progress.headers_sent = true;
+        return slot_writer_send(&g->writer, k_sse_head, strlen(k_sse_head)) &&
+               slot_writer_send(&g->writer, beat, strlen(beat));
     }
-    if (!beat) return false;   /* non-streaming request: nothing to keep alive */
+    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
 
     /* Write through the slot's OWN writer, not send_all: send_all only becomes
      * non-blocking when that writer is INSTALLED thread-locally, which it is
