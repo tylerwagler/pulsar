@@ -5,6 +5,7 @@
 #include "engine/exl3_trellis.h" /* L269 W1: exl3_expert_cut, the EXL3 expert half */
 
 #include <list>
+#include <pthread.h>
 
 
 /// Host base of the model mapping set by pulsar_gpu_set_model_map (the one cuda_model_ptr translates).
@@ -1763,6 +1764,261 @@ void *pulsar_gpu_host_alloc(uint64_t bytes) {
 
 void pulsar_gpu_host_free(void *p) {
     if (p) (void)cudaFreeHost(p);
+}
+
+/* L347 I3a: the copy-out's stream and its two events, one set per calling thread (the server's worker; a test thread)
+ * -- created on first use, kept for the thread's life. */
+/// The calling thread's copy stream (non-blocking: it never serialises with the legacy stream).
+static thread_local cudaStream_t t_copy_stream = NULL;
+/// Recorded on the calling thread's compute stream: the fence the copy stream waits for.
+static thread_local cudaEvent_t t_copy_fence = NULL;
+/// Recorded on the copy stream after the copies: what the host waits for.
+static thread_local cudaEvent_t t_copy_done = NULL;
+
+int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_gpu_copy_span &c = spans[i];
+        if (!c.src || !c.dst || c.offset > c.src->bytes || c.bytes > c.src->bytes - c.offset) {
+            fprintf(stderr, "pulsar: copy-out span %u out of range (offset %llu + %llu > %llu bytes)\n", i,
+                    (unsigned long long)c.offset, (unsigned long long)c.bytes,
+                    (unsigned long long)(c.src ? c.src->bytes : 0));
+            return 0;
+        }
+        total += c.bytes;
+    }
+    if (!t_copy_stream && !cuda_ok(cudaStreamCreateWithFlags(&t_copy_stream, cudaStreamNonBlocking), "copy stream"))
+        return 0;
+    if (!t_copy_fence && !cuda_ok(cudaEventCreateWithFlags(&t_copy_fence, cudaEventDisableTiming), "copy fence"))
+        return 0;
+    if (!t_copy_done && !cuda_ok(cudaEventCreateWithFlags(&t_copy_done, cudaEventDisableTiming), "copy done"))
+        return 0;
+    if (!cuda_ok(cudaEventRecord(t_copy_fence, cudaStreamPerThread), "copy fence record") ||
+        !cuda_ok(cudaStreamWaitEvent(t_copy_stream, t_copy_fence, 0), "copy fence wait"))
+        return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_gpu_copy_span &c = spans[i];
+        if (c.bytes == 0 || c.src->dry) continue;
+        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset, (size_t)c.bytes,
+                                     cudaMemcpyDeviceToHost, t_copy_stream), "copy-out"))
+            return 0;
+    }
+    pulsar_cuda_sync_note(2, total);   /* one host wait, for the copy stream alone */
+    return cuda_ok(cudaEventRecord(t_copy_done, t_copy_stream), "copy done record") &&
+           cuda_ok(cudaEventSynchronize(t_copy_done), "copy-out wait");
+}
+
+/* ---- L347 I4: the copy lane (pulsar_gpu.h) ---------------------------------------------------------------------
+ * Measured on CT 124's RTX 5000 (2026-11-03): a device -> host copy queued on ANY stream holds the copy engine until it
+ * is done, and every blocking read the compute side makes meanwhile -- each step's routed-expert flags and logits,
+ * pulsar_gpu_end_commands -- queues behind all of it, even split into pieces queued at once (211 MiB: every 4-byte read
+ * waited 65 ms, whole or in 4 MiB pieces; a copy kernel instead slowed a compute kernel beside it 2-4x).  So the lane
+ * keeps ONE piece on the engine at a time: a pump thread takes the queued copies in order, waits for the compute
+ * fence each carries, then issues its pieces one by one, each after the last has landed -- a compute read waits for
+ * one piece at most.
+ *
+ * A ticket is (seq, event): seq = the queued copy that last wrote its bytes (done once the pump's `landed` passes
+ * it), event = the last use the calling thread's stream made of them (pulsar_gpu_lane_h2d).  A wait waits for
+ * both; an order (a stream waiting) waits on the host for the pump's copy -- it is the copy's own landing, and a
+ * stream cannot wait for an event the pump has not recorded yet -- then on the stream for the event. */
+/** The most bytes the lane keeps on the copy engine at once (see above): ~0.7 ms of PCIe 3.0 x16. */
+#define PULSAR_GPU_LANE_PIECE_BYTES (8ull << 20)
+
+/** One queued device -> host copy. */
+struct lane_job {
+    cudaEvent_t fence;   ///< recorded on the caller's stream at the queueing: the copy reads what that work wrote
+    const char *src;     ///< device source
+    char *dst;           ///< pinned host destination
+    uint64_t bytes;      ///< bytes
+    uint64_t seq;        ///< its sequence number (1, 2, ...)
+};
+
+/** One ticket: the queued copy that last wrote its bytes, and the stream's last use of them. */
+struct lane_ticket {
+    uint64_t seq;        ///< 0 = no copy ever
+    cudaEvent_t ev;      ///< recorded on the caller's stream by h2d (never recorded = complete)
+};
+
+/** A copy lane (pulsar_gpu.h): the pump, its queue and the ticket table. */
+struct pulsar_gpu_lane {
+    cudaStream_t stream;       ///< the pump's non-blocking stream
+    cudaEvent_t piece;         ///< the pump's: the piece on the engine
+    lane_ticket *ticket;       ///< [n] the tickets
+    uint32_t n;                ///< tickets in the table
+    int device;                ///< the device the pump binds to
+    pthread_t pump;            ///< the pump thread
+    bool pump_up;              ///< the thread was started
+    pthread_mutex_t mu;        ///< guards everything below
+    pthread_cond_t cv;         ///< signalled on a queued copy, a landed one, and stop
+    std::list<lane_job> queue; ///< copies queued, in order
+    uint64_t queued;           ///< the last sequence number handed out
+    uint64_t landed;           ///< every copy with seq <= this has landed
+    bool failed;               ///< a copy failed: every later wait fails
+    bool stop;                 ///< destroy: drain, then exit
+};
+
+/// @param arg the lane
+/// @return NULL
+static void *lane_pump_main(void *arg) {
+    pulsar_gpu_lane *l = (pulsar_gpu_lane *)arg;
+    bool bound = cuda_ok(cudaSetDevice(l->device), "lane pump device");
+    pthread_mutex_lock(&l->mu);
+    for (;;) {
+        while (l->queue.empty() && !l->stop) pthread_cond_wait(&l->cv, &l->mu);
+        if (l->queue.empty()) break;
+        lane_job j = l->queue.front();
+        l->queue.pop_front();
+        pthread_mutex_unlock(&l->mu);
+        bool ok = bound && cuda_ok(cudaStreamWaitEvent(l->stream, j.fence, 0), "lane fence wait");
+        for (uint64_t at = 0; ok && at < j.bytes; at += PULSAR_GPU_LANE_PIECE_BYTES) {
+            const uint64_t n = j.bytes - at < PULSAR_GPU_LANE_PIECE_BYTES ? j.bytes - at : PULSAR_GPU_LANE_PIECE_BYTES;
+            ok = cuda_ok(cudaMemcpyAsync(j.dst + at, j.src + at, (size_t)n, cudaMemcpyDeviceToHost, l->stream),
+                         "lane device -> host") &&
+                 cuda_ok(cudaEventRecord(l->piece, l->stream), "lane piece record") &&
+                 cuda_ok(cudaEventSynchronize(l->piece), "lane piece wait");
+        }
+        (void)cudaEventDestroy(j.fence);
+        pthread_mutex_lock(&l->mu);
+        if (!ok) l->failed = true;
+        l->landed = j.seq;
+        pthread_cond_broadcast(&l->cv);
+    }
+    pthread_mutex_unlock(&l->mu);
+    return NULL;
+}
+
+pulsar_gpu_lane *pulsar_gpu_lane_create(uint32_t tickets) {
+    if (tickets == 0) return NULL;
+    pulsar_gpu_lane *l = new pulsar_gpu_lane();
+    pthread_mutex_init(&l->mu, NULL);
+    pthread_cond_init(&l->cv, NULL);
+    l->ticket = (lane_ticket *)calloc(tickets, sizeof(lane_ticket));
+    bool ok = l->ticket != NULL && cuda_ok(cudaGetDevice(&l->device), "lane device") &&
+              cuda_ok(cudaStreamCreateWithFlags(&l->stream, cudaStreamNonBlocking), "lane stream") &&
+              cuda_ok(cudaEventCreateWithFlags(&l->piece, cudaEventDisableTiming | cudaEventBlockingSync),
+                      "lane piece");   /* the pump sleeps on a piece, it does not spin a core */
+    for (uint32_t i = 0; ok && i < tickets; i++) {
+        ok = cuda_ok(cudaEventCreateWithFlags(&l->ticket[i].ev, cudaEventDisableTiming), "lane ticket");
+        if (ok) l->n = i + 1u;
+    }
+    if (ok) {
+        l->pump_up = pthread_create(&l->pump, NULL, lane_pump_main, l) == 0;
+        if (!l->pump_up) fprintf(stderr, "pulsar: copy lane: the pump thread could not start\n");
+        ok = l->pump_up;
+    }
+    if (!ok) {
+        pulsar_gpu_lane_destroy(l);
+        return NULL;
+    }
+    return l;
+}
+
+void pulsar_gpu_lane_destroy(pulsar_gpu_lane *lane) {
+    if (!lane) return;
+    if (lane->pump_up) {
+        pthread_mutex_lock(&lane->mu);
+        lane->stop = true;
+        pthread_cond_broadcast(&lane->cv);
+        pthread_mutex_unlock(&lane->mu);
+        pthread_join(lane->pump, NULL);   /* the queue drains first */
+    }
+    for (uint32_t i = 0; i < lane->n; i++) {
+        (void)cudaEventSynchronize(lane->ticket[i].ev);
+        (void)cudaEventDestroy(lane->ticket[i].ev);
+    }
+    if (lane->piece) (void)cudaEventDestroy(lane->piece);
+    if (lane->stream) (void)cudaStreamDestroy(lane->stream);
+    free(lane->ticket);
+    pthread_cond_destroy(&lane->cv);
+    pthread_mutex_destroy(&lane->mu);
+    delete lane;
+}
+
+/// @param lane   the lane (may be NULL)
+/// @param ticket a ticket index
+/// @return true when the lane holds it (said otherwise)
+static bool lane_ticket_ok(const pulsar_gpu_lane *lane, uint32_t ticket) {
+    if (lane && ticket < lane->n) return true;
+    fprintf(stderr, "pulsar: copy lane: ticket %u outside its table (%u)\n", ticket, lane ? lane->n : 0u);
+    return false;
+}
+
+/* The host waits until the pump's copy that last wrote `ticket` has landed (at once when it has).
+ * @return false when a lane copy failed (said by the pump) */
+/// @param lane   the lane
+/// @param ticket a valid ticket
+/// @return true when landed and no lane copy failed
+static bool lane_wait_copy(pulsar_gpu_lane *lane, uint32_t ticket) {
+    pthread_mutex_lock(&lane->mu);
+    const uint64_t seq = lane->ticket[ticket].seq;
+    while (lane->landed < seq && !lane->failed) pthread_cond_wait(&lane->cv, &lane->mu);
+    const bool ok = !lane->failed;
+    pthread_mutex_unlock(&lane->mu);
+    if (!ok) fprintf(stderr, "pulsar: copy lane: a device -> host copy failed\n");
+    return ok;
+}
+
+int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, uint64_t offset, void *dst,
+                        uint64_t bytes, const uint32_t *done, uint32_t n_done) {
+    for (uint32_t i = 0; i < n_done; i++)
+        if (!lane_ticket_ok(lane, done[i])) return 0;
+    if (!lane || !src || !dst || offset > src->bytes || bytes > src->bytes - offset) {
+        fprintf(stderr, "pulsar: copy lane: device -> host span out of range\n");
+        return 0;
+    }
+    if (bytes == 0 || src->dry) return 1;
+    lane_job j = {NULL, (const char *)src->ptr + offset, (char *)dst, bytes, 0};
+    if (!cuda_ok(cudaEventCreateWithFlags(&j.fence, cudaEventDisableTiming), "lane fence") ||
+        !cuda_ok(cudaEventRecord(j.fence, cudaStreamPerThread), "lane fence record")) {
+        if (j.fence) (void)cudaEventDestroy(j.fence);
+        return 0;
+    }
+    pthread_mutex_lock(&lane->mu);
+    j.seq = ++lane->queued;
+    for (uint32_t i = 0; i < n_done; i++) lane->ticket[done[i]].seq = j.seq;
+    lane->queue.push_back(j);
+    pthread_cond_broadcast(&lane->cv);
+    pthread_mutex_unlock(&lane->mu);
+    return 1;
+}
+
+int pulsar_gpu_lane_order(pulsar_gpu_lane *lane, uint32_t ticket) {
+    return lane_ticket_ok(lane, ticket) && lane_wait_copy(lane, ticket) &&
+           cuda_ok(cudaStreamWaitEvent(cudaStreamPerThread, lane->ticket[ticket].ev, 0), "lane order");
+}
+
+int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, uint64_t offset, const void *src,
+                        uint64_t bytes, uint32_t ticket) {
+    if (!lane_ticket_ok(lane, ticket)) return 0;
+    if (!dst || !src || offset > dst->bytes || bytes > dst->bytes - offset) {
+        fprintf(stderr, "pulsar: copy lane: host -> device span out of range\n");
+        return 0;
+    }
+    if (bytes == 0 || dst->dry) return 1;
+    return pulsar_gpu_lane_order(lane, ticket) &&
+           cuda_ok(cudaMemcpyAsync((char *)dst->ptr + offset, src, (size_t)bytes, cudaMemcpyHostToDevice,
+                                   cudaStreamPerThread), "lane host -> device") &&
+           cuda_ok(cudaEventRecord(lane->ticket[ticket].ev, cudaStreamPerThread), "lane ticket record");
+}
+
+int pulsar_gpu_lane_wait(pulsar_gpu_lane *lane, uint32_t ticket) {
+    if (!lane_ticket_ok(lane, ticket) || !lane_wait_copy(lane, ticket)) return 0;
+    pulsar_cuda_sync_note(0, 0);   /* a host wait, on one ticket */
+    return cuda_ok(cudaEventSynchronize(lane->ticket[ticket].ev), "lane wait");
+}
+
+int pulsar_gpu_lane_pending(pulsar_gpu_lane *lane, uint32_t ticket) {
+    if (!lane_ticket_ok(lane, ticket)) return -1;
+    pthread_mutex_lock(&lane->mu);
+    const bool copying = lane->landed < lane->ticket[ticket].seq;
+    pthread_mutex_unlock(&lane->mu);
+    if (copying) return 1;
+    const cudaError_t rc = cudaEventQuery(lane->ticket[ticket].ev);
+    if (rc == cudaErrorNotReady) {
+        (void)cudaGetLastError();
+        return 1;
+    }
+    return cuda_ok(rc, "lane query") ? 0 : -1;
 }
 
 

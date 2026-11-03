@@ -4576,7 +4576,7 @@ bool pulsar_tp_segment_key_ok(const char *key) {
 }
 
 int pulsar_tp_send_segment(pulsar_tp *tp, pulsar_tp_frame_type type, const pulsar_tp_segment_command *cmd) {
-    if (!cmd || !pulsar_tp_segment_key_ok(cmd->key) ||
+    if (!cmd || !pulsar_tp_segment_key_ok(cmd->key) || cmd->part > PULSAR_TP_SEGMENT_PART_RESTORE_POINT ||
         (type != PULSAR_TP_FRAME_SEGMENT_SAVE && type != PULSAR_TP_FRAME_SEGMENT_LOAD &&
          type != PULSAR_TP_FRAME_SEGMENT_DROP)) return 0;
     return tp_send_frame_to_peers(tp, (uint32_t)type, cmd, sizeof(*cmd));
@@ -5079,7 +5079,8 @@ int pulsar_tp_recv_command(pulsar_tp *tp, pulsar_tp_command *command,
     case PULSAR_TP_FRAME_SEGMENT_DROP:
         if (bytes != sizeof(command->segment)) { ok = 0; break; }
         memcpy(&command->segment, payload, sizeof(command->segment));
-        if (!pulsar_tp_segment_key_ok(command->segment.key)) { ok = 0; break; }
+        if (!pulsar_tp_segment_key_ok(command->segment.key) ||
+            command->segment.part > PULSAR_TP_SEGMENT_PART_RESTORE_POINT) { ok = 0; break; }
         command->session_id = command->segment.session_id;
         break;
     case PULSAR_TP_FRAME_SEGMENT_RECONCILE: {

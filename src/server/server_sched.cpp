@@ -1120,7 +1120,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
-        s->kv_cache_persist(sl, "evict", true);
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT);
         stored = true;
     }
     if (!stored && live_tokens > 0) {
@@ -2401,7 +2401,18 @@ bool server::spill_bank(session_slot *victim) {
         return false;
     }
     const double t0 = server_now_sec();
-    s->kv_cache_persist(victim, "spill", true);
+    /* L347 I3a: the bank is freed only once its history is copied out.  A copy-out that found no room in the host
+     * pool (and nothing in flight to make it) leaves the history unwritten: the spill FAILS -- counted, said -- and the
+     * bank stays resident (the WIP freed it anyway and lost the history); the guard stops this round and tries again
+     * on a later turn, when the writer has drained. */
+    bool no_room = false;
+    s->kv_cache_persist(victim, KV_PERSIST_SPILL, nullptr, &no_room);
+    if (no_room) {
+        s->count_metric(&s->m_spill_no_room);
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %u spill refused: its copy-out found no room in the "
+                   "kv cache's host pool -- the bank stays resident", vb);
+        return false;
+    }
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
     if (!pulsar_session_bank_state_restore(pool, (uint32_t)park)) return false;
     s->live_bank = park;
@@ -3520,7 +3531,7 @@ bool server::fuse_prepare(session_slot *sl) {
     if (!s->bank_switch(sl->bank)) {
         snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
                  (unsigned)sl->bank);
-        s->gen_prefill_fail(sl, false);
+        s->gen_prefill_fail(sl);
         return false;
     }
     const TokPos pos = pulsar_session_pos(pool);
@@ -3995,7 +4006,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             for (int r = 0; r < n_fr; r++) {
                 gen_state *pg = fr[r].sl->gen;
                 snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
-                s->gen_prefill_fail(fr[r].sl, false);   /* shared by every rider: no one file is implicated */
+                s->gen_prefill_fail(fr[r].sl);
                 s->worker_finish_slot(fr[r].sl);        /* L282 */
             }
             for (int q = 0; q < m; q++) {
@@ -4035,7 +4046,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 pulsar_session_note_prefilled(pool, pg->prompt_for_sync->v + fr[r].p0, fr[r].k, head) != 0) {
                 snprintf(pg->err, sizeof pg->err, "bank %u: the fused prompt chunk could not be recorded",
                          (unsigned)c->bank);
-                s->gen_prefill_fail(c, false);
+                s->gen_prefill_fail(c);
                 s->worker_finish_slot(c);   /* L282 (the bank stays assigned: the save below reads it) */
             } else {
                 /* The classic sync's per-chunk callback: slot progress for

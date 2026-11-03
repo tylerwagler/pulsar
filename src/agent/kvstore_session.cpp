@@ -193,7 +193,10 @@ int agent_kv_load(agent_worker *w, const pulsar_tokens *tokens) {
 void agent_kv_persist(agent_worker *w, const char *what) {
     if (!w->kv) return;
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(w->kv, w->engine, w->session, 0, true, NULL, &r);
+    const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(w->kv);   /* the agent persists and loads in one breath */
+    /* a saved session is a history about to leave the process: its chain end gets a restore point (L347 I2) */
+    pulsar_kvchain_persist(w->kv, w->engine, w->session, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl,
+                           &r);
     if (r.err[0]) {
         agent_buf b = {0};
         agent_buf_puts(&b, "pulsar-agent: ");
