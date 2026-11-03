@@ -41,8 +41,8 @@
 #include "exl3_moe_prefill.cuh"   /* exl3_moe_act */
 
 /** One layer's routed EXL3 stacks: exl3_expert_table() pointer pairs over the experts this rank holds.  Three forms:
- *  FUSED (gate_up), PAIR (gate + up) -- both SwiGLU -- and (L296) UP-ONLY (up alone, gate and gate_up NULL): an
- *  ungated expert, act = PULSAR_FFN_ACT_RELU2 (pulsar_cuda_qwen.h), h = relu(up x)^2. */
+ *  FUSED (gate_up, SwiGLU), PAIR (gate + up: SwiGLU, or (L338) GeGLU-tanh) and (L296) UP-ONLY (up alone, gate and
+ *  gate_up NULL): an ungated expert, act = PULSAR_FFN_ACT_RELU2 (pulsar_cuda_qwen.h), h = relu(up x)^2. */
 struct exl3_moe_stacks {
     const void *gate_up;            ///< the FUSED [in -> 2 mid] slices (gate rows, then up rows), or NULL
     /// The PAIR form's gate slices [in -> mid], or NULL (FUSED and UP-ONLY).
@@ -58,7 +58,7 @@ struct exl3_moe_stacks {
      *  the output width (a multiple of 128) */
     /// The input width (a multiple of 128).
     int in_dim, mid_dim, out_dim;
-    int act;                        ///< pulsar_ffn_act: 0 SWIGLU (fused / pair), 1 RELU2 (up-only); 0 when unnamed
+    int act;                        ///< pulsar_ffn_act: 0 SWIGLU (fused / pair), 1 RELU2 (up-only), 2 GEGLU_TANH (pair)
 };
 
 /** The caller's buffers.  gate_z [pairs][mid] (fused: [pairs][2 mid]), up_z [pairs][mid] (pair form only),

@@ -8,6 +8,8 @@ KINDS (the engine's k_kinds table, spec_block.cpp, reads each one's config under
   lilicorr   NVIDIA's LiLiCorr drafter for Nemotron 3.5 Super (ModelOpt W4A16_NVFP4, its own lm_head) -- below
   dflash2    z-lab's DFlash2 drafter (incoai/Qwen3.8-Flash-Next-DFlash2: BF16, binds the TARGET's lm_head, a
              CandidateSelector head) -- the DFlash2 section
+  dflash     z-lab's plain DFlash drafter (z-lab/gemma-4-26B-A4B-it-DFlash, L338: no convolutions, no chain head,
+             window / full layers, the target's embedding and lm_head as the target holds them) -- the DFlash section
 
 Container names are the drafter's HF names under DRAFTER (`drafter.layers.0.mlp.gate_proj.weight`), all in shard
 `drafter`; every tensor carries its bind record (role / block / layer): the backbone block `drafter`, the chain head's
@@ -297,6 +299,9 @@ class Drafter:
         if kind == "dflash2":
             dflash2_build(self, target)
             return
+        if kind == "dflash":
+            dflash_build(self, target)
+            return
         dims, self.kvs = lili_config(self.ckpt.config["top_level"], target)
         table = _lili_table(dims)
         lili_check_exclude(table, dims["exclude"])
@@ -551,4 +556,114 @@ def dflash2_build(self: Drafter, target: Target):
                                   bind=(("role", "head_ids"), ("block", "drafter")))
 
 
-KINDS = ("lilicorr", "dflash2")
+# ---------------------------------------------------------------------------
+# DFlash (L338): z-lab's plain DFlash block drafter (DFlashDraftModel; z-lab/gemma-4-26B-A4B-it-DFlash for Gemma 4
+# 26B-A4B) -- the same backbone as DFlash2 / LiLiCorr (Qwen3-style non-causal layers fed by the target's hidden states
+# at dflash_config.target_layer_ids through `fc`) WITHOUT the grouped convolutions and WITHOUT a chain head: each slot
+# is the head's own top-k (the engine's PLAIN head).  Its layers are sliding_attention or full_attention by
+# layer_types; it reads the TARGET's input embedding and the TARGET's lm_head as the target holds them (the engine
+# binds both -- nothing derived here), and soft-caps its logits (final_logit_softcapping).  BF16 throughout; the
+# formats are the recipe's (format-maps/gemma4-exl3-k4-dflash.json: the Linears f16 on Turing, the rest as stored).
+#
+# Recipe roles: `drafter_linear` (f16 or bf16), `drafter_native` (as stored).
+# ---------------------------------------------------------------------------
+DF_TOP = {"fc.weight": ("fc", True), "hidden_norm.weight": ("hidden_norm", False), "norm.weight": ("out_norm", False)}
+DF_LAYER = {"input_layernorm.weight": ("in_norm", False), "post_attention_layernorm.weight": ("post_norm", False),
+            "self_attn.q_proj.weight": ("attn_q", True), "self_attn.k_proj.weight": ("attn_k", True),
+            "self_attn.v_proj.weight": ("attn_v", True), "self_attn.o_proj.weight": ("attn_o", True),
+            "self_attn.q_norm.weight": ("q_norm", False), "self_attn.k_norm.weight": ("k_norm", False),
+            "mlp.gate_proj.weight": ("mlp_gate", True), "mlp.up_proj.weight": ("mlp_up", True),
+            "mlp.down_proj.weight": ("mlp_down", True)}
+DF_WRITE = ("hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "head_dim",
+            "intermediate_size", "hidden_act", "rms_norm_eps", "vocab_size", "max_position_embeddings",
+            "attention_bias", "rope_theta", "tie_word_embeddings", "num_target_layers", "layer_types",
+            "sliding_window", "use_sliding_window", "max_window_layers", "dflash_config", "bos_token_id",
+            "eos_token_id", "block_size", "final_logit_softcapping")
+DF_IGNORE = {
+    "architectures": "pinned [DFlashDraftModel]; pulsar.drafter names the drafter",
+    "model_type": "pinned qwen3 (the backbone's HF class); pulsar.drafter names the drafter",
+    "dtype": "every tensor's dtype is checked against the declaration instead",
+    "initializer_range": "training only",
+    "attention_dropout": "training only (pinned 0.0)",
+    "pad_token_id": "no padding in a draft block",
+    "transformers_version": "provenance of the checkpoint's writer",
+    "use_cache": "an HF generate() switch; the engine keeps the drafter's KV as its declared state",
+    "rope_scaling": "pinned null: the native rope",
+}
+DF_DFLASH = ("mask_token_id", "target_layer_ids")
+DF_PIN = {"architectures": ["DFlashDraftModel"], "model_type": "qwen3", "hidden_act": "silu", "attention_bias": False,
+          "tie_word_embeddings": False, "use_sliding_window": True, "attention_dropout": 0.0, "rope_scaling": None}
+
+
+def dflash_build(self: Drafter, target: Target):
+    """The plain DFlash checkpoint checked against the declaration and the target -> self.kvs, self.mapped."""
+    top = self.ckpt.config["top_level"]
+    unknown = sorted(set(top) - set(DF_WRITE) - set(DF_IGNORE))
+    if unknown:
+        raise SystemExit(f"drafter config.json: key {unknown[0]!r} is neither written nor ignored by the DFlash "
+                         f"declaration -- refusing (all unknown: {unknown})")
+    for k, want in DF_PIN.items():
+        got = top.get(k, "<absent>")
+        if got != want or type(got) is not type(want):
+            raise SystemExit(f"drafter config.json {k} = {got!r}; the DFlash declaration implements {want!r} -- "
+                             f"refusing")
+    dfl = top.get("dflash_config")
+    if not isinstance(dfl, dict) or sorted(dfl) != sorted(DF_DFLASH):
+        raise SystemExit(f"drafter config.json dflash_config {dfl!r}: the declaration reads {list(DF_DFLASH)}")
+    w = "the top level"
+    H, nl = _df2_int(top, "hidden_size", w), _df2_int(top, "num_hidden_layers", w)
+    nq, nkv, hd = _df2_int(top, "num_attention_heads", w), _df2_int(top, "num_key_value_heads", w), _df2_int(top, "head_dim", w)
+    V, nt, ff = _df2_int(top, "vocab_size", w), _df2_int(top, "num_target_layers", w), _df2_int(top, "intermediate_size", w)
+    _df2_int(top, "block_size", w, lo=2)
+    _df2_int(top, "sliding_window", w)
+    if H != target.hidden or V != target.vocab or nt != target.n_blocks:
+        raise SystemExit(f"drafter config.json: hidden_size {H} / vocab_size {V} / num_target_layers {nt}; the target's "
+                         f"are {target.hidden} / {target.vocab} / {target.n_blocks} -- refusing")
+    lt = top.get("layer_types")
+    if (not isinstance(lt, list) or len(lt) != nl or
+            any(t not in ("sliding_attention", "full_attention") for t in lt)):
+        raise SystemExit(f"drafter config.json layer_types {lt!r}: one of sliding_attention / full_attention per layer")
+    sc = top.get("final_logit_softcapping")
+    if not isinstance(sc, (int, float)) or isinstance(sc, bool) or not sc > 0:
+        raise SystemExit(f"drafter config.json final_logit_softcapping {sc!r}: a positive soft-cap")
+    if not _df2_int(dfl, "mask_token_id", "dflash_config", lo=0) < V:
+        raise SystemExit(f"drafter config.json dflash_config.mask_token_id: inside the vocabulary ({V})")
+    tl = dfl.get("target_layer_ids")
+    if (not isinstance(tl, list) or not tl or any(not isinstance(x, int) or isinstance(x, bool) or not 0 <= x < nt
+                                                  for x in tl)):
+        raise SystemExit(f"drafter config.json dflash_config.target_layer_ids {tl!r}: HF block indices < {nt}")
+    self.kvs = []
+    for k in DF_WRITE:
+        n0 = len(self.kvs)
+        KV.config_kvs(f"dflash.{k}", float(top[k]) if k == "final_logit_softcapping" else top[k], self.kvs)
+        if len(self.kvs) == n0:
+            raise SystemExit(f"drafter config.json {k} = {top[k]!r}: nothing to write (null / empty) -- refusing")
+    lay = {"input_layernorm.weight": [H], "post_attention_layernorm.weight": [H],
+           "self_attn.q_proj.weight": [nq * hd, H], "self_attn.k_proj.weight": [nkv * hd, H],
+           "self_attn.v_proj.weight": [nkv * hd, H], "self_attn.o_proj.weight": [H, nq * hd],
+           "self_attn.q_norm.weight": [hd], "self_attn.k_norm.weight": [hd],
+           "mlp.gate_proj.weight": [ff, H], "mlp.up_proj.weight": [ff, H], "mlp.down_proj.weight": [H, ff]}
+    table = {"fc.weight": ([H, len(tl) * H], *DF_TOP["fc.weight"]), "hidden_norm.weight": ([H], *DF_TOP["hidden_norm.weight"]),
+             "norm.weight": ([H], *DF_TOP["norm.weight"])}
+    for i in range(nl):
+        for sfx, s in lay.items():
+            table[f"layers.{i}.{sfx}"] = (s, *DF_LAYER[sfx])
+    self.mapped = {}
+    for n, (shp, bind, linear) in table.items():
+        layer = int(n.split(".")[1]) if n.startswith("layers.") else None
+        rec = (("role", bind), ("block", "drafter")) + ((("layer", layer),) if layer is not None else ())
+        self.mapped[DRAFTER + n] = Mapped(DRAFTER + n, DRAFTER + n, "drafter", "drafter", layer, None, None, False,
+                                         role="drafter_linear" if linear else "drafter_native", bind=rec)
+    have = set(self.ckpt.names())
+    unknown = sorted(have - set(table))
+    missing = sorted(set(table) - have)
+    if unknown or missing:
+        raise SystemExit(f"the DFlash checkpoint {self.dir} and the declaration disagree -- refusing: not declared "
+                         f"{unknown[:5]}, missing {missing[:5]}")
+    wrong = [f"{n}: {self.ckpt.dtype(n)} {self.ckpt.shape(n)}, the declaration says BF16 {s}"
+             for n, (s, *_r) in table.items() if (self.ckpt.dtype(n), self.ckpt.shape(n)) != ("BF16", s)]
+    if wrong:
+        raise SystemExit(f"{len(wrong)} drafter tensors disagree with the declaration -- refusing: {wrong[:3]}")
+
+
+KINDS = ("lilicorr", "dflash2", "dflash")

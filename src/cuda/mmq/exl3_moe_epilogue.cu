@@ -11,6 +11,7 @@
 #include "exl3_moe_epilogue.cuh"
 #include "ds4_exl3_dev.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
+#include "cuda/pulsar_cuda_qwen.h"   /* pulsar_ffn_act: the fold's activation */
 #include "engine/exl3_trellis.h"
 
 #include <cstdint>
@@ -20,10 +21,11 @@ namespace {
 
 /* One warp per (pair, 128-block of mid); lane l holds mid columns 4l..4l+3
  * of the block.  The four values per lane make one 32-element MX group an
- * EIGHT-lane group, as in moe_mmq_swiglu_fold_v4_kernel.  UP_ONLY (L296): the
- * up-only fold -- no gate projection (gate_z / gate_table unread), the
- * activation relu(y_u)^2 (pulsar_relu2_elem) with the route weight folded in;
- * every other step is the gated fold's, unchanged. */
+ * EIGHT-lane group, as in moe_mmq_swiglu_fold_v4_kernel.  ACT (a pulsar_ffn_act):
+ * SWIGLU and (L338) GEGLU_TANH are the gated folds (pulsar_swiglu_elem /
+ * pulsar_geglu_tanh_elem); RELU2 (L296) the up-only fold -- no gate projection
+ * (gate_z / gate_table unread), the activation relu(y_u)^2 (pulsar_relu2_elem)
+ * with the route weight folded in; every other step is the same fold. */
 /// The fold (ds4_exl3_moe_fold*_launch).  Grid ceil(pairs * mid_dim / 128 / 8), 256 threads: one warp per
 /// (pair, 128-block of mid).
 /// @param gate_z          gate projection's unrotated z, f32 [pairs][z_stride] (unread when UP_ONLY)
@@ -38,14 +40,14 @@ namespace {
 /// @param in_dim          the gate / up input width
 /// @param mid_dim         the mid width, a multiple of 128
 /// @param pairs           tokens x slots
-/// @param clamp           the SwiGLU clamp (pulsar_swiglu_elem); unused when UP_ONLY
+/// @param clamp           the SwiGLU clamp (pulsar_swiglu_elem); unused by RELU2 and GEGLU_TANH
 /// @param mid_q           E4M3 mid [pairs][mid_dim], or NULL
 /// @param mid_sf          the mid's per-32 ue8m0 scales (pulsar_mx_sfoff layout), with mid_q
 /// @param mid_bf16        bf16 mid [pairs][mid_dim], or NULL
 /// @param mid_kbp         the scale plane's k-block pitch (pulsar_mx_sfoff)
 /// @param z_splits        K-split partials to add in split order (1: none)
 /// @param z_split_stride  floats between consecutive splits
-template <bool UP_ONLY>
+template <int ACT>
 __global__ void __launch_bounds__(256)
 exl3_moe_fold_kernel(const float *__restrict__ gate_z,
                      const float *__restrict__ up_z,
@@ -77,6 +79,7 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
     const __half *suh_d = reinterpret_cast<const __half *>(pd[2 * (size_t)e + 1]);
     const int col0 = blk * 128 + lane * 4;
     const float wv = weights[pair];
+    constexpr bool UP_ONLY = ACT == PULSAR_FFN_ACT_RELU2;   /* the gated activations read the gate too */
     float g[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if constexpr (!UP_ONLY) {
         const float4 g4 = *reinterpret_cast<const float4 *>(gate_z + pair * z_stride + col0);
@@ -109,7 +112,10 @@ exl3_moe_fold_kernel(const float *__restrict__ gate_z,
         for (int j = 0; j < 4; ++j) {
             const float yg = g[j] * __half2float(svh_g[col0 + j]);
             const float yu = u[j] * __half2float(svh_u[col0 + j]);
-            t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
+            if constexpr (ACT == PULSAR_FFN_ACT_GEGLU_TANH)
+                t[j] = pulsar_geglu_tanh_elem(yg, yu, wv) * __half2float(suh_d[col0 + j]);
+            else
+                t[j] = pulsar_swiglu_elem(yg, yu, wv, clamp) * __half2float(suh_d[col0 + j]);
         }
     }
     exl3dev::had128(t);
@@ -249,19 +255,31 @@ int ds4_exl3_moe_fold_launch(const float *gate_z, const float *up_z, const int32
                              const float *weights, const void *gate_table, const void *up_table,
                              const void *down_table, int in_dim, int mid_dim, int64_t pairs,
                              float clamp, void *mid_q, void *mid_sf, int mid_kbp, cudaStream_t stream, void *mid_bf16,
-                             int z_splits, int64_t z_split_stride) {
+                             int z_splits, int64_t z_split_stride, int act) {
     if (!gate_z || !up_z || !selected || !weights || !gate_table || !up_table || !down_table ||
         (!mid_q || !mid_sf) && !mid_bf16 || pairs <= 0 || in_dim <= 0 || mid_dim <= 0 || mid_dim % EXL3_HAD_BLOCK ||
         z_splits < 1) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: null pointer or bad shape (mid_dim %% 128)\n");
         return -1;
     }
+    if ((act != PULSAR_FFN_ACT_SWIGLU && act != PULSAR_FFN_ACT_GEGLU_TANH) ||
+        (act == PULSAR_FFN_ACT_GEGLU_TANH && clamp != 0.0f)) {
+        fprintf(stderr, "ds4_exl3_moe_fold_launch: activation %d (clamp %g): the pair folds SwiGLU or (unclamped) "
+                        "GeGLU-tanh -- refusing\n", act, (double)clamp);
+        return -1;
+    }
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_fold_kernel<false><<<blocks, 256, 0, stream>>>(
-        gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
-        clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits,
-        z_split_stride);
+    if (act == PULSAR_FFN_ACT_GEGLU_TANH)
+        exl3_moe_fold_kernel<PULSAR_FFN_ACT_GEGLU_TANH><<<blocks, 256, 0, stream>>>(
+            gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
+            clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits,
+            z_split_stride);
+    else
+        exl3_moe_fold_kernel<PULSAR_FFN_ACT_SWIGLU><<<blocks, 256, 0, stream>>>(
+            gate_z, up_z, mid_dim, selected, weights, gate_table, up_table, in_dim, down_table, in_dim, mid_dim, pairs,
+            clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits,
+            z_split_stride);
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_exl3_moe_fold_launch: launch failed: %s\n", cudaGetErrorString(err));
@@ -283,7 +301,7 @@ int ds4_exl3_moe_fold_fused_launch(const float *gate_up_z, const int32_t *select
      * plane is suh [in_dim] | svh [2 mid], so up's svh starts at in_dim + mid */
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_fold_kernel<false><<<blocks, 256, 0, stream>>>(
+    exl3_moe_fold_kernel<PULSAR_FFN_ACT_SWIGLU><<<blocks, 256, 0, stream>>>(
         gate_up_z, gate_up_z + mid_dim, 2 * mid_dim, selected, weights, gate_up_table, gate_up_table, in_dim + mid_dim,
         down_table, in_dim, mid_dim, pairs, clamp, (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp,
         z_splits, z_split_stride);
@@ -305,7 +323,7 @@ int ds4_exl3_moe_fold_up_launch(const float *up_z, const int32_t *selected, cons
     }
     const int64_t tasks = pairs * (mid_dim >> 7);
     const unsigned blocks = (unsigned)((tasks + 7) / 8);
-    exl3_moe_fold_kernel<true><<<blocks, 256, 0, stream>>>(
+    exl3_moe_fold_kernel<PULSAR_FFN_ACT_RELU2><<<blocks, 256, 0, stream>>>(
         nullptr, up_z, mid_dim, selected, weights, nullptr, up_table, in_dim, down_table, in_dim, mid_dim, pairs, 0.0f,
         (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, (__nv_bfloat16 *)mid_bf16, mid_kbp, z_splits, z_split_stride);
     const cudaError_t err = cudaGetLastError();

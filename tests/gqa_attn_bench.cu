@@ -9,6 +9,7 @@
  *               32K / 128K context, DRAM-cold (each sequence its own pool, an
  *               L2 flush between calls): time per call, the KV bytes it must
  *               read, GB/s against the measured read bandwidth
+ *   (L338, GQA_BENCH_GEMMA=1 alone) Gemma 4's wide-head verify by decode group (pulsar_gqa_io::decode_group)
  *   prefill     a 4096-row chunk at position 0 and at 32K: time, attention
  *               FLOPs (4 * n_q * head_dim per (row, key) attended; the P V hi
  *               / lo pair counts once), TFLOPS against the measured mma rate
@@ -38,6 +39,7 @@ __global__ void read_kernel(const uint4 *p, uint64_t n, uint32_t *sink) {
 }
 __global__ void mma_kernel(float *sink, int iters) {
     float d[4][4] = {};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800   /* bf16 m16n8k16 is sm_80+: on Turing the rate reads 0 */
     uint32_t a = threadIdx.x * 0x3c003c00u, b = 0x3c003c00u ^ threadIdx.x;
     for (int i = 0; i < iters; i++) {
         #pragma unroll
@@ -46,6 +48,9 @@ __global__ void mma_kernel(float *sink, int iters) {
                          : "+f"(d[j][0]), "+f"(d[j][1]), "+f"(d[j][2]), "+f"(d[j][3])
                          : "r"(a), "r"(b), "r"(a), "r"(b), "r"(b), "r"(a));
     }
+#else
+    (void)iters;
+#endif
     float s = 0;
     for (int j = 0; j < 4; j++) s += d[j][0] + d[j][1] + d[j][2] + d[j][3];
     if (s == 1234.5f) *sink = s;
@@ -140,6 +145,52 @@ static std::vector<pulsar_gqa_seq> make_pools(const pulsar_gqa_layer &L, uint32_
 }
 static void free_pools(std::vector<pulsar_gqa_seq> &v) { for (auto &s : v) CK(cudaFree(s.kv)); }
 
+/* L338: Gemma 4's wide heads (window 16q/8kv/256 over 1024 keys, global 16q/2kv/512): a verify of `rows` rows of one
+ * sequence at `ctx` on the flash-decoding arm, `group` rows a CTA (pulsar_gqa_io::decode_group), DRAM-cold */
+static double time_gemma(bool window, uint32_t ctx, uint32_t rows, int group) {
+    pulsar_gqa_layer L{};
+    const uint32_t HD = window ? 256u : 512u, NKV = window ? 8u : 2u, NQ = 16u;
+    L.n_q = NQ; L.n_kv = NKV; L.head_dim = HD; L.kv_fmt = PULSAR_GQA_KV_BF16;
+    L.span = window ? PULSAR_GQA_WINDOW : PULSAR_GQA_FULL; L.window = window ? 1024u : 0u;
+    L.scale = 1.0f; L.qk_norm = 1; L.norm_eps = 1e-6f; L.rope_theta = 10000.f;
+    uint16_t *qw = rand_bf16(HD, 1.f), *kw = rand_bf16(HD, 1.f);
+    L.q_norm_w = qw; L.k_norm_w = kw;
+    std::vector<pulsar_gqa_seq> seqs = make_pools(L, 1, window ? 1024u + 15u : ctx + 32u);
+    const uint32_t ld = (NQ + 2u * NKV) * HD, p0 = ctx - rows;
+    std::vector<uint32_t> rs(rows, 0u), rp(rows);
+    for (uint32_t i = 0; i < rows; i++) rp[i] = p0 + i;
+    uint16_t *in = rand_bf16((uint64_t)rows * ld, 1.f);
+    __nv_bfloat16 *out;
+    CK(cudaMalloc(&out, (uint64_t)rows * NQ * HD * 2));
+    const uint64_t wsb = pulsar_gqa_workspace_bytes(&L, rows, ctx);
+    void *ws;
+    CK(cudaMalloc(&ws, wsb));
+    pulsar_gqa_io io{};
+    io.q = {in, ld, HD}; io.k = {in + NQ * HD, ld, HD}; io.v = {in + (NQ + NKV) * HD, ld, HD};
+    io.out_bf16 = out; io.ld_out = NQ * HD; io.workspace = ws; io.workspace_bytes = wsb;
+    io.decode_rows = getenv("GQA_BENCH_MMA") ? 0 : 1;   /* GQA_BENCH_MMA: the MMA tile arm (the prompt rows') instead */
+    if (const char *arm = getenv("GQA_BENCH_ARM")) pulsar_gqa_decode_arm_force(atoi(arm));   /* 1 flash, 2 MMA decode */
+    io.decode_group = group;
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    double ms_total = 0;
+    const int iters = 30;
+    for (int it = -1; it < iters; it++) {
+        flush_l2();
+        CK(cudaEventRecord(e0, 0));
+        if (pulsar_gqa_forward(&L, seqs.data(), 1, rs.data(), rp.data(), rows, &io, 0) != 0) { fprintf(stderr, "refused\n"); exit(2); }
+        CK(cudaEventRecord(e1, 0));
+        CK(cudaEventSynchronize(e1));
+        float ms;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        if (it >= 0) ms_total += ms;
+    }
+    CK(cudaFree(in)); CK(cudaFree(out)); CK(cudaFree(ws)); CK(cudaFree(qw)); CK(cudaFree(kw));
+    free_pools(seqs);
+    CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+    return ms_total / iters;
+}
+
 int main() {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
@@ -148,6 +199,36 @@ int main() {
     uint32_t *sink;
     CK(cudaMalloc(&sink, 64));
 
+    if (const char *one = getenv("GQA_BENCH_CASE")) {   /* L338: one Gemma case (a profiler's target): w,ctx,rows,group */
+        int w = 0, group = 1;
+        unsigned ctx = 0, rows = 0;
+        if (sscanf(one, "%d,%u,%u,%d", &w, &ctx, &rows, &group) != 4 || ctx < rows || rows == 0) {
+            fprintf(stderr, "GQA_BENCH_CASE=window(0|1),ctx,rows,group\n");
+            return 2;
+        }
+        printf("  %s ctx %u %u rows group %d: %.1f us\n", w ? "window" : "global", ctx, rows, group,
+               time_gemma(w != 0, ctx, rows, group) * 1e3);
+        return 0;
+    }
+    if (getenv("GQA_BENCH_GEMMA")) {   /* L338: the wide heads' flash-decoding, every CTA shape (rows x heads) */
+        printf("gemma4 flash-decoding (DRAM-cold): layer, ctx, rows -> us/call by CTA shape rows x heads (forced); "
+               "'pick' = the launch's own\n");
+        const int shapes[4][2] = {{1, 1}, {1, 2}, {1, 4}, {2, 2}};
+        for (int w = 1; w >= 0; w--)
+            for (uint32_t ctx : {512u, 2048u, 8192u, 32768u})
+                for (uint32_t rows : {1u, 2u, 4u, 8u, 16u}) {
+                    printf("  %-6s ctx %5u %2u rows:", w ? "window" : "global", ctx, rows);
+                    for (const auto &sh : shapes) {
+                        if (w && sh[1] > 2) continue;                       /* G = 2 */
+                        if ((uint32_t)sh[0] > rows) continue;
+                        pulsar_gqa_decode_force(sh[0], sh[1]);
+                        printf("  %dx%d %7.1f", sh[0], sh[1], time_gemma(w, ctx, rows, 4) * 1e3);
+                    }
+                    pulsar_gqa_decode_force(0, 0);
+                    printf("  pick %7.1f\n", time_gemma(w, ctx, rows, 4) * 1e3);
+                }
+        return 0;
+    }
     /* ---- roofline */
     double bw = 0, tf = 0;
     {

@@ -79,6 +79,13 @@ FAMILIES = {
         'kv': 'nemotron_h.hidden_size',
         'stack': 'language_model.backbone.layers.1.mixer.experts.up_proj',
     },
+    'gemma4': {   # L338: Gemma 4 26B-A4B (layer 1 a window layer: every layer is dense MLP + MoE)
+        'tensor': 'model.language_model.layers.1.self_attn.q_proj.weight',   # an EXL3 dense linear
+        'tensor_record': 'role attn_q, block layers, layer 1',
+        'plain': 'model.language_model.layers.1.router.proj.weight',        # the router, bf16 [2816 -> 128]
+        'kv': 'gemma4.hidden_size',
+        'stack': 'model.language_model.layers.1.experts.gate_proj',
+    },
 }
 MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',

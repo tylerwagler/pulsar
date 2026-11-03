@@ -1,0 +1,1618 @@
+[
+{
+"start_reasoning": false,
+"text": "Just content.  ",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "Just content.  ",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought\nlet me think\n<channel|>The answer.",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "let me think",
+"content": "The answer.",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought\nr<channel|>\n\nAnswer\n",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "r",
+"content": "\n\nAnswer\n",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought<channel|>Bare label.",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "Bare label.",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>no label here<channel|>x",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "no label here",
+"content": "x",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought\n<|channel>repeated open<channel|>a",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "repeated open",
+"content": "a",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "answer<channel|> tail",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "answer tail",
+"calls": []
+}
+},
+{
+"start_reasoning": true,
+"text": "continued reasoning<channel|>final",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "continued reasoning",
+"content": "final",
+"calls": []
+}
+},
+{
+"start_reasoning": true,
+"text": "thought\nlabelled again<channel|>final",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "labelled again",
+"content": "final",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"city": "Paris",
+"days": 3,
+"metric": true
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "Let me check.<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "Let me check.",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"city": "Oslo"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought\nneed the tool<|tool_call>call:run{cmd:<|\"|>ls -la<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "need the tool",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "ls -la"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:run{cmd:<|\"|>a<|\"|>}<tool_call|><|tool_call>call:run{cmd:<|\"|>b<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "a"
+}
+},
+{
+"name": "run",
+"arguments": {
+"cmd": "b"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:get_weather{tags:[<|\"|>x<|\"|>,<|\"|>y<|\"|>],opts:{k:1,deep:{z:<|\"|>q<|\"|>}},ratio:2.5}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"tags": [
+"x",
+"y"
+],
+"opts": {
+"k": "1",
+"deep": {
+"z": "q"
+}
+},
+"ratio": 2.5
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:get_weather{zip:12345}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "get_weather",
+"arguments": {
+"zip": "12345"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:unknown_fn{n:42,f:1.5,b:false,z:null,s:<|\"|>v<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "unknown_fn",
+"arguments": {
+"n": "42",
+"f": "1.5",
+"b": "false",
+"z": "null",
+"s": "v"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:run{}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:run<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>:run{cmd:<|\"|>bare colon<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "bare colon"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:run{cmd:<|\"|>has } brace and , comma<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "has } brace and , comma"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "<|tool_call>call:run{cmd:<|\"|>multi\nline\n<|\"|>}<tool_call|> trailing words",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "multi\nline\n"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "  \n<|tool_call>call:run{cmd:<|\"|>x<|\"|>}<tool_call|>",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "x"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "cut <|tool_call>call:run{cmd:<|\"|>unterminated",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "cut",
+"calls": [
+{
+"name": "run",
+"arguments": {
+"cmd": "unterminated"
+}
+}
+]
+}
+},
+{
+"start_reasoning": false,
+"text": "text with <bos> and <|turn> dropped",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "text with  and  dropped",
+"calls": []
+}
+},
+{
+"start_reasoning": false,
+"text": "<|channel>thought\n",
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string"
+},
+"days": {
+"type": "integer"
+},
+"metric": {
+"type": "boolean"
+},
+"zip": {
+"type": "string"
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object"
+},
+"ratio": {
+"type": "number"
+}
+}
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "run",
+"parameters": {
+"type": "object",
+"properties": {
+"cmd": {
+"type": "string"
+}
+}
+}
+}
+}
+],
+"expect": {
+"reasoning": "",
+"content": "",
+"calls": []
+}
+}
+]

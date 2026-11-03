@@ -198,6 +198,71 @@ static void logits_tests() {
     cudaFree(d);
 }
 
+/* L338: Gemma 4's two head facts -- the scaled embedding and the soft-capped logits */
+static void gemma4_tests() {
+    printf("\n== Gemma 4: the embedding times bf16(sqrt 2816) = 53, the logits soft-capped at 30 ==\n");
+    const uint32_t H = 2816, V = 64, n = 6;
+    const uint64_t ld = H + 32;
+    Rng g(338);
+    std::vector<uint16_t> table((size_t)V * H);
+    for (auto &x : table) x = sref_f2bf((float)(0.05 * g.n()));
+    const float s = sref_bf2f(sref_f2bf(53.0660f));   /* HF: the f32 sqrt(2816), cast to the weight dtype: 53 */
+    uint16_t *d_table, *d_out;
+    int32_t *d_ids;
+    const int32_t ids[n] = {0, 17, 63, 17, 5, 40};
+    CK(cudaMalloc(&d_table, table.size() * 2));
+    CK(cudaMalloc(&d_out, (size_t)n * ld * 2));
+    CK(cudaMalloc(&d_ids, sizeof ids));
+    CK(cudaMemcpy(d_table, table.data(), table.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ids, ids, sizeof ids, cudaMemcpyHostToDevice));
+    pulsar_head_decl h{H, nullptr, 0.0f, 262144, 262144, 1.0f};
+    h.softcap = 30.0f;
+    h.embed_scale = s;
+    check(s == 53.0f, "the bf16-rounded scale is 53 (got %g)", (double)s);
+    check(pulsar_head_embed_launch(&h, d_table, V, d_ids, n, d_out, ld, 0) == 0, "%u scaled embedding rows", n);
+    std::vector<uint16_t> out((size_t)n * ld);
+    CK(cudaMemcpy(out.data(), d_out, out.size() * 2, cudaMemcpyDeviceToHost));
+    bool emb = true;
+    for (uint32_t t = 0; t < n; ++t)
+        for (uint32_t c = 0; c < H; ++c)
+            emb = emb && out[(size_t)t * ld + c] == sref_f2bf(sref_bf2f(table[(size_t)ids[t] * H + c]) * s);
+    check(emb, "every element == bf16_rn(x * 53) (torch's bf16 multiply), bit-exact");
+    /* the soft-cap: tanh(x / 30) * 30 in f32 vs double, over logits spanning the cap's linear and saturated ranges */
+    const uint32_t NL = 4096, rows = 3;
+    std::vector<float> in((size_t)rows * NL);
+    for (size_t i = 0; i < in.size(); ++i) in[i] = (float)(40.0 * g.n());
+    in[0] = 0.0f; in[1] = -0.0f; in[2] = 1e4f; in[3] = -1e4f; in[4] = 1e-3f;
+    float *d;
+    CK(cudaMalloc(&d, in.size() * 4));
+    CK(cudaMemcpy(d, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
+    pulsar_head_decl hc{H, nullptr, 0.0f, NL, NL, 1.0f};
+    hc.softcap = 30.0f;
+    check(pulsar_head_logits_finish_launch(&hc, d, rows, NL, 0) == 0, "%u soft-capped rows", rows);
+    std::vector<float> lo(in.size());
+    CK(cudaMemcpy(lo.data(), d, lo.size() * 4, cudaMemcpyDeviceToHost));
+    double worst = 0;
+    bool bounded = true, order = true;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const double ref = tanh((double)in[i] / 30.0) * 30.0;
+        worst = std::max(worst, fabs((double)lo[i] - ref) / std::max(fabs(ref), 1e-6));
+        bounded = bounded && fabs(lo[i]) <= 30.0f;
+    }
+    for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t c = 1; c < NL; ++c) {   /* monotone: a larger logit never caps below a smaller one */
+            const float a = in[(size_t)r * NL + c - 1], b = in[(size_t)r * NL + c];
+            const float ca = lo[(size_t)r * NL + c - 1], cb = lo[(size_t)r * NL + c];
+            order = order && (a < b ? ca <= cb : a > b ? ca >= cb : true);
+        }
+    /* the engine builds with --use_fast_math, which makes tanhf the hardware tanh (MUFU, tanh.approx.f32): 1.07e-5 rel
+     * worst measured on sm_75 (2026-11-01).  The reference itself soft-caps in bf16 (HF's lm_head output is bf16, so
+     * x / 30, tanh and * 30 each round to bf16: ~4e-3 a step), so the bound is the hardware tanh's, calibrated: 3e-5 */
+    check(worst < 3e-5, "soft-cap vs tanh(x / 30) * 30 in double: worst rel %.2e (limit 3e-5: the hardware tanh)", worst);
+    check(bounded && lo[2] == 30.0f && lo[3] == -30.0f && lo[0] == 0.0f, "every logit within [-30, 30]; +-1e4 cap at "
+          "+-30; 0 stays 0");
+    check(order, "the cap is monotone (no ranking flips)");
+    cudaFree(d); cudaFree(d_table); cudaFree(d_out); cudaFree(d_ids);
+}
+
 static void refusals() {
     printf("\n== refusals ==\n");
     float *d; uint16_t *t; int32_t *ids;
@@ -224,6 +289,10 @@ static void refusals() {
     em("a misaligned table", base, 64, t + 1);
     h = base; h.embed_norm_w = t + 1; em("a misaligned norm weight", h, 64, t);
     h = base; h.embed_norm_eps = -1.0f; em("a negative epsilon", h, 64, t);
+    h = base; h.softcap = -1.0f; lg("a negative soft-cap", h, 1, 1000);
+    h = base; h.softcap = NAN; lg("a NaN soft-cap", h, 1, 1000);
+    h = base; h.embed_scale = 53.0f; em("an embed scale with an embedding norm", h, 64, t);
+    h = base; h.embed_norm_w = nullptr; h.embed_scale = -1.0f; em("a negative embed scale", h, 64, t);
     CK(cudaDeviceSynchronize());
     cudaFree(d); cudaFree(t); cudaFree(ids);
 }
@@ -313,6 +382,7 @@ int main(int argc, char **argv) {
     printf("head gate (L295 E5): the family head options\n");
     embed_tests();
     logits_tests();
+    gemma4_tests();
     refusals();
     printf("\n%s\n", g_fail ? "HEAD GATE FAILED" : "HEAD GATE PASS");
     return g_fail;

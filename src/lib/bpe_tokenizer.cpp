@@ -52,6 +52,12 @@ struct bpe_tokenizer {
     bool added_first[256] = {};           ///< first bytes that can open an added token
     /// The eos ids from the eos config (generation_config.json's eos_token_id); each is an added token.
     std::vector<int> stop_ids;
+    /** L338: the SentencePiece-BPE pipeline (Gemma 4): a run is normalised ' ' -> U+2581, is ONE piece, and starts
+     *  as one symbol per character -- the vocab's -- or, for a character the vocab lacks, one per UTF-8 byte (its
+     *  `<0xXX>` token, byte_id); then the HF merges.  false: the byte-level pipelines. */
+    bool spm = false;
+    /** spm: the vocab's single-character tokens, by their spelling (the normalised text's characters). */
+    std::unordered_map<std::string, int> spm_char;
 };
 
 namespace {
@@ -426,11 +432,21 @@ const char kO200kPattern[] =
 const char kTekkenPattern[] =
     R"re([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
 
+/* gemma4 -- Gemma 4's Split(String " ", MergedWithPrevious), which tokenizers runs on text its Replace(" " -> U+2581)
+ * normaliser has already rid of every space: it never matches, so a run is ONE piece (L338, the SentencePiece-BPE
+ * pipeline).  Its `regex` is the Split's String pattern. */
+/// @param n  the run's codepoint count
+/// @return n: the whole run
+size_t whole_run_match_at(const uint32_t *, const uint32_t *, size_t n, size_t) { return n; }
+/// The gemma4 Split's String pattern (a single space).
+const char kGemma4Split[] = " ";
+
 /// The registry: every pre-tokenizer split this engine implements (name, regex, matcher).
 const bpe_pretok_pattern k_patterns[] = {
     {"qwen35", kQwen35Pattern, qwen35_match_at},
     {"o200k", kO200kPattern, o200k_match_at},
     {"tekken", kTekkenPattern, tekken_match_at},
+    {"gemma4", kGemma4Split, whole_run_match_at},
 };
 
 }  // namespace
@@ -507,27 +523,14 @@ bool pair_rank(const bpe_tokenizer *t, const unsigned char *p, const std::vector
     return true;
 }
 
-/// BPE one pre-tokenized piece: lowest-rank adjacent pair first, leftmost among equals, until none merges
-/// (a piece that is whole in `t->whole` is that token without merging).
+/// The merge loop over a piece's initial symbols (one at offset 0, linked by prev / next): lowest-rank adjacent pair
+/// first, leftmost among equals, until none merges; then the live symbols' ids, in order.
 /// @param t   the tokenizer
 /// @param p   the piece's bytes
 /// @param n   their count (>= 1)
+/// @param w   the symbols, indexed by start offset (entries between starts unused)
 /// @param out receives the piece's token ids
-void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<int> *out) {
-    if (n == 1) {
-        out->push_back(t->byte_id[p[0]]);
-        return;
-    }
-    if (t->whole) {   /* a piece that is a token is that token */
-        auto it = t->whole->find(std::string_view((const char *)p, n));
-        if (it != t->whole->end()) {
-            out->push_back(it->second);
-            return;
-        }
-    }
-    std::vector<sym> w(n);
-    for (size_t i = 0; i < n; i++)
-        w[i] = {t->byte_id[p[i]], (long)i - 1, i + 1 < n ? (long)i + 1 : -1, false};
+void merge_all(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<sym> &w, std::vector<int> *out) {
     /* where the symbol at `pos` ends: the next live symbol's start */
     auto end_of = [&](size_t pos) { return w[pos].next < 0 ? n : (size_t)w[pos].next; };
     std::priority_queue<merge_item> q;
@@ -537,7 +540,7 @@ void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<i
         int rank = 0, id = 0;
         if (pair_rank(t, p, w, l, r, end_of(r), &rank, &id)) q.push({rank, l, id});
     };
-    for (size_t i = 0; i + 1 < n; i++) push(i);
+    for (long i = 0; i >= 0; i = w[(size_t)i].next) push((size_t)i);
     while (!q.empty()) {
         const merge_item top = q.top();
         q.pop();
@@ -562,6 +565,55 @@ void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<i
     }
 }
 
+/// BPE one byte-level piece: one symbol per byte, then the merges (a piece that is whole in `t->whole` is that
+/// token without merging).
+/// @param t   the tokenizer
+/// @param p   the piece's bytes
+/// @param n   their count (>= 1)
+/// @param out receives the piece's token ids
+void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<int> *out) {
+    if (n == 1) {
+        out->push_back(t->byte_id[p[0]]);
+        return;
+    }
+    if (t->whole) {   /* a piece that is a token is that token */
+        auto it = t->whole->find(std::string_view((const char *)p, n));
+        if (it != t->whole->end()) {
+            out->push_back(it->second);
+            return;
+        }
+    }
+    std::vector<sym> w(n);
+    for (size_t i = 0; i < n; i++)
+        w[i] = {t->byte_id[p[i]], (long)i - 1, i + 1 < n ? (long)i + 1 : -1, false};
+    merge_all(t, p, n, w, out);
+}
+
+/// BPE one SentencePiece-BPE piece (L338; tokenizers' BPE::merge_word with byte_fallback): a character the vocab
+/// holds is one symbol, any other is one symbol per UTF-8 byte (its <0xXX> token); then the merges.
+/// @param t   the tokenizer (spm)
+/// @param p   the piece's bytes (normalised: no ' ', valid UTF-8)
+/// @param n   their count (>= 1)
+/// @param out receives the piece's token ids
+void bpe_spm(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<int> *out) {
+    std::vector<sym> w(n);
+    long prev = -1;
+    auto add = [&](size_t at, int id) {
+        w[at] = {id, prev, -1, false};
+        if (prev >= 0) w[(size_t)prev].next = (long)at;
+        prev = (long)at;
+    };
+    for (size_t i = 0; i < n;) {
+        const int k = utf8_seq_ok(p + i, n - i);   /* validated by the caller */
+        auto it = t->spm_char.find(std::string((const char *)p + i, (size_t)k));
+        if (it != t->spm_char.end()) add(i, it->second);
+        else
+            for (int j = 0; j < k; j++) add(i + (size_t)j, t->byte_id[p[i + (size_t)j]]);
+        i += (size_t)k;
+    }
+    merge_all(t, p, n, w, out);
+}
+
 /* One run between added tokens: NFC (when the configuration has it), split, BPE. */
 /// @param t    the tokenizer
 /// @param text the run's bytes (valid UTF-8: the caller validated it)
@@ -569,6 +621,15 @@ void bpe(const bpe_tokenizer *t, const unsigned char *p, size_t n, std::vector<i
 /// @param out  receives the run's token ids
 void encode_run(const bpe_tokenizer *t, const char *text, size_t len, std::vector<int> *out) {
     if (!len) return;
+    if (t->spm) {   /* L338: Replace(' ' -> U+2581), one piece a run (the gemma4 Split never matches) */
+        std::string piece;
+        piece.reserve(len + len / 2);
+        for (size_t i = 0; i < len; i++)
+            if (text[i] == ' ') piece.append("\xe2\x96\x81");
+            else piece.push_back(text[i]);
+        bpe_spm(t, (const unsigned char *)piece.data(), piece.size(), out);
+        return;
+    }
     std::vector<uint32_t> cps;
     cps.reserve(len);
     for (size_t i = 0; i < len;) {
@@ -764,6 +825,40 @@ const hf_pipeline k_hf_pipelines[] = {
      true},
 };
 
+/* L338: the SentencePiece-BPE pipeline (Gemma 4), every section as tokenizer.json spells it: the Replace(' ' ->
+ * U+2581) normaliser, the Split(" ") the normaliser leaves nothing to match, the BPE model with byte_fallback (and
+ * fuse_unk, which byte_fallback leaves no unk to fuse: every byte has its <0xXX> token, asserted at load), the
+ * Replace / ByteFallback / Fuse decoder (token_bytes: U+2581 -> ' ', <0xXX> -> the byte), a post-processor that adds
+ * nothing. */
+/// The spm row's normaliser.
+const char kSpmNormalizer[] = "{\"type\": \"Replace\", \"pattern\": {\"String\": \" \"}, \"content\": \"\xe2\x96\x81\"}";
+/// The spm row's pre-tokenizer.
+const char kSpmPre[] =
+    R"({"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false})";
+/// The spm row's decoder.
+const char kSpmDecoder[] = "{\"type\": \"Sequence\", \"decoders\": [{\"type\": \"Replace\", \"pattern\": "
+                           "{\"String\": \"\xe2\x96\x81\"}, \"content\": \" \"}, {\"type\": \"ByteFallback\"}, "
+                           "{\"type\": \"Fuse\"}]}";
+/// The spm row's post-processor.
+const char kSpmPost[] =
+    R"({"type": "TemplateProcessing", "single": [{"Sequence": {"id": "A", "type_id": 0}}], "pair": [{"Sequence": )"
+    R"({"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}], "special_tokens": {}})";
+
+/* A SentencePiece-BPE vocab spelling -> the bytes it decodes to: <0xXX> (two upper-case hex digits) -> that byte,
+ * else every U+2581 -> ' ' (the decoder's Replace, then ByteFallback) */
+/// @param s the spelling
+/// @return the decoded bytes
+std::string spm_bytes(const std::string &s) {
+    auto hex = [](char c) { return (c >= '0' && c <= '9') ? c - '0' : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1; };
+    if (s.size() == 6 && !s.compare(0, 3, "<0x") && s[5] == '>' && hex(s[3]) >= 0 && hex(s[4]) >= 0)
+        return std::string(1, (char)(hex(s[3]) * 16 + hex(s[4])));
+    std::string out;
+    for (size_t i = 0; i < s.size();)
+        if (!s.compare(i, 3, "\xe2\x96\x81")) { out.push_back(' '); i += 3; }
+        else out.push_back(s[i++]);
+    return out;
+}
+
 }  // namespace
 
 bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenizer_len, const char *eos_config_json,
@@ -778,11 +873,15 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
      * regex names its pattern in the registry, and the pattern names the one pipeline around it this engine
      * implements (k_hf_pipelines). */
     const pyjson_value *pre = doc.get("pre_tokenizer");
+    std::string pre_got;
+    if (pre) pyjson_dump(*pre, &pre_got);
+    const bool spm = pre_got == kSpmPre;   /* L338: the SentencePiece-BPE row (Gemma 4) */
     const pyjson_value *steps = pre ? pre->get("pretokenizers") : NULL;
     const pyjson_value *split = steps && steps->kind == pyjson_value::ARR && !steps->a.empty() ? &steps->a[0] : NULL;
     const pyjson_value *pat = split && split->get("pattern") ? split->get("pattern")->get("Regex") : NULL;
-    const bpe_pretok_pattern *pattern = pat && pat->kind == pyjson_value::STR ? bpe_pretok_by_regex(pat->s.c_str())
-                                                                              : NULL;
+    const bpe_pretok_pattern *pattern = spm ? bpe_pretok_by_name("gemma4")
+                                        : pat && pat->kind == pyjson_value::STR ? bpe_pretok_by_regex(pat->s.c_str())
+                                                                                : NULL;
     if (!pattern) {
         refuse(err, errlen, "the pre-tokenizer's Split regex is not a registered pattern (bpe_pretok_*)");
         return NULL;
@@ -794,19 +893,24 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     if (doc.get("normalizer")) pyjson_dump(*doc.get("normalizer"), &norm_got);
     for (const hf_pipeline &x : k_hf_pipelines)
         if (!strcmp(x.pattern, pattern->name) && (!pl || norm_got == x.normalizer)) pl = &x;
-    if (!pl) {
+    if (!pl && !spm) {
         refuse(err, errlen, "pattern \"%s\" has no HF pipeline row (k_hf_pipelines)", pattern->name);
         return NULL;
     }
+    if (spm ? !expect_dump(doc.get("normalizer"), kSpmNormalizer, "the normalizer", err, errlen) ||
+                  !expect_dump(doc.get("decoder"), kSpmDecoder, "the decoder", err, errlen) ||
+                  !expect_dump(doc.get("post_processor"), kSpmPost, "the post-processor", err, errlen)
+            : false)
+        return NULL;
     std::string pre_expect = R"({"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": )";
     pyjson_dump_string(pattern->regex, strlen(pattern->regex), &pre_expect);
     pre_expect += R"(}, "behavior": "Isolated", "invert": false}, )";
-    pre_expect += pl->byte_level;
+    pre_expect += spm ? "" : pl->byte_level;
     pre_expect += "]}";
-    if (!expect_dump(doc.get("normalizer"), pl->normalizer, "the normalizer", err, errlen) ||
+    if (!spm && (!expect_dump(doc.get("normalizer"), pl->normalizer, "the normalizer", err, errlen) ||
         !expect_dump(pre, pre_expect.c_str(), "the pre-tokenizer", err, errlen) ||
         !expect_dump(doc.get("decoder"), pl->decoder, "the decoder", err, errlen) ||
-        !expect_dump(doc.get("post_processor"), pl->post_processor, "the post-processor", err, errlen))
+        !expect_dump(doc.get("post_processor"), pl->post_processor, "the post-processor", err, errlen)))
         return NULL;
     const pyjson_value *model = doc.get("model");
     if (!model || model->kind != pyjson_value::OBJ) {
@@ -814,9 +918,10 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         return NULL;
     }
     const struct { const char *key, *value; } model_expect[] = {
-        {"type", "\"BPE\""}, {"dropout", "null"}, {"unk_token", "null"},
-        {"continuing_subword_prefix", pl->affix}, {"end_of_word_suffix", pl->affix},
-        {"fuse_unk", "false"}, {"byte_fallback", "false"}, {"ignore_merges", pl->ignore_merges ? "true" : "false"},
+        {"type", "\"BPE\""}, {"dropout", "null"}, {"unk_token", spm ? "\"<unk>\"" : "null"},
+        {"continuing_subword_prefix", spm ? "null" : pl->affix}, {"end_of_word_suffix", spm ? "null" : pl->affix},
+        {"fuse_unk", spm ? "true" : "false"}, {"byte_fallback", spm ? "true" : "false"},
+        {"ignore_merges", !spm && pl->ignore_merges ? "true" : "false"},
     };
     for (const auto &e : model_expect) {
         char what[64];
@@ -834,8 +939,9 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
 
     bpe_tokenizer *t = new bpe_tokenizer();
     t->pattern = pattern;
-    t->nfc = pl->nfc;
-    t->drop_zwnj = pl->drop_zwnj;
+    t->nfc = !spm && pl->nfc;
+    t->drop_zwnj = !spm && pl->drop_zwnj;
+    t->spm = spm;
     uint32_t cp_of[256];
     byte_level_map(cp_of);
     std::unordered_map<uint32_t, int> byte_of_cp;
@@ -852,6 +958,14 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         if (kv.second.kind != pyjson_value::INT) { refuse(err, errlen, "vocab id is not an int"); delete t; return NULL; }
         const int id = atoi(kv.second.num.c_str());
         id_of[kv.first] = id;
+        if (spm) {   /* L338: the decoder's bytes; a single-character spelling is a starting symbol */
+            if (utf8_seq_ok((const unsigned char *)kv.first.data(), kv.first.size()) == (int)kv.first.size())
+                t->spm_char.emplace(kv.first, id);
+            vocab_at[id] = entries.size();
+            entries.emplace_back(id, spm_bytes(kv.first));
+            max_id = std::max(max_id, id);
+            continue;
+        }
         /* byte-level text -> raw bytes */
         std::string raw;
         const unsigned char *s = (const unsigned char *)kv.first.data();
@@ -895,7 +1009,13 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
     }
     for (int b = 0; b < 256; b++) {
         std::string s;
-        utf8_put(&s, cp_of[b]);
+        if (spm) {   /* tokenizers' byte fallback: format!("<{:#04X}>", b) */
+            char f[8];
+            snprintf(f, sizeof f, "<0x%02X>", b);
+            s = f;
+        } else {
+            utf8_put(&s, cp_of[b]);
+        }
         auto it = id_of.find(s);
         if (it == id_of.end()) { refuse(err, errlen, "byte 0x%02x has no token", b); delete t; return NULL; }
         t->byte_id[b] = it->second;
@@ -934,7 +1054,7 @@ bpe_tokenizer *bpe_tokenizer_load_hf(const char *tokenizer_json, size_t tokenize
         delete t;
         return NULL;
     }
-    if (pl->ignore_merges) {   /* the vocab's tokens, whole (views into t->bytes, fixed from here on) */
+    if (!spm && pl->ignore_merges) {   /* the vocab's tokens, whole (views into t->bytes, fixed from here on) */
         t->vocab_of.reserve(vocab_at.size() * 2);
         for (const auto &v : vocab_at) t->vocab_of.emplace(std::string_view(t->bytes[(size_t)v.first]), v.first);
         t->whole = &t->vocab_of;
