@@ -8,7 +8,8 @@
  * longer conversation wherever the template composes (nemotron-chat-gate S1).
  *
  * What is refused by name, never rendered in another spelling:
- *   - images: the template's <image> placeholders need the family's vision front (N11), not wired;
+ *   - an image in an assistant turn, and a message whose text spells <image> beside its images (nemotron_chat.h,
+ *     "IMAGES"; L331 renders the others through the family's image front);
  *   - the template variables beyond the shared ones (medium_effort, truncate_history_thinking, force_nonempty_content):
  *     the server reads enable_thinking and reasoning_effort only; "medium" is the medium_effort level.
  * Departures from vLLM: client text spelling a marker stays text (L223); a call the turn ends inside is broken
@@ -42,13 +43,16 @@ const server_effort_map k_effort_nemotron_h = {
 
 /* The parsed messages as the renderer's, borrowing `msgs`: the request's system FIELD first (the protocol parsers
  * append it to the array), then the messages in order -- or, for a TAIL, the messages from `start`, the system field
- * not among them.  false + err: an image (N11's front is not wired). */
+ * not among them.  L331: a message's images as their offsets in its marker-free content.  false + err: an image whose
+ * parser marker is not at its offset. */
 /** The renderer's message list built by nemotron_messages; its strings borrow the chat_msgs it was built from. */
 struct nemotron_msgs {
     /// The messages in render order.
     std::vector<nemotron_msg_in> m;
     /// Per SOURCE message index: its calls (`m` points in).
     std::vector<std::vector<nemotron_tool_call_in>> calls;
+    /// L331: per SOURCE message index, its content without the image markers and each image's offset in it.
+    std::vector<chat_msg_images> imgs;
 };
 
 /** Build `out` from `msgs` (the rule above).
@@ -62,18 +66,18 @@ struct nemotron_msgs {
 bool nemotron_messages(const chat_msgs *msgs, int start, bool tail, nemotron_msgs *out, char *err, size_t errlen) {
     out->m.clear();
     out->calls.assign((size_t)msgs->len, {});
+    out->imgs.assign((size_t)msgs->len, chat_msg_images());
     auto add = [&](int i) -> bool {
         const chat_msg *c = &msgs->v[i];
-        if (c->images_len > 0) {
-            snprintf(err, errlen, "nemotron_h: a message carries an image -- the family's vision front (N11) is not "
-                                  "wired; this engine renders text only");
-            return false;
-        }
+        chat_msg_images &mi = out->imgs[(size_t)i];
+        if (c->images_len > 0 && !chat_strip_image_markers(c, &mi, err, errlen)) return false;
         std::vector<nemotron_tool_call_in> &k = out->calls[(size_t)i];
         for (int j = 0; j < c->calls.len; j++) k.push_back({c->calls.v[j].name, c->calls.v[j].arguments});
         nemotron_msg_in q = {};
         q.role = c->role;
-        q.content = c->content;
+        q.content = c->images_len > 0 ? mi.content.c_str() : c->content;
+        q.image_at = mi.at.empty() ? NULL : mi.at.data();
+        q.n_images = (int)mi.at.size();
         q.reasoning = c->reasoning;
         q.calls = k.empty() ? NULL : k.data();
         q.n_calls = (int)k.size();

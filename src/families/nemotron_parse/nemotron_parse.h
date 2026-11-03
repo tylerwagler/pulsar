@@ -32,6 +32,7 @@
 
 #include "engine/pulsar_engine_internal.h"
 #include "engine/role_bind.h"
+#include "engine/vit_encoder.h"
 
 #include <string>
 #include <unordered_map>
@@ -132,35 +133,6 @@ bool pulsar_nemotron_parse_read_shape(const pulsar_model *m, pulsar_nemotron_par
 
 /* ---- 2. Weights + the decode table ----------------------------------------------------------------------------- */
 
-/** One ViT (timm) block; f32 norms and biases, f16 Linears [in -> out]; bind roles vit_* in block `vit`. */
-typedef struct {
-    /** @var pulsar_nemotron_parse_vit_block::norm1
-     *  LN1 weight [vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::norm1_b
-     *  LN1 bias [vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::qkv
-     *  qkv [vit_width -> 3 * vit_heads * vit_head_dim]: q | k | v
-     *  @var pulsar_nemotron_parse_vit_block::qkv_b
-     *  qkv bias [3 * vit_heads * vit_head_dim]
-     *  @var pulsar_nemotron_parse_vit_block::proj
-     *  the attention output [vit_heads * vit_head_dim -> vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::proj_b
-     *  proj bias [vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::norm2
-     *  LN2 weight [vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::norm2_b
-     *  LN2 bias [vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::fc1
-     *  fc1 [vit_width -> vit_mlp] (GELU after)
-     *  @var pulsar_nemotron_parse_vit_block::fc1_b
-     *  fc1 bias [vit_mlp]
-     *  @var pulsar_nemotron_parse_vit_block::fc2
-     *  fc2 [vit_mlp -> vit_width]
-     *  @var pulsar_nemotron_parse_vit_block::fc2_b
-     *  fc2 bias [vit_width] */
-    pulsar_tensor *norm1, *norm1_b, *qkv, *qkv_b, *proj, *proj_b, *norm2, *norm2_b, *fc1, *fc1_b, *fc2, *fc2_b;
-} pulsar_nemotron_parse_vit_block;
-
 /** One mBART decoder layer; f32 norms and biases, f16 Linears [in -> out]; bind roles in block `layers`. */
 typedef struct {
     /** @var pulsar_nemotron_parse_dec_layer::attn_norm
@@ -223,8 +195,8 @@ typedef struct {
      *  @var pulsar_nemotron_parse_model::pos
      *  vit_pos: the learned position field, f32 [pos_grid * pos_grid][vit_width] (copied to pos_field at bind) */
     pulsar_tensor *patch, *cls, *pos;
-    /// The ViT blocks; entries [0, shape.vit_depth) are bound.
-    pulsar_nemotron_parse_vit_block vit[PULSAR_NEMOTRON_PARSE_VIT_MAX];
+    /// The ViT blocks (the shared encoder's, engine/vit_encoder.h); entries [0, shape.vit_depth) are bound.
+    pulsar_vit_block vit[PULSAR_NEMOTRON_PARSE_VIT_MAX];
     /** @var pulsar_nemotron_parse_model::neck_proj
      *  neck_proj (conv1, 1x1): [vit_width -> neck_width]
      *  @var pulsar_nemotron_parse_model::neck_proj_b
