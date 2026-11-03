@@ -1246,7 +1246,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
     pulsar_session *s = session_build(e, ctx_size, gpu_graph_bank_pool_n());
     if (!s) return 1;
     s->resident_bytes = pulsar_gpu_tensor_alloc_bytes_current() - alloc_before;
-    /* the disk-KV staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
+    /* the kv-state payload staging buffer, pinned once (pulsar_session::io_buf): a session that cannot have it does not open */
     s->io_buf = (uint8_t *)pulsar_gpu_host_alloc(PULSAR_SESSION_IO_CHUNK);
     if (!s->io_buf) {
         fprintf(stderr, "pulsar: session create: the %u MiB pinned disk-KV staging buffer could not be allocated -- "

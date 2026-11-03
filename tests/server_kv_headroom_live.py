@@ -37,6 +37,7 @@ ap.add_argument("--port", type=int, default=8198)
 ap.add_argument("--ctx", type=int, default=1048576)
 ap.add_argument("--banks", type=int, default=4)
 ap.add_argument("--headroom-gib", type=float, default=0.5, help="MemAvailable above the floor the server starts with")
+VARIANCE_GIB = 0.5   # the balloon's slack for the probe-vs-guarded cost variance (see the balloon below)
 ap.add_argument("--slack-gib", type=float, default=0.5, help="how far under the floor MemAvailable may dip (unpriced)")
 ap.add_argument("--abort-gib", type=float, default=1.0, help="a dip this far under the floor ends the run as a FAIL")
 ap.add_argument("--timeout", type=int, default=1500)
@@ -199,7 +200,10 @@ try:
 
     # ---- the balloon: all but the floor + headroom, before the guarded server starts
     time.sleep(5)
-    want = mem_available() - cost - FLOOR - a.headroom_gib * GiB
+    # L347: + VARIANCE_GIB.  The guarded server's cost differs from the probe's from run to run (battery #590 started
+    # 0.16 GiB short of the asked headroom, #592 0.6 GiB short -- below the floor, and the server rightly refused to
+    # start); every check below is against the headroom the guarded server MEASURES, so the slack only keeps it above 0.
+    want = mem_available() - cost - FLOOR - (a.headroom_gib + VARIANCE_GIB) * GiB
     check(want > 0, "room for a balloon of %.2f GiB" % (want / GiB))
     if want > 0:
         mb = mmap.mmap(-1, int(want), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_POPULATE", 0))

@@ -1,5 +1,5 @@
 /** @file
- *  Page-cache-neutral streaming writes (L261): header-only, shared by the payload writer and the segment store. */
+ *  Page-cache-neutral streaming writes (L261): header-only, shared by the kv-state payload writer and the TP workers. */
 /* Page-cache-neutral streaming writes (L261).
  *
  * A disk-KV snapshot is ~800 MB for a 300k-token conversation, written once as
@@ -10,7 +10,8 @@
  * the same bytes but hands every PULSAR_WRITEBACK_STEP of them to the disk and
  * drops them from the cache as it goes, so a store's footprint stays bounded.
  *
- * Header-only; the engine's payload writer and the segment store share it. */
+ * Header-only; the engine's kv-state payload writer and the TP workers' segment copies share it (L347 I3a: the
+ * segment store writes with O_DIRECT and leaves no page cache to drop). */
 #pragma once
 
 #include <fcntl.h>
@@ -36,7 +37,8 @@ typedef struct {
 static inline void pulsar_writeback_init(pulsar_writeback *w, FILE *fp) {
     w->fp = fp;
     w->synced = fp ? ftello(fp) : 0;
-    if (w->synced < 0) w->fp = NULL;
+    /* L338: a memory stream (fmemopen: a segment's payload staged for the background writer) has no descriptor */
+    if (w->synced < 0 || (fp && fileno(fp) < 0)) w->fp = NULL;
 }
 
 /* Push [synced, end) to disk and drop it from the cache.  Always waits: the
