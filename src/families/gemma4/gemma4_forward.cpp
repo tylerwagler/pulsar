@@ -225,6 +225,14 @@ uint64_t lin_ws(int in, int out, uint32_t rows) {
 
 /* ---- scratch layouts: one function each, for sizing AND carving -------------------------------------------------- */
 
+/** @var rows_scratch::ids
+ *  offset of int32 [R]: the token ids
+ *  @var rows_scratch::nf
+ *  offset of uint32: the routed experts' non-finite flag (zeroed by every stage)
+ *  @var rows_scratch::ad
+ *  offset of u8 [R]: the rows the runtime adapter applies to (L338 P2)
+ *  @var rows_scratch::total
+ *  the arena's bytes */
 /** The ROWS arena: int32 [R] token ids, the routed experts' non-finite flag (zeroed by every stage), u8 [R] the rows
  *  the runtime adapter applies to (L338 P2: uploaded by a stage whose banks run it). */
 struct rows_scratch { uint64_t ids, nf, ad, total; };
@@ -240,6 +248,40 @@ rows_scratch rows_layout(uint32_t R) {
     return r;
 }
 
+/** @var mix_scratch::qf
+ *  offset of f32 [R][q width]: the q projection (the wider layer kind's width, as every row below)
+ *  @var mix_scratch::kf
+ *  offset of f32 [R][kv width]: the k projection
+ *  @var mix_scratch::vf
+ *  offset of f32 [R][kv width]: the v projection
+ *  @var mix_scratch::qb
+ *  offset of bf16 [R][q width]: q
+ *  @var mix_scratch::kb
+ *  offset of bf16 [R][kv width]: k (also v's source on a global layer)
+ *  @var mix_scratch::vb
+ *  offset of bf16 [R][kv width]: v
+ *  @var mix_scratch::vn
+ *  offset of bf16 [R][kv width]: the unweighted-normed v
+ *  @var mix_scratch::ab
+ *  offset of bf16 [R][q width]: the attention's output
+ *  @var mix_scratch::of
+ *  offset of f32 [R][n_embd]: the o_proj's output
+ *  @var mix_scratch::db
+ *  offset of bf16 [R][n_embd]: its bf16 rows
+ *  @var mix_scratch::lora
+ *  offset of the runtime LoRA's workspace (its widest projection: q / o of a global layer)
+ *  @var mix_scratch::lora_bytes
+ *  its bytes
+ *  @var mix_scratch::lin
+ *  offset of the dense arm's workspace (the widest of the attention's linears, either layer kind)
+ *  @var mix_scratch::lin_bytes
+ *  its bytes
+ *  @var mix_scratch::gqa
+ *  offset of F1's workspace (the wider layer kind's)
+ *  @var mix_scratch::gqa_bytes
+ *  its bytes
+ *  @var mix_scratch::total
+ *  the arena's bytes */
 /** The MIX arena (attention), sized for the wider of the two layer kinds:
  *  qf / kf / vf f32 and qb / kb / vb bf16 the projections (kb also v's source on a global layer), vn bf16 the
  *  unweighted-normed v, ab bf16 the attention's output, of f32 / db bf16 the o_proj's (its post-norm rides the
@@ -284,6 +326,24 @@ mix_scratch mix_layout(uint32_t R, uint32_t ctx) {
     return t;
 }
 
+/** @var ffn_scratch::xd
+ *  offset of bf16 [R][n_embd]: the dense MLP's normed input
+ *  @var ffn_scratch::xm
+ *  offset of bf16 [R][n_embd]: the routed experts' normed input
+ *  @var ffn_scratch::xr
+ *  offset of bf16 [R][n_embd]: the router's normed input
+ *  @var ffn_scratch::fo
+ *  offset of f32 [R][n_embd]: the routed sum
+ *  @var ffn_scratch::lora
+ *  offset of the dense MLP's LoRA workspace (n_embd -> n_ff -> n_embd)
+ *  @var ffn_scratch::lora_bytes
+ *  its bytes
+ *  @var ffn_scratch::u
+ *  offset of the MoE block's carved workspace
+ *  @var ffn_scratch::moe_bytes
+ *  its bytes
+ *  @var ffn_scratch::total
+ *  the arena's bytes */
 /** The FFN arena: xd / xm / xr bf16 the three normed inputs (dense MLP, experts, router); fo f32 the routed sum; the
  *  dense MLP's LoRA workspace; then the MoE block's carved workspace (router, routed, the dense MLP's buffers as the
  *  block's one shared expert -- its f32 rows, ys, the tail's other branch). */
@@ -307,6 +367,12 @@ ffn_scratch ffn_layout(uint32_t R) {
     return f;
 }
 
+/** @var head_scratch::lin
+ *  offset of the head linear's workspace
+ *  @var head_scratch::lin_bytes
+ *  its bytes, at PULSAR_DRIVER_HEADS_MAX rows
+ *  @var head_scratch::total
+ *  the arena's bytes */
 /** The HEAD arena: the head linear's workspace at PULSAR_DRIVER_HEADS_MAX rows. */
 struct head_scratch { uint64_t lin, lin_bytes, total; };
 /** @return the HEAD arena's offsets and size */

@@ -2538,6 +2538,7 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
  * -- only invalidation does.  L306: the catalog stays declared and recaptures on its next uses; a regrow after the
  * warmup is announced once and counted. */
 /// Scratch-regrow hook: drops every exec (keeps the catalog), deferred while a capture is open.
+/// @param what the buffer regrown (named in the first post-warmup regrow's line; NULL = unnamed)
 void pulsar_gpu_seg_note_device_free(const char *what) {
     if (g_seg_capturing) {
         g_seg_reset_pending = true;

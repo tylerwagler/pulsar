@@ -16,7 +16,7 @@ namespace {
 const std::string kQ = "<|\"|>";
 
 /// @param c a byte
-/// @return true for vLLM's argument separators' whitespace (' ', '\n', '\t')
+/// @return true for vLLM's argument separators' whitespace (space, newline, tab)
 bool ws(char c) { return c == ' ' || c == '\n' || c == '\t'; }
 
 /// @param s text

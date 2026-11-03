@@ -79,7 +79,7 @@ struct gemma4_render_in {
     int n_msgs;
     const char *tools_json;   ///< the request's tools array as JSON text; NULL = none
     bool thinking;            ///< enable_thinking
-    bool add_generation_prompt;
+    bool add_generation_prompt;   ///< add_generation_prompt: end with the template's opener of the model's reply
 };
 
 /// A render's result: the prompt text and the client-data span map.
@@ -93,7 +93,7 @@ struct gemma4_render_out : chat_render_out {};
 /// @return true on success, false on refusal
 bool gemma4_chat_render(const gemma4_render_in &in, gemma4_render_out *out, char *err, size_t errlen);
 
-/** The turn-by-turn front's head (pulsar_chat_open): <bos>, then the system turn when `thinking` or `system` is
+/** The turn-by-turn front's head (pulsar_chat_open): `<bos>`, then the system turn when `thinking` or `system` is
  *  non-empty -- what the full render writes before the messages for a conversation that opens with that system
  *  message (none when `system` is NULL / empty) and no tools. */
 /// @param system   the system text (client data; NULL = none)
