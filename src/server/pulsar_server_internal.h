@@ -1155,10 +1155,30 @@ void slot_writer_free(slot_writer *w);
 
 /** L264 S4: the disk KV cache's placement policy. */
 typedef struct {
-    int min_tokens;          ///< a conversation shorter than this is not persisted, nor restored
-    int sys_prefix_align;    ///< the sys-prefix cut lands on a multiple of this (a resume-grid multiple)
-    int sys_prefix_margin;   ///< and this far below the chat anchor, clear of preamble jitter
+    int min_tokens;          ///< a conversation shorter than this is not persisted, nor restored, nor anchored
 } kv_cache_options;
+
+/** L347 I2: why a persist runs -- the one authority for what each writes (kv_persist_writes). */
+typedef enum {
+    KV_PERSIST_CONTINUED,   ///< prefill progress: rows to the last grid point
+    KV_PERSIST_PROMPT,      ///< the prompt's end: rows and the tail
+    KV_PERSIST_TERMINAL,    ///< a finished turn's history: rows and the tail
+    KV_PERSIST_EVICT,       ///< the bank's history is about to be replaced: rows, tail, restore point
+    KV_PERSIST_SPILL,       ///< the guard spills the bank: rows, tail, restore point
+    KV_PERSIST_ABANDONED,   ///< a prefill whose client left: rows, tail, restore point
+    KV_PERSIST_SHUTDOWN,    ///< the server stops: rows, tail, restore point
+    KV_PERSIST_ANCHOR,      ///< a shared prefix's second sighting: rows, tail, restore point flagged an anchor
+    KV_PERSIST_TRIGGERS     ///< count
+} kv_persist_trigger;
+/// The triggers' log words, by kv_persist_trigger
+extern const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS];
+/** L347 I2: what a persist for `t` writes (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR; rows up to the deepest grid point and
+ *  the periodic restore points always).  Restore points are written where a restore starts: at the chain's end when
+ *  the history is about to be lost (evict, spill, abandon, shutdown) and at an anchor -- never on the request path of
+ *  a history that stays resident (continued, prompt, terminal: rows only).
+ *  @param t the trigger
+ *  @return its PULSAR_KVCHAIN_* request */
+unsigned kv_persist_writes(kv_persist_trigger t);
 
 /// The segment store (src/lib/pulsar_segstore.h).
 typedef struct pulsar_segstore pulsar_segstore;
@@ -2088,7 +2108,7 @@ struct server {
      * startup, worker thread reads only). */
     int slot_trivial_common_tokens;
     /** L272 B5: the template's turn markers (pulsar_chat_turn_markers at startup; zeroed when the
-     * tokenizer does not spell them, which leaves the sys-prefix cold store and the last-turn routing
+     * tokenizer does not spell them, which leaves the anchor cold store and the last-turn routing
      * anchor off).  Immutable after startup. */
     pulsar_turn_markers turn_markers;
     int default_tokens;      ///< generation cap when the request does not set one
@@ -2380,17 +2400,21 @@ struct server {
     void kv_cache_restore_tool_memory_for_messages(const chat_msgs *msgs);
     /** L264 S4: persist the INSTALLED bank's history as segments -- the chain the
      * store already holds for this text, extended by segments of at least one
-     * prefill chunk (pulsar_kvchain_persist) and, when `close`, to the bank's
-     * deepest grid checkpoint.  Only a store on prefill progress ("continued")
-     * leaves the chain open: a prompt riding decode steps lands a checkpoint
-     * every grid slice, and a segment per slice wrote the whole recurrent state
-     * each time.  *chain_end (when given): where the stored chain ends after the
-     * write (0: none).  @return segments written (0: nothing new, or disabled). */
+     * prefill chunk (pulsar_kvchain_persist) and what the trigger asks for
+     * (kv_persist_writes: the tail to the bank's deepest grid checkpoint, the
+     * restore point there).  *chain_end (when given): where the stored chain ends
+     * after the write (0: none).  @return segments written (0: nothing new, or disabled). */
     /// @param sl         the slot whose bank is installed (unused beyond that precondition)
-    /// @param reason     the log word for this store ("prompt", "continued", "abandoned", "terminal", ...)
-    /// @param close      also close the chain at the bank's deepest grid checkpoint
+    /// @param why        the trigger: what is written and the log word
     /// @param chain_end  receives the stored chain's end position in tokens (0: none); may be NULL
-    int kv_cache_persist(session_slot *sl, const char *reason, bool close, int *chain_end = nullptr);
+    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr);
+    /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
+     *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.
+     *  Then the prefill stops at `cut` and persists it as KV_PERSIST_ANCHOR.
+     *  @param prompt the request's tokens
+     *  @param cut    the anchor cut (kv_cache_anchor_cut)
+     *  @return true when the anchor is due */
+    bool kv_cache_anchor_due(const pulsar_tokens *prompt, int cut);
     warn_limiter persist_skip_warn;   ///< the persist-skipped line, rate-limited (each skip is counted)
     /** The guard's live touched-KV budget: server_guard_touched_budget over the CURRENT MemAvailable (re-read at most
      *  every 0.25 s) and touched KV, never above the startup ceiling -- so memory nobody accounts for (host heap,
@@ -3572,7 +3596,7 @@ struct gen_state {
     char ctx_span[48];   ///< human-readable context span, for logs ("1234-5678")
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata
-    int cold_store_len;  ///< the shared-preamble cut (chat_anchor_pos, system prompt + tools before the task message) written as a "sys-prefix" entry after its own prefill phase; always < the prompt; 0 = no cold write
+    int cold_store_len;  ///< the anchor cut (kv_cache_anchor_cut, system prompt + tools before the task message) the prefill stops at and persists as KV_PERSIST_ANCHOR on its second sighting (L347 I2); always < the prompt; 0 = no cold write
     pulsar_tokens cold_prefix;  ///< the token prefix the cold write covers
     /** L329 (a): a cut on the resume grid that a queued request waits for this prefill to stand at (0: none; stale
      *  once the bank stands at or past it).  The prefill's next chunk ends there, so it captures the grid checkpoint
@@ -4489,7 +4513,15 @@ void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_sto
 /// @return tokens shared with `live`
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
                                    const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out);
-int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor);
+/** L347 I2: the shared-prefix anchor's cut -- the chat anchor (kv_cache_chat_anchor_pos) aligned down to the
+ *  family's resume grid (pulsar_session_resume_grid), where a prefill that stops there captures a checkpoint; 0 below
+ *  the cache's min_tokens.  No margin and no floor beyond that: the second-sighting rule (server::kv_cache_anchor_due)
+ *  writes only a prefix two requests rendered alike.
+ *  @param kc     the cache (its min_tokens)
+ *  @param anchor the chat anchor, tokens (-1: none)
+ *  @param grid   the resume grid, tokens
+ *  @return the cut in tokens, 0 for none */
+int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
@@ -4518,8 +4550,9 @@ int server_route_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_t
  * that bank (defined in server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_route_in_place(int common, int score, int frontier, int prefilled, int protect_floor,
                            int anchor);
-/* L273: an image request's cold phase -- `cut` (the sys-prefix cut) when every image begins at or past it, 0 when
- * one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in server_tests.cpp. */
+/* L273: an image request's cold phase -- `cut` (the anchor cut, kv_cache_anchor_cut) when every image begins at or
+ * past it, 0 when one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in
+ * server_tests.cpp. */
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,

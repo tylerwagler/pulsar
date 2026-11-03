@@ -117,29 +117,49 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     r->bytes += payload + tbytes;
     return PUT_STORED;
 }
-/* L347: the restore point of the chain's end `key` at G -- the bank's checkpoint there -- written through the store
- * now (pulsar_segstore_put_rp; `key` may still be the writer's), unless the store has it.  False: `r->err` says why. */
-/** Store the restore point at a persisted chain's end (see above).
- *  @param st  the segment store
- *  @param s   the session whose installed bank holds the checkpoint at G
- *  @param key the key of the segment ending at G (stored, or being written)
- *  @param G   the chain's end
- *  @param r   counters updated on a write; `r->err` set on failure
- *  @return true when the store holds (or now has) the restore point, or the bank holds no checkpoint at G */
-bool kvchain_put_rp(pulsar_segstore *st, pulsar_session *s, const char key[41], int G,
-                    pulsar_kvchain_persist_result *r) {
+/* L347: the restore point of segment `key` at G, written through the store now (pulsar_segstore_put_rp; `key` may
+ * still be the writer's) with `flags`, unless the store has one there -- the same key is the same state: it only gains
+ * the flags.  *wrote: a new file was written.  False: `r->err` says why. */
+/** Store one restore point of a persisted chain (see above).
+ *  @param st    the segment store
+ *  @param src   where the state at G comes from
+ *  @param link  the segment ending at G (stored, or being written)
+ *  @param flags its PULSAR_SEGSTORE_RP_* flags
+ *  @param r     counters updated on a write; `r->err` set on failure
+ *  @param wrote receives whether a restore point was written
+ *  @return true when the store holds (or now has) the restore point, or `src` holds no checkpoint at G */
+bool kvchain_put_rp(pulsar_segstore *st, const pulsar_kvchain_rp_source *src, const pulsar_kvchain_link &link,
+                    uint32_t flags, pulsar_kvchain_persist_result *r, bool *wrote) {
+    *wrote = false;
     pulsar_segstore_seg had;
-    if (pulsar_segstore_get(st, key, &had) && had.rp_bytes > 0u) return true;   /* the same key: the same state */
-    const uint64_t bytes = pulsar_session_restore_point_bytes(s, TokPos{G});
+    if (pulsar_segstore_get(st, link.key, &had) && had.rp_bytes > 0u) {
+        if (pulsar_segstore_flag_rp(st, link.key, flags)) return true;
+        snprintf(r->err, sizeof(r->err), "restore point %.40s at %d: its flags could not be written", link.key, link.G);
+        return false;
+    }
+    const uint64_t bytes = src->bytes(src->ud, link.G);
     if (bytes == 0u) return true;
-    struct ctx { pulsar_session *s; int G; const char *key; } c = { s, G, key };
-    if (!pulsar_segstore_put_rp(st, key, bytes, [](FILE *fp, void *ud, char *err, size_t errlen) {
+    struct ctx { const pulsar_kvchain_rp_source *src; const pulsar_kvchain_link *link; } c = { src, &link };
+    if (!pulsar_segstore_put_rp(st, link.key, bytes, flags, [](FILE *fp, void *ud, char *err, size_t errlen) {
             const ctx *x = (const ctx *)ud;
-            return pulsar_session_save_restore_point(x->s, fp, TokPos{x->G}, x->key, err, errlen);
+            return x->src->write(fp, x->src->ud, x->link->G, x->link->key, err, errlen);
         }, &c, r->err, sizeof(r->err)))
         return false;
-    r->rp_bytes = bytes;
+    r->rp_bytes += bytes;
+    r->rp_written++;
+    *wrote = true;
     return true;
+}
+/** The installed bank's checkpoints as a pulsar_kvchain_rp_source::bytes.  @param ud the pulsar_session
+ *  @param G the position  @return pulsar_session_restore_point_bytes at G (0: no checkpoint there) */
+uint64_t session_rp_bytes(void *ud, int G) {
+    return pulsar_session_restore_point_bytes((pulsar_session *)ud, TokPos{G});
+}
+/** The installed bank's checkpoints as a pulsar_kvchain_rp_source::write.  @param fp the file  @param ud the session
+ *  @param G the position  @param key the segment's key  @param err reason  @param errlen bytes at err
+ *  @return pulsar_session_save_restore_point's status: 0 = written */
+int session_rp_write(FILE *fp, void *ud, int G, const char *key, char *err, size_t errlen) {
+    return pulsar_session_save_restore_point((pulsar_session *)ud, fp, TokPos{G}, key, err, errlen);
 }
 }  // namespace
 
@@ -185,21 +205,48 @@ pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st) {
 
 int pulsar_kvchain_grid(pulsar_session *s) { return pulsar_session_prefill_cap(s).raw(); }
 
-int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int *ends, int cap) {
+int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool tail, int *ends, int cap) {
     if (grid <= 0 || prev < 0 || deepest <= prev) return 0;
     int m = 0;
     for (int g = (prev / grid + 1) * grid; g <= deepest && m < cap; g += grid) ends[m++] = g;
-    if (close && deepest % grid != 0 && m < cap) ends[m++] = deepest;
+    if (tail && deepest % grid != 0 && m < cap) ends[m++] = deepest;
     return m;
 }
 
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
+bool pulsar_kvchain_rp_periodic(int G, int grid) {
+    return grid > 0 && G > 0 && G % (grid * PULSAR_KVCHAIN_RP_EVERY_CELLS) == 0;
+}
+
+void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
+                              const pulsar_kvchain_rp_source *src, pulsar_kvchain_persist_result *r) {
+    for (int i = 0; i < n; i++) {
+        const bool end = i == n - 1 && (what & PULSAR_KVCHAIN_RP);
+        uint32_t flags = pulsar_kvchain_rp_periodic(links[i].G, grid) ? PULSAR_SEGSTORE_RP_PERIODIC : 0u;
+        if (end && (what & PULSAR_KVCHAIN_ANCHOR)) flags |= PULSAR_SEGSTORE_RP_ANCHOR;
+        if (!end && flags == 0u) continue;
+        pulsar_kvchain_persist_result one;
+        memset(&one, 0, sizeof one);
+        bool wrote = false;
+        const bool ok = kvchain_put_rp(st, src, links[i], flags, &one, &wrote);
+        r->rp_bytes += one.rp_bytes;
+        r->rp_written += one.rp_written;
+        if (!ok && !r->err[0]) memcpy(r->err, one.err, sizeof(r->err));
+        if (end && wrote) r->rp_dropped += pulsar_segstore_drop_superseded_rps(st, links[i].key);
+    }
+}
+
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
                            const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
                            pulsar_kvchain_persist_result *out) {
     pulsar_kvchain_persist_result r;
     memset(&r, 0, sizeof(r));
     if (!writer || !writer->admit || !writer->submit) {
         snprintf(r.err, sizeof(r.err), "persist: no segment writer");
+        if (out) *out = r;
+        return 0;
+    }
+    if ((what & PULSAR_KVCHAIN_ANCHOR) && !(what & PULSAR_KVCHAIN_RP)) {
+        snprintf(r.err, sizeof(r.err), "persist: an anchor is a restore point (PULSAR_KVCHAIN_ANCHOR without _RP)");
         if (out) *out = r;
         return 0;
     }
@@ -243,7 +290,11 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         }
     }
     int ends[PULSAR_KVCHAIN_MAX];
-    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, close, ends, PULSAR_KVCHAIN_MAX);
+    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, (what & PULSAR_KVCHAIN_TAIL) != 0u, ends,
+                                              PULSAR_KVCHAIN_MAX);
+    /* the chain's segments this persist passes, for the restore point policy: the new ones, or the stored end alone */
+    pulsar_kvchain_link links[PULSAR_KVCHAIN_MAX];
+    int n_links = 0;
     for (int k = 0; k < m; k++) {
         char key[41];
         const put_rc rc = kvchain_put(st, e, s, toks, parent, prev, ends[k], trailer, writer, &r, key);
@@ -254,16 +305,19 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         }
         memcpy(parent, key, 41);
         prev = ends[k];
+        memcpy(links[n_links].key, key, 41);
+        links[n_links++].G = prev;
+    }
+    if (n_links == 0 && prev > 0) {
+        memcpy(links[0].key, parent, 41);
+        links[n_links++].G = prev;
     }
     r.end = prev;
     memcpy(r.key, parent, 41);
-    /* L347: a closing persist leaves a restore point at the chain's end, when the bank holds its checkpoint there --
-     * also where the write stopped short (its error is kept: the first one says why the chain is short) */
-    if (close && prev > 0) {
-        pulsar_kvchain_persist_result rp_r = r;
-        if (!kvchain_put_rp(st, s, parent, prev, &rp_r) && !r.err[0]) memcpy(r.err, rp_r.err, sizeof(r.err));
-        r.rp_bytes = rp_r.rp_bytes;
-    }
+    /* L347 I2: the restore points, when the bank holds its checkpoints there -- also where the write stopped short
+     * (its error is kept: the first one says why the chain is short) */
+    const pulsar_kvchain_rp_source src = { s, session_rp_bytes, session_rp_write };
+    pulsar_kvchain_place_rps(st, links, n_links, grid, what, &src, &r);
     if (out) *out = r;
     return r.written;
 }

@@ -155,7 +155,7 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     {
         pulsar_kvchain_persist_result r;
         const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
-        pulsar_kvchain_persist(st, e, *sp, 0, true, NULL, &inl, &r);
+        pulsar_kvchain_persist(st, e, *sp, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &r);
         if (r.err[0] || r.end != deepest) {
             snprintf(err, errlen, "the persist stored a chain to %d, not %d: %.180s", r.end, deepest, r.err);
             goto out;

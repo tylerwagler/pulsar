@@ -19,17 +19,23 @@
  * (the server's tool map).  Writes are durable (tmp + fsync + rename + dir
  * fsync) and leave no page cache (L261).  Eviction keeps the budget by removing
  * a LEAF: a segment with children is part of a longer chain and goes only after
- * them.  L323: a DOMINATED leaf goes first -- one whose text is a byte prefix of
- * a sibling's (the same conversation's older tail, superseded by a later tail or
- * by the grid segment that covers it) -- then the least recently used.
+ * them.  L323: a DOMINATED leaf goes before other leaves -- one whose text is a
+ * byte prefix of a sibling's (the same conversation's older tail, superseded by a
+ * later tail or by the grid segment that covers it) -- then the least recently
+ * used (L347 I2: after the unflagged restore points, below).
  *
  * L347: the state at a segment's end G lives apart, in the key's RESTORE POINT
  * <dir>/<key>.rp = fixed header + the engine's restore point
  * (pulsar_session_save_restore_point).  The index records its file's size
  * (rp_bytes), so a lookup can ask for a chain that ends at a restore point and
  * a load can price "every segment's rows + the last one's restore point"
- * without opening a file.  The budget counts both files; eviction takes a
- * victim leaf's restore point before the leaf. */
+ * without opening a file.  The budget counts both files.
+ *
+ * L347 I2: a restore point carries FLAGS (PULSAR_SEGSTORE_RP_ANCHOR, _PERIODIC: why it was written, kept in the .rp
+ * header so they survive a restart).  Eviction takes, in order (oldest first within each class, never a key pinned
+ * or pending): (0) a restore point that is not flagged and not on a branch point (a key with >= 2 children); (1) a
+ * dominated leaf; (2) any other leaf, LRU; (3) a flagged or branch-point restore point.  A leaf's restore point so
+ * always goes before the leaf.  The dominated rule applies only to a leaf without a restore point (so unflagged). */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,8 +47,13 @@
 #define PULSAR_SEGSTORE_VERSION 3u            /* v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp */
 /// Magic of a .rp file's header: "PRP1" (L347).
 #define PULSAR_SEGSTORE_RP_MAGIC   0x31505250u   /* "PRP1" */
-/// Restore point file format version (L347).  Older versions are removed at open.
-#define PULSAR_SEGSTORE_RP_VERSION 1u
+/// Restore point file format version; v2 (L347 I2): the header's word at 12 is the restore point's flags.  Older
+/// versions are removed at open.
+#define PULSAR_SEGSTORE_RP_VERSION 2u
+/// Restore point flag (L347 I2): written at a request's shared-prefix anchor (the second sighting of its preamble)
+#define PULSAR_SEGSTORE_RP_ANCHOR 1u
+/// Restore point flag (L347 I2): written at a periodic grid point (pulsar_kvchain_rp_periodic)
+#define PULSAR_SEGSTORE_RP_PERIODIC 2u
 /// Header flag: a trailer follows the payload.
 #define PULSAR_SEGSTORE_FLAG_TRAILER 1u       /* a trailer follows the payload */
 
@@ -61,6 +72,7 @@ typedef struct {
     /// Engine payload bytes (rows only, L347), pulsar_session_save_segment's output
     uint64_t payload_bytes;
     uint64_t rp_bytes;        ///< L347: bytes of the key's .rp file, the restore point at G (0 = none)
+    uint32_t rp_flags;        ///< L347 I2: its PULSAR_SEGSTORE_RP_* flags (0 without one)
     /// Optional trailer bytes after the payload (0 = none)
     uint64_t trailer_bytes;
     /// The whole .seg file: header + text + payload + trailer; what the budget counts
@@ -68,7 +80,9 @@ typedef struct {
     /// Lookups that used this segment (pulsar_segstore_touch)
     uint32_t hits;
     uint64_t last_used;       ///< unix seconds
-    bool dominated;           ///< L323: a leaf whose text is a byte prefix of a sibling's (index-derived)
+    /// L323: its text is a byte prefix of a sibling's (index-derived); eviction counts it only for a leaf without a
+    /// restore point (L347 I2)
+    bool dominated;
 } pulsar_segstore_seg;
 
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
@@ -250,17 +264,44 @@ uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job);
 /** L347: write the restore point of stored segment `key` (the state at its G) as `<dir>/<key>.rp`, durably (tmp +
  *  rename, like a segment), replacing one it has.  Makes room first by evicting (never `key` itself); the budget counts
  *  the file.  A key still being written (reserved, not committed) takes it too: the restore point joins the segment at
- *  its commit, and is removed if the segment's write fails.
+ *  its commit, and is removed if the segment's write fails.  L347 I2: `flags` (PULSAR_SEGSTORE_RP_*) are joined to
+ *  those of a restore point it replaces -- the same key is the same state, its reasons to be kept only accumulate.
  *  @param st       the store
  *  @param key      40 hex chars of a stored (or pending) segment
  *  @param rp_bytes bytes write_rp will write (the engine's restore point)
+ *  @param flags    why it is written (PULSAR_SEGSTORE_RP_*; 0 for a chain end)
  *  @param write_rp writes them
  *  @param ud       context for write_rp
  *  @param err      receives a reason on failure
  *  @param errlen   size of `err`
  *  @return true when the restore point is in place (false leaves any older one as it was) */
-bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes,
+bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes, uint32_t flags,
                             pulsar_segstore_write_fn write_rp, void *ud, char *err, size_t errlen);
+/** L347 I2: join `flags` to the flags of stored segment `key`'s restore point, in its index entry and its file's
+ *  header (in place: the state is the same).
+ *  @param st    the store
+ *  @param key   40 hex chars
+ *  @param flags PULSAR_SEGSTORE_RP_* to add
+ *  @return true when the key has a restore point and its header took the flags */
+bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t flags);
+/** L347 I2: drop the restore points a chain end at `key` supersedes -- the earlier ends of the same chain: every
+ *  ancestor's, and every leaf sibling's along the way whose text is a byte prefix of the chain's (an older tail of
+ *  the same conversation) -- except a flagged one (anchor, periodic), a branch point's (a key with >= 2 children)
+ *  and a key pinned or pending.  The segments stay.
+ *  @param st  the store
+ *  @param key 40 hex chars of the chain's end (stored)
+ *  @return the number of restore points dropped */
+int pulsar_segstore_drop_superseded_rps(pulsar_segstore *st, const char key[41]);
+/** L347 I2: does the store hold the rows of text[0, len)?  True when a stored chain's text runs through byte `len`:
+ *  one ends exactly there, or its next segment's own text starts with the rest of `text` (a tail written by an earlier
+ *  request that went on past `len`; its text is read from its file only when the first bytes the index caches
+ *  match).  *rp_at_len says whether a stored chain ending exactly at `len` has a restore point.
+ *  @param st        the store
+ *  @param text      the text
+ *  @param len       bytes of it to cover
+ *  @param rp_at_len receives whether a chain ending at `len` has a restore point
+ *  @return true when stored rows cover text[0, len) */
+bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, bool *rp_at_len);
 /** L347: open a segment's restore point for reading, positioned at the engine's restore point.
  *  @param st    the store
  *  @param key   40 hex chars

@@ -18,15 +18,21 @@
  * Before L323 the cuts were wherever the writer's checkpoints fell, so copies
  * deduped only when cut alike, and every segment carried the ~133 MiB state.
  * L347: a segment is rows only; the state at a chain's end is the end key's
- * RESTORE POINT (pulsar_segstore_put_rp), written when a persist closes.
+ * RESTORE POINT (pulsar_segstore_put_rp).  L347 I2: restore points exist only where
+ * a restore starts -- a chain's end when its bank is about to lose it, a shared
+ * prefix's anchor, and every PULSAR_KVCHAIN_RP_EVERY_CELLS grid cells -- while rows
+ * are written by every persist.
  *
  * persist: extend the deepest grid-ended chain the store already holds for the
  *   installed bank's history by the grid segments past it up to the bank's
  *   deepest checkpoint, so a write costs only the new tokens (a segment the store
- *   has is not written again).  A closing persist (prompt end, evict, spill,
- *   abandon, shutdown) also writes the tail to that checkpoint and the restore
- *   point at the chain's end (synchronously, through the store); a persist on
- *   progress stops at the last grid point and writes no restore point.  The
+ *   has is not written again).  What else it writes is the caller's request
+ *   (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR): the tail to that checkpoint, the restore
+ *   point at the chain's end (synchronously, through the store), flagged an anchor;
+ *   and, whatever it asked, a periodic restore point at each grid point it passes
+ *   that pulsar_kvchain_rp_periodic names, when the bank holds its checkpoint there
+ *   (pulsar_kvchain_place_rps).  A new restore point at the chain's end drops the
+ *   ones it supersedes (pulsar_segstore_drop_superseded_rps).  The
  *   stored chain is this history only if the bank's own tokens up to its end
  *   render to exactly its text (same bytes at the same position, the L115 rule);
  *   otherwise a fresh chain starts at the root.
@@ -53,6 +59,19 @@
  *  65 at the production grid, so far below it. */
 #define PULSAR_KVCHAIN_MAX 512
 
+/** L347 I2: a persist writes a restore point at every multiple of this many disk-grid cells it passes (32768 tokens at
+ *  the production grid of 4096), when the bank holds its checkpoint there, so a crash or a lost restore point costs at
+ *  most this many cells of state to rebuild, never the whole history (Tyler 2026-11-03: "yes, 8 cells is fine"). */
+#define PULSAR_KVCHAIN_RP_EVERY_CELLS 8
+
+/** L347 I2: what a persist writes besides the rows up to the deepest grid point (pulsar_kvchain_persist's `what`). */
+/// Also the tail, from the last grid point to the deepest grid checkpoint (closing the chain there)
+#define PULSAR_KVCHAIN_TAIL 1u
+/// And the restore point at the chain's end (the history is about to be lost: evict, spill, abandon, shutdown)
+#define PULSAR_KVCHAIN_RP 2u
+/// Which is a shared-prefix anchor (PULSAR_SEGSTORE_RP_ANCHOR); only with PULSAR_KVCHAIN_RP
+#define PULSAR_KVCHAIN_ANCHOR 4u
+
 /** An optional per-segment trailer (the server's tool map).  `size` reports the
  *  trailer for a segment's text (0 bytes = none); `write` writes exactly it. */
 typedef struct {
@@ -67,7 +86,7 @@ typedef struct {
 /** L338: where a persist's segments go once staged -- the server's background writer.  A segment is staged on the
  *  calling thread (its rows copied out of the bank, which moves on), then written elsewhere and committed back on the
  *  store's thread (pulsar_segstore_reserve / _job_write / _commit).  L347: restore points are not staged (I1): a
- *  closing persist writes the chain end's through pulsar_segstore_put_rp itself. */
+ *  persist writes its restore points through pulsar_segstore_put_rp itself (pulsar_kvchain_place_rps). */
 typedef struct {
     /// context for both hooks
     void *ud;
@@ -91,7 +110,9 @@ typedef struct {
     int written;        ///< new segments, staged and handed to the writer (L338: committed later, on its thread)
     int end;            ///< the chain's end after the write (0: none)
     uint64_t bytes;     ///< payload + trailer bytes staged
-    uint64_t rp_bytes;  ///< L347: the restore point written at the chain's end (0: none written by this persist)
+    uint64_t rp_bytes;  ///< L347: bytes of the restore points this persist wrote (chain end and periodic; 0: none)
+    int rp_written;     ///< L347 I2: how many restore points it wrote
+    int rp_dropped;     ///< L347 I2: how many superseded restore points it dropped
     char key[41];       ///< the chain's last key ("" when none)
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
@@ -104,33 +125,74 @@ typedef struct {
 int pulsar_kvchain_grid(pulsar_session *s);
 
 /** L323: where the segments of a chain stored to `prev` (a grid point, or 0) end when the history's deepest grid
- *  checkpoint is `deepest`: every multiple of `grid` in (prev, deepest], then, with `close`, the tail to `deepest`
+ *  checkpoint is `deepest`: every multiple of `grid` in (prev, deepest], then, with `tail`, the tail to `deepest`
  *  when it is not one.  Writes them ascending to `ends` (room for `cap`); returns how many. */
 /// @param prev    the stored chain's end (a grid point, or 0)
 /// @param deepest the history's deepest grid checkpoint
 /// @param grid    the disk grid (pulsar_kvchain_grid)
-/// @param close   also end with the tail to `deepest` when it is not a grid point
+/// @param tail    also end with the tail to `deepest` when it is not a grid point
 /// @param ends    receives the segment ends, ascending
 /// @param cap     capacity of `ends`
 /// @return the number of ends written
-int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool close, int *ends, int cap);
+int pulsar_kvchain_segment_ends(int prev, int deepest, int grid, bool tail, int *ends, int cap);
+
+/** L347 I2: is `G` a periodic restore point -- a positive multiple of PULSAR_KVCHAIN_RP_EVERY_CELLS cells of `grid`?
+ *  @param G    a segment end
+ *  @param grid the disk grid (pulsar_kvchain_grid)
+ *  @return true when a persist passing G writes a restore point there */
+bool pulsar_kvchain_rp_periodic(int G, int grid);
+
+/** L347 I2: one segment of a persisted chain: its key and its end. */
+typedef struct {
+    char key[41];   ///< the segment's key
+    int G;          ///< its end
+} pulsar_kvchain_link;
+
+/** L347 I2: where a persist's restore points come from -- the installed bank's checkpoints in pulsar_kvchain_persist,
+ *  a fixture in the unit tests. */
+typedef struct {
+    /// context for both hooks
+    void *ud;
+    /** The restore point's bytes at G; 0 = there is no checkpoint at G (nothing is written there). */
+    uint64_t (*bytes)(void *ud, int G);
+    /** Write exactly those bytes for G, the restore point of segment `key`, into fp; 0 on success, else err. */
+    int (*write)(FILE *fp, void *ud, int G, const char *key, char *err, size_t errlen);
+} pulsar_kvchain_rp_source;
+
+/** L347 I2: the restore point policy of a persist that stored (or found stored) the segments `links` (ascending; the
+ *  last is the chain's end): a periodic one (PULSAR_SEGSTORE_RP_PERIODIC) at each link pulsar_kvchain_rp_periodic
+ *  names, and with PULSAR_KVCHAIN_RP in `what` one at the chain's end (PULSAR_SEGSTORE_RP_ANCHOR with
+ *  PULSAR_KVCHAIN_ANCHOR) -- each where `src` holds a checkpoint, one write per key (a key that has one gains the
+ *  flags).  A restore point newly written at the chain's end drops those it supersedes
+ *  (pulsar_segstore_drop_superseded_rps).  Counts into r (rp_bytes, rp_written, rp_dropped); the first failure is
+ *  r->err (when it is empty).
+ *  @param st    the store
+ *  @param links the chain's segments this persist passed, ascending
+ *  @param n     how many
+ *  @param grid  the disk grid
+ *  @param what  the persist's request (PULSAR_KVCHAIN_*)
+ *  @param src   the checkpoints
+ *  @param r     the persist's result */
+void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
+                              const pulsar_kvchain_rp_source *src, pulsar_kvchain_persist_result *r);
 
 /** Persist the installed bank's history (see above), never past
- *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  `close`: end the
- *  chain with the tail to the deepest grid checkpoint (pulsar_kvchain_segment_ends) and leave the restore point at the
- *  chain's end (L347).  A grid point an image block
- *  lies across is not a cut (the segment runs on to the next one).  Nothing is written when the deepest grid
+ *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  `what` (L347 I2):
+ *  PULSAR_KVCHAIN_TAIL ends the chain with the tail to the deepest grid checkpoint (pulsar_kvchain_segment_ends),
+ *  PULSAR_KVCHAIN_RP leaves the restore point at the chain's end, PULSAR_KVCHAIN_ANCHOR (with _RP) flags it an
+ *  anchor; the periodic restore points are written whatever it asks (pulsar_kvchain_place_rps).  A grid point an image
+ *  block lies across is not a cut (the segment runs on to the next one).  Nothing is written when the deepest grid
  *  checkpoint is below `min_tokens`.  Returns `written` (segments the store did not hold). */
 /// @param st         the store
 /// @param e          the engine
 /// @param s          the session whose installed bank is persisted
 /// @param min_tokens write nothing when the deepest grid checkpoint is below this
-/// @param close      end the chain with the tail and its restore point (prompt end, evict, spill, abandon, shutdown)
+/// @param what       PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR (0: the rows to the last grid point, and periodic points)
 /// @param trailer    the per-segment trailer, or NULL for none
 /// @param writer     where the staged segments go (required)
 /// @param out        receives what the persist did, or NULL
 /// @return the number of segments written
-int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, bool close,
+int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
                            const pulsar_kvchain_trailer *trailer, const pulsar_kvchain_writer *writer,
                            pulsar_kvchain_persist_result *out);
 

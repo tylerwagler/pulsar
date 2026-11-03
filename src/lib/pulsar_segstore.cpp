@@ -31,10 +31,14 @@ namespace {
 /// Bytes of the fixed .seg header (layout above); the text starts at this offset.
 constexpr size_t HDR = 160;
 /* L347: a restore point file's header, little-endian:
- *   0 magic, 4 version, 8 identity, 12 pad, 16 key[40], 56 payload_bytes u64  -> 64 bytes; the engine's restore
- *   point payload follows. */
+ *   0 magic, 4 version, 8 identity, 12 flags (PULSAR_SEGSTORE_RP_*, v2), 16 key[40], 56 payload_bytes u64  -> 64
+ *   bytes; the engine's restore point payload follows. */
 /// Bytes of the fixed .rp header (layout above); the payload starts at this offset.
 constexpr size_t RP_HDR = 64;
+/** L347 I2: the bytes of a segment's text the index keeps (pulsar_segstore::heads), so pulsar_segstore_covers reads a
+ *  segment's file only when they match: a store of one-shot prompts holds many root tails that share a template's
+ *  first bytes and part soon after them. */
+constexpr size_t HEAD_BYTES = 256;
 
 /** Store v little-endian at p[0..4). @param p destination @param v value */
 void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
@@ -84,9 +88,15 @@ struct pulsar_segstore {
     std::unordered_set<std::string> pending;
     /// L338: parents of the writes in flight, with their count: eviction never takes one
     std::unordered_map<std::string, int> pinned;
-    /// L347: restore points written for a pending key (its .seg not committed yet): key -> .rp file bytes, moved onto
-    /// the entry at its commit (or removed with a failed one)
-    std::unordered_map<std::string, uint64_t> pending_rp;
+    /** L347: a restore point written for a pending key (its .seg not committed yet). */
+    struct pending_point {
+        uint64_t bytes = 0;   ///< its .rp file's bytes
+        uint32_t flags = 0;   ///< its PULSAR_SEGSTORE_RP_* flags
+    };
+    /// L347: restore points written for pending keys, moved onto the entry at its commit (or removed with a failed one)
+    std::unordered_map<std::string, pending_point> pending_rp;
+    /// L347 I2: key -> the first HEAD_BYTES of its own text (all of it when shorter), for pulsar_segstore_covers
+    std::unordered_map<std::string, std::string> heads;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -136,9 +146,10 @@ struct pulsar_segstore {
      *  @param fp            the open .rp file
      *  @param key           receives the key it names (40 hex + NUL)
      *  @param payload_bytes receives the payload's size
+     *  @param flags         receives its PULSAR_SEGSTORE_RP_* flags
      *  @param older         receives true when it is a restore point of an older store version
      *  @return false on a short read, another magic / version / identity, or a malformed key */
-    bool read_rp_header(FILE *fp, char key[41], uint64_t *payload_bytes, bool *older) const {
+    bool read_rp_header(FILE *fp, char key[41], uint64_t *payload_bytes, uint32_t *flags, bool *older) const {
         uint8_t h[RP_HDR];
         *older = false;
         if (fread(h, 1, RP_HDR, fp) != RP_HDR || get32(h) != PULSAR_SEGSTORE_RP_MAGIC) return false;
@@ -149,6 +160,7 @@ struct pulsar_segstore {
         if (get32(h + 8) != identity) return false;
         memcpy(key, h + 16, 40);
         key[40] = '\0';
+        *flags = get32(h + 12);
         *payload_bytes = get64(h + 56);
         return hex40(key);
     }
@@ -179,6 +191,7 @@ struct pulsar_segstore {
         for (size_t i = 0; i < sib.size(); i++)
             if (sib[i] == key) { sib.erase(sib.begin() + (long)i); break; }
         children.erase(key);
+        heads.erase(key);
         segs.erase(it);
         if (parent.empty() || segs.count(parent)) refresh_dominated(parent);
     }
@@ -259,30 +272,54 @@ struct pulsar_segstore {
         ::unlink(rp_path(e.key).c_str());
         used -= e.rp_bytes;
         e.rp_bytes = 0;
+        e.rp_flags = 0;
         if (removed) removed(removed_ud, e.key, true);
     }
-    /* A leaf, never `keep` or `keep2`: a dominated one first (L323), else the least recently used.  L347: a leaf with a
-     * restore point loses the restore point first (its rows stay, a parent for a later chain); the leaf itself goes at a
-     * later eviction.  false when none can go. */
-    /** Evict one leaf's restore point, or the leaf (file and index), by the rule above.
+    /** @param key a stored key
+     *  @return how many children the index holds for it */
+    size_t n_children(const std::string &key) const {
+        auto ch = children.find(key);
+        return ch == children.end() ? 0u : ch->second.size();
+    }
+    /* L347 I2 (D5): the eviction classes, lowest first -- (0) a restore point neither flagged nor on a branch point (a
+     * dead end's or a superseded one's: big, and a restore from it is the cheapest thing to lose); (1) a dominated leaf
+     * (L323; only a leaf without a restore point, so never a flagged one); (2) any other leaf; (3) a flagged (anchor,
+     * periodic) or branch-point restore point: where restores of many requests start.  -1: not a candidate (a segment
+     * with children and no restore point). */
+    /** @param e      an index entry
+     *  @param leaf   it has no children
+     *  @param branch it has >= 2 children
+     *  @return its eviction class (above), -1 for none */
+    static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch) {
+        if (e.rp_bytes > 0u) return e.rp_flags == 0u && !branch ? 0 : 3;
+        if (!leaf) return -1;
+        return e.dominated ? 1 : 2;
+    }
+    /** Evict one restore point (file and index), or one leaf (files and index), by the classes above: the lowest class
+     *  first, the least recently used within it.  Never `keep` or `keep2`, a parent of a write in flight or a key being
+     *  written (L338).
      *  @param keep a key to spare (NULL = none)
      *  @param keep2 a second key to spare (NULL = none)
-     *  @return false when no leaf may go */
+     *  @return false when nothing may go */
     bool evict_one(const char *keep, const char *keep2) {
         const pulsar_segstore_seg *victim = nullptr;
+        int victim_class = 4;
         for (auto &kv : segs) {
             if ((keep && kv.first == keep) || (keep2 && kv.first == keep2)) continue;
             if (pinned.count(kv.first) || pending.count(kv.first)) continue;   /* L338: a write in flight */
-            auto ch = children.find(kv.first);
-            if (ch != children.end() && !ch->second.empty()) continue;
-            const pulsar_segstore_seg &c = kv.second;
-            if (!victim || (c.dominated && !victim->dominated) ||
-                (c.dominated == victim->dominated && c.last_used < victim->last_used)) victim = &c;
+            const size_t kids = n_children(kv.first);
+            const int c = evict_class(kv.second, kids == 0u, kids >= 2u);
+            if (c < 0) continue;
+            if (!victim || c < victim_class || (c == victim_class && kv.second.last_used < victim->last_used)) {
+                victim = &kv.second;
+                victim_class = c;
+            }
         }
         if (!victim) return false;
         const std::string k = victim->key;
         if (victim->rp_bytes > 0u) {
-            drop_rp_of(segs[k], "store over budget");
+            drop_rp_of(segs[k], victim_class == 0 ? "store over budget"
+                                                  : "store over budget (a flagged or branch point's)");
             return true;
         }
         logf("evicted segment %s [%u,%u) %llu bytes%s: store over budget", k.c_str(), victim->G_prev, victim->G,
@@ -339,6 +376,8 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
         struct stat sb;
         const bool stat_ok = fstat(fileno(fp), &sb) == 0;
         const bool sized = ok && stat_ok && (uint64_t)sb.st_size == HDR + e.text_len + e.payload_bytes + e.trailer_bytes;
+        std::string head(sized ? (e.text_len < HEAD_BYTES ? e.text_len : HEAD_BYTES) : 0u, '\0');
+        const bool head_ok = head.empty() || fread(&head[0], 1, head.size(), fp) == head.size();
         /* L323: a segment of an OLDER store version can never load again (on-disk KV carries no back-compat, Tyler
          * 2026-10-13) and its bytes sit outside the budget: removed, whatever model wrote it */
         bool older = false;
@@ -352,9 +391,10 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
             retired++;
             retired_bytes += stat_ok ? (uint64_t)sb.st_size : 0u;
         }
-        if (!sized) continue;
+        if (!sized || !head_ok) continue;
         e.file_bytes = (uint64_t)sb.st_size;
         st->link(e);
+        st->heads[e.key] = head;
     }
     closedir(d);
     if (retired)
@@ -370,14 +410,16 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
         if (!fp) continue;
         char key[41];
         uint64_t payload = 0;
+        uint32_t flags = 0;
         bool older = false;
-        const bool ok = st->read_rp_header(fp, key, &payload, &older) && !memcmp(key, k.data(), 40);
+        const bool ok = st->read_rp_header(fp, key, &payload, &flags, &older) && !memcmp(key, k.data(), 40);
         struct stat sb;
         const bool sized = ok && fstat(fileno(fp), &sb) == 0 && (uint64_t)sb.st_size == RP_HDR + payload;
         fclose(fp);
         auto it = st->segs.find(k);
         if (sized && it != st->segs.end()) {
             it->second.rp_bytes = (uint64_t)sb.st_size;
+            it->second.rp_flags = flags;
             st->used += it->second.rp_bytes;
             continue;
         }
@@ -649,10 +691,12 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
     }
     /* L347: a restore point written while the segment was pending joins it, or goes with it */
     uint64_t rp_bytes = 0;
+    uint32_t rp_flags = 0;
     {
         auto r = st->pending_rp.find(key);
         if (r != st->pending_rp.end()) {
-            rp_bytes = r->second;
+            rp_bytes = r->second.bytes;
+            rp_flags = r->second.flags;
             st->pending_rp.erase(r);
         }
     }
@@ -678,7 +722,9 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         e.text_end = (parent.empty() ? 0u : st->segs[parent].text_end) + job->text.size();
         st->used -= rp_bytes;   /* link counts it again, on the entry */
         e.rp_bytes = rp_bytes;
+        e.rp_flags = rp_bytes ? rp_flags : 0u;
         st->link(e);
+        st->heads[e.key] = job->text.substr(0, HEAD_BYTES);
         st->refresh_dominated(e.parent);
         indexed = true;
     }
@@ -708,7 +754,7 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
     return pulsar_segstore_commit(st, job, ok) && ok;
 }
 
-bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes,
+bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes, uint32_t flags,
                             pulsar_segstore_write_fn write_rp, void *ud, char *err, size_t errlen) {
     if (!st || !key || !write_rp || rp_bytes == 0u) {
         snprintf(err, errlen, "restore point put: no store, key, writer or bytes");
@@ -723,7 +769,9 @@ bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp
     }
     /* the restore point it replaces (if any) leaves the count first: the room is made for the new file alone.  The
      * slot stays valid through eviction, which never takes `key` (unordered_map nodes do not move) */
-    uint64_t *slot = pending ? &st->pending_rp[k] : &it->second.rp_bytes;
+    uint64_t *slot = pending ? &st->pending_rp[k].bytes : &it->second.rp_bytes;
+    uint32_t *slot_flags = pending ? &st->pending_rp[k].flags : &it->second.rp_flags;
+    const uint32_t joined = (*slot ? *slot_flags : 0u) | flags;
     const uint64_t need = RP_HDR + rp_bytes;
     if (st->budget && need > st->budget) {
         snprintf(err, errlen, "restore point put: %llu bytes exceed the whole budget", (unsigned long long)need);
@@ -742,6 +790,7 @@ bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp
     put32(h, PULSAR_SEGSTORE_RP_MAGIC);
     put32(h + 4, PULSAR_SEGSTORE_RP_VERSION);
     put32(h + 8, st->identity);
+    put32(h + 12, joined);
     memcpy(h + 16, key, 40);
     put64(h + 56, rp_bytes);
     const bool ok = durable_write(st->rp_path(k.c_str()), h, RP_HDR, [&](FILE *fp) {
@@ -754,7 +803,102 @@ bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp
     }
     st->used = st->used - *slot + need;
     *slot = need;
+    *slot_flags = joined;
     return true;
+}
+
+bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t flags) {
+    if (!st) return false;
+    auto it = st->segs.find(std::string(key, 40));
+    if (it == st->segs.end() || it->second.rp_bytes == 0u) return false;
+    const uint32_t joined = it->second.rp_flags | flags;
+    if (joined == it->second.rp_flags) return true;
+    FILE *fp = fopen(st->rp_path(it->first.c_str()).c_str(), "r+b");
+    if (!fp) return false;
+    uint8_t b[4];
+    put32(b, joined);
+    const bool ok = fseek(fp, 12, SEEK_SET) == 0 && fwrite(b, 1, 4, fp) == 4;
+    const bool closed = fclose(fp) == 0;
+    if (!ok || !closed) return false;
+    it->second.rp_flags = joined;
+    return true;
+}
+
+int pulsar_segstore_drop_superseded_rps(pulsar_segstore *st, const char key[41]) {
+    if (!st) return 0;
+    std::string cur(key, 40);
+    if (!st->segs.count(cur)) return 0;
+    /* may this key's restore point go?  Not flagged, not a branch point, no write in flight */
+    auto droppable = [st](const std::string &k) {
+        const pulsar_segstore_seg &e = st->segs[k];
+        return e.rp_bytes > 0u && e.rp_flags == 0u && st->n_children(k) < 2u && !st->pinned.count(k) &&
+               !st->pending.count(k);
+    };
+    int dropped = 0;
+    for (;;) {
+        const std::string parent = st->segs[cur].parent;
+        /* an older tail of this conversation under the same parent: a leaf whose text is a byte prefix of cur's (so
+         * dominated, the index's cheap test first; then the texts) */
+        std::string cur_text;
+        bool have_cur = false;
+        auto sib = st->children.find(parent);
+        if (sib != st->children.end())
+            for (const std::string &c : sib->second) {
+                const pulsar_segstore_seg &e = st->segs[c];
+                if (c == cur || !e.dominated || st->n_children(c) != 0u || !droppable(c) ||
+                    e.text_len >= st->segs[cur].text_len)
+                    continue;
+                if (!have_cur && !(have_cur = st->read_text(cur, &cur_text))) break;
+                std::string t;
+                if (!st->read_text(c, &t) || memcmp(t.data(), cur_text.data(), t.size()) != 0) continue;
+                st->drop_rp_of(st->segs[c], "superseded by a later end of its chain");
+                dropped++;
+            }
+        if (parent.empty()) break;
+        if (droppable(parent)) {
+            st->drop_rp_of(st->segs[parent], "superseded by a later end of its chain");
+            dropped++;
+        }
+        cur = parent;
+    }
+    return dropped;
+}
+
+bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, bool *rp_at_len) {
+    *rp_at_len = false;
+    if (!st || !text || len == 0u) return false;
+    /* the lookup's walk (children whose key the text's own bytes reproduce), plus, at each node it reaches, a child
+     * that runs past `len` and starts with the rest of the text */
+    struct frame { std::string key; uint64_t end; };
+    std::vector<frame> stack{{"", 0}};
+    bool covered = false;
+    while (!stack.empty()) {
+        const frame f = stack.back();
+        stack.pop_back();
+        if (!f.key.empty() && f.end == len) {
+            covered = true;
+            if (st->segs[f.key].rp_bytes > 0u) *rp_at_len = true;
+            continue;
+        }
+        auto ch = st->children.find(f.key);
+        if (ch == st->children.end()) continue;
+        for (const std::string &c : ch->second) {
+            const pulsar_segstore_seg &cs = st->segs[c];
+            if (f.end + cs.text_len <= len) {
+                char k[41];
+                pulsar_segstore_child_key(f.key.c_str(), text + f.end, cs.text_len, k);
+                if (c == k) stack.push_back({c, f.end + cs.text_len});
+                continue;
+            }
+            if (covered) continue;
+            const size_t rest = len - f.end;
+            const std::string &head = st->heads[c];
+            if (memcmp(head.data(), text + f.end, rest < head.size() ? rest : head.size()) != 0) continue;
+            std::string t;
+            covered = rest <= head.size() || (st->read_text(c, &t) && memcmp(t.data(), text + f.end, rest) == 0);
+        }
+    }
+    return covered;
 }
 
 FILE *pulsar_segstore_open_rp(pulsar_segstore *st, const char key[41], uint64_t *bytes) {
@@ -765,8 +909,9 @@ FILE *pulsar_segstore_open_rp(pulsar_segstore *st, const char key[41], uint64_t 
     if (!fp) return nullptr;
     char k[41];
     uint64_t payload = 0;
+    uint32_t flags = 0;
     bool older = false;
-    if (!st->read_rp_header(fp, k, &payload, &older) || memcmp(k, it->first.data(), 40) != 0 ||
+    if (!st->read_rp_header(fp, k, &payload, &flags, &older) || memcmp(k, it->first.data(), 40) != 0 ||
         RP_HDR + payload != it->second.rp_bytes) {
         fclose(fp);
         return nullptr;

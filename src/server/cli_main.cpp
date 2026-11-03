@@ -1473,10 +1473,10 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    /* L272 B5: the template's turn markers, for the sys-prefix cold store and the routing anchor. */
+    /* L272 B5: the template's turn markers, for the anchor cold store and the routing anchor. */
     if (!pulsar_chat_turn_markers(engine, &s.turn_markers))
         server_log(PULSAR_LOG_WARNING, "pulsar-server: the tokenizer does not spell the chat turn markers: "
-                   "the sys-prefix cold store and the last-turn routing anchor are off");
+                   "the anchor cold store and the last-turn routing anchor are off");
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
     if (cfg.kv_disk_dir &&
@@ -1686,7 +1686,7 @@ int main(int argc, char **argv) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: persisting slot %d KV cache before shutdown tokens=%d",
                        i, tokens->len);
-            s.kv_cache_persist(sl, "shutdown", true);
+            s.kv_cache_persist(sl, KV_PERSIST_SHUTDOWN);
         }
     }
     s.close_resources();

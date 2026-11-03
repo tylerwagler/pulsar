@@ -176,7 +176,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            p->srv->kv_cache_persist(p->slot, "continued", false);
+            p->srv->kv_cache_persist(p->slot, KV_PERSIST_CONTINUED);
         }
         return;
     }
@@ -232,7 +232,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        p->srv->kv_cache_persist(p->slot, "continued", false);
+        p->srv->kv_cache_persist(p->slot, KV_PERSIST_CONTINUED);
     }
 }
 
@@ -580,7 +580,7 @@ void server::gen_prefill_abandon(session_slot *sl) {
      * the same ones a "continued" store writes on progress; this store closes the chain at the deepest of them. */
     if (s->kv.enabled && s->bank_switch(sl->bank)) {
         int end = 0;
-        s->kv_cache_persist(sl, "abandoned", true, &end);
+        s->kv_cache_persist(sl, KV_PERSIST_ABANDONED, &end);
         const int kept = end - g->progress.cached_tokens;
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: abandoned prefill of bank %u: chain stored to %d (resumed at %d, prompt %d)",
@@ -787,7 +787,7 @@ void server::gen_begin(session_slot *sl) {
      * from their placeholders in the suffix -- so the engine merges them where
      * their blocks fall.  Before L273 the disk resolver was off for it: the pair
      * 2026-10-06 20:21, an image turn routed to a fresh bank prefilled 150k
-     * tokens cold past the sys-prefix cut where a text turn loads the chain. */
+     * tokens cold past the anchor cut where a text turn loads the chain. */
     const bool image_request = j->req.n_images > 0;
     sl->terminal_pending = false;   /* L311: this job's own sync resumes the bank's last turn */
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
@@ -838,7 +838,7 @@ void server::gen_begin(session_slot *sl) {
     if (image_request) {
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: image request (%d image%s): live and disk resolvers apply, "
-                   "cold phase covers the sys-prefix only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
+                   "cold phase covers the anchor only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
     }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
@@ -1001,7 +1001,7 @@ void server::gen_begin(session_slot *sl) {
          * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
          * touched first, so making room for the persist evicts other leaves. */
         if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
-        s->kv_cache_persist(sl, "evict", true);
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT);
     }
     if (pick == RESUME_ADOPT) {
         char aerr[192] = "";
@@ -1181,36 +1181,47 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
      * forward -- on the pair ~300 ms for a 61-token tail (the grouped MoE at
      * small M reads ~every expert) plus ~167 ms of staging, ~24% of a 2K
      * prompt -- for entries L261's baseline shows rarely hit.  A long
-     * conversation still checkpoints through the continued store. */
+     * conversation still checkpoints through the continued store.
+     * L347 I2: the cut is the chat anchor aligned down to the resume grid (no
+     * 2048-token margin and alignment, so a ~2K preamble has one too), and the
+     * phase runs only on the preamble's SECOND sighting: an earlier request's
+     * rows cover it and no restore point stands at the cut
+     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  A sync from
+     * token 0 only: a request a restore point at the cut serves loads it (the
+     * resume pick, L318) and resumes at or past the cut. */
     int cold_store_len = 0;
     if (resumed_at == TokPos{0} &&   /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens)
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers);
-        cold_store_len = kv_cache_sys_prefix_cut(&s->kv, anchor);
+        cold_store_len = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
+        if (cold_store_len >= prompt_for_sync->len) cold_store_len = 0;
     }
     /* An image request's cold phase covers the shared preamble only, and the
-     * cut sits a margin below the first user turn, so no image block begins
+     * cut sits at or below the first user turn, so no image block begins
      * inside it: that phase is the PLAIN text sync (gen_step_prefill), and the
      * main sync then merges every image on top of the checkpoint it leaves --
      * L261 reuse with 0 held images and all of them new, the text-turn-then-
      * image-turn shape.  A block that does begin inside the cut would be split
-     * from its merge, so such a cut is dropped and the main pass merges from
-     * token 0.  (l264t, 2026-10-05: with the !image_request gate gone, the cut
-     * itself was handed to sync_mm with every start_pos past its end -> HTTP
-     * 400 "image 0 at N is not a sentinel block" for any prompt whose first
-     * user turn sat past ~4k tokens, i.e. every Claude Code request.) */
+     * from its merge, so such a cut is dropped (no anchor) and the main pass
+     * merges from token 0.  (l264t, 2026-10-05: with the !image_request gate
+     * gone, the cut itself was handed to sync_mm with every start_pos past its
+     * end -> HTTP 400 "image 0 at N is not a sentinel block" for any prompt
+     * whose first user turn sat past ~4k tokens, i.e. every Claude Code
+     * request.) */
     if (image_request) {
         int inside = -1;
         const int cut = server_image_cold_cut(cold_store_len, j->req.images, j->req.n_images, &inside);
         if (inside >= 0)
             server_log(PULSAR_LOG_PREFILL,
                        "pulsar-server: image request: image %d at %d begins inside the "
-                       "sys-prefix cut %d -- no cold phase, the main pass merges it",
+                       "anchor cut %d -- no cold phase, the main pass merges it",
                        inside, j->req.images[inside].start_pos, cold_store_len);
         cold_store_len = cut;
     }
+    /* L347 I2: the second sighting, last -- it renders the cut's text and walks the store */
+    if (cold_store_len > 0 && !s->kv_cache_anchor_due(prompt_for_sync, cold_store_len)) cold_store_len = 0;
     g->cold_store_len = cold_store_len;
     /* The prompt the prefill phases sync, in later quanta (effective_prompt is g's own). */
     g->prompt_for_sync = prompt_for_sync;
@@ -1322,9 +1333,10 @@ void server::gen_step_prefill(session_slot *sl) {
     }
 
     if (cold) {
-        /* The cold prefill ended on the sys-prefix cut, a grid point, so the
-         * shared preamble is a checkpoint now: persist it as its own chain. */
-        s->kv_cache_persist(sl, "sys-prefix", true);
+        /* The cold prefill ended on the anchor cut, a resume-grid point, so the
+         * shared preamble is a checkpoint now: persist it as its own chain, its
+         * end an anchor restore point (L347 I2). */
+        s->kv_cache_persist(sl, KV_PERSIST_ANCHOR);
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
@@ -1349,7 +1361,7 @@ void server::gen_stream_begin(session_slot *sl) {
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_persist(sl, "prompt", true);
+    s->kv_cache_persist(sl, KV_PERSIST_PROMPT);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -2184,7 +2196,7 @@ bool server::terminal_checkpoint_step() {
                "pulsar-server: terminal checkpoint: bank %u prefilled [%d, %d) of its turn (prefill frontier was %d) "
                "in %.1f ms%s%s",
                pick->bank, origin.raw(), C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ", err);
-    if (rc == 0) s->kv_cache_persist(pick, "terminal", true);
+    if (rc == 0) s->kv_cache_persist(pick, KV_PERSIST_TERMINAL);
     else pulsar_session_invalidate(s->sess);   /* the bank's state is no position's; its next turn rebuilds it */
     pulsar_tokens_free(&target);
     return true;

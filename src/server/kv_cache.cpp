@@ -14,14 +14,31 @@
 
 
 
-/// @brief The default checkpoint policy: min_tokens 512, sys-prefix align 2048 and margin 2048 (tokens).
+/// @brief The default checkpoint policy: min_tokens 512.
 /// @return the options
 kv_cache_options kv_cache_default_options(void) {
     kv_cache_options o = {};
     o.min_tokens = 512;
-    o.sys_prefix_align = 2048;
-    o.sys_prefix_margin = 2048;
     return o;
+}
+
+const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS] = {
+    "continued", "prompt", "terminal", "evict", "spill", "abandoned", "shutdown", "anchor",
+};
+
+unsigned kv_persist_writes(kv_persist_trigger t) {
+    switch (t) {
+    case KV_PERSIST_CONTINUED: return 0u;
+    case KV_PERSIST_PROMPT:
+    case KV_PERSIST_TERMINAL: return PULSAR_KVCHAIN_TAIL;
+    case KV_PERSIST_EVICT:
+    case KV_PERSIST_SPILL:
+    case KV_PERSIST_ABANDONED:
+    case KV_PERSIST_SHUTDOWN: return PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP;
+    case KV_PERSIST_ANCHOR: return PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR;
+    case KV_PERSIST_TRIGGERS: break;
+    }
+    return 0u;
 }
 
 
@@ -608,17 +625,30 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
-/* Back the anchor cut off below harness-injected preamble jitter and land it on
- * an alignment boundary (a multiple of the resume grid, so the cold prefill that
- * ends there leaves a grid checkpoint).  0 when nothing useful survives. */
-/// @param kc      the cache (its min_tokens, sys_prefix_margin, sys_prefix_align)
-/// @param anchor  the chat anchor (kv_cache_chat_anchor_pos), tokens
-/// @return the cut position in tokens, 0 for none
-int kv_cache_sys_prefix_cut(const kv_disk_cache *kc, int anchor) {
-    if (anchor < kc->opt.min_tokens) return 0;
-    int cut = anchor - kc->opt.sys_prefix_margin;
-    if (kc->opt.sys_prefix_align > 0) cut -= cut % kc->opt.sys_prefix_align;
+int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid) {
+    if (grid <= 0 || anchor < kc->opt.min_tokens) return 0;
+    const int cut = anchor - anchor % grid;
     return cut >= kc->opt.min_tokens ? cut : 0;
+}
+
+bool server::kv_cache_anchor_due(const pulsar_tokens *prompt, int cut) {
+    if (!kv.enabled || !kv.st || cut <= 0 || cut > prompt->len) return false;
+    (void)kv_cache_commit_written(&kv);   /* L338: the rows an earlier request's writer finished since the last look */
+    /* the anchor's text as a persist renders it (pulsar_kvchain_persist keys segments by their tokens' text) */
+    pulsar_tokens head;
+    memset(&head, 0, sizeof head);
+    head.v = prompt->v;
+    head.len = head.cap = cut;
+    size_t len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(engine, &head, &len);
+    if (!text) return false;
+    bool rp_at_cut = false;
+    const bool covered = pulsar_segstore_covers(kv.st, text, len, &rp_at_cut);
+    free(text);
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache anchor at %d: rows %s, restore point %s -> %s", cut,
+               covered ? "stored (second sighting)" : "not stored (first sighting)", rp_at_cut ? "stored" : "none",
+               covered && !rp_at_cut ? "write it" : "no write");
+    return covered && !rp_at_cut;
 }
 
 namespace {
@@ -645,8 +675,9 @@ int seg_trailer_write(FILE *fp, void *ud, const char *text, char *err, size_t er
 }
 }  // namespace
 
-int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, int *chain_end) {
+int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end) {
     auto *s = this;
+    const char *reason = kv_persist_trigger_names[why];
     (void)sl;   /* the caller installed the slot's bank */
     if (chain_end) *chain_end = 0;
     if (!s->kv.enabled) return 0;
@@ -685,15 +716,16 @@ int server::kv_cache_persist(session_slot *sl, const char *reason, bool close, i
     const pulsar_kvchain_trailer tool_maps = { s, seg_trailer_size, seg_trailer_write };
     const pulsar_kvchain_writer writer = { s->kv.writer, kv_writer_admit, kv_writer_submit };
     pulsar_kvchain_persist_result r;
-    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, close, &tool_maps, &writer, &r);
+    pulsar_kvchain_persist(s->kv.st, s->engine, s->sess, s->kv.opt.min_tokens, kv_persist_writes(why), &tool_maps,
+                           &writer, &r);
     if (r.err[0])
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache chain not fully stored (reason=%s): %s", reason, r.err);
-    if (r.written || r.rp_bytes)
+    if (r.written || r.rp_written || r.rp_dropped)
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: kv cache persisted reason=%s chain to %d (%d new segments, %.1f MiB, staged and "
-                   "written in the background; restore point %.1f MiB written) in %.1f ms",
-                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), (double)r.rp_bytes / (1024.0 * 1024.0),
-                   (server_now_sec() - t0) * 1000.0);
+                   "written in the background; %d restore points, %.1f MiB written; %d superseded dropped) in %.1f ms",
+                   reason, r.end, r.written, (double)r.bytes / (1024.0 * 1024.0), r.rp_written,
+                   (double)r.rp_bytes / (1024.0 * 1024.0), r.rp_dropped, (server_now_sec() - t0) * 1000.0);
     if (chain_end) *chain_end = r.end;
     return r.written;
 }

@@ -6824,25 +6824,31 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
 
 
 
-/* The anchor sits above harness-injected preamble jitter, so the cut must back
- * off below it. Numbers are the live Claude Code session measured 2026-08-11:
- * anchor 21,950, replay agreement wandering over 20,393..21,886. */
-static void test_kv_cache_sys_prefix_cut_clears_preamble_jitter(void) {
+/* L347 I2: the anchor cut is the chat anchor aligned DOWN to the resume grid -- no 2048-token margin, no 4096-token
+ * floor (a ~2K judge preamble has an anchor now; the old cut 2048 below an aligned anchor gave it none), nothing below
+ * min_tokens -- and an image block below it leaves no anchor (server_image_cold_cut). */
+static void test_l347_anchor_cut(void) {
     kv_disk_cache kc = {0};
     kc.opt = kv_cache_default_options();
-
-    const int anchor = 21950;
-    const int cut = kv_cache_sys_prefix_cut(&kc, anchor);
-    TEST_ASSERT(cut == 18432);
-    TEST_ASSERT(cut % kc.opt.sys_prefix_align == 0);
-    /* Must sit below every observed replay-agreement point, or the checkpoint
-     * is stored and evicted forever without ever being a valid byte-prefix. */
-    TEST_ASSERT(cut < 20393);
-
-    /* Degenerate inputs yield "no checkpoint", never a negative length. */
-    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, 0) == 0);
-    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, kc.opt.min_tokens - 1) == 0);
-    TEST_ASSERT(kv_cache_sys_prefix_cut(&kc, kc.opt.sys_prefix_margin) == 0);
+    TEST_ASSERT(kc.opt.min_tokens == 512);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, 128) == 21888);   /* the 2026-08-11 Claude Code anchor */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2100, 128) == 2048);     /* a judge preamble: the old rule's cut was 0 */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 2048, 128) == 2048);     /* on the grid: the anchor itself */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 639, 128) == 512);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 700, 256) == 512);       /* the family's grid, whatever it is */
+    /* nothing below min_tokens, before or after the alignment; no anchor or no grid, no cut */
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 511, 128) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 1000, 1024) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, -1, 128) == 0);
+    TEST_ASSERT(kv_cache_anchor_cut(&kc, 21950, 0) == 0);
+    /* an image block that begins below the cut: no anchor (the cold phase is a text sync) */
+    pulsar_image_ref imgs[1];
+    memset(imgs, 0, sizeof imgs);
+    imgs[0].start_pos = 1500;
+    int inside = -1;
+    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, 128), imgs, 1, &inside) == 0 && inside == 0);
+    imgs[0].start_pos = 2100;
+    TEST_ASSERT(server_image_cold_cut(kv_cache_anchor_cut(&kc, 2100, 128), imgs, 1, &inside) == 2048 && inside == -1);
 }
 
 /* L310: a disk hit loads only when its measured read beats half the priced prefill of what it adds (Flare 2.10);
@@ -7302,10 +7308,11 @@ static int l323_rp_write(FILE *fp, void *ud, char *err, size_t errlen) {
     for (uint64_t i = 4; i < L323_STATE; i++) if (fputc(0xa5, fp) == EOF) return 1;
     return 0;
 }
-static bool l323_put_rp(pulsar_segstore *st, const char key[41], uint32_t G) {
+static bool l347_put_rp(pulsar_segstore *st, const char key[41], uint32_t G, uint32_t flags) {
     char err[256];
-    return pulsar_segstore_put_rp(st, key, L323_STATE, l323_rp_write, &G, err, sizeof err);
+    return pulsar_segstore_put_rp(st, key, L323_STATE, flags, l323_rp_write, &G, err, sizeof err);
 }
+static bool l323_put_rp(pulsar_segstore *st, const char key[41], uint32_t G) { return l347_put_rp(st, key, G, 0u); }
 static void l323_text(int from, int to, std::string *out) {
     out->clear();
     char tok[16];
@@ -7421,7 +7428,8 @@ static void test_l323_grid_cut_dedupes_copies(void) {
 
 /* L323 (2): a tail is superseded -- dominated -- once its conversation goes on under the same parent (a later tail,
  * or the grid segment covering it); a real branch is not; a dominated leaf is evicted before any LRU choice; and the
- * marks are re-derived at open. */
+ * marks are re-derived at open.  L347 I2: unflagged restore points go before any leaf (the old branch's too, the
+ * oldest), then the dominated tails' rows, never the branch's rows first. */
 static void test_l323_tail_supersession(void) {
     char t[] = "/tmp/pulsar-l323-tail.XXXXXX";
     char *dir = l323_tmpdir(t);
@@ -7473,8 +7481,8 @@ static void test_l323_tail_supersession(void) {
                                   const uint64_t u = pulsar_segstore_used_bytes(o); pulsar_segstore_close(o); return u; }();
     st = pulsar_segstore_open(dir, used + 200, 7, NULL, NULL);   /* room for nothing big: a put must evict */
     TEST_ASSERT(l323_persist(st, 8400, 4096, true, tip) == 1);
-    TEST_ASSERT(pulsar_segstore_contains(st, bkey));                           /* the old branch stays */
-    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes > 0u);      /* with its restore point */
+    TEST_ASSERT(pulsar_segstore_contains(st, bkey));                           /* the old branch's rows stay */
+    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes == 0u);     /* its dead end's restore point went */
     TEST_ASSERT(!pulsar_segstore_contains(st, t1) || !pulsar_segstore_contains(st, t2));   /* a dominated tail went */
     pulsar_segstore_close(st);
     l323_rmdir(dir);
@@ -7698,6 +7706,339 @@ static void test_l347_restore_points(void) {
         TEST_ASSERT(seen.rps == rps0 + 1 && seen.segs == segs0);   /* the restore point went, not the leaf */
         pulsar_segstore_close(st);
     }
+    l323_rmdir(dir);
+}
+
+/* ===== L347 I2: restore points where a restore starts ================================================== */
+/* A fixture bank's checkpoints (pulsar_kvchain_rp_source): every G, or only those listed. */
+struct l347_ckpts {
+    bool all = true;          ///< a checkpoint at every G
+    std::vector<int> held;    ///< else only at these
+};
+static uint64_t l347_src_bytes(void *ud, int G) {
+    const l347_ckpts *c = (const l347_ckpts *)ud;
+    if (c->all) return L323_STATE;
+    for (int g : c->held) if (g == G) return L323_STATE;
+    return 0;
+}
+static int l347_src_write(FILE *fp, void *ud, int G, const char *key, char *err, size_t errlen) {
+    (void)ud; (void)key;
+    uint32_t g = (uint32_t)G;
+    return l323_rp_write(fp, &g, err, errlen);
+}
+/* Persist the history [0, deepest) as pulsar_kvchain_persist does -- the segments past the deepest stored grid-ended
+ * chain, the tail when `what` asks -- and run the real restore point policy (pulsar_kvchain_place_rps) over them. */
+static int l347_persist(pulsar_segstore *st, int deepest, int grid, unsigned what, l347_ckpts *ck,
+                        pulsar_kvchain_persist_result *r, char tip[41]) {
+    std::string full;
+    l323_text(0, deepest, &full);
+    const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
+    pulsar_segstore_seg chain[64];
+    const int c = pulsar_segstore_lookup(st, full.data(), full.size(), &grid_end, chain, 64);
+    char parent[41] = "";
+    int prev = 0;
+    if (c > 0) { memcpy(parent, chain[c - 1].key, 41); prev = (int)chain[c - 1].G; }
+    int ends[64];
+    const int m = pulsar_kvchain_segment_ends(prev, deepest, grid, (what & PULSAR_KVCHAIN_TAIL) != 0u, ends, 64);
+    pulsar_kvchain_link links[64];
+    int n = 0, written = 0;
+    for (int k = 0; k < m; k++) {
+        const int G = ends[k];
+        l323_payload p = { (uint32_t)prev, (uint32_t)G, l323_rows_bytes((uint32_t)prev, (uint32_t)G) };
+        std::string text;
+        l323_text(prev, G, &text);
+        char key[41], err[256];
+        pulsar_segstore_child_key(parent, text.data(), text.size(), key);
+        written += !pulsar_segstore_contains(st, key);
+        TEST_ASSERT(pulsar_segstore_put(st, parent, (uint32_t)prev, (uint32_t)G, text.data(), text.size(), p.bytes,
+                                        l323_payload_write, 0, NULL, &p, key, err, sizeof err));
+        memcpy(parent, key, 41);
+        prev = G;
+        memcpy(links[n].key, key, 41);
+        links[n++].G = G;
+    }
+    if (n == 0 && prev > 0) { memcpy(links[0].key, parent, 41); links[n++].G = prev; }
+    memset(r, 0, sizeof *r);
+    const pulsar_kvchain_rp_source src = { ck, l347_src_bytes, l347_src_write };
+    pulsar_kvchain_place_rps(st, links, n, grid, what, &src, r);
+    memcpy(tip, parent, 41);
+    return written;
+}
+/* the stored segment of history [0, G) by its text (any end), or false */
+static bool l347_seg_at(pulsar_segstore *st, int G, pulsar_segstore_seg *out) {
+    std::string text;
+    l323_text(0, G, &text);
+    pulsar_segstore_seg chain[64];
+    const int n = pulsar_segstore_lookup(st, text.data(), text.size(), NULL, chain, 64);
+    if (n == 0 || (int)chain[n - 1].G != G) return false;
+    *out = chain[n - 1];
+    return true;
+}
+
+/* L347 I2 (1): what each trigger writes -- kv_persist_writes, the one table -- and what that request leaves in the
+ * store: rows always (to the last grid point), the tail for every trigger but a progress one, a restore point at the
+ * chain's end only where the history is about to be lost (evict / spill / abandon / shutdown) and at an anchor, which
+ * is flagged so. */
+static void test_l347_i2_trigger_table(void) {
+    TEST_ASSERT(kv_persist_writes(KV_PERSIST_CONTINUED) == 0u);
+    TEST_ASSERT(kv_persist_writes(KV_PERSIST_PROMPT) == PULSAR_KVCHAIN_TAIL);
+    TEST_ASSERT(kv_persist_writes(KV_PERSIST_TERMINAL) == PULSAR_KVCHAIN_TAIL);
+    const kv_persist_trigger loss[] = { KV_PERSIST_EVICT, KV_PERSIST_SPILL, KV_PERSIST_ABANDONED, KV_PERSIST_SHUTDOWN };
+    for (kv_persist_trigger t : loss) TEST_ASSERT(kv_persist_writes(t) == (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP));
+    TEST_ASSERT(kv_persist_writes(KV_PERSIST_ANCHOR) ==
+                (PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP | PULSAR_KVCHAIN_ANCHOR));
+    for (int t = 0; t < KV_PERSIST_TRIGGERS; t++)
+        TEST_ASSERT(kv_persist_trigger_names[t] && kv_persist_trigger_names[t][0]);
+    TEST_ASSERT(!strcmp(kv_persist_trigger_names[KV_PERSIST_ANCHOR], "anchor"));
+    /* each trigger's request on a 9000-token history, its bank holding a checkpoint everywhere */
+    for (int t = 0; t < KV_PERSIST_TRIGGERS; t++) {
+        char tmpl[] = "/tmp/pulsar-l347-trig.XXXXXX";
+        char *dir = l323_tmpdir(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+        pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        const unsigned what = kv_persist_writes((kv_persist_trigger)t);
+        l347_ckpts ck;
+        pulsar_kvchain_persist_result r;
+        char tip[41];
+        const int written = l347_persist(st, 9000, 4096, what, &ck, &r, tip);
+        const bool tail = (what & PULSAR_KVCHAIN_TAIL) != 0u, rp = (what & PULSAR_KVCHAIN_RP) != 0u;
+        TEST_ASSERT(written == (tail ? 3 : 2));
+        pulsar_segstore_seg g;
+        TEST_ASSERT(l347_seg_at(st, 8192, &g) && g.rp_bytes == 0u);   /* a grid point inside the chain: rows only */
+        TEST_ASSERT(l347_seg_at(st, 9000, &g) == tail);
+        if (tail) {
+            TEST_ASSERT(rp ? g.rp_bytes > L323_STATE : g.rp_bytes == 0u);
+            TEST_ASSERT(g.rp_flags == ((what & PULSAR_KVCHAIN_ANCHOR) ? PULSAR_SEGSTORE_RP_ANCHOR : 0u));
+        }
+        TEST_ASSERT(r.rp_written == (rp ? 1 : 0) && r.rp_dropped == 0 && !r.err[0]);
+        /* the flags survive a restart (the .rp header) */
+        pulsar_segstore_close(st);
+        st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        if (tail && rp)
+            TEST_ASSERT(l347_seg_at(st, 9000, &g) && g.rp_bytes > L323_STATE &&
+                        g.rp_flags == ((what & PULSAR_KVCHAIN_ANCHOR) ? PULSAR_SEGSTORE_RP_ANCHOR : 0u));
+        pulsar_segstore_close(st);
+        l323_rmdir(dir);
+    }
+}
+
+/* L347 I2 (2): a periodic restore point every PULSAR_KVCHAIN_RP_EVERY_CELLS grid cells (32768 tokens at 4096), written
+ * by any persist that passes the point -- a progress one too -- when the bank holds its checkpoint there, flagged
+ * so. */
+static void test_l347_i2_periodic(void) {
+    TEST_ASSERT(PULSAR_KVCHAIN_RP_EVERY_CELLS == 8);
+    TEST_ASSERT(pulsar_kvchain_rp_periodic(32768, 4096) && pulsar_kvchain_rp_periodic(65536, 4096));
+    TEST_ASSERT(!pulsar_kvchain_rp_periodic(4096, 4096) && !pulsar_kvchain_rp_periodic(28672, 4096) &&
+                !pulsar_kvchain_rp_periodic(36864, 4096));
+    TEST_ASSERT(!pulsar_kvchain_rp_periodic(0, 4096) && !pulsar_kvchain_rp_periodic(32768, 0));
+    TEST_ASSERT(pulsar_kvchain_rp_periodic(1024, 128));
+    char tmpl[] = "/tmp/pulsar-l347-per.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    l347_ckpts ck;
+    pulsar_kvchain_persist_result r;
+    char tip[41];
+    /* a prefill's progress past 32768: the rows, and the periodic restore point there */
+    TEST_ASSERT(l347_persist(st, 40000, 4096, kv_persist_writes(KV_PERSIST_CONTINUED), &ck, &r, tip) == 9);
+    TEST_ASSERT(r.rp_written == 1 && r.rp_bytes == L323_STATE);
+    pulsar_segstore_seg g;
+    TEST_ASSERT(l347_seg_at(st, 32768, &g) && g.rp_bytes > L323_STATE && g.rp_flags == PULSAR_SEGSTORE_RP_PERIODIC);
+    TEST_ASSERT(l347_seg_at(st, 28672, &g) && g.rp_bytes == 0u);
+    TEST_ASSERT(l347_seg_at(st, 36864, &g) && g.rp_bytes == 0u);
+    /* the bank no longer holds a checkpoint at 65536: the persist passes it without one */
+    ck.all = false;
+    ck.held = { 70000 };
+    TEST_ASSERT(l347_persist(st, 70000, 4096, kv_persist_writes(KV_PERSIST_EVICT), &ck, &r, tip) == 9);
+    TEST_ASSERT(l347_seg_at(st, 65536, &g) && g.rp_bytes == 0u);
+    TEST_ASSERT(l347_seg_at(st, 70000, &g) && g.rp_bytes > L323_STATE && g.rp_flags == 0u);
+    TEST_ASSERT(r.rp_written == 1);
+    /* a chain end ON a periodic point carries both flags, in one file */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    char tmpl2[] = "/tmp/pulsar-l347-per2.XXXXXX";
+    dir = l323_tmpdir(tmpl2);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    ck.all = true;
+    TEST_ASSERT(l347_persist(st, 32768, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip) == 8);
+    TEST_ASSERT(r.rp_written == 1 && l347_seg_at(st, 32768, &g) &&
+                g.rp_flags == (PULSAR_SEGSTORE_RP_PERIODIC | PULSAR_SEGSTORE_RP_ANCHOR));
+    /* a key that has one only gains flags (the same key is the same state): no second write */
+    TEST_ASSERT(pulsar_segstore_flag_rp(st, g.key, PULSAR_SEGSTORE_RP_PERIODIC));
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(l347_seg_at(st, 32768, &g) && g.rp_flags == (PULSAR_SEGSTORE_RP_PERIODIC | PULSAR_SEGSTORE_RP_ANCHOR));
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L347 I2 (4): a restore point written at a new chain end drops those of the same chain's earlier ends -- an
+ * ancestor's, an older tail's under an ancestor -- but never an anchor's, a periodic one's or a branch point's. */
+static void test_l347_i2_superseded(void) {
+    l347_ckpts ck;
+    pulsar_kvchain_persist_result r;
+    char tip[41];
+    pulsar_segstore_seg g;
+    const unsigned evict = kv_persist_writes(KV_PERSIST_EVICT);
+    /* an older tail goes, an anchor stays */
+    {
+        char tmpl[] = "/tmp/pulsar-l347-sup.XXXXXX";
+        char *dir = l323_tmpdir(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+        pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        l347_persist(st, 5000, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);   /* [4096,5000) anchor */
+        l347_persist(st, 9000, 4096, evict, &ck, &r, tip);                                  /* [8192,9000) */
+        TEST_ASSERT(r.rp_written == 1 && r.rp_dropped == 0);
+        TEST_ASSERT(l347_seg_at(st, 5000, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
+        l347_persist(st, 13000, 4096, evict, &ck, &r, tip);                                 /* [12288,13000) */
+        TEST_ASSERT(r.rp_written == 1 && r.rp_dropped == 1);
+        TEST_ASSERT(l347_seg_at(st, 9000, &g) && g.rp_bytes == 0u);       /* the older end's: superseded */
+        TEST_ASSERT(l347_seg_at(st, 5000, &g) && g.rp_bytes > 0u);        /* the anchor's: kept */
+        TEST_ASSERT(l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
+        /* a persist that writes no restore point drops nothing */
+        l347_persist(st, 13500, 4096, kv_persist_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
+        TEST_ASSERT(r.rp_written == 0 && r.rp_dropped == 0 && l347_seg_at(st, 13000, &g) && g.rp_bytes > 0u);
+        pulsar_segstore_close(st);
+        l323_rmdir(dir);
+    }
+    /* a periodic point stays */
+    {
+        char tmpl[] = "/tmp/pulsar-l347-sup2.XXXXXX";
+        char *dir = l323_tmpdir(tmpl);
+        pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        l347_persist(st, 33000, 4096, evict, &ck, &r, tip);
+        TEST_ASSERT(r.rp_written == 2 && r.rp_dropped == 0);   /* 32768 periodic + the end */
+        l347_persist(st, 37000, 4096, evict, &ck, &r, tip);
+        TEST_ASSERT(r.rp_written == 1 && r.rp_dropped == 1);
+        TEST_ASSERT(l347_seg_at(st, 33000, &g) && g.rp_bytes == 0u);
+        TEST_ASSERT(l347_seg_at(st, 32768, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_PERIODIC);
+        pulsar_segstore_close(st);
+        l323_rmdir(dir);
+    }
+    /* an ancestor's goes (a chain end that was a grid point); a branch point's stays */
+    for (int branch = 0; branch < 2; branch++) {
+        char tmpl[] = "/tmp/pulsar-l347-sup3.XXXXXX";
+        char *dir = l323_tmpdir(tmpl);
+        pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        l347_persist(st, 8192, 4096, evict, &ck, &r, tip);   /* the end ON the grid: [4096,8192) holds it */
+        TEST_ASSERT(r.rp_written == 1 && l347_seg_at(st, 8192, &g) && g.rp_bytes > 0u);
+        if (branch) {   /* another conversation goes on from 8192 its own way */
+            char bkey[41], err[256];
+            const char *btext = "a branch the main line never says";
+            l323_payload p = { 8192, 8300, l323_rows_bytes(8192, 8300) };
+            TEST_ASSERT(pulsar_segstore_put(st, tip, 8192, 8300, btext, strlen(btext), p.bytes, l323_payload_write, 0,
+                                            NULL, &p, bkey, err, sizeof err));
+        }
+        l347_persist(st, 13000, 4096, evict, &ck, &r, tip);
+        TEST_ASSERT(r.rp_written == 1 && r.rp_dropped == (branch ? 0 : 1));
+        TEST_ASSERT(l347_seg_at(st, 8192, &g) && (branch ? g.rp_bytes > 0u : g.rp_bytes == 0u));
+        pulsar_segstore_close(st);
+        l323_rmdir(dir);
+    }
+}
+
+/* L347 I2 (3): the anchor's second sighting -- pulsar_segstore_covers says the store holds the rows of the anchor's
+ * text (an earlier request's tail ran past it, or a chain ends there) and whether a restore point stands there; a
+ * different preamble, or none stored, is a first sighting; after the anchor's own persist it is not due again. */
+static void test_l347_i2_second_sighting(void) {
+    char tmpl[] = "/tmp/pulsar-l347-anc.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    l347_ckpts ck;
+    pulsar_kvchain_persist_result r;
+    char tip[41];
+    std::string anchor;
+    l323_text(0, 2048, &anchor);   /* the preamble to a cut at 2048 */
+    bool rp = true;
+    TEST_ASSERT(!pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* empty store */
+    /* the first request (preamble + its task) trickles its rows: one root tail [0,3000) */
+    l347_persist(st, 3000, 4096, kv_persist_writes(KV_PERSIST_PROMPT), &ck, &r, tip);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);   /* second sighting: due */
+    /* a preamble that parts inside the cut is a first sighting; text past every stored row too */
+    std::string other = anchor;
+    other[100] = 'X';
+    TEST_ASSERT(!pulsar_segstore_covers(st, other.data(), other.size(), &rp));
+    std::string longer;
+    l323_text(0, 3000, &longer);
+    longer += "more";
+    TEST_ASSERT(!pulsar_segstore_covers(st, longer.data(), longer.size(), &rp));
+    /* across a grid cell: rows [0,4096) + a tail run past an anchor at 5120 */
+    l347_persist(st, 6000, 4096, kv_persist_writes(KV_PERSIST_TERMINAL), &ck, &r, tip);
+    std::string deep;
+    l323_text(0, 5120, &deep);
+    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), deep.size(), &rp) && !rp);
+    /* past the first HEAD_BYTES of a tail's text: read from its file, also after a restart */
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);
+    TEST_ASSERT(pulsar_segstore_covers(st, deep.data(), deep.size(), &rp) && !rp);
+    std::string late = anchor;
+    late[anchor.size() - 3] = 'X';   /* parts after the first 256 bytes */
+    TEST_ASSERT(!pulsar_segstore_covers(st, late.data(), late.size(), &rp));
+    /* the anchor's own persist (the cold phase stopped at 2048): rows and its restore point -- not due again */
+    l347_persist(st, 2048, 4096, kv_persist_writes(KV_PERSIST_ANCHOR), &ck, &r, tip);
+    TEST_ASSERT(r.rp_written == 1);
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && rp);
+    /* rows ending exactly at the cut without a restore point: due (the anchor's was evicted) */
+    pulsar_segstore_seg g;
+    TEST_ASSERT(l347_seg_at(st, 2048, &g) && pulsar_segstore_drop_rp(st, g.key));
+    TEST_ASSERT(pulsar_segstore_covers(st, anchor.data(), anchor.size(), &rp) && !rp);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L347 I2 (5): eviction order (D5) -- an unflagged, non-branch restore point first; then a dominated leaf (only one
+ * without a restore point); then other leaves; anchor / periodic restore points last.  A branch point's restore point
+ * is kept as long as it is one; a leaf's restore point goes before the leaf. */
+struct l347_evlog { std::vector<std::pair<std::string, bool>> ev; };
+static void l347_evlog_hook(void *ud, const char key[41], bool rp_only) {
+    ((l347_evlog *)ud)->ev.push_back({std::string(key, 40), rp_only});
+}
+static int l347_ev_at(const l347_evlog &l, const char key[41], bool rp_only) {
+    for (size_t i = 0; i < l.ev.size(); i++)
+        if (l.ev[i].first == std::string(key, 40) && l.ev[i].second == rp_only) return (int)i;
+    return -1;
+}
+static void test_l347_i2_eviction_order(void) {
+    char tmpl[] = "/tmp/pulsar-l347-ev.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char L0[41], B[41], D[41], P[41], A[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a dead end", 300, 1, L0));
+    TEST_ASSERT(l323_put_rp(st, L0, 128));                                   /* class 0 */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a shared prefix", 300, 2, B));
+    TEST_ASSERT(l323_put_rp(st, B, 128));                                    /* a branch point's: class 3 */
+    TEST_ASSERT(test_seg_put(st, B, 128, 256, "its tail", 300, 3, D));       /* dominated by P */
+    TEST_ASSERT(test_seg_put(st, B, 128, 256, "its tail goes on", 300, 4, P));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "an anchor", 300, 5, A));
+    TEST_ASSERT(l347_put_rp(st, A, 128, PULSAR_SEGSTORE_RP_ANCHOR));         /* class 3 */
+    pulsar_segstore_seg g;
+    TEST_ASSERT(pulsar_segstore_get(st, D, &g) && g.dominated);
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    /* a store just big enough for it all, then a put of nearly the whole budget: everything evictable goes, in order */
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    l347_evlog log;
+    pulsar_segstore_set_removed_hook(st, l347_evlog_hook, &log);
+    char big[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "the newcomer", used - 200, 6, big));
+    const int l0_rp = l347_ev_at(log, L0, true), d = l347_ev_at(log, D, false), b_rp = l347_ev_at(log, B, true);
+    const int p = l347_ev_at(log, P, false), l0 = l347_ev_at(log, L0, false), b = l347_ev_at(log, B, false);
+    const int a_rp = l347_ev_at(log, A, true), a = l347_ev_at(log, A, false);
+    TEST_ASSERT(l0_rp == 0);                     /* the dead end's restore point first */
+    TEST_ASSERT(d == 1);                         /* then the dominated leaf */
+    TEST_ASSERT(b_rp == 2);                      /* B is no branch point any more: its restore point next */
+    TEST_ASSERT(p > b_rp && l0 > b_rp && b > p);  /* then the leaves, LRU; B a leaf once P is gone */
+    TEST_ASSERT(a_rp > p && a_rp > l0 && a_rp > b && a > a_rp);   /* the anchor's restore point last, then its rows */
+    TEST_ASSERT((int)log.ev.size() == 8 && pulsar_segstore_count(st) == 1);
+    pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
 
@@ -12023,10 +12364,10 @@ static void test_persist_skipped_under_the_floor(void) {
     s.kv.enabled = true;                                 /* a store is configured ... */
     (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));      /* ... and no box has this much free */
     int end = -1;
-    TEST_ASSERT(s.kv_cache_persist(NULL, "continued", false, &end) == 0);
+    TEST_ASSERT(s.kv_cache_persist(NULL, KV_PERSIST_CONTINUED, &end) == 0);
     TEST_ASSERT(end == 0);
     TEST_ASSERT(s.m_persist_skipped == 1);
-    TEST_ASSERT(s.kv_cache_persist(NULL, "prompt", true) == 0);
+    TEST_ASSERT(s.kv_cache_persist(NULL, KV_PERSIST_PROMPT) == 0);
     TEST_ASSERT(s.m_persist_skipped == 2);
     (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
@@ -12764,7 +13105,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_marker_state_ignores_orphan_end();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
-    test_kv_cache_sys_prefix_cut_clears_preamble_jitter();
+    test_l347_anchor_cut();
     test_l310_restore_vs_recompute();
     test_l318_resume_picks_the_deepest();
     test_l329_prefix_wait_pick();
@@ -12781,6 +13122,11 @@ static void pulsar_server_unit_tests_run(void) {
     test_l323_tail_supersession();
     test_l323_state_restore_math();
     test_l347_restore_points();
+    test_l347_i2_trigger_table();
+    test_l347_i2_periodic();
+    test_l347_i2_superseded();
+    test_l347_i2_second_sighting();
+    test_l347_i2_eviction_order();
     test_l264_segstore_eviction_and_hygiene();
     test_l264_segstore_release();
     test_l179_tool_admission_is_bound_decode_only();
