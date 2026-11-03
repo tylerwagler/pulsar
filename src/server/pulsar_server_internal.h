@@ -173,7 +173,7 @@
  * L264: the disk KV cache is a content-addressed SEGMENT store
  * (src/lib/pulsar_segstore.h, src/server/kv_cache.cpp).  A segment is one grid
  * span of a conversation -- tokens [G_prev, G), their comp/index-K rows and the
- * grid checkpoint at G (pulsar_session_save_segment) -- plus the rendered text
+ * grid checkpoint at G (pulsar_session_copy_out_segment) -- plus the rendered text
  * of those tokens; its key is sha1(parent_key || text), so a chain's last key
  * names the whole text from position 0 and conversations sharing a prefix share
  * its segments.  A lookup returns the deepest chain whose text is a byte prefix
@@ -185,7 +185,8 @@
  * from checkpoints the live bank already holds; the session is never rolled
  * back to build an entry.  The store is keyed by pulsar_segstore_identity
  * (model + routed-expert format), evicts least-recently-used LEAVES first, and
- * writes durably without leaving page cache (L261).
+ * (L347 I3a) writes behind with O_DIRECT from a pinned host pool -- on a
+ * discrete-GPU host also the RAM tier the restores read first.
  *
  * The optional tool-id map rides as a segment TRAILER.  It is not model state,
  * but it is needed to render future client JSON back to the exact DSML the
@@ -1197,7 +1198,7 @@ typedef struct pulsar_segstore pulsar_segstore;
 
 /** L310: what a disk hit's restore-vs-recompute decided (after Flare's prefix-cache offload policy, 2.10): a chain
  *  loads only when reading it takes under half the prefill of the tokens it adds over the bank's own resume, both
- *  priced from measurements -- the read from this store's loads (kv_read_cost, L327: disk and page cache apart), the
+ *  priced from measurements -- the read from this store's loads (kv_read_cost, L327: disk and RAM tier apart), the
  *  prefill from the engine's one prompt chunk cost fit (pulsar_engine_prefill_ms, L304 / L327: its solo terms, fed by
  *  every solo prefill chunk and kept across restarts beside the verify curve).  Either way the bank ends with the same
  *  bytes (a segment is the prefill's own rows, L264), so the verdict moves time, never a number.  Before either is
@@ -1225,8 +1226,10 @@ kv_restore_verdict kv_restore_decide(uint32_t gained, bool measured, double tran
                                      double prefill_ms);
 
 /** L327: what a chain load costs, measured -- an exponentially weighted (1/8 a load) least squares of each load's wall
- *  on the bytes it read from the DISK and the bytes it read from the PAGE CACHE (pulsar_kvchain_cached_bytes, taken
- *  just before the load), no intercept: load_ms = cold_bytes * u + cached_bytes * w.  One rate did not do: L320's
+ *  on the bytes it read from the DISK and the bytes it read from MEMORY, no intercept: load_ms = cold_bytes * u +
+ *  cached_bytes * w.  L347 I3a: "cached" is the RAM tier's (pulsar_kvchain_resident_bytes, taken just before the
+ *  load); it was the page cache's (mincore), which the store's O_DIRECT reads and writes no longer fill -- so on a
+ *  unified-memory host, where the RAM tier is off, every byte is priced at the disk rate.  One rate did not do: L320's
  *  loads ran 1.0-4.2 GB/s by how much of the chain an earlier load had left in memory, and the mean of the last eight
  *  lagged that by a factor of 2.7 (18:53: priced at 1.24 GB/s, read at 3.3).  A ridge toward u == w (KV_READ_RIDGE,
  *  GiB^2) keeps the system solvable before the loads tell the two apart -- one load prices both at its own rate. */
@@ -1245,7 +1248,7 @@ typedef struct {
 /** @var kv_read_cost::scw
  *  EW sum of cold * cached (GiB^2). */
 /** @var kv_read_cost::sww
- *  EW sum of cached^2 (cached = page-cache GiB of a load). */
+ *  EW sum of cached^2 (cached = RAM-tier GiB of a load; L347 I3a). */
 /** @var kv_read_cost::scy
  *  EW sum of cold * load ms (GiB ms). */
 /** @var kv_read_cost::cold_ms_per_gib
@@ -1263,11 +1266,11 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
 /// @param c        the fit (caller holds server::mu)
 /// @param now_sec  server_now_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
-/** The estimated read of `bytes`, `cached` of them in the page cache, at `now_sec`; false (and 0) before the first
+/** The estimated read of `bytes`, `cached` of them in the RAM tier, at `now_sec`; false (and 0) before the first
  *  load.  Each cost's gap above its best halves every KV_READ_RELAX_SEC since the last load (L342). */
 /// @param c        the fit
 /// @param bytes    bytes to read
-/// @param cached   of which in the page cache
+/// @param cached   of which in the RAM tier
 /// @param now_sec  server_now_sec() now (the relaxation's clock)
 /// @param ms       receives the estimate, ms
 /// @return false before the first load
@@ -1394,14 +1397,14 @@ typedef struct {
     pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
     int n;               ///< segments, root first (0: none)
     uint64_t bytes;      ///< what a load reads
-    uint64_t cached;     ///< L327: ... of which in the page cache when it was found
+    uint64_t cached;     ///< L327 / L347 I3a: ... of which in the RAM tier when it was found (was: the page cache)
 } kv_chain_hit;
 
 /** L310: the restore-vs-recompute telemetry, on /metrics.  Worker-written under server::mu. */
 typedef struct {
     uint64_t picks[RESUME_PICKS];      ///< L318: every resume decision, by the source it picked
     uint64_t abandon_persisted_tokens; ///< L318: tokens an abandoned prefill persisted past its chain's stored end
-    kv_read_cost read;                 ///< L327: the loads' measured cost, disk and page cache apart
+    kv_read_cost read;                 ///< L327: the loads' measured cost, disk and RAM tier apart (L347 I3a)
     /// every restore decision, by its kv_restore_verdict
     uint64_t verdicts[KV_RESTORE_VERDICTS];
     uint64_t restored_tokens;          ///< tokens the loaded chains added over the banks' own resumes
@@ -1413,11 +1416,39 @@ typedef struct {
 /** L338: the disk KV cache's background segment writer (kv_cache.cpp). */
 struct kv_writer;
 
+/** L347 I3a: the RAM tier's cap when --kv-ram-mb is not given on a discrete-GPU host: the pool is a quarter of the
+ *  host's MemTotal, at most this, MiB. */
+#define KV_RAM_DEFAULT_CAP_MB 16384
+/** L347 I3a: the copy-out ring on a unified-memory host when --kv-ram-mb is not given, MiB (a Gemma 4 rows cell is
+ *  ~80 MiB, its restore point ~238 MiB: one of each, written behind while the next is copied out). */
+#define KV_RAM_RING_MB 1024
+/** L347 I3a: the disk cache's host memory pool, decided once at startup (kv_ram_plan_for). */
+typedef struct {
+    uint64_t bytes;   ///< the pool's size (pinned at kv_cache_open)
+    bool retain;      ///< the RAM tier is on: written entries stay resident (never on a unified-memory host)
+} kv_ram_plan;
+/** L347 I3a (plans/124 D9): the pool's plan, pure -- the one place the RAM tier is decided.  On a unified-memory host
+ *  (`integrated` 1: GB10, host RAM is the GPU's) the RAM tier is OFF and the pool is only the copy-out ring
+ *  (KV_RAM_RING_MB unless `ram_mb` says); on a discrete-GPU host it is ON, sized by `ram_mb`, else a quarter of
+ *  `mem_total` capped at KV_RAM_DEFAULT_CAP_MB.
+ *  @param integrated pulsar_gpu_integrated()
+ *  @param mem_total  the host's MemTotal, bytes
+ *  @param ram_mb     --kv-ram-mb (< 0: not given)
+ *  @param bytes      receives the pool's size
+ *  @param retain     receives whether the RAM tier is on */
+void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain);
+
 /** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
 typedef struct {
     pulsar_segstore *st;     ///< NULL while disabled
-    /// L338: writes the persists' staged segments off the worker; they are indexed by kv_cache_commit_written
+    /// L338: writes the persists' copied-out files off the worker; they are indexed by kv_cache_commit_written
     struct kv_writer *writer;
+    /// L347 I3a: the pinned host region the pool carves (pulsar_gpu_host_alloc), owned
+    void *ram_base;
+    /// L347 I3a: the pool over it: copy-out images, and the RAM tier's copies when `ram_retain`
+    pulsar_kvpool *ram;
+    /// L347 I3a: the RAM tier is on (kv_ram_plan::retain)
+    bool ram_retain;
     /// the store's directory (owned); also where preempted banks' payloads are written; NULL while disabled
     char *dir;
     /// kv_cache_open succeeded: the store is configured and open
@@ -2272,6 +2303,10 @@ struct server {
     KvBytes  m_kv_touched;        ///< L328: resident demand-paged KV (pulsar_session_touched_kv_bytes), published
     KvBytes  m_kv_budget;         ///< the guard's live budget (server::guard_budget), published
     uint64_t m_persist_skipped;   ///< disk-KV persists skipped: MemAvailable could not cover them over the floor
+    /// L347 I3a: disk-KV persists that left a file unwritten: the host pool had no room for its copy-out
+    uint64_t m_persist_no_room;
+    /// L347 I3a: guard spills refused because their copy-out found no room in the host pool (the bank stayed resident)
+    uint64_t m_spill_no_room;
     uint64_t m_prefill_mem_refusals;  ///< prefills stopped mid-prompt: MemAvailable under the floor before a chunk
     KvBytes  m_kv_reserved;       ///< L328: kv_reserved_bytes(NULL), the base every admission reads, published
     uint64_t m_preemptions;  ///< L314: running decoders preempted through their terminal checkpoint
@@ -2419,11 +2454,14 @@ struct server {
     /// @param sl         the slot whose bank is installed (unused beyond that precondition)
     /// @param why        the trigger: what is written and the log word
     /// @param chain_end  receives the stored chain's end position in tokens (0: none); may be NULL
+    /// @param no_room    L347 I3a: receives whether a file could not be copied out for want of host pool room (a spill
+    ///                   that sees it keeps its bank); may be NULL
+    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
     /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point at a loss when
      *  kv_rp_worth says no (an anchor always writes its own).  @param why the trigger  @return the PULSAR_KVCHAIN_*
      *  mask */
     unsigned kv_rp_writes_for_loss(kv_persist_trigger why);
-    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr);
+
     /** L347 I2: the anchor's second sighting -- the store holds the rows of `prompt`[0, cut) (an earlier request with
      *  the same preamble trickled them; pulsar_segstore_covers over the rendered text) and no restore point at `cut`.
      *  Then the prefill stops at `cut` and persists it as KV_PERSIST_ANCHOR.
@@ -2473,7 +2511,7 @@ struct server {
     /// @param prompt_text   the prompt text the chain's text must be a byte prefix of
     /// @param image_hashes  the request's image hashes, in prompt order
     /// @param n_images      hashes in `image_hashes`
-    /// @param hit           receives the chain (n = 0 for none) with its bytes and page-cached bytes
+    /// @param hit           receives the chain (n = 0 for none) with its bytes and RAM-resident bytes
     int kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit);
     /** kv_cache_find() for a request's prompt and images. */
     /// @param req  the request (its prompt_text and images; at most 64 image hashes are compared)
@@ -3758,6 +3796,7 @@ typedef struct {
     const char *kv_disk_dir;       ///< directory for the on-disk KV cache
     bool kv_disk_disable;          ///< turn the disk cache off entirely
     uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
+    int64_t kv_ram_mb;             ///< L347 I3a: --kv-ram-mb, the host pool in MiB (< 0: kv_ram_plan_for's default)
     kv_cache_options kv_cache;     ///< checkpoint placement policy
     /** L321: every -m in order (engine.model_path is the first); more than one opens them as one engine group in
      *  this process, which serves encoders and parsers only (encode_server.cpp) */
@@ -4487,7 +4526,7 @@ void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
 bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
-                   kv_cache_options opt);
+                   kv_cache_options opt, kv_ram_plan ram);
 void kv_cache_close(kv_disk_cache *kc);
 /** L338: index the segments the background writer has finished (the store's thread: the worker, or the close). */
 /// @param kc the cache

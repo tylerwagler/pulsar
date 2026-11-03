@@ -28,11 +28,15 @@
  *   deepest checkpoint, so a write costs only the new tokens (a segment the store
  *   has is not written again).  What else it writes is the caller's request
  *   (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR): the tail to that checkpoint, the restore
- *   point at the chain's end (synchronously, through the store), flagged an anchor;
+ *   point at the chain's end, flagged an anchor;
  *   and, whatever it asked, a periodic restore point at each grid point it passes
  *   that pulsar_kvchain_rp_periodic names, when the bank holds its checkpoint there
  *   (pulsar_kvchain_place_rps).  A new restore point at the chain's end drops the
- *   ones it supersedes (pulsar_segstore_drop_superseded_rps).  The
+ *   ones it supersedes once it is indexed (pulsar_segstore_job_supersede).  L347
+ *   I3a: every file -- segment or restore point -- is COPIED OUT on the calling
+ *   thread into its image (pulsar_session_copy_out_*: an event-fenced copy, the
+ *   bank moves on) and handed to the writer (pulsar_kvchain_writer), which seals,
+ *   writes and commits it.  The
  *   stored chain is this history only if the bank's own tokens up to its end
  *   render to exactly its text (same bytes at the same position, the L115 rule);
  *   otherwise a fresh chain starts at the root.
@@ -83,36 +87,40 @@ typedef struct {
     int (*write)(FILE *fp, void *ud, const char *text, char *err, size_t errlen);
 } pulsar_kvchain_trailer;
 
-/** L338: where a persist's segments go once staged -- the server's background writer.  A segment is staged on the
- *  calling thread (its rows copied out of the bank, which moves on), then written elsewhere and committed back on the
- *  store's thread (pulsar_segstore_reserve / _job_write / _commit).  L347: restore points are not staged (I1): a
- *  persist writes its restore points through pulsar_segstore_put_rp itself (pulsar_kvchain_place_rps). */
+/** L338 / L347 I3a: where a persist's files go once copied out -- the server's background writer.  A file (a segment
+ *  or a restore point) is reserved in the store with its image (pulsar_segstore_reserve / _reserve_rp), copied out into
+ *  it on the calling thread (the bank moves on), then handed to the writer, which seals and writes it
+ *  (pulsar_segstore_job_write) and commits it back on the store's thread (pulsar_segstore_commit). */
 typedef struct {
     /// context for both hooks
     void *ud;
-    /** Room for `bytes` of staged segment now (may wait for the writer to drain); false = none: the segment is not
-     *  written by this persist. */
-    bool (*admit)(void *ud, uint64_t bytes);
-    /** Take the reserved job and its staged payload and trailer (malloc'd, `trailer` NULL when it has none); the
-     *  writer owns all three from here and commits the job. */
-    void (*submit)(void *ud, pulsar_segstore_job *job, uint8_t *payload, uint64_t payload_len, uint8_t *trailer,
-                   uint64_t trailer_len);
+    /** The store's pool has no room for an image of a `file_bytes` file: wait for the writer to finish (and commit)
+     *  what it holds until pulsar_segstore_ram_make_room makes it; false = nothing in flight can make it (the file is
+     *  not written by this persist, which says so: pulsar_kvchain_persist_result::no_room). */
+    bool (*wait_room)(void *ud, uint64_t file_bytes);
+    /** Take the reserved, filled job: the writer owns it from here, writes it and commits it. */
+    void (*submit)(void *ud, pulsar_segstore_job *job);
 } pulsar_kvchain_writer;
 
-/** L338: a writer that writes and commits each staged segment on the calling thread before the persist goes on --
- *  for the gates and tools that persist and load in one breath (the server writes in the background). */
+/** L338: a writer that writes and commits each job on the calling thread before the persist goes on -- for the gates
+ *  and tools that persist and load in one breath (the server writes in the background). */
 /// @param st the store the persist writes to
 /// @return the writer (its ud is `st`)
 pulsar_kvchain_writer pulsar_kvchain_writer_inline(pulsar_segstore *st);
 
 /** What a persist did. */
 typedef struct {
-    int written;        ///< new segments, staged and handed to the writer (L338: committed later, on its thread)
+    int written;        ///< new segments, copied out and handed to the writer (L338: committed later, on its thread)
     int end;            ///< the chain's end after the write (0: none)
-    uint64_t bytes;     ///< payload + trailer bytes staged
-    uint64_t rp_bytes;  ///< L347: bytes of the restore points this persist wrote (chain end and periodic; 0: none)
-    int rp_written;     ///< L347 I2: how many restore points it wrote
-    int rp_dropped;     ///< L347 I2: how many superseded restore points it dropped
+    uint64_t bytes;     ///< payload + trailer bytes copied out
+    uint64_t rp_bytes;  ///< L347: bytes of the restore points this persist copied out (chain end and periodic; 0: none)
+    int rp_written;     ///< L347 I2: how many restore points it handed to the writer
+    /// L347 I2 / I3a: how many superseded restore points were dropped while it ran (a chain end's commit drops them:
+    /// at once with the inline writer, when the background writer's job commits otherwise)
+    int rp_dropped;
+    /// L347 I3a: a file could not be copied out: the store's RAM pool had no room and nothing in flight could make it
+    /// (a spill that sees this does not free its bank)
+    bool no_room;
     char key[41];       ///< the chain's last key ("" when none)
     char err[256];      ///< why the write stopped early ("" when it did not)
 } pulsar_kvchain_persist_result;
@@ -155,26 +163,29 @@ typedef struct {
     void *ud;
     /** The restore point's bytes at G; 0 = there is no checkpoint at G (nothing is written there). */
     uint64_t (*bytes)(void *ud, int G);
-    /** Write exactly those bytes for G, the restore point of segment `key`, into fp; 0 on success, else err. */
-    int (*write)(FILE *fp, void *ud, int G, const char *key, char *err, size_t errlen);
+    /** L347 I3a: copy exactly those bytes for G, the restore point of segment `key`, into `dst` (its digest slot is
+     *  the writer's); 0 on success, else err. */
+    int (*copy)(void *ud, int G, const char *key, uint8_t *dst, uint64_t bytes, char *err, size_t errlen);
 } pulsar_kvchain_rp_source;
 
 /** L347 I2: the restore point policy of a persist that stored (or found stored) the segments `links` (ascending; the
  *  last is the chain's end): a periodic one (PULSAR_SEGSTORE_RP_PERIODIC) at each link pulsar_kvchain_rp_periodic
  *  names, and with PULSAR_KVCHAIN_RP in `what` one at the chain's end (PULSAR_SEGSTORE_RP_ANCHOR with
  *  PULSAR_KVCHAIN_ANCHOR) -- each where `src` holds a checkpoint, one write per key (a key that has one gains the
- *  flags).  A restore point newly written at the chain's end drops those it supersedes
- *  (pulsar_segstore_drop_superseded_rps).  Counts into r (rp_bytes, rp_written, rp_dropped); the first failure is
- *  r->err (when it is empty).
- *  @param st    the store
- *  @param links the chain's segments this persist passed, ascending
- *  @param n     how many
- *  @param grid  the disk grid
- *  @param what  the persist's request (PULSAR_KVCHAIN_*)
- *  @param src   the checkpoints
- *  @param r     the persist's result */
+ *  flags), copied out and handed to `writer`.  A restore point newly written at the chain's end drops those it
+ *  supersedes when it commits (pulsar_segstore_job_supersede).  Counts into r (rp_bytes, rp_written, rp_dropped,
+ *  no_room); the first failure is r->err (when it is empty).
+ *  @param st     the store
+ *  @param links  the chain's segments this persist passed, ascending
+ *  @param n      how many
+ *  @param grid   the disk grid
+ *  @param what   the persist's request (PULSAR_KVCHAIN_*)
+ *  @param src    the checkpoints
+ *  @param writer where the copied-out restore points go
+ *  @param r      the persist's result */
 void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *links, int n, int grid, unsigned what,
-                              const pulsar_kvchain_rp_source *src, pulsar_kvchain_persist_result *r);
+                              const pulsar_kvchain_rp_source *src, const pulsar_kvchain_writer *writer,
+                              pulsar_kvchain_persist_result *r);
 
 /** Persist the installed bank's history (see above), never past
  *  pulsar_session_persist_end (L281: the first block whose image the session does not record).  `what` (L347 I2):
@@ -189,7 +200,7 @@ void pulsar_kvchain_place_rps(pulsar_segstore *st, const pulsar_kvchain_link *li
 /// @param min_tokens write nothing when the deepest grid checkpoint is below this
 /// @param what       PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR (0: the rows to the last grid point, and periodic points)
 /// @param trailer    the per-segment trailer, or NULL for none
-/// @param writer     where the staged segments go (required)
+/// @param writer     where the copied-out files go (required)
 /// @param out        receives what the persist did, or NULL
 /// @return the number of segments written
 int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, int min_tokens, unsigned what,
@@ -222,12 +233,13 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
 /// @param n     its segment count
 /// @return bytes a load of it reads
 uint64_t pulsar_kvchain_load_bytes(const pulsar_segstore_seg *chain, int n);
-/** L327: how many of those bytes are in the page cache now (pulsar_segstore_cached_bytes over the same parts). */
+/** L347 I3a: how many of those bytes are in the store's RAM copies now (pulsar_segstore_resident_bytes over the same
+ *  parts). */
 /// @param st    the store
 /// @param chain the chain, root first
 /// @param n     its segment count
-/// @return bytes of those parts resident in the page cache
-uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
+/// @return bytes of those parts resident in RAM
+uint64_t pulsar_kvchain_resident_bytes(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n);
 /** L330: what a load of segment `i` of `chain` (n segments) reads: its rows and trailer, and its restore point file
  *  when it is the last (pulsar_kvchain_load_bytes is the sum over the chain). */
 /// @param chain the chain, root first
@@ -236,25 +248,28 @@ uint64_t pulsar_kvchain_cached_bytes(pulsar_segstore *st, const pulsar_segstore_
 /// @return bytes a load of segment `i` reads
 uint64_t pulsar_kvchain_segment_load_bytes(const pulsar_segstore_seg *chain, int n, int i);
 /** L330: one segment's load into whatever `ud` names (pulsar_session_load_segment's contract: `last` restores the
- *  state at the segment's end from its restore point; 0 = loaded, *G the position it stands at). */
+ *  state at the segment's end from its restore point; 0 = loaded, *G the position it stands at).  L347 I3a: from
+ *  memory -- the parts as pulsar_segstore_map_part mapped them, digests already checked. */
 /// @param ud       the loader's context
-/// @param fp       the segment's payload, positioned at its first byte
+/// @param seg      the segment's payload
 /// @param bytes    the payload's size
 /// @param last     restore the state at its end too (the chain's last segment)
-/// @param rp       L347: the segment's restore point (pulsar_segstore_open_rp) when `last`, else NULL
+/// @param rp       L347: the segment's restore point when `last`, else NULL
 /// @param rp_bytes its size (0 when not `last`)
 /// @param G        receives the position the bank stands at, or NULL
 /// @param key      the segment's key
 /// @param err      receives a reason on failure
 /// @param errlen   size of `err`
-typedef int (*pulsar_kvchain_segment_loader)(void *ud, FILE *fp, uint64_t bytes, bool last, FILE *rp,
-                                             uint64_t rp_bytes, int *G, const char *key, char *err, size_t errlen);
+typedef int (*pulsar_kvchain_segment_loader)(void *ud, const uint8_t *seg, uint64_t bytes, bool last,
+                                             const uint8_t *rp, uint64_t rp_bytes, int *G, const char *key, char *err,
+                                             size_t errlen);
 /** L330: load the next slice of a chain -- segments [*next, *next + k) of the `n` pulsar_kvchain_find returned, cut at
  *  the chain's end -- in order through `load` (the chain's last segment with its restore point, L347), advancing
  *  *next past each segment loaded.  The whole chain in one slice
  *  is the one-shot load (pulsar_kvchain_load); the server reads a long chain a slice per worker turn.  1 when a segment
  *  would not load: it is dropped from the store (and so is everything below it, by key) and `err` says which; *next
- *  stays at it.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
+ *  stays at it.  L347 I3a (plans/124 D7): 2 when a part could not be READ now (no room in the RAM pool): a transient
+ *  failure that drops nothing.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
  *  stands at the next segment's start. */
 /// @param st     the store (a failed segment is dropped from it)
 /// @param chain  the chain pulsar_kvchain_find returned
@@ -265,7 +280,7 @@ typedef int (*pulsar_kvchain_segment_loader)(void *ud, FILE *fp, uint64_t bytes,
 /// @param ud     context for `load`
 /// @param err    receives which segment failed
 /// @param errlen size of `err`
-/// @return 0 when the slice loaded, 1 on a bad slice or a segment that would not load
+/// @return 0 when the slice loaded, 1 on a bad slice or a segment that would not load, 2 on a transient read failure
 int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
                                    pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen);
 /** pulsar_kvchain_load_slice_with into the installed bank of `s` (pulsar_session_load_segment); a failed slice leaves
@@ -278,7 +293,7 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
 /// @param k      segments in the slice
 /// @param err    receives which segment failed
 /// @param errlen size of `err`
-/// @return 0 when the slice loaded, 1 when it did not (the bank is then invalidated)
+/// @return 0 when the slice loaded, else pulsar_kvchain_load_slice_with's code (the bank is then invalidated)
 int pulsar_kvchain_load_slice(pulsar_segstore *st, pulsar_session *s, const pulsar_segstore_seg *chain, int n,
                               int *next, int k, char *err, size_t errlen);
 /** L330: a loaded chain's last word (L196): the bank's tokens end at the chain's end and agree with `text` at its

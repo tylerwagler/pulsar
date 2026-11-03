@@ -160,7 +160,8 @@ MMQ_OBJS = $(MMQ_SRCS:.cu=.o)
 ifneq ($(strip $(MMQ_SRCS)),)
 MMQ_CPPFLAGS = -DPULSAR_HAVE_MMQ -Isrc/cuda/mmq
 endif
-LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h src/lib/pulsar_ctxmem.h src/lib/pulsar_json.h
+LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h src/lib/pulsar_utf8.h src/lib/pulsar_think_scan.hpp src/lib/pulsar_dsml.h src/lib/pulsar_ctxmem.h src/lib/pulsar_json.h \
+           src/lib/pulsar_kvdigest.h src/lib/pulsar_kvpool.h
 # pulsar_json.o rides in CORE_OBJS rather than being listed per target like the
 # other src/lib objects: the ENGINE objects reference it (the safetensors reader
 # scans shard headers and __metadata__ as JSON), so every target that links
@@ -171,7 +172,14 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
                 src/lib/inkling_chat.o src/lib/nemotron_chat.o src/lib/chat_render_kit.o src/lib/gemma4_chat.o src/lib/gemma4_output.o
-CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
+# L347 I3a: the disk KV payload digest (the engine's payload streams, the segment store and the TP workers share it)
+# and the store's host memory pool ride here too: the engine references the digest, the store both.
+KVIO_OBJS = src/lib/pulsar_kvdigest.o src/lib/pulsar_kvpool.o
+# The digest's four lanes are four scalar multiply chains: GCC's vectorizers pack them into AVX2, which has no 64-bit
+# multiply and emulates it (7.9 GB/s cache-resident on CT 124's Xeon 8259CL); scalar, they run 18.9 GB/s (v1: 5.1).
+src/lib/pulsar_kvdigest.o: CXXFLAGS += -fno-tree-vectorize -fno-tree-slp-vectorize
+CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS) \
+            $(KVIO_OBJS)
 # L303: grammar-constrained decoding.  xgrammar's C++ core is vendored VERBATIM under src/vendor/xgrammar (the pin
 # and the copy recipe: src/vendor/xgrammar/UPSTREAM), so a refresh is a copy.  Its flags are confined to it and to
 # the one boundary TU, src/lib/pulsar_grammar.cpp: -fexceptions (xgrammar reports every error by throwing; the
@@ -3093,7 +3101,7 @@ tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.
 tests/vision_chunk_gate.o: tests/vision_chunk_gate.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_chunk_gate.cpp
 
-tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
+tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h tests/segment_file_io.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
 
 tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
@@ -3336,7 +3344,7 @@ tests/bank_adopt_gate.o: tests/bank_adopt_gate.cpp tests/gate_entry.h src/pulsar
 tests/bank_adopt_gate: tests/bank_adopt_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/bank_residency_gate.o: tests/bank_residency_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+tests/bank_residency_gate.o: tests/bank_residency_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h tests/segment_file_io.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/bank_residency_gate.cpp
 
 tests/bank_residency_gate: tests/bank_residency_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3375,7 +3383,7 @@ tests/qwen_kv_walk: tests/qwen_kv_walk.o src/lib/pulsar_help.o $(CORE_OBJS)
 # L280: the session mechanisms past the native 262,144 positions (resume, the disk chain, spec == plain, the
 # payload) at one depth, each against one cold prefill.  Not in the battery (two prefills at the depth: ~10 min at
 # 300K); needs a real container and a long token file.
-tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp
+tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp tests/segment_file_io.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/qwen_deep_probe: tests/qwen_deep_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3521,7 +3529,7 @@ tests/sync_budget_gate.o: tests/sync_budget_gate.cpp tests/gate_entry.h tests/ga
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/sync_budget_gate: tests/sync_budget_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/session_contract_gate.o: tests/session_contract_gate.cpp
+tests/session_contract_gate.o: tests/session_contract_gate.cpp tests/segment_file_io.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/session_contract_gate: tests/session_contract_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

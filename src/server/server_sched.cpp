@@ -2294,7 +2294,18 @@ bool server::spill_bank(session_slot *victim) {
         return false;
     }
     const double t0 = server_now_sec();
-    s->kv_cache_persist(victim, KV_PERSIST_SPILL);
+    /* L347 I3a: the bank is freed only once its history is copied out.  A copy-out that found no room in the host
+     * pool (and nothing in flight to make it) leaves the history unwritten: the spill FAILS -- counted, said -- and the
+     * bank stays resident (the WIP freed it anyway and lost the history); the guard stops this round and tries again
+     * on a later turn, when the writer has drained. */
+    bool no_room = false;
+    s->kv_cache_persist(victim, KV_PERSIST_SPILL, nullptr, &no_room);
+    if (no_room) {
+        s->count_metric(&s->m_spill_no_room);
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %u spill refused: its copy-out found no room in the "
+                   "kv cache's host pool -- the bank stays resident", vb);
+        return false;
+    }
     pulsar_session_bank_state_save(pool, vb);         /* preserve host carry for restore */
     if (!pulsar_session_bank_state_restore(pool, (uint32_t)park)) return false;
     s->live_bank = park;

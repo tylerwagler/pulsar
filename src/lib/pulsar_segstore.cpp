@@ -2,7 +2,8 @@
  *  The content-addressed segment store's implementation (pulsar_segstore.h). */
 /* L264 S4: the content-addressed segment store (pulsar_segstore.h). */
 #include "pulsar_segstore.h"
-#include "pulsar_writeback.h"
+#include "pulsar_kvdigest.h"
+#include "pulsar_kvpool.h"
 #include "sha1.hpp"
 
 #include <dirent.h>
@@ -11,7 +12,6 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -88,15 +88,42 @@ struct pulsar_segstore {
     std::unordered_set<std::string> pending;
     /// L338: parents of the writes in flight, with their count: eviction never takes one
     std::unordered_map<std::string, int> pinned;
+    /** L347 I3a: a file's image in host memory -- the file's bytes from offset 0, padded to the O_DIRECT granule. */
+    struct image {
+        uint8_t *p = nullptr;   ///< the bytes (a pool block, or posix_memalign'd without a pool)
+        uint64_t cap = 0;       ///< bytes allocated
+    };
     /** L347: a restore point written for a pending key (its .seg not committed yet). */
     struct pending_point {
         uint64_t bytes = 0;   ///< its .rp file's bytes
         uint32_t flags = 0;   ///< its PULSAR_SEGSTORE_RP_* flags
+        image img;            ///< L347 I3a: its image, kept as the entry's RAM copy at the segment's commit (retain)
+        bool supersede = false;   ///< L347 I3a: a chain end's: it drops the ones it supersedes once its segment commits
     };
     /// L347: restore points written for pending keys, moved onto the entry at its commit (or removed with a failed one)
     std::unordered_map<std::string, pending_point> pending_rp;
     /// L347 I2: key -> the first HEAD_BYTES of its own text (all of it when shorter), for pulsar_segstore_covers
     std::unordered_map<std::string, std::string> heads;
+    /// L347 I3a: the pool images come from (pulsar_segstore_set_ram); NULL: posix_memalign'd, never kept
+    pulsar_kvpool *pool = nullptr;
+    /// L347 I3a: the RAM tier: a written file's image stays as its entry's RAM copy (D9; off on a unified host)
+    bool retain = false;
+    /// L347 I3a: the RAM tier's residency, the one authority for it: key -> the image of its .seg
+    std::unordered_map<std::string, image> ram_rows;
+    /// L347 I3a: ... and key -> the image of its .rp
+    std::unordered_map<std::string, image> ram_rp;
+    /// L347 I3a: a .seg image read from disk for a load and not kept (no RAM tier), until pulsar_segstore_unmap_part
+    std::unordered_map<std::string, image> loan_rows;
+    /// L347 I3a: ... and a .rp image so read
+    std::unordered_map<std::string, image> loan_rp;
+    /// L347 I3a: parts mapped for a load (pulsar_segstore_map_part; hold_name), with their count: RAM eviction skips them
+    std::unordered_map<std::string, int> held;
+    /** @param key a key  @param rp its restore point (else its rows)  @return the part's name in `held` */
+    static std::string hold_name(const std::string &key, bool rp) { return rp ? key + ".rp" : key; }
+    /// L347 I3a: restore point writes in flight (pulsar_segstore_reserve_rp): key -> flags joined while it flies
+    std::unordered_map<std::string, uint32_t> rp_jobs;
+    /// L347 I3a: restore points dropped as superseded by a chain end's commit, ever (pulsar_segstore_superseded_count)
+    uint64_t superseded = 0;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -124,7 +151,14 @@ struct pulsar_segstore {
      *  @return false on a short read, another magic / version / identity, a malformed key, or an empty span */
     bool read_header(FILE *fp, pulsar_segstore_seg *e, uint32_t *flags) const {
         uint8_t h[HDR];
-        if (fread(h, 1, HDR, fp) != HDR) return false;
+        return fread(h, 1, HDR, fp) == HDR && parse_header(h, e, flags);
+    }
+    /** L347 I3a: validate a .seg header in memory into *e (as read_header).
+     *  @param h     HDR bytes
+     *  @param e     receives the index entry
+     *  @param flags receives the header flags
+     *  @return false on another magic / version / identity, a malformed key, or an empty span */
+    bool parse_header(const uint8_t *h, pulsar_segstore_seg *e, uint32_t *flags) const {
         if (get32(h) != PULSAR_SEGSTORE_MAGIC || get32(h + 4) != PULSAR_SEGSTORE_VERSION) return false;
         if (get32(h + 8) != identity) return false;
         memset(e, 0, sizeof *e);
@@ -152,7 +186,18 @@ struct pulsar_segstore {
     bool read_rp_header(FILE *fp, char key[41], uint64_t *payload_bytes, uint32_t *flags, bool *older) const {
         uint8_t h[RP_HDR];
         *older = false;
-        if (fread(h, 1, RP_HDR, fp) != RP_HDR || get32(h) != PULSAR_SEGSTORE_RP_MAGIC) return false;
+        return fread(h, 1, RP_HDR, fp) == RP_HDR && parse_rp_header(h, key, payload_bytes, flags, older);
+    }
+    /** L347 I3a: validate a .rp header in memory (as read_rp_header).
+     *  @param h             RP_HDR bytes
+     *  @param key           receives the key it names (40 hex + NUL)
+     *  @param payload_bytes receives the payload's size
+     *  @param flags         receives its PULSAR_SEGSTORE_RP_* flags
+     *  @param older         receives true when it is a restore point of an older store version
+     *  @return false on another magic / version / identity, or a malformed key */
+    bool parse_rp_header(const uint8_t *h, char key[41], uint64_t *payload_bytes, uint32_t *flags, bool *older) const {
+        *older = false;
+        if (get32(h) != PULSAR_SEGSTORE_RP_MAGIC) return false;
         if (get32(h + 4) != PULSAR_SEGSTORE_RP_VERSION) {
             *older = get32(h + 4) < PULSAR_SEGSTORE_RP_VERSION;
             return false;
@@ -163,6 +208,87 @@ struct pulsar_segstore {
         *flags = get32(h + 12);
         *payload_bytes = get64(h + 56);
         return hex40(key);
+    }
+    /** L347 I3a: an image of `bytes` file bytes: a pool block (RAM images evicted to make room) or, without a pool,
+     *  posix_memalign'd.  Always one byte past the file (a memory stream's closing NUL, pulsar_segstore_put) and
+     *  padded to the granule, the pad zeroed by the caller.
+     *  @param bytes the file's bytes
+     *  @return the image (p NULL when there is no room) */
+    image img_alloc(uint64_t bytes) {
+        image im;
+        im.cap = pulsar_kvpool_round(bytes + 1u);
+        if (pool) {
+            if (ram_make_room(im.cap)) im.p = (uint8_t *)pulsar_kvpool_alloc(pool, im.cap);
+        } else {
+            void *q = nullptr;
+            if (posix_memalign(&q, PULSAR_KVPOOL_ALIGN, (size_t)im.cap) == 0) im.p = (uint8_t *)q;
+        }
+        if (!im.p) im.cap = 0;
+        return im;
+    }
+    /** L347 I3a: free an image (a no-op for an empty one).  @param im the image */
+    void img_free(const image &im) {
+        if (!im.p) return;
+        if (pool) pulsar_kvpool_free(pool, im.p);
+        else free(im.p);
+    }
+    /** L347 I3a: a written file's image becomes its entry's RAM copy (retain), or is freed.
+     *  @param map ram_rows or ram_rp
+     *  @param key the entry
+     *  @param im  the image */
+    void img_keep(std::unordered_map<std::string, image> &map, const std::string &key, const image &im) {
+        img_drop(map, key);   /* a replaced restore point's copy */
+        if (!retain) { img_free(im); return; }
+        map[key] = im;
+    }
+    /** L347 I3a: drop a key's RAM copy in `map`, if any (its file stays).  @param map ram_rows or ram_rp
+     *  @param key the entry */
+    void img_drop(std::unordered_map<std::string, image> &map, const std::string &key) {
+        auto it = map.find(key);
+        if (it == map.end()) return;
+        img_free(it->second);
+        map.erase(it);
+    }
+    /* L347 I3a (D9): RAM eviction in the disk eviction's value order -- (0) an unflagged restore point off a branch
+     * point, (1) a dominated leaf's rows, (2) any other rows, (3) a flagged or branch-point restore point -- the least
+     * recently used first within a class.  A copy that goes stays on disk: an entry is indexed only once its file is
+     * written, so dropping its image loses nothing.  Never an image mapped for a load. */
+    /** Free one RAM copy by the order above.  @return false when none may go */
+    bool ram_evict_one() {
+        const std::string *victim = nullptr;
+        bool victim_rp = false;
+        int victim_class = 4;
+        uint64_t victim_used = 0;
+        auto consider = [&](const std::string &k, bool rp) {
+            if (held.count(hold_name(k, rp))) return;
+            auto it = segs.find(k);
+            if (it == segs.end()) return;
+            const size_t kids = n_children(k);
+            const int c = rp ? (it->second.rp_flags == 0u && kids < 2u ? 0 : 3)
+                             : (it->second.dominated && kids == 0u ? 1 : 2);
+            if (!victim || c < victim_class || (c == victim_class && it->second.last_used < victim_used)) {
+                victim = &it->first;
+                victim_rp = rp;
+                victim_class = c;
+                victim_used = it->second.last_used;
+            }
+        };
+        for (auto &kv : ram_rp) consider(kv.first, true);
+        for (auto &kv : ram_rows) consider(kv.first, false);
+        if (!victim) return false;
+        const std::string k = *victim;
+        img_drop(victim_rp ? ram_rp : ram_rows, k);
+        return true;
+    }
+    /** L347 I3a: make a free block of `bytes` in the pool by evicting RAM copies (true without a pool).
+     *  @param bytes the block wanted
+     *  @return true when the pool can hand out such a block now */
+    bool ram_make_room(uint64_t bytes) {
+        if (!pool) return true;
+        const uint64_t want = pulsar_kvpool_round(bytes);
+        while (pulsar_kvpool_largest_free(pool) < want)
+            if (!ram_evict_one()) return false;
+        return true;
     }
     /** Remove a stored segment's files, its .seg and its .rp (L347), from disk (not from the index).
      *  @param key the segment */
@@ -192,6 +318,8 @@ struct pulsar_segstore {
             if (sib[i] == key) { sib.erase(sib.begin() + (long)i); break; }
         children.erase(key);
         heads.erase(key);
+        img_drop(ram_rows, key);   /* L347 I3a: its RAM copies go with it */
+        img_drop(ram_rp, key);
         segs.erase(it);
         if (parent.empty() || segs.count(parent)) refresh_dominated(parent);
     }
@@ -270,6 +398,7 @@ struct pulsar_segstore {
     void drop_rp_of(pulsar_segstore_seg &e, const char *why) {
         logf("dropped restore point %s at %u, %llu bytes: %s", e.key, e.G, (unsigned long long)e.rp_bytes, why);
         ::unlink(rp_path(e.key).c_str());
+        img_drop(ram_rp, e.key);   /* L347 I3a */
         used -= e.rp_bytes;
         e.rp_bytes = 0;
         e.rp_flags = 0;
@@ -335,14 +464,24 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
     if (!dir || !dir[0]) return nullptr;
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return nullptr;
     /* Refuse a directory this process cannot write up front, instead of
-     * failing every store later. */
+     * failing every store later.  L347 I3a: every file is written and read with
+     * O_DIRECT (the one I/O path): a filesystem that refuses it refuses the store. */
     {
         char probe[4096];
         snprintf(probe, sizeof probe, "%s/.probe.%ld", dir, (long)getpid());
-        const int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) return nullptr;
-        close(fd);
+        const int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0600);
+        const int saved = errno;
+        if (fd >= 0) close(fd);
         ::unlink(probe);
+        if (fd < 0) {
+            if (log) {
+                char msg[512];
+                snprintf(msg, sizeof msg, "segment store %s refused: it cannot be written with O_DIRECT (%s)", dir,
+                         strerror(saved));
+                log(log_ud, msg);
+            }
+            return nullptr;
+        }
     }
     auto *st = new pulsar_segstore();
     st->dir = dir;
@@ -444,7 +583,21 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
     return st;
 }
 
-void pulsar_segstore_close(pulsar_segstore *st) { delete st; }
+void pulsar_segstore_close(pulsar_segstore *st) {
+    if (!st) return;
+    /* L347 I3a: the RAM copies and any loaned image go back to the pool (no job may be out: the caller drained its
+     * writer) */
+    for (auto *m : {&st->ram_rows, &st->ram_rp, &st->loan_rows, &st->loan_rp})
+        for (auto &kv : *m) st->img_free(kv.second);
+    for (auto &kv : st->pending_rp) st->img_free(kv.second.img);
+    delete st;
+}
+
+void pulsar_segstore_set_ram(pulsar_segstore *st, pulsar_kvpool *pool, bool retain) {
+    if (!st) return;
+    st->pool = pool;
+    st->retain = pool != nullptr && retain;
+}
 
 void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]) {
     pulsar::Sha1 h;
@@ -507,15 +660,8 @@ bool pulsar_segstore_get(pulsar_segstore *st, const char key[41], pulsar_segstor
     return true;
 }
 
-/** Write all `n` bytes of `p` to `fp`.
- *  @param fp the open file
- *  @param p  the bytes
- *  @param n  their count
- *  @return 0 when every byte was written, 1 on a short write */
-static int write_all(FILE *fp, const void *p, size_t n) { return fwrite(p, 1, n, fp) == n ? 0 : 1; }
-
-/** Run one writer and check it wrote exactly what it promised.
- *  @param fp     the file, positioned where the bytes go
+/** Run one writer into a memory stream and check it wrote exactly what it promised.
+ *  @param fp     the stream, positioned where the bytes go
  *  @param fn     the writer
  *  @param ud     its context
  *  @param bytes  the bytes it promised
@@ -527,7 +673,7 @@ static int write_part(FILE *fp, pulsar_segstore_write_fn fn, void *ud, uint64_t 
                       size_t errlen) {
     const long at = ftell(fp);
     if (fn(fp, ud, err, errlen) != 0) return 1;
-    if ((uint64_t)(ftell(fp) - at) != bytes) {
+    if (fflush(fp) != 0 || (uint64_t)(ftell(fp) - at) != bytes) {
         snprintf(err, errlen, "segment put: %s wrote %ld bytes, promised %llu", what, ftell(fp) - at,
                  (unsigned long long)bytes);
         return 1;
@@ -535,64 +681,62 @@ static int write_part(FILE *fp, pulsar_segstore_write_fn fn, void *ud, uint64_t 
     return 0;
 }
 
-/* The one durable file write of the store: "<final>.tmp.<pid>", the header, `body`, fsync, out of the page cache
- * (L261), rename, directory fsync.  False leaves no file. */
-/// @tparam F     a callable `int(FILE *)` writing the bytes after the header: 0 on success (err filled otherwise)
-/// @param final_path the file's path
-/// @param hdr        the fixed header
-/// @param hdr_len    its bytes
-/// @param body       writes the rest
-/// @param err        receives a reason on failure
-/// @param errlen     size of `err`
-/// @return true when the file is in place
-template <typename F>
-static bool durable_write(const std::string &final_path, const uint8_t *hdr, size_t hdr_len, F body, char *err,
-                          size_t errlen) {
-    char tmp[64];
-    snprintf(tmp, sizeof tmp, ".tmp.%ld", (long)getpid());
-    const std::string tmp_path = final_path + tmp;
-    FILE *fp = fopen(tmp_path.c_str(), "wb");
-    if (!fp) { snprintf(err, errlen, "segment put: %s: %s", tmp_path.c_str(), strerror(errno)); return false; }
-    pulsar_writeback wb;
-    pulsar_writeback_init(&wb, fp);
-    int rc = write_all(fp, hdr, hdr_len);
-    if (rc) snprintf(err, errlen, "segment put: header: %s", strerror(errno));
-    if (rc == 0) rc = body(fp);
-    if (rc == 0 && (fflush(fp) != 0 || fsync(fileno(fp)) != 0)) {
-        snprintf(err, errlen, "segment put: flush: %s", strerror(errno));
-        rc = 1;
+/** Fill `bytes` of an image through a writer (a memory stream over them, one byte past: glibc's fmemopen writes a NUL
+ *  there on every flush -- the image always has that byte, pulsar_segstore::img_alloc).
+ *  @param at     where the bytes go
+ *  @param bytes  how many
+ *  @param fn     the writer
+ *  @param ud     its context
+ *  @param what   names the part in a failure
+ *  @param err    receives a reason on failure
+ *  @param errlen size of `err`
+ *  @return 0, or 1 */
+static int fill_part(uint8_t *at, uint64_t bytes, pulsar_segstore_write_fn fn, void *ud, const char *what, char *err,
+                     size_t errlen) {
+    FILE *m = fmemopen(at, (size_t)bytes + 1u, "wb");
+    if (!m) {
+        snprintf(err, errlen, "segment put: %s: no memory stream", what);
+        return 1;
     }
-    if (rc == 0) pulsar_writeback_finish(&wb);
-    pulsar_writeback_drop_file(fp);
-    fclose(fp);
-    if (rc == 0 && rename(tmp_path.c_str(), final_path.c_str()) != 0) {
-        snprintf(err, errlen, "segment put: rename: %s", strerror(errno));
-        rc = 1;
-    }
-    if (rc != 0) { ::unlink(tmp_path.c_str()); return false; }
-    const std::string dir = final_path.substr(0, final_path.rfind('/'));
-    const int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
-    return true;
+    const int rc = write_part(m, fn, ud, bytes, what, err, errlen);
+    fclose(m);
+    return rc;
 }
 
-/** L338: a put in three steps, so the file write can leave the thread that owns the index.  The job carries
- * everything the write needs (no store state is read while it runs); the store keeps the job's key PENDING (a second
+/** L338 / L347 I3a: a put in three steps, so the file write can leave the thread that owns the index.  The job
+ * carries everything the write needs -- the file's whole IMAGE in host memory (header, text, payload, trailer, padded
+ * to the O_DIRECT granule) -- so no store state is read while it runs; the store keeps the job's key PENDING (a second
  * reserve of it writes nothing) and its parent PINNED (eviction takes leaves only, and a pending child is not yet a
- * child in the index) until the commit. */
+ * child in the index) until the commit.  A restore point job (pulsar_segstore_reserve_rp) pins its own key. */
 struct pulsar_segstore_job {
+    int kind;                ///< PULSAR_SEGSTORE_PART_ROWS (a .seg) or _RP (a .rp)
     char key[41];            ///< the segment's key
-    char parent[41];         ///< its parent's key ("" for a root)
-    uint32_t G_prev;         ///< the span's start
-    uint32_t G;              ///< the span's end
-    std::string text;        ///< the segment's own rendered text
-    uint64_t payload_bytes;  ///< the payload writer's bytes
-    uint64_t trailer_bytes;  ///< the trailer writer's bytes (0 = none)
-    bool with_trailer;       ///< a trailer follows the payload
+    char parent[41];         ///< its parent's key ("" for a root; rows only)
+    uint32_t G_prev;         ///< the span's start (rows only)
+    uint32_t G;              ///< the span's end (rows only)
+    uint64_t text_len;       ///< the segment's own text bytes (rows only)
+    uint64_t payload_off;    ///< where the payload starts in the image
+    uint64_t payload_bytes;  ///< the payload's bytes (its last 8 are its digest, sealed by job_write)
+    uint64_t trailer_bytes;  ///< the trailer's bytes (0 = none; rows only)
+    uint32_t flags;          ///< the restore point's PULSAR_SEGSTORE_RP_* flags as its header carries them (rp only)
+    bool supersede;          ///< a chain end's restore point: its commit drops those it supersedes (rp only)
     uint64_t need;           ///< the file's bytes
-    uint32_t identity;       ///< the store identity the header carries
-    std::string final_path;  ///< `<dir>/<key>.seg`
+    pulsar_segstore::image img;   ///< the file's image
+    std::string final_path;  ///< `<dir>/<key>.seg` or `.rp`
 };
+
+/** Room in the budget for `need` more bytes, evicting by the classes (never `keep` / `keep2`).
+ *  @param st    the store
+ *  @param need  the bytes
+ *  @param freed bytes the write releases when it commits (a replaced restore point)
+ *  @param keep  a key to spare
+ *  @param keep2 a second key to spare (NULL = none)
+ *  @return true when they fit */
+static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, const char *keep, const char *keep2) {
+    while (st->budget && st->used + st->reserved - freed + need > st->budget)
+        if (!st->evict_one(keep, keep2)) break;
+    return !st->budget || st->used + st->reserved - freed + need <= st->budget;
+}
 
 int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
                             size_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
@@ -600,6 +744,11 @@ int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_
     *job_out = nullptr;
     if (!st || G <= G_prev || (G_prev == 0) != (!parent || !parent[0])) {
         snprintf(err, errlen, "segment put: a root starts at 0 and only a root has no parent");
+        return -1;
+    }
+    if (payload_bytes < PULSAR_KVDIGEST_BYTES) {
+        snprintf(err, errlen, "segment put: a payload ends with its %u-byte digest; %llu bytes cannot",
+                 PULSAR_KVDIGEST_BYTES, (unsigned long long)payload_bytes);
         return -1;
     }
     if (parent && parent[0] && !pulsar_segstore_contains(st, parent) && !st->pending.count(std::string(parent, 40))) {
@@ -611,31 +760,57 @@ int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_
     memcpy(key_out, key, 41);
     /* the same text is the same segment: stored, or being written (its write carries what this one would) */
     if (st->pending.count(std::string(key, 40)) || pulsar_segstore_contains(st, key)) return 0;
-    const uint64_t need = HDR + text_len + payload_bytes + trailer_bytes;
+    const uint64_t need = pulsar_segstore_seg_file_bytes(text_len, payload_bytes, trailer_bytes);
     if (st->budget && need > st->budget) {
         snprintf(err, errlen, "segment put: %llu bytes exceed the whole budget", (unsigned long long)need);
         return -1;
     }
-    while (st->budget && st->used + st->reserved + need > st->budget)
-        if (!st->evict_one(parent, key)) break;
-    if (st->budget && st->used + st->reserved + need > st->budget) {
+    if (!budget_room(st, need, 0, parent, key)) {
         snprintf(err, errlen, "segment put: no room (only the chain being extended and the segments being written "
                               "remain)");
         return -1;
     }
+    const pulsar_segstore::image img = st->img_alloc(need);
+    if (!img.p) {
+        snprintf(err, errlen, "segment put: no room in the RAM pool for a %.1f MiB image now",
+                 (double)need / (1024.0 * 1024.0));
+        return -2;
+    }
     pulsar_segstore_job *j = new pulsar_segstore_job();
+    j->kind = PULSAR_SEGSTORE_PART_ROWS;
     memcpy(j->key, key, 41);
     memset(j->parent, 0, sizeof j->parent);
     if (parent && parent[0]) memcpy(j->parent, parent, 40);
     j->G_prev = G_prev;
     j->G = G;
-    j->text.assign(text, text_len);
+    j->text_len = text_len;
+    j->payload_off = HDR + text_len;
     j->payload_bytes = payload_bytes;
     j->trailer_bytes = trailer_bytes;
-    j->with_trailer = trailer_bytes > 0u;
+    j->flags = 0;
+    j->supersede = false;
     j->need = need;
-    j->identity = st->identity;
+    j->img = img;
     j->final_path = st->path(key);
+    /* the header and the text now; the payload and the trailer are the caller's to fill */
+    uint8_t *h = img.p;
+    memset(h, 0, HDR);
+    const uint64_t now = (uint64_t)time(nullptr);
+    put32(h, PULSAR_SEGSTORE_MAGIC);
+    put32(h + 4, PULSAR_SEGSTORE_VERSION);
+    put32(h + 8, st->identity);
+    put32(h + 12, trailer_bytes ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
+    memcpy(h + 16, key, 40);
+    if (j->parent[0]) memcpy(h + 56, j->parent, 40);
+    put32(h + 96, G_prev);
+    put32(h + 100, G);
+    put64(h + 104, text_len);
+    put64(h + 112, payload_bytes);
+    put64(h + 120, trailer_bytes);
+    put64(h + 136, now);
+    put64(h + 144, now);
+    if (text_len) memcpy(h + HDR, text, text_len);
+    memset(img.p + need, 0, (size_t)(img.cap - need));   /* the O_DIRECT pad */
     st->reserved += need;
     st->pending.insert(std::string(key, 40));
     if (j->parent[0]) st->pinned[std::string(j->parent, 40)]++;
@@ -643,45 +818,212 @@ int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_
     return 1;
 }
 
+int pulsar_segstore_reserve_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes, uint32_t flags,
+                               pulsar_segstore_job **job_out, char *err, size_t errlen) {
+    *job_out = nullptr;
+    if (!st || !key || rp_bytes < PULSAR_KVDIGEST_BYTES) {
+        snprintf(err, errlen, "restore point put: no store or key, or fewer bytes than its digest");
+        return -1;
+    }
+    const std::string k(key, 40);
+    auto it = st->segs.find(k);
+    const bool pending = it == st->segs.end() && st->pending.count(k) != 0;
+    if (it == st->segs.end() && !pending) {
+        snprintf(err, errlen, "restore point put: segment %.40s is not stored", key);
+        return -1;
+    }
+    /* one in flight, or one written for the pending segment: the same key is the same state -- it gains the flags */
+    auto flying = st->rp_jobs.find(k);
+    if (flying != st->rp_jobs.end()) {
+        flying->second |= flags;
+        return 0;
+    }
+    auto waiting = st->pending_rp.find(k);
+    if (pending && waiting != st->pending_rp.end()) {
+        waiting->second.flags |= flags;
+        return 0;
+    }
+    /* a stored one is replaced (its flags joined); it leaves the count at the commit, the room is made for the new */
+    const uint64_t had = pending ? 0u : it->second.rp_bytes;
+    const uint32_t joined = (had ? it->second.rp_flags : 0u) | flags;
+    const uint64_t need = pulsar_segstore_rp_file_bytes(rp_bytes);
+    if (st->budget && need > st->budget) {
+        snprintf(err, errlen, "restore point put: %llu bytes exceed the whole budget", (unsigned long long)need);
+        return -1;
+    }
+    if (!budget_room(st, need, had, key, nullptr)) {
+        snprintf(err, errlen, "restore point put: no room for %llu bytes", (unsigned long long)need);
+        return -1;
+    }
+    const pulsar_segstore::image img = st->img_alloc(need);
+    if (!img.p) {
+        snprintf(err, errlen, "restore point put: no room in the RAM pool for a %.1f MiB image now",
+                 (double)need / (1024.0 * 1024.0));
+        return -2;
+    }
+    pulsar_segstore_job *j = new pulsar_segstore_job();
+    j->kind = PULSAR_SEGSTORE_PART_RP;
+    memcpy(j->key, key, 40);
+    j->key[40] = '\0';
+    memset(j->parent, 0, sizeof j->parent);
+    j->G_prev = 0;
+    j->G = pending ? 0u : it->second.G;
+    j->text_len = 0;
+    j->payload_off = RP_HDR;
+    j->payload_bytes = rp_bytes;
+    j->trailer_bytes = 0;
+    j->flags = joined;
+    j->supersede = false;
+    j->need = need;
+    j->img = img;
+    j->final_path = st->rp_path(j->key);
+    uint8_t *h = img.p;
+    memset(h, 0, RP_HDR);
+    put32(h, PULSAR_SEGSTORE_RP_MAGIC);
+    put32(h + 4, PULSAR_SEGSTORE_RP_VERSION);
+    put32(h + 8, st->identity);
+    put32(h + 12, joined);
+    memcpy(h + 16, key, 40);
+    put64(h + 56, rp_bytes);
+    memset(img.p + need, 0, (size_t)(img.cap - need));
+    st->reserved += need;
+    st->rp_jobs[k] = 0u;
+    st->pinned[k]++;
+    *job_out = j;
+    return 1;
+}
+
+int pulsar_segstore_job_kind(const pulsar_segstore_job *job) { return job->kind; }
 const char *pulsar_segstore_job_key(const pulsar_segstore_job *job) { return job->key; }
 uint32_t pulsar_segstore_job_G_prev(const pulsar_segstore_job *job) { return job->G_prev; }
 uint32_t pulsar_segstore_job_G(const pulsar_segstore_job *job) { return job->G; }
-const char *pulsar_segstore_job_text(const pulsar_segstore_job *job) { return job->text.c_str(); }
 uint64_t pulsar_segstore_job_bytes(const pulsar_segstore_job *job) { return job->need; }
+uint64_t pulsar_segstore_job_image_bytes(const pulsar_segstore_job *job) { return job->img.cap; }
+uint8_t *pulsar_segstore_job_payload(pulsar_segstore_job *job) { return job->img.p + job->payload_off; }
+uint64_t pulsar_segstore_job_payload_bytes(const pulsar_segstore_job *job) { return job->payload_bytes; }
+uint8_t *pulsar_segstore_job_trailer(pulsar_segstore_job *job) {
+    return job->trailer_bytes ? job->img.p + job->payload_off + job->payload_bytes : nullptr;
+}
 
-bool pulsar_segstore_job_write(pulsar_segstore_job *job, pulsar_segstore_write_fn write_payload,
-                               pulsar_segstore_write_fn write_trailer, void *ud, char *err, size_t errlen) {
-    if (!write_payload || (job->with_trailer && !write_trailer)) {
-        snprintf(err, errlen, "segment put: no writer for the payload or its trailer");
+void pulsar_segstore_job_supersede(pulsar_segstore_job *job) { job->supersede = true; }
+
+uint64_t pulsar_segstore_superseded_count(const pulsar_segstore *st) { return st ? st->superseded : 0u; }
+
+uint64_t pulsar_segstore_seg_file_bytes(uint64_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes) {
+    return HDR + text_len + payload_bytes + trailer_bytes;
+}
+
+uint64_t pulsar_segstore_rp_file_bytes(uint64_t rp_bytes) { return RP_HDR + rp_bytes; }
+
+uint64_t pulsar_segstore_image_bytes(uint64_t file_bytes) { return pulsar_kvpool_round(file_bytes + 1u); }
+
+/* L347 I3a: the one file write of the store.  The payload's digest is sealed here (pulsar_kvdigest_seal: its last 8
+ * bytes, over the rest), off the store's thread; the image goes to "<final>.tmp.<pid>" with O_DIRECT -- straight from
+ * the image, which is granule-aligned and padded, so the write is whole granules; the file is then cut to its true
+ * size (ftruncate: the file's bytes are exactly the store's layout, no pad on disk) -- and renamed into place.
+ * NO fsync and no directory fsync: an O_DIRECT write is on the device when it returns, and a file a crash tore (the
+ * rename's metadata lost, a tmp left behind) is refused when the store opens (tmp files removed, every file's size
+ * checked against its header) or when it is read (the payload's digest). */
+bool pulsar_segstore_job_write(pulsar_segstore_job *job, char *err, size_t errlen) {
+    pulsar_kvdigest_seal(job->img.p + job->payload_off, job->payload_bytes);
+    char tmp[64];
+    snprintf(tmp, sizeof tmp, ".tmp.%ld", (long)getpid());
+    const std::string tmp_path = job->final_path + tmp;
+    const int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        snprintf(err, errlen, "segment write: %s: %s", tmp_path.c_str(), strerror(errno));
         return false;
     }
-    uint8_t h[HDR];
-    memset(h, 0, sizeof h);
-    const uint64_t now = (uint64_t)time(nullptr);
-    put32(h, PULSAR_SEGSTORE_MAGIC);
-    put32(h + 4, PULSAR_SEGSTORE_VERSION);
-    put32(h + 8, job->identity);
-    put32(h + 12, job->with_trailer ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
-    memcpy(h + 16, job->key, 40);
-    if (job->parent[0]) memcpy(h + 56, job->parent, 40);
-    put32(h + 96, job->G_prev);
-    put32(h + 100, job->G);
-    put64(h + 104, job->text.size());
-    put64(h + 112, job->payload_bytes);
-    put64(h + 120, job->trailer_bytes);
-    put64(h + 136, now);
-    put64(h + 144, now);
-    return durable_write(job->final_path, h, HDR, [&](FILE *fp) {
-        if (write_all(fp, job->text.data(), job->text.size()) != 0) {
-            snprintf(err, errlen, "segment put: text: %s", strerror(errno));
-            return 1;
+    const uint64_t padded = pulsar_kvpool_round(job->need);
+    uint64_t done = 0;
+    bool ok = true;
+    while (ok && done < padded) {
+        const uint64_t step = padded - done < (UINT64_C(1) << 30) ? padded - done : (UINT64_C(1) << 30);
+        const ssize_t w = write(fd, job->img.p + done, (size_t)step);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0 || (uint64_t)w % PULSAR_KVPOOL_ALIGN != 0u) {
+            snprintf(err, errlen, "segment write: %s: %s", tmp_path.c_str(),
+                     w < 0 ? strerror(errno) : "a short O_DIRECT write");
+            ok = false;
+            break;
         }
-        if (write_part(fp, write_payload, ud, job->payload_bytes, "payload", err, errlen) != 0) return 1;
-        return job->with_trailer ? write_part(fp, write_trailer, ud, job->trailer_bytes, "trailer", err, errlen) : 0;
-    }, err, errlen);
+        done += (uint64_t)w;
+    }
+    if (ok && ftruncate(fd, (off_t)job->need) != 0) {
+        snprintf(err, errlen, "segment write: truncate %s: %s", tmp_path.c_str(), strerror(errno));
+        ok = false;
+    }
+    if (close(fd) != 0 && ok) {
+        snprintf(err, errlen, "segment write: close %s: %s", tmp_path.c_str(), strerror(errno));
+        ok = false;
+    }
+    if (ok && rename(tmp_path.c_str(), job->final_path.c_str()) != 0) {
+        snprintf(err, errlen, "segment write: rename: %s", strerror(errno));
+        ok = false;
+    }
+    if (!ok) ::unlink(tmp_path.c_str());
+    return ok;
+}
+
+/** L347 I3a: commit a restore point job (see pulsar_segstore_commit).
+ *  @param st      the store
+ *  @param job     the job (not freed here)
+ *  @param written its write succeeded
+ *  @return true when the restore point is indexed, or waits for its pending segment */
+static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool written) {
+    const std::string key(job->key, 40);
+    st->reserved -= job->need;
+    {
+        auto p = st->pinned.find(key);
+        if (p != st->pinned.end() && --p->second == 0) st->pinned.erase(p);
+    }
+    uint32_t extra = 0;
+    {
+        auto f = st->rp_jobs.find(key);
+        if (f != st->rp_jobs.end()) { extra = f->second; st->rp_jobs.erase(f); }
+    }
+    if (!written) { st->img_free(job->img); return false; }
+    const uint32_t flags = job->flags | extra;
+    if (flags != job->flags) {   /* flags joined while it flew: its header takes them, file and image */
+        uint8_t b[4];
+        put32(b, flags);
+        const int fd = open(job->final_path.c_str(), O_WRONLY | O_CLOEXEC);
+        const bool ok = fd >= 0 && pwrite(fd, b, 4, 12) == 4;
+        if (fd >= 0) close(fd);
+        if (!ok) st->logf("restore point %s: its joined flags could not be written (kept as written)", job->key);
+        else memcpy(job->img.p + 12, b, 4);
+    }
+    const uint32_t kept = flags;
+    auto it = st->segs.find(key);
+    if (it != st->segs.end()) {
+        st->used = st->used - it->second.rp_bytes + job->need;
+        it->second.rp_bytes = job->need;
+        it->second.rp_flags = kept;
+        st->img_keep(st->ram_rp, key, job->img);
+        if (job->supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
+        return true;
+    }
+    if (st->pending.count(key)) {   /* its segment is still being written: the restore point joins it at its commit */
+        pulsar_segstore::pending_point &pp = st->pending_rp[key];
+        pp.bytes = job->need;
+        pp.flags = kept;
+        pp.img = job->img;
+        pp.supersede = job->supersede;
+        st->used += job->need;
+        return true;
+    }
+    st->logf("restore point %s dropped: its segment is gone", job->key);
+    ::unlink(job->final_path.c_str());
+    st->img_free(job->img);
+    return false;
 }
 
 bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool written) {
+    if (job->kind == PULSAR_SEGSTORE_PART_RP) {
+        const bool ok = commit_rp(st, job, written);
+        delete job;
+        return ok;
+    }
     const std::string key(job->key, 40), parent(job->parent);
     st->reserved -= job->need;
     st->pending.erase(key);
@@ -690,13 +1032,11 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         if (p != st->pinned.end() && --p->second == 0) st->pinned.erase(p);
     }
     /* L347: a restore point written while the segment was pending joins it, or goes with it */
-    uint64_t rp_bytes = 0;
-    uint32_t rp_flags = 0;
+    pulsar_segstore::pending_point rp;
     {
         auto r = st->pending_rp.find(key);
         if (r != st->pending_rp.end()) {
-            rp_bytes = r->second.bytes;
-            rp_flags = r->second.flags;
+            rp = r->second;
             st->pending_rp.erase(r);
         }
     }
@@ -714,24 +1054,32 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         if (!parent.empty()) memcpy(e.parent, job->parent, 40);
         e.G_prev = job->G_prev;
         e.G = job->G;
-        e.text_len = job->text.size();
+        e.text_len = job->text_len;
         e.payload_bytes = job->payload_bytes;
         e.trailer_bytes = job->trailer_bytes;
         e.file_bytes = job->need;
         e.last_used = (uint64_t)time(nullptr);
-        e.text_end = (parent.empty() ? 0u : st->segs[parent].text_end) + job->text.size();
-        st->used -= rp_bytes;   /* link counts it again, on the entry */
-        e.rp_bytes = rp_bytes;
-        e.rp_flags = rp_bytes ? rp_flags : 0u;
+        e.text_end = (parent.empty() ? 0u : st->segs[parent].text_end) + job->text_len;
+        st->used -= rp.bytes;   /* link counts it again, on the entry */
+        e.rp_bytes = rp.bytes;
+        e.rp_flags = rp.bytes ? rp.flags : 0u;
         st->link(e);
-        st->heads[e.key] = job->text.substr(0, HEAD_BYTES);
+        st->heads[e.key] = std::string((const char *)job->img.p + HDR,
+                                       (size_t)(job->text_len < HEAD_BYTES ? job->text_len : HEAD_BYTES));
         st->refresh_dominated(e.parent);
+        st->img_keep(st->ram_rows, key, job->img);
+        if (rp.bytes) st->img_keep(st->ram_rp, key, rp.img);
+        if (rp.bytes && rp.supersede) st->superseded += (uint64_t)pulsar_segstore_drop_superseded_rps(st, job->key);
         indexed = true;
     }
-    if (!indexed && rp_bytes) {
-        ::unlink(st->rp_path(key.c_str()).c_str());
-        st->used -= rp_bytes;
-        if (st->removed) st->removed(st->removed_ud, key.c_str(), true);
+    if (!indexed) {
+        st->img_free(job->img);
+        if (rp.bytes) {
+            ::unlink(st->rp_path(key.c_str()).c_str());
+            st->used -= rp.bytes;
+            st->img_free(rp.img);
+            if (st->removed) st->removed(st->removed_ud, key.c_str(), true);
+        }
     }
     delete job;
     return indexed;
@@ -750,61 +1098,26 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
     const int rc = pulsar_segstore_reserve(st, parent, G_prev, G, text, text_len, payload_bytes,
                                            write_trailer ? trailer_bytes : 0u, key_out, &job, err, errlen);
     if (rc <= 0) return rc == 0;
-    const bool ok = pulsar_segstore_job_write(job, write_payload, write_trailer, ud, err, errlen);
+    bool ok = fill_part(pulsar_segstore_job_payload(job), payload_bytes, write_payload, ud, "payload", err, errlen) == 0;
+    if (ok && job->trailer_bytes)
+        ok = fill_part(pulsar_segstore_job_trailer(job), job->trailer_bytes, write_trailer, ud, "trailer", err,
+                       errlen) == 0;
+    ok = ok && pulsar_segstore_job_write(job, err, errlen);
     return pulsar_segstore_commit(st, job, ok) && ok;
 }
 
 bool pulsar_segstore_put_rp(pulsar_segstore *st, const char key[41], uint64_t rp_bytes, uint32_t flags,
                             pulsar_segstore_write_fn write_rp, void *ud, char *err, size_t errlen) {
-    if (!st || !key || !write_rp || rp_bytes == 0u) {
-        snprintf(err, errlen, "restore point put: no store, key, writer or bytes");
+    if (!write_rp) {
+        snprintf(err, errlen, "restore point put: no writer");
         return false;
     }
-    const std::string k(key, 40);
-    auto it = st->segs.find(k);
-    const bool pending = it == st->segs.end() && st->pending.count(k) != 0;
-    if (it == st->segs.end() && !pending) {
-        snprintf(err, errlen, "restore point put: segment %.40s is not stored", key);
-        return false;
-    }
-    /* the restore point it replaces (if any) leaves the count first: the room is made for the new file alone.  The
-     * slot stays valid through eviction, which never takes `key` (unordered_map nodes do not move) */
-    uint64_t *slot = pending ? &st->pending_rp[k].bytes : &it->second.rp_bytes;
-    uint32_t *slot_flags = pending ? &st->pending_rp[k].flags : &it->second.rp_flags;
-    const uint32_t joined = (*slot ? *slot_flags : 0u) | flags;
-    const uint64_t need = RP_HDR + rp_bytes;
-    if (st->budget && need > st->budget) {
-        snprintf(err, errlen, "restore point put: %llu bytes exceed the whole budget", (unsigned long long)need);
-        if (pending && *slot == 0u) st->pending_rp.erase(k);
-        return false;
-    }
-    while (st->budget && st->used + st->reserved - *slot + need > st->budget)
-        if (!st->evict_one(key, nullptr)) break;
-    if (st->budget && st->used + st->reserved - *slot + need > st->budget) {
-        snprintf(err, errlen, "restore point put: no room for %llu bytes", (unsigned long long)need);
-        if (pending && *slot == 0u) st->pending_rp.erase(k);
-        return false;
-    }
-    uint8_t h[RP_HDR];
-    memset(h, 0, sizeof h);
-    put32(h, PULSAR_SEGSTORE_RP_MAGIC);
-    put32(h + 4, PULSAR_SEGSTORE_RP_VERSION);
-    put32(h + 8, st->identity);
-    put32(h + 12, joined);
-    memcpy(h + 16, key, 40);
-    put64(h + 56, rp_bytes);
-    const bool ok = durable_write(st->rp_path(k.c_str()), h, RP_HDR, [&](FILE *fp) {
-        return write_part(fp, write_rp, ud, rp_bytes, "restore point", err, errlen);
-    }, err, errlen);
-    if (!ok) {
-        /* a failed write left the old file in place (the rename never happened) */
-        if (pending && *slot == 0u) st->pending_rp.erase(k);
-        return false;
-    }
-    st->used = st->used - *slot + need;
-    *slot = need;
-    *slot_flags = joined;
-    return true;
+    pulsar_segstore_job *job = nullptr;
+    const int rc = pulsar_segstore_reserve_rp(st, key, rp_bytes, flags, &job, err, errlen);
+    if (rc <= 0) return rc == 0;
+    bool ok = fill_part(pulsar_segstore_job_payload(job), rp_bytes, write_rp, ud, "restore point", err, errlen) == 0;
+    ok = ok && pulsar_segstore_job_write(job, err, errlen);
+    return pulsar_segstore_commit(st, job, ok) && ok;
 }
 
 bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t flags) {
@@ -821,6 +1134,8 @@ bool pulsar_segstore_flag_rp(pulsar_segstore *st, const char key[41], uint32_t f
     const bool closed = fclose(fp) == 0;
     if (!ok || !closed) return false;
     it->second.rp_flags = joined;
+    auto ram = st->ram_rp.find(it->first);   /* L347 I3a: its RAM copy's header too */
+    if (ram != st->ram_rp.end()) memcpy(ram->second.p + 12, b, 4);
     return true;
 }
 
@@ -832,7 +1147,7 @@ int pulsar_segstore_drop_superseded_rps(pulsar_segstore *st, const char key[41])
     auto droppable = [st](const std::string &k) {
         const pulsar_segstore_seg &e = st->segs[k];
         return e.rp_bytes > 0u && e.rp_flags == 0u && st->n_children(k) < 2u && !st->pinned.count(k) &&
-               !st->pending.count(k);
+               !st->pending.count(k) && !st->rp_jobs.count(k);
     };
     int dropped = 0;
     for (;;) {
@@ -901,23 +1216,122 @@ bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, b
     return covered;
 }
 
-FILE *pulsar_segstore_open_rp(pulsar_segstore *st, const char key[41], uint64_t *bytes) {
-    if (!st) return nullptr;
-    auto it = st->segs.find(std::string(key, 40));
-    if (it == st->segs.end() || it->second.rp_bytes == 0u) return nullptr;
-    FILE *fp = fopen(st->rp_path(it->first.c_str()).c_str(), "rb");
-    if (!fp) return nullptr;
-    char k[41];
-    uint64_t payload = 0;
-    uint32_t flags = 0;
-    bool older = false;
-    if (!st->read_rp_header(fp, k, &payload, &flags, &older) || memcmp(k, it->first.data(), 40) != 0 ||
-        RP_HDR + payload != it->second.rp_bytes) {
-        fclose(fp);
-        return nullptr;
+/* L347 I3a: a part's bytes for a load -- the RAM copy when the entry has one (no disk I/O), else the file read whole
+ * with O_DIRECT into a fresh image (granule-sized reads into the pool's aligned block, the short last one at EOF), its
+ * header and size checked and its payload's digest checked (pulsar_kvdigest_check): a mismatch is the file's fault.
+ * With the RAM tier the image read stays as the entry's RAM copy; without it, it is the load's until the unmap. */
+int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, const uint8_t **payload,
+                             uint64_t *bytes, bool *from_disk, char *err, size_t errlen) {
+    *payload = nullptr;
+    *bytes = 0;
+    if (from_disk) *from_disk = false;
+    if (!st) { snprintf(err, errlen, "no store"); return 1; }
+    const std::string k(key, 40);
+    auto it = st->segs.find(k);
+    const bool rp = part == PULSAR_SEGSTORE_PART_RP;
+    if (it == st->segs.end() || (rp && it->second.rp_bytes == 0u)) {
+        snprintf(err, errlen, "%s not stored", rp ? "restore point" : "segment");
+        return 1;
     }
-    if (bytes) *bytes = payload;
-    return fp;
+    const pulsar_segstore_seg &e = it->second;
+    const uint64_t off = rp ? RP_HDR : HDR + e.text_len;
+    const uint64_t pbytes = rp ? e.rp_bytes - RP_HDR : e.payload_bytes;
+    auto &ram = rp ? st->ram_rp : st->ram_rows;
+    auto res = ram.find(k);
+    if (res != ram.end()) {
+        st->held[pulsar_segstore::hold_name(k, rp)]++;
+        *payload = res->second.p + off;
+        *bytes = pbytes;
+        return 0;
+    }
+    const uint64_t file_bytes = rp ? e.rp_bytes : e.file_bytes;
+    const pulsar_segstore::image img = st->img_alloc(file_bytes);
+    if (!img.p) {
+        snprintf(err, errlen, "no room in the RAM pool to read a %.1f MiB %s now", (double)file_bytes / (1024.0 * 1024.0),
+                 rp ? "restore point" : "segment");
+        return 2;
+    }
+    const std::string path = rp ? st->rp_path(k.c_str()) : st->path(k.c_str());
+    const int fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    uint64_t got = 0;
+    int rd_errno = 0;
+    if (fd < 0) rd_errno = errno;
+    const uint64_t padded = pulsar_kvpool_round(file_bytes);
+    while (fd >= 0 && got < padded) {
+        const uint64_t step = padded - got < (UINT64_C(1) << 30) ? padded - got : (UINT64_C(1) << 30);
+        const ssize_t r = read(fd, img.p + got, (size_t)step);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) { rd_errno = errno; break; }
+        if (r == 0) break;
+        got += (uint64_t)r;
+        if ((uint64_t)r % PULSAR_KVPOOL_ALIGN != 0u) break;   /* the short read at EOF */
+    }
+    if (fd >= 0) close(fd);
+    const char *why = nullptr;
+    if (rd_errno) why = strerror(rd_errno);
+    else if (got != file_bytes) why = "its size is not the indexed size";
+    else if (rp) {
+        char hk[41];
+        uint64_t hp = 0;
+        uint32_t hf = 0;
+        bool older = false;
+        if (!st->parse_rp_header(img.p, hk, &hp, &hf, &older) || memcmp(hk, k.data(), 40) != 0 || hp != pbytes)
+            why = "its header is not the indexed one";
+    } else {
+        pulsar_segstore_seg h;
+        uint32_t hf = 0;
+        if (!st->parse_header(img.p, &h, &hf) || memcmp(h.key, k.data(), 40) != 0 || h.payload_bytes != pbytes ||
+            h.text_len != e.text_len)
+            why = "its header is not the indexed one";
+    }
+    if (!why && !pulsar_kvdigest_check(img.p + off, pbytes))
+        why = rp ? "digest mismatch (corrupt restore point)" : "digest mismatch (corrupt segment)";
+    if (why) {
+        snprintf(err, errlen, "%s %s: %s", rp ? "restore point" : "segment", path.c_str(), why);
+        st->img_free(img);
+        return 1;
+    }
+    if (st->retain) ram[k] = img;
+    else (rp ? st->loan_rp : st->loan_rows)[k] = img;
+    st->held[pulsar_segstore::hold_name(k, rp)]++;
+    *payload = img.p + off;
+    *bytes = pbytes;
+    if (from_disk) *from_disk = true;
+    return 0;
+}
+
+void pulsar_segstore_unmap_part(pulsar_segstore *st, const char key[41], int part) {
+    if (!st) return;
+    const std::string k(key, 40);
+    const bool rp = part == PULSAR_SEGSTORE_PART_RP;
+    auto h = st->held.find(pulsar_segstore::hold_name(k, rp));
+    if (h == st->held.end()) return;
+    if (--h->second > 0) return;   /* a second map still reads it */
+    st->held.erase(h);
+    st->img_drop(rp ? st->loan_rp : st->loan_rows, k);
+}
+
+bool pulsar_segstore_ram_make_room(pulsar_segstore *st, uint64_t bytes) {
+    return st && st->ram_make_room(pulsar_segstore_image_bytes(bytes));
+}
+
+uint64_t pulsar_segstore_resident_bytes(pulsar_segstore *st, const char key[41], bool rows, bool rp) {
+    if (!st) return 0u;
+    const std::string k(key, 40);
+    auto it = st->segs.find(k);
+    if (it == st->segs.end()) return 0u;
+    uint64_t got = 0;
+    if (rows && st->ram_rows.count(k)) got += it->second.payload_bytes + it->second.trailer_bytes;
+    if (rp && st->ram_rp.count(k)) got += it->second.rp_bytes;
+    return got;
+}
+
+uint64_t pulsar_segstore_ram_bytes(const pulsar_segstore *st) {
+    uint64_t got = 0;
+    if (st)
+        for (auto *m : {&st->ram_rows, &st->ram_rp})
+            for (auto &kv : *m) got += kv.second.cap;
+    return got;
 }
 
 bool pulsar_segstore_drop_rp(pulsar_segstore *st, const char key[41]) {
@@ -954,55 +1368,6 @@ FILE *pulsar_segstore_open_trailer(pulsar_segstore *st, const char key[41], uint
     if (fseek(fp, (long)(HDR + e.text_len + e.payload_bytes), SEEK_SET) != 0) { fclose(fp); return nullptr; }
     if (trailer_bytes) *trailer_bytes = e.trailer_bytes;
     return fp;
-}
-
-/* The bytes of [off, off + len) of an open file that sit in the page cache, by mincore over a read-only mapping of
- * the pages that span it (pages straddling the range's ends count by their overlap). */
-/// Page-cache residency of a byte range of an open file (see the comment above).
-/// @param fd  the open file
-/// @param off the range's first byte
-/// @param len the range's length in bytes
-/// @return bytes of the range resident in the page cache; 0 when the mapping fails
-static uint64_t segstore_resident(int fd, uint64_t off, uint64_t len) {
-    if (len == 0u) return 0u;
-    const long pg_l = sysconf(_SC_PAGESIZE);
-    const uint64_t pg = pg_l > 0 ? (uint64_t)pg_l : 4096u;
-    const uint64_t a0 = off / pg * pg, a1 = (off + len + pg - 1u) / pg * pg;
-    void *map = mmap(nullptr, (size_t)(a1 - a0), PROT_READ, MAP_SHARED, fd, (off_t)a0);
-    if (map == MAP_FAILED) return 0u;
-    std::vector<unsigned char> vec((size_t)((a1 - a0) / pg));
-    uint64_t got = 0u;
-    if (mincore(map, (size_t)(a1 - a0), vec.data()) == 0)
-        for (size_t i = 0; i < vec.size(); i++) {
-            if (!(vec[i] & 1u)) continue;
-            const uint64_t p0 = a0 + (uint64_t)i * pg, p1 = p0 + pg;
-            const uint64_t lo = p0 > off ? p0 : off, hi = p1 < off + len ? p1 : off + len;
-            got += hi > lo ? hi - lo : 0u;
-        }
-    munmap(map, (size_t)(a1 - a0));
-    return got;
-}
-
-uint64_t pulsar_segstore_cached_bytes(pulsar_segstore *st, const char key[41], uint64_t payload_len, bool trailer,
-                                      bool rp) {
-    if (!st) return 0u;
-    auto it = st->segs.find(std::string(key, 40));
-    if (it == st->segs.end()) return 0u;
-    const pulsar_segstore_seg &e = it->second;
-    const int fd = open(st->path(it->first.c_str()).c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return 0u;
-    const uint64_t at = HDR + e.text_len;
-    uint64_t got = segstore_resident(fd, at, payload_len < e.payload_bytes ? payload_len : e.payload_bytes);
-    if (trailer) got += segstore_resident(fd, at + e.payload_bytes, e.trailer_bytes);
-    close(fd);
-    if (rp && e.rp_bytes) {   /* L347: the restore point file, whole */
-        const int rfd = open(st->rp_path(it->first.c_str()).c_str(), O_RDONLY | O_CLOEXEC);
-        if (rfd >= 0) {
-            got += segstore_resident(rfd, 0, e.rp_bytes);
-            close(rfd);
-        }
-    }
-    return got;
 }
 
 void pulsar_segstore_touch(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n) {

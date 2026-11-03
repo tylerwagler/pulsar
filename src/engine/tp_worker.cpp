@@ -2,6 +2,7 @@
  *  @brief The tensor-parallel worker rank: its session registry and the mirrored-frame loop. */
 #include "pulsar_engine_internal.h"
 #include "tp/pulsar_tp.h"
+#include "pulsar_kvdigest.h"
 #include "pulsar_writeback.h"
 
 #include <dirent.h>
@@ -238,7 +239,9 @@ static bool worker_mkdir_p(const char *path) {
 }
 
 /* The installed bank's segment [G_prev, G) (part 0) or its restore point at G (part 1, L347), durably: tmp + fsync +
- * rename, and out of the page cache (L261). */
+ * rename, and out of the page cache (L261).  L347 I3a: the worker keeps its synchronous write (TP is on demand): it
+ * copies the payload out into a host buffer (the engine's one copy-out), seals its digest itself and writes it
+ * before its verdict -- the same bytes the leader's store writes behind. */
 /// @param s      the session
 /// @param path   the file's path (worker_segment_path of the same part)
 /// @param part   PULSAR_TP_SEGMENT_PART_ROWS or _RESTORE_POINT
@@ -249,18 +252,33 @@ static bool worker_mkdir_p(const char *path) {
 /// @return true when the file is in place (the temp file removed otherwise)
 static bool worker_segment_save(pulsar_session *s, const char *path, uint32_t part, int G_prev, int G, char *err,
                                 size_t errlen) {
+    err[0] = '\0';
+    const bool is_rp = part == PULSAR_TP_SEGMENT_PART_RESTORE_POINT;
+    const uint64_t bytes = is_rp ? s->restore_point_bytes((uint32_t)G)
+                                 : s->segment_bytes((uint32_t)G_prev, (uint32_t)G, NULL);
+    uint8_t *buf = bytes >= PULSAR_KVDIGEST_BYTES ? (uint8_t *)malloc((size_t)bytes) : NULL;
+    if (!buf) {
+        snprintf(err, errlen, "no %s of %llu bytes to copy out", bytes ? "host memory" : "payload",
+                 (unsigned long long)bytes);
+        return false;
+    }
+    const int rc = is_rp ? s->copy_out_restore_point((uint32_t)G, buf, bytes, err, errlen)
+                         : s->copy_out_segment((uint32_t)G_prev, (uint32_t)G, buf, bytes, err, errlen);
+    if (rc != 0) {
+        free(buf);
+        return false;
+    }
+    pulsar_kvdigest_seal(buf, bytes);
     char tmp[4700];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
     FILE *fp = fopen(tmp, "wb");
     if (!fp) {
         snprintf(err, errlen, "cannot create %.400s: %s", tmp, strerror(errno));
+        free(buf);
         return false;
     }
-    err[0] = '\0';
-    const int rc = part == PULSAR_TP_SEGMENT_PART_RESTORE_POINT
-                       ? s->save_restore_point(fp, (uint32_t)G, err, errlen)
-                       : s->save_segment(fp, (uint32_t)G_prev, (uint32_t)G, err, errlen);
-    bool ok = rc == 0 && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    bool ok = fwrite(buf, 1, (size_t)bytes, fp) == bytes && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    free(buf);
     if (ok) pulsar_writeback_drop_file(fp);
     const int saved_errno = errno;
     if (fclose(fp) != 0) ok = false;
@@ -270,6 +288,33 @@ static bool worker_segment_save(pulsar_session *s, const char *path, uint32_t pa
         if (!err[0]) snprintf(err, errlen, "writing %.400s failed: %s", path, strerror(saved_errno ? saved_errno : errno));
     }
     return ok;
+}
+
+/* A worker's copy of a file, whole, into a malloc'd buffer, its digest checked.  NULL (err filled) when it cannot be
+ * read or its digest does not match. */
+/// @param path   the file
+/// @param bytes  receives its size
+/// @param err    receives the failure
+/// @param errlen bytes of `err`
+/// @return the bytes (caller frees), or NULL
+static uint8_t *worker_read_checked(const char *path, uint64_t *bytes, char *err, size_t errlen) {
+    FILE *fp = fopen(path, "rb");
+    struct stat st;
+    if (!fp || fstat(fileno(fp), &st) != 0) {
+        snprintf(err, errlen, "no copy %.400s: %s", path, strerror(errno));
+        if (fp) fclose(fp);
+        return NULL;
+    }
+    *bytes = (uint64_t)st.st_size;
+    uint8_t *buf = *bytes ? (uint8_t *)malloc((size_t)*bytes) : NULL;
+    const bool ok = buf && fread(buf, 1, (size_t)*bytes, fp) == *bytes;
+    fclose(fp);
+    if (!ok || !pulsar_kvdigest_check(buf, *bytes)) {
+        snprintf(err, errlen, "%.400s: %s", path, !ok ? "unreadable" : "digest mismatch (corrupt copy)");
+        free(buf);
+        return NULL;
+    }
+    return buf;
 }
 
 /* Load this rank's copy and reach the state the leader states: the same span
@@ -283,32 +328,20 @@ static bool worker_segment_save(pulsar_session *s, const char *path, uint32_t pa
 /// @return true when loaded and at the leader's state
 static bool worker_segment_load(pulsar_session *s, const char *path, const pulsar_tp_segment_command *cmd,
                                 char *err, size_t errlen) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(err, errlen, "no copy %.400s: %s", path, strerror(errno));
-        return false;
-    }
-    FILE *rp = NULL;
-    struct stat rst;
-    if (cmd->last != 0) {
+    err[0] = '\0';
+    uint64_t bytes = 0, rp_bytes = 0;
+    uint8_t *seg = worker_read_checked(path, &bytes, err, errlen);
+    uint8_t *rp = NULL;
+    if (seg && cmd->last != 0) {
         char rp_path[4700];
         snprintf(rp_path, sizeof(rp_path), "%s.rp", path);
-        rp = fopen(rp_path, "rb");
-        if (!rp || fstat(fileno(rp), &rst) != 0) {
-            snprintf(err, errlen, "no restore point %.400s: %s", rp_path, strerror(errno));
-            if (rp) fclose(rp);
-            fclose(fp);
-            return false;
-        }
+        rp = worker_read_checked(rp_path, &rp_bytes, err, errlen);
     }
-    struct stat st;
     uint32_t G = 0;
-    err[0] = '\0';
-    bool ok = fstat(fileno(fp), &st) == 0 &&
-              s->load_segment(fp, (uint64_t)st.st_size, cmd->last != 0, rp, rp ? (uint64_t)rst.st_size : 0u, &G, err,
-                              errlen) == 0;
-    if (rp) fclose(rp);
-    fclose(fp);
+    bool ok = seg && (cmd->last == 0 || rp) &&
+              s->load_segment(seg, bytes, cmd->last != 0, rp, rp_bytes, &G, err, errlen) == 0;
+    free(seg);
+    free(rp);
     if (ok && ((int)G != cmd->G || pulsar_session_checkpoint_digest(s) != cmd->digest)) {
         snprintf(err, errlen, "the copy loaded to %u (digest %016llx); the leader stands at %d (digest %016llx)",
                  G, (unsigned long long)pulsar_session_checkpoint_digest(s), cmd->G,

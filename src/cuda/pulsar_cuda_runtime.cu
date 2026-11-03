@@ -1765,6 +1765,48 @@ void pulsar_gpu_host_free(void *p) {
     if (p) (void)cudaFreeHost(p);
 }
 
+/* L347 I3a: the copy-out's stream and its two events, one set per calling thread (the server's worker; a test thread)
+ * -- created on first use, kept for the thread's life. */
+/// The calling thread's copy stream (non-blocking: it never serialises with the legacy stream).
+static thread_local cudaStream_t t_copy_stream = NULL;
+/// Recorded on the calling thread's compute stream: the fence the copy stream waits for.
+static thread_local cudaEvent_t t_copy_fence = NULL;
+/// Recorded on the copy stream after the copies: what the host waits for.
+static thread_local cudaEvent_t t_copy_done = NULL;
+
+int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_gpu_copy_span &c = spans[i];
+        if (!c.src || !c.dst || c.offset > c.src->bytes || c.bytes > c.src->bytes - c.offset) {
+            fprintf(stderr, "pulsar: copy-out span %u out of range (offset %llu + %llu > %llu bytes)\n", i,
+                    (unsigned long long)c.offset, (unsigned long long)c.bytes,
+                    (unsigned long long)(c.src ? c.src->bytes : 0));
+            return 0;
+        }
+        total += c.bytes;
+    }
+    if (!t_copy_stream && !cuda_ok(cudaStreamCreateWithFlags(&t_copy_stream, cudaStreamNonBlocking), "copy stream"))
+        return 0;
+    if (!t_copy_fence && !cuda_ok(cudaEventCreateWithFlags(&t_copy_fence, cudaEventDisableTiming), "copy fence"))
+        return 0;
+    if (!t_copy_done && !cuda_ok(cudaEventCreateWithFlags(&t_copy_done, cudaEventDisableTiming), "copy done"))
+        return 0;
+    if (!cuda_ok(cudaEventRecord(t_copy_fence, cudaStreamPerThread), "copy fence record") ||
+        !cuda_ok(cudaStreamWaitEvent(t_copy_stream, t_copy_fence, 0), "copy fence wait"))
+        return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_gpu_copy_span &c = spans[i];
+        if (c.bytes == 0 || c.src->dry) continue;
+        if (!cuda_ok(cudaMemcpyAsync(c.dst, (const char *)c.src->ptr + c.offset, (size_t)c.bytes,
+                                     cudaMemcpyDeviceToHost, t_copy_stream), "copy-out"))
+            return 0;
+    }
+    pulsar_cuda_sync_note(2, total);   /* one host wait, for the copy stream alone */
+    return cuda_ok(cudaEventRecord(t_copy_done, t_copy_stream), "copy done record") &&
+           cuda_ok(cudaEventSynchronize(t_copy_done), "copy-out wait");
+}
+
 
 
 /* The write counterpart of pulsar_read_q_f32: host f32 in, stored Q element

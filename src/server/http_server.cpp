@@ -531,6 +531,8 @@ bool server::send_metrics(int fd) {
     const unsigned long long kv_reserved = (unsigned long long)s->m_kv_reserved.raw();
     const unsigned long long kv_budget_live = (unsigned long long)s->m_kv_budget.raw();   /* 2026-10-29 */
     const unsigned long long persist_skipped = (unsigned long long)s->m_persist_skipped;
+    const unsigned long long persist_no_room = (unsigned long long)s->m_persist_no_room;   /* L347 I3a */
+    const unsigned long long spill_no_room = (unsigned long long)s->m_spill_no_room;
     const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
@@ -903,7 +905,7 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:kv_dup_censuses_total %llu\n", dup_censuses);
 
     /* L310: the disk tier's restore-vs-recompute -- what each hit decided, the measured read rates it priced the
-     * read with (L327: from the disk and from the page cache), the last decision's two prices, and the tokens each
+     * read with (L327: from the disk and from the RAM tier, L347 I3a), the last decision's two prices, and the tokens each
      * side carried. */
     buf_puts(&b, "# HELP pulsar:kv_disk_restore_decisions_total Disk chain hits by restore-vs-recompute verdict.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_restore_decisions_total counter\n");
@@ -911,11 +913,11 @@ bool server::send_metrics(int fd) {
         buf_printf(&b, "pulsar:kv_disk_restore_decisions_total{verdict=\"%s\"} %llu\n", kv_restore_verdict_names[i],
                    (unsigned long long)disk_meter.verdicts[i]);
     buf_puts(&b, "# HELP pulsar:kv_disk_read_bytes_per_second Measured disk chain load rate, of the bytes read from "
-                 "the disk and from the page cache (0 until the first load).\n");
+                 "the disk and from the RAM tier (0 until the first load).\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_read_bytes_per_second gauge\n");
     {
         const double per_gib[2] = {disk_meter.read.cold_ms_per_gib, disk_meter.read.cached_ms_per_gib};
-        const char *from[2] = {"disk", "page_cache"};
+        const char *from[2] = {"disk", "ram"};   /* L347 I3a: the RAM tier (was page_cache) */
         for (int i = 0; i < 2; i++)
             buf_printf(&b, "pulsar:kv_disk_read_bytes_per_second{from=\"%s\"} %.0f\n", from[i],
                        per_gib[i] > 0.0 ? 1024.0 * 1024.0 * 1024.0 * 1000.0 / per_gib[i] : 0.0);
@@ -1029,6 +1031,12 @@ bool server::send_metrics(int fd) {
     buf_puts(&b, "# HELP pulsar:kv_persist_skipped_total Disk-KV persists skipped because MemAvailable could not cover them over the memory floor.\n");
     buf_puts(&b, "# TYPE pulsar:kv_persist_skipped_total counter\n");
     buf_printf(&b, "pulsar:kv_persist_skipped_total %llu\n", persist_skipped);
+    buf_puts(&b, "# HELP pulsar:kv_persist_no_room_total Disk-KV persists that left a file unwritten: the host pool had no room for its copy-out (--kv-ram-mb).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_persist_no_room_total counter\n");
+    buf_printf(&b, "pulsar:kv_persist_no_room_total %llu\n", persist_no_room);
+    buf_puts(&b, "# HELP pulsar:kv_spill_no_room_total Guard spills refused because their copy-out found no room in the host pool (the bank stayed resident).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_spill_no_room_total counter\n");
+    buf_printf(&b, "pulsar:kv_spill_no_room_total %llu\n", spill_no_room);
     buf_puts(&b, "# HELP pulsar:prefill_mem_refusals_total Prefills stopped mid-prompt because MemAvailable was under the memory floor before a chunk.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_mem_refusals_total counter\n");
     buf_printf(&b, "pulsar:prefill_mem_refusals_total %llu\n", prefill_mem_refusals);

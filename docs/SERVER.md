@@ -33,6 +33,7 @@ The topics are `runtime`, `steering`, `api`, `kv-cache`, `thinking` and `all`.
 | `--kv-disk-dir DIR` | see [Disk KV cache](#disk-kv-cache) | `""` disables the cache. The last disk-KV flag on the line wins. |
 | `--no-kv-disk` | | Disable the disk KV cache. |
 | `--kv-disk-space-mb N` | unset: no budget | Disk budget in MiB. When the store is over budget it evicts leaves (see below). |
+| `--kv-ram-mb N` | 25% of RAM, at most 16384 (discrete GPU); 1024 (unified memory) | The disk cache's pinned host pool in MiB: copy-out buffers, and on a discrete-GPU host the RAM tier restores read before disk (see below). |
 | `--no-dspark` | | Run without the container's drafter, for every family. |
 | `--drafter NAME` | the container's | Which drafter to load when the container holds more than one: `mtp`, `dflash2` (Qwen; its default) or `lilicorr` (Nemotron; a container with both MTP and LiLiCorr must name one). Naming a drafter the container does not hold is refused. |
 | `--spec-depth N` | the drafter's | The draft depth a session starts at (DSpark 3, then its controller walks 2..5; MTP 4). Env form: `PULSAR_SPEC_DEPTH`. |
@@ -350,15 +351,23 @@ Format (`src/lib/pulsar_segstore.h`, `src/lib/pulsar_kvchain.h`):
   optional state at its end, and an optional trailer (the tool-call replay map).
 - **Keys.** A segment's key is `sha1(parent_key || text)`, so a key names the
   whole text from position 0, and conversations that share a prefix share its
-  segments. Files are `<key>.seg`, written durably (tmp + fsync + rename) and
-  without leaving page cache behind.
+  segments. Files are `<key>.seg` (rows) and `<key>.rp` (the state at its end, a
+  restore point). A persist copies each file out of the GPU into the pinned host
+  pool (`--kv-ram-mb`) and a writer thread writes it behind with O_DIRECT (tmp +
+  rename; no fsync: sizes and digests reject a torn file), so no page cache is
+  left behind.
+- **RAM tier.** On a discrete-GPU host a written file stays in the pool as a RAM
+  copy, and a restore of it reads no disk; RAM copies are evicted
+  least-recently-used (dead-end restore points first, anchors and branch points
+  last) and stay on disk. On unified memory (GB10) the tier is off: host RAM is
+  the GPU's, so the pool is only the copy-out ring.
 - **The grid.** Chains are cut on a fixed grid (the prefill chunk) plus one tail
   segment. Copies and branches of a conversation therefore deduplicate.
 - **Lookup.** A lookup returns the deepest chain whose text is a byte prefix of
   the request and whose last segment carries a state.
 - **Identity.** A store records the model, its routed-expert format and its rope.
-  Segments of another identity or payload version (segment v6, store v2) are
-  refused and rewritten, never converted.
+  Segments of another identity or payload version (segment v8, restore point
+  v2, store v4) are refused and rewritten, never converted.
 - **Restore.** A restore loads in slices between decode rounds, so other
   sessions keep decoding (L330).
 - **Eviction.** With a budget, the store evicts leaves only: first those

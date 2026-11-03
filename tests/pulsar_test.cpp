@@ -4027,16 +4027,16 @@ static void test_qwen_eos(void) {
 }
 
 /* L335: the session entries that report through `err` accept err == NULL with a nonzero errlen, as their siblings
- * do (decode_fused, bank_adopt, restore_checkpoint and the segment save / load wrote through it unchecked; the restore point save too, L347).  Each
+ * do (decode_fused, bank_adopt, restore_checkpoint and the segment save / load wrote through it unchecked; the restore point save too, L347; L347 I3a: the copy-outs).  Each
  * refuses a NULL session here, so the check needs no engine. */
 static void test_api_err_null(void) {
     pulsar_tokens prompt = {0};
     TEST_ASSERT(pulsar_session_restore_checkpoint(NULL, TokPos{0}, NULL, 64) == 1);
     TEST_ASSERT(pulsar_session_bank_adopt(NULL, 1u, &prompt, NULL, 64).status == PULSAR_ADOPT_REFUSED);
-    TEST_ASSERT(pulsar_session_save_segment(NULL, NULL, TokPos{0}, TokPos{0}, NULL, NULL, 64) == 1);
+    TEST_ASSERT(pulsar_session_copy_out_segment(NULL, TokPos{0}, TokPos{0}, NULL, NULL, 0, NULL, 64) == 1);
     TokPos G = TokPos{7};
     TEST_ASSERT(pulsar_session_load_segment(NULL, NULL, 0, false, NULL, 0, &G, NULL, NULL, 64) == 1 && G == TokPos{0});
-    TEST_ASSERT(pulsar_session_save_restore_point(NULL, NULL, TokPos{128}, NULL, NULL, 64) == 1);
+    TEST_ASSERT(pulsar_session_copy_out_restore_point(NULL, TokPos{128}, NULL, NULL, 0, NULL, 64) == 1);
     TEST_ASSERT(pulsar_session_restore_point_bytes(NULL, TokPos{128}) == 0u);
 }
 

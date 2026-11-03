@@ -15,6 +15,7 @@
  * DeepSeek's pool has its own gate (bank_evict_restore_gate); this one runs on any family that declares banks and
  * segments. */
 #include "pulsar.h"
+#include "segment_file_io.h"   /* L347 I3a: segments to and from files through the copy-out */
 #include "gate_entry.h"
 #include "gate_util.h"
 
@@ -138,8 +139,8 @@ int GATE_ENTRY(int argc, char **argv) {
     const uint64_t seg_bytes = ok ? pulsar_session_segment_bytes(s, TokPos{0}, TokPos{G}, NULL) : 0;
     ok = ok && seg && rp && pulsar_session_bank_state_restore(s, 1) &&
          pulsar_session_checkpoint_best(s, TokPos{G}).raw() == G &&
-         pulsar_session_save_segment(s, seg, TokPos{0}, TokPos{G}, NULL, err, sizeof(err)) == 0 &&
-         pulsar_session_save_restore_point(s, rp, TokPos{G}, NULL, err, sizeof(err)) == 0;
+         gate_save_segment(s, seg, TokPos{0}, TokPos{G}, err, sizeof(err)) == 0 &&
+         gate_save_restore_point(s, rp, TokPos{G}, err, sizeof(err)) == 0;
     const uint64_t rp_bytes = ok ? pulsar_session_restore_point_bytes(s, TokPos{G}) : 0;
     if (ok) pulsar_session_bank_state_save(s, 1);
     ok = ok && pulsar_session_bank_state_restore(s, 0);
@@ -179,7 +180,7 @@ int GATE_ENTRY(int argc, char **argv) {
     if (seg) rewind(seg);
     if (rp) rewind(rp);
     const bool loaded = backed && pulsar_session_bank_state_restore(s, 1) &&
-                        pulsar_session_load_segment(s, seg, seg_bytes, true, rp, rp_bytes, &g, NULL, err,
+                        gate_load_segment(s, seg, seg_bytes, true, rp, rp_bytes, &g, err,
                                                     sizeof(err)) == 0;
     CHECK(loaded && g.raw() == G && pulsar_session_bank_touched_kv_bytes(s, 1).raw() == t1,
           "R2 the chain loaded bank 1 back to %d (touched %.1f MiB): %s", g.raw(),

@@ -278,6 +278,22 @@ void *pulsar_gpu_host_alloc(uint64_t bytes);
 /** @brief Free memory from pulsar_gpu_host_alloc.
  *  @param p the buffer, or NULL */
 void pulsar_gpu_host_free(void *p);
+/** L347 I3a: one device -> host span of pulsar_gpu_copy_out. */
+typedef struct {
+    const pulsar_gpu_tensor *src;   ///< the device tensor read
+    uint64_t offset;                ///< the span's byte offset in it
+    void *dst;                      ///< host destination (pinned for a true DMA; pageable works, staged by the driver)
+    uint64_t bytes;                 ///< the span's bytes; the range must fit `src`
+} pulsar_gpu_copy_span;
+/** L347 I3a: the disk KV cache's copy-out.  An event is recorded on the calling thread's stream (the work that wrote
+ *  the spans: every kernel and copy queued on it before this call), the calling thread's COPY stream (a non-blocking
+ *  stream of its own, created on first use) waits for it, one cudaMemcpyAsync per span runs there, and the host waits
+ *  for that stream alone -- no device-wide drain, and compute queued on the calling thread's stream meanwhile is not
+ *  waited for.  When it returns every span has landed: the source rows / slot may be reused at once.
+ *  @param spans [n] the spans
+ *  @param n     spans
+ *  @return 1 when every span landed, 0 on a bad range or a CUDA error (said) */
+int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n);
 
 /** Fill a Q buffer from host f32, converting to the stored Q element type.
  * Host callers cannot see pulsar_q_t (it is CUDA-only), so a plain

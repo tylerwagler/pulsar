@@ -44,6 +44,7 @@
  * coverage is asserted below (frontier_coverage), not assumed.
  */
 #include "pulsar.h"
+#include "segment_file_io.h"   /* L347 I3a: segments to and from files through the copy-out */
 #include "pulsar_engine_internal.h"
 #include "pulsar_gpu.h"
 #include "gate_entry.h"
@@ -155,7 +156,7 @@ static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, 
         Gs[i] = desc[n - 1 - i];
         fp[i] = tmpfile();
         bytes[i] = pulsar_session_segment_bytes(s, TokPos{prev}, TokPos{Gs[i]}, NULL);
-        if (!fp[i] || pulsar_session_save_segment(s, fp[i], TokPos{prev}, TokPos{Gs[i]}, NULL, err, errlen) != 0) {
+        if (!fp[i] || gate_save_segment(s, fp[i], TokPos{prev}, TokPos{Gs[i]}, err, errlen) != 0) {
             for (int k = 0; k <= i; k++) if (fp[k]) fclose(fp[k]);
             return 0;
         }
@@ -164,7 +165,7 @@ static int save_chain(pulsar_session *s, int limit, FILE **fp, uint64_t *bytes, 
     *rp = tmpfile();
     *rp_bytes = pulsar_session_restore_point_bytes(s, TokPos{Gs[n - 1]});
     if (!*rp || *rp_bytes == 0 ||
-        pulsar_session_save_restore_point(s, *rp, TokPos{Gs[n - 1]}, NULL, err, errlen) != 0) {
+        gate_save_restore_point(s, *rp, TokPos{Gs[n - 1]}, err, errlen) != 0) {
         if (*rp_bytes == 0) snprintf(err, errlen, "no restore point at the chain's end %d", Gs[n - 1]);
         for (int k = 0; k < n; k++) fclose(fp[k]);
         if (*rp) fclose(*rp);
@@ -266,8 +267,8 @@ int GATE_ENTRY(int argc, char **argv) {
       for (int i = 0; i < n_chain; i++) {
           TokPos G{0};
           const bool last = i == n_chain - 1;
-          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? rp_fp : NULL,
-                                            last ? rp_bytes : 0, &G, NULL, err, sizeof err) == 0,
+          CHECK(gate_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? rp_fp : NULL,
+                                            last ? rp_bytes : 0, &G, err, sizeof err) == 0,
                 "segment %d load: %s", i, err);
           CHECK(G.raw() == chain_G[i], "segment %d loaded G=%d, saved %d", i, G.raw(), chain_G[i]);
       }
@@ -307,8 +308,8 @@ int GATE_ENTRY(int argc, char **argv) {
           const bool last = i == n_chain - 1;
           CHECK(!last || fseek(rp_fp, 0, SEEK_SET) == 0, "sliced: rewind the restore point");
           TokPos G{0};
-          CHECK(pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? rp_fp : NULL,
-                                            last ? rp_bytes : 0, &G, NULL, err, sizeof err) == 0,
+          CHECK(gate_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? rp_fp : NULL,
+                                            last ? rp_bytes : 0, &G, err, sizeof err) == 0,
                 "sliced: segment %d load (after a switch away and back): %s", i, err);
           CHECK(G.raw() == chain_G[i], "sliced: segment %d loaded G=%d, saved %d", i, G.raw(), chain_G[i]);
           if (i == n_chain - 1) break;
@@ -361,10 +362,11 @@ int GATE_ENTRY(int argc, char **argv) {
     /* ===== Review finding 3 -- a corrupt/short segment must fail its load
      * SAFELY: refused, and the bank advertises no rows.  Bank 1 is freed by now;
      * give it physical back and make it cur, as a restore would.  (a) truncated:
-     * the stream ends early; (b) one flipped byte: the digest catches it AFTER
-     * the device writes, so the load must also take back what it wrote; (c) L347:
-     * one flipped byte in the chain end's restore point, after the whole chain's
-     * rows are in. ===== */
+     * the stream ends early; (b) one flipped byte: the digest catches it (L347
+     * I3a: when the part is read, before the engine sees it -- segment_file_io.h,
+     * as the store's reader does); (c) L347: one flipped byte in the chain end's
+     * restore point, after the whole chain's rows are in: the failed load leaves
+     * the bank invalidated (pulsar_kvchain_load_slice's rule). ===== */
     CHECK(pulsar_session_bank_alloc_physical(s, 1), "finding3: alloc_physical(bank 1)");
     CHECK(pulsar_session_bank_state_restore(s, 1), "finding3: repoint to bank 1");
     { const uint64_t nb = chain_bytes[0];
@@ -382,7 +384,7 @@ int GATE_ENTRY(int argc, char **argv) {
           }
           rewind(fp);
           TokPos G{0};
-          const int lrc = pulsar_session_load_segment(s, fp, nb, false, NULL, 0, &G, NULL, err, sizeof err);
+          const int lrc = gate_load_segment(s, fp, nb, false, NULL, 0, &G, err, sizeof err);
           fclose(fp);
           const char *what = leg == 0 ? "(a) truncated" : "(b) flipped byte";
           CHECK(lrc != 0, "finding3%s: load ACCEPTED it", what);
@@ -405,8 +407,8 @@ int GATE_ENTRY(int argc, char **argv) {
               const bool last = i == n_chain - 1;
               TokPos G{0};
               lrc = fseek(chain_fp[i], 0, SEEK_SET) != 0 ||
-                    pulsar_session_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? fp : NULL,
-                                                last ? rp_bytes : 0, &G, NULL, err, sizeof err) != 0 ? (last ? 1 : 2) : 0;
+                    gate_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? fp : NULL,
+                                                last ? rp_bytes : 0, &G, err, sizeof err) != 0 ? (last ? 1 : 2) : 0;
           }
           CHECK(lrc == 1, "finding3(c) flipped restore point byte: %s", lrc == 0 ? "load ACCEPTED it"
                                                                       : "an earlier segment failed instead");

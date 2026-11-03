@@ -21,6 +21,7 @@
  * tokens.bin is int32 token ids, at least D + 4 + N.  Scratch holds the segments and the payload (D x ~13.4 KB
  * each); they are deleted at exit.  Exit 0 = every check passed. */
 #include "pulsar.h"
+#include "segment_file_io.h"   /* L347 I3a: segments to and from files through the copy-out */
 
 #include <math.h>
 #include <stdint.h>
@@ -236,9 +237,9 @@ int main(int argc, char **argv) {
         b2 = ok ? pulsar_session_segment_bytes(s, TokPos{Gk}, TokPos{GD}, NULL) : 0;
         brp = ok ? pulsar_session_restore_point_bytes(s, TokPos{GD}) : 0;
         const double t2 = now_s();
-        ok = ok && a && b && r && pulsar_session_save_segment(s, a, TokPos{0}, TokPos{Gk}, NULL, err, sizeof err) == 0 &&
-             pulsar_session_save_segment(s, b, TokPos{Gk}, TokPos{GD}, NULL, err, sizeof err) == 0 &&
-             pulsar_session_save_restore_point(s, r, TokPos{GD}, NULL, err, sizeof err) == 0;
+        ok = ok && a && b && r && gate_save_segment(s, a, TokPos{0}, TokPos{Gk}, err, sizeof err) == 0 &&
+             gate_save_segment(s, b, TokPos{Gk}, TokPos{GD}, err, sizeof err) == 0 &&
+             gate_save_restore_point(s, r, TokPos{GD}, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
         if (r) fclose(r);
@@ -261,8 +262,8 @@ int main(int argc, char **argv) {
         TokPos g1{0}, g2{0};
         const double t0 = now_s();
         bool ok = a && b && r && pulsar_session_create(&s, e, ctx) == 0 &&
-                  pulsar_session_load_segment(s, a, b1, false, NULL, 0, &g1, NULL, err, sizeof err) == 0 &&
-                  pulsar_session_load_segment(s, b, b2, true, r, brp, &g2, NULL, err, sizeof err) == 0;
+                  gate_load_segment(s, a, b1, false, NULL, 0, &g1, err, sizeof err) == 0 &&
+                  gate_load_segment(s, b, b2, true, r, brp, &g2, err, sizeof err) == 0;
         if (a) fclose(a);
         if (b) fclose(b);
         if (r) fclose(r);

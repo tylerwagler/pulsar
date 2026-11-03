@@ -376,6 +376,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget in MiB. Default: unbounded unless set.");
+    opt(fp, c, "--kv-ram-mb N", "Disk KV host pool in MiB (pinned at startup): the RAM tier restores read before disk, and the copy-out buffers. Default: 25% of RAM, at most 16384, on a discrete GPU; 1024 (copy-out only, no RAM tier) on unified memory.");
     fputc('\n', fp);
 }
 

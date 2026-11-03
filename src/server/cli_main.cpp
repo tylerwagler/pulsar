@@ -662,6 +662,7 @@ static server_config parse_options(int argc, char **argv) {
     c.judge_banks = -1;   /* L338 P2.4: one reserved bank when the container carries an adapter */
     c.reasoning_default = -1;   /* L338 P4: the family's default unless --reasoning */
     c.kv_cache = kv_cache_default_options();
+    c.kv_ram_mb = -1;   /* L347 I3a: kv_ram_plan_for's default unless --kv-ram-mb */
 
     bool directional_steering_scale_set = false;
     /* Did -m/--model name a path?  The default below is a POINTER name, and
@@ -747,6 +748,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-ram-mb")) {
+            c.kv_ram_mb = parse_int_arg(need_arg(&i, argc, argv, arg), arg);   /* >= 1, else the start is refused */
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -1479,10 +1482,17 @@ int main(int argc, char **argv) {
                    "the anchor cold store and the last-turn routing anchor are off");
     s.default_tokens = cfg.default_tokens;
     s.tool_mem.max_entries = PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
+    /* L347 I3a: the disk cache's host pool -- the RAM tier on a discrete-GPU host, the copy-out ring on a unified one */
+    kv_ram_plan ram = {0, false};
+    {
+        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+        const uint64_t mem_total = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
+        kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
+    }
     if (cfg.kv_disk_dir &&
         !kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                        pulsar_engine_kv_identity(engine),
-                       cfg.kv_cache))
+                       cfg.kv_cache, ram))
     {
         /* Never fatal: an uncreatable/read-only directory logs its reason in
          * kv_cache_open; state the consequence once and serve without disk
