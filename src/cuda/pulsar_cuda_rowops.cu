@@ -30,7 +30,8 @@ __device__ __forceinline__ uint32_t f2bf(float f) { return (uint32_t)__bfloat16_
  * is of the stored bytes); its squares are an f32 fma chain over its chunks in order, the warps fold by
  * xor-shuffle, warp 0 adds the eight warp sums in order. */
 /** Optional residual add then optional RMS norm, bf16.  Grid n_rows (blockIdx.x = row); block kNormThreads; static
- *  smem only.  With delta: res[t] = bf16(res[t] + delta[t]) stored.  With w: y[t] = bf16((res[t] * rstd) * w).
+ *  smem only.  With delta: res[t] = bf16(res[t] + delta[t]) stored.  With w:
+ *  y[t] = bf16((res[t] * rstd) * w) of the stored row.
  *  @param res      device bf16 rows (the residual; updated in place with delta), 16-byte aligned
  *  @param ld_res   res row pitch in elements (a multiple of 8)
  *  @param delta    device bf16 rows to add, or NULL
@@ -330,6 +331,256 @@ bool norm_args_ok(const char *who, const void *res, uint64_t ld_res, const void 
     return ok;
 }
 
+
+/* ---- L338: fused row chains (Gemma 4's residual stream between its blocks) -----------------------------------------
+ *
+ * Each is a sequence of rows_norm_kernel's operations on one row in one CTA, bit for bit: a thread owns the 8-element
+ * chunks i, i + 256, ... (held in registers, kChainChunks at most: width <= 8 * 256 * kChainChunks), squares summed as
+ * an f32 fma chain over its chunks in order, the warps folded by xor-shuffle, warp 0 adding the eight warp sums in
+ * order, rstd = rsqrt(sum / width + eps), y = bf16((x * rstd) * w); a sum rounds once, a scaled sum twice. */
+
+/// Chunks of 8 a thread holds in a fused chain (width <= 8 * kNormThreads * kChainChunks).
+constexpr int kChainChunks = 4;
+
+/// rows_norm_kernel's square sum of one held row: this thread's chunks in order.
+/// @param u  [kChainChunks][4] the thread's chunks (bf16 pairs)
+/// @param nc chunks this thread holds
+/// @return the thread's partial
+__device__ __forceinline__ float chain_ss(const uint32_t (&u)[kChainChunks][4], int nc) {
+    float ss = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float a = bf2f(u[c][k] & 0xffffu), b = bf2f(u[c][k] >> 16);
+            ss = __fmaf_rn(a, a, ss);
+            ss = __fmaf_rn(b, b, ss);
+        }
+    }
+    return ss;
+}
+
+/// rows_norm_kernel's rstd from every thread's partial (two block syncs; every thread calls it).
+/// @param ss     this thread's partial
+/// @param width  the row width
+/// @param eps    the norm's epsilon
+/// @param warp_s shared [kNormThreads / 32]
+/// @param out    shared slot the rstd is published through
+/// @return rstd, in every thread
+__device__ __forceinline__ float chain_rstd(float ss, uint32_t width, float eps, float *warp_s, float *out) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, o));
+    if ((threadIdx.x & 31) == 0) warp_s[threadIdx.x / 32] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int k = 0; k < kNormThreads / 32; ++k) tot = __fadd_rn(tot, warp_s[k]);
+        *out = rsqrtf(__fadd_rn(__fdiv_rn(tot, (float)width), eps));
+    }
+    __syncthreads();
+    return *out;
+}
+
+/// One normed chunk: bf16((x * rstd) * w) of 8 elements.
+/// @param u    the chunk (bf16 pairs)
+/// @param wv   the weight's chunk
+/// @param rstd the row's rstd
+/// @param o    receives the normed chunk
+__device__ __forceinline__ void chain_norm(const uint32_t (&u)[4], uint4 wv, float rstd, uint32_t (&o)[4]) {
+    const uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float lo = __fmul_rn(__fmul_rn(bf2f(u[k] & 0xffffu), rstd), bf2f(wu[k] & 0xffffu));
+        const float hi = __fmul_rn(__fmul_rn(bf2f(u[k] >> 16), rstd), bf2f(wu[k] >> 16));
+        o[k] = f2bf(lo) | (f2bf(hi) << 16);
+    }
+}
+
+/// One summed chunk: bf16(a + b), and with a scale bf16(bf16(a + b) * s) -- rows_norm_kernel's add.
+/// @param a     the residual's chunk, updated
+/// @param b     the delta's chunk
+/// @param scale device bf16 scalar, or NULL
+__device__ __forceinline__ void chain_add(uint32_t (&a)[4], const uint32_t (&b)[4], const uint16_t *scale) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        uint32_t lo = f2bf(__fadd_rn(bf2f(a[k] & 0xffffu), bf2f(b[k] & 0xffffu)));
+        uint32_t hi = f2bf(__fadd_rn(bf2f(a[k] >> 16), bf2f(b[k] >> 16)));
+        if (scale) {
+            const float s = bf2f(*scale);
+            lo = f2bf(__fmul_rn(bf2f(lo), s));
+            hi = f2bf(__fmul_rn(bf2f(hi), s));
+        }
+        a[k] = lo | (hi << 16);
+    }
+}
+
+/// The row-chain outputs of rows_norm_add_norms_kernel: up to three norms of the updated residual.
+struct chain_outs {
+    const uint4 *w[3];   ///< norm weights (NULL: unused slot)
+    uint16_t *y[3];      ///< their output rows
+    uint64_t ld[3];      ///< their pitches in elements
+};
+
+/** res = bf16(res + bf16(rmsnorm(x) * w_x)), then y_j = bf16(rmsnorm(res) * w_j) for each given j -- a block's
+ *  post-norm, the residual add and the next blocks' input norms in one pass (the norms of one row share its rstd: the
+ *  same reduction).  Grid n_rows; block kNormThreads.
+ *  @param x      device bf16 delta rows (normed before the add)
+ *  @param ld_x   x pitch in elements
+ *  @param w_x    device bf16 [width] the delta's norm weight
+ *  @param res    device bf16 residual rows, updated in place
+ *  @param ld_res res pitch
+ *  @param width  row width
+ *  @param eps    the norms' epsilon
+ *  @param outs   the residual's norms */
+__global__ void __launch_bounds__(kNormThreads)
+rows_norm_add_norms_kernel(const uint16_t *__restrict__ x, uint64_t ld_x, const uint4 *__restrict__ w_x,
+                           uint16_t *__restrict__ res, uint64_t ld_res, uint32_t width, float eps, chain_outs outs) {
+    __shared__ float warp_s[kNormThreads / 32];
+    __shared__ float s_out;
+    const uint64_t t = blockIdx.x;
+    const uint32_t chunks = width / 8;
+    const int nc = threadIdx.x < chunks ? (int)((chunks - threadIdx.x + kNormThreads - 1) / kNormThreads) : 0;
+    const uint4 *x4 = (const uint4 *)(x + t * ld_x);
+    uint4 *r4 = (uint4 *)(res + t * ld_res);
+    uint32_t u[kChainChunks][4], h[kChainChunks][4];
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+        const uint4 v = x4[threadIdx.x + c * kNormThreads];
+        u[c][0] = v.x; u[c][1] = v.y; u[c][2] = v.z; u[c][3] = v.w;
+    }
+    const float r0 = chain_rstd(chain_ss(u, nc), width, eps, warp_s, &s_out);
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        uint32_t d[4];
+        chain_norm(u[c], w_x[i], r0, d);
+        const uint4 v = r4[i];
+        h[c][0] = v.x; h[c][1] = v.y; h[c][2] = v.z; h[c][3] = v.w;
+        chain_add(h[c], d, nullptr);
+        r4[i] = make_uint4(h[c][0], h[c][1], h[c][2], h[c][3]);
+    }
+    const float r1 = chain_rstd(chain_ss(h, nc), width, eps, warp_s, &s_out);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        if (!outs.w[j]) continue;
+        uint4 *y4 = (uint4 *)(outs.y[j] + t * outs.ld[j]);
+#pragma unroll
+        for (int c = 0; c < kChainChunks; ++c) {
+            if (c >= nc) break;
+            const uint32_t i = threadIdx.x + c * kNormThreads;
+            uint32_t o[4];
+            chain_norm(h[c], outs.w[j][i], r1, o);
+            y4[i] = make_uint4(o[0], o[1], o[2], o[3]);
+        }
+    }
+}
+
+/** Two f32 branch outputs into the residual: e_a = bf16(a), e_b = bf16(b); s = bf16(bf16(rmsnorm(e_a) * w_a) +
+ *  bf16(rmsnorm(e_b) * w_b)); res = bf16(bf16(res + bf16(rmsnorm(s) * w_s)) * scale); y = bf16(rmsnorm(res) * w_n)
+ *  -- Gemma 4's FFN tail (the dense MLP and the experts, their post-norms, the sum's norm, the layer's scaled add and
+ *  the next reader's norm) in one pass.  Grid n_rows; block kNormThreads.
+ *  @param a      device f32 rows of branch a
+ *  @param ld_a   a pitch in elements
+ *  @param w_a    device bf16 [width] branch a's norm weight
+ *  @param b      device f32 rows of branch b
+ *  @param ld_b   b pitch
+ *  @param w_b    branch b's norm weight
+ *  @param w_s    the sum's norm weight
+ *  @param res    device bf16 residual rows, updated in place
+ *  @param ld_res res pitch
+ *  @param scale  device bf16 scalar the summed residual is multiplied by
+ *  @param w_n    the updated residual's norm weight
+ *  @param y      device bf16 rows of that norm
+ *  @param ld_y   y pitch
+ *  @param width  row width
+ *  @param eps    the norms' epsilon */
+__global__ void __launch_bounds__(kNormThreads)
+rows_sum2_norm_add_kernel(const float *__restrict__ a, uint64_t ld_a, const uint4 *__restrict__ w_a,
+                          const float *__restrict__ b, uint64_t ld_b, const uint4 *__restrict__ w_b,
+                          const uint4 *__restrict__ w_s, uint16_t *__restrict__ res, uint64_t ld_res,
+                          const uint16_t *__restrict__ scale, const uint4 *__restrict__ w_n, uint16_t *__restrict__ y,
+                          uint64_t ld_y, uint32_t width, float eps) {
+    __shared__ float warp_s[kNormThreads / 32];
+    __shared__ float s_out;
+    const uint64_t t = blockIdx.x;
+    const uint32_t chunks = width / 8;
+    const int nc = threadIdx.x < chunks ? (int)((chunks - threadIdx.x + kNormThreads - 1) / kNormThreads) : 0;
+    uint32_t ua[kChainChunks][4], ub[kChainChunks][4];
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        const float4 *pa = (const float4 *)(a + t * ld_a + (uint64_t)i * 8u);
+        const float4 *pb = (const float4 *)(b + t * ld_b + (uint64_t)i * 8u);
+        const float4 a0 = pa[0], a1 = pa[1], b0 = pb[0], b1 = pb[1];
+        ua[c][0] = f2bf(a0.x) | (f2bf(a0.y) << 16); ua[c][1] = f2bf(a0.z) | (f2bf(a0.w) << 16);
+        ua[c][2] = f2bf(a1.x) | (f2bf(a1.y) << 16); ua[c][3] = f2bf(a1.z) | (f2bf(a1.w) << 16);
+        ub[c][0] = f2bf(b0.x) | (f2bf(b0.y) << 16); ub[c][1] = f2bf(b0.z) | (f2bf(b0.w) << 16);
+        ub[c][2] = f2bf(b1.x) | (f2bf(b1.y) << 16); ub[c][3] = f2bf(b1.z) | (f2bf(b1.w) << 16);
+    }
+    const float ra = chain_rstd(chain_ss(ua, nc), width, eps, warp_s, &s_out);
+    const float rb = chain_rstd(chain_ss(ub, nc), width, eps, warp_s, &s_out);
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {   /* ua := the sum of the two post-norms */
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        uint32_t da[4], db[4];
+        chain_norm(ua[c], w_a[i], ra, da);
+        chain_norm(ub[c], w_b[i], rb, db);
+        chain_add(da, db, nullptr);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) ua[c][k] = da[k];
+    }
+    const float rs = chain_rstd(chain_ss(ua, nc), width, eps, warp_s, &s_out);
+    uint4 *r4 = (uint4 *)(res + t * ld_res);
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {   /* ub := the updated residual */
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        uint32_t d[4];
+        chain_norm(ua[c], w_s[i], rs, d);
+        const uint4 v = r4[i];
+        ub[c][0] = v.x; ub[c][1] = v.y; ub[c][2] = v.z; ub[c][3] = v.w;
+        chain_add(ub[c], d, scale);
+        r4[i] = make_uint4(ub[c][0], ub[c][1], ub[c][2], ub[c][3]);
+    }
+    const float rn = chain_rstd(chain_ss(ub, nc), width, eps, warp_s, &s_out);
+    uint4 *y4 = (uint4 *)(y + t * ld_y);
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        uint32_t o[4];
+        chain_norm(ub[c], w_n[i], rn, o);
+        y4[i] = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+}
+
+/// A fused chain's shape: rows, a width of whole chunks within kChainChunks a thread, 16-byte rows.
+/// @param who   the launch's name
+/// @param n_rows rows
+/// @param width the row width
+/// @param eps   the epsilon
+/// @return true when launchable (else said)
+bool chain_args_ok(const char *who, uint32_t n_rows, uint32_t width, float eps) {
+    const bool ok = n_rows > 0 && n_rows <= 0x7fffffffu && width > 0 && width % 8 == 0 &&
+                    width <= 8u * kNormThreads * kChainChunks && eps >= 0.0f;
+    if (!ok)
+        fprintf(stderr, "pulsar: rows %s: %u rows of width %u (a multiple of 8, at most %u), eps >= 0 -- refusing\n",
+                who, n_rows, width, 8u * kNormThreads * kChainChunks);
+    return ok;
+}
+
+/// A bf16 row operand: present, 16-byte aligned, a pitch of whole chunks >= the width.
+/// @param p the rows
+/// @param ld their pitch
+/// @param width the row width
+/// @return true when usable
+bool chain_rows_ok(const void *p, uint64_t ld, uint32_t width) { return p && aligned16(p) && ld >= width && ld % 8 == 0; }
+
 } // namespace
 
 extern "C" int pulsar_rows_rmsnorm_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t width,
@@ -442,4 +693,48 @@ extern "C" int pulsar_rows_layernorm32_launch(const void *x, bool x_f32, uint64_
                                                                      width, w, b, eps, y, ld_y,
                                                                      y_fmt == PULSAR_ROWS_OUT_F16, yf, ld_yf);
     return launched("layernorm32");
+}
+
+extern "C" int pulsar_rows_norm_add_norms_launch(const uint16_t *x, uint64_t ld_x, const uint16_t *w_x, uint16_t *res,
+                                                 uint64_t ld_res, uint32_t n_rows, uint32_t width,
+                                                 const uint16_t *const w[3], uint16_t *const y[3],
+                                                 const uint64_t ld_y[3], float eps, cudaStream_t stream) {
+    if (!chain_args_ok("norm-add-norms", n_rows, width, eps)) return -1;
+    bool ok = chain_rows_ok(x, ld_x, width) &&
+              w_x && aligned16(w_x) && chain_rows_ok(res, ld_res, width) && w && y && ld_y;
+    chain_outs o{};
+    for (int j = 0; ok && j < 3; ++j) {
+        if (!w[j]) continue;
+        ok = aligned16(w[j]) && chain_rows_ok(y[j], ld_y[j], width);
+        o.w[j] = (const uint4 *)w[j];
+        o.y[j] = y[j];
+        o.ld[j] = ld_y[j];
+    }
+    if (!ok) {
+        fprintf(stderr, "pulsar: rows norm-add-norms: a missing or misaligned operand -- refusing\n");
+        return -1;
+    }
+    rows_norm_add_norms_kernel<<<n_rows, kNormThreads, 0, stream>>>(x, ld_x, (const uint4 *)w_x, res, ld_res, width,
+                                                                    eps, o);
+    return launched("norm-add-norms");
+}
+
+extern "C" int pulsar_rows_sum2_norm_add_launch(const float *a, uint64_t ld_a, const uint16_t *w_a, const float *b,
+                                                uint64_t ld_b, const uint16_t *w_b, const uint16_t *w_s, uint16_t *res,
+                                                uint64_t ld_res, const uint16_t *scale, const uint16_t *w_n,
+                                                uint16_t *y, uint64_t ld_y, uint32_t n_rows, uint32_t width, float eps,
+                                                cudaStream_t stream) {
+    if (!chain_args_ok("sum2-norm-add", n_rows, width, eps)) return -1;
+    const bool ok = a && aligned16(a) && ld_a >= width &&
+                    ld_a % 8 == 0 && b && aligned16(b) && ld_b >= width && ld_b % 8 == 0 && w_a && aligned16(w_a) &&
+                    w_b && aligned16(w_b) && w_s && aligned16(w_s) && chain_rows_ok(res, ld_res, width) && scale &&
+                    w_n && aligned16(w_n) && chain_rows_ok(y, ld_y, width);
+    if (!ok) {
+        fprintf(stderr, "pulsar: rows sum2-norm-add: a missing or misaligned operand -- refusing\n");
+        return -1;
+    }
+    rows_sum2_norm_add_kernel<<<n_rows, kNormThreads, 0, stream>>>(a, ld_a, (const uint4 *)w_a, b, ld_b,
+                                                                   (const uint4 *)w_b, (const uint4 *)w_s, res, ld_res,
+                                                                   scale, (const uint4 *)w_n, y, ld_y, width, eps);
+    return launched("sum2-norm-add");
 }

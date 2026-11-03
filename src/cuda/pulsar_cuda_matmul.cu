@@ -1692,7 +1692,7 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
 static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const char *what) {
     if (*cap >= need) return 1;
     void *p = NULL;
-    if (*buf) { pulsar_gpu_seg_note_device_free();  ///< stale baked pointers
+    if (*buf) { pulsar_gpu_seg_note_device_free(what ? what : "an MXFP8 activation cache");  ///< stale baked pointers
                 (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
     if (cudaMalloc(&p, need) != cudaSuccess) {
         (void)cudaGetLastError();

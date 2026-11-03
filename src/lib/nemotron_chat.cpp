@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "chat_refuse.h"
+#include "chat_render_kit.h"
 #include "pulsar_utf8.h"
 
 /* ---- effort ---------------------------------------------------------------- */
@@ -63,189 +64,20 @@ const char kToolsTail[] =
     "do not tell the user about function calls\n"
     "</IMPORTANT>";
 
-/* A piece of text with the client-data ranges inside it (offsets into `s`): what the template's string operations
- * (concatenation, split, trim) act on, carrying the spans along. */
-/// Text plus the client-data spans inside it (see the comment above).
-struct piece {
-    /// The text.
-    std::string s;
-    /// Client-data ranges in `s`, ascending, disjoint.
-    std::vector<pulsar_text_span> spans;
+/* the shared kit's types under this file's names (chat_render_kit.h) */
+using piece = chat_piece;
+using writer = chat_writer;
 
-    /// Append template text.
-    /// @param t the literal
-    void lit(const std::string &t) { s += t; }
-    /// Append client data, recording its span.
-    /// @param t the client's text (nothing is recorded when empty)
-    void client(const std::string &t) {
-        if (t.empty()) return;
-        spans.push_back({(uint32_t)s.size(), (uint32_t)(s.size() + t.size())});
-        s += t;
-    }
-    /// Append another piece, its spans rebased.
-    /// @param p the piece
-    void add(const piece &p) {
-        const uint32_t base = (uint32_t)s.size();
-        for (const pulsar_text_span &sp : p.spans) spans.push_back({base + sp.lo, base + sp.hi});
-        s += p.s;
-    }
-    /* [lo, hi) of this piece, its spans clipped */
-    /// @param lo the first byte kept
-    /// @param hi one past the last byte kept
-    /// @return the sub-piece
-    piece sub(size_t lo, size_t hi) const {
-        piece out;
-        out.s = s.substr(lo, hi - lo);
-        for (const pulsar_text_span &sp : spans) {
-            const size_t a = sp.lo > lo ? sp.lo : lo, b = sp.hi < hi ? sp.hi : hi;
-            if (a < b) out.spans.push_back({(uint32_t)(a - lo), (uint32_t)(b - lo)});
-        }
-        return out;
-    }
-    /// @return the piece with Python str.strip() whitespace removed from both ends, spans clipped
-    piece trimmed() const {
-        size_t lo = 0, hi = 0;
-        py_strip_bounds(s.data(), s.size(), &lo, &hi);
-        return sub(lo, hi);
-    }
-    /// @param t a NUL-terminated substring
-    /// @return true when the text contains `t`
-    bool contains(const char *t) const { return s.find(t) != std::string::npos; }
-};
-
-/// Appends to a render's output, recording client-data spans as it goes.
-struct writer {
-    /// The output being written (not owned).
-    nemotron_render_out *out;
-    /// Append template text.
-    /// @param t the literal
-    void lit(const char *t) { out->text += t; }
-    /// Append template text.
-    /// @param t the literal
-    void lit(const std::string &t) { out->text += t; }
-    /// Append client data, recording its span.
-    /// @param t the client's text (nothing is recorded when empty)
-    void client(const std::string &t) {
-        if (t.empty()) return;
-        const uint32_t lo = (uint32_t)out->text.size();
-        out->text += t;
-        out->spans.push_back({lo, (uint32_t)out->text.size()});
-    }
-    /* a piece, its spans merged with an abutting previous one (the spans stay ascending and disjoint) */
-    /// @param p the piece
-    void add(const piece &p) {
-        const uint32_t base = (uint32_t)out->text.size();
-        for (const pulsar_text_span &sp : p.spans) {
-            const pulsar_text_span v = {base + sp.lo, base + sp.hi};
-            if (!out->spans.empty() && out->spans.back().hi == v.lo) out->spans.back().hi = v.hi;
-            else out->spans.push_back(v);
-        }
-        out->text += p.s;
-    }
-};
-
-/// Refuse a render too large for the 32-bit span map.
+/// Refuse a render too large for the 32-bit span map (chat_render_finish).
 /// @param out    the finished render
 /// @param err    the error buffer
 /// @param errlen its size
-/// @return true when the text fits (<= UINT32_MAX bytes)
-bool finish(const nemotron_render_out *out, char *err, size_t errlen) {
-    if (out->text.size() > UINT32_MAX)
-        return chat_refuse(err, errlen, "prompt_too_large", "%zu bytes do not fit the 32-bit span map", out->text.size());
-    return true;
-}
-
-/* ---- Python's str() / repr() of what json.loads produced: the template's `| string` ------------------------ */
-
-void py_repr(const pyjson_value &v, std::string *out);
-
-/// Python's repr() of a str: single quotes unless the text has a ' and no ", escapes as CPython writes them.
-/// @param s   the string (UTF-8; an invalid byte is copied as is)
-/// @param out receives the repr
-void py_repr_str(const std::string &s, std::string *out) {
-    const bool dq = s.find('\'') != std::string::npos && s.find('"') == std::string::npos;
-    const char q = dq ? '"' : '\'';
-    out->push_back(q);
-    const unsigned char *u = (const unsigned char *)s.data();
-    for (size_t i = 0; i < s.size();) {
-        const int k = utf8_seq_ok(u + i, s.size() - i);
-        const uint32_t cp = k ? utf8_cp_at(u + i, k) : u[i];
-        char esc[16] = "";
-        if (cp == '\\') snprintf(esc, sizeof esc, "\\\\");
-        else if (cp == (uint32_t)q) snprintf(esc, sizeof esc, "\\%c", q);
-        else if (cp == '\n') snprintf(esc, sizeof esc, "\\n");
-        else if (cp == '\r') snprintf(esc, sizeof esc, "\\r");
-        else if (cp == '\t') snprintf(esc, sizeof esc, "\\t");
-        else if (cp < 0x20 || cp == 0x7f || (cp >= 0x80 && cp < 0xa0)) snprintf(esc, sizeof esc, "\\x%02x", cp);
-        if (esc[0]) out->append(esc);
-        else out->append(s, i, k ? (size_t)k : 1);
-        i += k ? (size_t)k : 1;
-    }
-    out->push_back(q);
-}
-
-/// Python's repr() of a float.
-/// @param f   the value
-/// @param out receives the repr ("inf" / "-inf", else the shortest round-trip digits)
-void py_float(double f, std::string *out) {
-    if (isinf(f)) {
-        out->append(f > 0 ? "inf" : "-inf");
-        return;
-    }
-    pyjson_value v;
-    v.kind = pyjson_value::FLOAT;
-    v.f = f;
-    pyjson_dump(v, out);   /* repr(): the shortest round-trip digits, Python's notation */
-}
-
-/// Python's repr() of a json.loads value: None, True/False, numbers, quoted strings, [..], {..}.
-/// @param v   the value
-/// @param out receives the repr
-void py_repr(const pyjson_value &v, std::string *out) {
-    switch (v.kind) {
-    case pyjson_value::NUL: out->append("None"); return;
-    case pyjson_value::BOOL: out->append(v.b ? "True" : "False"); return;
-    case pyjson_value::INT: out->append(v.num); return;
-    case pyjson_value::FLOAT: py_float(v.f, out); return;
-    case pyjson_value::STR: py_repr_str(v.s, out); return;
-    case pyjson_value::ARR:
-        out->push_back('[');
-        for (size_t i = 0; i < v.a.size(); i++) {
-            if (i) out->append(", ");
-            py_repr(v.a[i], out);
-        }
-        out->push_back(']');
-        return;
-    case pyjson_value::OBJ:
-        out->push_back('{');
-        for (size_t i = 0; i < v.o.size(); i++) {
-            if (i) out->append(", ");
-            py_repr_str(v.o[i].first, out);
-            out->append(": ");
-            py_repr(v.o[i].second, out);
-        }
-        out->push_back('}');
-        return;
-    }
-}
-
-/* `x | string`: a string as itself, anything else its repr (str() of a number, bool, None, list, dict). */
-/// @param v the value
-/// @return Python's str(v)
-std::string py_str(const pyjson_value &v) {
-    if (v.kind == pyjson_value::STR) return v.s;
-    std::string out;
-    py_repr(v, &out);
-    return out;
-}
+/// @return true when the text fits
+bool finish(const nemotron_render_out *out, char *err, size_t errlen) { return chat_render_finish(out, err, errlen); }
 
 /// @param v the value
-/// @return the template's `| tojson`: pyjson_dump of `v`
-std::string tojson(const pyjson_value &v) {
-    std::string out;
-    pyjson_dump(v, &out);
-    return out;
-}
+/// @return the template's `| tojson` (py_tojson)
+std::string tojson(const pyjson_value &v) { return py_tojson(v); }
 
 /* the template's render_extra_keys: every key of a mapping not in `handled`, as \n<key>value</key> -- a mapping or
  * a list as tojson, anything else as `| string`.  Keys and values are the client's. */

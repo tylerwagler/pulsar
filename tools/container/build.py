@@ -6,6 +6,8 @@
     plan    --hf DIR [--exl3 DIR] [--exl3-experts DIR] [--tessera DIR] [--recipe JSON] [--dump FILE]
             [--drafter KIND DIR] a block drafter written into the container (drafters.py): Nemotron-H lilicorr
             (NVIDIA's LiLiCorr), qwen4_exp dflash2 (z-lab's DFlash2, L299)
+            [--adapter KIND DIR] a LoRA adapter + decision head written into the container for runtime application
+            (adapters.py): gemma4 jev (autotrust's JEV System 1 judge, L338)
     emit    ... --out DIR (--shard S | --all) [--mxfp8-scale rederive|verbatim]
             DeepSeek: [--layers L,L,...] a layer-subset test fixture (names.py drop rule 4);
                       [--engram-layout JSON] V4.1's Engram hash layout (tools/engram/engram_layout.py)
@@ -44,6 +46,7 @@ import inkling as I        # noqa: E402
 import nemotron_h as N     # noqa: E402
 import nemotron_enc as NE  # noqa: E402
 import nemotron_parse as NP  # noqa: E402
+import gemma4 as G         # noqa: E402
 import entries as EN       # noqa: E402
 
 ALIGN = 32
@@ -104,9 +107,11 @@ def dense_entry(hf, fam, m, name, fmt, ctx):
     entry = {'name': m.container_name, 'layout': layout, 'gguf_name': m.gguf_name}
     if layout in exl3_rates.K2:
         exl3_rates.admit(m.role, layout, name)
-        if hf.dtype(name) != 'BF16' or len(hshape) != 2 or not name.endswith('.weight'):
+        if hf.dtype(name) != 'BF16' or len(hshape) != 2 or len(dshape) != 2 or not name.endswith('.weight'):
             raise SystemExit(f'{name}: EXL3 dense Linear from a BF16 [out, in] .weight, got {hf.dtype(name)} {hshape}')
-        out, inp = hshape
+        # the DECLARED [out, in]: the source's, except where a family declares the pack's stored width (gemma4's
+        # dense MLP, padded to 128 by exllamav3 on both sides with exact zeros -- gemma4.py docstring)
+        out, inp = dshape
         ranges, nbytes = EN.exl3_ranges(ctx.sources[src], name[:-len('.weight')], layout, inp, out)
         entry.update(dtype='U8', shape=[nbytes], nbytes=nbytes, src=('ranges', ranges))
     elif layout == 'tessera':
@@ -331,9 +336,10 @@ def write_index(out_dir):
 # (InklingForConditionalGeneration, model_type inkling_mm_model); nemotron_h.py: Nemotron-H (the Omni checkpoint,
 # NemotronH_Omni_Reasoning_V3, model_type nemotron_h_omni); nemotron_enc.py: the Nemotron-3.5 retrieval encoders
 # (Mistral3Model / Mistral3ForSequenceClassification, model_type mistral3; L321); nemotron_parse.py: Nemotron-3.5
-# Parse (RadioMBartPrefixForCausalLM, model_type nemotron_parse; L321).
+# Parse (RadioMBartPrefixForCausalLM, model_type nemotron_parse; L321); gemma4.py: Gemma 4 26B-A4B
+# (Gemma4ForConditionalGeneration, model_type gemma4; L338).
 FAMILIES = {'deepseek_v4': D, 'deepseek_v41': D, 'qwen4_exp': Q, I.MODEL_TYPE: I, N.MODEL_TYPE: N, NE.MODEL_TYPE: NE,
-            NP.MODEL_TYPE: NP}
+            NP.MODEL_TYPE: NP, G.MODEL_TYPE: G}
 
 
 def family_of(hf):
@@ -542,7 +548,7 @@ _HF = {}
 def hf_of(args):
     """The HF source as its family reads it (fam.source: the checkpoint itself, or a view that names the tensors a
     fused HF tensor holds -- inkling.Source)."""
-    key = (args.hf, tuple(args.drafter or ()))
+    key = (args.hf, tuple(args.drafter or ()), tuple(getattr(args, 'adapter', None) or ()))
     if key not in _HF:
         hf = HFCheckpoint(args.hf)
         fam = family_of(hf)
@@ -551,6 +557,10 @@ def hf_of(args):
             if not hasattr(fam, 'with_drafter'):
                 raise SystemExit(f'--drafter: the {fam.__name__} family reads no drafter input (nemotron_h, qwen do)')
             src = fam.with_drafter(src, *args.drafter)
+        if getattr(args, 'adapter', None):
+            if not hasattr(fam, 'with_adapter'):
+                raise SystemExit(f'--adapter: the {fam.__name__} family reads no adapter input (gemma4 does)')
+            src = fam.with_adapter(src, *args.adapter)
         _HF[key] = src
     return _HF[key]
 
@@ -628,6 +638,10 @@ def main():
                            help='a separate block-drafter checkpoint written into the container, shard `drafter` '
                            '(drafters.py): KIND lilicorr on Nemotron-H (NVIDIA\'s LiLiCorr), dflash2 on qwen4_exp '
                            '(z-lab\'s DFlash2, its head the target lm_head\'s draft-vocabulary rows)')
+            p.add_argument('--adapter', nargs=2, metavar=('KIND', 'DIR'),
+                           help='a LoRA adapter (and its decision head) written into the container beside the base, '
+                           'shard `adapter`, for the engine to apply at runtime (adapters.py): KIND jev on gemma4 '
+                           '(autotrust\'s JEV System 1 judge)')
             p.add_argument('--recipe', metavar='JSON', help='a pulsar.recipe.v1 (recipe.py; format-maps/*.json).  '
                            'DeepSeek default: generated from policy.py + the EXL3 source (`recipe` prints it)')
             p.add_argument('--mxfp8-scale', choices=('rederive', 'verbatim'), default='rederive',

@@ -287,6 +287,32 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
     return PULSAR_SERVER_USABLE_BYTES - reserved;
 }
 
+/* L338: a DISCRETE card's sessions live in its own memory, which server_kv_budget_bytes' constants (GB10's unified
+ * 121 GiB and its process reserve) do not describe -- on a 24 GB RTX 6000 they budgeted 84.6 GiB, auto-sized 16
+ * banks, and the create died out of device memory at bank 11.  There the budget is what the device has free once the
+ * weights are staged, less server_discrete_margin_bytes (the working set that materializes after startup); the
+ * post-warmup re-derivation still min()s it. */
+/// @param free_bytes  the device's free memory, the weights staged
+/// @param total_bytes the device's memory
+/// @return the session budget in bytes (0 when the margin exceeds what is free)
+static uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t total_bytes) {
+    const uint64_t margin = server_discrete_margin_bytes(total_bytes);
+    return free_bytes > margin ? free_bytes - margin : 0;
+}
+
+/* The budget for the device this process runs on: the discrete formula when the device says its memory is its own,
+ * else (GB10, or a device that did not answer) the unified one. */
+/// @param weights_resident_bytes the resident weights, bytes (the unified formula's)
+/// @return the session budget in bytes
+static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
+    if (pulsar_gpu_integrated() == 0) {
+        uint64_t free_b = 0, total_b = 0;
+        pulsar_gpu_mem_info(&free_b, &total_b);
+        return server_kv_budget_discrete_bytes(free_b, total_b);
+    }
+    return server_kv_budget_bytes(weights_resident_bytes);
+}
+
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
  * every lazy slot provisioning in the scheduler (server_sched.cpp); an over-budget
@@ -383,11 +409,11 @@ uint64_t server_persist_host_bytes(int tokens) {
 /// @param kv_budget_bytes the ledger's budget
 /// @param eager_bytes the eager floor already resident
 /// @param touched_bytes the KV resident now
-/// @param avail_bytes MemAvailable now (0 = unreadable)
-/// @return the resident-KV budget in bytes; 0 when MemAvailable is at or under the floor
+/// @param avail_bytes the headroom reading now, MemAvailable or the device's free memory (0 = unreadable)
+/// @param floor the floor that reading keeps free (server_guard_floor)
+/// @return the resident-KV budget in bytes; 0 when the reading is at or under the floor
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes) {
-    const KvBytes floor = server_mem_floor();
+                                    KvBytes avail_bytes, KvBytes floor) {
     if (avail_bytes <= floor) return KvBytes{};
     const KvBytes ledger = kv_budget_bytes > eager_bytes ? kv_budget_bytes - eager_bytes : KvBytes{};
     const KvBytes headroom = avail_bytes - floor;
@@ -397,8 +423,20 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
 
 
 
+uint64_t server_guard_avail_bytes(bool discrete) {
+    if (!discrete) return server_mem_available_bytes();
+    uint64_t free_b = 0, total_b = 0;
+    pulsar_gpu_mem_info(&free_b, &total_b);
+    return free_b;
+}
+
+KvBytes server_guard_floor(bool discrete) {
+    return discrete ? KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES} : server_mem_floor();
+}
+
 void server::close_resources() {
     auto *s = this;
+    server_judge_close(s);   /* L338 P2.4 */
     for (int i = 0; i < s->tp_rank_json_n; i++) free(s->tp_rank_json[i]);
     free(s->tp_rank_json);
     free(s->tp_rank_ids);
@@ -621,6 +659,8 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 1048576,
         .default_tokens = 393216,
     };
+    c.judge_banks = -1;   /* L338 P2.4: one reserved bank when the container carries an adapter */
+    c.reasoning_default = -1;   /* L338 P4: the family's default unless --reasoning */
     c.kv_cache = kv_cache_default_options();
 
     bool directional_steering_scale_set = false;
@@ -649,6 +689,21 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark_disable = true;
         } else if (!strcmp(arg, "--drafter")) {
             c.engine.drafter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reasoning")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "on")) c.reasoning_default = 1;
+            else if (!strcmp(v, "off")) c.reasoning_default = 0;
+            else {
+                fprintf(stderr, "pulsar-server: --reasoning takes on or off\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--judge-banks")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (strcmp(v, "0") && strcmp(v, "1")) {
+                fprintf(stderr, "pulsar-server: --judge-banks takes 0 or 1\n");
+                exit(2);
+            }
+            c.judge_banks = v[0] - '0';
         } else if (!strcmp(arg, "--rope-yarn")) {
             c.engine.rope_yarn_factor = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 1.0f, 64.0f);
         } else if (!strcmp(arg, "--spec-depth")) {
@@ -868,7 +923,7 @@ int main(int argc, char **argv) {
      * then gate the slot's graph allocation on it. The scheduler runs the same
      * predicate for every lazily provisioned slot. */
     const uint64_t weights_resident = pulsar_engine_weights_resident_bytes(engine);
-    const uint64_t kv_budget = server_kv_budget_bytes(weights_resident);
+    const uint64_t kv_budget = server_kv_budget_for_device(weights_resident);
 
     /* Tier-2 pool auto-sizing (batching ON by default, auto-fit). Batching is
      * the default: the bank count is DERIVED from --ctx so a moderate ctx yields
@@ -985,14 +1040,26 @@ int main(int argc, char **argv) {
         overcommit_admission_est = oc_shared + (uint64_t)finalN * oc_eager_pb;
     }
     const uint64_t session_est = overcommit ? overcommit_admission_est : full_banked_est;
-    server_log(PULSAR_LOG_DEFAULT,
-               "pulsar-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
-               "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
-               (double)PULSAR_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
-               (double)PULSAR_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
-               (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    if (pulsar_gpu_integrated() == 0) {   /* L338: the discrete card's own memory (server_kv_budget_for_device) */
+        uint64_t free_b = 0, total_b = 0;
+        pulsar_gpu_mem_info(&free_b, &total_b);
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: session admission: discrete GPU -- device %.1f GiB, free after the weights %.1f GiB "
+                   "(weights_resident=%.1f GiB), margin %.1f GiB, budget=%.1f GiB",
+                   (double)total_b / (1024.0 * 1024.0 * 1024.0), (double)free_b / (1024.0 * 1024.0 * 1024.0),
+                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
+                   (double)server_discrete_margin_bytes(total_b) / (1024.0 * 1024.0 * 1024.0),
+                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: session admission: usable=%.1f GiB, weights_resident=%.1f GiB, "
+                   "overhead=%.1f GiB, floor=%.1f GiB, budget=%.1f GiB",
+                   (double)PULSAR_SERVER_USABLE_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)weights_resident / (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_PROCESS_OVERHEAD_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)PULSAR_SERVER_MEM_FLOOR_BYTES / (1024.0 * 1024.0 * 1024.0),
+                   (double)kv_budget / (1024.0 * 1024.0 * 1024.0));
+    }
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: session admission: per-session true cost est=%.2f GiB (ctx=%d)",
                (double)session_est / (1024.0 * 1024.0 * 1024.0),
@@ -1067,6 +1134,7 @@ int main(int argc, char **argv) {
     }
     uint64_t kv_budget_final = kv_budget;
     uint64_t warm_avail = 0;   /* L319: the touched-KV ceiling's measurement (below) */
+    uint64_t warm_dev_free = 0;   /* L338: its discrete-card reading, the device's free memory at the same point */
     KvBytes warm_touched{};
     {
         /* What of slot 0 is RESIDENT now, and so already out of MemAvailable:
@@ -1088,6 +1156,7 @@ int main(int argc, char **argv) {
         const uint64_t avail_now = server_mem_available_bytes();
         warm_avail = avail_now;
         warm_touched = touched_now;
+        if (pulsar_gpu_integrated() == 0) warm_dev_free = server_guard_avail_bytes(true);   /* the same reading */
         if (avail_now > 0) {
             const uint64_t floor = server_mem_floor().raw();
             const uint64_t headroom = avail_now > floor ? avail_now - floor : 0;
@@ -1155,6 +1224,29 @@ int main(int argc, char **argv) {
         pool_banks_clamped = PULSAR_SESSION_POOL_CAP;
     }
     s.pool_banks = pool_banks_clamped > 1 ? pool_banks_clamped : 0;
+    s.reasoning_default = cfg.reasoning_default < 0 ? 0 : cfg.reasoning_default + 1;   /* L338 P4: --reasoning */
+    if (s.reasoning_default)
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: --reasoning %s: a request that sends no thinking control %s",
+                   cfg.reasoning_default ? "on" : "off", cfg.reasoning_default ? "thinks" : "does not think");
+    /* L338 P2.4: the judge's reserved bank -- the pool's last, past the chat pool (no chat slot is it).  The chat
+     * pool keeps at least two banks (a pool); a smaller one serves no judge. */
+    int judge_bank = -1;
+    {
+        const bool has = pulsar_engine_has_adapter(engine);
+        const int want = cfg.judge_banks < 0 ? (has ? 1 : 0) : cfg.judge_banks;
+        if (want > 0 && !has) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: --judge-banks %d: the container carries no adapter -- "
+                       "refusing to start", want);
+            return 1;
+        }
+        if (want > 0 && s.pool_banks - 1 >= 2) {
+            s.pool_banks -= 1;
+            judge_bank = s.pool_banks;
+        } else if (want > 0) {
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: no /v1/systemone: the bank pool (%d) leaves no chat pool of "
+                       "two beside a judge bank (set PULSAR_MSEQ_BANKS >= 3 or a smaller --ctx)", pool_banks_clamped);
+        }
+    }
     /* The mixed lane fits a prefill run of kstep = prefill_chunk - POOL_CAP rows
      * beside up to POOL_CAP decode rows; a pinned chunk below POOL_CAP + 1
      * clamps kstep to 1 and the step exceeds the chunk cap on every quantum
@@ -1258,7 +1350,11 @@ int main(int argc, char **argv) {
      * lowers the budget for the memory-safety smoke so the guard fires at modest
      * fills while the box stays far from real OOM. */
     if (overcommit && s.pool_banks > 0) {
-        uint64_t budget = kv_budget_final;
+        /* L338: a discrete card's guard reads the device (server_guard_avail_bytes), and the ledger's share does not
+         * cap it unless the test hook below sets a budget. */
+        s.guard_discrete = (pulsar_gpu_integrated() == 0);
+        s.guard_floor = server_guard_floor(s.guard_discrete);
+        uint64_t budget = s.guard_discrete ? UINT64_MAX : kv_budget_final;
         /* Test hook (restored L264, 2026-10-04: its callers are the guard legs of
          * tools/tp2-l264 -- the spill/restore through the segment chain has no
          * other way to fire at a test's fills). */
@@ -1277,28 +1373,39 @@ int main(int argc, char **argv) {
          * would grow until the box runs dry.  2026-10-29: every guard decision reads the LIVE budget under this
          * ceiling (server::guard_budget). */
         s.guard_kv_budget = KvBytes{budget};
-        s.guard_touched_ceiling =
-            server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched, KvBytes{warm_avail});
+        const uint64_t guard_warm_avail = s.guard_discrete ? warm_dev_free : warm_avail;
+        s.guard_touched_ceiling = server_guard_touched_budget(s.guard_kv_budget, s.guard_eager_bytes, warm_touched,
+                                                              KvBytes{guard_warm_avail}, s.guard_floor);
         s.guard_enabled = (s.guard_touched_ceiling > KvBytes{});
         const double gib = 1024.0 * 1024.0 * 1024.0;
         if (!s.guard_enabled) {
             server_log(PULSAR_LOG_ERROR,
-                       "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (MemAvailable "
-                       "%.2f GiB post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
+                       "pulsar-server: refusing to start: a %d-bank pool has no touched-KV headroom (%s %.2f GiB "
+                       "post-warmup, floor %.2f GiB; kv budget %.2f − eager %.2f GiB) -- lower --ctx or "
                        "PULSAR_MSEQ_BANKS (L319)",
-                       s.pool_banks, (double)warm_avail / gib, (double)server_mem_floor().raw() / gib,
+                       s.pool_banks, s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       (double)s.guard_floor.raw() / gib,
                        (double)budget / gib, (double)s.guard_eager_bytes.raw() / gib);
             pulsar_session_free(session);
             pulsar_engine_close(engine);
             return 1;
         }
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
-                   "%.2f, touched %.2f + MemAvailable %.2f − floor %.2f post-warmup); every decision reads the live "
-                   "budget under it (touched + MemAvailable − floor now); spills persist to the disk KV cache",
-                   (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
-                   (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib, (double)warm_avail / gib,
-                   (double)server_mem_floor().raw() / gib);
+        if (s.guard_discrete && budget == UINT64_MAX)
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: Tier-2 2b guard ENABLED (discrete GPU): touched ceiling %.2f GiB = touched %.2f "
+                       "+ device free %.2f − floor %.2f post-warmup; every decision reads the live budget under it "
+                       "(touched + device free − floor now); spills persist to the disk KV cache",
+                       (double)s.guard_touched_ceiling.raw() / gib, (double)warm_touched.raw() / gib,
+                       (double)guard_warm_avail / gib, (double)s.guard_floor.raw() / gib);
+        else
+            server_log(PULSAR_LOG_DEFAULT,
+                       "pulsar-server: Tier-2 2b guard ENABLED: touched ceiling %.2f GiB = min(kv budget %.2f − eager "
+                       "%.2f, touched %.2f + %s %.2f − floor %.2f post-warmup); every decision reads the live "
+                       "budget under it (touched + %s − floor now); spills persist to the disk KV cache",
+                       (double)s.guard_touched_ceiling.raw() / gib, (double)budget / gib,
+                       (double)s.guard_eager_bytes.raw() / gib, (double)warm_touched.raw() / gib,
+                       s.guard_discrete ? "device free" : "MemAvailable", (double)guard_warm_avail / gib,
+                       (double)s.guard_floor.raw() / gib, s.guard_discrete ? "device free" : "MemAvailable");
     }
     s.sess = session;                /* the one session; slot 0 describes it */
     /* ctx_size on slot 0 is the pool's shared per-bank ctx reference and is
@@ -1458,6 +1565,15 @@ int main(int argc, char **argv) {
      * calls into the engine (CUDA-state audit, pulsar_server_internal.h). This
      * runs before the worker thread starts, so it is still single-threaded
      * engine access. */
+    /* L338 P2.4: the judge on its reserved bank (single-threaded: before the worker starts) */
+    if (judge_bank >= 0) {
+        char jerr[320];
+        if (!server_judge_open(&s, cfg.engine.model_path, judge_bank, jerr, sizeof jerr)) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: /v1/systemone: %s -- refusing to start", jerr);
+            s.close_resources();
+            return 1;
+        }
+    }
     s.publish_metrics_snapshot();
     /* Same window: still single-threaded, and the TP records are final. */
     s.build_tp_health();

@@ -97,6 +97,9 @@ struct pulsar_driver_state {
     uint64_t tp_vocab_seq;
     /** L296 N9: the chained-MTP drafter's lane (spec_mtp.h) when the family's ops declare modules, else NULL */
     struct pulsar_mtp_lane *mtp;
+    /** L338 P2: [n_banks] 1 = the bank runs the engine's runtime adapter (pulsar_session_set_bank_adapter), 0 = plain;
+     *  every bank plain at create.  Allocated with the driver's buffers when the ops declare an adapter, else NULL. */
+    uint8_t *bank_adapter;
     /** L298: the block drafter's lane (spec_block.h) when the engine loaded one, else NULL */
     struct pulsar_block_lane *block;
 };
@@ -226,6 +229,18 @@ typedef struct pulsar_driver_ops {
     uint32_t (*read_ahead)(const pulsar_engine *e, uint64_t tag, const int32_t *prompt, uint32_t from, uint32_t to);
     /** Present with read_ahead: the pool its rows go through (the core cancels a tag's rows and reads the counters). */
     struct pulsar_engram_io *(*read_ahead_pool)(const pulsar_engine *e);
+    /** Optional (L338 P2): the engine carries a runtime adapter (a LoRA the family applies on the rows of the banks
+     *  pulsar_session_set_bank_adapter marks, reading pulsar_driver_state::bank_adapter).  NULL = none: every bank
+     *  is plain and the setter refuses. */
+    bool (*adapter)(const pulsar_engine *e);
+    /** Optional (L338 P2): the final-norm hidden state of the LAST row the head produced logits for (what a decision
+     *  head reads: Gemma 4's JEV), widened to f32 into out[0, cap).  Returns the floats written (the model's hidden
+     *  width); 0 = nothing headed yet / cap short / refused.  NULL = not offered (pulsar_session_copy_hidden refuses). */
+    uint32_t (*hidden)(pulsar_session *s, float *out, uint32_t cap);
+    /** Optional (L338 P2.4): the adapter's decision head -- its weight (f32 [slots][hidden], row s the slot's) and
+     *  bias (f32 [slots]) as the container's tensors, read on the host from the mapping.  Returns the slots; 0 = none
+     *  (*w / *b untouched).  NULL = not offered. */
+    uint32_t (*decision_head)(const pulsar_engine *e, const pulsar_tensor **w, const pulsar_tensor **b);
 } pulsar_driver_ops;
 
 /** The first thing a forward over `plan` would need that `ops` lacks -- "embed", the block of a layer kind (its

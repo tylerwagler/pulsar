@@ -1,0 +1,16 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "gemma4-exl3-k4",
+ "model_type": "gemma4",
+ "about": "Gemma 4 26B-A4B on the uniform K4 EXL3 pack (exllamav3 1.6.5, mul1 codebook, L338): every Linear -- attention q / k / v / o, the dense GeGLU MLP and the routed experts (split gate / up per expert) -- exl3m_k4, and the head exllamav3 quantized from the tied embedding exl3m_k6 (the Turing build runs it: the BF16 head GEMM needs sm_80+), byte copies of the pack (--exl3), the MLP and experts at the pack's stored widths (2176, 768); norms, the router and its scales, the per-layer scalar and the embedding (lookups) from the BF16 checkpoint (--hf) as stored. The vision tower is consumed by name (v1: text only).",
+ "rows": [
+  {"role": "dense", "format": "exl3m_k4"},
+  {"role": "expert_gate_up", "format": "exl3m_k4"},
+  {"role": "expert_down", "format": "exl3m_k4"},
+  {"role": "router", "format": "native"},
+  {"role": "norm", "format": "native"},
+  {"role": "embed", "format": "native"},
+  {"role": "head", "format": "exl3m_k6"},
+  {"role": "other", "format": "native"}
+ ]
+}

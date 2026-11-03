@@ -120,6 +120,10 @@ struct out_grammar {
     /** Markers removed wherever they appear (the tokenizer's other special tokens: vLLM drops a special
      *  token that is not one of the grammar's terminals). */
     std::vector<std::string> dropped;
+    /** L338: a label the turn's reasoning opens with, not part of it (Gemma 4's "thought\n" after <|channel>):
+     *  dropped from the start of the turn's reasoning as reported (after its section policy), and reasoning that
+     *  is nothing but a proper prefix of it reports nothing (vLLM's Gemma4Parser).  NULL = none. */
+    const char *reasoning_prefix = nullptr;
 };
 
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
@@ -317,6 +321,8 @@ private:
     int errors_ = 0;
     /// The reasoning and content text reported so far.
     std::string reasoning_, content_;
+    std::string prefix_held_;  ///< reasoning held while it may still be the grammar's reasoning_prefix
+    bool prefix_done_ = false; ///< the reasoning_prefix was settled (dropped, or proved absent)
     /** @var out_parser::content_
     *  The content text reported so far. */
     /// The well-formed calls read so far.

@@ -10,7 +10,8 @@ are pure bytes-in / bytes-out codecs.  The driver is `build.py`; how to run it a
 
 Families (build.py `FAMILIES`, keyed by `config.json` `model_type`): `deepseek_v4` / `deepseek_v41`
 (`deepseek.py`), `qwen4_exp` (`qwen.py`), Inkling (`inkling.py`), Nemotron-H (`nemotron_h.py`), the Nemotron-3.5
-retrieval encoders (`nemotron_enc.py`, L321) and Nemotron-3.5 Parse (`nemotron_parse.py`, L321).  Recipes live in
+retrieval encoders (`nemotron_enc.py`, L321), Nemotron-3.5 Parse (`nemotron_parse.py`, L321) and Gemma 4
+(`gemma4.py`, L338: every Linear from the exllamav3 pack at its stored, 128-padded width).  Recipes live in
 [format-maps/](format-maps/README.md).  The Python unit tests are `test_*.py` beside the modules
 (`make container-tests`).
 
@@ -59,6 +60,9 @@ deepseek.py / qwen.py / inkling.py      # the family modules (build.FAMILIES, by
                                         #  (the EXL3 pack's names) and checks names, dtypes, shapes against the declared
                                         #  Shape both ways; Mapped.bind carries the role table into pulsar.tensors
 nemotron_enc.py / nemotron_parse.py      # the Nemotron-3.5 Embed / Rerank encoders and the Parse model (L321)
+gemma4.py                               # Gemma 4 26B-A4B (L338): sliding + global (K = V) attention, dense GeGLU MLP
+                                        #  beside the routed experts; the MLP / expert widths declared as the pack stores them
+                                        #  (exllamav3 pads to 128; the gate / up svh pad is checked zero)
 nemotron_h.py                           # Nemotron-H (the Omni checkpoint); with_drafter(hf, kind, dir) is build.py's
                                         #  --drafter lilicorr DIR (L298), through drafters.py; the recipe omits the MTP
 drafters.py                             # the block-drafter input, every family's (L298 / L299): with_drafter(hf, kind,

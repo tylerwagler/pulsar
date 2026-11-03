@@ -7,7 +7,9 @@
  *
  * What a family declares (pulsar_gqa_layer), all at RUNTIME:
  *   geometry      n_q query heads, n_kv KV heads (n_q % n_kv == 0, the group
- *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64 or 128)
+ *                 G = n_q / n_kv <= 64), head_dim (a built tile: 64 or 128, or
+ *                 L338's wide heads 256 / 512 -- S in 128-dim passes, O in
+ *                 128-dim slices, one CTA a slice; no bias, gate or block)
  *   KV rows       the row format (pulsar_gqa_kv_fmt; BF16 today)
  *   span          FULL (every earlier key) or WINDOW (the last `window` keys,
  *                 self included, held in a ring of `cap` >= window slots)
@@ -104,7 +106,7 @@ typedef enum {
 typedef struct {
     uint32_t          n_q;          /**< query heads */
     uint32_t          n_kv;         /**< KV heads; n_q % n_kv == 0, n_q / n_kv <= 64 */
-    uint32_t          head_dim;     /**< 64 or 128 */
+    uint32_t          head_dim;     /**< 64 or 128; 256 or 512 (L338: no rel bias, out_gate or block) */
     /** The KV row format of this layer's pools (and of the call's own fresh rows). */
     pulsar_gqa_kv_fmt kv_fmt;
     /** Which keys a row attends: FULL or WINDOW (with `window`). */
@@ -163,7 +165,34 @@ typedef struct {
     void         *workspace;  /**< device, >= pulsar_gqa_workspace_bytes */
     /** Size of `workspace`, bytes. */
     uint64_t      workspace_bytes;
+    /** L338: 1 = every row is a DECODE row (the caller's row kind: a decode step's or a verify's, never a prompt
+     *  chunk's) -- a wide-head (256, 512) call under the folded width then takes the flash-decoding arm (f32 on the
+     *  CUDA cores: not the MMA tile's bytes; a row's bytes the same whatever rides with it, so a verified row is the
+     *  plain decode's); 0 = the MMA tile, whose bytes a prompt cut anywhere keeps. */
+    int           decode_rows;
+    /** L338: the most rows a flash-decoding CTA may attend together (0 or 1 = one a CTA; 2; 4) -- the caller's: 4 when
+     *  consecutive rows are one sequence's (a verify's), whose keys a group then loads once for all of them.  The call
+     *  runs at the CTA shape (rows x a KV head's query heads) its layer, chunks and row count measure best, at most
+     *  this many rows.  A row's bytes are the same at
+     *  any group (each row's arithmetic is the one-row CTA's); rows of different sequences in a group each load their
+     *  own keys. */
+    int           decode_group;
 } pulsar_gqa_io;
+
+/** L338: an instrument's forced flash-decoding CTA shape -- `rows` rows x `heads` query heads of one KV head (1 x 1,
+ *  1 x 2, 1 x 4, 2 x 2: the pick's shapes; a call whose layer's G the heads do not divide refuses); 0, 0 = the
+ *  launch's own pick.  The bytes are the same at every shape (gqa_attn_gate); the engine never calls it.
+ *  @param rows  rows a CTA
+ *  @param heads query heads a CTA
+ *  @return 0, -1 not an instantiated shape */
+int pulsar_gqa_decode_force(int rows, int heads);
+
+/** L338: an instrument's forced decode arm for the wide heads' decode rows -- 0 the launch's pick, 1 flash-decoding
+ *  (its shape: pulsar_gqa_decode_force), 2 the tensor-core arm (a layer it cannot run refuses).  The engine never
+ *  calls it.
+ *  @param arm 0, 1 or 2
+ *  @return 0, -1 out of range */
+int pulsar_gqa_decode_arm_force(int arm);
 
 /** Bytes of one token's KV row for this layer (every KV head, K and V). */
 /// @param layer the layer's declaration.

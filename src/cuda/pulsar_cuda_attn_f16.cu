@@ -1448,7 +1448,7 @@ static float *af16_partials(uint32_t n_dec, uint32_t n_head, uint32_t n_split) {
     if (need > cap) {
         /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffer */
         if (cuda_grow_refused_under_capture("attn f16 split-K partials")) return NULL;
-        if (buf) { pulsar_gpu_seg_note_device_free(); (void)cudaFree(buf); buf = NULL; cap = 0; }
+        if (buf) { pulsar_gpu_seg_note_device_free("attn f16 split-K partials"); (void)cudaFree(buf); buf = NULL; cap = 0; }
         void *p = NULL;
         const cudaError_t e = cudaMalloc(&p, (size_t)need);
         if (e != cudaSuccess) {

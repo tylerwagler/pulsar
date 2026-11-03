@@ -80,6 +80,9 @@ typedef enum : uint8_t {
     PULSAR_FFN_NONE  = 0,
     PULSAR_FFN_DENSE = 1,  ///< one dense gated MLP
     PULSAR_FFN_MOE   = 2,  ///< the routed MoE (with whatever shared experts the family's router config declares)
+    /** L338: a dense gated MLP AND the routed MoE side by side on the same residual, each with its own pre / post norm,
+     *  their outputs summed (Gemma 4: every layer); not a shared expert -- the MLP is its own block with its own norms. */
+    PULSAR_FFN_DENSE_MOE = 3,
 } pulsar_ffn_kind;
 /** A PULSAR_LAYER_BLOCKS layer's blocks, family-neutral: the kind's parameters, not a second description beside it.
  *  The plan's kind[il] says WHICH block op runs layer il (the core driver dispatches on it alone,

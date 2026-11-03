@@ -126,6 +126,7 @@ typedef enum {
     PULSAR_FAMILY_ID_NEMOTRON_H = 3, ///< NVIDIA Nemotron-H (Nemotron 3.5 Super VL; HF nemotron_h_omni; src/families/nemotron_h)
     PULSAR_FAMILY_ID_NEMOTRON_ENC = 4, ///< NVIDIA Nemotron-3.5 Embed / Rerank encoders (HF mistral3; src/families/nemotron_enc)
     PULSAR_FAMILY_ID_NEMOTRON_PARSE = 5, ///< NVIDIA Nemotron-3.5 Parse (HF nemotron_parse; src/families/nemotron_parse)
+    PULSAR_FAMILY_ID_GEMMA4 = 6,     ///< Google Gemma 4 26B-A4B (HF gemma4; src/families/gemma4; L338)
 } pulsar_family_id;
 
 /** The conversation format a front end must render for the loaded model: the
@@ -139,6 +140,7 @@ typedef enum {
     PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
     PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
     PULSAR_CHAT_NONE    = 5,  ///< no conversation: an encoder family (L321) renders its inputs through pulsar_engine_encode_render
+    PULSAR_CHAT_GEMMA4  = 6,  ///< Gemma 4's turn / channel / tool-call renderer (L338: src/lib/gemma4_chat)
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */
@@ -1315,6 +1317,13 @@ int pulsar_session_step_row_logprobs(pulsar_session *s, uint32_t row, int token,
  *  @param cap floats at out
  *  @return floats copied (the width), or 0 when cap is short or nothing is live */
 int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
+/** L338 P2: the final-norm hidden state of the last row the head produced logits for -- after a sync, the prompt's
+ *  last token's (what a decision head reads: Gemma 4's JEV judge) -- as f32.
+ *  @param s the session
+ *  @param out receives the model's hidden width of floats
+ *  @param cap floats at out
+ *  @return floats copied (the hidden width), or 0 when the family offers none, cap is short or nothing was headed */
+int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap);
 /** Overwrite the live logits row (mirrored on a TP group).
  *  @param s the session
  *  @param logits the row
@@ -1503,6 +1512,32 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
 /** @param s the session
  *  @return the pool size (1 when not pooled; 0 for a family without banks) */
 int  pulsar_session_bank_count(pulsar_session *s);
+/** L338 P2: whether the engine carries a runtime adapter (a LoRA its family applies per bank: Gemma 4's JEV judge).
+ *  @param e the engine
+ *  @return true when pulsar_session_set_bank_adapter can turn it on */
+bool pulsar_engine_has_adapter(pulsar_engine *e);
+/** L338 P2.4: the runtime adapter's decision head, on the host (the container's mapping): w f32 [slots][width] (row
+ *  s the slot's weights over the final-norm hidden pulsar_session_copy_hidden returns), b f32 [slots].
+ *  @param e the engine
+ *  @param w receives the weight (borrowed: valid while the engine is open)
+ *  @param b receives the bias (borrowed)
+ *  @param width receives the hidden width
+ *  @return the slots; 0 = no decision head (outputs untouched) */
+uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const float **b, uint32_t *width);
+/** L338 P2: run bank `bank` with (on) or without the engine's runtime adapter.  A bank's K / V are the adapter's while
+ *  it is on, so the switch moves only an EMPTY bank (position 0: invalidate it first); the bank's segments and
+ *  payloads carry the switch in their layout digest, so the disk store never crosses it.  The caller keeps adapter
+ *  banks' prompts apart from plain ones (slot routing, adoption).
+ *  @param s    the session
+ *  @param bank the bank
+ *  @param on   adapter on (true) or off
+ *  @return true = set; false = refused (said): no adapter, a bank out of range or not empty */
+bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on);
+/** L338 P2: whether bank `bank` runs the runtime adapter.
+ *  @param s    the session
+ *  @param bank the bank
+ *  @return true when on */
+bool pulsar_session_bank_adapter(const pulsar_session *s, uint32_t bank);
 /** Point the device views at `bank` (a family without a separate repoint restores it instead).
  *  @param s the session
  *  @param bank the bank
@@ -2207,6 +2242,11 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
  *  @param draft_ms the drafting, ms */
 void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
                                         double host_ms, double draft_ms);
+/** L338: the depth the round in progress runs at -- its live banks' mean frontier, tokens; 0 = the profile's.  Every
+ *  price the round takes (the verify pick, the round selection, a drafter's keep) and its observation read it.
+ *  @param e the engine (no curve: nothing)
+ *  @param depth tokens */
+void pulsar_engine_verify_curve_depth(pulsar_engine *e, uint32_t depth);
 /** The verify pick: of m drafts with survivals `surv` sorted DESCENDING, how many a round of n_seqs base rows
  *  verifies within cap_rows rows (the best ratio on the curve; no curve: as many as the rows hold).  The SERVER'S
  *  pick: on a tensor-parallel group it runs on the leader, on the leader's curve (L315), and its choice reaches the
@@ -2234,8 +2274,11 @@ typedef struct {
     bool cached;                                  ///< loaded from the disk cache (else profiled by this process)
     uint32_t rows_max;                            ///< the widest verify step
     float base_ms[33];                            ///< [r]: the profiled r-row verify forward, ms (1..rows_max)
-    bool slope_valid;                             ///< the online correction has a number
-    float slope_ms;                               ///< its residual per row (applied as max(0, slope))
+    bool line_valid;                              ///< the online correction has a line at the current depth
+    float line_a_ms;                              ///< its fixed residual past the profile, ms
+    float line_b_ms;                              ///< its residual a row, ms
+    uint32_t depth;                               ///< the depth it prices at (0 = the profile's), tokens
+    uint32_t profile_depth;                       ///< the profile's depth, tokens
     float host_ms;                                ///< the round's recent wall outside the forward and drafting
     float draft_ms;                               ///< the round's recent drafting wall
     uint64_t observed;                            ///< rounds observed

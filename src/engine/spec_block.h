@@ -66,8 +66,20 @@
 /** Where in a trunk layer a tap reads the residual stream: after its mixer's residual add, or after its FFN's. */
 enum pulsar_block_tap_sub : uint32_t { PULSAR_BLOCK_TAP_MIXER = 0, PULSAR_BLOCK_TAP_FFN = 1 };
 
-/** The chain head a drafter's declaration ends in (the header's CHAIN). */
-enum pulsar_block_head_kind : uint32_t { PULSAR_BLOCK_HEAD_LILICORR = 0, PULSAR_BLOCK_HEAD_SELECTOR = 1 };
+/** The chain head a drafter's declaration ends in (the header's CHAIN).  PLAIN (L338, z-lab's plain DFlash): no
+ *  chain head -- each slot's own top-k, its score table the slot's log-probs whatever the slot before chose, its greedy
+ *  walk the slots' top-1s; the walk and the sampled draw below are the same for it. */
+enum pulsar_block_head_kind : uint32_t {
+    PULSAR_BLOCK_HEAD_LILICORR = 0,
+    PULSAR_BLOCK_HEAD_SELECTOR = 1,
+    PULSAR_BLOCK_HEAD_PLAIN = 2
+};
+
+/** L338: the context keys a FULL-attention drafter layer keeps (a ring this deep): z-lab's plain DFlash for Gemma 4
+ *  has one full layer among its windowed ones.  A draft past this context sees its last 8192 keys there -- the
+ *  drafter only proposes (the verify decides every token), so the cut moves acceptance at a very long context, never
+ *  an output. */
+#define PULSAR_BLOCK_FULL_KEYS 8192u
 
 /** One drafter layer's tensors (bind block `drafter`, layer l). */
 typedef struct {
@@ -171,7 +183,7 @@ typedef struct {
  *  its state ids.  A plain record that owns nothing: the tensors are the model's, `kind` is static and the per-session
  *  buffers are the lane's (pulsar_block_lane_free), so the family that allocated it frees it with free(). */
 typedef struct pulsar_block_drafter {
-    const char *kind;            ///< the container's pulsar.drafter ("lilicorr", "dflash2")
+    const char *kind;            ///< the container's pulsar.drafter ("lilicorr", "dflash2", "dflash")
     /// The chain head the kind ends in (the kind table's).
     pulsar_block_head_kind head_kind;
     /* the declaration (the container's <kind>.* keys) */
@@ -195,8 +207,14 @@ typedef struct pulsar_block_drafter {
     uint32_t window;             ///< the sliding window over the context (keys a row sees, itself included)
     /** @var pulsar_block_drafter::conv_group
      *  Channels per conv group (divides hidden): the projection makes hidden / conv_group groups. */
-    /// The dynamic convolution's taps, 1 .. block.
+    /// The dynamic convolution's taps, 1 .. block; 0 = no convolutions (PLAIN: z-lab's plain DFlash).
     uint32_t conv_taps, conv_group;
+    /** L338: bit l = drafter layer l attends the FULL context (a PULSAR_BLOCK_FULL_KEYS ring), else the window. */
+    uint32_t full_layers;
+    /** L338: the TARGET's input-embedding scale (Gemma: bf16(sqrt(hidden)) = 53; 0 = none) -- the family's. */
+    float embed_scale;
+    /** L338: the head's logit soft-cap (tanh(z / c) * c; 0 = none): the declaration's. */
+    float softcap;
     uint32_t topk;               ///< candidates per slot
     /** @var pulsar_block_drafter::rope_theta
      *  The drafter's own NeoX rope base (> 0), at the target's absolute positions. */
@@ -214,7 +232,7 @@ typedef struct pulsar_block_drafter {
     pulsar_tensor *fc;           ///< n_taps hidden -> hidden
     pulsar_tensor *hidden_norm;  ///< the context norm
     pulsar_tensor *out_norm;     ///< the final norm
-    pulsar_tensor *head;         ///< hidden -> head_rows (the drafter's own lm_head)
+    pulsar_tensor *head;         ///< hidden -> head_rows (the drafter's own lm_head; PLAIN: the TARGET's, the family's)
     /** The head's rows' vocabulary ids, I32 [head_rows] ascending, when the head is a SUBSET of the vocabulary (a
      *  draft vocabulary: the cheaper read); NULL = the head is the whole vocabulary (head_rows == vocab). */
     pulsar_tensor *head_ids;
@@ -229,8 +247,8 @@ typedef struct pulsar_block_drafter {
      * (LILICORR), else UINT32_MAX */
     /** @var pulsar_block_drafter::decl_anchor
      *  The anchor row's decl (LILICORR only), else UINT32_MAX. */
-    /// The state plan's decl of the per-layer K | V context ring.
-    uint32_t decl_kv, decl_anchor;
+    /// The state plan's decl of the per-layer K | V context ring (decl_kv_full: a full layer's, UINT32_MAX = none).
+    uint32_t decl_kv, decl_anchor, decl_kv_full;
     /** The round API's drafter for this declaration (pulsar_block_drafter_read: PULSAR_BLOCK_DRAFTER_OPS at a chain of
      *  the block's block - 1 slots) -- the engine's drafter_ops points here. */
     pulsar_drafter_ops ops;
