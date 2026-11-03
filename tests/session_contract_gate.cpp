@@ -51,6 +51,7 @@
  * standalone `make session-contract-gate-qwen` / `-ds` remain for iterating.  Replaces L266's
  * qwen_chunk_neutrality_gate and qwen_banks_gate. */
 #include "pulsar.h"
+#include "segment_file_io.h"   /* L347 I3a: segments to and from files through the copy-out */
 #include "gate_entry.h"
 #include "gate_util.h"
 #include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field; S2 reads the recurrent state */
@@ -264,19 +265,23 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
                   pulsar_session_sync(a, &P, err, sizeof(err)) == 0;
         CHECK(ok && pulsar_session_checkpoint_best(a, TokPos{512}).raw() == 512 && pulsar_session_checkpoint_best(a, TokPos{N}).raw() == Gend,
               "C4 checkpoints at 512 and %d after two syncs: %s", Gend, err);
-        FILE *f1 = tmpfile(), *f2 = tmpfile();
+        FILE *f1 = tmpfile(), *f2 = tmpfile(), *frp = tmpfile();   /* L347: the restore point at Gend apart */
         const uint64_t b1 = pulsar_session_segment_bytes(a, TokPos{0}, TokPos{512}, NULL), b2 = pulsar_session_segment_bytes(a, TokPos{512}, TokPos{Gend}, NULL);
-        ok = ok && f1 && f2 && pulsar_session_save_segment(a, f1, TokPos{0}, TokPos{512}, NULL, err, sizeof(err)) == 0 &&
-             pulsar_session_save_segment(a, f2, TokPos{512}, TokPos{Gend}, NULL, err, sizeof(err)) == 0;
+        const uint64_t brp = pulsar_session_restore_point_bytes(a, TokPos{Gend});
+        ok = ok && f1 && f2 && frp && brp > 0 &&
+             gate_save_segment(a, f1, TokPos{0}, TokPos{512}, err, sizeof(err)) == 0 &&
+             gate_save_segment(a, f2, TokPos{512}, TokPos{Gend}, err, sizeof(err)) == 0 &&
+             gate_save_restore_point(a, frp, TokPos{Gend}, err, sizeof(err)) == 0;
         CHECK(ok, "C4 saved [0, 512) %llu B and [512, %d) %llu B: %s", (unsigned long long)b1, Gend, (unsigned long long)b2, err);
         pulsar_session_free(a);
         TokPos g1{0}, g2{0};
         if (ok) {
             rewind(f1);
             rewind(f2);
+            rewind(frp);
             ok = pulsar_session_create(&b, e, 8192) == 0 &&
-                 pulsar_session_load_segment(b, f1, b1, false, &g1, NULL, err, sizeof(err)) == 0 &&
-                 pulsar_session_load_segment(b, f2, b2, true, &g2, NULL, err, sizeof(err)) == 0;
+                 gate_load_segment(b, f1, b1, false, NULL, 0, &g1, err, sizeof(err)) == 0 &&
+                 gate_load_segment(b, f2, b2, true, frp, brp, &g2, err, sizeof(err)) == 0;
         }
         CHECK(ok && g1.raw() == 512 && g2.raw() == Gend, "C4 a fresh session loaded the chain to %d: %s", g2.raw(), err);
         std::vector<std::vector<float>> got;
@@ -294,6 +299,7 @@ static void part_chunks(pulsar_engine *e, int W, bool explicit_chunk) {
         if (b) pulsar_session_free(b);
         if (f1) fclose(f1);
         if (f2) fclose(f2);
+        if (frp) fclose(frp);
         pulsar_tokens_free(&Q);
     }
     /* C5: an interrupted sync resumes exactly (L272 P2) */

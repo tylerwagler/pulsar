@@ -683,6 +683,11 @@ KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q
 /** @param s the session
  *  @return GPU bytes the create allocated */
 uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
+/** L347 I4: the pinned host RAM the session's grid checkpoints and records live in -- a discrete card's (the store's
+ *  host tier); 0 on an integrated GPU (GB10), where they are device memory and in pulsar_session_resident_bytes.
+ *  @param s the session
+ *  @return pinned host bytes */
+uint64_t pulsar_session_ckpt_host_bytes(const pulsar_session *s);
 /** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
  * This competes with per-session KV for the unified-memory budget. */
@@ -887,8 +892,8 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token);
 /** The chat template's TURN MARKERS as token sequences (L272 B5): the tokens that open a user turn
  * and an assistant turn in a rendered prompt.  DeepSeek names each with one special token
  * (\<｜User｜\>, \<｜Assistant｜\>); Qwen's template spells a turn as the added token \<|im_start|\> followed
- * by the role word, so a marker is two tokens there.  The server's prefix anchors (the sys-prefix
- * cold store, the last-turn routing anchor) scan a prompt with pulsar_turn_marker_at.  false, with
+ * by the role word, so a marker is two tokens there.  The server's prefix anchors (the shared-prefix
+ * anchor, the last-turn routing anchor) scan a prompt with pulsar_turn_marker_at.  false, with
  * `out` zeroed (no marker matches anywhere), when the loaded tokenizer does not spell them -- said
  * once, never a marker that matches at the wrong place. */
 typedef struct {
@@ -2388,10 +2393,11 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * v5 (L302): the copy drafter's measured acceptance joins the speculation record (5 u32), so a
  * restored session prices its copy rounds as the saved one does; v4 refuses on the version.
  * v6 (L308): the copy acceptance's age (tokens since its last verdict) joins it (6 u32), so a restored session
- * re-probes a stale copy estimate when the saved one would; v5 refuses on the version. */
+ * re-probes a stale copy estimate when the saved one would; v5 refuses on the version.
+ * v7 (L347 I3a): the trailing digest is lib/pulsar_kvdigest.h's v2 (four lanes); v6 refuses on the version. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-/** The kv-state payload's format version (the v2..v6 history above); a payload of another version is refused. */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(6)
+/** The kv-state payload's format version (the v2..v7 history above); a payload of another version is refused. */
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(7)
 
 /** @param s the session (a family with payloads; else 0)
  *  @return the serialized payload's size, bytes */
@@ -2419,65 +2425,134 @@ int pulsar_session_load_payload(pulsar_session *s, FILE *fp, uint64_t payload_by
  *  @return 0, or 1 */
 int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *snap, char *err, size_t errlen);
 
-/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G), every append-only pool's
+/** L264 S4: a disk SEGMENT -- the tokens [G_prev, G) and every append-only pool's
  * rows for those positions (DeepSeek: every kv source's compressed and index-K
- * rows), and -- when the installed bank holds it -- the grid checkpoint at G
- * (G_prev and G are grid points, G_prev may be 0, and no image block lies across
- * either).  A chain of segments from position 0 rebuilds a bank exactly at its
- * last G, which is how the server's disk cache persists a conversation: each new
- * prefill adds the segments past the chain's last one, so a write costs the new
- * tokens, not the whole history.
- *   save: the installed bank must hold the history and its rows to G; the state
- *         at G is written iff the bank holds its checkpoint there (L323).
+ * rows); G_prev and G are grid points, G_prev may be 0, and no image block lies
+ * across either.  L347: the state at G -- the grid checkpoint's slot -- is not in
+ * the segment but in a RESTORE POINT (pulsar_session_copy_out_restore_point), stored
+ * beside the chain's last segment.  A chain of segments from position 0 plus the
+ * restore point at its last G rebuilds a bank exactly at that G, which is how the
+ * server's disk cache persists a conversation: each new prefill adds the segments
+ * past the chain's last one, so a write costs the new tokens, not the whole
+ * history.
+ *   copy-out: the installed bank must hold the history and its rows to G.
  *   load: the installed bank must stand at G_prev (a root, G_prev 0, resets it).
- *         L323: only `last` reads the segment's state and restores it (refused
- *         when the segment carries none), so the bank stands LIVE at G and the
+ *         Only `last` restores a state: the restore point at G, given beside the
+ *         segment (refused without one), so the bank stands LIVE at G and the
  *         next sync evaluates from there; an earlier segment's rows are read and
- *         its state skipped -- the bank keeps the one checkpoint at the end. */
+ *         the bank keeps the one checkpoint at the end.
+ * L347 I3a: both go through MEMORY.  A copy-out fills a caller's buffer (the segment
+ * store's pinned image of the file) with the payload's exact bytes -- the device
+ * rows / slot by an event-fenced copy on a copy stream (pulsar_gpu_copy_out), no
+ * device-wide drain -- and leaves the DIGEST SLOT zero: a segment's and a restore
+ * point's last 8 bytes are the digest of the bytes before them
+ * (pulsar_kvdigest_seal over [0, bytes - 8), stored little-endian at [bytes - 8,
+ * bytes)), which the store's writer computes off the worker.  A load reads the
+ * bytes from memory and does not check the digest: whoever read them off a disk
+ * checked it (pulsar_kvdigest_check). */
 #define PULSAR_SESSION_SEGMENT_MAGIC UINT32_C(0x31474553) /* "SEG1" */
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
 /** The disk segment format's version (history beside it); a segment of another version is refused. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(6)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state */
-/** The bytes pulsar_session_save_segment writes for [G_prev, G) (0: not a segment span), and in *state_bytes (may be
- *  NULL) the trailing part a load of a non-last segment skips: the state at G and its digest (0 = rows only). */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(8)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state; v7 (L347): rows only; the state at G is the key's restore point file (header word 8 carries no flag, 0); v8 (L347 I3a): the digest is pulsar_kvdigest v2 (four lanes) */
+/** L347: a RESTORE POINT -- the state at a grid point G: the installed bank's
+ * grid checkpoint slot at G behind a header (magic, version, the segment layout
+ * digest, the slot size, the resume grid, G, flags 0) and its own digest.  The
+ * disk cache stores it beside the segment that ends at G, under the same key. */
+#define PULSAR_SESSION_RESTORE_POINT_MAGIC UINT32_C(0x31505253) /* "SRP1" */
+/** The restore point format's version (v2, L347 I3a: the digest is pulsar_kvdigest v2); another version is refused. */
+#define PULSAR_SESSION_RESTORE_POINT_VERSION UINT32_C(2)
+/** The bytes pulsar_session_copy_out_segment writes for [G_prev, G) (0: not a segment span), and in *state_bytes (may
+ *  be NULL) the bytes of the restore point at G (pulsar_session_restore_point_bytes; 0 = the bank holds no checkpoint
+ *  there). */
 /** @param s the session
  *  @param G_prev the span's start (a grid point)
  *  @param G its end
- *  @param state_bytes receives the state part; may be NULL
- *  @return bytes, or 0 */
+ *  @param state_bytes receives the restore point's bytes at G; may be NULL
+ *  @return the segment's bytes (rows only), or 0 */
 uint64_t pulsar_session_segment_bytes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *state_bytes);
-/** `key`: the segment's store key (pulsar_segstore_child_key).  Off a TP group
- *  it is unused (NULL is fine); on one it names every worker's own copy, and
- *  save and load are mirrored verdicts whose disagreement is a miss on every
- *  rank (L264 S4e).  Refused inside a mirrored sync. */
-/** @param s the session
- *  @param fp an open stream
- *  @param G_prev the span's start
- *  @param G its end
- *  @param key the store key (NULL off a TP group)
+/** L347: the bytes pulsar_session_copy_out_restore_point writes at G.
+ *  @param s the session
+ *  @param G the grid position
+ *  @return bytes, 0 when the installed bank holds no checkpoint at G */
+uint64_t pulsar_session_restore_point_bytes(pulsar_session *s, TokPos G);
+/** L347 I3a: copy the restore point at G (the installed bank's checkpoint there) into `dst`, its digest slot zero (see
+ *  above).  `key` as for pulsar_session_copy_out_segment.
+ *  @param s the session
+ *  @param G the grid position (the installed bank holds a checkpoint there)
+ *  @param key the store key of the segment ending at G (NULL off a TP group)
+ *  @param dst receives the restore point (pinned memory for a true DMA)
+ *  @param bytes bytes at `dst`: exactly pulsar_session_restore_point_bytes(s, G)
  *  @param err receives the failure
  *  @param errlen bytes at err
  *  @return 0, or nonzero */
-int pulsar_session_save_segment(pulsar_session *s, FILE *fp, TokPos G_prev, TokPos G, const char *key,
-                                char *err, size_t errlen);
-/** Load one disk segment onto the installed bank (the load rule in the L264 S4 note above).
+int pulsar_session_copy_out_restore_point(pulsar_session *s, TokPos G, const char *key, uint8_t *dst, uint64_t bytes,
+                                          char *err, size_t errlen);
+/** L347 I3a: copy the segment [G_prev, G) into `dst`, its digest slot zero (see above).  `key`: the segment's store
+ *  key (pulsar_segstore_child_key).  Off a TP group it is unused (NULL is fine); on one it names every worker's own
+ *  copy -- each worker copies out and writes its file synchronously -- and the copy-out and the load are mirrored
+ *  verdicts whose disagreement is a miss on every rank (L264 S4e).  Refused inside a mirrored sync.
  *  @param s the session
- *  @param fp the stream at the segment
+ *  @param G_prev the span's start
+ *  @param G its end
+ *  @param key the store key (NULL off a TP group)
+ *  @param dst receives the segment (pinned memory for a true DMA)
+ *  @param bytes bytes at `dst`: exactly pulsar_session_segment_bytes(s, G_prev, G, NULL)
+ *  @param err receives the failure
+ *  @param errlen bytes at err
+ *  @return 0, or nonzero */
+int pulsar_session_copy_out_segment(pulsar_session *s, TokPos G_prev, TokPos G, const char *key, uint8_t *dst,
+                                    uint64_t bytes, char *err, size_t errlen);
+/** L347 I3b (plans/124 D7): what a refused segment load or check says about its bytes -- the one classification a
+ *  disk restore drops by.  A content fault is the stored bytes' (they will never load: the store drops that part); a
+ *  transient failure is the bank's, the device's or a TP rank's (the store keeps every byte). */
+typedef enum {
+    PULSAR_SEGMENT_OK = 0,          ///< loaded (checked)
+    PULSAR_SEGMENT_BAD_ROWS = 1,    ///< the segment's bytes are not a segment of this layout: drop the key's rows
+    PULSAR_SEGMENT_BAD_RP = 2,      ///< the restore point's bytes are not this layout's state at G: drop it alone
+    PULSAR_SEGMENT_TRANSIENT = 3,   ///< not the bytes' fault (the bank, the device, a TP rank's copy, a caller error)
+} pulsar_segment_status;
+/** L347 I3b: check one disk segment (and, with `last`, its restore point) against the installed bank's layout --
+ *  every check pulsar_session_load_segment makes of the bytes before its first device write, and nothing of the
+ *  bank's state (where it stands, its slots, the device): a restore runs it over the whole chain before the root
+ *  segment clears the bank, so a content fault leaves the bank as it was.  Off a TP group's leader too (each worker
+ *  checks its own copy at the load).  The digests are the reader's (the store checks them).
+ *  @param s the session
+ *  @param seg the segment's bytes
  *  @param bytes its size
- *  @param last the chain's last segment: its state is read and the bank stands live at G
+ *  @param last the chain's last segment: its restore point is checked too
+ *  @param rp the restore point at G when `last` (required then), else NULL
+ *  @param rp_bytes its size (0 when not `last`)
+ *  @param err receives the fault
+ *  @param errlen bytes at err
+ *  @return PULSAR_SEGMENT_OK, _BAD_ROWS, _BAD_RP, or _TRANSIENT (no session, a caller error) */
+pulsar_segment_status pulsar_session_check_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                   const uint8_t *rp, uint64_t rp_bytes, char *err, size_t errlen);
+/** Load one disk segment from memory onto the installed bank (the load rule in the L264 S4 note above; the digests
+ *  are not checked here).  L347 I3b: a refusal is classified (pulsar_segment_status): every content check runs before
+ *  the first device write (pulsar_session_check_segment's), so a content fault leaves the bank as it was; a failure
+ *  after it (the bank not standing at the segment's start, no checkpoint slot, the device, a TP worker's miss) is
+ *  transient and leaves the bank holding nothing.
+ *  @param s the session
+ *  @param seg the segment's bytes (pinned memory for a true DMA)
+ *  @param bytes its size
+ *  @param last the chain's last segment: the restore point at its G is read and the bank stands live at G
+ *  @param rp L347: the restore point at G when `last` (required then), else NULL
+ *  @param rp_bytes its size (0 when not `last`)
  *  @param G_out receives G (0 on a refusal); may be NULL
  *  @param key the store key (NULL off a TP group)
  *  @param err receives the refusal
  *  @param errlen bytes at err
- *  @return 0, or nonzero */
-int pulsar_session_load_segment(pulsar_session *s, FILE *fp, uint64_t bytes, bool last,
-                                TokPos *G_out, const char *key, char *err, size_t errlen);
-/** A store removed segment `key`: the workers delete their copies (void; a
- *  no-op off a TP leader). */
+ *  @return PULSAR_SEGMENT_OK, or the refusal's class */
+pulsar_segment_status pulsar_session_load_segment(pulsar_session *s, const uint8_t *seg, uint64_t bytes, bool last,
+                                                  const uint8_t *rp, uint64_t rp_bytes, TokPos *G_out, const char *key,
+                                                  char *err, size_t errlen);
+/** A store removed segment `key` (part 0: the segment and its restore point) or only its restore point (part 1,
+ *  L347): the workers delete their copies (void; a no-op off a TP leader). */
 /** @param e the engine
- *  @param key the removed segment's key */
-void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key);
+ *  @param key the removed segment's key
+ *  @param part 0 = the segment with its restore point, 1 = the restore point only */
+void pulsar_engine_segment_dropped(pulsar_engine *e, const char *key, int part);
 /** Bring-up: the leader's whole key set (n_keys x 40 hex); each worker removes
  *  the copies it does not name.  0 when sent or nothing to do. */
 /** @param e the engine

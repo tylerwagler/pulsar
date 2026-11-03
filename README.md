@@ -161,6 +161,8 @@ Flags a user normally sets:
 | `--kv-disk-dir DIR` | `$XDG_CACHE_HOME/pulsar/kv-<model>` (else `~/.cache/pulsar/...`) | Disk KV cache directory. `""` disables it. |
 | `--no-kv-disk` | | Disable the disk KV cache. |
 | `--kv-disk-space-mb N` | no limit | Disk KV budget. |
+| `--kv-ram-mb N` | 25% of RAM (max 16 GiB) on a discrete GPU; 1 GiB on unified memory | Disk KV host pool: copy-out buffers and the RAM tier. |
+| `--kv-pinned-max-mb N` | 2048 | Budget for pinned anchors (`X-Pulsar-KV: pin-anchor`). |
 | `--no-dspark` | | Run without the container's drafter (any family). |
 | `--drafter NAME` | the container's | `mtp`, `dflash2` (Qwen) or `lilicorr` (Nemotron). |
 | `--spec-depth N`, `--spec-tau F\|off` | the drafter's | Starting draft depth and draft stop threshold. |

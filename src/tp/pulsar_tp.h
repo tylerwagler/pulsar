@@ -29,7 +29,7 @@
 /// Wire magic of every control frame and the hello ("DS4T", as upstream).
 #define PULSAR_TP_MAGIC UINT32_C(0x44533454)     /* "DS4T", same wire magic as upstream */
 /// Wire protocol version; both sides of the hello must carry the same one (history in the trailing comment).
-#define PULSAR_TP_PROTOCOL_VERSION 29u           /* v29: VERIFY_PROFILE -- the verify curve profiled by every rank in step, so the leader prices its verify pick on the pair and every rank receives the chosen rows (L315); v28: a SPEC_ROUND_END_BATCH step record carries its greedy_rows (the server tool-call override per verify row, L296 toolsample) where it carried a reserved 0; v27: the RDMA arming handshake (RDMA_GATE_ARMED) rides the link's DATA socket, not the control socket, where a pipelined eval's deferred ack was read as the peer's ARMED (L269); v26: the gate QP carries ONE SEND per vector at any width (the 16 KiB chunk retired -- the port's max_msg_sz bounds a row, bring-up refuses past it) and the gate ring holds at least WINDOW + MAX_ROWS slots, so the row lane arms for every pair model -- n_embd 5120 (V4.1) and layer-subset fixtures included (L269); v25: REWRITE_FROM_COMMON retired -- the tool-checkpoint canonicalization is a mirrored sync -- and the spec frames no longer carry an eos id (the round stops at the engine's whole stop set) (L284); v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
+#define PULSAR_TP_PROTOCOL_VERSION 30u           /* v30: a segment command's `part` (was reserved 0): 0 the row segment, 1 its restore point -- SAVE part 1 writes <key>.tpseg.rp, DROP part 1 removes it alone, and a LOAD with last reads the worker's own .rp beside its .tpseg (L347); v29: VERIFY_PROFILE -- the verify curve profiled by every rank in step, so the leader prices its verify pick on the pair and every rank receives the chosen rows (L315); v28: a SPEC_ROUND_END_BATCH step record carries its greedy_rows (the server tool-call override per verify row, L296 toolsample) where it carried a reserved 0; v27: the RDMA arming handshake (RDMA_GATE_ARMED) rides the link's DATA socket, not the control socket, where a pipelined eval's deferred ack was read as the peer's ARMED (L269); v26: the gate QP carries ONE SEND per vector at any width (the 16 KiB chunk retired -- the port's max_msg_sz bounds a row, bring-up refuses past it) and the gate ring holds at least WINDOW + MAX_ROWS slots, so the row lane arms for every pair model -- n_embd 5120 (V4.1) and layer-subset fixtures included (L269); v25: REWRITE_FROM_COMMON retired -- the tool-checkpoint canonicalization is a mirrored sync -- and the spec frames no longer carry an eos id (the round stops at the engine's whole stop set) (L284); v24: SPEC_ROUND_END_BATCH's header carries the leader's measured spec cost (flat_us, row_us, valid in i1..i3) so every rank prices the yield quench from the same integers (L263); v23: SEGMENT_SAVE/LOAD/DROP/RECONCILE -- the disk KV cache's segment chains mirrored per rank (L264 S4e); v22: BANK_FORK retired -- the server never forks a bank since L264's checkpoint routing; v21: BANK_KV_SAVE/LOAD and KVSTORE_SAVE/LOAD/DROP/RECONCILE retired -- the bank KV snapshot and the mirrored disk KV cache are gone with the segment store (L264); v20: BANK_FORK_PARTIAL retired -- the partial fork is gone with the grid checkpoints (L264); v19: FUSED_BATCH + NOTE_PREFILLED -- the fused step (verify rows and queued prompts' chunks in one forward) and the record of a chunk it prefilled (L260); v18: the rdma info carries the bulk lane's second rail (PULSAR_TP_RDMA_DEV2: rkey, QP, address) -- every bulk exchange splits over both HCA functions of the port (L260); v17: SPEC_*_BATCH -- the batched spec lane's per-bank bookkeeping as one frame per phase, per-bank records after the header (L260); v16: SYNC_CHECK -- before a mirrored sync the leader states its cached position + prefix digest and waits for the workers to agree (L250); v15: CHUNK_VERDICT -- a mirrored prefill yields at a chunk boundary on both ranks; v14: the bulk lane -- rdma info carries a bulk buffer + second QP; v13: a NODE frame after bring-up carries each rank's host, build and RDMA device; v12: SESSION_CREATE carries the bank-pool size; v11: the command ack carries a logits digest (L243); v10: batch header carries max_head_runs; v9: row payload + RNG_STATE; v8: rank + n_ranks in the hello */
 
 enum { PULSAR_TP_GATE_ATTN = 0, PULSAR_TP_GATE_FFN = 1, PULSAR_TP_GATES_PER_LAYER = 2 };
 /** Layer tag for exchanges that are NOT per-layer (slice 4d's vocab gather).
@@ -1209,13 +1209,16 @@ typedef enum {
     PULSAR_TP_FRAME_NOTE_PREFILLED = 51,
     /* v23 (L264 S4e): the disk KV cache's segment chains.  KV is replicated
      * per rank, so each rank keeps its own copy of every segment the leader's
-     * store names, as <tp_kv_dir>/<key>.tpseg.  The payload is a
-     * pulsar_tp_segment_command.  SAVE: verdict (0 stored, 1 a miss -- the
-     * leader skips the segment on every rank).  LOAD: verdict (0 the same
-     * state, 1 a miss); the leader loads first and states the result (G and
-     * the history digest).  DROP: void.  RECONCILE: void, the leader's whole
-     * key set at bring-up (n_keys x 40 hex after a u32 count); a worker
-     * removes the copies it does not name. */
+     * store names, as <tp_kv_dir>/<key>.tpseg, and (v30, L347) of its restore
+     * point, as <tp_kv_dir>/<key>.tpseg.rp.  The payload is a
+     * pulsar_tp_segment_command; its `part` says which file.  SAVE: verdict
+     * (0 stored, 1 a miss -- the leader skips the segment or restore point on
+     * every rank).  LOAD: verdict (0 the same state, 1 a miss); the leader
+     * loads first and states the result (G and the history digest); `last`
+     * reads the restore point too.  DROP: void (part 0: both files, part 1:
+     * the restore point).  RECONCILE: void, the leader's whole key set at
+     * bring-up (n_keys x 40 hex after a u32 count); a worker removes the
+     * copies it does not name. */
     PULSAR_TP_FRAME_SEGMENT_SAVE = 52,
     PULSAR_TP_FRAME_SEGMENT_LOAD = 53,
     PULSAR_TP_FRAME_SEGMENT_DROP = 54,
@@ -1227,6 +1230,11 @@ typedef enum {
     PULSAR_TP_FRAME_VERIFY_PROFILE = 56,
 } pulsar_tp_frame_type;
 
+/** pulsar_tp_segment_command::part: the row segment (v23's only file). */
+#define PULSAR_TP_SEGMENT_PART_ROWS 0u
+/** pulsar_tp_segment_command::part: the restore point beside it (v30, L347). */
+#define PULSAR_TP_SEGMENT_PART_RESTORE_POINT 1u
+
 /** One segment operation (L264 S4e). */
 typedef struct {
     /// The mirrored session the segment belongs to.
@@ -1235,8 +1243,9 @@ typedef struct {
     int32_t G_prev, G;    ///< the span (SAVE), the span loaded (LOAD)
     uint64_t digest;      ///< LOAD: pulsar_session_checkpoint_digest after the leader's load
     int32_t last;         ///< LOAD: the chain's last segment (restores its checkpoint)
-    /// Pad to keep `key` 8-byte aligned; 0 on the wire.
-    uint32_t reserved;
+    /// SAVE / DROP: which file (PULSAR_TP_SEGMENT_PART_ROWS or _RESTORE_POINT; v30, L347); also keeps `key` 8-byte
+    /// aligned
+    uint32_t part;
     char key[40];         ///< the segment's store key, 40 lowercase hex
 } pulsar_tp_segment_command;
 
