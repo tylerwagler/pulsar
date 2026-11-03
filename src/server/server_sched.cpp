@@ -160,24 +160,25 @@ uint64_t server_mem_available_bytes(void) {
 KvBytes server::guard_budget() {
     const double now = server_now_sec();
     if (guard_avail_at == 0.0 || now - guard_avail_at >= 0.25) {
-        guard_avail = KvBytes{server_mem_available_bytes()};
+        guard_avail = KvBytes{server_guard_avail_bytes(guard_discrete)};
         guard_avail_at = now;
     }
     const KvBytes live =
         server_guard_touched_budget(guard_kv_budget, guard_eager_bytes, pulsar_session_touched_kv_bytes(sess),
-                                    guard_avail);
+                                    guard_avail, guard_floor);
     const KvBytes b = live < guard_touched_ceiling ? live : guard_touched_ceiling;
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
     const KvBytes step{512ull << 20};
     if ((b > guard_budget_said ? b - guard_budget_said : guard_budget_said - b) >= step) {
         const double gib = 1024.0 * 1024.0 * 1024.0;
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: guard: live touched-KV budget %.2f GiB (ceiling %.2f; touched %.2f + MemAvailable "
+                   "pulsar-server: guard: live touched-KV budget %.2f GiB (ceiling %.2f; touched %.2f + %s "
                    "%.2f − floor %.2f)%s",
                    (double)b.raw() / gib, (double)guard_touched_ceiling.raw() / gib,
-                   (double)pulsar_session_touched_kv_bytes(sess).raw() / gib, (double)guard_avail.raw() / gib,
-                   (double)server_mem_floor().raw() / gib,
-                   guard_avail != KvBytes{} ? "" : " -- MemAvailable unreadable: fail closed");
+                   (double)pulsar_session_touched_kv_bytes(sess).raw() / gib,
+                   guard_discrete ? "device free" : "MemAvailable", (double)guard_avail.raw() / gib,
+                   (double)guard_floor.raw() / gib,
+                   guard_avail != KvBytes{} ? "" : " -- the headroom reading is unreadable: fail closed");
         guard_budget_said = b;
     }
     return b;
@@ -2043,8 +2044,9 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  * Tyler 2026-10-08: "Make the model behaviors match."  The spec lane's tokens a round over its round's cost
  * against the plain lane's decoders a step over its step's cost, one rule for every family.  Each lane's price
  * for the N decoders at hand, tokens/s, is
- *   - MEASURED where that lane has run at this N: the tokens it committed over its steps' wall, EW
- *     (lane_price::meas_*, reset when N moves);
+ *   - MEASURED where that lane has run at this N and depth band: the tokens it committed over its steps' wall, EW
+ *     (lane_price::meas_*, reset when N moves or the decoders' context leaves its band -- L338: a spec price
+ *     measured at 26K tokens, 67 tok/s, put the next short request on the plain lane at half its speed);
  *   - else PREDICTED from the engine's fits (pulsar_engine_lane_cost, one structure, step_ms = flat + row *
  *     rows) and the spec lane's measured yield per bank per round (lane_price::tau / rho):
  *         plain = N / plain_ms(N)
@@ -2182,6 +2184,16 @@ static double lane_price_measured(const lane_price *lp, int li, int n) {
     return 1000.0 * lp->meas_tok[li] / lp->meas_ms[li];
 }
 
+/* L338: the depth band a measured price holds for -- factors of 4 from 2K tokens ([0, 2K), [2K, 8K), [8K, 32K), ..):
+ * what a decode step costs moves with the context it attends, and a short request never leaves its band. */
+/// @param depth the decoders' mean frontier, tokens
+/// @return its band
+static int lane_depth_band(uint32_t depth) {
+    int b = 0;
+    for (uint32_t d = depth >> 11; d; d >>= 2) b++;
+    return b;
+}
+
 /* The priced lane (2 plain, 3 spec) for `n` decoders the spec lane could carry; called once a quantum.  The
  * fits' step counts (pulsar_lane_cost::n) time the hold and the probes.  Updates lp's prices and reason. */
 /// @param lp the lane prices (updated)
@@ -2189,9 +2201,17 @@ static double lane_price_measured(const lane_price *lp, int li, int n) {
 /// @param spec the spec lane's cost fit
 /// @param n decoders
 /// @param verify_rows the verify width
+/// @param depth the decoders' mean frontier, tokens (a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                           uint32_t verify_rows) {
+                           uint32_t verify_rows, uint32_t depth) {
+    const int band = lane_depth_band(depth);
+    if (band != lp->meas_depth) {   /* another context band: what was measured prices it no longer */
+        memset(lp->meas_tok, 0, sizeof lp->meas_tok);
+        memset(lp->meas_ms, 0, sizeof lp->meas_ms);
+        memset(lp->meas_steps, 0, sizeof lp->meas_steps);
+        lp->meas_depth = band;
+    }
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
         lp->lane = 3;
         lp->held_n0 = spec->n;
@@ -3697,6 +3717,17 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             }
             npend[i] = np;
         }
+        /* L338: the depth the round is priced (and observed) at -- its live banks' mean frontier */
+        {
+            uint64_t dsum = 0;
+            uint32_t dn = 0;
+            for (int i = 0; i < n; i++)
+                if (dec[i]->gen && dec[i]->gen->phase == GEN_DECODE) {
+                    dsum += (uint64_t)server_bank_pos(pool, (uint32_t)dec[i]->bank).raw();
+                    dn++;
+                }
+            pulsar_engine_verify_curve_depth(s->engine, dn ? (uint32_t)(dsum / dn) : 0u);
+        }
         bool overflow = false;
         int pick_cut =
             spec_pick_rows(s->engine, surv, npend, n, (int)n_live_w, (int)heads_max, k_alloc, &overflow, k_tok);
@@ -4771,6 +4802,8 @@ void *server_worker_main(void *arg) {
         pulsar_stall_mark("worker: scheduling");   /* the watchdog's heartbeat (pulsar_stall.h) */
         bool bound = false;
         while (s->worker_try_bind()) bound = true;
+        /* L338 P2.4: the judge's turn -- one chunk on its reserved bank between the decode quanta */
+        const bool judged = server_judge_step(s);
         /* L314: a preempted decoder whose KV fits again is reloaded -- once no queued prompt waits on KV (the prompt
          * it was preempted for binds first; readmitting ahead of it would only preempt it again) */
         {
@@ -4801,6 +4834,7 @@ void *server_worker_main(void *arg) {
             usleep(10000);   /* L314: only parked decoders, waiting for room: poll their readmission */
             continue;
         }
+        if (n_active == 0 && judged) continue;   /* L338 P2.4: the judge's next chunk before any wait */
         if (n_active == 0) {
             /* With every slot free, choose_slot_for_job never returns NULL
              * (provision_bank floor-gates only the SECOND bank onward, so an
@@ -4826,8 +4860,8 @@ void *server_worker_main(void *arg) {
             {
                 pulsar::ScopedLock lk(&s->mu);
                 had_head = s->head != NULL;
-                while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-                quit = !s->head && s->stopping;   /* read shared state under the lock */
+                while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+                quit = !s->head && !server_judge_queued(s) && s->stopping;   /* read shared state under the lock */
             }
             if (quit) break;
             /* A head that was already queued when nothing is active is a head
@@ -4901,7 +4935,10 @@ void *server_worker_main(void *arg) {
         if (spec_carries) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
-            priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows);
+            uint64_t dsum = 0;   /* L338: the decoders' mean frontier: the depth band the prices are measured in */
+            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
+            priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
+                                     (uint32_t)(dsum / (uint64_t)n_dec));
         }
         if (priced == 3 && n_batched > 0) {
             for (int i = 0; i < n_dec; i++)

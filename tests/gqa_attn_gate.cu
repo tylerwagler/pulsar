@@ -29,6 +29,8 @@
  *   8. store      (L298, every geometry) pulsar_gqa_store of the prompt's rows,
  *                 one call and calls of 1, 37, 64, 63, 200, == the prefill's
  *                 pool, byte-identical (a window's ring wraps).
+ * L338, Gemma 4's wide heads: a 16q/8kv/256 window layer (NeoX rope 1e4) and a 16q/2kv/512 global layer with the
+ * proportional rope (a per-pair table, 192 of 256 pairs at frequency 0), both at scale 1 -- the whole battery above.
  * L298, the block drafter's layer (32q/8kv/128, window, qk norm, NeoX rope base
  * 1e6): the whole battery above with rope on (the host's rope is its own
  * transcription of the HF / vLLM bf16 arithmetic; the mutations 'no rope' and
@@ -109,6 +111,8 @@ struct Case {
     double in_sd = 1.0;      /* raw q / k scale */
     uint16_t *d_qw = nullptr, *d_kw = nullptr, *d_P = nullptr;
     uint64_t ld = 0, off_k = 0, off_v = 0, off_r = 0, off_g = 0;   /* the fused input row */
+    /* L338: a case's own fidelity bars (0 = the battery's), each with its reason -- Gemma 4 at its own softmax scale 1 */
+    double bar_fro = 0, bar_max = 0;
 };
 
 static void upload_bf(uint16_t **d, const std::vector<float> &h) {
@@ -167,6 +171,11 @@ static uint64_t g_ws_bytes = 0;
 /* L296 perf: 0 = pulsar_gqa_forward; else the two halves -- pulsar_gqa_plan bounded at g_bound, the descriptors
  * uploaded here, pulsar_gqa_launch (what a captured step does) */
 static uint32_t g_bound = 0;
+/* L338: the next calls' rows are DECODE rows (pulsar_gqa_io::decode_rows): run_schedule's one-width schedules up to
+ * 16 rows (decodes, verifies) and the batched decode of 16 sequences -- a prompt's chunks stay prompt chunks */
+static bool g_decode_call = false;
+/* L338: rows a flash-decoding CTA attends (pulsar_gqa_io::decode_group) for the decode calls */
+static int g_decode_group = 1;
 /* f(i) for i in [0, n) on up to 16 host threads */
 template <class F> static void par_for(uint32_t n, F f) {
     const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
@@ -207,6 +216,8 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
     std::vector<pulsar_gqa_seq> ss(seqs.size());
     for (size_t i = 0; i < seqs.size(); i++) ss[i] = {seqs[i]->kv, seqs[i]->bytes, seqs[i]->cap};
     pulsar_gqa_io io{};
+    io.decode_rows = g_decode_call ? 1 : 0;   /* L338: the call's row kind (run_schedule's one-row decodes) */
+    io.decode_group = g_decode_group;
     io.q = {d_in, C.ld, C.R.hd};
     io.k = {d_in + C.off_k, C.ld, C.R.hd};
     io.v = {d_in + C.off_v, C.ld, C.R.hd};
@@ -254,6 +265,9 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
 
 /* a run of consecutive rows of one sequence in calls of the given sizes (the last repeats) */
 static std::vector<Out> run_schedule(const Case &C, Seq &s, uint32_t p0, uint32_t p1, const std::vector<uint32_t> &sizes) {
+    const bool was = g_decode_call;
+    g_decode_call = sizes.size() == 1 && sizes[0] <= 16u;   /* a decode / verify width a call: decode rows */
+    struct restore { bool w; ~restore() { g_decode_call = w; } } r_{was};
     std::vector<Out> all;
     std::vector<Seq *> v{&s};
     uint32_t p = p0, k = 0;
@@ -301,6 +315,27 @@ static bool same(const Out &a, const Out &b) {
 }
 static uint32_t first_diff(const std::vector<Out> &a, const std::vector<Out> &b, uint32_t off_b = 0) {
     for (uint32_t i = 0; i < b.size(); i++) if (!same(a[off_b + i], b[i])) return i;
+    return UINT32_MAX;
+}
+/* L338: the wide heads' (256, 512) decode-shaped calls run the flash-decoding arm (gqa_decode_kernel: the scores and
+ * P V on the CUDA cores in f32), not the MMA tile's bytes -- Tyler 2026-11-02 took the speed over decode == prefill
+ * bytes for them.  Where a check compares that arm with the MMA tile's it is graded: every element of the f32 tap
+ * within 2^-12 of the row's largest |value| (f32 accumulation in another order: ~1e-6), and the decode rows are graded
+ * against the reference on the prefill's bars.  Every other head width keeps its bit-exact checks. */
+static bool g_flashdec = false;
+static bool close_rows(const Out &a, const Out &b) {
+    if (a.tap.size() != b.tap.size()) return false;
+    float mx = 0.f, d = 0.f;
+    for (size_t i = 0; i < a.tap.size(); i++) {
+        mx = std::max(mx, std::fabs(a.tap[i]));
+        d = std::max(d, std::fabs(a.tap[i] - b.tap[i]));
+    }
+    return d <= mx * (1.0f / 4096.0f);
+}
+/* the decode arm's rows against the MMA tile's: bit-exact, or (g_flashdec) close_rows */
+static bool dec_match(const Out &a, const Out &b) { return g_flashdec ? close_rows(a, b) : same(a, b); }
+static uint32_t dec_diff(const std::vector<Out> &a, const std::vector<Out> &b, uint32_t off_b = 0) {
+    for (uint32_t i = 0; i < b.size(); i++) if (!dec_match(a[off_b + i], b[i])) return i;
     return UINT32_MAX;
 }
 static bool pools_equal(const Case &C, const Seq &a, const Seq &b, uint32_t upto) {
@@ -391,6 +426,9 @@ static Grade grade(const Case &C, const History &H, const std::vector<uint32_t> 
 }
 
 static const double BAR_FRO = 2e-5, BAR_MAX = 2e-4, BAR_EQ = 0.99;
+/// The case's fidelity bars (Case::bar_fro / bar_max, else the battery's).
+static double bar_fro(const Case &C) { return C.bar_fro > 0 ? C.bar_fro : BAR_FRO; }
+static double bar_max(const Case &C) { return C.bar_max > 0 ? C.bar_max : BAR_MAX; }
 
 /* the mean over rows / heads of the largest attention weight (fixture liveness) */
 static double mean_peak(const Case &C, const History &H, const std::vector<uint32_t> &p_list) {
@@ -438,6 +476,7 @@ static void run_case(Case &C) {
            C.R.gate ? "on" : "off", C.R.rope_theta, C.R.e4m3 ? "E4M3" : "BF16",
            (unsigned long long)pulsar_gqa_kv_token_bytes(&C.L), C.N);
     const uint32_t N = C.N;
+    g_flashdec = C.R.hd > 128u;
     History H;
     history_build(C, 1, N, H);
 
@@ -450,18 +489,28 @@ static void run_case(Case &C) {
     for (uint32_t p = 0; p < N; p++) { all[p] = p; gp[p] = &pre[p]; }
     const Grade G = grade(C, H, all, gp);
     printf("  reference rms %.4f, mean peak attention weight %.3f\n", G.rms, mean_peak(C, H, all));
-    check(G.fro <= BAR_FRO && G.max <= BAR_MAX && G.eq >= BAR_EQ,
+    check(G.fro <= bar_fro(C) && G.max <= bar_max(C) && G.eq >= BAR_EQ,
           "fidelity (prefill, %u rows, graded): fro %.2e (bar %.0e), max %.2e (bar %.0e), bf16 out == bf16(ref) %.4f (bar %.2f)",
-          N, G.fro, BAR_FRO, G.max, BAR_MAX, G.eq, BAR_EQ);
+          N, G.fro, bar_fro(C), G.max, bar_max(C), G.eq, BAR_EQ);
 
     /* 2. decode */
     {
         Seq B = seq_new(C, 1);
         std::vector<Out> dec = run_schedule(C, B, 0, N, {1});
-        const uint32_t d = first_diff(pre, dec);
+        const uint32_t d = dec_diff(pre, dec);
         check(dec.size() == N && d == UINT32_MAX && pools_equal(C, A, B, N),
-              "decode: %u one-row calls == the prefill (out, tap, pool), bit-exact%s", N,
+              "decode: %u one-row calls == the prefill (out, tap, pool), %s%s", N,
+              g_flashdec ? "the flash-decoding arm: tap within 2^-12 of the row's max, pools bit-exact" : "bit-exact",
               d == UINT32_MAX ? "" : " -- first difference at a row");
+        if (g_flashdec && dec.size() == N) {
+            std::vector<const Out *> gd(N);
+            for (uint32_t p = 0; p < N; p++) gd[p] = &dec[p];
+            const Grade GD = grade(C, H, all, gd);
+            check(GD.fro <= bar_fro(C) && GD.max <= bar_max(C) && GD.eq >= BAR_EQ,
+                  "fidelity (one-row decodes on the flash-decoding arm, %u rows, graded): fro %.2e (bar %.0e), max %.2e "
+                  "(bar %.0e), bf16 out == bf16(ref) %.4f (bar %.2f)", N, GD.fro, bar_fro(C), GD.max, bar_max(C), GD.eq,
+                  BAR_EQ);
+        }
         seq_free(B);
     }
     /* 2b. L296 perf: the bounded halves (plan at a bound past every position, launch from uploaded descriptors) --
@@ -472,10 +521,10 @@ static void run_case(Case &C) {
         std::vector<Out> dec = run_schedule(C, B, 0, N, {1});
         std::vector<Out> ch = run_schedule(C, D, 0, N, {1, 37, 64, 63, 200});
         g_bound = 0;
-        check(dec.size() == N && first_diff(pre, dec) == UINT32_MAX && pools_equal(C, A, B, N) && ch.size() == N &&
+        check(dec.size() == N && dec_diff(pre, dec) == UINT32_MAX && pools_equal(C, A, B, N) && ch.size() == N &&
               first_diff(pre, ch) == UINT32_MAX && pools_equal(C, A, D, N),
               "bounded (ctx_bound %u): one-row calls and calls of 1, 37, 64, 63, 200 rows planned + launched == the "
-              "forward's prefill, bit-exact", N + 300u);
+              "forward's prefill, %s", N + 300u, g_flashdec ? "the one-row calls graded (flash-decoding)" : "bit-exact");
         seq_free(B);
         seq_free(D);
     }
@@ -494,12 +543,89 @@ static void run_case(Case &C) {
         std::vector<Out> v = run_schedule(C, B, 0, N0, {N0});
         bool ok = v.size() == N0;
         uint32_t p = N0;
+        std::vector<Out> v_runs;   /* every run's rows, in order (the CTA-shape comparison below) */
+        if (g_flashdec) {   /* the reference: flash-decoding, one row x one head a CTA */
+            pulsar_gqa_decode_arm_force(1);
+            pulsar_gqa_decode_force(1, 1);
+        }
         for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
             std::vector<Out> o = run_schedule(C, B, p, p + k, {k});
-            ok = ok && o.size() == k && first_diff(pre, o, p) == UINT32_MAX;
+            ok = ok && o.size() == k && dec_diff(pre, o, p) == UINT32_MAX;   /* decode rows (g_flashdec: graded) */
+            v_runs.insert(v_runs.end(), o.begin(), o.end());
             p += k;
         }
-        check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, bit-exact", N0);
+        pulsar_gqa_decode_force(0, 0);
+        pulsar_gqa_decode_arm_force(0);
+        check(ok && pools_equal(C, A, B, N), "verify: runs of 2, 3, 4, 5, 6, 16 rows after a %u-row prefill == the prefill, "
+              "%s", N0, g_flashdec ? "graded (decode rows: flash-decoding), pools bit-exact" : "bit-exact");
+        /* L338: the same runs at every flash-decoding CTA shape (rows x heads of a KV head: one sequence's keys loaded
+         * once for its rows, a KV head's keys once for its heads) == one row x one head a CTA, byte for byte */
+        const int shapes[4][2] = {{1, 2}, {1, 4}, {2, 2}, {0, 0}};
+        const uint32_t G = C.R.n_q / C.R.n_kv;
+        for (const auto &sh : shapes) {
+            if (!g_flashdec || (sh[1] && G % (uint32_t)sh[1] != 0u)) continue;
+            Seq Bg = seq_new(C, 1);
+            run_schedule(C, Bg, 0, N0, {N0});
+            pulsar_gqa_decode_force(sh[0], sh[1]);
+            pulsar_gqa_decode_arm_force(1);   /* the flash arm's shapes (its own pick at {0, 0}) */
+            g_decode_group = 4;
+            bool gok = true;
+            uint32_t q = N0, k0 = 0;
+            for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
+                std::vector<Out> o = run_schedule(C, Bg, q, q + k, {k});
+                gok = gok && o.size() == k;
+                for (uint32_t i = 0; gok && i < k; i++) gok = same(o[i], v_runs[k0 + i]);
+                q += k;
+                k0 += k;
+            }
+            g_decode_group = 1;
+            pulsar_gqa_decode_force(0, 0);
+            pulsar_gqa_decode_arm_force(0);
+            if (sh[0]) check(gok && pools_equal(C, B, Bg, N), "verify at a CTA of %d row(s) x %d head(s): every run's rows "
+                             "byte-identical to one x one, pools bit-exact", sh[0], sh[1]);
+            else check(gok && pools_equal(C, B, Bg, N), "verify at flash-decoding's own CTA shape (a verify's group of "
+                       "4): byte-identical to one x one, pools bit-exact");
+            seq_free(Bg);
+        }
+        /* L338: the tensor-core decode arm (a G = 8k layer): every verify run's rows byte-identical to the same rows
+         * decoded one at a time on it (a verify's rows and a plain decode's are its bytes alike), graded against the
+         * flash-decoding reference, pools bit-exact */
+        if (g_flashdec && G % 8u == 0u) {
+          for (int grp : {2, 4}) {
+            Seq Bm = seq_new(C, 1), Bd = seq_new(C, 1);
+            run_schedule(C, Bm, 0, N0, {N0});
+            run_schedule(C, Bd, 0, N0, {N0});
+            pulsar_gqa_decode_arm_force(2);
+            g_decode_group = grp;
+            bool same_ok = true, graded = true;
+            uint32_t q = N0, k0 = 0;
+            for (uint32_t k : {2u, 3u, 4u, 5u, 6u, 16u, 1u}) {
+                std::vector<Out> o = run_schedule(C, Bm, q, q + k, {k});
+                std::vector<Out> d1;
+                g_decode_group = 1;   /* the plain decode's one row a CTA */
+                for (uint32_t i = 0; i < k; i++) {
+                    std::vector<Out> one = run_schedule(C, Bd, q + i, q + i + 1, {1});
+                    d1.insert(d1.end(), one.begin(), one.end());
+                }
+                g_decode_group = grp;
+                same_ok = same_ok && o.size() == k && d1.size() == k;
+                for (uint32_t i = 0; same_ok && i < k; i++) {
+                    same_ok = same(o[i], d1[i]);
+                    graded = graded && close_rows(o[i], v_runs[k0 + i]);
+                }
+                q += k;
+                k0 += k;
+            }
+            g_decode_group = 1;
+            pulsar_gqa_decode_arm_force(0);
+            check(same_ok && pools_equal(C, B, Bm, N) && pools_equal(C, Bm, Bd, N),
+                  "verify on the tensor-core decode arm, up to %d rows a CTA: every run's rows byte-identical to the "
+                  "same rows decoded one at a time, pools bit-exact", grp);
+            check(graded, "the tensor-core decode arm's rows within 2^-12 of each row's max of flash-decoding's");
+            seq_free(Bm);
+            seq_free(Bd);
+          }
+        }
         seq_free(B);
     }
     /* 5. rollback of a junk verify */
@@ -515,7 +641,9 @@ static void run_case(Case &C) {
             for (uint32_t i = 0; i < 6; i++) rows.push_back({0u, N0 + i});
             run_call(C, v, rows, nullptr, true);                     /* the junk verify ... */
             std::vector<Out> o = run_schedule(C, B, N0, N, {3, 1}); /* ... rolled back to N0 */
-            const bool match = o.size() == N - N0 && first_diff(pre, o, N0) == UINT32_MAX;
+            bool match = o.size() == N - N0;   /* the 3-row call bit-exact; the one-row calls after it dec_match */
+            for (uint32_t i = 0; match && i < o.size(); i++)
+                match = i < 3u ? same(pre[N0 + i], o[i]) : dec_match(pre[N0 + i], o[i]);
             if (pass == 0) check(match, "rollback: a 6-row junk verify, rolled back, == the prefill (ring of %u = window - 1 + 16), bit-exact", C.cap);
             else check(!match, "rollback negative control: on a ring of exactly the window (%u) the same rollback differs", C.cap);
             seq_free(B);
@@ -538,12 +666,32 @@ static void run_case(Case &C) {
         std::vector<std::pair<uint32_t, uint32_t>> rows;
         for (uint32_t s = 0; s < NS; s++) { xs.push_back(&X[s]); rows.push_back({s, len[s]}); }
         std::vector<Out> bat;
+        g_decode_call = true;    /* one decode row of each of 16 sequences */
         ok = run_call(C, xs, rows, &bat) == 0;
+        g_decode_call = false;
         for (uint32_t s = 0; s < NS && ok; s++) {
             std::vector<Out> one = run_schedule(C, Y[s], len[s], len[s] + 1, {1});
             ok = one.size() == 1 && same(one[0], bat[s]);
         }
         check(ok, "batching: 16 decode rows of 16 sequences in one call == each alone, bit-exact");
+        if (g_flashdec) {   /* L338: the same 16 rows at decode group 4: sequences of their own, each loads its keys */
+            std::vector<Seq> Z(NS);
+            std::vector<Seq *> zs;
+            for (uint32_t s = 0; s < NS; s++) {
+                Z[s] = seq_new(C, 100 + s);
+                run_schedule(C, Z[s], 0, len[s], {len[s]});
+                zs.push_back(&Z[s]);
+            }
+            std::vector<Out> bat4;
+            g_decode_call = true;
+            g_decode_group = 4;   /* rows grouped a CTA (flash 2 x 2, or the tensor-core arm's 4 in per-sequence passes) */
+            bool gok = run_call(C, zs, rows, &bat4) == 0 && bat4.size() == bat.size();
+            g_decode_group = 1;
+            g_decode_call = false;
+            for (uint32_t s = 0; gok && s < NS; s++) gok = same(bat4[s], bat[s]);
+            check(gok, "batching with rows grouped a CTA (16 sequences, no keys shared): == one row a CTA, bit-exact");
+            for (uint32_t s = 0; s < NS; s++) seq_free(Z[s]);
+        }
         /* the folded schedule: sequence 0 runs 70 rows, 1..5 one row each */
         rows.clear(); xs.clear();
         for (uint32_t s = 0; s < 6; s++) xs.push_back(&X[s]);
@@ -551,10 +699,10 @@ static void run_case(Case &C) {
         for (uint32_t s = 1; s < 6; s++) rows.push_back({s, len[s] + 1u});
         ok = run_call(C, xs, rows, &bat) == 0;
         std::vector<Out> r0 = run_schedule(C, Y[0], len[0] + 1u, len[0] + 71u, {7});
-        for (uint32_t i = 0; i < 70 && ok; i++) ok = same(r0[i], bat[i]);
+        for (uint32_t i = 0; i < 70 && ok; i++) ok = dec_match(r0[i], bat[i]);   /* 7-row calls: decode rows */
         for (uint32_t s = 1; s < 6 && ok; s++) {
             std::vector<Out> one = run_schedule(C, Y[s], len[s] + 1, len[s] + 2, {1});
-            ok = one.size() == 1 && same(one[0], bat[70 + s - 1]);
+            ok = one.size() == 1 && dec_match(one[0], bat[70 + s - 1]);
         }
         check(ok, "batching: a 70-row run + 5 decode rows in one (folded) call == each alone in 7-row / 1-row calls, bit-exact");
         for (uint32_t s = 0; s < NS; s++) { seq_free(X[s]); seq_free(Y[s]); }
@@ -568,7 +716,7 @@ static void run_case(Case &C) {
         for (auto &m : ms) {
             if (!m.applies) continue;
             const Grade M = grade(C, H, all, gp, m.mu);
-            check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX,
+            check(M.fro >= 20 * bar_fro(C) || M.max >= 20 * bar_max(C),
                   "mutation '%s' fails the grade: fro %.2e, max %.2e", m.what, M.fro, M.max);
         }
         kv_mutations(C, 1, N, 0, 0, all, gp, "");
@@ -637,7 +785,7 @@ static void kv_mutations(const Case &C, uint64_t sid, uint32_t n, uint32_t from,
         History Hm;
         history_build(C, sid, n, Hm, from, rows_from, m.mu);
         const Grade M = grade(C, Hm, pl, gp, m.mu);
-        check(M.fro >= 20 * BAR_FRO || M.max >= 20 * BAR_MAX, "mutation '%s'%s fails the grade: fro %.2e, max %.2e",
+        check(M.fro >= 20 * bar_fro(C) || M.max >= 20 * bar_max(C), "mutation '%s'%s fails the grade: fro %.2e, max %.2e",
               m.what, where, M.fro, M.max);
     }
 }
@@ -932,6 +1080,10 @@ static void run_refusals(Case &C, Case &Rp) {
     L = C.L;
     L.n_kv = 3; expect("n_q not a multiple of n_kv", L, {{0, 0}});
     L = C.L; L.head_dim = 96; expect("head_dim 96 (no built tile)", L, {{0, 0}});
+    /* L338: the wide heads are built for plain attention */
+    L = C.L; L.head_dim = 256; expect("head_dim 256 with a relative bias (the wide heads have none)", L, {{0, 0}});
+    L = Rp.L; L.head_dim = 512; L.out_gate = 1; expect("head_dim 512 with an output gate", L, {{0, 0}});
+    L = Rp.L; L.head_dim = 512; L.block = 1; expect("head_dim 512 with a block run", L, {{0, 0}});
     L = C.L; L.rel_dim = 32; expect("rel_dim 32", L, {{0, 0}});
     L = C.L; L.qk_norm = 1; L.q_norm_w = nullptr; expect("qk_norm without its weight", L, {{0, 0}});
     L = C.L; L.window = 5000; L.span = PULSAR_GQA_WINDOW; expect("a ring smaller than the window", L, {{0, 0}});
@@ -1069,6 +1221,46 @@ int main(int argc, char **argv) {
     run_case(g2);
     run_case(g3);
     run_case(g4);
+
+    /* L338: Gemma 4's WIDE heads -- the 256 / 512 tiles (S in 128-dim passes, O in 128-dim slices), q and k RMS-normed
+     * with weights (eps 1e-6), no bias / temperature / gate; each geometry TWICE:
+     *   at 1 / sqrt(head_dim) against the battery's bars -- the kernel's accuracy (measured 2026-11-01, RTX 5000: fro
+     *   7.2e-6 / 9.6e-6, max 2.5e-5 / 3.5e-5);
+     *   at Gemma 4's own softmax scale 1 against bars that are the logits' -- unit-RMS q and k at scale 1 make logits
+     *   16 / 23 x larger, and f32 rounding of q . k and of the softmax grows with them: measured fro 2.7e-5 / 5.5e-5, max
+     *   1.2e-3 / 1.7e-3, below one bf16 output step (2^-8 = 3.9e-3), the bf16 output == bf16(reference) on 99.9 / 99.8 %
+     *   (the battery's 0.99 bar unchanged).  Bars there: fro 1e-4, max 4e-3 (one bf16 step).  The window layer: 16q/8kv/256, NeoX
+     * rope base 1e4 (Gemma's window is 1024; 300 here runs the battery cheaply -- the span is the same mechanism).
+     * The global layer: 16q/2kv/512 (G = 8), FULL, the PROPORTIONAL rope -- 64 of the 256 pairs rotate at
+     * 1e6^(-2p/512), the other 192 carry inverse frequency 0 (an exact identity: cos 1, sin 0) -- as a per-pair table */
+    Case gw, gg;
+    case_init(gw, "gemma4-window256-rope", 16, 8, 256, 300, 300 + 15, true, 0, 0.f, 0.f, false, 1.0f, N, 338);
+    gw.R.rope_theta = 1e4f; gw.L.rope_theta = 1e4f;
+    case_init(gg, "gemma4-global512-proprope", 16, 2, 512, 0, N + 64, true, 0, 0.f, 0.f, false, 1.0f, N, 339);
+    gg.R.rope_theta = 1e6f; gg.L.rope_theta = 1e6f;
+    {
+        gg.R.inv_freq.assign(256, 0.0f);
+        for (uint32_t i = 0; i < 64; i++) gg.R.inv_freq[i] = (float)(1.0 / pow(1e6, (double)(2u * i) / 512.0));
+        float *d_inv = nullptr;
+        CK(cudaMalloc(&d_inv, 256 * sizeof(float)));
+        CK(cudaMemcpy(d_inv, gg.R.inv_freq.data(), 256 * sizeof(float), cudaMemcpyHostToDevice));
+        gg.L.rope_inv_freq = d_inv;
+    }
+    gw.bar_fro = gg.bar_fro = 1e-4;
+    gw.bar_max = gg.bar_max = 4e-3;
+    run_case(gw);
+    run_case(gg);
+    Case gw1, gg1;   /* at 1 / sqrt(head_dim): the battery's bars */
+    case_init(gw1, "gemma4-window256-rope@1/sqrt(hd)", 16, 8, 256, 300, 300 + 15, true, 0, 0.f, 0.f, false, 1.0f / 16.0f, N,
+              338);
+    gw1.R.rope_theta = 1e4f; gw1.L.rope_theta = 1e4f;
+    case_init(gg1, "gemma4-global512-proprope@1/sqrt(hd)", 16, 2, 512, 0, N + 64, true, 0, 0.f, 0.f, false,
+              1.0f / sqrtf(512.f), N, 339);
+    gg1.R.rope_theta = 1e6f; gg1.L.rope_theta = 1e6f;
+    gg1.R.inv_freq = gg.R.inv_freq;
+    gg1.L.rope_inv_freq = gg.L.rope_inv_freq;
+    run_case(gw1);
+    run_case(gg1);
 
     Case gl;
     const uint32_t P0 = 131000;

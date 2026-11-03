@@ -58,10 +58,21 @@ void out_parser::init(const out_grammar *g, out_call_body *body, out_state initi
     reasoning_.clear();
     content_.clear();
     calls_.clear();
+    prefix_held_.clear();
+    prefix_done_ = !g->reasoning_prefix;
 }
 
 void out_parser::send(bool reasoning, std::string &&text, std::vector<out_event> *ev) {
     if (text.empty()) return;
+    if (reasoning && !prefix_done_) {   /* L338: the grammar's reasoning label, dropped once */
+        prefix_held_ += text;
+        const std::string pre = g_->reasoning_prefix;
+        if (prefix_held_.size() < pre.size() && !pre.compare(0, prefix_held_.size(), prefix_held_)) return;
+        prefix_done_ = true;
+        text = !prefix_held_.compare(0, pre.size(), pre) ? prefix_held_.substr(pre.size()) : std::move(prefix_held_);
+        prefix_held_.clear();
+        if (text.empty()) return;
+    }
     (reasoning ? reasoning_ : content_) += text;
     out_event e;
     e.kind = reasoning ? out_event::REASONING : out_event::CONTENT;

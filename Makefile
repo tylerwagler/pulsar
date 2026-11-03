@@ -170,7 +170,7 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
-                src/lib/inkling_chat.o src/lib/nemotron_chat.o
+                src/lib/inkling_chat.o src/lib/nemotron_chat.o src/lib/chat_render_kit.o src/lib/gemma4_chat.o src/lib/gemma4_output.o
 CORE_OBJS = $(ENGINE_OBJS) $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) src/lib/pulsar_json.o $(FRONTEND_OBJS) $(TP_OBJS)
 # L303: grammar-constrained decoding.  xgrammar's C++ core is vendored VERBATIM under src/vendor/xgrammar (the pin
 # and the copy recipe: src/vendor/xgrammar/UPSTREAM), so a refresh is a copy.  Its flags are confined to it and to
@@ -294,7 +294,7 @@ pulsar-agent: $(AGENT_OBJS) src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/li
 CUDA_REGRESSION_BINS = tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate \
                        tests/exl3_moe_epilogue_gate tests/exl3_dense_gate tests/exl3_moe_prefill_gate tests/exl3_half_gate \
                        tests/gdn_gate tests/qsa_attn_gate tests/qsa_yarn_test tests/qwen_s4_gate tests/router_gate tests/gqa_attn_gate tests/sconv_gate tests/head_gate \
-                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate \
+                       tests/bf16_rows_gate tests/nvfp4_rows_gate tests/mamba2_gate tests/rowops_gate tests/lora_rows_gate tests/arch_gate tests/pool_gate tests/f16_rows_gate tests/fmha_gate \
                        tests/kernel_contract_gate
 # 2026-10-14: they run CONCURRENTLY, each one's output kept together (-O).  They are model-free and mostly
 # host-bound (their references run on the CPU: measured alone, 258 s in series, the longest 114 s of which 113 s
@@ -814,6 +814,15 @@ tests/rowops_gate: tests/rowops_gate.cu tests/sconv_ref.h src/cuda/pulsar_cuda_r
 .PHONY: rowops-gate
 rowops-gate: tests/rowops_gate
 	./tests/rowops_gate
+# L338: the runtime LoRA primitive (pulsar_rows_lora_launch) against the f64 reference at Gemma 4's shapes; row
+# independence, determinism, the padded pitches untouched, refusals.  Model-free.
+tests/lora_rows_gate: tests/lora_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o src/cuda/pulsar_cuda_lt_fixed.o \
+                      src/cuda/pulsar_cuda_f16_rows.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lora_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o \
+	    src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
+.PHONY: lora-rows-gate
+lora-rows-gate: tests/lora_rows_gate
+	./tests/lora_rows_gate
 
 # The same on the Inkling-Small mini against its transformers fp32 capture: the embedding
 # norm, and the 1/16 logit scale + padding on the head's unscaled f32 output.
@@ -1145,6 +1154,29 @@ inkling-family-gate: tests/inkling_family_gate tests/loader_open
 	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
 	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
+# L338 E2: the Gemma 4 family's load on a built container (tests/gemma4_family_gate.cpp): every tensor bound by its
+# bind record, every byte priced, the plan (PULSAR_FFN_DENSE_MOE), the stored widths, the facts, the session refusals;
+# then the loader contract's neutral faults on it.  Host-only.  The container: tools/container/build.py emit --hf <the
+# BF16 checkpoint> --exl3 <its exllamav3 1.6.5 K4 pack> --recipe format-maps/gemma4-exl3-k4.json --all (L338 E1).
+GEMMA4_GATE_MODEL ?= $(call need_path,GEMMA4_GATE_MODEL)
+.PHONY: gemma4-family-gate
+gemma4-family-gate: tests/gemma4_family_gate tests/loader_open
+	./tests/gemma4_family_gate $(GEMMA4_GATE_MODEL)
+	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(GEMMA4_GATE_MODEL)
+# L338 P2.3: the runtime JEV adapter on a container built with --adapter jev (tests/gemma4_jev_gate.cpp): the bank
+# switch, every decision prompt synced on an adapter bank, reuse == cold, the plain bank untouched; then the decision
+# head on the captured hidden rows against the BF16 reference (tests/gemma4/jev_grade.py).  Needs the full model (the
+# RTX 6000).  GEMMA4_JEV_REF = decision_ref.pt (L338 P0), GEMMA4_JEV_SNAP = the JEV snapshot (head + calibration).
+GEMMA4_JEV_MODEL ?= $(call need_path,GEMMA4_JEV_MODEL)
+GEMMA4_JEV_REF ?= $(call need_path,GEMMA4_JEV_REF)
+GEMMA4_JEV_SNAP ?= $(call need_path,GEMMA4_JEV_SNAP)
+GEMMA4_JEV_WORK ?= /tmp/gemma4-jev
+.PHONY: gemma4-jev-gate
+gemma4-jev-gate: tests/gemma4_jev_gate
+	mkdir -p $(GEMMA4_JEV_WORK)
+	python3 tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
+	./tests/gemma4_jev_gate $(GEMMA4_JEV_MODEL) $(GEMMA4_JEV_WORK)/cases.bin $(GEMMA4_JEV_WORK)/out.bin
+	python3 tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
 # L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
 # every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
@@ -1333,7 +1365,7 @@ inkling-chat-gate: tests/inkling_chat_gate
 # parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
 # tokenizer files and the L216 corpus.
 NEMOTRON_TOK_DIR ?= $(call need_path,NEMOTRON_TOK_DIR)
-NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/qwen_output.cpp \
+NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/chat_render_kit.cpp src/lib/qwen_output.cpp \
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
                           src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/qwen_chat.h \
@@ -1356,6 +1388,23 @@ tests/nemotron_enc_tok_gate: tests/nemotron_enc_tok_gate.cpp tests/bpe_gate_util
 .PHONY: nemotron-enc-tok-gate
 nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
 	./tests/nemotron_enc_tok_gate --tok $(NEMOTRON_ENC_TOK_DIR) --vectors tests/test-vectors/nemotron_enc --calib $(QWEN_CALIB)
+
+# L338: the Gemma 4 frontend -- the shared BPE engine's SentencePiece-BPE row (Replace(' ' -> U+2581), one piece a run,
+# a symbol per character with <0xXX> byte fallback) graded against HF tokenizers (T1-T6), the renderer of the
+# checkpoint's chat_template.jinja against transformers' apply_chat_template (R1 hand cases, R2 the L216 corpus) and the
+# turn-by-turn front's composition (C1); goldens from tests/gemma4/gen_tok_goldens.py and gen_render_goldens.py.
+# Model-free; GEMMA4_TOK_DIR holds the checkpoint's tokenizer.json + generation_config.json (the container's copies).
+GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
+GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/gemma4_chat.cpp src/lib/gemma4_output.cpp \
+                   src/lib/chat_render_kit.cpp src/lib/out_parse_kit.cpp
+tests/gemma4_chat_gate: tests/gemma4_chat_gate.cpp tests/bpe_gate_util.h $(GEMMA4_CHAT_SRCS) src/lib/bpe_tokenizer.h \
+                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
+                        src/lib/chat_refuse.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_chat_gate.cpp $(GEMMA4_CHAT_SRCS)
+.PHONY: gemma4-chat-gate
+gemma4-chat-gate: tests/gemma4_chat_gate
+	./tests/gemma4_chat_gate --tok $(GEMMA4_TOK_DIR) --vectors tests/test-vectors/gemma4 --calib $(QWEN_CALIB) \
+	    --cases $(QWEN_RENDER_CASES)
 
 # The attention layout table gate (two profiles, one engine) -- HOST ONLY.  The
 # table is a pure function of the artifact's declared metadata, so both profiles'
@@ -1806,7 +1855,7 @@ CONTAINER_V41_EXL3 ?= $(call need_path,CONTAINER_V41_EXL3)
 container-tests:
 	cd tools/container && export PULSAR_SERVED='$(CONTAINER_SERVED)' PULSAR_HF_SNAPSHOT='$(CONTAINER_VEXP_HF)' \
 	  PULSAR_V41_SNAPSHOT='$(CONTAINER_V41_HF)' PULSAR_V41_EXL3='$(CONTAINER_V41_EXL3)' && \
-	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py; do \
+	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
@@ -3384,6 +3433,24 @@ tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/
                              src/engine/pulsar_engine_internal.h src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+# L338: the f16 m16n8k16 MMA's sm_75 body (two m16n8k8) graded against the exact product and the k16 instruction --
+# model-free, on an sm_80+ card (it refuses below: the k16 instruction is the comparison).  The split is not the k16
+# instruction's bits (a numerics change on sm_75); both must hold 2^-21 * sum |terms| of exact.
+MMA_K8_ARCH ?= sm_120f
+tests/mma_k8_split_gate: tests/mma_k8_split_gate.cu src/cuda/pulsar_cuda_arch.cuh
+	$(NVCC) -O3 -gencode arch=compute_$(subst sm_,,$(MMA_K8_ARCH)),code=$(MMA_K8_ARCH) -o $@ $<
+.PHONY: mma-k8-split-gate
+mma-k8-split-gate: tests/mma_k8_split_gate
+	./tests/mma_k8_split_gate
+tests/gemma4_family_gate.o: tests/gemma4_family_gate.cpp src/families/gemma4/gemma4.h src/engine/role_bind.h \
+                            src/engine/pulsar_engine_internal.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/gemma4_family_gate: tests/gemma4_family_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/gemma4_jev_gate.o: tests/gemma4_jev_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
+tests/gemma4_jev_gate: tests/gemma4_jev_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/nemotron_family_gate.o: tests/nemotron_family_gate.cpp src/families/nemotron_h/nemotron_h.h src/engine/role_bind.h \
                               src/engine/pulsar_engine_internal.h src/pulsar.h

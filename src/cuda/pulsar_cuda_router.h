@@ -10,13 +10,15 @@
  *            accumulation per (row, logit) whatever the batch width.  A family whose router weight takes another
  *            format computes its logits through the format front door (linear.cpp) instead.
  *   select   pulsar_router_select_launch, one warp per row:
- *              score     s_e = f(l_e) over the routed logits l_0..l_{E-1} (bf16-rounded first when the family's
- *                        decision is made on bf16 logits): softmax | sqrt(softplus) | sigmoid;
+ *              score     s_e = f(l_e) over the routed logits l_0..l_{E-1} -- each logit read times logit_scale
+ *                        (L338), then bf16-rounded when the family's decision is made on bf16 logits: softmax |
+ *                        sqrt(softplus) | sigmoid;
  *              pick      the top-k of s_e + bias_e (the selection bias, or the image-slot bias on a row whose token
  *                        id says it is an image slot) in the total order (descending, ties to the LOWER expert id,
  *                        torch.topk's order; a row whose s_e + bias_e is not all finite has no routing); or, on a
  *                        token-id table layer, the table's row for the token;
- *              weights   SUM: w_k = s_k / max(sum_k s_k, floor) * route_scale, the picks' UNBIASED scores;
+ *              weights   SUM: w_k = s_k / max(sum_k s_k, floor) * route_scale [* expert_scale[pick k], L338], the
+ *                        picks' UNBIASED scores;
  *                        LOGSIGMOID_SINKS: over the k picks' RAW logits and the S sink logits (rows E..E+S-1),
  *                        w_i = softmax_i(logsigmoid(a_i)) * route_scale * global_scale -- the last S of them gate
  *                        the S shared experts;
@@ -82,6 +84,10 @@ typedef struct pulsar_router_cfg {
     float sum_floor;        /**< RENORM_SUM: the denominator's floor */
     float route_scale;      /**< multiplies every routed weight (and, under the sink renormalisation, the sink
                              *  gammas; a SIGMOID gamma is the gate row's sigmoid alone) */
+    float logit_scale;      /**< L338: every logit the select reads (routed, sink, gate rows) is multiplied by it before
+                             *  scoring and before logits_bf16's rounding -- 1 for a router whose logits are its
+                             *  projection's; Gemma 4: hidden^-1/2, the router input's scalar carried across the linear
+                             *  projection (W (x c) = c (W x)).  Required: finite and > 0 (no default) */
 } pulsar_router_cfg;
 
 /** One layer's router tensors (device pointers; any may be NULL). */
@@ -96,6 +102,8 @@ typedef struct pulsar_router_layer {
     /** rows in `table` (> 0 when a table is bound) */
     int32_t table_rows;
     const float *global_scale;    /**< [1] multiplies the sink renormalisation's weights, or NULL */
+    const float *expert_scale;    /**< L338: [E] multiplies pick k's routed weight by expert_scale[its expert] after the
+                                   *  sum renormalisation (Gemma 4's per_expert_scale), or NULL; not with the sinks */
 } pulsar_router_layer;
 
 /** Logit rows a router reads per token: E, plus S when its shared experts are gated by logit rows. */

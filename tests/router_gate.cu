@@ -1,7 +1,7 @@
 /* L295 F2: the shared MoE router (src/cuda/pulsar_cuda_router.cu) against a double host reference, for every router
  * the engine declares -- Qwen3.8-Flash-Next's (pulsar_qwen_router_cfg), DeepSeek V4's through its tensor binding
  * (pulsar_gpu_router_select_batch_tensor: the correction bias, the vision image-slot bias, the hash-routed token
- * table), Inkling-Small's and Nemotron 3.5 Super's -- plus, when a fixture is given, Inkling's router on REAL router weights against
+ * table), Inkling-Small's, Nemotron 3.5 Super's and (L338) Gemma 4's (the logit scale, the per-expert scale) -- plus, when a fixture is given, Inkling's router on REAL router weights against
  * transformers' own InklingTopkRouter (tests/inkling_router_fixture.py).
  *
  *   A  logits: bf16 rows x bf16 weight rows (+ a tail) -> f32, vs double; a row's logits the same bytes at any T
@@ -76,6 +76,7 @@ struct host_layer {
     int32_t table_rows = 0;
     double global_scale = 1.0;
     bool has_global = false;
+    std::vector<float> expert_scale;   ///< L338: [E] per pick's weight after the sum renormalisation, or empty
 };
 struct host_route {
     std::vector<int32_t> sel;
@@ -90,7 +91,9 @@ static host_route host_select(const pulsar_router_cfg &c, const host_layer &l, c
     const int E = c.n_expert, K = c.top_k, S = c.shared_gate == PULSAR_ROUTER_SHARED_NONE ? 0 : c.n_shared;
     host_route r;
     std::vector<double> raw(E), p(E);
-    for (int e = 0; e < E; e++) raw[e] = c.logits_bf16 ? bf_round(lg[e]) : (double)lg[e];
+    /* the logit as the device reads it: times logit_scale in f32, then (logits_bf16) bf16-rounded */
+    auto logit = [&](int i) { const float x = lg[i] * c.logit_scale; return c.logits_bf16 ? bf_round(x) : (double)x; };
+    for (int e = 0; e < E; e++) raw[e] = logit(e);
     if (c.score == PULSAR_ROUTER_SCORE_SOFTMAX) {
         double m = -INFINITY, z = 0;
         for (int e = 0; e < E; e++) m = std::max(m, raw[e]);
@@ -138,7 +141,7 @@ static host_route host_select(const pulsar_router_cfg &c, const host_layer &l, c
         }
     }
     if (sinks) {
-        for (int j = 0; j < S; j++) v.push_back(c.logits_bf16 ? bf_round(lg[E + j]) : (double)lg[E + j]);
+        for (int j = 0; j < S; j++) v.push_back(logit(E + j));
         double m = -INFINITY, z = 0;
         for (double &a : v) { a = std::min(a, 0.0) - log1p(exp(-fabs(a))); m = std::max(m, a); }
         for (double &a : v) z += a = exp(a - m);
@@ -153,9 +156,13 @@ static host_route host_select(const pulsar_router_cfg &c, const host_layer &l, c
     double sum = 0;
     for (double a : v) sum += a;
     sum = std::max(sum, (double)c.sum_floor);
-    for (double a : v) r.w.push_back(c.weights_bf16 ? bf_round(a / sum * c.route_scale) : a / sum * c.route_scale);
+    for (size_t k = 0; k < v.size(); k++) {
+        double x = v[k] / sum * c.route_scale;
+        if (!l.expert_scale.empty()) x *= (double)l.expert_scale[r.sel[k]];
+        r.w.push_back(c.weights_bf16 ? bf_round(x) : x);
+    }
     for (int j = 0; j < S; j++) {
-        const double g = c.logits_bf16 ? bf_round(lg[E + j]) : (double)lg[E + j];
+        const double g = logit(E + j);
         r.gam.push_back(c.weights_bf16 ? bf_round(sigmoid(g)) : sigmoid(g));
     }
     return r;
@@ -179,6 +186,7 @@ static pulsar_router_cfg ds_contract(int E, int K) {
     c.n_expert = E; c.top_k = K; c.n_shared = 0; c.shared_gate = PULSAR_ROUTER_SHARED_NONE;
     c.score = PULSAR_ROUTER_SCORE_SQRT_SOFTPLUS; c.renorm = PULSAR_ROUTER_RENORM_SUM;
     c.logits_bf16 = false; c.weights_bf16 = false; c.sum_floor = 6.103515625e-5f; c.route_scale = 1.5f;
+    c.logit_scale = 1.0f;
     return c;
 }
 /* Inkling-Small's router (config.json + the vLLM / transformers references): 256 routed experts, top-6, sigmoid +
@@ -189,6 +197,7 @@ static pulsar_router_cfg inkling_cfg(void) {
     c.n_expert = 256; c.top_k = 6; c.n_shared = 2; c.shared_gate = PULSAR_ROUTER_SHARED_SINK;
     c.score = PULSAR_ROUTER_SCORE_SIGMOID; c.renorm = PULSAR_ROUTER_RENORM_LOGSIGMOID_SINKS;
     c.logits_bf16 = false; c.weights_bf16 = false; c.sum_floor = 0.0f; c.route_scale = 8.0f;
+    c.logit_scale = 1.0f;
     return c;
 }
 
@@ -201,6 +210,20 @@ static pulsar_router_cfg nemotron_contract(void) {
     c.n_expert = 512; c.top_k = 22; c.n_shared = 1; c.shared_gate = PULSAR_ROUTER_SHARED_NONE;
     c.score = PULSAR_ROUTER_SCORE_SIGMOID; c.renorm = PULSAR_ROUTER_RENORM_SUM;
     c.logits_bf16 = false; c.weights_bf16 = false; c.sum_floor = 0.0f; c.route_scale = 5.0f;
+    c.logit_scale = 1.0f;
+    return c;
+}
+
+/* Gemma 4 26B-A4B's router (L338; HF modeling_gemma4 Gemma4TextRouter): 128 routed experts, top-8, softmax over bf16
+ * logits (the bf16 projection's output, softmaxed in fp32), the picks renormalised by their sum, then each scaled by
+ * its expert's per_expert_scale; no shared expert.  The router input's hidden^-1/2 rides as the logit scale (W (x c) =
+ * c (W x)).  Stated here as the contract the family's declaration must meet. */
+static pulsar_router_cfg gemma4_contract(void) {
+    pulsar_router_cfg c{};
+    c.n_expert = 128; c.top_k = 8; c.n_shared = 0; c.shared_gate = PULSAR_ROUTER_SHARED_NONE;
+    c.score = PULSAR_ROUTER_SCORE_SOFTMAX; c.renorm = PULSAR_ROUTER_RENORM_SUM;
+    c.logits_bf16 = true; c.weights_bf16 = false; c.sum_floor = 0.0f; c.route_scale = 1.0f;
+    c.logit_scale = (float)(1.0 / sqrt(2816.0));
     return c;
 }
 
@@ -259,15 +282,17 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
           *dp = (float *)dalloc((size_t)T * E * 4);
     const host_layer &h = rc.hl;
     float *db = h.bias.empty() ? nullptr : up(h.bias), *dgs = h.has_global ? up(std::vector<float>{(float)h.global_scale}) : nullptr;
+    float *dxs = h.expert_scale.empty() ? nullptr : up(h.expert_scale);
     pulsar_router_layer l{};
     l.bias = db;
     l.global_scale = dgs;
+    l.expert_scale = dxs;
     o.rc = pulsar_router_select_launch(&c, &l, dlg, dtok, T, dsel, dw, dg, dp, 0);
     o.sel = down(dsel, (size_t)T * K);
     o.w = down(dw, (size_t)T * K);
     o.gam = S ? down(dg, (size_t)S * T) : std::vector<float>{};
     o.probs = down(dp, (size_t)T * E);
-    cudaFree(dlg); cudaFree(dtok); cudaFree(dsel); cudaFree(dw); cudaFree(dg); cudaFree(dp); cudaFree(db); cudaFree(dgs);
+    cudaFree(dlg); cudaFree(dtok); cudaFree(dsel); cudaFree(dw); cudaFree(dg); cudaFree(dp); cudaFree(db); cudaFree(dgs); cudaFree(dxs);
     return o;
 }
 
@@ -388,6 +413,15 @@ static void section_select(void) {
         for (auto &b : n.hl.bias) b = (float)(0.05 * rndn());
         cases.push_back(n);
     }
+    {
+        /* raw logits of ~40 so the scaled logits (x 2816^-1/2) sit near +-0.75, where the bf16 rounding of the scaled
+         * logit decides; per_expert_scale in [0.5, 1.5] as the checkpoint's are */
+        router_case g{"Gemma 4 128 / top-8, softmax over bf16 logits x hidden^-1/2, SUM x per_expert_scale",
+                      gemma4_contract(), {}, false, 40.0};
+        g.hl.expert_scale.resize(128);
+        for (auto &x : g.hl.expert_scale) x = (float)(0.5 + rndu());
+        cases.push_back(g);
+    }
     const int T = 37;
     for (const router_case &rc : cases) {
         const int R = pulsar_router_logit_rows(&rc.c), E = rc.c.n_expert, K = rc.c.top_k;
@@ -476,6 +510,19 @@ static void section_refusals(void) {
     c.score = (pulsar_router_score)0;
     CHECK(pulsar_router_select_launch(&c, &none, lg, nullptr, 1, sel, w, nullptr, nullptr, 0) != 0,
           "a score function the router does not have");
+    /* L338: the logit scale is required (finite, > 0); a per-expert scale rides the sum renormalisation only */
+    c = gemma4_contract();
+    c.logit_scale = 0.0f;
+    CHECK(pulsar_router_select_launch(&c, &none, lg, nullptr, 1, sel, w, nullptr, nullptr, 0) != 0,
+          "a logit scale of 0 (unset)");
+    c.logit_scale = NAN;
+    CHECK(pulsar_router_select_launch(&c, &none, lg, nullptr, 1, sel, w, nullptr, nullptr, 0) != 0,
+          "a NaN logit scale");
+    c = inkling_cfg();
+    pulsar_router_layer xs{};
+    xs.expert_scale = w;
+    CHECK(pulsar_router_select_launch(&c, &xs, lg, nullptr, 1, sel, w, g, nullptr, 0) != 0,
+          "a per-expert scale with the sink renormalisation");
     cudaFree(lg); cudaFree(sel); cudaFree(tok); cudaFree(w); cudaFree(g);
 }
 

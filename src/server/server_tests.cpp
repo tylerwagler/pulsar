@@ -4104,6 +4104,9 @@ static void test_l303_response_format_answer(void) {
          "{\"n\": 42}"},
         {PULSAR_CHAT_INKLING, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]" L303_RF "}",
          "<|content_thinking|>hmm<|end_message|><|message_model|><|content_text|>", "{\"n\": 42}<|end_message|>"},
+        /* L338 P4: Gemma 4, thinking off -- the prompt closed the thought channel, the answer is the first byte */
+        {PULSAR_CHAT_GEMMA4, "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\"" L303_RF
+         "}", "", "{\"n\": 42}"},
     };
     for (const fcase &fc : cases) {
         job j;
@@ -4144,6 +4147,14 @@ static void test_l303_response_format_answer(void) {
                               "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"response_format\":{\"type\":"
                               "\"regex\",\"pattern\":\"(\"}}", &j.req, err, sizeof err));
     TEST_ASSERT(strstr(err, "response_format") != NULL);
+    /* L338 P4: Gemma 4's shape has no call markup -- strict tools are refused by name, never left unconstrained */
+    {
+        job jg;
+        memset(&jg, 0, sizeof jg);
+        TEST_ASSERT(!l303_request(&srv, PULSAR_CHAT_GEMMA4, API_OPENAI, L303_BODY(",\"reasoning_effort\":\"none\""),
+                                  &jg.req, err, sizeof err));
+        TEST_ASSERT(strstr(err, "no tool-call markup") != NULL);
+    }
     l303_server_free(&srv);
 #undef L303_RF
 }
@@ -4875,6 +4886,119 @@ static void test_nemotron_refusals(void) {
         request_free(&r);
         chat_conversation_free(&c);
     }
+}
+
+/* ---- L338: Gemma 4's server table (family_gemma4.cpp over src/lib/gemma4_chat) -------------------------------- */
+
+/* The effort map: thinking on unless asked off (the server's one rule) -- on writes <|think|> in a system turn, off
+ * closes an empty thought channel in the generation prompt; every named effort but none is on (one level). */
+/* L338 P4 -- --reasoning: a request that sends no thinking control takes the server's default (llama-server's
+ * --reasoning off, which the gate's Gemma clients were written against); any control the request sends wins. */
+static void test_l338_reasoning_default(void) {
+    static server srv;
+    memset(&srv, 0, sizeof srv);
+    srv.family_no_engine = server_family_for_format(PULSAR_CHAT_GEMMA4);
+    auto run = [&](int dflt, const char *extra, bool want_on) {
+        srv.reasoning_default = dflt;
+        char body[256], err[256];
+        snprintf(body, sizeof body, EFFORT_BODY("%s"), extra);
+        request r;
+        test_request_init(&r, REQ_CHAT, 16);
+        chat_conversation c;
+        memset(&c, 0, sizeof c);
+        err[0] = 0;
+        const bool ok = parse_chat_conversation_openai(body, &c, &r, err, sizeof err) &&
+                        render_chat_conversation(NULL, PULSAR_CHAT_GEMMA4, &srv, &c, &r, err, sizeof err);
+        chat_conversation_free(&c);
+        TEST_ASSERT(ok);
+        TEST_ASSERT(ok && (r.think_mode != PULSAR_THINK_NONE) == want_on);
+        request_free(&r);
+    };
+    run(0, "", true);                                                   /* unset: the family's default */
+    run(1, "", false);                                                  /* --reasoning off */
+    run(1, ",\"reasoning_effort\":\"high\"", true);                   /* an effort asked for */
+    run(1, ",\"chat_template_kwargs\":{\"enable_thinking\":true}", true);
+    run(2, "", true);                                                   /* --reasoning on */
+    run(2, ",\"reasoning_effort\":\"none\"", false);
+}
+
+static void test_gemma4_effort_map(void) {
+    char err[256];
+    request r;
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, EFFORT_BODY(""), &r, err, sizeof err));
+    TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
+    TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nx<turn|>\n<|turn>model\n"));
+    TEST_ASSERT(r.prompt_n_spans == 1 && r.prompt_spans[0].hi - r.prompt_spans[0].lo == 1);
+    request_free(&r);
+    static const char *const off[] = {",\"reasoning_effort\":\"none\"",
+                                      ",\"chat_template_kwargs\":{\"enable_thinking\":false}"};
+    char body[256];
+    for (const char *o : off) {
+        snprintf(body, sizeof body, EFFORT_BODY("%s"), o);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == 0 && r.think_mode == PULSAR_THINK_NONE);
+        TEST_ASSERT(!strcmp(r.prompt_text, "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"));
+        request_free(&r);
+    }
+    for (const char *on : {"\"minimal\"", "\"low\"", "\"high\"", "\"max\"", "60"}) {
+        snprintf(body, sizeof body, EFFORT_BODY(",\"reasoning_effort\":%s"), on);
+        TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body, &r, err, sizeof err));
+        TEST_ASSERT(r.family_effort == 1 && r.think_mode == PULSAR_THINK_DEFAULT);
+        request_free(&r);
+    }
+}
+
+/* A tool round trip through the server: the declaration in the system turn, the call and its result folded into the
+ * model turn (the result named by tool_call_id), and -- thinking off after a result -- no generation prompt (the
+ * model's turn continues); the refusals by name. */
+static void test_gemma4_tools_and_refusals(void) {
+    char err[256];
+    request r;
+    const char *tools = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{"
+                        "\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}]";
+    std::string body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"w?\"},{\"role\":\"assistant\","
+                       "\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":"
+                       "\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":"
+                       "\"c1\",\"content\":\"sunny\"}],\"reasoning_effort\":\"none\"") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    TEST_ASSERT(r.has_tools);
+    TEST_ASSERT(!strcmp(r.prompt_text,
+                        "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|><|\"|>,parameters:{properties:{"
+                        "city:{type:<|\"|>STRING<|\"|>}},type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nw?<turn|>\n"
+                        "<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:"
+                        "get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>"));
+    request_free(&r);
+    /* L338 P4: a required call is prefilled into an open call -- the generation prompt kept, the opener appended
+     * (its name and the arguments' "{" for a named tool), the output seeded with it */
+    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\","
+                       "\"tool_choice\":\"required\"") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    TEST_ASSERT(r.force_tool_call);
+    {
+        /* the one declared tool: "required" names it (the request parse's rule for every family) */
+        const char *tail = "<|turn>model\n<|channel>thought\n<channel|><|tool_call>call:get_weather{";
+        const size_t n = strlen(r.prompt_text), m = strlen(tail);
+        TEST_ASSERT(n >= m && !strcmp(r.prompt_text + n - m, tail));
+    }
+    request_free(&r);
+    body = std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"reasoning_effort\":\"none\","
+                       "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}}") + tools + "}";
+    TEST_ASSERT(effort_case(PULSAR_CHAT_GEMMA4, body.c_str(), &r, err, sizeof err));
+    {
+        const char *tail = "<|tool_call>call:get_weather{";
+        const size_t n = strlen(r.prompt_text), m = strlen(tail);
+        TEST_ASSERT(r.force_tool_call && n >= m && !strcmp(r.prompt_text + n - m, tail));
+    }
+    request_free(&r);
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, qwen_test_image_msg("user", "Look: ", ""));
+    chat_conversation c = {};
+    c.msgs = msgs;
+    test_request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(!render_chat_conversation(NULL, PULSAR_CHAT_GEMMA4, NULL, &c, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "vision tower") != NULL);
+    request_free(&r);
+    chat_conversation_free(&c);
 }
 
 /* The model-visible retry: the turn's close, ONE tool result (the error, the system turn reminded), the generation
@@ -7623,6 +7747,27 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 
 
 
+/* L338: Gemma 4 declares no find_call_block (no tool memory); its persisted segments carry no tool map, where the
+ * disk KV cache used to call the NULL hook and crash on the first chunk (CT 130, 2026-11-02). */
+static void test_kv_tool_map_family_without_tool_memory(void) {
+    server s = {0};
+    s.family_no_engine = server_family_for_format(PULSAR_CHAT_GEMMA4);
+    TEST_ASSERT(s.family_no_engine->find_call_block == NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    const char *text = "<|turn>model\n<|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|>";
+    s.tool_memory_put("call_1", text);
+    uint64_t bytes = 1;
+    TEST_ASSERT(s.kv_tool_map_serialized_size(text, &bytes) && bytes == 0);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t written = 1;
+    TEST_ASSERT(s.kv_tool_map_write(fp, text, &written) && written == 0);
+    TEST_ASSERT(ftell(fp) == 0);
+    fclose(fp);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -7966,6 +8111,11 @@ static void test_kv_admission_budget_math(void) {
     TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
     TEST_ASSERT(server_kv_budget_bytes(PULSAR_SERVER_USABLE_BYTES) == 0);
+    /* L338: a discrete card's budget is its own free memory less the margin (the larger of 2 GiB and an eighth) */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 24ull * GiB) == 6ull * GiB);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(3ull * GiB, 16ull * GiB) == 1ull * GiB);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 16ull * GiB) == 0);   /* no underflow */
+    TEST_ASSERT(server_discrete_margin_bytes(80ull * GiB) == 10ull * GiB);
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
     TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));
@@ -8016,26 +8166,26 @@ static void test_guard_touched_budget_is_physical(void) {
     const uint64_t GiB = 1024ull * MiB;
     const uint64_t F = PULSAR_SERVER_MEM_FLOOR_BYTES;
     const uint64_t avail = 9400ull * MiB, budget = 41257ull * MiB, eager = 31990ull * MiB;   /* 9.18 / 40.29 / 31.24 */
-    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail));
+    const KvBytes c = server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(avail), server_mem_floor());
     TEST_ASSERT(c == kvb(avail - F));                /* the headroom binds, not the ledger's 9.05 GiB */
     TEST_ASSERT(c < kvb(budget - eager));
     /* pages the warmup touched are already out of MemAvailable: they count toward the ceiling */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail)) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(1 * GiB), kvb(avail), server_mem_floor()) ==
                 kvb(avail - F + 1 * GiB));
     /* a roomy box: the ledger's share binds */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB)) == kvb(budget - eager));
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(64 * GiB), server_mem_floor()) == kvb(budget - eager));
     /* no headroom, or /proc/meminfo unreadable: 0 (startup refuses rather than run the pool unguarded) */
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail)) == KvBytes{});
-    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail)) ==
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(F - 1), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(0), kvb(0), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(eager), kvb(eager), kvb(0), kvb(avail), server_mem_floor()) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(UINT64_MAX), kvb(0), kvb(UINT64_MAX), kvb(avail), server_mem_floor()) ==
                 KvBytes::max());   /* no wrap */
     /* the invariant over a sweep */
     for (uint64_t a = F + 1; a < 40 * GiB; a += 777 * MiB)
         for (uint64_t t = 0; t < 8 * GiB; t += 1531 * MiB)
             for (uint64_t b = 0; b < 64 * GiB; b += 2999 * MiB) {
-                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a)).raw();
+                const uint64_t ceil = server_guard_touched_budget(kvb(b), kvb(eager / 4), kvb(t), kvb(a), server_mem_floor()).raw();
                 TEST_ASSERT(ceil <= t || a - (ceil - t) >= F);
             }
 }
@@ -9301,65 +9451,91 @@ static void l284_steps(lane_price *lp, pulsar_lane_cost *fit, int li, uint32_t k
         fit->n++;
     }
 }
+/* L338 P2.4 -- /v1/systemone renders an object `state` as the adapter's training data did, json.dumps(state, indent=1)
+ * (ASCII-escaped, 1-space indent): the expected bytes are Python's own (non-ASCII, a surrogate pair, the short
+ * escapes, empty containers, nested arrays, numbers). */
+static void test_l338_systemone_state_dump(void) {
+    static const char src[] = "{\"user_request\": \"fix the bug \303\274n\303\257code \342\200\223 \342\200\234quotes\342\200\235\", \"working_directory\": \"/tmp\", \"n\": 3, \"f\": 1.5, \"neg\": -0.25, \"t\": true, \"z\": null, \"action\": {\"tool\": \"Bash\", \"input\": {\"command\": \"echo \\\"hi\\\"\\n\\tdone\\\\\", \"argv\": [], \"obj\": {}, \"emoji\": \"\360\237\231\202\"}}, \"list\": [1, [2, {\"a\": \"b\"}]]}";
+    static const char want[] = "{\n \"user_request\": \"fix the bug \\u00fcn\\u00efcode \\u2013 \\u201cquotes\\u201d\",\n \"working_directory\": \"/tmp\",\n \"n\": 3,\n \"f\": 1.5,\n \"neg\": -0.25,\n \"t\": true,\n \"z\": null,\n \"action\": {\n  \"tool\": \"Bash\",\n  \"input\": {\n   \"command\": \"echo \\\"hi\\\"\\n\\tdone\\\\\",\n   \"argv\": [],\n   \"obj\": {},\n   \"emoji\": \"\\ud83d\\ude42\"\n  }\n },\n \"list\": [\n  1,\n  [\n   2,\n   {\n    \"a\": \"b\"\n   }\n  ]\n ]\n}";
+    pyjson_value v;
+    char err[160];
+    TEST_ASSERT(pyjson_parse(src, sizeof src - 1, &v, err, sizeof err));
+    std::string got;
+    judge_dump_indent1(v, 0, &got);
+    TEST_ASSERT(got == want);
+}
+
 static void test_l284_lane_price_pick(void) {
     lane_price lp;
     memset(&lp, 0, sizeof lp);
     pulsar_lane_cost spec = l284_cost(25000, 7700, true, 400u, 4.0f, 55.8f);
     pulsar_lane_cost plain = l284_cost(20000, 7700, true, 400u, 3.0f, 43.1f);
     /* nothing measured: the spec lane runs, measuring itself, whatever plain predicts */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.t_spec == 0.0 && lp.t_plain > 0.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.t_spec == 0.0 && lp.t_plain > 0.0);
     TEST_ASSERT(lp.held_n0 == 400u && !lp.meas_spec && !lp.meas_plain);
     /* one decoder, 32 rounds of 2 tokens over 4 rows in 50 ms: spec measured 40 tok/s against plain predicted
      * 1 / 27.7 ms = 36.1 -- spec holds, nothing to measure */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 2, 4, 50.0);
     TEST_ASSERT(fabsf(lp.tau - 2.0f) < 1e-4f && fabsf(lp.rho - 4.0f) < 1e-4f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.meas_spec && !lp.meas_plain);
     TEST_ASSERT(fabs(lp.t_spec - 40.0) < 1e-6 && lp.t_plain > 36.0 && lp.t_plain < 36.3 && lp.probe == 0);
     /* six decoders, nothing measured at six: plain PREDICTED 6 / 66.2 ms = 90.6 tok/s against spec predicted 63.0
      * (24 rows rationed to 16: 9.3 tokens a 148 ms round) -- the better-predicted lane is measured there first */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 2 && lp.lane == 2 && lp.probe == 0);
     TEST_ASSERT(!lp.meas_spec && !lp.meas_plain && lp.t_spec > 62.5 && lp.t_spec < 63.5 && lp.held_n0 == 400u);
     /* plain measured at six: 6 tokens a 80 ms step = 75 tok/s (its fit overpriced it); spec's 63.0 is no faster */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.lane == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 2 && lp.lane == 2 && lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && !lp.meas_spec && fabs(lp.t_plain - 75.0) < 1e-6);
     /* ...until the plain lane has run LANE_PRICE_REPROBE_STEPS steps: the spec lane is measured */
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS - LANE_PRICE_PROBE_STEPS - 1u, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 2 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 2 && lp.probe == 0);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 6, 6, 6, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 3 && lp.lane == 2);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 3);   /* its steps are not in */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 3 && lp.probe == 3 && lp.lane == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 3 && lp.probe == 3);   /* its steps are not in */
     /* measured at 13 tokens a 148 ms round (87.8 tok/s), past the margin over 75: the decoders move */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 6, 13, 16, 148.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 3 && lp.lane == 3 && lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && lp.t_spec > 87.0 && lp.t_spec < 88.5 && lp.held_n0 == spec.n);
     /* held, then priced on both measured numbers: no flap */
     for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 6, 13, 16, 148.0);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u) == 3 && lp.probe == 0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 6, 16u, 0u) == 3 && lp.probe == 0);
     }
     /* DeepSeek at N8: the fits, extrapolated past the rows they saw, predict plain 8 / 72 ms = 111 tok/s against
      * the spec lane's measured 99.5 -- the probe measures plain at 80 and the decoders stay */
     memset(&lp, 0, sizeof lp);
     spec = l284_cost(53700, 5570, true, 1000u, 8.0f, 98.3f);
     plain = l284_cost(16000, 7000, true, 1000u, 3.0f, 37.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.held_n0 == 1000u);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u, 0u) == 3 && lp.held_n0 == 1000u);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.5);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 2 && lp.probe == 2 && lp.t_plain > 110.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u, 0u) == 2 && lp.probe == 2 && lp.t_plain > 110.0);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 100.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.lane == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u, 0u) == 3 && lp.lane == 3 && lp.probe == 0);
     TEST_ASSERT(fabs(lp.t_plain - 80.0) < 1e-6 && lp.t_spec > 99.0 && lp.t_spec < 100.0);
     /* and a probe whose lane measures inside the margin hands the decoders back too, without re-probing until the
      * re-probe is due (both measured: no prediction left to chase) */
     for (uint32_t k = 0; k < 2u * LANE_PRICE_HOLD_STEPS; k++) {
         l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 8, 10, 16, 100.5);
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u) == 3 && lp.probe == 0);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 32u, 0u) == 3 && lp.probe == 0);
     }
     /* a new decoder count drops what was measured: nothing is measured at nine, and the better-predicted lane (plain
      * 9 / 79 ms = 114 against spec 11.25 tokens a 154 ms round = 73) is measured there first */
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 9, 32u) == 2 && lp.lane == 2 && !lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 9, 32u, 0u) == 2 && lp.lane == 2 && !lp.meas_spec && !lp.meas_plain);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 9, 11, 18, 105.0);
     TEST_ASSERT(lp.meas_n == 9 && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.meas_steps[PULSAR_LANE_SPEC] == 1u);
+    /* L338: the context's band drops them too -- a spec price measured at 26K tokens (67 tok/s, Gemma) priced the
+     * next short request onto the plain lane; within a band (a short request's 0 .. 2K) they hold */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 9, 11, 18, 105.0);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, 32u, 1500u);
+    TEST_ASSERT(lp.meas_spec);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, 32u, 26000u);
+    TEST_ASSERT(!lp.meas_spec && lp.meas_steps[PULSAR_LANE_SPEC] == 0u);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 9, 7, 18, 105.0);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, 32u, 30000u);   /* still [8K, 32K) */
+    TEST_ASSERT(lp.meas_spec);
+    (void)lane_price_pick(&lp, &plain, &spec, 9, 32u, 40u);
+    TEST_ASSERT(!lp.meas_spec);
 }
 
 /* L289 -- the scheduled re-measure is evidence-based.  Qwen one stream (L288): spec measured ~75 tok/s, plain ~35:
@@ -9371,32 +9547,32 @@ static void test_l289_lane_reprobe_evidence(void) {
     memset(&lp, 0, sizeof lp);
     pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
     pulsar_lane_cost plain = l284_cost(28000, 1000, true, 100u, 1.0f, 29.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3);
     /* spec: 3.8 tokens a 50.7 ms round = 75 tok/s; plain probed and measured: 1 token a 28.6 ms step = 35 */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
     lp.probe = 2;
     lp.probe_n0 = plain.n;
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.meas_plain && lp.meas_spec);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.meas_plain && lp.meas_spec);
     TEST_ASSERT(lp.held_n0 == spec.n && lp.deferral == 0);
     /* the 512-step clock passes: x2.1 clears, no probe, the deferral is flagged for its one announce */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.deferral == 1);
     lp.deferral = 2;   /* the caller announced it */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u) - 1u, 1, 4, 5,
                53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.deferral == 2);
     /* ...until the measurement is LANE_PRICE_CLEAR_SPAN re-probes old: it is taken again */
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 1, 1, 1, 28.6);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.probe == 0 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.deferral == 0);
     /* hard content: spec falls to 2 tokens a 50 ms round (40 tok/s, x1.14) -- inside the clearance, so the plain
      * 512-step schedule re-measures */
     for (uint32_t k = 0; k < 64u; k++) l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 2, 5, 50.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 3 && lp.t_spec < 35.0 * LANE_PRICE_CLEAR);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.t_spec < 35.0 * LANE_PRICE_CLEAR);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS - 64u, 1, 2, 5, 50.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u) == 2 && lp.probe == 2 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
     /* eight decoders, plain in force at 105 against spec measured 100 (L288): no clearance either way, the plain
      * schedule re-measures spec at 512 */
     memset(&lp, 0, sizeof lp);
@@ -9404,28 +9580,28 @@ static void test_l289_lane_reprobe_evidence(void) {
     lp.held_n0 = plain.n;
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS, 8, 8, 8, 76.2);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 8, 10, 16, 100.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 2 && lp.meas_plain && lp.meas_spec);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u, 0u) == 2 && lp.meas_plain && lp.meas_spec);
     l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_REPROBE_STEPS, 8, 8, 8, 76.2);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u) == 3 && lp.probe == 3 && lp.lane == 2);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 8, 16u, 0u) == 3 && lp.probe == 3 && lp.lane == 2);
     /* L288: the other lane PREDICTED (a moving decoder count drops the measurements) and cleared by the measured
      * lane in force: the re-measure waits the same way.  Four Qwen decoders: spec 13 tokens a 80 ms round = 162.5
      * tok/s measured, plain predicted 4 / 44 ms = 90.9 -- x1.79 */
     memset(&lp, 0, sizeof lp);
     plain = l284_cost(20000, 6000, true, 100u, 4.0f, 44.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3 && lp.meas_spec && !lp.meas_plain && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 3 && lp.meas_spec && !lp.meas_plain && lp.probe == 0);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3 && lp.probe == 0 && lp.deferral == 1);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 3 && lp.probe == 0 && lp.deferral == 1);
     lp.deferral = 2;
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_REPROBE_STEPS * (LANE_PRICE_CLEAR_SPAN - 1u), 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
     /* ...and a prediction inside the clearance keeps the 512-step clock: plain predicted 4 / 30 ms = 133 */
     memset(&lp, 0, sizeof lp);
     plain = l284_cost(10000, 5000, true, 100u, 4.0f, 30.0f);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 3);
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS + LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u) == 2 && lp.probe == 2 && lp.deferral == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
@@ -11643,8 +11819,8 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
     TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
     /* the guard's ceiling keeps the derived floor free */
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB)) == kvb(3 * MiB));
-    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F)) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
+    TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
     /* headroom: unreadable MemAvailable (0) is never room; no wrap */
     TEST_ASSERT(!server_headroom_admits(kvb(0), kvb(0), kvb(0)));
     TEST_ASSERT(server_headroom_admits(kvb(5), kvb(2), kvb(3)));
@@ -11673,6 +11849,7 @@ static void test_guard_budget_reads_live_memavailable(void) {
     s.guard_touched_ceiling = kvb(5 * GiB);     /* cut at warmup: MemAvailable was floor + 5 GiB */
     s.guard_budget_said = kvb(5 * GiB);         /* no line for the cases below that stay put */
     s.guard_avail_at = server_now_sec();        /* the reading below is fresh: no /proc read in this test */
+    s.guard_floor = server_mem_floor();
     s.guard_avail = kvb(F + 2 * GiB);           /* 3 GiB went to something no ledger counts */
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));   /* the live headroom binds */
     s.guard_avail = kvb(F + 20 * GiB);          /* memory came back: never above the startup ceiling */
@@ -11681,6 +11858,41 @@ static void test_guard_budget_reads_live_memavailable(void) {
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     s.guard_avail = KvBytes{};                  /* unreadable: fail closed */
     TEST_ASSERT(s.guard_budget() == KvBytes{});
+}
+
+/* L338: a discrete card's guard reads the device and keeps PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES of it free; the
+ * ledger's share does not cap it.  The shape is CT 130's RTX 6000 (Gemma 4, 3 banks x 40960, 2026-11-02): budget 5.00,
+ * eager 4.96, touched 0.08 and 2.2 GiB of the device free post-warmup -- the host formula left 0.04 GiB. */
+static void test_guard_discrete_reads_the_device(void) {
+    const uint64_t MiB = 1024ull * 1024ull;
+    const uint64_t GiB = 1024ull * MiB;
+    const KvBytes floor = server_guard_floor(true);
+    TEST_ASSERT(floor == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_guard_floor(false) == server_mem_floor());
+    const uint64_t budget = 5120ull * MiB, eager = 5079ull * MiB, touched = 82ull * MiB, dev_free = 2253ull * MiB;
+    /* the host formula's ledger binds at 0.04 GiB: what refused every judge prompt */
+    TEST_ASSERT(server_guard_touched_budget(kvb(budget), kvb(eager), kvb(touched), kvb(dev_free), floor) ==
+                kvb(budget - eager));
+    /* the discrete ceiling: touched + device free − floor (the startup passes no ledger) */
+    const KvBytes c = server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(touched), kvb(dev_free), floor);
+    TEST_ASSERT(c == kvb(touched + dev_free - PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(c > kvb(35724ull * 20ull * 1024ull));   /* the 35.7K-token prompt's KV fits beside the warm banks */
+    /* at the floor, or unreadable: nothing more may be touched */
+    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), floor, floor) == KvBytes{});
+    TEST_ASSERT(server_guard_touched_budget(KvBytes::max(), kvb(eager), kvb(0), KvBytes{}, floor) == KvBytes{});
+    /* the live budget reads the device when the guard is discrete, and stays under the startup ceiling */
+    server s;
+    memset(&s, 0, sizeof s);
+    s.guard_enabled = true;
+    s.guard_discrete = true;
+    s.guard_floor = floor;
+    s.guard_kv_budget = KvBytes::max();
+    s.guard_eager_bytes = kvb(eager);
+    s.guard_touched_ceiling = c;
+    s.guard_budget_said = c;
+    s.guard_avail_at = server_now_sec();
+    s.guard_avail = kvb(floor.raw() + 1 * GiB);   /* 1.2 GiB went to something else: the live reading binds */
+    TEST_ASSERT(s.guard_budget() == kvb(1 * GiB));
 }
 
 /* 2026-10-29: a persist MemAvailable cannot cover over the floor is skipped -- counted and said, nothing written,
@@ -12257,6 +12469,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();
+    test_guard_discrete_reads_the_device();
     test_persist_skipped_under_the_floor();
     test_prefill_mem_step_tries_remedies_first();
     test_stall_watchdog_rules();
@@ -12383,6 +12596,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_nemotron_hooks_compose_to_the_full_render();
     test_nemotron_raw_calls_replay_and_key();
     test_nemotron_refusals();
+    test_gemma4_effort_map();
+    test_l338_reasoning_default();
+    test_gemma4_tools_and_refusals();
     test_nemotron_tool_error_suffix_reminds_the_system_turn();
     test_anthropic_turn_render_is_stable_across_the_next_user_turn();
     test_live_tail_joins_before_a_committed_stop();
@@ -12398,6 +12614,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_kv_tool_map_family_without_tool_memory();
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
@@ -12458,6 +12675,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_batch_leave_when_spec_lane_carries_all();
     test_l293_batch_leave_stops_at_the_budget();
     test_l284_lane_price_pick();
+    test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

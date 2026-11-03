@@ -23,7 +23,10 @@
  * outlasted the spin says so).  Time = per call; GB/s = the weight's wire
  * bytes (EXL3: trellis + suh + svh; MXFP8: E4M3 data + E8M0 scales) / time.
  *
- *   tests/exl3_dense_bench [iters=120] [shape index, -1 = all] [M, 0 = all]
+ *   tests/exl3_dense_bench [iters=120] [shape index, -1 = all] [M, 0 = all] [set: qwen (default) | gemma]
+ *
+ * The gemma set (L338): Gemma 4 26B-A4B's dense Linears and its K=6 tied head, at the rates its pack stores (4, 6).
+ * The MXFP8 arm needs the MX tensor cores (sm_100+); below them it is not run (said once).
  */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
@@ -96,7 +99,17 @@ int main(int argc, char **argv) {
     const int only_shape = argc > 2 ? atoi(argv[2]) : -1;
     const int only_m = argc > 3 ? atoi(argv[3]) : 0;
     struct shape { int K, N; const char *what; };
-    const shape shapes[] = {
+    const bool gemma = argc > 4 && !strcmp(argv[4], "gemma");
+    const shape gemma_shapes[] = {
+        {2816, 4096,   "g4 q_proj (window)"},
+        {2816, 8192,   "g4 q_proj (global)"},
+        {2816, 2048,   "g4 k/v_proj (window)"},
+        {4096, 2816,   "g4 o_proj (window)"},
+        {2816, 2112,   "g4 mlp gate/up"},
+        {2112, 2816,   "g4 mlp down"},
+        {2816, 262144, "g4 head (tied)"},
+    };
+    const shape qwen_shapes[] = {
         {2560, 10240, "DeltaNet in_proj_qkv"},
         {2560, 6144,  "DeltaNet in_proj_z"},
         {6144, 2560,  "DeltaNet out_proj"},
@@ -105,9 +118,11 @@ int main(int argc, char **argv) {
         {2560, 640,   "Qwen shared gate/up"},
         {640, 2560,   "Qwen shared down"},
     };
+    const shape *shapes_p = gemma ? gemma_shapes : qwen_shapes;
+    const int n_shapes = gemma ? (int)(sizeof gemma_shapes / sizeof *gemma_shapes) : (int)(sizeof qwen_shapes / sizeof *qwen_shapes);
     const int widths[] = {1, 2, 4, 8, 16, 128, 512, 2048};
     const int kMaxRows = 2048;
-    const int rates[] = {4, 6, 8, 10};
+    const std::vector<int> rates = gemma ? std::vector<int>{8, 12} : std::vector<int>{4, 6, 8, 10};
 
     if (!pulsar_gpu_init()) { fprintf(stderr, "no GPU\n"); return 2; }
     int sms = 0;
@@ -116,10 +131,16 @@ int main(int argc, char **argv) {
     CK(cudaMalloc((void **)&d_sink, 4));
     printf("exl3_dense_bench: %d SMs, %d calls per point, weights rotated over >= %.0f MB of replicas (DRAM-cold)\n",
            sms, iters, kMinRotateBytes / 1e6);
+    int cc_major = 0;
+    CK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0));
+    const bool with_f8 = cc_major >= 10;
+    if (!with_f8) printf("exl3_dense_bench: sm_%d: no MX tensor cores -- the MXFP8 arm is not run\n", cc_major * 10);
     printf("%-22s %-11s %4s | %-9s %8s %7s %6s | read-roofline us\n", "shape", "arm", "M", "bytes MB", "us", "GB/s", "x read");
 
-    for (const shape &sh : shapes) {
-        if (only_shape >= 0 && &sh - shapes != only_shape) continue;
+    for (int si = 0; si < n_shapes; si++) {
+        const shape &sh = shapes_p[si];
+        if (only_shape >= 0 && si != only_shape) continue;
+        if (gemma && si == n_shapes - 1 && only_shape < 0) continue;   /* the head (2.2 GB of replicas) only by index */
         const int K = sh.K, N = sh.N;
         /* the activation: 16 rows of f32 the bench produces, armed as the A8
          * slot by the engine's own producer-side encoder */
@@ -151,11 +172,11 @@ int main(int argc, char **argv) {
         const uint64_t f8_data = (uint64_t)K * N, f8_scale = (uint64_t)pulsar_mx_rup(N, 128) * KBp;
         const uint64_t f8_bytes = f8_data + f8_scale;
         const uint64_t f8_span = (uint64_t)N * ((K + 31) / 32) * 33;     /* the resolver's offset stride */
-        const int n_f8 = n_replicas((double)f8_bytes);
+        const int n_f8 = with_f8 ? n_replicas((double)f8_bytes) : 0;
         std::vector<pulsar_gpu_tensor *> f8d(n_f8), f8s(n_f8);
         static char key_storage[8];
-        const void *key = key_storage + (&sh - shapes);
-        {
+        const void *key = key_storage + si;
+        if (with_f8) {
             std::vector<uint8_t> hd(f8_data), hs(f8_scale);
             for (int r = 0; r < n_f8; r++) {
                 for (auto &b : hd) { b = (uint8_t)rnd(); if ((b & 0x7f) == 0x7f) b ^= 1; }   /* no NaN codes */
@@ -202,15 +223,18 @@ int main(int argc, char **argv) {
         /* MXFP8's bytes live in two tensors per replica; the roofline reads one contiguous run
          * of the same size per replica */
         uint8_t *f8_scratch = nullptr;
-        const int n_f8r = n_replicas((double)f8_bytes);
-        CK(cudaMalloc((void **)&f8_scratch, (size_t)f8_bytes * n_f8r));
-        CK(cudaMemset(f8_scratch, 0x11, (size_t)f8_bytes * n_f8r));
-        const double roof_f8 = read_us(f8_scratch, f8_bytes, f8_bytes, n_f8r);
-        cudaFree(f8_scratch);
+        double roof_f8 = 0;
+        if (with_f8) {
+            const int n_f8r = n_replicas((double)f8_bytes);
+            CK(cudaMalloc((void **)&f8_scratch, (size_t)f8_bytes * n_f8r));
+            CK(cudaMemset(f8_scratch, 0x11, (size_t)f8_bytes * n_f8r));
+            roof_f8 = read_us(f8_scratch, f8_bytes, f8_bytes, n_f8r);
+            cudaFree(f8_scratch);
+        }
 
         for (int M : widths) {
             if (only_m && M != only_m) continue;
-            if (!pulsar_gpu_mxfp8_act_cache_encode_f32(x, M, K)) { fprintf(stderr, "act encode refused\n"); return 2; }
+            if (with_f8 && !pulsar_gpu_mxfp8_act_cache_encode_f32(x, M, K)) { fprintf(stderr, "act encode refused\n"); return 2; }
             /* L251 / ac69748f: the EXL3 arm takes the bf16 plane, not an E4M3 slot. */
             void *xq = nullptr;
             if (!pulsar_gpu_bf16_act_slot(xb, M, K, &xq) || !xq) {
@@ -220,16 +244,18 @@ int main(int argc, char **argv) {
             /* MXFP8: decode rows up to the decode cap, prefill rows past it */
             const bool prefill = M > 16;
             const int n_it = prefill ? (iters + 9) / 10 : iters;
-            pulsar_gpu_matmul_set_batch_decode_rows(prefill ? 0 : M);
-            bool f8_ok = true;
-            const double t_f8 = time_calls(n_it, [&](int i) {
-                const int r = i % n_f8;
-                if (!pulsar_gpu_matmul_mxfp8_tensor(out, key, map_size, (uint64_t)r * f8_span, K, N, x, M)) f8_ok = false;
-            });
-            pulsar_gpu_matmul_set_batch_decode_rows(0);
-            if (!f8_ok) { fprintf(stderr, "MXFP8 GEMV refused at M=%d\n", M); return 2; }
-            printf("%-22s %-11s %4d | %9.2f %8.1f %7.1f %6.2f | %.1f\n", sh.what, prefill ? "MXFP8 pf" : "MXFP8", M, f8_bytes / 1e6, t_f8,
-                   f8_bytes / (t_f8 * 1e-6) / 1e9, t_f8 / roof_f8, roof_f8);
+            if (with_f8) {
+                pulsar_gpu_matmul_set_batch_decode_rows(prefill ? 0 : M);
+                bool f8_ok = true;
+                const double t_f8 = time_calls(n_it, [&](int i) {
+                    const int r = i % n_f8;
+                    if (!pulsar_gpu_matmul_mxfp8_tensor(out, key, map_size, (uint64_t)r * f8_span, K, N, x, M)) f8_ok = false;
+                });
+                pulsar_gpu_matmul_set_batch_decode_rows(0);
+                if (!f8_ok) { fprintf(stderr, "MXFP8 GEMV refused at M=%d\n", M); return 2; }
+                printf("%-22s %-11s %4d | %9.2f %8.1f %7.1f %6.2f | %.1f\n", sh.what, prefill ? "MXFP8 pf" : "MXFP8", M,
+                       f8_bytes / 1e6, t_f8, f8_bytes / (t_f8 * 1e-6) / 1e9, t_f8 / roof_f8, roof_f8);
+            }
             /* EXL3 at every rate, from the same rows (bf16) */
             for (size_t j = 0; j < sets.size(); j++) {
                 const exl3_set &s = sets[j];

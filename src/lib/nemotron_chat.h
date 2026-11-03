@@ -50,6 +50,7 @@
 #include "pulsar.h"
 #include "pyjson.h"
 #include "qwen_chat.h"
+#include "chat_render_kit.h"
 
 /// The reasoning-effort levels the Nemotron template can express (the request's reasoning_effort, parsed).
 enum nemotron_effort {
@@ -111,12 +112,8 @@ struct nemotron_render_in {
     bool add_generation_prompt;
 };
 
-/// A render's result: the prompt text and the client-data span map.
-struct nemotron_render_out {
-    /// The rendered text (UTF-8; at most UINT32_MAX bytes, else prompt_too_large).
-    std::string text;
-    std::vector<pulsar_text_span> spans;   ///< client-data ranges, ascending, disjoint
-};
+/// A render's result: the prompt text and the client-data span map (the shared kit's, chat_render_kit.h).
+struct nemotron_render_out : chat_render_out {};
 
 /** Render.  false + "<refusal key>: detail" on refusal. */
 /// @param in     the conversation, tools and effort

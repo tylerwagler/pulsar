@@ -382,7 +382,7 @@ bool server::send_root(int fd) {
         "{\"service\":\"pulsar-server\",\"version\":\"%s\",\"status\":\"ok\","
         "\"endpoints\":[\"/health\",\"/version\",\"/v1/models\","
         "\"/v1/chat/completions\",\"/v1/completions\",\"/v1/messages\","
-        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/metrics\","
+        "\"/v1/messages/count_tokens\",\"/v1/responses\",\"/v1/systemone\",\"/metrics\","
         "\"/metrics/stream\"]}\n",
         PULSAR_VERSION_STR);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
@@ -643,16 +643,22 @@ bool server::send_metrics(int fd) {
     buf_printf(&b, "pulsar:spec_grammar_cut_rows_total %llu\n",
                (unsigned long long)s->m_spec_grammar_cut_rows);
     /* L301: the verify curve the pick prices with (verify_curve.cpp): the profiled forward per row count, the
-     * online correction per row, and the round's measured wall outside the forward. */
+     * online correction at the current depth, and the round's measured wall outside the forward. */
     if (vc.valid) {
         buf_puts(&b, "# HELP pulsar:spec_verify_curve_ms Profiled verify forward wall at this many rows, ms.\n");
         buf_puts(&b, "# TYPE pulsar:spec_verify_curve_ms gauge\n");
         for (uint32_t r = 1; r <= vc.rows_max && r < 33u; r++)
             buf_printf(&b, "pulsar:spec_verify_curve_ms{rows=\"%u\",source=\"%s\"} %.4f\n", r,
                        vc.cached ? "cache" : "profile", (double)vc.base_ms[r]);
-        buf_puts(&b, "# HELP pulsar:spec_verify_slope_ms The forward's online residual per row past the profile, ms.\n");
-        buf_puts(&b, "# TYPE pulsar:spec_verify_slope_ms gauge\n");
-        if (vc.slope_valid) buf_printf(&b, "pulsar:spec_verify_slope_ms %.4f\n", (double)vc.slope_ms);
+        buf_puts(&b, "# HELP pulsar:spec_verify_residual_ms The forward's online residual past the profile at the "
+                     "current depth: its fixed part (term=\"fixed\") and a row's (term=\"row\"), ms.\n");
+        buf_puts(&b, "# TYPE pulsar:spec_verify_residual_ms gauge\n");
+        if (vc.line_valid) {
+            buf_printf(&b, "pulsar:spec_verify_residual_ms{term=\"fixed\",depth=\"%u\"} %.4f\n", vc.depth,
+                       (double)vc.line_a_ms);
+            buf_printf(&b, "pulsar:spec_verify_residual_ms{term=\"row\",depth=\"%u\"} %.4f\n", vc.depth,
+                       (double)vc.line_b_ms);
+        }
         buf_puts(&b, "# HELP pulsar:spec_verify_host_ms A round's recent wall outside the forward and drafting, ms.\n");
         buf_puts(&b, "# TYPE pulsar:spec_verify_host_ms gauge\n");
         buf_printf(&b, "pulsar:spec_verify_host_ms %.4f\n", (double)vc.host_ms);
@@ -1333,6 +1339,13 @@ void *client_main(void *arg) {
         http_response(fd, 200, "application/json", cb.ptr);
         buf_free(&cb);
         request_free(&creq);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* L338 P2.4: the judge's decisions (systemone.cpp): its own queue on its reserved bank */
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/systemone")) {
+        server_judge_http(s, fd, hr.body, hr.body_len);
         http_request_free(&hr);
         goto done;
     }

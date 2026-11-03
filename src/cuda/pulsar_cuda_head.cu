@@ -37,10 +37,12 @@ __device__ __forceinline__ uint16_t f2bf(float f) { return __bfloat16_as_ushort(
  *  @param norm_w  device bf16 [n_embd] norm weight as uint4, or NULL: no norm
  *  @param eps     the norm's epsilon (added to the mean square)
  *  @param out     device bf16 output rows, row t at out + t * ld_out (16-byte aligned)
- *  @param ld_out  output row pitch in elements (a multiple of 8) */
+ *  @param ld_out  output row pitch in elements (a multiple of 8)
+ *  @param scale   L338: with no norm, the row times this (one bf16 rounding of each product); 0 = copied as stored */
 __global__ void __launch_bounds__(kEmbedThreads)
 head_embed_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, const int32_t *__restrict__ ids, uint32_t n_embd,
-                  const uint4 *__restrict__ norm_w, float eps, uint16_t *__restrict__ out, uint64_t ld_out) {
+                  const uint4 *__restrict__ norm_w, float eps, uint16_t *__restrict__ out, uint64_t ld_out,
+                  float scale) {
     __shared__ float warp_ss[kEmbedThreads / 32];
     __shared__ float s_rstd;
     const uint32_t t = blockIdx.x, chunks = n_embd / 8;
@@ -52,8 +54,21 @@ head_embed_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, const int32
         return;
     }
     const uint4 *src = table + (uint64_t)id * chunks;
-    if (!norm_w) {
+    if (!norm_w && scale == 0.0f) {
         for (uint32_t i = threadIdx.x; i < chunks; i += kEmbedThreads) dst[i] = src[i];
+        return;
+    }
+    if (!norm_w) {   /* the scaled embedding (L338): bf16_rn(x * s), torch's bf16 multiply */
+        for (uint32_t i = threadIdx.x; i < chunks; i += kEmbedThreads) {
+            const uint4 v = src[i];
+            const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+            uint32_t o[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+                o[k] = (uint32_t)f2bf(__fmul_rn(bf2f((uint16_t)(u[k] & 0xffffu)), scale)) |
+                       ((uint32_t)f2bf(__fmul_rn(bf2f((uint16_t)(u[k] >> 16)), scale)) << 16);
+            dst[i] = make_uint4(o[0], o[1], o[2], o[3]);
+        }
         return;
     }
     float ss = 0.0f;
@@ -92,18 +107,27 @@ head_embed_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, const int32
     }
 }
 
-/** Logits finish in place: columns < n_real are multiplied by `scale`, padding columns [n_real, n_logits) are set
- *  to -inf.  Grid (ceil(n_logits / (kFinishThreads * 8)), n rows); block kFinishThreads; grid-stride over columns.
+/** Logits finish in place: columns < n_real are multiplied by `scale` (then soft-capped, L338), padding columns
+ *  [n_real, n_logits) are set to -inf.  Grid (ceil(n_logits / (kFinishThreads * 8)), n rows); block kFinishThreads; grid-stride over columns.
  *  @param logits  device f32 rows, row r at logits + r * ld
  *  @param ld      row pitch in elements
  *  @param n_logits columns to touch (the padded vocab)
  *  @param n_real  real-id columns (ids >= n_real are padding)
- *  @param scale   the family's logit scale */
+ *  @param scale   the family's logit scale
+ *  @param softcap L338: > 0 applies tanh(v / softcap) * softcap after the scale; 0 = none */
 __global__ void __launch_bounds__(kFinishThreads)
-head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, uint32_t n_real, float scale) {
+head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, uint32_t n_real, float scale,
+                   float softcap) {
     float *row = logits + (uint64_t)blockIdx.y * ld;
-    for (uint32_t c = blockIdx.x * kFinishThreads + threadIdx.x; c < n_logits; c += gridDim.x * kFinishThreads)
-        row[c] = c < n_real ? __fmul_rn(row[c], scale) : -INFINITY;
+    for (uint32_t c = blockIdx.x * kFinishThreads + threadIdx.x; c < n_logits; c += gridDim.x * kFinishThreads) {
+        if (c >= n_real) {
+            row[c] = -INFINITY;
+            continue;
+        }
+        float v = __fmul_rn(row[c], scale);
+        if (softcap != 0.0f) v = __fmul_rn(tanhf(__fdiv_rn(v, softcap)), softcap);   /* L338: Gemma 4's soft-cap */
+        row[c] = v;
+    }
 }
 
 /** Validates a head declaration (width a positive multiple of 8, 1 <= n_real <= n_logits, finite nonzero scale,
@@ -114,10 +138,13 @@ head_finish_kernel(float *__restrict__ logits, uint64_t ld, uint32_t n_logits, u
 bool decl_ok(const pulsar_head_decl *h, const char *who) {
     if (!h || h->n_embd == 0 || h->n_embd % 8 || h->n_logits == 0 || h->n_real == 0 || h->n_real > h->n_logits ||
         !isfinite(h->logit_scale) || h->logit_scale == 0.0f || (h->embed_norm_w && !(h->embed_norm_eps >= 0.0f)) ||
-        ((uintptr_t)h->embed_norm_w & 15u)) {
+        ((uintptr_t)h->embed_norm_w & 15u) || !(h->softcap >= 0.0f && isfinite(h->softcap)) ||
+        !(h->embed_scale >= 0.0f && isfinite(h->embed_scale)) || (h->embed_scale != 0.0f && h->embed_norm_w)) {
         fprintf(stderr, "pulsar: head %s: a declaration with n_embd %u (a positive multiple of 8), n_real %u of %u logits, "
-                        "scale %g (finite, nonzero) or a misaligned / negative-eps norm -- refusing\n",
-                who, h ? h->n_embd : 0, h ? h->n_real : 0, h ? h->n_logits : 0, h ? (double)h->logit_scale : 0.0);
+                        "scale %g (finite, nonzero), soft-cap %g / embed scale %g (finite, >= 0; the embed scale not with "
+                        "a norm) or a misaligned / negative-eps norm -- refusing\n",
+                who, h ? h->n_embd : 0, h ? h->n_real : 0, h ? h->n_logits : 0, h ? (double)h->logit_scale : 0.0,
+                h ? (double)h->softcap : 0.0, h ? (double)h->embed_scale : 0.0);
         return false;
     }
     return true;
@@ -147,7 +174,8 @@ extern "C" int pulsar_head_embed_launch(const pulsar_head_decl *h, const uint16_
         return -1;
     }
     head_embed_kernel<<<n, kEmbedThreads, 0, stream>>>((const uint4 *)table, n_vocab, ids, h->n_embd,
-                                                       (const uint4 *)h->embed_norm_w, h->embed_norm_eps, out, ld_out);
+                                                       (const uint4 *)h->embed_norm_w, h->embed_norm_eps, out, ld_out,
+                                                       h->embed_scale);
     return launched("embed");
 }
 
@@ -159,8 +187,9 @@ extern "C" int pulsar_head_logits_finish_launch(const pulsar_head_decl *h, float
                 (unsigned long long)ld, h->n_logits);
         return -1;
     }
-    if (h->logit_scale == 1.0f && h->n_real == h->n_logits) return 0;   /* nothing declared */
+    if (h->logit_scale == 1.0f && h->n_real == h->n_logits && h->softcap == 0.0f) return 0;   /* nothing declared */
     const uint32_t blocks = (h->n_logits + kFinishThreads * 8 - 1) / (kFinishThreads * 8);
-    head_finish_kernel<<<dim3(blocks, n), kFinishThreads, 0, stream>>>(logits, ld, h->n_logits, h->n_real, h->logit_scale);
+    head_finish_kernel<<<dim3(blocks, n), kFinishThreads, 0, stream>>>(logits, ld, h->n_logits, h->n_real, h->logit_scale,
+                                                                      h->softcap);
     return launched("logits");
 }

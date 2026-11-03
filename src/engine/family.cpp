@@ -37,7 +37,9 @@ const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_lay
         }
         if (d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW && d.mixer != PULSAR_MIXER_MAMBA2)
             return "a blocks layer with no mixer";
-        if (d.ffn != PULSAR_FFN_NONE && d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE) return "a blocks layer with an unknown FFN";
+        if (d.ffn != PULSAR_FFN_NONE && d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE &&
+            d.ffn != PULSAR_FFN_DENSE_MOE)
+            return "a blocks layer with an unknown FFN";
         if ((d.window != 0) != (d.mixer == PULSAR_MIXER_ATTN_WINDOW)) return "a window on a full-attention layer, or none on a window layer";
     }
     *at_layer = UINT32_MAX;
@@ -53,6 +55,8 @@ extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
 /// The Nemotron Parse page-parser family.
 extern const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE;
+/// The Gemma 4 family (src/families/gemma4).
+extern const pulsar_family PULSAR_FAMILY_GEMMA4;
 
 /* Every family the engine serves.  The ONE place an architecture string is
  * mapped to code. */
@@ -64,6 +68,7 @@ static const pulsar_family *const k_families[] = {
     &PULSAR_FAMILY_NEMOTRON_H,
     &PULSAR_FAMILY_NEMOTRON_ENC,
     &PULSAR_FAMILY_NEMOTRON_PARSE,
+    &PULSAR_FAMILY_GEMMA4,
 };
 
 const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {

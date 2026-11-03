@@ -13,18 +13,22 @@
  * over every (bank, draft position) ranked by survival -- a bank's verified drafts are then a prefix of its chain,
  * survival being monotone along it.  round_ms is MEASURED, never a constant of a deployment:
  *
- *   round_ms(n, r) = base[r] + slope * r + host(n) + draft(n)
+ *   round_ms(n, r) = max(base[r] + a(d) + b(d) * r, base[r] / 2) + host(n) + draft(n)    at the round's depth d
  *
  *   - base[r]: the verify forward of an r-row step, profiled once per (container, drafter, bank pool, context,
  *     build) at startup (pulsar_session_verify_curve_open) and cached on disk under that key.  A per-row-count
  *     TABLE, not a line: the decode arms run 16-row blocks, so the cost is a staircase, flat inside a block and a
  *     step at 17 -- L288's 16 / 32 width probes priced two points of it, the linear lane fit none.
- *   - slope: the online correction (DeepInfer's ForwardRuntimeEstimator).  The profile ran at one depth; a served
- *     round's forward drifts from it with the context it attends and with the box.  Each round contributes its
- *     residual per row, (forward_ms - base[rows]) / rows; the medians per row count (counts with >= 10 samples,
- *     each count equal weight) are reduced by their median over a window of the last 5000 rounds -- robust to a
- *     stray round (a page-fault burst, a GC pause on the host) and to which row counts dominate the window.
- *     Applied as max(0, slope): the profile is the floor, a negative residual is not extrapolated to wider rows.
+ *   - a(d) + b(d) r: the online correction (DeepInfer's ForwardRuntimeEstimator), by DEPTH.  The profile ran at one
+ *     depth (the warmup bank's frontier); a served round attends its own context, and every row's attention grows
+ *     with it -- L338: Gemma's verify at 26K keys cost what no correction learned at 2K could price, so the pick
+ *     drafted as wide there and DFlash gained nothing over plain decode.  The round's depth (the server's: its live
+ *     banks' mean frontier, pulsar_engine_verify_curve_depth) picks a bucket (the attention bound's powers of two);
+ *     each bucket keeps the residual forward_ms - base[rows] of its last 2000 rounds, the median per row count, and
+ *     the line through those medians (each count one vote) -- a, the depth's fixed cost (the one-row forward grows
+ *     too), b its cost a row -- robust to a stray round (a page-fault burst, a GC pause on the host) and to which row
+ *     counts dominate.  A bucket with no line prices on the nearest one's (none: the profile).  The forward is
+ *     floored at half the profile.
  *   - host(n) and draft(n): the round's wall outside the forward -- planning, the walk, emission, and the next
  *     round's drafting -- the median of the last 9 rounds at n banks (valid from 5), else of the last 9 at any n
  *     (DeepInfer's SamplerRuntimeEstimator).  They do not depend on T, but they set how much a wider forward costs
@@ -152,64 +156,83 @@ struct recent_median {
     }
 };
 
-/* The residual per row of the forward against the profile: the median per row count over a window of rounds, then
- * the median of those (counts with VC_SLOPE_MIN samples or more, each count one vote). */
-/// Rounds in the residual slope's window.
-#define VC_SLOPE_WINDOW 5000u
-/// Samples a row count needs to vote in the slope.
-#define VC_SLOPE_MIN 10u
-/// The forward's residual per row against the profile: median of per-row-count medians over a sliding window.
-struct residual_slope {
-    /// The window: (row count, residual ms per row) of the last VC_SLOPE_WINDOW rounds, oldest first.
+/* The forward's residual against the profile at one depth: per verify row count the median over a window of rounds,
+ * and the line a + b r through those medians (each count one vote, least squares) -- a the depth's fixed cost (every
+ * row attends the deeper context: the one-row forward grows too), b its cost a row.  One count alone: a shift. */
+/// Rounds in a depth's residual window.
+#define VC_LINE_WINDOW 2000u
+/// Samples a row count needs to vote in its depth's line.
+#define VC_LINE_MIN 5u
+/// The forward's residual (ms) against the profile at one depth bucket: a sliding window, medians per row count, and
+/// the line through them.
+struct residual_line {
+    /// The window: (row count, residual ms) of this depth's last VC_LINE_WINDOW rounds, oldest first.
     std::deque<std::pair<uint32_t, double>> win;
     /// The window's residuals by verify row count.
     std::map<uint32_t, median_set> by_rows;
-    /// The per-row-count medians of the counts with >= VC_SLOPE_MIN samples, one vote each.
-    median_set medians;
-    /// Add or remove one residual of a row count, keeping `medians` in step with its count's median.
-    /// @param rows the round's verify row count
-    /// @param v the residual (ms per row)
-    /// @param insert true to add the sample, false to remove it
-    void update(uint32_t rows, double v, bool insert) {
-        median_set &m = by_rows[rows];
-        if (m.size() >= VC_SLOPE_MIN) medians.erase(m.get());
-        if (insert) m.insert(v);
-        else m.erase(v);
-        if (m.size() >= VC_SLOPE_MIN) medians.insert(m.get());
-        else if (m.size() == 0) by_rows.erase(rows);
-    }
     /// Push one round's residual, evicting the oldest once the window is full.
     /// @param rows the round's verify row count
-    /// @param v the residual (ms per row)
+    /// @param v the residual (ms)
     void add(uint32_t rows, double v) {
-        if (win.size() == VC_SLOPE_WINDOW) {
-            update(win.front().first, win.front().second, false);
+        if (win.size() == VC_LINE_WINDOW) {
+            median_set &old = by_rows[win.front().first];
+            old.erase(win.front().second);
+            if (old.size() == 0) by_rows.erase(win.front().first);
             win.pop_front();
         }
         win.emplace_back(rows, v);
-        update(rows, v, true);
+        by_rows[rows].insert(v);
     }
-    /// @param out receives the median of the per-row-count medians
-    /// @return false (out untouched) while no row count has VC_SLOPE_MIN samples
-    bool get(double *out) const {
-        if (medians.size() == 0) return false;
-        *out = medians.get();
+    /// The line through the medians of the row counts with VC_LINE_MIN samples or more.
+    /// @param a receives the fixed residual, ms
+    /// @param b receives the residual a row, ms
+    /// @return false (a, b untouched) while no row count has VC_LINE_MIN samples
+    bool get(double *a, double *b) const {
+        double n = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+        for (const auto &kv : by_rows) {
+            if (kv.second.size() < VC_LINE_MIN) continue;
+            const double x = (double)kv.first, y = kv.second.get();
+            n += 1.0; sx += x; sy += y; sxx += x * x; sxy += x * y;
+        }
+        if (n == 0.0) return false;
+        const double den = n * sxx - sx * sx;
+        if (n < 2.0 || !(den > 0.0)) {   /* one row count: a shift */
+            *a = sy / n;
+            *b = 0.0;
+            return true;
+        }
+        *b = (n * sxy - sx * sy) / den;
+        *a = (sy - *b * sx) / n;
         return true;
     }
 };
 
+/* Depth buckets: the attention bound's powers of two -- [0, 256) is bucket 0, [2^(7+k), 2^(8+k)) bucket k. */
+/// Depth buckets the correction keeps (up to 2^(8 + 23) tokens: any context).
+#define VC_DEPTH_BUCKETS 24u
+/// The bucket of a depth in tokens.
+/// @param depth tokens
+/// @return the bucket, < VC_DEPTH_BUCKETS
+static uint32_t vc_bucket(uint32_t depth) {
+    uint32_t b = 0;
+    for (uint32_t d = depth >> 8; d && b + 1u < VC_DEPTH_BUCKETS; d >>= 1) b++;
+    return b;
+}
+
 }  // namespace
 
 /* The engine's verify curve (pulsar_engine::verify_curve; NULL = none). */
-/// The measured verify cost curve round_ms(n, r) = base[r] + max(0, slope) * r + host(n) + draft(n) (file comment).
+/// The measured verify cost curve round_ms(n, r) = base[r] + a(d) + b(d) r + host(n) + draft(n) (file comment).
 /// Built by pulsar_verify_curve_new, freed by pulsar_verify_curve_free; held by the engine (NULL = no curve).
 struct pulsar_verify_curve {
     uint32_t rows_max;                              ///< the widest verify step (the family's fused_heads_max)
     double base_ms[PULSAR_SPEC_LOGITS_ROWS + 1];    ///< [r]: the profiled r-row verify forward, ms ([0] unused)
     uint64_t key;                                   ///< the cache key it was profiled / loaded under
     bool cached;                                    ///< loaded from the cache (else profiled this process)
-    /// The online residual per row of the served forwards against base_ms (applied as max(0, slope)).
-    residual_slope slope;
+    /// The online residual of the served forwards against base_ms, per depth bucket (vc_bucket).
+    residual_line line[VC_DEPTH_BUCKETS];
+    uint32_t profile_depth;                         ///< the profile's depth (the bank's frontier it ran at), tokens
+    uint32_t depth;                                 ///< the depth the round in progress is priced at (0 = the profile's)
     /** @var pulsar_verify_curve::host_any
      *  host(n) at any bank count (the fallback while host[n] has too few). */
     /// host[n]: the round's host wall outside the forward (planning, walk, emission), ms, at n banks.
@@ -219,10 +242,11 @@ struct pulsar_verify_curve {
     /// draft[n]: the next round's drafting wall, ms, at n banks.
     recent_median draft[PULSAR_SPEC_LOGITS_ROWS + 1], draft_any;
     uint64_t observed;                              ///< rounds observed
-    double ann_slope;                               ///< the residual last announced (rule 5)
-    /// ann_slope holds an announced value.
-    bool ann_slope_valid;
-    uint64_t ann_at;                                ///< `observed` at that announcement
+    /// Per bucket: the line last announced holds a value (rule 5).
+    bool ann_valid[VC_DEPTH_BUCKETS];
+    double ann_a[VC_DEPTH_BUCKETS];                 ///< its fixed residual, ms
+    double ann_b[VC_DEPTH_BUCKETS];                 ///< its residual a row, ms
+    uint64_t ann_at[VC_DEPTH_BUCKETS];              ///< `observed` at that announcement
 };
 
 pulsar_verify_curve *pulsar_verify_curve_new(uint32_t rows_max, const double *base_ms) {
@@ -246,20 +270,40 @@ static double vc_recent(const recent_median *by_n, const recent_median *any, uin
     return any->get(&v) ? v : 0.0;
 }
 
+/* The bucket a depth prices at: the round's depth (0 = the profile's). */
 /// @param c the curve
-/// @return the residual slope in force, ms per row: max(0, slope), 0 while unmeasured
-static double vc_slope(const pulsar_verify_curve *c) {
-    double v = 0.0;
-    return c->slope.get(&v) && v > 0.0 ? v : 0.0;
+/// @param depth tokens (0 = the profile's)
+/// @return its bucket
+static uint32_t vc_depth_bucket(const pulsar_verify_curve *c, uint32_t depth) {
+    return vc_bucket(depth ? depth : c->profile_depth);
 }
 
-/* The verify forward of `rows` rows: the profile + the correction (rows past the profile clamp to its widest). */
+/* The residual line a depth prices with: its bucket's, else the nearest bucket's that has one (the shallower on a
+ * tie), else none. */
+/// @param c the curve
+/// @param depth tokens (0 = the profile's)
+/// @param a receives the fixed residual, ms
+/// @param b receives the residual a row, ms
+/// @return false while no bucket has a line
+static bool vc_line(const pulsar_verify_curve *c, uint32_t depth, double *a, double *b) {
+    const int b0 = (int)vc_depth_bucket(c, depth);
+    for (int d = 0; d < (int)VC_DEPTH_BUCKETS; d++) {
+        if (b0 - d >= 0 && c->line[b0 - d].get(a, b)) return true;
+        if (d > 0 && b0 + d < (int)VC_DEPTH_BUCKETS && c->line[b0 + d].get(a, b)) return true;
+    }
+    return false;
+}
+
+/* The verify forward of `rows` rows at the round's depth: the profile + its depth's residual line, at least half the
+ * profile (a stray fit never prices a forward near free; rows past the profile clamp to its widest). */
 /// @param c the curve
 /// @param rows verify rows (>= 1)
 /// @return ms
 static double vc_forward_ms(const pulsar_verify_curve *c, uint32_t rows) {
     if (rows > c->rows_max) rows = c->rows_max;
-    return c->base_ms[rows] + vc_slope(c) * (double)rows;
+    double a = 0.0, b = 0.0;
+    const double f = c->base_ms[rows] + (vc_line(c, c->depth, &a, &b) ? a + b * (double)rows : 0.0);
+    return std::max(f, 0.5 * c->base_ms[rows]);
 }
 
 /* round_ms(n, rows): see the head of the file.  rows in [1, rows_max]. */
@@ -414,12 +458,17 @@ uint32_t pulsar_spec_chain_step(const pulsar_session *s, uint32_t n_chains, cons
 
 /* ---- the online correction --------------------------------------------------------------------------------- */
 
+void pulsar_engine_verify_curve_depth(pulsar_engine *e, uint32_t depth) {
+    if (e && e->verify_curve) e->verify_curve->depth = depth;
+}
+
 void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint32_t rows, double forward_ms,
                                         double host_ms, double draft_ms) {
     pulsar_verify_curve *c = e ? e->verify_curve : NULL;
     /* L315: on a pair, the leader's (a worker has no curve) */
     if (!c || n_seqs == 0u || rows == 0u || rows > c->rows_max || !(forward_ms > 0.0)) return;
-    c->slope.add(rows, (forward_ms - c->base_ms[rows]) / (double)rows);
+    const uint32_t bk = vc_depth_bucket(c, c->depth);   /* the depth the round ran (and was priced) at */
+    c->line[bk].add(rows, forward_ms - c->base_ms[rows]);
     if (host_ms >= 0.0) {
         if (n_seqs <= PULSAR_SPEC_LOGITS_ROWS) c->host[n_seqs].add(host_ms);
         c->host_any.add(host_ms);
@@ -429,18 +478,22 @@ void pulsar_engine_verify_curve_observe(pulsar_engine *e, uint32_t n_seqs, uint3
         c->draft_any.add(draft_ms);
     }
     c->observed++;
-    /* rule 5: the correction announces itself when it first has a number and, at most once in 4096 rounds, when it
-     * has moved by more than 0.1 ms a row since -- the round cost the pick prices with is in the log */
-    double sl;
-    if (!c->slope.get(&sl)) return;
-    if (!c->ann_slope_valid || (c->observed - c->ann_at >= 4096u && fabs(sl - c->ann_slope) > 0.1)) {
-        fprintf(stderr, "pulsar: verify curve correction%s: %+.3f ms a row past the profile (applied %.3f), host %.1f "
-                        "ms, draft %.1f ms at %u banks (%llu rounds)\n",
-                c->ann_slope_valid ? " moved" : "", sl, vc_slope(c), vc_recent(c->host, &c->host_any, n_seqs),
-                vc_recent(c->draft, &c->draft_any, n_seqs), n_seqs, (unsigned long long)c->observed);
-        c->ann_slope = sl;
-        c->ann_slope_valid = true;
-        c->ann_at = c->observed;
+    /* rule 5: each depth's line announces itself when it first has a number and, at most once in 4096 rounds, when it
+     * has moved by more than 0.5 ms (its fixed part) or 0.1 ms a row since -- what the pick prices with is in the
+     * log */
+    double la, lb;
+    if (!c->line[bk].get(&la, &lb)) return;
+    if (!c->ann_valid[bk] ||
+        (c->observed - c->ann_at[bk] >= 4096u && (fabs(la - c->ann_a[bk]) > 0.5 || fabs(lb - c->ann_b[bk]) > 0.1))) {
+        fprintf(stderr, "pulsar: verify curve correction%s at depth %u..%u (profile %u): %+.3f ms %+.3f ms a row past "
+                        "the profile, host %.1f ms, draft %.1f ms at %u banks (%llu rounds)\n",
+                c->ann_valid[bk] ? " moved" : "", bk ? 128u << bk : 0u, (256u << bk) - 1u, c->profile_depth, la, lb,
+                vc_recent(c->host, &c->host_any, n_seqs), vc_recent(c->draft, &c->draft_any, n_seqs), n_seqs,
+                (unsigned long long)c->observed);
+        c->ann_valid[bk] = true;
+        c->ann_a[bk] = la;
+        c->ann_b[bk] = lb;
+        c->ann_at[bk] = c->observed;
     }
 }
 
@@ -452,9 +505,12 @@ void pulsar_engine_verify_curve_view(const pulsar_engine *e, pulsar_verify_curve
     out->cached = c->cached;
     out->rows_max = c->rows_max;
     for (uint32_t r = 1; r <= c->rows_max; r++) out->base_ms[r] = (float)c->base_ms[r];
-    double sl = 0.0;
-    out->slope_valid = c->slope.get(&sl);
-    out->slope_ms = (float)sl;
+    double la = 0.0, lb = 0.0;
+    out->line_valid = vc_line(c, c->depth, &la, &lb);
+    out->line_a_ms = (float)la;
+    out->line_b_ms = (float)lb;
+    out->depth = c->depth;
+    out->profile_depth = c->profile_depth;
     out->host_ms = (float)vc_recent(c->host, &c->host_any, PULSAR_SPEC_LOGITS_ROWS + 1u);
     out->draft_ms = (float)vc_recent(c->draft, &c->draft_any, PULSAR_SPEC_LOGITS_ROWS + 1u);
     out->observed = c->observed;
@@ -705,6 +761,7 @@ int pulsar_session_verify_curve_open(pulsar_session *s, const char *cache_dir, c
     pulsar_verify_curve *c = pulsar_verify_curve_new(rows_max, base);
     c->key = key;
     c->cached = cached;
+    c->profile_depth = (uint32_t)pulsar_session_pos(s).raw();   /* the walk's frontier (the warmup bank's) */
     pulsar_verify_curve_free(e->verify_curve);
     e->verify_curve = c;
     /* rule 5: the curve the pick prices with, and where it came from */

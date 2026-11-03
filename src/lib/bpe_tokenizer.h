@@ -19,6 +19,12 @@
  *        encoder lookup); otherwise the adjacent pair whose concatenation has the lowest rank merges
  *        first, leftmost among equals (tiktoken's byte_pair_merge).
  *
+ * The SentencePiece-BPE row (L338, Gemma 4: pattern "gemma4") is the same engine with other symbols: added tokens
+ * cut first as above; a run is normalised ' ' -> U+2581 (HF's Replace normaliser) and is ONE piece (its Split(" ")
+ * has nothing left to match); the piece starts as one symbol per character the vocab holds, or one per UTF-8 byte
+ * (its <0xXX> token: tokenizers' byte_fallback) for a character it lacks; then the HF merges, the same loop.  A
+ * token's bytes are the decoder's: U+2581 -> ' ', <0xXX> -> the byte.
+ *
  * The L223 guard: `encode` takes the byte ranges the renderer copied from CLIENT data, and no added token
  * matches whose bytes touch one -- a client who types a marker gets ordinary text tokens.  The ranges do
  * NOT cut the text: pre-tokenisation and NFC run over the whole run between two real markers, so a prompt
@@ -43,7 +49,7 @@ struct bpe_tokenizer;
  * (JSON-decoded), and the hand-written matcher that IS that regex under Oniguruma (graded over every scalar
  * value against tokenizers' own Split).  The registry is the one place a pattern lives. */
 struct bpe_pretok_pattern {
-    const char *name;   ///< "qwen35" (Qwen3.5 / 3.8), "o200k" (Inkling; tiktoken's o200k_base split), "tekken" (Nemotron-H)
+    const char *name;   ///< "qwen35" (Qwen3.5 / 3.8), "o200k" (Inkling; tiktoken's o200k_base split), "tekken" (Nemotron-H), "gemma4" (L338: the whole run)
     const char *regex;  ///< the spelling tokenizer.json carries
     /** The end of the first alternative that matches at `i` of the codepoints `s` (classes `cl`, from the
      *  engine's Unicode table), `n` long. */
@@ -60,7 +66,8 @@ const bpe_pretok_pattern *bpe_pretok_by_regex(const char *regex);
 
 /** HF tokenizer.json (BPE model, Split(registered regex) + ByteLevel pre-tokenizer, ByteLevel decoder and
  * post-processor) in one of the pipelines the registered pattern names -- Qwen's (NFC normaliser, every merge
- * applied) or Nemotron-H's (no normaliser, ignore_merges: a piece found whole in the vocab is that token) --
+ * applied) or Nemotron-H's (no normaliser, ignore_merges: a piece found whole in the vocab is that token) -- or
+ * (L338) Gemma 4's SentencePiece-BPE pipeline, every section spelled exactly as its file spells it --
  * plus the config file whose `eos_token_id` (an int or a list, in its order) lists the stop ids (Qwen,
  * Nemotron-H: generation_config.json).  NULL + a one-line reason on refusal. */
 /// @param tokenizer_json  tokenizer.json's bytes (need not be NUL-terminated)

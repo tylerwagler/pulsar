@@ -1149,6 +1149,61 @@ int pulsar_session_decode_fused(pulsar_session *s, const pulsar_multiseq_req *re
     }
     return 0;
 }
+int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap) {
+    const pulsar_driver_ops *ops = s && s->engine && s->engine->family ? s->engine->family->driver : NULL;
+    if (!ops || !ops->hidden || !s->driver || !out || cap <= 0 || pulsar_session_is_mirrored(s)) {
+        fprintf(stderr, "pulsar: copy hidden: %s -- refusing\n",
+                !ops || !ops->hidden ? "the family offers no hidden-state readout" : "no buffer, or a mirrored session");
+        return 0;
+    }
+    return (int)ops->hidden(s, out, (uint32_t)cap);
+}
+
+bool pulsar_engine_has_adapter(pulsar_engine *e) {
+    const pulsar_driver_ops *ops = e && e->family ? e->family->driver : NULL;
+    return ops && ops->adapter && ops->adapter(e);
+}
+
+uint32_t pulsar_engine_decision_head(pulsar_engine *e, const float **w, const float **b, uint32_t *width) {
+    const pulsar_driver_ops *ops = e && e->family ? e->family->driver : NULL;
+    const pulsar_tensor *tw = NULL, *tb = NULL;
+    const uint32_t slots = ops && ops->decision_head ? ops->decision_head(e, &tw, &tb) : 0u;
+    if (!slots || !tw || !tb || tw->type != PULSAR_TENSOR_F32 || tb->type != PULSAR_TENSOR_F32 || tw->ndim != 2 ||
+        tw->dim[1] != slots || tb->elements != slots) {
+        if (slots) fprintf(stderr, "pulsar: the decision head is not f32 [%u][hidden] + [%u] -- refusing\n", slots, slots);
+        return 0;
+    }
+    *w = (const float *)((const uint8_t *)tensor_map_base(&e->model, tw) + tw->abs_offset);
+    *b = (const float *)((const uint8_t *)tensor_map_base(&e->model, tb) + tb->abs_offset);
+    *width = (uint32_t)tw->dim[0];
+    return slots;
+}
+
+bool pulsar_session_set_bank_adapter(pulsar_session *s, uint32_t bank, bool on) {
+    pulsar_driver_state *d = s ? s->driver : NULL;
+    const int n = s && s->states ? (int)s->states->n_banks : 0;
+    if (!d || !d->bank_adapter || (int)bank >= n) {
+        fprintf(stderr, "pulsar: set bank adapter: %s -- refusing\n",
+                !d || !d->bank_adapter ? "the engine carries no runtime adapter" : "the bank is out of range");
+        return false;
+    }
+    if ((d->bank_adapter[bank] != 0) == on) return true;
+    /* empty = no history yet (a fresh session's bank) or an invalidated one */
+    const pulsar_tokens *held = pulsar_bank_history(s, bank);
+    if (held && held->len > 0) {
+        fprintf(stderr, "pulsar: set bank adapter: bank %u holds %d tokens of the %s model -- invalidate it first; "
+                        "refusing\n", bank, held->len, d->bank_adapter[bank] ? "adapted" : "plain");
+        return false;
+    }
+    d->bank_adapter[bank] = on ? 1u : 0u;
+    return true;
+}
+
+bool pulsar_session_bank_adapter(const pulsar_session *s, uint32_t bank) {
+    const pulsar_driver_state *d = s ? s->driver : NULL;
+    return d && d->bank_adapter && s->states && bank < s->states->n_banks && d->bank_adapter[bank];
+}
+
 int pulsar_session_bank_count(pulsar_session *s) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank pool", 0); return s ? session_banks(s)->count(s) : 0; }
 /* ---- The bank surface (increment 2).  Bank SELECTION already rode the
  * decode rows; these mirror the leader scheduler's bank DECISIONS -- save,

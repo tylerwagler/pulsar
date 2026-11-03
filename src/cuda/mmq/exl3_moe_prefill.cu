@@ -107,18 +107,6 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const __half *p) {
                  : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(s));
 }
 
-/// 16 bytes global -> shared, asynchronously (cp.async.cg); traps below sm_80.
-/// @param smem       16-byte aligned shared destination
-/// @param gmem       16-byte aligned global source
-/// @param src_bytes  bytes read (16, or 0 to zero-fill)
-__device__ __forceinline__ void cp_async16(void *smem, const void *gmem, int src_bytes) {
-    const uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
-#if PULSAR_SM80
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(s), "l"(gmem), "r"(src_bytes));
-#else
-    __trap();
-#endif
-}
 
 /* The work list: expert e's assignments [bounds[e], bounds[e+1]) cut into
  * blocks of kBM, in expert order.  One block of E threads, an inclusive
@@ -346,13 +334,9 @@ exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ 
             const int r = c >> 4, ch = c & 15;
             const bool real = r < mr;
             const __half *src = phi + (size_t)(a0 + (real ? r : 0)) * K + (size_t)blk * 128 + ch * 8;
-            cp_async16(&S.a_hi[buf][r][ch * 8], src, real ? 16 : 0);
+            pulsar_cp_async16(&S.a_hi[buf][r][ch * 8], src, real ? 16 : 0);
         }
-#if PULSAR_SM80
-        asm volatile("cp.async.commit_group;\n" ::: "memory");
-#else
-        __trap();
-#endif
+        pulsar_cp_async_commit();
         if (tid < kBM) S.inv[buf][tid] = tid < mr ? pinv[(size_t)(a0 + tid) * nblk + blk] : 0.0f;
     };
     auto load_words = [&](int blk, uint32_t (&wd)[8][4]) {
@@ -372,17 +356,9 @@ exl3_moe_gemm_kernel(const void *__restrict__ table, const __half *__restrict__ 
         if (more) {
             issue_a(blk + 1, buf ^ 1);
             load_words(blk + 1, wnxt);
-#if PULSAR_SM80
-            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-#else
-            __trap();
-#endif
+            pulsar_cp_async_wait<1>();
         } else {
-#if PULSAR_SM80
-            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-#else
-            __trap();
-#endif
+            pulsar_cp_async_wait<0>();
         }
         __syncthreads();
         float ia[4], ib[4];
@@ -786,7 +762,6 @@ int exl3_moe_prefill_launch(const void *table, int k2, bool rotate_input, const 
                             const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds,
                             float *out, int M, int K, int64_t n_assign, int n_experts,
                             void *ws, size_t ws_bytes, cudaStream_t stream) {
-    PULSAR_REQUIRE_CC(80, "the EXL3 MoE prefill GEMM (m16n8k16, cp.async)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "exl3_moe_prefill_launch";
     const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
     if (!table || !act.x || !ids_dst || !ids_src || !expert_bounds || !out || !ws || n_assign <= 0 ||
@@ -894,7 +869,6 @@ int exl3_moe_decode_launch(const void *table0, const void *table1, int k2, bool 
                            const int32_t *ids_dst, const int32_t *ids_src, const int32_t *expert_bounds, int M, int K,
                            int64_t n_assign, int n_experts, void *ws, size_t ws_bytes, exl3_moe_partials *out,
                            cudaStream_t stream) {
-    PULSAR_REQUIRE_CC(80, "the EXL3 MoE decode (m16n8k16)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     const char *tag = "exl3_moe_decode_launch";
     const bool e4m3 = act.format == EXL3_MOE_ACT_E4M3_SLOT;
     const int n_proj = table1 ? 2 : 1;

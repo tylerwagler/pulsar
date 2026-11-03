@@ -270,7 +270,8 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
     return true;
 }
 
-bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen) {
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, int server_default, bool *on, char *err,
+                              size_t errlen) {
     const bool none = a->level == k_effort_row_none;
     if (a->thinking == 1 && none) {
         snprintf(err, errlen, "reasoning_effort: none is thinking off, and thinking was requested on");
@@ -278,6 +279,9 @@ bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool 
     }
     if (a->thinking >= 0) *on = a->thinking == 1;
     else if (none) *on = false;
+    /* L338 P4: nothing sent at all -- the server's default when the operator set one (--reasoning; llama-server's
+     * --reasoning off, which the gate's Gemma clients were written against: they send no thinking control) */
+    else if (server_default >= 0 && a->level < 0 && !a->value) *on = server_default == 1;
     /* the DeepSeek API's non-thinking model name, on any family: a default, never over a control */
     else *on = !(model && !strcmp(model, "deepseek-chat"));
     return true;
@@ -292,12 +296,13 @@ bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool 
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
 /// @return false + err on a malformed or contradictory control
-static bool chat_resolve_thinking(pulsar_engine *e, const chat_conversation *c, request *r, char *err,
-                                  size_t errlen) {
+static bool chat_resolve_thinking(pulsar_engine *e, const server *s, const chat_conversation *c, request *r,
+                                  char *err, size_t errlen) {
     chat_effort_ask a;
     bool on = false;
     if (!chat_effort_ask_read(c->controls, c->n_controls, &a, err, errlen) ||
-        !chat_effort_ask_thinking(&a, r->model, &on, err, errlen))
+        !chat_effort_ask_thinking(&a, r->model, s && s->reasoning_default ? s->reasoning_default - 1 : -1, &on, err,
+                                  errlen))
         return false;
     const server_effort_map *m = r->family->effort;
     r->think_mode = PULSAR_THINK_NONE;
@@ -1115,6 +1120,7 @@ const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
     case PULSAR_CHAT_QWEN:    return &k_family_qwen;
     case PULSAR_CHAT_INKLING: return &k_family_inkling;
     case PULSAR_CHAT_NEMOTRON_H: return &k_family_nemotron_h;
+    case PULSAR_CHAT_GEMMA4: return &k_family_gemma4;
     case PULSAR_CHAT_NONE: break;   /* an encoder or a parser: no conversation to serve */
     }
     pulsar_die("server_family_for_format: a chat format without a server family table");
@@ -1140,7 +1146,7 @@ const server_family_ops *server_tool_family(const server *s) {
 bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *s, chat_conversation *c,
                               request *r, char *err, size_t errlen) {
     r->family = server_family_for_format(fmt);
-    if (!chat_resolve_thinking(e, c, r, err, errlen)) return false;
+    if (!chat_resolve_thinking(e, s, c, r, err, errlen)) return false;
     /* The protocol's tool-result checks: every result's call is in this request's
      * history or bound to the live frontier (parse-without-server skips them). */
     if (s && r->api == API_ANTHROPIC &&

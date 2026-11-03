@@ -122,6 +122,7 @@ Chat models (`src/server/http_server.cpp`):
 | `POST /v1/messages` | Anthropic Messages. Errors use Anthropic's error envelope. |
 | `POST /v1/messages/count_tokens` | `{"input_tokens": n}`, rendered and tokenized exactly as `/v1/messages` would. It creates no job and does not reject over-long prompts. |
 | `POST /v1/completions` | Raw continuation of `prompt`: no chat template, no thinking, no logprobs (refused). |
+| `POST /v1/systemone` | The container's runtime-adapter judge (Gemma 4 + JEV): System 1 decisions, one prefill a question on a reserved bank. See [System 1 decisions](#system-1-decisions-v1systemone). |
 | `GET /v1/models` | The loaded model only (its served id). |
 | `GET /v1/models/{id}` | 200 for the served id; any other id is 404. |
 | `GET /health` | See [Health and metrics](#health-and-metrics). |
@@ -401,6 +402,31 @@ progress for `PULSAR_STALL_WATCHDOG_S` seconds (default 120). It then:
   until progress resumes.
 
 It never touches the engine.
+
+## System 1 decisions (`/v1/systemone`)
+
+A container that carries a runtime adapter and its decision head (Gemma 4's JEV judge: `build.py --adapter`) serves
+`POST /v1/systemone` (L338 P2.4, `src/server/systemone.cpp`). Each question is one prefill of the adapter's bare-v1
+template on a bank reserved for it at startup (`--judge-banks`, default 1 with an adapter: the pool's last bank, outside
+the chat pool, so chat traffic never touches its K / V; it needs a pool of three). The worker serves the judge's queue
+between decode quanta, a 1024-token chunk a turn.
+
+```json
+{"state": {"user_request": "...", "working_directory": "...", "action": {"tool": "Bash", "input": {"command": "..."}}},
+ "questions": [{"kind": "noul", "question": "Does this tool call match one of the block rules below? ..."},
+               {"kind": "score", "question": "How harmful is running the tool call ..."},
+               {"kind": "choice", "question": "...", "options": ["...", "..."]}]}
+```
+
+- `state`: a string used verbatim, or an object serialized as the adapter's training data was, `json.dumps(state,
+  indent=1)` (ASCII-escaped).
+- `kind`: one the head answers (`judge_config.json` `slots.ranges`). `options` default to `false`/`true` (noul) and
+  `0`..`5` (score); a choice question's are rendered `A) ...`.
+- Answer: `{"object":"systemone.decisions","decisions":[{"kind","options","probs","choice", "p_block" (noul) |
+  "score" (score: the expectation)}],"usage":{"prompt_tokens","cached_tokens"},"ms"}` -- `probs` = softmax over the
+  kind's slots of `softcap * tanh((W h + b) / softcap) / T_kind` (`calibration_gold.json`), h the last row's final-norm
+  hidden.
+- 404 without a judge; 400 for a malformed request; 503 when its prefill fails.
 
 ## Health and metrics
 

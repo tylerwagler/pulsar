@@ -191,9 +191,13 @@ bool pulsar_moe_routed_rows(const pulsar_moe_rows_call *c) {
     const pulsar_ffn_act act = (pulsar_ffn_act)c->act;
     const pulsar_moe_arm up_arm = act == PULSAR_FFN_ACT_RELU2 && !G ? pulsar_moe_arm_up_only(U, D, PULSAR_ACT_ROWS_BF16)
                                                                     : PULSAR_MOE_ARM_NONE;
-    if (act != PULSAR_FFN_ACT_SWIGLU && up_arm == PULSAR_MOE_ARM_NONE) {
+    if (act == PULSAR_FFN_ACT_RELU2 && up_arm == PULSAR_MOE_ARM_NONE) {
         fprintf(stderr, "pulsar: routed MoE: activation %d runs up-only experts (no gate stack) in BF16 or EXL3 alone -- "
                         "refusing\n", (int)act);
+        return false;
+    }
+    if (act != PULSAR_FFN_ACT_SWIGLU && act != PULSAR_FFN_ACT_RELU2 && act != PULSAR_FFN_ACT_GEGLU_TANH) {
+        fprintf(stderr, "pulsar: routed MoE: activation %d is not one the arms implement -- refusing\n", (int)act);
         return false;
     }
     const pulsar_tensor *G0 = G ? G : U;   /* the first projection: its input width, its plan slice */
