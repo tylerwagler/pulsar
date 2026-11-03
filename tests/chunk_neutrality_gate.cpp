@@ -136,9 +136,9 @@ static char *read_file(const char *path, size_t *len_out) {
  * (pulsar_kvchain, keyed by the rendered text of the tokens) -- close the store and throw the session away (the
  * restart), reopen the store, find the chain by a text lookup of the whole prompt alone, and load it into a fresh
  * session.  L323: the chain is cut on the canonical disk grid (grid segments, then the tail to the deepest
- * checkpoint, `limit`), a grid segment whose checkpoint the ladder thinned away carries rows only, and the load reads
- * every segment's rows and the last one's state.  Says the chain it moved and which segments carry a state, so the
- * log shows the segment path ran. */
+ * checkpoint, `limit`), every segment carries rows only, the closing persist leaves the restore point at the chain's
+ * end (L347), and the load reads every segment's rows and that restore point.  Says the chain it moved and which
+ * segments have a restore point, so the log shows the segment path ran. */
 static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsar_tokens *prompt, int limit,
                               char *err, size_t errlen) {
     const int deepest = pulsar_session_checkpoint_best(*sp, TokPos{limit}).raw();
@@ -154,7 +154,8 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
     if (!st) { snprintf(err, errlen, "segment store open failed"); goto out; }
     {
         pulsar_kvchain_persist_result r;
-        pulsar_kvchain_persist(st, e, *sp, 0, true, NULL, &r);
+        const pulsar_kvchain_writer inl = pulsar_kvchain_writer_inline(st);
+        pulsar_kvchain_persist(st, e, *sp, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &r);
         if (r.err[0] || r.end != deepest) {
             snprintf(err, errlen, "the persist stored a chain to %d, not %d: %.180s", r.end, deepest, r.err);
             goto out;
@@ -179,7 +180,7 @@ static int segment_round_trip(pulsar_engine *e, pulsar_session **sp, const pulsa
         free(full);
         printf("  [segments]");
         for (int i = 0; i < loaded; i++)
-            printf(" [%u,%u)%s", chain[i].G_prev, chain[i].G, chain[i].state_bytes ? "+state" : "");
+            printf(" [%u,%u)%s", chain[i].G_prev, chain[i].G, chain[i].rp_bytes ? "+restore point" : "");
         printf("\n");
         if (G != deepest || loaded != n) {
             if (!err[0]) snprintf(err, errlen, "the restore stood at %d (%d segments), persisted to %d", G, loaded,

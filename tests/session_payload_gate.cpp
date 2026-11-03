@@ -128,11 +128,9 @@ static uint64_t checksum_lanes(pulsar_session *s, const char *tag) {
         int pf = pulsar_session_pos(s).raw();
         if (pf > s->prefill_frontier) pf = s->prefill_frontier;
         G = pulsar_ckpt_best(&g->ckpt, gpu_graph_cur_bank(g), pulsar_ckpt_grid_floor(&g->ckpt, (uint32_t)pf));
-        pulsar_gpu_tensor *slab = NULL;
-        uint64_t off = 0;
-        ok = G != 0u && pulsar_ckpt_locate(&g->ckpt, gpu_graph_cur_bank(g), G, &slab, &off) &&
-             g->ckpt.slot_bytes <= cap &&
-             pulsar_gpu_tensor_read(slab, off, buf, g->ckpt.slot_bytes) != 0;
+        pulsar_ckpt_slot_at at;
+        ok = G != 0u && pulsar_ckpt_locate(&g->ckpt, gpu_graph_cur_bank(g), G, &at) &&
+             g->ckpt.slot_bytes <= cap && pulsar_ckpt_slot_get(&g->ckpt, &at, buf);
         if (ok) for (uint64_t i = 0; i < g->ckpt.slot_bytes; i++) { h ^= buf[i]; h *= 1099511628211ull; }
     }
     free(buf);

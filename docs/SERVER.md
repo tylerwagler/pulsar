@@ -33,6 +33,8 @@ The topics are `runtime`, `steering`, `api`, `kv-cache`, `thinking` and `all`.
 | `--kv-disk-dir DIR` | see [Disk KV cache](#disk-kv-cache) | `""` disables the cache. The last disk-KV flag on the line wins. |
 | `--no-kv-disk` | | Disable the disk KV cache. |
 | `--kv-disk-space-mb N` | unset: no budget | Disk budget in MiB. When the store is over budget it evicts leaves (see below). |
+| `--kv-ram-mb N` | 25% of RAM, at most 16384 (discrete GPU); 1024 (unified memory) | The disk cache's pinned host pool in MiB: copy-out buffers, and on a discrete-GPU host the RAM tier restores read before disk (see below). |
+| `--kv-pinned-max-mb N` | 2048 | Budget in MiB for pinned anchors (`X-Pulsar-KV: pin-anchor`, below): each anchor's restore point and its chain's segments. Past it, the least recently used anchor loses its pin (logged). |
 | `--no-dspark` | | Run without the container's drafter, for every family. |
 | `--drafter NAME` | the container's | Which drafter to load when the container holds more than one: `mtp`, `dflash2` (Qwen; its default) or `lilicorr` (Nemotron; a container with both MTP and LiLiCorr must name one). Naming a drafter the container does not hold is refused. |
 | `--spec-depth N` | the drafter's | The draft depth a session starts at (DSpark 3, then its controller walks 2..5; MTP 4). Env form: `PULSAR_SPEC_DEPTH`. |
@@ -350,20 +352,62 @@ Format (`src/lib/pulsar_segstore.h`, `src/lib/pulsar_kvchain.h`):
   optional state at its end, and an optional trailer (the tool-call replay map).
 - **Keys.** A segment's key is `sha1(parent_key || text)`, so a key names the
   whole text from position 0, and conversations that share a prefix share its
-  segments. Files are `<key>.seg`, written durably (tmp + fsync + rename) and
-  without leaving page cache behind.
+  segments. Files are `<key>.seg` (rows) and `<key>.rp` (the state at its end, a
+  restore point). A persist copies each file out of the GPU into the pinned host
+  pool (`--kv-ram-mb`) and a writer thread writes it behind with O_DIRECT (tmp +
+  rename; no fsync: sizes and digests reject a torn file), so no page cache is
+  left behind.
+- **RAM tier.** On a discrete-GPU host a written file stays in the pool as a RAM
+  copy, and a restore of it reads no disk; RAM copies are evicted
+  least-recently-used (dead-end restore points first, anchors and branch points
+  last) and stay on disk. On unified memory (GB10) the tier is off: host RAM is
+  the GPU's, so the pool is only the copy-out ring.
 - **The grid.** Chains are cut on a fixed grid (the prefill chunk) plus one tail
   segment. Copies and branches of a conversation therefore deduplicate.
 - **Lookup.** A lookup returns the deepest chain whose text is a byte prefix of
   the request and whose last segment carries a state.
 - **Identity.** A store records the model, its routed-expert format and its rope.
-  Segments of another identity or payload version (segment v6, store v2) are
-  refused and rewritten, never converted.
+  Segments of another identity or payload version (segment v8, restore point
+  v2, store v4) are refused and rewritten, never converted.
 - **Restore.** A restore loads in slices between decode rounds, so other
-  sessions keep decoding (L330).
+  sessions keep decoding (L330). The chain is pinned against eviction while it
+  loads. When the bank holds a history the request could resume from, every
+  part of the chain is read and checked first, and the bank is written only
+  after all of it passed.
+- **Failures.** Only a content fault drops anything: a file that is missing,
+  unreadable, of the wrong size or header, or whose digest is wrong. A bad
+  segment drops itself and every segment below it. A bad restore point drops
+  only itself; its rows stay. Any other failure (no RAM room, no checkpoint
+  slot, the device, a TP worker's copy) drops nothing. A request whose restore
+  failed resumes from its bank's own history (when the restore had not written
+  it yet) or from another bank's state, never from 0 when either serves it.
 - **Eviction.** With a budget, the store evicts leaves only: first those
   dominated by a longer sibling, then the least recently used. Without
-  `--kv-disk-space-mb` there is no budget.
+  `--kv-disk-space-mb` there is no budget. Pinned anchors are never evicted
+  while anything else can go.
+
+### The `X-Pulsar-KV` request header
+
+Any generation request (`/v1/chat/completions`, `/v1/completions`,
+`/v1/responses`, `/v1/messages`) may carry `X-Pulsar-KV`: comma-separated
+tokens, case-insensitive, spaces around them ignored. Several header lines join.
+An unknown token is refused with a 400 that names it.
+
+| Token | Effect |
+| --- | --- |
+| `read-only` | The request writes nothing to the disk KV cache: no rows, no restore points, no anchor (unless `pin-anchor` is also given). Its bank's history then writes nothing when it is later evicted, spilled, abandoned or saved at shutdown, until a request without `read-only` takes the bank. Restores still read the cache. |
+| `pin-anchor` | The request's anchor (the chat preamble up to the last user message before the first assistant turn, aligned down to the resume grid) is written on its first sighting if the store holds no restore point there, and pinned. A restore point already stored there is pinned instead. A pinned anchor and its chain are never evicted from the RAM tier or the disk and never dropped as superseded. A pin is lost only when the store needs room and nothing else can go, or past `--kv-pinned-max-mb`. |
+
+A judge that sends the same preamble on every call uses
+`X-Pulsar-KV: read-only, pin-anchor`: each call restores the pinned preamble and
+prefills only its own tail, and writes nothing else. The anchor is written only
+by a request whose prefill starts at token 0, so a judge whose bank still holds
+the preamble pins it the first time it misses. `/metrics` counts the header's
+requests (`pulsar:kv_header_requests_total`), the persists it suppressed
+(`pulsar:kv_persist_read_only_total`), the pinned anchors and their bytes
+(`pulsar:kv_pinned_anchors`, `pulsar:kv_pinned_bytes`), lost pins
+(`pulsar:kv_pins_released_total`) and failed restores by fault
+(`pulsar:kv_restore_failures_total`).
 
 The cache is disposable: stop the server and delete the directory to reset it.
 Segment files contain the conversation text in clear.
@@ -478,8 +522,12 @@ Everything else is in the `pulsar:` namespace. The main groups:
   `pulsar:bank_spills_total`, `pulsar:bank_restores_total`,
   `pulsar:slot_evictions_total`.
 - **Disk KV:** `pulsar:kv_disk_*`, `pulsar:kv_restore_slices_total`,
-  `pulsar:kv_restore_stall_max_seconds`, `pulsar:kv_persist_skipped_total`, and
-  the duplicate-prefix census `pulsar:kv_dup_*`.
+  `pulsar:kv_restore_stall_max_seconds`, `pulsar:kv_persist_skipped_total`,
+  `pulsar:kv_restore_failures_total`, the `X-Pulsar-KV` counters
+  (`pulsar:kv_header_requests_total`, `pulsar:kv_persist_read_only_total`,
+  `pulsar:kv_pinned_anchors`, `pulsar:kv_pinned_bytes`,
+  `pulsar:kv_pins_released_total`), and the duplicate-prefix census
+  `pulsar:kv_dup_*`.
 - **Speculation:** `pulsar:spec_draft_depth`, `pulsar:spec_verify_*` (the
   measured verify cost curve), `pulsar:spec_calib_*` (per-drafter confidence
   calibration), and the round phase timers.

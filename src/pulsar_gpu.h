@@ -278,6 +278,80 @@ void *pulsar_gpu_host_alloc(uint64_t bytes);
 /** @brief Free memory from pulsar_gpu_host_alloc.
  *  @param p the buffer, or NULL */
 void pulsar_gpu_host_free(void *p);
+/** L347 I3a: one device -> host span of pulsar_gpu_copy_out. */
+typedef struct {
+    const pulsar_gpu_tensor *src;   ///< the device tensor read
+    uint64_t offset;                ///< the span's byte offset in it
+    void *dst;                      ///< host destination (pinned for a true DMA; pageable works, staged by the driver)
+    uint64_t bytes;                 ///< the span's bytes; the range must fit `src`
+} pulsar_gpu_copy_span;
+/** L347 I3a: the disk KV cache's copy-out.  An event is recorded on the calling thread's stream (the work that wrote
+ *  the spans: every kernel and copy queued on it before this call), the calling thread's COPY stream (a non-blocking
+ *  stream of its own, created on first use) waits for it, one cudaMemcpyAsync per span runs there, and the host waits
+ *  for that stream alone -- no device-wide drain, and compute queued on the calling thread's stream meanwhile is not
+ *  waited for.  When it returns every span has landed: the source rows / slot may be reused at once.
+ *  @param spans [n] the spans
+ *  @param n     spans
+ *  @return 1 when every span landed, 0 on a bad range or a CUDA error (said) */
+int pulsar_gpu_copy_out(const pulsar_gpu_copy_span *spans, uint32_t n);
+
+/** L347 I4: a COPY LANE -- device -> host copies the host does not wait for: a host-tier checkpoint's capture
+ *  overlaps the compute that follows it.  A pump thread of the lane's own issues the queued copies in order, one piece
+ *  (8 MiB) on the copy engine at a time, so a blocking read the compute side makes meanwhile (a step's flags and
+ *  logits) waits for one piece, never a whole capture (runtime.cu, measured).  The lane holds a table of TICKETS, each
+ *  naming some bytes: the queued copy that last wrote them, and the last read the calling thread's stream made of them
+ *  (pulsar_gpu_lane_h2d).  Whoever later reads or reuses the bytes waits on their ticket alone -- the host
+ *  (pulsar_gpu_lane_wait) or the calling thread's stream (pulsar_gpu_lane_order) -- never on a copy it does not read.
+ *  A ticket nothing touched is complete.  Dry tensors (pulsar_gpu_tensor_dry_begin) copy nothing and succeed. */
+typedef struct pulsar_gpu_lane pulsar_gpu_lane;
+/** @brief Create a lane: its stream, its pump thread and `tickets` tickets.
+ *  @param tickets tickets in its table (>= 1)
+ *  @return the lane, or NULL on a CUDA error (said) */
+pulsar_gpu_lane *pulsar_gpu_lane_create(uint32_t tickets);
+/** @brief Wait for every copy queued on the lane, then free it.  NULL is a no-op.
+ *  @param lane the lane */
+void pulsar_gpu_lane_destroy(pulsar_gpu_lane *lane);
+/** @brief Queue a device -> host copy on the lane: an event fence is recorded on the calling thread's stream now (the
+ *  copy reads what the work queued there before this call wrote), the pump copies once the fence passes, and every
+ *  ticket in `done` names this copy.  Returns at once.
+ *  @param lane   the lane
+ *  @param src    the device tensor read
+ *  @param offset byte offset in `src`
+ *  @param dst    pinned host destination (pulsar_gpu_host_alloc)
+ *  @param bytes  bytes; the range must fit `src`
+ *  @param done   [n_done] tickets this copy now names
+ *  @param n_done tickets in `done`
+ *  @return 1 when queued, 0 on a bad range, a bad ticket or a CUDA error (said) */
+int pulsar_gpu_lane_d2h(pulsar_gpu_lane *lane, const pulsar_gpu_tensor *src, uint64_t offset, void *dst,
+                        uint64_t bytes, const uint32_t *done, uint32_t n_done);
+/** @brief Host -> device on the calling thread's stream, after the ticket's copy (pulsar_gpu_lane_order); the ticket
+ *  then names this read too, so a host writer of `src` waits for it.  The host waits only while the ticket's own copy
+ *  is still in flight.
+ *  @param lane   the lane
+ *  @param dst    the device tensor written
+ *  @param offset byte offset in `dst`
+ *  @param src    pinned host source
+ *  @param bytes  bytes; the range must fit `dst`
+ *  @param ticket the source's ticket
+ *  @return 1 when queued, 0 on a bad range, a bad ticket or a CUDA error (said) */
+int pulsar_gpu_lane_h2d(pulsar_gpu_lane *lane, pulsar_gpu_tensor *dst, uint64_t offset, const void *src,
+                        uint64_t bytes, uint32_t ticket);
+/** @brief Order the calling thread's stream after `ticket`: the host waits while the ticket's copy is still on the
+ *  pump (a stream cannot wait for a copy not yet issued), the stream waits for the ticket's last read.
+ *  @param lane   the lane
+ *  @param ticket the ticket
+ *  @return 1 when ordered, 0 on a bad ticket, a failed lane copy or a CUDA error (said) */
+int pulsar_gpu_lane_order(pulsar_gpu_lane *lane, uint32_t ticket);
+/** @brief The host waits for `ticket` -- its copy and its last read, nothing else on any stream.
+ *  @param lane   the lane
+ *  @param ticket the ticket
+ *  @return 1 when complete, 0 on a bad ticket, a failed lane copy or a CUDA error (said) */
+int pulsar_gpu_lane_wait(pulsar_gpu_lane *lane, uint32_t ticket);
+/** @brief Is `ticket` still in flight?  (A probe for tests and announces; readers wait instead.)
+ *  @param lane   the lane
+ *  @param ticket the ticket
+ *  @return 1 in flight, 0 complete, -1 on a bad ticket or a CUDA error */
+int pulsar_gpu_lane_pending(pulsar_gpu_lane *lane, uint32_t ticket);
 
 /** Fill a Q buffer from host f32, converting to the stored Q element type.
  * Host callers cannot see pulsar_q_t (it is CUDA-only), so a plain
