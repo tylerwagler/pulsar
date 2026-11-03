@@ -153,6 +153,7 @@ bool anthropic_final_response(int fd,
     append_anthropic_stop(&b, finish, stop_sequence);
     buf_puts(&b, ",\"usage\":");
     append_anthropic_usage_json(&b, r, prompt_tokens, completion_tokens);
+    append_ctx_management_json(&b, r);   /* L337 */
     buf_puts(&b, "}\n");
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -471,19 +472,22 @@ static bool anthropic_sse_tool_blocks_live(int fd, const request *r, const char 
 
 
 
-/// Send message_delta (stop reason, output tokens) and message_stop.
+/// Send message_delta (stop reason, output tokens, the applied context edits) and message_stop.
 /// @param fd                 the client socket
+/// @param r                  the request (its context edits)
 /// @param finish             the finish label
 /// @param stop_sequence      the matched stop sequence, or NULL
 /// @param completion_tokens  the tokens generated
 /// @return false when a write failed
-static bool anthropic_sse_stop_live(int fd, const char *finish, const char *stop_sequence,
+static bool anthropic_sse_stop_live(int fd, const request *r, const char *finish, const char *stop_sequence,
                                     int completion_tokens) {
     buf b = {0};
     buf_puts(&b, "{\"type\":\"message_delta\",\"delta\":{");
     append_anthropic_stop(&b, finish, stop_sequence);
     buf_puts(&b, "},\"usage\":{\"output_tokens\":");
-    buf_printf(&b, "%d}}", completion_tokens);
+    buf_printf(&b, "%d}", completion_tokens);
+    append_ctx_management_json(&b, r);   /* L337: applied_edits rides the final message_delta */
+    buf_putc(&b, '}');
     bool ok = sse_event(fd, "message_delta", b.ptr);
     buf_free(&b);
     if (ok) ok = sse_event(fd, "message_stop", "{\"type\":\"message_stop\"}");
@@ -514,7 +518,7 @@ static bool anthropic_sse_finish_tail(int fd, const request *r, const char *id, 
     }
 
     if (!anthropic_sse_tool_blocks_live(fd, r, id, st, calls)) return false;
-    return anthropic_sse_stop_live(fd, finish, stop_sequence, completion_tokens);
+    return anthropic_sse_stop_live(fd, r, finish, stop_sequence, completion_tokens);
 }
 
 /* ---- L267: the Anthropic sink (chat_sink) ------------------------------------ */

@@ -238,6 +238,62 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
 
 
 
+/* ---- L249 D: the early stream ---------------------------------------------------------------------------------
+ * A streaming request answers nothing until the worker writes its first byte -- at the first prefill chunk, or at
+ * decode start for a cached prompt.  Queued behind other work (a slot, a bank, a prefill it shares), it sends
+ * nothing at all, and a gateway in front gives up first: Cloudflare answers 524 after ~100 s of an origin's silence,
+ * and Claude Code's idle watchdog aborts after 300 s.  So once a streaming request has waited one heartbeat
+ * interval, its client thread opens the stream (the SSE head) and sends the protocol's keepalive every interval
+ * until the worker claims the socket; from the bind on, the worker's heartbeat sweep (gen_stream_heartbeat) keeps
+ * the same cadence.  An error after the stream opened goes out as an error event with the type the HTTP status
+ * would have had (job_reply_error), so a capacity refusal still reads overloaded_error. */
+
+/// One write from the client thread to a job's (non-blocking) socket: all of it now or a failure.  Never waits: the
+/// client thread holds the job's mutex, which the worker takes to claim the socket.
+/// @param fd  the socket
+/// @param p   the bytes
+/// @return false when the bytes did not all go out
+static bool job_early_send(int fd, const char *p) {
+    const size_t n = strlen(p);
+    ssize_t w;
+    do {
+        w = send(fd, p, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    } while (w < 0 && errno == EINTR);
+    return w == (ssize_t)n;
+}
+
+void job_early_keepalive(job *j, double now) {
+    if (!j->req.stream || j->done || j->worker_writes || j->sse_early_dead) return;
+    const double interval = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    if (now - (j->sse_early ? j->early_last : j->accepted_at) < interval) return;
+    bool ok = true;
+    if (!j->sse_early) {
+        ok = job_early_send(j->fd, k_sse_head);
+        j->sse_early = true;   /* even a partial head has opened (and broken) the stream */
+        if (ok) server_log(PULSAR_LOG_GENERATION, "pulsar-server: stream opened early: queued %.1f s with nothing sent",
+                           now - j->accepted_at);
+    }
+    if (ok) ok = job_early_send(j->fd, stream_keepalive_beat(&j->req));
+    j->early_last = now;
+    if (!ok) j->sse_early_dead = true;
+}
+
+bool job_claim_writes(job *j, bool *dead) {
+    pthread_mutex_lock(&j->mu);
+    j->worker_writes = true;
+    const bool open = j->sse_early;
+    *dead = j->sse_early_dead;
+    pthread_mutex_unlock(&j->mu);
+    return open;
+}
+
+bool job_reply_error(const job *j, bool sse_open, int code, const char *msg) {
+    if (sse_open) return sse_error_event(j->fd, &j->req, code, msg);
+    if (j->req.api == API_ANTHROPIC) return http_error_anthropic(j->fd, code, msg);
+    if (code == 503) return http_error_retry(j->fd, code, msg, HTTP_RETRY_GOING_AWAY_S);
+    return http_error(j->fd, code, msg);
+}
+
 void server::send_prefill_failure_response(const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
@@ -251,7 +307,7 @@ void server::send_prefill_failure_response(const job *j,
                        flags && flags[0] ? flags : "", err);
             return;
         }
-        if (!sse_error_event(j->fd, &j->req, err)) {
+        if (!sse_error_event(j->fd, &j->req, j->req.n_images > 0 ? 400 : 500, err)) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
@@ -945,16 +1001,16 @@ void server::gen_begin(session_slot *sl) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
+        job_reply_error(j, g->progress.headers_sent, 409,
+                        "Responses continuation state is not available; retry by replaying the full input history");
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        job_reply_error(j, g->progress.headers_sent, 409,
+                        "Anthropic continuation state is not available; retry by replaying the full messages history");
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0) {
@@ -1057,6 +1113,11 @@ void server::gen_begin(session_slot *sl) {
     /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
      * every later persist of the bank reads its X-Pulsar-KV tokens */
     sl->kv_flags = j->req.kv_flags;
+    /* L249 D: the bank's history is this job's from here -- a replaced dead prefix is gone (its bank reused), a
+     * continued one revived -- and so is its session */
+    if (sl->hint_dead && (sync_from_zero || pick != RESUME_OWN)) s->count_metric(&s->m_hint_dead_reuse);
+    sl->hint_dead = false;
+    snprintf(sl->hint_session, sizeof sl->hint_session, "%s", j->req.hints.session);
     if (pick == RESUME_ADOPT) {
         gen_resolution ar = {};
         ar.cached = cached;
@@ -1168,6 +1229,8 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
                               cache_source, disk_cached, g->disk_cache_path);
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
     sl->prefill_counted = resumed_at.raw();   /* L114 counter watermark: computed rows start here (L334: the live side) */
+    /* L249 D: a stream already open (early, or by the heartbeat while the job restored) stays open */
+    const bool headers_sent = g->progress.headers_sent, stream_failed = g->progress.stream_failed;
     g->progress = (server_prefill_progress){
         .srv = s,
         .slot = sl,
@@ -1179,6 +1242,9 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         .t0 = g->t0,
         .fd = j->fd,
         .stream = j->req.stream,
+        .headers_sent = headers_sent,
+        .stream_failed = stream_failed,
+        .last_keepalive = headers_sent ? server_now_sec() : 0.0,
     };
     snprintf(g->progress.ctx, sizeof(g->progress.ctx), "%s", g->ctx_span);
     log_flags(g->req_flags, sizeof(g->req_flags), responses_protocol,
@@ -2023,8 +2089,10 @@ void server::gen_step_finish(session_slot *sl) {
     if (j->req.api == API_ANTHROPIC) {
         /* a family without a tool-result tail keeps no live tool state (its renderer refuses a
          * continuation that would need it), so nothing is remembered for it */
-        if (parsed_calls.len && j->req.family->tool_result_tail && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
+        /* L337: nor after an edited prompt -- the KV is the edited history, and the client's next request renders
+         * as sent unless its own edits clear the same parts, so only a prefix match can tell */
+        if (parsed_calls.len && j->req.family->tool_result_tail && !j->req.ctx_edited &&
+            strcmp(final_finish, "error") && strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);
         } else {
@@ -2070,13 +2138,7 @@ void server::gen_step_finish(session_slot *sl) {
          * event, matching the pre-generation failure path. Non-streaming: a
          * real 500 with the protocol's error envelope. */
         const char *emsg = g->err[0] ? g->err : "internal generation error";
-        if (j->req.stream) {
-            sse_error_event(j->fd, &j->req, emsg);
-        } else if (j->req.api == API_ANTHROPIC) {
-            http_error_anthropic(j->fd, 500, emsg);
-        } else {
-            http_error(j->fd, 500, emsg);
-        }
+        job_reply_error(j, j->req.stream, 500, emsg);
     } else if (j->req.stream) {
         bool response_ok = true;
         if (g->sink.text) {
@@ -2318,6 +2380,14 @@ void server::generate_job_begin(session_slot *sl, job *j) {
      * and deferred; drained in generate_job_end. */
     slot_writer_init(&g->writer, j->fd);
     slot_writer_install(&g->writer);
+    /* L249 D: the socket is the worker's from here; a stream the client thread opened stays open, its keepalive
+     * clock continuing in the slot's writer (the heartbeat sweep beats it from here) */
+    bool dead = false;
+    if (job_claim_writes(j, &dead)) {
+        g->progress.headers_sent = true;
+        slot_writer_mark_written(&g->writer);
+    }
+    g->progress.stream_failed = dead;
     s->gen_begin(sl);
 }
 
