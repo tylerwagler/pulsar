@@ -19,6 +19,7 @@
 #include "../src/server/chat_family.cpp"
 #include "../src/server/family_inkling.cpp"
 #include "../src/server/family_nemotron_h.cpp"
+#include "../src/server/family_gemma4.cpp"
 #include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"
@@ -36,6 +37,7 @@
 #include "../src/server/sched_value.cpp"
 #include "../src/server/server_sched.cpp"
 #include "../src/server/http_server.cpp"
+#include "../src/server/systemone.cpp"
 #include "../src/server/watchdog.cpp"
 #include "../src/server/cli_main.cpp"
 

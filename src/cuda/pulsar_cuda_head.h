@@ -11,16 +11,23 @@
  *                `logits_mup_width_multiplier` 16); 1 = none
  *   real vocab   the head's rows past n_real are padding (Inkling: 201024
  *                rows, 200058 real); n_real == n_logits = none
+ *   soft-cap     (L338) logit = tanh(logit / c) * c after the scale (Gemma 4's
+ *                final_logit_softcapping 30); 0 = none
+ *   embed scale  (L338) the embedding row times a scalar, one bf16 rounding of
+ *                the product -- torch's bf16 multiply (Gemma 4: the embedding
+ *                times bf16(sqrt(hidden)) = 53); 0 = none; not with a norm
  *
  * Embedding:  out[t] = bf16_rn((x * rstd) * w),  x = table[ids[t]] widened,
  *             rstd = rsqrtf(sum(x^2) / n_embd + eps), f32, one CTA a row with a
  *             fixed reduction order -- a row's bytes never depend on its batch.
  *             (vLLM's embed_rmsnorm: ONE rounding.  transformers rounds x * rstd
  *             to the dtype and multiplies by the weight in it: two.)
- *             Without a norm the row is copied as stored.
+ *             Without a norm the row is copied as stored -- or, with an embed
+ *             scale s, out[t][c] = bf16_rn(x[t][c] * s).
  * Logits:     the head GEMM writes f32 logits [rows][n_logits]; the finish
  *             pass makes, in place, logit[c] = logit[c] * scale for c < n_real
- *             and -inf for the padding.  The product is of the GEMM's FINAL f32
+ *             (then, with a soft-cap c, tanh(logit / c) * c, every op f32) and
+ *             -inf for the padding.  The product is of the GEMM's FINAL f32
  *             value -- exactly what an alpha in the GEMM's f32 epilogue
  *             computes (vLLM folds 1/mup into addmm's alpha, beta 0) -- so moving
  *             the scale into a head arm's epilogue later is byte-identical.
@@ -54,6 +61,8 @@ typedef struct {
     uint32_t        n_logits;        /**< the head's rows = the logits row width (the padded vocab) */
     uint32_t        n_real;          /**< ids < n_real are real; 1 .. n_logits */
     float           logit_scale;     /**< finite, nonzero; 1 = none */
+    float           softcap;         /**< L338: finite, >= 0; logit = tanh(logit / softcap) * softcap; 0 = none */
+    float           embed_scale;     /**< L338: finite, >= 0; the embedding row times it (no norm); 0 = none */
 } pulsar_head_decl;
 
 /** Token embedding rows: out[t] (bf16, at out + t * ld_out) = the declared

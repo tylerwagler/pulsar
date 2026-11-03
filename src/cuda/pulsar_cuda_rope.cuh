@@ -93,32 +93,38 @@ __device__ static inline void rope_pair_rotate_core_dev(
 /// @param x the value
 /// @return x rounded to bf16 (nearest even), as f32
 __device__ static inline float rope_neox_bf16_round_dev(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-/* The rotation at a GIVEN inverse frequency `inv` (L321: a scaled rope -- YaRN -- hands its per-pair table here;
- * src/lib/pulsar_yarn.h builds it on the host). */
-/// @param x0  pair element p (a bf16 value in f32)
-/// @param x1  pair element p + d/2
-/// @param inv the pair's inverse frequency
-/// @param pos the token's position
-/// @param r0  out: rotated x0 (bf16 value in f32)
-/// @param r1  out: rotated x1
-__device__ static inline void rope_neox_bf16_pair_inv_dev(float x0, float x1, float inv, uint32_t pos, float *r0, float *r1) {
-    const double ang = (double)__fmul_rn((float)pos, inv);
-    const float c = rope_neox_bf16_round_dev((float)cos(ang)), s = rope_neox_bf16_round_dev((float)sin(ang));
-    *r0 = rope_neox_bf16_round_dev(__fsub_rn(rope_neox_bf16_round_dev(__fmul_rn(x0, c)), rope_neox_bf16_round_dev(__fmul_rn(x1, s))));
-    *r1 = rope_neox_bf16_round_dev(__fadd_rn(rope_neox_bf16_round_dev(__fmul_rn(x1, c)), rope_neox_bf16_round_dev(__fmul_rn(x0, s))));
-}
-/// The NeoX rotation of pair p at inverse frequency 1 / base^(2p / d) (see above).
-/// @param x0   pair element p (a bf16 value in f32)
-/// @param x1   pair element p + d/2
+/* L338: the pieces of the rotation, so a caller computes a row's cos / sin ONCE per (position, pair) and rotates every
+ * head from them (gqa_prep_kernel: on Turing the double cos / sin per element per head was 52 us a decode row). */
+/// Pair p's inverse frequency, 1 / base^(2p / d) in the arithmetic above (pow in double, rounded once; IEEE division).
 /// @param p    pair index, 0 .. d/2 - 1
 /// @param d    head dims
-/// @param pos  the token's position
 /// @param base rope base
-/// @param r0   out: rotated x0
-/// @param r1   out: rotated x1
-__device__ static inline void rope_neox_bf16_pair_dev(float x0, float x1, uint32_t p, uint32_t d, uint32_t pos,
-                                                      float base, float *r0, float *r1) {
+/// @return the f32 inverse frequency
+__device__ static inline float rope_neox_inv_freq_dev(uint32_t p, uint32_t d, float base) {
     const float e = __fdiv_rn((float)(2u * p), (float)d);
-    const float inv = __fdiv_rn(1.0f, (float)pow((double)base, (double)e));
-    rope_neox_bf16_pair_inv_dev(x0, x1, inv, pos, r0, r1);
+    return __fdiv_rn(1.0f, (float)pow((double)base, (double)e));
+}
+/// The bf16 cos and sin of a pair at inverse frequency `inv` (L321: a scaled rope -- YaRN -- hands its per-pair
+/// table's value; src/lib/pulsar_yarn.h builds it on the host) at position `pos`: the angle in f32, cos / sin in
+/// double rounded to f32 then to bf16.
+/// @param inv the pair's inverse frequency
+/// @param pos the token's position
+/// @param c   out: bf16 cos (as f32)
+/// @param s   out: bf16 sin (as f32)
+__device__ static inline void rope_neox_bf16_cs_dev(float inv, uint32_t pos, float *c, float *s) {
+    const double ang = (double)__fmul_rn((float)pos, inv);
+    *c = rope_neox_bf16_round_dev((float)cos(ang));
+    *s = rope_neox_bf16_round_dev((float)sin(ang));
+}
+/// The rotation of one pair by its bf16 cos / sin (rope_neox_bf16_cs_dev), each product and the difference / sum one
+/// bf16 rounding.
+/// @param x0 pair element p (a bf16 value in f32)
+/// @param x1 pair element p + d/2
+/// @param c  the pair's bf16 cos
+/// @param s  the pair's bf16 sin
+/// @param r0 out: rotated x0 (bf16 value in f32)
+/// @param r1 out: rotated x1
+__device__ static inline void rope_neox_bf16_rotate_dev(float x0, float x1, float c, float s, float *r0, float *r1) {
+    *r0 = rope_neox_bf16_round_dev(__fsub_rn(rope_neox_bf16_round_dev(__fmul_rn(x0, c)), rope_neox_bf16_round_dev(__fmul_rn(x1, s))));
+    *r1 = rope_neox_bf16_round_dev(__fadd_rn(rope_neox_bf16_round_dev(__fmul_rn(x1, c)), rope_neox_bf16_round_dev(__fmul_rn(x0, s))));
 }

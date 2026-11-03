@@ -193,7 +193,7 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
             return -1;
         }
         if (g_scratch[dev]) {
-            pulsar_gpu_seg_note_device_free();   /* graphs that baked the old scratch die with it */
+            pulsar_gpu_seg_note_device_free("the qwen exl3 dense prefill scratch");   /* graphs that baked the old scratch die with it */
             (void)cudaFree(g_scratch[dev]);
         }
         g_scratch[dev] = nullptr;

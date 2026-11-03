@@ -1543,7 +1543,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
   const size_t midq_bytes = midq_elems + midsf_bytes;
   const size_t need = (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
-    if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free(); cudaFree(g_fp4_gemv_actbuf); }
+    if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free("the fp4 gemv activation buffer"); cudaFree(g_fp4_gemv_actbuf); }
     g_fp4_gemv_actbuf = nullptr;
     if (cudaMalloc(&g_fp4_gemv_actbuf, need * sizeof(float)) != cudaSuccess) {
       g_fp4_gemv_actbuf_floats = 0;
@@ -1590,7 +1590,7 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     }
     const size_t grp_bytes = (size_t)n_slots * (sizeof(int4) + sizeof(int32_t)) + 16;
     if (grp_bytes > g_ffn_grp_bytes) {
-      if (g_ffn_grp) { pulsar_gpu_seg_note_device_free(); cudaFree(g_ffn_grp); }
+      if (g_ffn_grp) { pulsar_gpu_seg_note_device_free("the fp4 ffn group table"); cudaFree(g_ffn_grp); }
       g_ffn_grp = nullptr;
       if (cudaMalloc(&g_ffn_grp, grp_bytes) != cudaSuccess) { g_ffn_grp_bytes = 0; return 1; }
       g_ffn_grp_bytes = grp_bytes;

@@ -1,0 +1,6 @@
+{
+ "tokenizers": "0.23.3",
+ "tokenizer.json sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+ "calib": "calib-qwen38-v1.jsonl",
+ "calib sha256": "870e3226e28ce2ee27e1fea2ff936b856a810467b800ddf50d9bda851ee9e8eb"
+}

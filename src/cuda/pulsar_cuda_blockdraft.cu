@@ -240,6 +240,28 @@ int pulsar_blockdraft_conv_launch(const uint16_t *x, uint64_t ld_x, const uint16
     return launched("grouped conv");
 }
 
+namespace {
+/* L338: x = bf16(tanh(x / cap) * cap), a thread an element */
+/// @param x rows, bf16, in place
+/// @param ld x row stride
+/// @param width columns
+/// @param cap the soft-cap
+__global__ void softcap_kernel(uint16_t *__restrict__ x, uint64_t ld, uint32_t width, float cap) {
+    const uint32_t c = blockIdx.x * 256u + threadIdx.x;
+    if (c >= width) return;
+    __nv_bfloat16 *p = reinterpret_cast<__nv_bfloat16 *>(x) + (uint64_t)blockIdx.y * ld + c;
+    *p = __float2bfloat16_rn(tanhf(__bfloat162float(*p) / cap) * cap);
+}
+}  // namespace
+
+int pulsar_blockdraft_softcap_launch(uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t width, float cap,
+                                     cudaStream_t stream) {
+    if (!x || n_rows == 0 || n_rows > 65535u || width == 0 || !(cap > 0.f))
+        return refuse("softcap: a NULL buffer, no rows or a cap <= 0");
+    softcap_kernel<<<dim3((width + 255u) / 256u, n_rows), 256, 0, stream>>>(x, ld_x, width, cap);
+    return launched("softcap");
+}
+
 int pulsar_blockdraft_swiglu_launch(const uint16_t *g, uint64_t ld_g, const uint16_t *u, uint64_t ld_u,
                                     uint32_t n_rows, uint32_t width, uint16_t *h, uint64_t ld_h, cudaStream_t stream) {
     if (!g || !u || !h || n_rows == 0 || n_rows > 65535u || width == 0)

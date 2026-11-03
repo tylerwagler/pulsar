@@ -163,6 +163,10 @@ typedef struct pulsar_ckpt_store {
      *  of another quantisation of the same model is refused, never loaded (L266: Qwen's containers
      *  share one store identity).  0 = the store identity alone decides (DeepSeek's routed tier). */
     uint64_t artifact;
+    /** L338 P2: [banks] the driver's per-bank runtime-adapter switch (pulsar_driver_state::bank_adapter), borrowed;
+     *  NULL = no adapter.  An adapter bank's segments and payloads mix it into their layout digest, so a segment one
+     *  bank wrote with the adapter is refused by a plain bank and the reverse (its K / V are another model's). */
+    const uint8_t *bank_adapter;
     /// per bank: ckpt_slots slots, slot s at s * slot_bytes (NULL = bank not allocated); owned
     struct pulsar_gpu_tensor *slab[PULSAR_MSEQ_MAX];
     /// bytes of one checkpoint slot (the grid walk's size, rounded up to 256)

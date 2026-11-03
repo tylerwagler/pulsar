@@ -1,0 +1,5 @@
+{
+ "transformers": "5.22.1",
+ "chat_template.jinja sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+ "cases": "/mnt/models/reap-corpus/cases"
+}

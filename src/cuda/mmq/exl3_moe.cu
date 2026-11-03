@@ -229,10 +229,12 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     const bool fused = w.gate_up != nullptr;
     /* L296: the UP-ONLY form -- one up slice per expert, no gate, the ungated activation (relu^2) */
     const bool up_only = !fused && !w.gate && w.up;
-    if (up_only != (w.act == PULSAR_FFN_ACT_RELU2) || (up_only && clamp != 0.0f) ||
-        (w.act != PULSAR_FFN_ACT_SWIGLU && w.act != PULSAR_FFN_ACT_RELU2)) {
-        fprintf(stderr, "%s: activation %d with %s stacks -- SwiGLU reads a fused gate_up or a gate + up pair, relu^2 an "
-                        "up stack alone (no clamp) -- refusing\n", tag, w.act, up_only ? "up-only" : "gated");
+    const bool geglu = w.act == PULSAR_FFN_ACT_GEGLU_TANH;
+    if (up_only != (w.act == PULSAR_FFN_ACT_RELU2) || (up_only && clamp != 0.0f) || (geglu && (fused || clamp != 0.0f)) ||
+        (w.act != PULSAR_FFN_ACT_SWIGLU && w.act != PULSAR_FFN_ACT_RELU2 && !geglu)) {
+        fprintf(stderr, "%s: activation %d with %s stacks -- SwiGLU reads a fused gate_up or a gate + up pair, GeGLU-tanh a "
+                        "gate + up pair (no clamp), relu^2 an up stack alone (no clamp) -- refusing\n", tag, w.act,
+                up_only ? "up-only" : fused ? "fused" : "pair");
         return -1;
     }
     const int gu_kind = fused ? EXL3_ARM_GATE_UP_FUSED : EXL3_ARM_PAIR;   /* up-only: the pair's up side, its rates */
@@ -320,7 +322,7 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
        : fused ? ds4_exl3_moe_fold_fused_launch(gz, sel, wts, s.gate_up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
                                                 msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride)
                : ds4_exl3_moe_fold_launch(gz, uz, sel, wts, s.gate, s.up, s.down, s.in_dim, s.mid_dim, pairs, clamp, mq,
-                                          msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride);
+                                          msf, b.mid.kbp, stream, mb, gp.splits, gp.split_stride, s.act);
     if (rc) return -1;
     /* the down: its source row is the pair (the fold wrote one mid row per pair) */
     rc = project(EXL3_ARM_DOWN, s.down, nullptr, s.k2_down, b.mid, ids_dst, ids_dst, bounds, b.down_z, nullptr,

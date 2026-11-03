@@ -42,7 +42,8 @@ namespace {
  * the shared down projection reads a bf16 row, so the producer emits bf16 -- and bf16 carries its own
  * exponent, so there is no per-32 block and no scale slab any more. */
 /* L296 N4: the same producer for the non-gated activation (pulsar_ffn_act RELU2): relu(u)^2, g unread. */
-/** The shared expert's activation, emitted bf16: SwiGLU silu(g) * u, or (act RELU2) relu(u)^2 with g unread.
+/** The shared expert's activation, emitted bf16: SwiGLU silu(g) * u, (act GEGLU_TANH, L338) gelu_tanh(g) * u, or
+ *  (act RELU2) relu(u)^2 with g unread.
  *  Grid = T blocks (one per row), block = 256 threads striding the D channels.
  *  @param g   f32 [T][D] gate projection (unread under RELU2)
  *  @param u   f32 [T][D] up projection
@@ -57,8 +58,9 @@ rows_act_emit_kernel(const float *__restrict__ g, const float *__restrict__ u, i
         const int c = c0 + (int)threadIdx.x;
         if (c < D) {
             const size_t i = (size_t)t * D + c;
-            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2 ? pulsar_relu2_elem(u[i], 1.0f)
-                                                                 : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
+            xb[i] = __float2bfloat16(act == PULSAR_FFN_ACT_RELU2        ? pulsar_relu2_elem(u[i], 1.0f)
+                                     : act == PULSAR_FFN_ACT_GEGLU_TANH ? pulsar_geglu_tanh_elem(g[i], u[i], 1.0f)
+                                                                        : pulsar_swiglu_elem(g[i], u[i], 1.0f, 0.0f));
         }
     }
 }
@@ -442,6 +444,11 @@ extern "C" size_t pulsar_rows_moe_routed_workspace_bytes(int T, int top_k, int m
 /// @return true when q can ride (SwiGLU, three EXL3 slices H -> mid -> H); false said
 static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_shared *sh) {
     const int smid = q->gate.out;
+    if (q->lora_gate || q->lora_up || q->lora_down) {   /* L338: the routed fold has no LoRA step */
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert carries a runtime LoRA; it runs "
+                        "pulsar_rows_moe_shared_launch (the LoRA is added to its f32 outputs) -- refusing\n");
+        return false;
+    }
     if (q->act != PULSAR_FFN_ACT_SWIGLU) {
         fprintf(stderr, "pulsar: routed MoE (bf16 rows): a riding shared expert is SwiGLU (the EXL3 front door's fold); "
                         "activation %d runs pulsar_rows_moe_shared_launch -- refusing\n", (int)q->act);
@@ -493,12 +500,16 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
         return -1;
     }
     /* L295 F7 / L296: a non-gated activation (relu^2) runs on up-only stacks alone -- BF16 (no gate stack) or EXL3
-     * (an up table alone); an EXL3 up table alone is relu^2 only */
-    if ((w->act != PULSAR_FFN_ACT_SWIGLU &&
-         (w->act != PULSAR_FFN_ACT_RELU2 || (bf16 ? w->bf16_gate != nullptr : !exl3_up))) ||
-        (exl3_up && w->act != PULSAR_FFN_ACT_RELU2)) {
-        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d runs on up-only stacks (BF16 without a gate, or an "
-                        "EXL3 up table alone) and only there; the gated arms are SwiGLU -- refusing\n", (int)w->act);
+     * (an up table alone); an EXL3 up table alone is relu^2 only.  L338: GeGLU-tanh is a gated activation on the
+     * EXL3 gated arms (fused gate_up or the gate + up pair: the fold's ACT); the BF16 and Tessera arms stay SwiGLU */
+    const bool act_ok = w->act == PULSAR_FFN_ACT_SWIGLU       ? !exl3_up
+                        : w->act == PULSAR_FFN_ACT_RELU2      ? (bf16 ? w->bf16_gate == nullptr : exl3_up)
+                        : w->act == PULSAR_FFN_ACT_GEGLU_TANH ? exl3 && !exl3_up && !tessera && !bf16
+                                                              : false;
+    if (!act_ok) {
+        fprintf(stderr, "pulsar: routed MoE (bf16 rows): activation %d does not run on these stacks (SwiGLU: any gated "
+                        "arm; relu^2: up-only stacks -- BF16 without a gate, or an EXL3 up table alone; GeGLU-tanh: the "
+                        "EXL3 gated arms) -- refusing\n", (int)w->act);
         return -1;
     }
     if (tessera || bf16 ? (tessera ? (!w->tessera_up || !w->tessera_down)
@@ -629,14 +640,15 @@ extern "C" int pulsar_rows_moe_routed_launch(const pulsar_rows_moe *w, int32_t *
 /// @param what the caller's name for the message
 /// @return true when the descriptor and its buffers are consistent; false said
 static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
-    const bool gated = q && q->act == PULSAR_FFN_ACT_SWIGLU;
+    const bool gated = q && q->act != PULSAR_FFN_ACT_RELU2;
     const int smid = q ? q->up.out : 0, H = q ? q->up.in : 0;
-    if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2) ||
+    const bool any_lora = q && (q->lora_gate || q->lora_up || q->lora_down);
+    if (!q || (q->act != PULSAR_FFN_ACT_SWIGLU && q->act != PULSAR_FFN_ACT_RELU2 && q->act != PULSAR_FFN_ACT_GEGLU_TANH) ||
         (gated && (!q->yg || q->gate.in != H || q->gate.out != smid)) || !q->yu || !q->ys || !q->h ||
-        q->down.in != smid || q->down.out != H) {
-        fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers -- "
-                        "refusing\n", what, q ? (int)q->act : -1, gated ? "a gate of the up's shape, " : "", H, smid,
-                q ? q->down.in : -1, q ? q->down.out : -1);
+        q->down.in != smid || q->down.out != H || (any_lora && !q->lora_ws) || (q && q->lora_gate && !gated)) {
+        fprintf(stderr, "pulsar: MoE shared expert %s: activation %d, %s%d->%d / %d->%d (in -> mid -> in), its buffers "
+                        "(a LoRA's workspace; no gate LoRA without a gate) -- refusing\n", what, q ? (int)q->act : -1,
+                gated ? "a gate of the up's shape, " : "", H, smid, q ? q->down.in : -1, q ? q->down.out : -1);
         return false;
     }
     return true;
@@ -649,13 +661,22 @@ static bool shared_ok(const pulsar_rows_moe_shared *q, const char *what) {
 /// @param stream stream to launch on
 /// @return 0 on success, negative on a refusal or a launch failure
 static int shared_ys(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream) {
-    int rc = q->act == PULSAR_FFN_ACT_SWIGLU ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
-                                                                         stream) : 0;
+    /* L338: a Linear's runtime LoRA on its f32 output, before anything reads it */
+    auto lora = [&](const pulsar_rows_lora *l, const uint16_t *x, uint64_t ld_x, float *y, uint64_t ld_y) {
+        return !l ? 0 : pulsar_rows_lora_launch(x, ld_x, T, l, y, ld_y, q->lora_rows, q->up.prompt, q->lora_ws,
+                                                q->lora_ws_bytes, stream);
+    };
+    const int H = q->up.in, mid = q->up.out;
+    int rc = q->act != PULSAR_FFN_ACT_RELU2 ? pulsar_rows_linear_launch(&q->gate, x_bf16, T, q->yg, q->ws, q->ws_bytes,
+                                                                        stream) : 0;
+    if (!rc && q->act != PULSAR_FFN_ACT_RELU2) rc = lora(q->lora_gate, x_bf16, H, q->yg, mid);
     if (!rc) rc = pulsar_rows_linear_launch(&q->up, x_bf16, T, q->yu, q->ws, q->ws_bytes, stream);
+    if (!rc) rc = lora(q->lora_up, x_bf16, H, q->yu, mid);
     if (rc) return rc;
     rows_act_emit_kernel<<<T, 256, 0, stream>>>(q->yg, q->yu, q->up.out, (int)q->act, (__nv_bfloat16 *)q->h);
     if (!launch_ok("shared activation")) return -3;
-    return pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
+    rc = pulsar_rows_linear_launch(&q->down, q->h, T, q->ys, q->ws, q->ws_bytes, stream);
+    return rc ? rc : lora(q->lora_down, q->h, mid, q->ys, q->down.out);
 }
 
 /* out += scale * ys */

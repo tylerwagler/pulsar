@@ -73,6 +73,17 @@ int pulsar_blockdraft_conv_launch(const uint16_t *x, uint64_t ld_x, const uint16
 /// @param h output rows.
 /// @param ld_h h row stride, elements.
 /// @param stream the stream.
+/** L338: a head's logit soft-cap in place on its bf16 rows: x = bf16(tanh(x / cap) * cap) (z-lab's plain DFlash for
+ *  Gemma 4: final_logit_softcapping).  @return 0, -1 refused, -3 launch failure. */
+/// @param x the logits rows, bf16, finished in place.
+/// @param ld_x x row stride, elements.
+/// @param n_rows rows (<= 65535).
+/// @param width columns.
+/// @param cap the soft-cap (> 0).
+/// @param stream the stream.
+int pulsar_blockdraft_softcap_launch(uint16_t *x, uint64_t ld_x, uint32_t n_rows, uint32_t width, float cap,
+                                     cudaStream_t stream);
+
 int pulsar_blockdraft_swiglu_launch(const uint16_t *g, uint64_t ld_g, const uint16_t *u, uint64_t ld_u,
                                     uint32_t n_rows, uint32_t width, uint16_t *h, uint64_t ld_h, cudaStream_t stream);
 

@@ -40,7 +40,7 @@ static int g_decode_rows = 0;
 int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
 /* The split-K partials regrow drops the captured segment graphs (pulsar_gpu_seg_note_device_free,
  * defined in pulsar_cuda_runtime.cu, not linked here); this test captures none. */
-void pulsar_gpu_seg_note_device_free(void) {}
+void pulsar_gpu_seg_note_device_free(const char *) {}
 /* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
  * pulsar_cuda_norm_kv.cu, not linked here).  This test owns the value and drives
  * BOTH families, because a gate built from one family's fixture cannot fail for

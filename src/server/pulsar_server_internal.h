@@ -752,6 +752,8 @@ const server_family_ops *server_tool_family(const server *s);
 extern const server_family_ops k_family_inkling;
 /** Nemotron-H's (family_nemotron_h.cpp). */
 extern const server_family_ops k_family_nemotron_h;
+/// Gemma 4's table (family_gemma4.cpp, L338).
+extern const server_family_ops k_family_gemma4;
 /** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */
@@ -799,7 +801,7 @@ typedef struct server_grammar_shape {
     const char *answer_open;    ///< the bytes that open the answer ("</think>"; Inkling "<|content_text|>")
     bool answer_at_think_close; ///< answer_open is the reasoning close: a turn outside reasoning starts there
     const char *answer_close;   ///< after the answer, before the stop ("" or "<|end_message|>")
-    const char *call_trigger;   ///< opens the turn's calls ("<tool_call>", DSML's calls tag, ...)
+    const char *call_trigger;   ///< opens the turn's calls ("<tool_call>", DSML's calls tag, ...); NULL = no call markup (response formats only: strict tools refused)
     const char *block_head;     ///< after the trigger, before the first call
     const char *name_open;      ///< before a call's name
     const char *name_close;     ///< after it, before the arguments
@@ -1693,10 +1695,27 @@ typedef struct {
  *     constants are an upper bound rather than the load-bearing estimate.
  * Re-measure the constants when the measured/static gap logged at startup
  * ("session admission: measured budget") exceeds ~2 GiB. */
+/** L338: a discrete card's working set past its staged weights and its sessions' priced state -- cuBLAS workspaces,
+ *  graph instantiation, scratch, the CUDA context's growth -- the larger of 2 GiB and an eighth of the card.  Measured
+ *  on the 24 GB RTX 6000 (Gemma 4, 4 banks, after warmup): 21.9 GB in use against 19.8 priced (weights 14.4 + context
+ *  0.3 + shared 1.89 + banks 3.24), a 2.1 GiB working set under the 3 GiB margin.
+ *  @param total_bytes the device's memory
+ *  @return the margin, bytes */
+static inline uint64_t server_discrete_margin_bytes(uint64_t total_bytes) {
+    const uint64_t eighth = total_bytes / 8u, two = 2ull * 1024ull * 1024ull * 1024ull;
+    return eighth > two ? eighth : two;
+}
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
 /// The process's measured steady-state overhead the admission budget reserves, bytes.
 #define PULSAR_SERVER_PROCESS_OVERHEAD_BYTES (18ull * 1024ull * 1024ull * 1024ull)
+
+/* L338: what a discrete card's guard keeps free of its device memory.  The live budget re-reads cudaMemGetInfo every
+ * 0.25 s, so memory the runtime takes after warmup (cuBLASLt workspaces, lazily captured graphs) shrinks the room KV
+ * may take by itself; the floor covers what grows between two readings and a step's transient allocations.  Measured
+ * on the RTX 6000 (Gemma 4, 3 banks x 40960, the P4 parity suite incl. a 35.7K-token prompt and the judge): the device
+ * grew 820 MiB of which 698 MiB were that prompt's KV, ~120 MiB else. */
+#define PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES (512ull * 1024ull * 1024ull)
 
 /* Free-memory floor (2026-07-13 lockup postmortem; re-sized 2026-07-15):
  * kernel/OS breathing room ONLY — the last-resort backstop for when other
@@ -1908,6 +1927,7 @@ typedef struct {
     uint32_t probe_n0;    ///< that lane's step count when the probe began
     uint32_t held_n0;     ///< `lane`'s step count when it was chosen or last weighed (hold and re-probe count from it)
     int meas_n;           ///< the decoder count the measured prices below are for
+    int meas_depth;       ///< L338: the depth band they are for (lane_depth_band: a new band drops them)
     double meas_tok[PULSAR_LANE_COUNT];        ///< EW tokens a step committed there, per pulsar_decode_lane
     double meas_ms[PULSAR_LANE_COUNT];         ///< EW wall of those steps, ms
     uint32_t meas_steps[PULSAR_LANE_COUNT];    ///< steps measured there
@@ -1988,6 +2008,12 @@ struct server {
      *  `token_bytes` first, then `grammar` by a release store that publishes both (client threads read it with
      *  an acquire load, constrain_compiler_published); a second build dies. */
     struct pulsar_grammar_compiler *grammar;
+    /** L338 P2.4: the /v1/systemone judge -- its reserved bank (past pool_banks: no chat slot is it), its decision
+     *  head and calibration, its queue (under mu); NULL = no judge.  Owned (systemone.cpp). */
+    struct server_judge *judge;
+    /** L338 P4: thinking when a request sends no thinking control (--reasoning): 0 the family's default (on) -- what a
+     *  zeroed server holds --, 1 off, 2 on.  Read-only after startup. */
+    int reasoning_default;
     /// every token's bytes, indexed by token id (built with `grammar`; owned, freed at shutdown)
     std::vector<std::string> *token_bytes;
     /** Session pool. slots[0..n_slots) are provisioned; the worker thread is
@@ -2048,7 +2074,9 @@ struct server {
     KvBytes      guard_touched_ceiling;  ///< the startup ceiling (post-warmup reading); the live budget never exceeds it
     KvBytes      guard_kv_budget;        ///< the ledger budget the ceiling was cut from
     KvBytes      guard_eager_bytes;      ///< eager floor already resident
-    KvBytes      guard_avail;            ///< the MemAvailable reading the live budget last used
+    KvBytes      guard_avail;            ///< the headroom reading the live budget last used (server_guard_avail_bytes)
+    KvBytes      guard_floor;            ///< the floor that reading must stay above (server_guard_floor)
+    bool         guard_discrete;         ///< L338: the KV is a discrete card's: the readings are the device's
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
@@ -3717,6 +3745,11 @@ typedef struct {
     const char *models[SERVER_MODELS_MAX];
     /// entries in `models`
     int n_models;
+    /** L338 P2.4: banks reserved for /v1/systemone (the runtime adapter's judge): -1 = one when the container carries
+     *  an adapter, 0 = none; at most 1 (the pool's last bank) */
+    int judge_banks;
+    /** L338 P4: --reasoning on|off -- thinking when a request sends no control; -1 = unset (the family's default) */
+    int reasoning_default;
 } server_config;
 
 /* ---- shared globals ---- */
@@ -4076,7 +4109,8 @@ bool chat_effort_ask_read(const chat_control *controls, int n, chat_effort_ask *
 /// @param err     receives the client error on false
 /// @param errlen  size of `err`
 /// @return false for a contradictory ask
-bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, bool *on, char *err, size_t errlen);
+bool chat_effort_ask_thinking(const chat_effort_ask *a, const char *model, int server_default, bool *on, char *err,
+                              size_t errlen);
 
 /** L267: a chat request as its protocol parser read it -- what the client asked for, before any model
  * family reads it.  OpenAI chat, Anthropic Messages and Responses each produce one; the loaded family's
@@ -4227,6 +4261,20 @@ void append_json_object_string(buf *b, const char *json);
 void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix);
 void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix);
 bool http_response(int fd, int code, const char *type, const char *body);
+/* ---- L338 P2.4: /v1/systemone (systemone.cpp) ---- */
+/** Open the judge on reserved bank `bank`: the container's decision head, its judge_config.json and
+ *  calibration_gold.json, the bank emptied with the adapter on.  Single-threaded startup.
+ *  @return false (said in err) when the container cannot serve it */
+bool server_judge_open(struct server *s, const char *container_dir, int bank, char *err, size_t errlen);
+/** Free the judge (its queue drained by the worker before shutdown). */
+void server_judge_close(struct server *s);
+/** A judge job waits (read under s->mu).  @return true when the worker has judge work */
+bool server_judge_queued(const struct server *s);
+/** The worker's judge turn: one chunk of the current judge prompt on the reserved bank, its decision when the prompt
+ *  is in.  @return true when it did work */
+bool server_judge_step(struct server *s);
+/** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer. */
+void server_judge_http(struct server *s, int fd, const char *body, size_t len);
 bool http_error(int fd, int code, const char *msg);
 /* Retry-After for a retryable 503, by cause: the box is going away
  * (shutting down, draining), or it is briefly full (connections, metric
@@ -4504,11 +4552,25 @@ bool server_kv_admits(uint64_t kv_budget_bytes,
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
 bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
-/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + MemAvailable − floor); 0 when MemAvailable is at
- * or under the floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the
- * post-warmup MemAvailable; the guard's live budget (server::guard_budget) the current one. */
+/* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
+ * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
+ * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
+ * (server_guard_avail_bytes, server_guard_floor). */
 KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes, KvBytes touched_bytes,
-                                    KvBytes avail_bytes);
+                                    KvBytes avail_bytes, KvBytes floor);
+/* L338: the guard's headroom on a DISCRETE card.  Its demand-paged KV lands in the card's own memory, so the reading
+ * is the device's free memory (cudaMemGetInfo, exact there) above PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, and the
+ * ledger's share (budget − eager) does not cap it: on a discrete card the budget is free-after-weights less the
+ * startup margin (server_discrete_margin_bytes), a pre-warmup estimate the post-warmup reading replaces -- on the RTX
+ * 6000 at 3 banks x 40960 it left budget 5.00 − eager 4.96 = 0.04 GiB with 2.2 GiB of the device free, and every
+ * prompt over ~2K tokens was refused (2026-11-02, CT 130).  GB10's unified memory keeps MemAvailable, the host floor
+ * and the ledger's share. */
+/// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
+/// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
+uint64_t server_guard_avail_bytes(bool discrete);
+/// @param discrete as server_guard_avail_bytes
+/// @return the floor that reading keeps free
+KvBytes server_guard_floor(bool discrete);
 
 /* ==== The memory floor (2026-10-29 production hang) ========================================================
  * The hang: Nemotron 3.5 Super, 16 banks at --ctx 1M, a continued prefill at ~188k.  The guard's ceiling had

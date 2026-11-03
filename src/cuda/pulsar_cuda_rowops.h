@@ -18,6 +18,10 @@
  *   emit      y[t][c]   = bf16_rn(x[t][c])  or  bf16_rn(x[t][c] * s)  for a device scalar s (f32 or bf16 stored) --
  *             the producer-stage encode of a linear whose arm has no bf16 epilogue yet (rule 3: the ONE encoder for
  *             that buffer, at the producer).
+ L338 (fused chains: the ops above composed on one row in one CTA, byte for byte the unfused sequence):
+ *   norm-add-norms  res = add(res, rmsnorm(x) * w_x), then up to three rmsnorms of the updated row (one rstd)
+ *   sum2-norm-add   two f32 branches emitted and normed, added, the sum normed, res = bf16_rn(bf16_rn(res + it) * s)
+ *                   for a device bf16 scalar s (Gemma 4's layer_scalar: torch's add, then its mul), then its rmsnorm
  * L321 (the encoder-decoder families: LayerNorm, biased linears, GELU, an f32 residual -- Nemotron Parse first;
  * weights and biases f32, and the rows they write bf16 or f16 by the consumer's format, rule 3):
  *   res32_add   res[t][c] += x[t][c] + bias[c]  in f32, for a linear's f32 output x -- an f32 RESIDUAL stream (a ViT's:
@@ -88,6 +92,52 @@ int pulsar_rows_rmsnorm_launch(const uint16_t *x, uint64_t ld_x, uint32_t n_rows
 int pulsar_rows_add_launch(uint16_t *res, uint64_t ld_res, const uint16_t *delta, uint64_t ld_delta, uint32_t n_rows,
                            uint32_t width, const uint16_t *w, float eps, uint16_t *y, uint64_t ld_y,
                            cudaStream_t stream);
+
+/** L338: res = bf16(res + bf16(rmsnorm(x) * w_x)) in place, then y[j] = bf16(rmsnorm(res) * w[j]) for each j whose
+ *  w[j] is given -- a block's post-norm, the residual add and the next blocks' input norms in one pass, bit for bit
+ *  rows_rmsnorm then rows_add (and rows_rmsnorm again for the extra norms).  Width at most 8192.
+ *  @return 0, -1 refused, -3 launch failure. */
+/// @param x      device bf16 delta rows, normed before the add (16-byte aligned)
+/// @param ld_x   x pitch in elements (a multiple of 8, >= width)
+/// @param w_x    device bf16 [width] the delta's norm weight
+/// @param res    device bf16 residual rows, updated in place
+/// @param ld_res res pitch in elements
+/// @param n_rows rows (one CTA each)
+/// @param width  row width (a multiple of 8, <= 8192)
+/// @param w      [3] device bf16 [width] norm weights of the updated residual, NULL = that output unused
+/// @param y      [3] their output rows
+/// @param ld_y   [3] their pitches in elements
+/// @param eps    the norms' epsilon
+/// @param stream stream to launch on
+int pulsar_rows_norm_add_norms_launch(const uint16_t *x, uint64_t ld_x, const uint16_t *w_x, uint16_t *res,
+                                      uint64_t ld_res, uint32_t n_rows, uint32_t width, const uint16_t *const w[3],
+                                      uint16_t *const y[3], const uint64_t ld_y[3], float eps, cudaStream_t stream);
+
+/** L338: two f32 branch outputs into the residual, bit for bit rows_emit (each), rows_rmsnorm (each), rows_add with
+ *  w_s, then the scaled add with w_n: s = bf16(bf16(rmsnorm(bf16(a)) * w_a) + bf16(rmsnorm(bf16(b)) * w_b));
+ *  res = bf16(bf16(res + bf16(rmsnorm(s) * w_s)) * scale); y = bf16(rmsnorm(res) * w_n).  Width at most 8192.
+ *  @return 0, -1 refused, -3 launch failure. */
+/// @param a      device f32 rows of branch a (16-byte aligned)
+/// @param ld_a   a pitch in elements (a multiple of 8, >= width)
+/// @param w_a    device bf16 [width] branch a's norm weight
+/// @param b      device f32 rows of branch b
+/// @param ld_b   b pitch in elements
+/// @param w_b    branch b's norm weight
+/// @param w_s    the branch sum's norm weight
+/// @param res    device bf16 residual rows, updated in place
+/// @param ld_res res pitch in elements
+/// @param scale  device bf16 scalar the summed residual is multiplied by
+/// @param w_n    the updated residual's norm weight
+/// @param y      device bf16 rows of that norm
+/// @param ld_y   y pitch in elements
+/// @param n_rows rows (one CTA each)
+/// @param width  row width (a multiple of 8, <= 8192)
+/// @param eps    the norms' epsilon
+/// @param stream stream to launch on
+int pulsar_rows_sum2_norm_add_launch(const float *a, uint64_t ld_a, const uint16_t *w_a, const float *b,
+                                     uint64_t ld_b, const uint16_t *w_b, const uint16_t *w_s, uint16_t *res,
+                                     uint64_t ld_res, const uint16_t *scale, const uint16_t *w_n, uint16_t *y,
+                                     uint64_t ld_y, uint32_t n_rows, uint32_t width, float eps, cudaStream_t stream);
 
 /** y = bf16(x [* s]) for n_rows rows of `width`: x f32 rows ld_x apart (elements; a multiple of 4), y bf16 rows ld_y
  *  apart.  `scale` is a device pointer to one value stored as `kind` (NULL with PULSAR_ROWS_SCALE_NONE).

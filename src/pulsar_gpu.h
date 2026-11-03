@@ -411,8 +411,8 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
 /** @brief Note a scratch free: every cached graph is dropped (deferred to seg_exit mid-capture); catalog keys
- *  recapture on use. */
-void pulsar_gpu_seg_note_device_free(void); /* REQUIRED at every grow-realloc
+ *  recapture on use.  @param what the buffer regrown (named in the first post-warmup regrow's line) */
+void pulsar_gpu_seg_note_device_free(const char *what); /* REQUIRED at every grow-realloc
                                     * scratch free: baked pointers go stale */
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */
@@ -507,6 +507,10 @@ int pulsar_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t con
 /** @brief Print the device's free / total memory to stderr.
  *  @param label prefix for the line, or NULL */
 void pulsar_gpu_print_memory_report(const char *label);
+/** Whether the device's memory is the host's (GB10: unified) or its own (a discrete card) -- cudaDevAttrIntegrated,
+ *  read in one place (L338).
+ *  @return 1 integrated, 0 discrete, -1 when the device did not answer */
+int pulsar_gpu_integrated(void);
 /** cudaMemGetInfo passthrough (0/0 on failure) for diagnostics/samplers. */
 /** @param free_out  receives free device bytes
  *  @param total_out receives total device bytes */
