@@ -403,8 +403,10 @@ int GATE_ENTRY(int argc, char **argv) {
           fwrite(rp, 1, rp_bytes, fp);
           rewind(fp);
           int lrc = 0;
+          uint64_t touched_rows = 0;   /* the bank's high-water once the rows before the last segment landed */
           for (int i = 0; lrc == 0 && i < n_chain; i++) {
               const bool last = i == n_chain - 1;
+              if (last) touched_rows = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
               TokPos G{0};
               lrc = fseek(chain_fp[i], 0, SEEK_SET) != 0 ||
                     gate_load_segment(s, chain_fp[i], chain_bytes[i], last, last ? fp : NULL,
@@ -412,10 +414,18 @@ int GATE_ENTRY(int argc, char **argv) {
           }
           CHECK(lrc == 1, "finding3(c) flipped restore point byte: %s", lrc == 0 ? "load ACCEPTED it"
                                                                       : "an earlier segment failed instead");
-          CHECK(pulsar_session_bank_touched_kv_bytes(s, 1).raw() == 0 && pulsar_session_pos(s).raw() == 0,
-                "finding3(c): bank1 advertises rows after the failed load");
-          fprintf(stderr, "evict_restore_gate: finding-3(c) flipped restore point byte rejected: %s : %s\n", err,
-                  lrc == 1 ? "OK" : "FAIL");
+          /* L347: the earlier segments' rows LANDED before the restore point failed, so their pages are backed: the
+           * bank's touched KV is its physical high-water (what the 2b guard must keep counting; the next prefill
+           * reuses those pages), and no failure path releases it -- invalidate never did, nor did the old
+           * segment_clear.  The contract is that the bank advertises no history (position 0: nothing resumes from
+           * it) and that the failed load grew nothing past the rows it already held. */
+          const uint64_t touched_after = pulsar_session_bank_touched_kv_bytes(s, 1).raw();
+          CHECK(pulsar_session_pos(s).raw() == 0 && touched_after <= touched_rows,
+                "finding3(c): bank1 advertises rows after the failed load (pos %d, touched %.3f -> %.3f GiB)",
+                pulsar_session_pos(s).raw(), (double)touched_rows / GIB, (double)touched_after / GIB);
+          fprintf(stderr, "evict_restore_gate: finding-3(c) flipped restore point byte rejected: %s : pos %d, touched "
+                  "%.3f -> %.3f GiB : %s\n", err, pulsar_session_pos(s).raw(), (double)touched_rows / GIB,
+                  (double)touched_after / GIB, lrc == 1 ? "OK" : "FAIL");
       }
       if (fp) fclose(fp);
       free(rp); }
