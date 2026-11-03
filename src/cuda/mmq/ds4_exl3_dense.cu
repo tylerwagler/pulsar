@@ -295,9 +295,9 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /// CTA of a 128-output block (on its counter) sums the splits in order, applies H128 and svh, writes y or yb.
 /// Static smem: 40 KB of A tiles (kWarps x kMaxBlocks x {hi, lo} x 16 x 16 fp16), reused for the reduction.
 /// @param P   the projections of one rate (the prep planes carry the input)
-/// @param M   rows, 1..kMaxRows (L341: kRows-row passes over the words read once)
+/// @param M   rows, 1..PASSES x kRows (L341: kRows-row passes over the words read once; PASSES the launch's)
 /// @param K   input width
-template <int K2>
+template <int K2, int PASSES>
 __global__ void __launch_bounds__(kOut * kWarps)
 exl3_dense_kernel(const dense_set P, int M, int K) {
     const int c = (int)blockIdx.x, j = proj_of(P, c);
@@ -352,7 +352,13 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     /* L341: the passes -- rows r0..r0+15 each, every one exactly the arithmetic a 16-row launch of those rows has
      * (its A tiles staged, the same MMAs, the same fmaf order over the blocks, the same warp-order reduction into
      * its rows of the split's partial); only the trellis words above are read once for all of them. */
-    for (int r0 = 0; r0 < M; r0 += kRows) {
+    /* L341 r2: PASSES is the launch's pass count, a compile-time bound -- the one-pass launch (M <= kRows, every
+     * single-stream step) compiles to the loop-free body and its registers (the runtime-bounded loop cost a
+     * 102 -> 128 register body at every width, ~1.3 ms a Qwen round at one stream); M <= PASSES * kRows. */
+#pragma unroll
+    for (int pass = 0; pass < PASSES; ++pass) {
+        const int r0 = pass * kRows;
+        if (r0 >= M) break;
         const int nr = M - r0 < kRows ? M - r0 : kRows;              /* 1..kRows */
         /* the A tiles: tile (w, i) is k-tile w of block i of the range, rows past the pass's zero */
         {
@@ -510,12 +516,15 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @return the launch's error
 cudaError_t gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M,
                         int K) {
-    void (*k)(const dense_set, int, int) = k2 == 4  ? exl3_dense_kernel<4>
-                                         : k2 == 6  ? exl3_dense_kernel<6>
-                                         : k2 == 8  ? exl3_dense_kernel<8>
-                                         : k2 == 10 ? exl3_dense_kernel<10>
-                                         : k2 == 12 ? exl3_dense_kernel<12>
-                                                    : exl3_dense_kernel<16>;   /* k2 == 16, checked */
+    static_assert(kMaxRows == 2 * kRows, "the instances below are one and two passes");
+    const bool two = M > kRows;   /* L341 r2: the pass count is the instance's (M <= kMaxRows, checked) */
+    void (*k)(const dense_set, int, int) =
+        k2 == 4  ? (two ? exl3_dense_kernel<4, 2>  : exl3_dense_kernel<4, 1>)
+      : k2 == 6  ? (two ? exl3_dense_kernel<6, 2>  : exl3_dense_kernel<6, 1>)
+      : k2 == 8  ? (two ? exl3_dense_kernel<8, 2>  : exl3_dense_kernel<8, 1>)
+      : k2 == 10 ? (two ? exl3_dense_kernel<10, 2> : exl3_dense_kernel<10, 1>)
+      : k2 == 12 ? (two ? exl3_dense_kernel<12, 2> : exl3_dense_kernel<12, 1>)
+                 : (two ? exl3_dense_kernel<16, 2> : exl3_dense_kernel<16, 1>);   /* k2 == 16, checked */
     /* L340: under the previous kernel's tail (the prep, or the last rate's GEMV): the kernel waits before its planes */
     return pulsar_launch_pdl(k, grid, block, 0, stream, P, M, K);
 }
