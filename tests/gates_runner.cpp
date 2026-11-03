@@ -62,6 +62,11 @@
  * the gates that used to load it themselves (the Nemotron LiLiCorr drafter, spec, scratch and adopt legs) runs those,
  * not the whole table.
  *
+ * `--needs=a,b` (L278 battery cut, 2026-11-03) restricts a model -- the primary too, before any `--model` -- to the table
+ * entries whose needs include at least one of those (ds4, tokenizer, spec, dspark, rewind, fixtures, vision, block): the
+ * battery runs the DeepSeek primary with `--needs=ds4,fixtures`, the gates only it can run, since every other entry also
+ * runs on the hosted families.  The table's needs column stays the one authority; no list of gate names.
+ *
  * PULSAR_GATES_SECTIONS=FILE (make gates): one line `cuda-runner-gate [<family>] SECONDS` per hosted model is
  * appended to FILE -- the per-model sections of the battery's wall-time budget (docs/QA_BEFORE_RELEASES.md).
  */
@@ -257,7 +262,27 @@ typedef struct {
     const char *path, *ref_dir, *ref_tol, *kl_story, *kl_code;
     const char *story_high, *story_flip, *code_high, *code_flip;
     const char *gates;   /* L317 --gates: the table entries this model runs (NULL = all) */
+    uint32_t    needs_any;   /* --needs: only entries needing one of these NEED_* (0 = all) */
 } model_args;
+
+/* `--needs=` names to NEED_* bits: false (and the bad name in *bad) on a name the table does not use. */
+static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
+    static const struct { const char *name; uint32_t bit; } k[] = {
+        {"ds4", NEED_DS4_INTERNALS}, {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"dspark", NEED_DSPARK},
+        {"rewind", NEED_REWIND}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION}, {"block", NEED_BLOCK},
+    };
+    *out = 0;
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        const size_t n = e ? (size_t)(e - p) : strlen(p);
+        bool found = false;
+        for (const auto &x : k)
+            if (strlen(x.name) == n && !strncmp(x.name, p, n)) { *out |= x.bit; found = true; }
+        if (!found) { *bad = p; return false; }
+        p += n + (e ? 1 : 0);
+    }
+    return *out != 0;
+}
 
 /* Append `flag value` to a spec's argv when the value is given. */
 static void spec_append(gate_spec *g, const char *flag, const char *value) {
@@ -495,6 +520,16 @@ int main(int argc, char **argv) {
         if (!strncmp(argv[i], "--only=", 7)) { g_only = argv[i] + 7; i += 1; continue; }
         if (!strncmp(argv[i], "--except=", 9)) { g_except = argv[i] + 9; i += 1; continue; }
         if (!strncmp(argv[i], "--gates=", 8)) { cur->gates = argv[i][8] ? argv[i] + 8 : NULL; i += 1; continue; }
+        if (!strncmp(argv[i], "--needs=", 8)) {
+            const char *bad = argv[i] + 8;
+            if (!parse_needs(argv[i] + 8, &cur->needs_any, &bad)) {
+                fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (ds4, tokenizer, spec, dspark, rewind, "
+                                "fixtures, vision, block)\n", argv[i] + 8, bad);
+                return 2;
+            }
+            i += 1;
+            continue;
+        }
         if (i + 1 >= argc) { fprintf(stderr, "gates_runner: option %s needs a value\n", argv[i]); return 2; }
         const char *v = argv[i + 1];
         if (!strcmp(argv[i], "--prefill-baseline")) prefill_baseline = v;
@@ -720,7 +755,8 @@ int main(int argc, char **argv) {
     const model_args *ma = NULL;
     /* a table entry runs when the selection takes it and the hosted model's own --gates list (if any) names it */
 #define WANTED(name, dev) (gate_selected((name), (dev)) && (!ma->gates || name_in_list(ma->gates, (name))))
-#define RUN(spec) do { if (WANTED((spec).name, (spec).dev) && n_results < RESULTS_MAX) { \
+#define RUN(spec) do { if (WANTED((spec).name, (spec).dev) && (!ma->needs_any || ((spec).needs & ma->needs_any)) && \
+                              n_results < RESULTS_MAX) { \
         if (run_gate(&(spec), &hm, &results[n_results++]) != 0) rc_all = 1; } } while (0)
 
     /* The primary model runs the whole table, its configurations in the order the header gives; each hosted model
@@ -739,6 +775,9 @@ int main(int argc, char **argv) {
         const double model0 = gate_now_s();
         if (host_model(&hm, ma->path, primary) != 0) { rc_all = 1; continue; }
         if (ma->gates) printf("gates_runner: %s [%s] runs its own legs only: --gates=%s\n", ma->path, hm.family, ma->gates);
+        if (ma->needs_any)
+            printf("gates_runner: %s [%s] runs only the entries needing one of --needs (0x%x; the rest run on the hosted "
+                   "families)\n", ma->path, hm.family, ma->needs_any);
 
         /* This model's reference gates, from its anchors.  Absent blobs SKIP LOUDLY: a gate that passes without its
          * fixture grades nothing.  The KL budgets grade direction and are passed only when present. */

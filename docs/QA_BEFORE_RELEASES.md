@@ -162,10 +162,9 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `blockdraft-gate` | 5 | |
 | `nvfp4-rows-gate` | 10 | |
 | `lilicorr-head-gate` | 10 | |
-| `cuda-runner-gate [DeepSeek V4]` | 1150 | the whole table, 2 engine opens |
+| `cuda-runner-gate [DeepSeek V4]` | 1150 | L278 cut (2026-11-03): only the entries needing DS4 internals or the fixture blobs (`--needs=ds4,fixtures`); 2 engine opens.  Re-set from the first measured battery |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
-| `live-legs [deepseek]` | 1150 | constrained, server-live, abandon: warm + hooks instances.  L326: 600 -> 1150, measured 985 / 986 s (#440 / #456; constrained ~800 s warm since L317) + 15% |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
 | `live-legs [nemotron]` | 420 | kv-dup, opencode-turns: warm + fresh.  L326: 240 -> 420, measured 365 s (#456: L324's kv-dup leg +~49 s, the warm load cold-cache 214 s vs 136) + 15% |
 | `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon, the Nemotron mini |

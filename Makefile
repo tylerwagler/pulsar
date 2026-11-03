@@ -2239,13 +2239,18 @@ prefix-turns-live-gate: pulsar-server
 # instance with the test hooks (the injected grammar failure, the KV-budget override), then one fresh instance for
 # every leg's reuse == cold reference.  Each leg keeps its own checks and PASS/FAIL; the targets above still run a
 # leg alone.  The last section of `make gates`.  LIVE_LEGS="a,b" runs only those.
+# L278 battery cut (2026-11-03, Tyler): the battery's live legs run on the served families (Qwen, Nemotron); DeepSeek's
+# (not served; ~985 s) are live-legs-deepseek, which gates-dev runs on a DeepSeek path change.
 LIVE_LEGS ?=
 LIVE_LEGS_WORK ?= $(CURDIR)/.build/live-legs
-.PHONY: live-legs
+LIVE_LEGS_MODELS ?= --model qwen=$(QWEN_GATE_MODEL) --model nemotron=$(LILICORR_GATE_MODEL)
+.PHONY: live-legs live-legs-deepseek
 live-legs: pulsar-server
-	python3 tests/live_legs.py --binary ./pulsar-server --work $(LIVE_LEGS_WORK) \
-	  --model deepseek=$(FRONTIER_MODEL) --model qwen=$(QWEN_GATE_MODEL) --model nemotron=$(LILICORR_GATE_MODEL) \
+	python3 tests/live_legs.py --binary ./pulsar-server --work $(LIVE_LEGS_WORK) $(LIVE_LEGS_MODELS) \
 	  $(if $(LIVE_LEGS),--legs $(LIVE_LEGS),)
+live-legs-deepseek: pulsar-server
+	python3 tests/live_legs.py --binary ./pulsar-server --work $(LIVE_LEGS_WORK)-deepseek \
+	  --model deepseek=$(FRONTIER_MODEL) $(if $(LIVE_LEGS),--legs $(LIVE_LEGS),)
 
 # L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / preempt the newest
 # decoder, L314 / 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered
@@ -2603,13 +2608,18 @@ GATE_RUNNER_FLAGS ?=
 # bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
 RUNNER_HOSTED_ARGS ?= --model $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHORS) \
                       --model $(LILICORR_GATE_MODEL) --gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate
+# L278 battery cut (2026-11-03, Tyler): the DeepSeek primary runs only the entries nothing else can -- DeepSeek V4's
+# mechanism gates (DS4: evict / restore, accounting, session payload, mixed prefill, rewind, frontier, ...) and the
+# fixture-blob gates (its prefill / decode bit-exact baselines); every other entry runs on the hosted Qwen and Nemotron.
+# RUNNER_PRIMARY_ARGS= runs the primary's whole table again.  gates-dev calls the runner itself and is unaffected.
+RUNNER_PRIMARY_ARGS ?= --needs=ds4,fixtures
 # L317: the seed of the chunk-neutrality sample is the sha the battery runs at (successive batteries rotate through
 # the schedules; one sha always runs the same ones).
 cuda-runner-gate: tests/gates_runner
 	PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-		$(PULSAR_REF_ANCHORS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
+		$(PULSAR_REF_ANCHORS) $(RUNNER_PRIMARY_ARGS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
 
 # Every release-blocking gate, in one command.
 #
@@ -2886,7 +2896,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; render=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; kvmem=0; chunk=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; render=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; kvmem=0; chunk=0; ds4legs=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2921,6 +2931,7 @@ gates-dev:
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
 	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
+	      case "$$p" in src/engine/family_deepseek*|src/engine/kv_state_ds4*|src/engine/spec_dspark*|src/engine/gpu_*|src/cuda/pulsar_cuda_csa2*|src/cuda/pulsar_cuda_dspark*|src/cuda/mmq/ds4_mmq*|src/cuda/mmq/ds4_mmid*|src/cuda/mmq/ds4_mxfp8*|src/cuda/mmq/ds4_quantize*|src/server/deepseek_*|src/server/parser_deepseek*|tests/live_legs.py) ds4legs=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
 	      case "$$p" in src/engine/gpu_prefill*|src/engine/prefill_loop*|src/engine/kv_state*|src/engine/checkpoint*|src/engine/sync_driver*|src/engine/session*|src/lib/pulsar_segstore*|*chunk*) chunk=1 ;; esac; \
 	      case $$cls in \
@@ -2956,6 +2967,7 @@ gates-dev:
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$render -eq 1 ]; then printf '  prefix-stability-gate: selected (L325: server / chat-render paths, every family, no model)\n'; fi; \
+	if [ $$ds4legs -eq 1 ]; then printf '  live-legs-deepseek: selected (L278: the DeepSeek live legs left the battery; a DeepSeek path change runs them)\n'; fi; \
 	if [ $$kvmem -eq 1 ]; then printf '  server-kv-headroom-live: selected (L319: the touched-KV ceiling is the measured headroom; admission / guard / bank paths)\n'; fi; \
 	if [ $$resume -eq 1 ]; then printf '  resume-deepest-live + sidecall-turns-live + kv-dup-live + fanout-prefix-live + restore-stall-live: selected (L318 / L322 / L324 / L329 / L330: routing / resume / disk-chain paths, the Open WebUI and the Claude Code side-call shapes, the fan-out duplicate census, the fan-out shared-prefix wait and the sliced disk restore on the Qwen pack)\n'; fi; \
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
@@ -3012,6 +3024,9 @@ gates-dev:
 	fi; \
 	if [ $$kvmem -eq 1 ]; then \
 	  $(MAKE) --no-print-directory server-kv-headroom-live CUDA_ARCH=sm_120f || rc=1; \
+	fi; \
+	if [ $$ds4legs -eq 1 ]; then \
+	  $(MAKE) --no-print-directory live-legs-deepseek CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	fi; \
 	if [ $$exl3 -eq 1 ]; then \
 	  $(MAKE) --no-print-directory exl3-dequant-gate CUDA_ARCH=sm_120f || rc=1; \
