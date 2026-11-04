@@ -331,8 +331,9 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     s->checkpoint_valid = true;
     if (!pulsar_ckpt_landed(c->ckpt, c->bank, chunk_end)) return false;
     /* L311: the walk stands at the prompt's message endpoint -- record it (said when it cannot be) */
-    if (chunk_end == c->endpoint)
-        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, chunk_end, c->prompt->v, NULL, 0u);
+    if (chunk_end == c->endpoint)   /* L350: with the request's images below it (none for a text history) */
+        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, chunk_end, c->prompt->v, NULL, 0u,
+                                         s->sync_n_images > 0 ? &s->sync_identity : NULL);
     c->at_resume_point = c->ckpt->ops->split_invariant || chunk_end % c->ckpt->ops->resume_grid == 0u;
     prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
     return true;
@@ -358,11 +359,13 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     }
     pulsar_prefill_plan plan;
     pulsar_prefill_plan_init(&plan, &shape, start, ckpt, s->engine, prompt, s->sync_images, s->sync_n_images);
-    /* L311: a text history's message endpoint past the walk's start is cut at and recorded (the records keep no
-     * image identity, as the prompt end below) */
-    if (s->sync_n_images == 0 && s->live_images.n == 0) {
+    /* L311: the prompt's message endpoint past the walk's start is cut at and recorded.  L350: an image request's
+     * too -- its records keep the request's image identity (s->sync_identity) -- but never a history whose images
+     * are the bank's and not this request's (a text request over an image KV), nor a cut inside a block */
+    if (s->sync_n_images > 0 || s->live_images.n == 0) {
         const uint32_t E = pulsar_prompt_endpoint(s->engine, ckpt, prompt);
-        plan.endpoint = E > start ? E : 0u;
+        uint32_t bs = 0, be = 0;
+        plan.endpoint = E > start && !prefill_plan_block_across(&plan, E, &bs, &be) ? E : 0u;
     }
     if (plan.n_images > 0) {
         /* every block must fit one chunk of THIS walk (a resume's chunks may be narrower than the cold pass's) */
@@ -392,13 +395,15 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     s->logits_stale = rc != 0;
     if (rc == 1) s->checkpoint_valid = false;
     /* L289: the prompt end is recorded -- the state, open rows and logits this prefill left at `end` -- so the
-     * same prompt resumes here without evaluating a row.  A text history only: a KV holding an image block is
-     * matched by its image identity, which the record does not keep (such a prompt resumes from the grid). */
-    if (rc == 0 && s->sync_n_images == 0 && s->live_images.n == 0) {
+     * same prompt resumes here without evaluating a row, and (split-invariant families) a longer prompt resumes from
+     * it.  L350: an image request's too, with its image identity (a KV holding an image block is matched by it, so
+     * a conversation whose turn ended on an image resumes past the block); not a text request over an image KV */
+    if (rc == 0 && (s->sync_n_images > 0 || s->live_images.n == 0)) {
         const float *live = s->live_host();   /* L302: the record keeps the row on the host */
         if (live)
             (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, end, prompt->v, live,
-                                             (uint32_t)pulsar_engine_logits_width(s->engine));
+                                             (uint32_t)pulsar_engine_logits_width(s->engine),
+                                             s->sync_n_images > 0 ? &s->sync_identity : NULL);
     }
     return rc;
 }

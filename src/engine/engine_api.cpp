@@ -1373,7 +1373,8 @@ pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
 uint32_t pulsar_session_live_bank(pulsar_session *s) {
     return session_banks(s)->live(s);
 }
-uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len) {
+uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
+                                     const pulsar_image_identity *want) {
     if (!s || common <= 0 || prompt_len <= 0) return 0;
     uint32_t limit = (uint32_t)common;
     const int pf = pulsar_session_bank_prefill_frontier(s, bank).raw();   /* L334: the body stays raw (P2b) */
@@ -1393,18 +1394,19 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     if (rlimit > (uint32_t)prompt_len) rlimit = (uint32_t)prompt_len;
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     const pulsar_ckpt_record *r =
-        h ? pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt_len) : NULL;
+        h ? pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt_len, want) : NULL;
     if (r && r->T > G && (r->T == (uint32_t)prompt_len || st->ops->split_invariant)) return r->T;
     return G;
 }
 
-const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len) {
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len,
+                                                       const pulsar_image_identity *want) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     /* below the prompt's end a grid checkpoint at T is the restore; AT it only a record (its logits) serves */
     if (!st || !st->ops || !h || T == 0u || (T < (uint32_t)prompt_len && pulsar_ckpt_best(st, bank, T) == T))
         return NULL;
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len);
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len, want);
     return r && r->T == T ? r : NULL;
 }
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len) {
@@ -1909,8 +1911,10 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
         return {TokPos::after(m.live_cut), m.prompt_cut};
     /* else the one resume rule over the stitched prompt (G <= the cut: below it the stitched prompt is the bank's
      * own tokens) */
+    /* L350: priced from tokens alone -- text records only; the sync matches an image record's identity itself */
     const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(),
-                                                   pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw());
+                                                   pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw(),
+                                                   NULL);
     const TokPos at{(int)G};
     /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
@@ -1944,14 +1948,14 @@ static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_t
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(s->engine, h->v, h->len, prompt->v, prompt->len, &m);
     *len = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
-    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut.raw(), *len);
+    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut.raw(), *len, NULL);   /* L350: no image adopts */
     if (T == 0u) return 0u;
     if (m.seamed) {
         pulsar_prefix_match at;
         pulsar_tokens_prefix_match(s->engine, h->v, (int)T, prompt->v, prompt->len, &at);
         if (at.live_cut != TokCount{(int)T}) return 0u;
     }
-    *rec = pulsar_session_resume_record(s, src, T, *len);
+    *rec = pulsar_session_resume_record(s, src, T, *len, NULL);
     return T;
 }
 

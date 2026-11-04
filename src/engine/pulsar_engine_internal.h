@@ -2609,8 +2609,9 @@ typedef struct {
 } pulsar_image_block;
 /// Most image blocks one KV records (pulsar_image_identity).
 #define PULSAR_IMAGE_BLOCKS_MAX 64
-/** The blocks a KV holds, in position order (image_identity.cpp). */
-typedef struct {
+/** The blocks a KV holds, in position order (image_identity.cpp).  Named (L350) so kv_state.h's checkpoint records,
+ *  declared before it, can hold one by pointer. */
+typedef struct pulsar_image_identity {
     /// Valid entries in b[].
     uint32_t n;
     /// The block records, in position order.
@@ -4260,16 +4261,20 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
 /// @param bank        the bank
 /// @param common      tokens the prompt shares with the bank's history
 /// @param prompt_len  the prompt's length, in tokens
+/// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @return the resume position, in tokens (0 = from the start).
-uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len);
+uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
+                                     const pulsar_image_identity *want);
 /** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
  *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
 /// @param s           the session
 /// @param bank        the bank
 /// @param T           the resume position
 /// @param prompt_len  the prompt's length, in tokens
+/// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @return the record (borrowed from the store), or NULL.
-const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len);
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len,
+                                                       const pulsar_image_identity *want);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
  * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
  * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not

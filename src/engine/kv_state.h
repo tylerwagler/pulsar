@@ -38,6 +38,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/** The image blocks a KV holds (pulsar_engine_internal.h); records keep one by pointer (L350). */
+struct pulsar_image_identity;
+
 /* Included from pulsar_engine_internal.h (pulsar_gpu_tensor, PULSAR_MSEQ_MAX); not standalone. */
 
 /** The most checkpoint slots any model keeps per bank (the store's array bound). */
@@ -154,6 +157,9 @@ typedef struct pulsar_ckpt_record {
     int32_t *tokens;
     /// capacity of `tokens` in ids (grown to T on capture)
     uint32_t tokens_cap;
+    /** L350: host, owned: the image blocks merged into the record's state below T -- the match authority beside
+     *  `tokens` (an image block's placeholder ids are the same for every image).  NULL or n == 0: a text history. */
+    struct pulsar_image_identity *img;
 } pulsar_ckpt_record;
 
 /** A model's grid checkpoints: per bank, ops->ckpt_slots slots of slot_bytes.  pos[bank][s] is
@@ -347,20 +353,26 @@ static inline uint32_t pulsar_ckpt_records_for(uint32_t n_banks) {
 /// @param tokens [T] the token ids the state is the prefill of (copied)
 /// @param logits [width] the prompt end's next-token row (copied), or NULL for an endpoint
 /// @param width  floats in `logits`
+/// @param img    L350: the image blocks merged into the state (copied, trimmed to T), or NULL for a text history
 /// @return true when captured
 bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckpt_record_kind kind, uint32_t T,
-                                const int *tokens, const float *logits, uint32_t width);
+                                const int *tokens, const float *logits, uint32_t width,
+                                const struct pulsar_image_identity *img);
 /** The deepest of `bank`'s records whose ids are tokens[0, T) (of `len`) with T <= limit and -- when T == prompt_len,
- *  a resume AT T -- that holds the logits that resume reads.  NULL when none. */
+ *  a resume AT T -- that holds the logits that resume reads.  NULL when none.  L350: and whose images are the
+ *  request's: with `want` the record's blocks equal want's below T and no block of want straddles T; without it
+ *  (a caller that prices from tokens alone) only a record holding no image matches. */
 /// @param st         the store
 /// @param bank       the bank
 /// @param tokens     the prompt's token ids
 /// @param len        ids in `tokens`
 /// @param limit      the highest record T acceptable, in tokens
 /// @param prompt_len the prompt's length in tokens (a record at it must keep logits)
+/// @param want       L350: the request's image blocks over the whole prompt, or NULL (text records only)
 /// @return the record (the store's; borrowed), or NULL
 const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens,
-                                                  uint32_t len, uint32_t limit, uint32_t prompt_len);
+                                                  uint32_t len, uint32_t limit, uint32_t prompt_len,
+                                                  const struct pulsar_image_identity *want);
 /** `bank`'s record of `kind`, NULL when none. */
 /// @param st   the store
 /// @param bank the bank

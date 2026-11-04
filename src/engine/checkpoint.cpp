@@ -259,6 +259,7 @@ void pulsar_ckpt_release(pulsar_ckpt_store *st) {
         pulsar_gpu_host_free(r->host);
         free(r->logits);
         free(r->tokens);
+        free(r->img);   /* L350 */
         memset(r, 0, sizeof(*r));
     }
     st->n_rec = 0;
@@ -403,7 +404,8 @@ static pulsar_ckpt_record *ckpt_record_pick(pulsar_ckpt_store *st) {
 }
 
 bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckpt_record_kind kind, uint32_t T,
-                                const int *tokens, const float *logits, uint32_t width) {
+                                const int *tokens, const float *logits, uint32_t width,
+                                const struct pulsar_image_identity *img) {
     if (bank >= PULSAR_MSEQ_MAX || T == 0u || !tokens || st->n_rec == 0u ||
         (kind == PULSAR_CKPT_REC_END) != (logits != NULL && width != 0u))
         return false;
@@ -463,6 +465,14 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckp
     }
     if (logits) memcpy(r->logits, logits, (size_t)width * sizeof(float));
     for (uint32_t i = 0; i < T; i++) r->tokens[i] = (int32_t)tokens[i];
+    /* L350: the images the state holds below T -- the match authority beside the ids */
+    if (img && img->n > 0) {
+        if (!r->img) r->img = (pulsar_image_identity *)xmalloc(sizeof(pulsar_image_identity));
+        *r->img = *img;
+        pulsar_image_identity_trim(r->img, T);
+    } else if (r->img) {
+        r->img->n = 0;
+    }
     r->bank = bank;
     r->kind = kind;
     r->used = ++st->rec_clock;
@@ -477,26 +487,37 @@ const pulsar_ckpt_record *pulsar_ckpt_record_of(const pulsar_ckpt_store *st, uin
     return NULL;
 }
 
-/* Are the record's ids tokens[0, T)? */
+/* Are the record's ids tokens[0, T) -- and (L350) its images the request's below T? */
 /// @param r      the record
 /// @param tokens the prompt's ids
 /// @param len    ids in `tokens`
-/// @return true when the record is live and its T ids are the prompt's first T
-static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, uint32_t len) {
+/// @param want   the request's image blocks over the prompt, or NULL (then only a record holding no image)
+/// @return true when the record is live, its T ids are the prompt's first T and its images are the request's
+static bool ckpt_record_matches(const pulsar_ckpt_record *r, const int *tokens, uint32_t len,
+                                const pulsar_image_identity *want) {
     if (r->T == 0u || !tokens || len < r->T) return false;
     for (uint32_t i = 0; i < r->T; i++)
         if ((int32_t)tokens[i] != r->tokens[i]) return false;
-    return true;
+    const uint32_t held = r->img ? r->img->n : 0u;
+    if (!want) return held == 0u;
+    /* a block of the request straddling T would resume with its merged rows cut */
+    for (uint32_t i = 0; i < want->n; i++)
+        if (want->b[i].start < r->T && want->b[i].end > r->T) return false;
+    pulsar_image_identity below = *want;
+    pulsar_image_identity_trim(&below, r->T);
+    if (below.n != held) return false;
+    return held == 0u || pulsar_image_identity_equal(r->img, &below);
 }
 
 const pulsar_ckpt_record *pulsar_ckpt_record_best(const pulsar_ckpt_store *st, uint32_t bank, const int *tokens,
-                                                  uint32_t len, uint32_t limit, uint32_t prompt_len) {
+                                                  uint32_t len, uint32_t limit, uint32_t prompt_len,
+                                                  const struct pulsar_image_identity *want) {
     const pulsar_ckpt_record *best = NULL;
     for (uint32_t i = 0; st && i < st->n_rec; i++) {
         const pulsar_ckpt_record *r = &st->rec[i];
         if (r->T == 0u || r->bank != bank || r->T > limit || (best && r->T <= best->T)) continue;
         if (r->T == prompt_len && !r->logits) continue;   /* a resume AT T reads the row the prefill left there */
-        if (ckpt_record_matches(r, tokens, len)) best = r;
+        if (ckpt_record_matches(r, tokens, len, want)) best = r;
     }
     return best;
 }
