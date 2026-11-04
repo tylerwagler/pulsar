@@ -614,6 +614,22 @@ bool server::send_metrics(int fd) {
     const int kv_pinned_anchors = s->m_kv_pinned_anchors;
     const unsigned long long kv_pinned_bytes = (unsigned long long)s->m_kv_pinned_bytes;
     const unsigned long long kv_pins_released = (unsigned long long)s->m_kv_pins_released;
+    /* L276: the disk KV store as the worker last published it (kv_cache_publish_store) */
+    const bool kv_disk_on = s->m_kv_disk_enabled;
+    const unsigned long long kv_disk_used = (unsigned long long)s->m_kv_disk_used;
+    const unsigned long long kv_disk_budget = (unsigned long long)s->m_kv_disk_budget;
+    const int kv_disk_segments = s->m_kv_disk_segments;
+    const unsigned long long kv_disk_ram = (unsigned long long)s->m_kv_disk_ram;
+    const unsigned long long kv_disk_ram_pool = (unsigned long long)s->m_kv_disk_ram_pool;
+    const unsigned long long kv_disk_fs_free = (unsigned long long)s->m_kv_disk_fs_free;
+    const unsigned long long kv_disk_fs_size = (unsigned long long)s->m_kv_disk_fs_size;
+    const unsigned long long kv_disk_segs_removed = (unsigned long long)s->m_kv_disk_segs_removed;
+    const unsigned long long kv_disk_rps_removed = (unsigned long long)s->m_kv_disk_rps_removed;
+    unsigned long long kv_disk_persisted[KV_PERSIST_TRIGGERS], kv_disk_rp_persisted[KV_PERSIST_TRIGGERS];
+    for (int i = 0; i < KV_PERSIST_TRIGGERS; i++) {
+        kv_disk_persisted[i] = (unsigned long long)s->m_kv_disk_persisted[i];
+        kv_disk_rp_persisted[i] = (unsigned long long)s->m_kv_disk_rp_persisted[i];
+    }
     unsigned long long req_class[REQ_CLASS_COUNT];                                 /* L249 D */
     for (int i = 0; i < REQ_CLASS_COUNT; i++) req_class[i] = (unsigned long long)s->m_req_class[i];
     const unsigned long long hint_dead_banks = (unsigned long long)s->m_hint_dead_banks;
@@ -1143,6 +1159,52 @@ bool server::send_metrics(int fd) {
                  "out of room.\n");
     buf_puts(&b, "# TYPE pulsar:kv_pins_released_total counter\n");
     buf_printf(&b, "pulsar:kv_pins_released_total %llu\n", kv_pins_released);
+    /* L276: the disk KV tier itself -- what it holds against its budget and its filesystem, what wrote and removed it */
+    buf_puts(&b, "# HELP pulsar:kv_disk_enabled 1 when the disk KV store is open (--kv-disk-dir), else 0.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_enabled gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_enabled %d\n", kv_disk_on ? 1 : 0);
+    buf_puts(&b, "# HELP pulsar:kv_disk_used_bytes Bytes of segment and restore-point files the disk KV store holds.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_used_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_used_bytes %llu\n", kv_disk_used);
+    buf_puts(&b, "# HELP pulsar:kv_disk_budget_bytes The disk KV store's byte budget (--kv-disk-space-mb); 0 = unbounded.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_budget_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_budget_bytes %llu\n", kv_disk_budget);
+    buf_puts(&b, "# HELP pulsar:kv_disk_segments Segments the disk KV store holds.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_segments gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_segments %d\n", kv_disk_segments);
+    buf_puts(&b, "# HELP pulsar:kv_disk_ram_bytes Bytes of the disk KV store's RAM tier: segment and restore-point copies "
+                 "in the host pool.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_ram_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_ram_bytes %llu\n", kv_disk_ram);
+    buf_puts(&b, "# HELP pulsar:kv_disk_ram_pool_bytes The disk KV host pool (--kv-ram-mb): the RAM tier and the copy-outs.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_ram_pool_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_ram_pool_bytes %llu\n", kv_disk_ram_pool);
+    buf_puts(&b, "# HELP pulsar:kv_disk_fs_free_bytes Free bytes on the KV directory's filesystem (statvfs, unprivileged).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_fs_free_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_fs_free_bytes %llu\n", kv_disk_fs_free);
+    buf_puts(&b, "# HELP pulsar:kv_disk_fs_size_bytes Size of the KV directory's filesystem.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_fs_size_bytes gauge\n");
+    buf_printf(&b, "pulsar:kv_disk_fs_size_bytes %llu\n", kv_disk_fs_size);
+    buf_puts(&b, "# HELP pulsar:kv_disk_segments_persisted_total Segments disk-KV persists copied out for writing, by "
+                 "trigger.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_segments_persisted_total counter\n");
+    for (int i = 0; i < KV_PERSIST_TRIGGERS; i++)
+        buf_printf(&b, "pulsar:kv_disk_segments_persisted_total{trigger=\"%s\"} %llu\n", kv_persist_trigger_names[i],
+                   kv_disk_persisted[i]);
+    buf_puts(&b, "# HELP pulsar:kv_disk_restore_points_persisted_total Restore points disk-KV persists copied out for "
+                 "writing, by trigger.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_restore_points_persisted_total counter\n");
+    for (int i = 0; i < KV_PERSIST_TRIGGERS; i++)
+        buf_printf(&b, "pulsar:kv_disk_restore_points_persisted_total{trigger=\"%s\"} %llu\n",
+                   kv_persist_trigger_names[i], kv_disk_rp_persisted[i]);
+    buf_puts(&b, "# HELP pulsar:kv_disk_segments_removed_total Segments the disk KV store removed: evicted for room, "
+                 "released, or dropped as bad.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_segments_removed_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_segments_removed_total %llu\n", kv_disk_segs_removed);
+    buf_puts(&b, "# HELP pulsar:kv_disk_restore_points_removed_total Restore points the disk KV store removed without "
+                 "their segment.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_restore_points_removed_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_restore_points_removed_total %llu\n", kv_disk_rps_removed);
     buf_puts(&b, "# HELP pulsar:kv_restore_failures_total Failed disk chain restores, by fault: content (what it "
                  "invalidates dropped) or transient (nothing dropped).\n");
     buf_puts(&b, "# TYPE pulsar:kv_restore_failures_total counter\n");

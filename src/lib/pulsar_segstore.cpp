@@ -126,6 +126,10 @@ struct pulsar_segstore {
     uint64_t pinned_max = 0;
     /// L347 I3b: pins taken away, ever: over the budget, or the store out of room (pulsar_segstore_pins_released)
     uint64_t pins_released = 0;
+    /// L276: segments taken out of the index, ever: evicted, released, dropped as bad (pulsar_segstore_removed)
+    uint64_t segs_removed = 0;
+    /// L276: restore points removed without their segment, ever (pulsar_segstore_removed)
+    uint64_t rps_removed = 0;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -327,6 +331,7 @@ struct pulsar_segstore {
         auto it = segs.find(key);
         if (it == segs.end()) return;
         if (removed) removed(removed_ud, key.c_str(), false);
+        segs_removed++;   /* L276 */
         used -= it->second.file_bytes + it->second.rp_bytes;
         const std::string parent = it->second.parent;
         auto &sib = children[parent];
@@ -418,6 +423,7 @@ struct pulsar_segstore {
         used -= e.rp_bytes;
         e.rp_bytes = 0;
         e.rp_flags = 0;
+        rps_removed++;   /* L276 */
         if (removed) removed(removed_ud, e.key, true);
     }
     /** @param key a stored key
@@ -1160,6 +1166,7 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
             ::unlink(st->rp_path(key.c_str()).c_str());
             st->used -= rp.bytes;
             st->img_free(rp.img);
+            st->rps_removed++;   /* L276 */
             if (st->removed) st->removed(st->removed_ud, key.c_str(), true);
         }
     }
@@ -1520,4 +1527,9 @@ int pulsar_segstore_pinned_anchors(const pulsar_segstore *st, uint64_t *bytes) {
 uint64_t pulsar_segstore_pins_released(const pulsar_segstore *st) { return st ? st->pins_released : 0u; }
 
 uint64_t pulsar_segstore_used_bytes(const pulsar_segstore *st) { return st ? st->used : 0u; }
+uint64_t pulsar_segstore_budget_bytes(const pulsar_segstore *st) { return st ? st->budget : 0u; }
+uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps) {
+    if (rps) *rps = st ? st->rps_removed : 0u;
+    return st ? st->segs_removed : 0u;
+}
 int pulsar_segstore_count(const pulsar_segstore *st) { return st ? (int)st->segs.size() : 0; }

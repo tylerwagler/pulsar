@@ -2519,9 +2519,26 @@ struct server {
     uint64_t m_persist_read_only;
     /// L347 I3b: failed disk restores by class: [0] a content fault (what it invalidates dropped), [1] transient (kept)
     uint64_t m_restore_faults[2];
-    int      m_kv_pinned_anchors;   ///< L347 I3b: the store's PINNED anchors, published (kv_cache_publish_pins)
+    int      m_kv_pinned_anchors;   ///< L347 I3b: the store's PINNED anchors, published (kv_cache_publish_store)
     uint64_t m_kv_pinned_bytes;     ///< L347 I3b: ... the bytes they hold
     uint64_t m_kv_pins_released;    ///< L347 I3b: ... pins taken away, ever
+    /** L276: the disk KV store as kv_cache_publish_store last saw it (the worker owns the store; /metrics reads these
+     *  under mu): open, bytes held / budget (0 = unbounded), segments, the RAM tier's bytes / its pool, the KV
+     *  directory's filesystem free / size, and what the store removed (segments; restore points alone). */
+    bool     m_kv_disk_enabled;
+    uint64_t m_kv_disk_used;          ///< L276: ... bytes held
+    uint64_t m_kv_disk_budget;        ///< L276: ... its budget (0 = unbounded)
+    int      m_kv_disk_segments;      ///< L276: ... segments
+    uint64_t m_kv_disk_ram;           ///< L276: ... RAM tier bytes
+    uint64_t m_kv_disk_ram_pool;      ///< L276: ... the host pool the RAM tier lives in
+    uint64_t m_kv_disk_fs_free;       ///< L276: ... the directory's filesystem, free bytes (statvfs)
+    uint64_t m_kv_disk_fs_size;       ///< L276: ... and its size
+    uint64_t m_kv_disk_segs_removed;  ///< L276: ... segments removed, ever
+    uint64_t m_kv_disk_rps_removed;   ///< L276: ... restore points removed without their segment, ever
+    /// L276: segments persists copied out for writing, by trigger (kv_persist_trigger_names)
+    uint64_t m_kv_disk_persisted[KV_PERSIST_TRIGGERS];
+    /// L276: restore points persists copied out for writing, by trigger
+    uint64_t m_kv_disk_rp_persisted[KV_PERSIST_TRIGGERS];
     /// L347 I3a: disk-KV persists that left a file unwritten: the host pool had no room for its copy-out
     uint64_t m_persist_no_room;
     /// L347 I3a: guard spills refused because their copy-out found no room in the host pool (the bank stayed resident)
@@ -2703,7 +2720,7 @@ struct server {
     bool kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut);
     /** L347 I3b: publish the store's pinned anchors for /metrics (the store is the worker's; send_metrics reads the
      *  copies under mu).  Worker thread. */
-    void kv_cache_publish_pins();
+    void kv_cache_publish_store();
     warn_limiter persist_skip_warn;   ///< the persist-skipped line, rate-limited (each skip is counted)
     /** The guard's live touched-KV budget: server_guard_touched_budget over the CURRENT MemAvailable (re-read at most
      *  every 0.25 s) and touched KV, never above the startup ceiling -- so memory nobody accounts for (host heap,

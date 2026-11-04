@@ -1555,6 +1555,7 @@ int main(int argc, char **argv) {
                    "serving without disk restore",
                    cfg.kv_disk_dir);
     }
+    s.kv_cache_publish_store();   /* L276: /metrics sees the store as it opened (a no-op when disabled) */
     /* L264 S4e: on a tensor-parallel group every worker keeps its own copy of
      * each segment the store names (the engine mirrors save and load).  Every
      * key the store removes from here on is dropped on the workers too, and the

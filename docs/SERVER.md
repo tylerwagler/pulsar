@@ -412,6 +412,23 @@ requests (`pulsar:kv_header_requests_total`), the persists it suppressed
 (`pulsar:kv_pins_released_total`) and failed restores by fault
 (`pulsar:kv_restore_failures_total`).
 
+The store itself is on `/metrics` too: whether it is open
+(`pulsar:kv_disk_enabled`), the bytes it holds against its budget
+(`pulsar:kv_disk_used_bytes`, `pulsar:kv_disk_budget_bytes`, 0 = unbounded),
+its segments (`pulsar:kv_disk_segments`), the RAM tier's bytes and the host pool
+it lives in (`pulsar:kv_disk_ram_bytes`, `pulsar:kv_disk_ram_pool_bytes`), and
+the free space and size of the filesystem under `--kv-disk-dir`
+(`pulsar:kv_disk_fs_free_bytes`, `pulsar:kv_disk_fs_size_bytes`), since the
+budget is not the disk. The counters say what wrote and removed it: segments and
+restore points persisted by trigger
+(`pulsar:kv_disk_segments_persisted_total{trigger=...}`,
+`pulsar:kv_disk_restore_points_persisted_total{trigger=...}`, the trigger words
+of the `persisted reason=` log lines) and what the store removed
+(`pulsar:kv_disk_segments_removed_total`,
+`pulsar:kv_disk_restore_points_removed_total`). The gauges are taken when the
+store changes (open, a persist, a write committed, a restore's end), not on
+every scrape.
+
 The cache is disposable: stop the server and delete the directory to reset it.
 Segment files contain the conversation text in clear.
 

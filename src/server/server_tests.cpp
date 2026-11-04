@@ -9038,6 +9038,12 @@ static void test_l347_i2_eviction_order(void) {
     TEST_ASSERT(p > b_rp && l0 > b_rp && b > p);  /* then the leaves, LRU; B a leaf once P is gone */
     TEST_ASSERT(a_rp > p && a_rp > l0 && a_rp > b && a > a_rp);   /* the anchor's restore point last, then its rows */
     TEST_ASSERT((int)log.ev.size() == 8 && pulsar_segstore_count(st) == 1);
+    /* L276: the store's own count of what it removed agrees with the hook's -- five segments, three restore points
+     * alone (L0, B, A) -- and the budget it reports is the one it was opened with */
+    uint64_t rps_removed = 0;
+    TEST_ASSERT(pulsar_segstore_removed(st, &rps_removed) == 5 && rps_removed == 3);
+    TEST_ASSERT(pulsar_segstore_budget_bytes(st) == used);
+    TEST_ASSERT(pulsar_segstore_removed(NULL, &rps_removed) == 0 && rps_removed == 0 && pulsar_segstore_budget_bytes(NULL) == 0);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }

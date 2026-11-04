@@ -519,6 +519,16 @@ uint64_t pulsar_segstore_pins_released(const pulsar_segstore *st);
 /// @return bytes of the .seg and .rp files the store holds
 /** Bytes the store holds, and the count of segments. */
 uint64_t pulsar_segstore_used_bytes(const pulsar_segstore *st);
+/** L276: the byte budget the store was opened with (--kv-disk-space-mb).
+ *  @param st the store, or NULL (0)
+ *  @return bytes; 0 = unbounded */
+uint64_t pulsar_segstore_budget_bytes(const pulsar_segstore *st);
+/** L276: what the store has removed, ever: segments taken out of the index (evicted for room, released, dropped as
+ *  bad) and, in `rps`, restore points removed without their segment.
+ *  @param st  the store, or NULL (0)
+ *  @param rps receives the restore points removed, or NULL
+ *  @return the segments removed */
+uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps);
 /** The number of segments the store holds.
  *  @param st the store, or NULL (0)
  *  @return the segment count */

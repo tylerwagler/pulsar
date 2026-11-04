@@ -8,6 +8,7 @@
 #include "lib/pulsar_kvchain.h"
 #include "lib/pulsar_kvpool.h"
 
+#include <sys/statvfs.h>
 #include <deque>
 #include <pthread.h>
 #include <string>
@@ -745,20 +746,38 @@ bool server::kv_cache_pin_anchor(const pulsar_tokens *prompt, int cut) {
         const bool ok = pulsar_segstore_flag_rp(kv.st, chain[n - 1].key, PULSAR_SEGSTORE_RP_PINNED);
         server_log(ok ? PULSAR_LOG_KVCACHE : PULSAR_LOG_WARNING, "pulsar-server: kv cache anchor at %d (%.12s) %s "
                    "(X-Pulsar-KV pin-anchor)", cut, chain[n - 1].key, ok ? "pinned" : "could not be pinned");
-        kv_cache_publish_pins();
+        kv_cache_publish_store();
     }
     return true;
 }
 
-void server::kv_cache_publish_pins() {
+void server::kv_cache_publish_store() {
     if (!kv.enabled || !kv.st) return;
-    uint64_t bytes = 0;
+    /* the store's walks (pinned, RAM tier) are O(segments): published on its events (open, persist, commit, restore
+     * end), not every quantum */
+    uint64_t bytes = 0, rps_removed = 0;
     const int n = pulsar_segstore_pinned_anchors(kv.st, &bytes);
     const uint64_t released = pulsar_segstore_pins_released(kv.st);
+    const uint64_t used = pulsar_segstore_used_bytes(kv.st), budget = pulsar_segstore_budget_bytes(kv.st);
+    const int segments = pulsar_segstore_count(kv.st);
+    const uint64_t ram = pulsar_segstore_ram_bytes(kv.st), ram_pool = kv.ram ? pulsar_kvpool_size(kv.ram) : 0;
+    const uint64_t segs_removed = pulsar_segstore_removed(kv.st, &rps_removed);
+    struct statvfs fs;   /* L276: the store's budget is not the disk's -- a full filesystem refuses stores */
+    const bool fs_ok = kv.dir && statvfs(kv.dir, &fs) == 0;
     pthread_mutex_lock(&mu);
     m_kv_pinned_anchors = n;
     m_kv_pinned_bytes = bytes;
     m_kv_pins_released = released;
+    m_kv_disk_enabled = true;
+    m_kv_disk_used = used;
+    m_kv_disk_budget = budget;
+    m_kv_disk_segments = segments;
+    m_kv_disk_ram = ram;
+    m_kv_disk_ram_pool = ram_pool;
+    m_kv_disk_fs_free = fs_ok ? (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize : 0;
+    m_kv_disk_fs_size = fs_ok ? (uint64_t)fs.f_blocks * (uint64_t)fs.f_frsize : 0;
+    m_kv_disk_segs_removed = segs_removed;
+    m_kv_disk_rps_removed = rps_removed;
     pthread_mutex_unlock(&mu);
 }
 
@@ -906,7 +925,13 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                    "for a copy-out and nothing in flight could make it -- that file is not written (raise "
                    "--kv-ram-mb)", reason, (double)pulsar_kvpool_size(s->kv.ram) / (1024.0 * 1024.0));
     }
-    if (r.written || r.rp_written) s->kv_cache_publish_pins();   /* L347 I3b: a write may have made room by a pin */
+    if (r.written || r.rp_written) {
+        pthread_mutex_lock(&s->mu);   /* L276: by the trigger the log line names */
+        s->m_kv_disk_persisted[why] += (uint64_t)r.written;
+        s->m_kv_disk_rp_persisted[why] += (uint64_t)r.rp_written;
+        pthread_mutex_unlock(&s->mu);
+        s->kv_cache_publish_store();   /* L347 I3b: a write may have made room by a pin */
+    }
     if (chain_end) *chain_end = r.end;
     /* L347: a spill frees its bank only when the history is stored: no host pool room, or any persist error (the
      * store full, a write refused), keeps the bank resident */
@@ -1019,7 +1044,7 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
     hit->bytes = 0;
     hit->cached = 0;
     if (!s->kv.enabled || !prompt_text) return 0;
-    if (kv_cache_commit_written(&s->kv) > 0) s->kv_cache_publish_pins();   /* L338; L347 I3b: a pinned anchor's */
+    if (kv_cache_commit_written(&s->kv) > 0) s->kv_cache_publish_store();   /* L338; L347 I3b: a pinned anchor's */
     char err[384];
     hit->n = pulsar_kvchain_find(s->kv.st, prompt_text, strlen(prompt_text), image_hashes, n_images,
                                  s->kv.opt.min_tokens, hit->chain, PULSAR_KVCHAIN_MAX, &hit->bytes, err, sizeof(err));
@@ -1146,9 +1171,11 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
 }
 
 void server::kv_restore_end(kv_restore *r) {
-    if (!r->pinned) return;
-    pulsar_kvchain_pin(kv.st, r->hit->chain, r->hit->n, false);
-    r->pinned = false;
+    if (r->pinned) {
+        pulsar_kvchain_pin(kv.st, r->hit->chain, r->hit->n, false);
+        r->pinned = false;
+    }
+    kv_cache_publish_store();   /* L276: a failed restore may have dropped what it invalidated */
 }
 
 /// @brief L347 I3b: the segment a restore's next slice starts at -- the next to check, while it checks.
