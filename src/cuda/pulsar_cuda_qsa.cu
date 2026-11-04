@@ -55,7 +55,6 @@ constexpr uint64_t QSA_SCORE_BUDGET = 64ull << 20;   /* bytes of scores per sele
 /// Block keys per score CTA (= its threads).
 constexpr uint32_t QSA_SCORE_BLK   = 128u;   /* blocks per score CTA */
 /// Shared-memory pitch of one staged block key, in u32 (bf16 pairs), padded by 4 words against bank conflicts.
-constexpr uint32_t QSA_BKS         = PULSAR_QSA_IDX_DIM / 2u + 4u;  /* bkey smem pitch (u32 of bf16x2) */
 
 static_assert(QSA_GQA == 12u, "GQA ratio");
 static_assert(PULSAR_QSA_KV_TOKEN_BYTES ==
@@ -350,13 +349,13 @@ __global__ void __launch_bounds__(1024) qsa_prep_kernel(
 constexpr uint32_t QSA_SCORE_ROWS = 4u;
 
 /** @param qs the row's indexer q, f32 [PULSAR_QSA_IDX_HEADS][PULSAR_QSA_IDX_DIM] (shared)
- *  @param kr one block key, bf16 pairs (shared)
+ *  @param kr one block key, bf16 pairs, in the thread's registers (L345: no smem stage)
  *  @return sum over heads in order of relu(q_h . k), each dot a sequential fmaf chain */
-__device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t *kr) {
+__device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t (&kr)[PULSAR_QSA_IDX_DIM / 2u]) {
     float acc[PULSAR_QSA_IDX_HEADS] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll
     for (uint32_t d2 = 0; d2 < PULSAR_QSA_IDX_DIM / 2u; d2 += 4u) {
-        const uint4 kk = *reinterpret_cast<const uint4 *>(&kr[d2]);
-        const uint32_t words[4] = {kk.x, kk.y, kk.z, kk.w};
+        const uint32_t words[4] = {kr[d2], kr[d2 + 1u], kr[d2 + 2u], kr[d2 + 3u]};
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             const float2 kf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&words[e]));
@@ -377,7 +376,9 @@ __device__ __forceinline__ float qsa_block_score(const float *qs, const uint32_t
 /* groups[i] = (first listed row of the pass << 8) | rows; scores are indexed by
  * the row's place in the pass. */
 /** Grid = (ceil(nb_max / QSA_SCORE_BLK), groups), block = QSA_SCORE_BLK (one thread per block key); static smem
- *  the group's q rows plus QSA_SCORE_BLK staged keys.
+ *  the group's q rows.  L345: each thread loads its block key straight into registers (16 x 16 B; the warp's
+ *  consecutive loads share sectors) instead of a staged 32 KB tile -- the tile held a CTA to ~2 an SM and the
+ *  kernel to ~60 % of DRAM at 1M.  Same key, same fmaf chain, same order: the scores' bytes are unchanged.
  *  @param rows   the call's row descriptors
  *  @param list   the pass's selecting rows (indices into rows)
  *  @param groups per group: (first listed index << 8) | row count
@@ -388,7 +389,6 @@ __global__ void __launch_bounds__(QSA_SCORE_BLK) qsa_score_kernel(
         const qsa_row *rows, const uint32_t *list, const uint32_t *groups, const float *iq, float *scores,
         uint32_t nb_max) {
     __shared__ float qs[QSA_SCORE_ROWS * PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM];
-    __shared__ uint32_t ks[QSA_SCORE_BLK * QSA_BKS];
     const uint32_t first = groups[blockIdx.y] >> 8, cnt = groups[blockIdx.y] & 0xffu;
     constexpr uint32_t QW = PULSAR_QSA_IDX_HEADS * PULSAR_QSA_IDX_DIM;
     uint32_t nb_hi = 0;
@@ -396,22 +396,20 @@ __global__ void __launch_bounds__(QSA_SCORE_BLK) qsa_score_kernel(
     for (uint32_t i = threadIdx.x; i < cnt * QW; i += blockDim.x) {
         qs[i] = iq[(uint64_t)list[first + i / QW] * QW + i % QW];
     }
-    const uint32_t b0 = blockIdx.x * QSA_SCORE_BLK;
-    /* coalesced: 16 B per thread per step, 16 steps per block key */
-    const uint4 *src = reinterpret_cast<const uint4 *>(rows[list[first]].bkey);
-    for (uint32_t i = threadIdx.x; i < QSA_SCORE_BLK * 16u; i += blockDim.x) {
-        const uint32_t bb = i >> 4, part = i & 15u;
-        uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if (b0 + bb < nb_hi) v = src[(uint64_t)(b0 + bb) * 16u + part];
-        *reinterpret_cast<uint4 *>(&ks[bb * QSA_BKS + part * 4u]) = v;
-    }
     __syncthreads();
-    const uint32_t b = b0 + threadIdx.x;
+    const uint32_t b = blockIdx.x * QSA_SCORE_BLK + threadIdx.x;
     if (b >= nb_max) return;
+    /* the thread's block key, 256 B, in registers (zero past the group's widest nb: never scored) */
+    uint32_t kr[PULSAR_QSA_IDX_DIM / 2u];
+    const uint4 *src = reinterpret_cast<const uint4 *>(rows[list[first]].bkey) + (uint64_t)b * 16u;
+    #pragma unroll
+    for (uint32_t part = 0; part < 16u; part++) {
+        const uint4 v = b < nb_hi ? __ldcs(src + part) : make_uint4(0u, 0u, 0u, 0u);
+        kr[part * 4u] = v.x; kr[part * 4u + 1u] = v.y; kr[part * 4u + 2u] = v.z; kr[part * 4u + 3u] = v.w;
+    }
     for (uint32_t i = 0; i < cnt; i++) {
         const uint32_t nb = rows[list[first + i]].nb;
-        scores[(uint64_t)(first + i) * nb_max + b] =
-                b < nb ? qsa_block_score(&qs[i * QW], &ks[threadIdx.x * QSA_BKS]) : -INFINITY;
+        scores[(uint64_t)(first + i) * nb_max + b] = b < nb ? qsa_block_score(&qs[i * QW], kr) : -INFINITY;
     }
 }
 
