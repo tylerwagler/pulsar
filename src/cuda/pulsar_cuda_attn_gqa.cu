@@ -163,6 +163,48 @@ __device__ __forceinline__ uint32_t gqa_bf2h(uint32_t w) {
 }
 #endif
 
+/// The MMA's operand form of a packed bf16x2 word (L349): itself on sm_80, its exact fp16 widening (gqa_bf2h) on
+/// sm_75 -- so a kernel widens a fragment ONCE where it is loaded and every MMA that reuses it (a K fragment across
+/// a verify's rows, a V fragment across rows and the P hi / lo pair) takes it as is.  Same values, same MMAs: the
+/// bytes of a kernel that widens once are the bytes of one that widens at every MMA.
+/// @param w a packed bf16x2 word.
+/// @return the word in the MMA's operand form.
+__device__ __forceinline__ uint32_t gqa_op(uint32_t w) {
+#if PULSAR_SM80
+    return w;
+#else
+    return gqa_bf2h(w);
+#endif
+}
+/// gqa_op on the four words of a 16-byte load (a K / V row's 8 elements as staged to smem).
+/// @param v four packed bf16x2 words.
+/// @return the same in the MMA's operand form.
+__device__ __forceinline__ uint4 gqa_op4(uint4 v) { return make_uint4(gqa_op(v.x), gqa_op(v.y), gqa_op(v.z), gqa_op(v.w)); }
+/// One m16n8k16 MMA with f32 accumulate, d += A B, over operands already in gqa_op form (on sm_75 two fp16 m16n8k8
+/// MMAs, k 0..7 then k 8..15).
+/// @param d the accumulator fragment, updated in place.
+/// @param a0 A fragment register 0 (gqa_op form).
+/// @param a1 A fragment register 1.
+/// @param a2 A fragment register 2.
+/// @param a3 A fragment register 3.
+/// @param b0 B fragment register 0 (gqa_op form).
+/// @param b1 B fragment register 1.
+__device__ __forceinline__ void gqa_mma_op(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                           uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    /* sm_75 (L321): Turing has no bf16 MMA and no k16 shape.  The same products as fp16 operands on two m16n8k8 MMAs:
+     * the k16 fragment's registers split along k exactly so (A a0 a1 / B b0 hold k 0..7, a2 a3 / b1 hold k 8..15),
+     * the split exllamav3's sm_75 port uses -- pulsar_mma_f16_16816_k8, the one definition (pulsar_cuda_arch.cuh).
+     * f32 accumulate as on sm_80. */
+    const uint32_t A[4] = {a0, a1, a2, a3};
+    pulsar_mma_f16_16816_k8(d, A, b0, b1);
+#endif
+}
 /// One m16n8k16 bf16 MMA with f32 accumulate, d += A B (on sm_75 two fp16 m16n8k8 MMAs, exact widening).
 /// @param d the accumulator fragment, updated in place.
 /// @param a0 A fragment register 0.
@@ -173,19 +215,7 @@ __device__ __forceinline__ uint32_t gqa_bf2h(uint32_t w) {
 /// @param b1 B fragment register 1.
 __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                         uint32_t b0, uint32_t b1) {
-#if PULSAR_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#else
-    /* sm_75 (L321): Turing has no bf16 MMA and no k16 shape.  The same products as fp16 operands (gqa_bf2h, exact)
-     * on two m16n8k8 MMAs, k 0..7 then k 8..15: the k16 fragment's registers split along k exactly so (A a0 a1 / B b0
-     * hold k 0..7, a2 a3 / b1 hold k 8..15), the split exllamav3's sm_75 port uses -- pulsar_mma_f16_16816_k8, the one
-     * definition (pulsar_cuda_arch.cuh).  f32 accumulate as on sm_80. */
-    const uint32_t A[4] = {gqa_bf2h(a0), gqa_bf2h(a1), gqa_bf2h(a2), gqa_bf2h(a3)};
-    pulsar_mma_f16_16816_k8(d, A, gqa_bf2h(b0), gqa_bf2h(b1));
-#endif
+    gqa_mma_op(d, gqa_op(a0), gqa_op(a1), gqa_op(a2), gqa_op(a3), gqa_op(b0), gqa_op(b1));
 }
 /// ldmatrix .x4 of four 8x8 b16 tiles from shared memory.
 /// @param r the four fragment registers.
@@ -474,8 +504,8 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
         const __nv_bfloat16 *qp = a.q + ((uint64_t)mrow[hh] * a.n_q + mhead[hh]) * HD;
         #pragma unroll
         for (int kk = 0; kk < KS; kk++) {
-            qa[kk][hh]     = mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u;
-            qa[kk][2 + hh] = mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u;
+            qa[kk][hh]     = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u);
+            qa[kk][2 + hh] = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u);
         }
     }
     const bool warp_live = 16u * w < mrows;
@@ -521,7 +551,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 #pragma unroll
                 for (uint32_t it = 0; it < LPT; it++) {
                     const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8;
-                    *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = ld[it];
+                    *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_op4(ld[it]);   /* operand form (gqa_op) */
                 }
             }
             __syncthreads();
@@ -570,8 +600,8 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 for (int nt = 0; nt < 8; nt += 2) {
                     uint32_t kb[4];
                     gqa_ldsm4(kb, &ks[(8u * nt + (lane & 7u) + ((lane >> 4) << 3)) * P + kk * 16 + ((lane >> 3) & 1u) * 8u]);
-                    gqa_mma(sc[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[0], kb[1]);
-                    gqa_mma(sc[nt + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[2], kb[3]);
+                    gqa_mma_op(sc[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[0], kb[1]);
+                    gqa_mma_op(sc[nt + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[2], kb[3]);
                 }
             }
             /* scores in the base-2 domain: ((q . k) * scale + bias) * log2(e); masked keys -inf */
@@ -629,13 +659,15 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 gqa_split2(sc[2 * kq + 1][0], sc[2 * kq + 1][1], ah[2], al[2]);
                 gqa_split2(sc[2 * kq + 1][2], sc[2 * kq + 1][3], ah[3], al[3]);
                 #pragma unroll
+                for (int j = 0; j < 4; j++) { ah[j] = gqa_op(ah[j]); al[j] = gqa_op(al[j]); }   /* once for every np */
+                #pragma unroll
                 for (int np = 0; np < ND / 2; np++) {
                     uint32_t vb[4];
                     gqa_ldsm4t(vb, &vs[(16u * kq + (lane & 7u) + ((lane >> 3) & 1u) * 8u) * P + 16 * np + (lane >> 4) * 8u]);
-                    gqa_mma(A[2 * np], ah[0], ah[1], ah[2], ah[3], vb[0], vb[1]);
-                    gqa_mma(A[2 * np], al[0], al[1], al[2], al[3], vb[0], vb[1]);
-                    gqa_mma(A[2 * np + 1], ah[0], ah[1], ah[2], ah[3], vb[2], vb[3]);
-                    gqa_mma(A[2 * np + 1], al[0], al[1], al[2], al[3], vb[2], vb[3]);
+                    gqa_mma_op(A[2 * np], ah[0], ah[1], ah[2], ah[3], vb[0], vb[1]);
+                    gqa_mma_op(A[2 * np], al[0], al[1], al[2], al[3], vb[0], vb[1]);
+                    gqa_mma_op(A[2 * np + 1], ah[0], ah[1], ah[2], ah[3], vb[2], vb[3]);
+                    gqa_mma_op(A[2 * np + 1], al[0], al[1], al[2], al[3], vb[2], vb[3]);
                 }
             }
         }
@@ -775,7 +807,7 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
         #pragma unroll
         for (uint32_t it = 0; it < LPT; it++) {
             const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8;
-            *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = ld[it];
+            *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_op4(ld[it]);   /* operand form (gqa_op) */
         }
     };
 
@@ -805,8 +837,8 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
                     const __nv_bfloat16 *qp = a.q + ((uint64_t)mrow[hh] * a.n_q + mhead[hh]) * HD + p * D;
                     #pragma unroll
                     for (int kk = 0; kk < KS; kk++) {
-                        qa[kk][hh]     = mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u;
-                        qa[kk][2 + hh] = mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u;
+                        qa[kk][hh]     = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u);
+                        qa[kk][2 + hh] = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u);
                     }
                 }
                 #pragma unroll
@@ -815,8 +847,8 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
                     for (int nt = 0; nt < 8; nt += 2) {
                         uint32_t kb[4];
                         gqa_ldsm4(kb, &ks[(8u * nt + (lane & 7u) + ((lane >> 4) << 3)) * P + kk * 16 + ((lane >> 3) & 1u) * 8u]);
-                        gqa_mma(sc[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[0], kb[1]);
-                        gqa_mma(sc[nt + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[2], kb[3]);
+                        gqa_mma_op(sc[nt], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[0], kb[1]);
+                        gqa_mma_op(sc[nt + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], kb[2], kb[3]);
                     }
                 }
             }
@@ -876,13 +908,15 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
                 gqa_split2(sc[2 * kq + 1][0], sc[2 * kq + 1][1], ah[2], al[2]);
                 gqa_split2(sc[2 * kq + 1][2], sc[2 * kq + 1][3], ah[3], al[3]);
                 #pragma unroll
+                for (int j = 0; j < 4; j++) { ah[j] = gqa_op(ah[j]); al[j] = gqa_op(al[j]); }   /* once for every np */
+                #pragma unroll
                 for (int np = 0; np < ND / 2; np++) {
                     uint32_t vb[4];
                     gqa_ldsm4t(vb, &vs[(16u * kq + (lane & 7u) + ((lane >> 3) & 1u) * 8u) * P + 16 * np + (lane >> 4) * 8u]);
-                    gqa_mma(A[2 * np], ah[0], ah[1], ah[2], ah[3], vb[0], vb[1]);
-                    gqa_mma(A[2 * np], al[0], al[1], al[2], al[3], vb[0], vb[1]);
-                    gqa_mma(A[2 * np + 1], ah[0], ah[1], ah[2], ah[3], vb[2], vb[3]);
-                    gqa_mma(A[2 * np + 1], al[0], al[1], al[2], al[3], vb[2], vb[3]);
+                    gqa_mma_op(A[2 * np], ah[0], ah[1], ah[2], ah[3], vb[0], vb[1]);
+                    gqa_mma_op(A[2 * np], al[0], al[1], al[2], al[3], vb[0], vb[1]);
+                    gqa_mma_op(A[2 * np + 1], ah[0], ah[1], ah[2], ah[3], vb[2], vb[3]);
+                    gqa_mma_op(A[2 * np + 1], al[0], al[1], al[2], al[3], vb[2], vb[3]);
                 }
             }
         }
@@ -1255,8 +1289,8 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
                 const uint4 *qp = reinterpret_cast<const uint4 *>(
                     a.q + ((uint64_t)(r0 + (act[r] ? (uint32_t)r : 0u)) * a.n_q + h0 + gq) * HD + 64 * q + 16 * (int)t);
                 const uint4 qa = qp[0], qb = qp[1];
-                qw[r][0] = qa.x; qw[r][1] = qa.y; qw[r][2] = qa.z; qw[r][3] = qa.w;
-                qw[r][4] = qb.x; qw[r][5] = qb.y; qw[r][6] = qb.z; qw[r][7] = qb.w;
+                qw[r][0] = gqa_op(qa.x); qw[r][1] = gqa_op(qa.y); qw[r][2] = gqa_op(qa.z); qw[r][3] = gqa_op(qa.w);
+                qw[r][4] = gqa_op(qb.x); qw[r][5] = gqa_op(qb.y); qw[r][6] = gqa_op(qb.z); qw[r][7] = gqa_op(qb.w);
             }
 #pragma unroll
             for (int m = 0; m < MT; m++) {
@@ -1273,14 +1307,17 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
                     b0 = p[0];
                     b1 = p[1];
                 }
-                const uint32_t k0[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-                const uint32_t k1[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+                /* widened once for every row's MMAs (gqa_op) */
+                const uint32_t k0[8] = {gqa_op(a0.x), gqa_op(a0.y), gqa_op(a0.z), gqa_op(a0.w),
+                                        gqa_op(a1.x), gqa_op(a1.y), gqa_op(a1.z), gqa_op(a1.w)};
+                const uint32_t k1[8] = {gqa_op(b0.x), gqa_op(b0.y), gqa_op(b0.z), gqa_op(b0.w),
+                                        gqa_op(b1.x), gqa_op(b1.y), gqa_op(b1.z), gqa_op(b1.w)};
 #pragma unroll
                 for (int r = 0; r < RB; r++) {
                     if (!act[r]) continue;
 #pragma unroll
                     for (int jj = 0; jj < 4; jj++)
-                        gqa_mma(S[m][r], k0[2 * jj], k1[2 * jj], k0[2 * jj + 1], k1[2 * jj + 1], qw[r][2 * jj],
+                        gqa_mma_op(S[m][r], k0[2 * jj], k1[2 * jj], k0[2 * jj + 1], k1[2 * jj + 1], qw[r][2 * jj],
                                 qw[r][2 * jj + 1]);
                 }
             }
@@ -1383,7 +1420,9 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
 #pragma unroll
             for (int j = 0; j < VL; j++) {
                 const uint32_t i = tid + (uint32_t)j * GQA_DMMA_THREADS;
-                reinterpret_cast<uint4 *>(&sv[i / (uint32_t)(HD / 8)][0])[i % (uint32_t)(HD / 8)] = vr[j];
+                const uint4 v = vr[j];   /* the V tile goes to smem widened (gqa_op): its fragments serve every row */
+                reinterpret_cast<uint4 *>(&sv[i / (uint32_t)(HD / 8)][0])[i % (uint32_t)(HD / 8)] =
+                    make_uint4(gqa_op(v.x), gqa_op(v.y), gqa_op(v.z), gqa_op(v.w));
             }
             __syncthreads();
             if (kt + 1 < KEYS / VT) v_load(kt + 1);
@@ -1393,6 +1432,7 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
             for (int r = 0; r < RB; r++) {
                 gqa_split2(sp[r * NV + gq][kk + 2u * t], sp[r * NV + gq][kk + 2u * t + 1u], hi0[r], lo0[r]);
                 gqa_split2(sp[r * NV + gq][kk + 8u + 2u * t], sp[r * NV + gq][kk + 8u + 2u * t + 1u], hi1[r], lo1[r]);
+                hi0[r] = gqa_op(hi0[r]); lo0[r] = gqa_op(lo0[r]); hi1[r] = gqa_op(hi1[r]); lo1[r] = gqa_op(lo1[r]);
             }
 #pragma unroll
             for (int d = 0; d < DT; d++) {
@@ -1401,8 +1441,8 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
 #pragma unroll
                 for (int r = 0; r < RB; r++) {
                     if (!act[r]) continue;
-                    gqa_mma(acc[d][r], rr[0], rr[1], rr[2], rr[3], hi0[r], hi1[r]);
-                    gqa_mma(acc[d][r], rr[0], rr[1], rr[2], rr[3], lo0[r], lo1[r]);
+                    gqa_mma_op(acc[d][r], rr[0], rr[1], rr[2], rr[3], hi0[r], hi1[r]);
+                    gqa_mma_op(acc[d][r], rr[0], rr[1], rr[2], rr[3], lo0[r], lo1[r]);
                 }
             }
         }
