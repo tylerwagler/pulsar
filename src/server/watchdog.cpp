@@ -94,34 +94,6 @@ void thread_wchan(int tid, char *out, size_t outlen) {
     out[n] = '\0';
 }
 
-/** What meminfo_kib found (L335: a missing key and an unreadable file are told apart). */
-enum meminfo_read {
-    MEMINFO_FOUND,       ///< the field was read
-    MEMINFO_MISSING,     ///< the file has no such field
-    MEMINFO_UNREADABLE,  ///< the file would not open
-};
-
-/** @param path the meminfo file ("/proc/meminfo"; a test passes its own)
- *  @param key a field with its colon ("SwapTotal:")
- *  @param kib receives the field's value in KiB (0 unless found)
- *  @return MEMINFO_FOUND, MEMINFO_MISSING (the file has no such field) or MEMINFO_UNREADABLE (it would not open) */
-meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib) {
-    *kib = 0;
-    FILE *fp = fopen(path, "r");
-    if (!fp) return MEMINFO_UNREADABLE;
-    char line[256];
-    unsigned long long v = 0;
-    const size_t kl = strlen(key);
-    meminfo_read r = MEMINFO_MISSING;
-    while (fgets(line, sizeof line, fp))
-        if (!strncmp(line, key, kl) && sscanf(line + kl, " %llu", &v) == 1) {
-            r = MEMINFO_FOUND;
-            *kib = v;
-            break;
-        }
-    fclose(fp);
-    return r;
-}
 
 /** The names of server::m_slot_phase's values (gen_phase + 1; 0 = no bound job), for the stall dump. */
 const char *const k_phase_names[] = {"idle", "restore", "prefill-cold", "prefill", "decode-init", "decode", "finish",
@@ -176,6 +148,25 @@ void *watchdog_main(void *arg) {
 }
 
 }  // namespace
+
+/* meminfo_kib: declared in pulsar_server_internal.h (also kv_host_mem_total_from's MemTotal) */
+meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib) {
+    *kib = 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return MEMINFO_UNREADABLE;
+    char line[256];
+    unsigned long long v = 0;
+    const size_t kl = strlen(key);
+    meminfo_read r = MEMINFO_MISSING;
+    while (fgets(line, sizeof line, fp))
+        if (!strncmp(line, key, kl) && sscanf(line + kl, " %llu", &v) == 1) {
+            r = MEMINFO_FOUND;
+            *kib = v;
+            break;
+        }
+    fclose(fp);
+    return r;
+}
 
 bool server::watchdog_start() {
     if (stall_limit_s <= 0) {

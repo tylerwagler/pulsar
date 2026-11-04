@@ -1121,8 +1121,7 @@ int main(int argc, char **argv) {
      * out of the guard's headroom and MemAvailable fell 1.02 GiB, below the floor. */
     kv_ram_plan ram = {0, false};
     {
-        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
-        const uint64_t mem_total = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
+        const uint64_t mem_total = kv_host_mem_total();   /* a container's limit, not the host's RAM (L338, CT 130) */
         kv_ram_plan_for(pulsar_gpu_integrated(), mem_total, cfg.kv_ram_mb, &ram.bytes, &ram.retain);
     }
     const uint64_t kv_pool_charge = cfg.kv_disk_dir && cfg.kv_disk_dir[0] ? ram.bytes : 0u;   /* the host pool the cache opens with */

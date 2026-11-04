@@ -1585,6 +1585,33 @@ typedef struct {
  *  @param bytes      receives the pool's size
  *  @param retain     receives whether the RAM tier is on */
 void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain);
+/** What meminfo_kib found (L335: a missing key and an unreadable file are told apart). */
+enum meminfo_read {
+    MEMINFO_FOUND,       ///< the field was read
+    MEMINFO_MISSING,     ///< the file has no such field
+    MEMINFO_UNREADABLE,  ///< the file would not open
+};
+/** One field of a meminfo-format file (watchdog.cpp; the stall dump's swap line and kv_host_mem_total_from's MemTotal).
+ *  @param path the meminfo file ("/proc/meminfo"; a test passes its own)
+ *  @param key a field with its colon ("SwapTotal:")
+ *  @param kib receives the field's value in KiB (0 unless found)
+ *  @return MEMINFO_FOUND, MEMINFO_MISSING (the file has no such field) or MEMINFO_UNREADABLE (it would not open) */
+meminfo_read meminfo_kib(const char *path, const char *key, uint64_t *kib);
+/** L338 (CT 130, 2026-11-03): a cgroup v2 memory.max value in bytes -- 0 for "max" (no limit) or anything unreadable.
+ *  @param text the file's contents  @return the limit in bytes, 0 for none */
+uint64_t kv_cgroup_limit_parse(const char *text);
+/** L338: the memory this process may use, for kv_ram_plan_for's default: the least of the physical pages, `meminfo`'s
+ *  MemTotal (LXCFS shows a container its own -- CT 130's 32 GiB where sysconf says the host's 125 GiB, so the default
+ *  pinned 16 GiB of a 32 GiB container) and every memory.max on the process's cgroup v2 path from `self_cgroup` up to
+ *  `cgroup_root` (systemd MemoryMax, a container runtime's limit).  A source that cannot be read is skipped.
+ *  @param phys        the physical bytes (sysconf), 0 = unknown
+ *  @param meminfo     a /proc/meminfo-format file, or NULL
+ *  @param cgroup_root the cgroup v2 mount (/sys/fs/cgroup), or NULL
+ *  @param self_cgroup a /proc/self/cgroup-format file, or NULL
+ *  @return the least of them in bytes (0 when none is known) */
+uint64_t kv_host_mem_total_from(uint64_t phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup);
+/** L338: kv_host_mem_total_from over this host's /proc and /sys.  @return bytes */
+uint64_t kv_host_mem_total(void);
 
 /** L264 S4: the disk KV cache -- the segment store (lib/pulsar_segstore.h). */
 typedef struct {

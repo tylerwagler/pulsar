@@ -8580,6 +8580,44 @@ static void test_l347_i3a_ram_tier(void) {
 /* (4) the RAM tier is decided once, by the host: on a unified-memory host (GB10) it is OFF -- the pool is only the
  * copy-out ring, whatever --kv-ram-mb says -- and on a discrete-GPU host it is on, a quarter of RAM capped at 16 GiB
  * unless --kv-ram-mb sizes it */
+/* L338 (CT 130, 2026-11-03): the default sizes from the memory this process may use -- LXCFS's MemTotal, the cgroup
+ * v2 limits up its path -- not sysconf's host RAM (it pinned 16 GiB of a 32 GiB container) */
+static void test_l338_host_mem_total(void) {
+    TEST_ASSERT(kv_cgroup_limit_parse("max\n") == 0u);
+    TEST_ASSERT(kv_cgroup_limit_parse("") == 0u && kv_cgroup_limit_parse(NULL) == 0u);
+    TEST_ASSERT(kv_cgroup_limit_parse("34359738368\n") == 34359738368ull);
+    TEST_ASSERT(kv_cgroup_limit_parse(" 1024") == 1024u);
+    char tmpl[] = "/tmp/pulsar-memtotal.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    const std::string d(dir);
+    auto put = [](const std::string &p, const char *text) { FILE *f = fopen(p.c_str(), "w"); if (f) { fputs(text, f); fclose(f); } };
+    const uint64_t GiB = 1ull << 30, host = 125ull * GiB;
+    put(d + "/meminfo", "MemTotal:       33554432 kB\nMemFree:  1 kB\n");   /* LXCFS: the CT's 32 GiB */
+    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/meminfo").c_str(), NULL, NULL) == 32ull * GiB);
+    /* a cgroup path whose parent caps it at 20 GiB, itself unlimited */
+    mkdir((d + "/cg").c_str(), 0700);
+    mkdir((d + "/cg/lxc").c_str(), 0700);
+    mkdir((d + "/cg/lxc/130").c_str(), 0700);
+    put(d + "/cg/lxc/130/memory.max", "max\n");
+    put(d + "/cg/lxc/memory.max", "21474836480\n");
+    put(d + "/self", "0::/lxc/130\n");
+    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/meminfo").c_str(), (d + "/cg").c_str(), (d + "/self").c_str()) ==
+                20ull * GiB);
+    /* nothing readable: the physical pages; physical unknown and a limit: the limit */
+    TEST_ASSERT(kv_host_mem_total_from(host, (d + "/none").c_str(), (d + "/none").c_str(), (d + "/none").c_str()) == host);
+    TEST_ASSERT(kv_host_mem_total_from(0, NULL, (d + "/cg").c_str(), (d + "/self").c_str()) == 20ull * GiB);
+    /* the default plan over CT 130's shape: 25 % of 32 GiB, not the 16 GiB cap of the host's 125 */
+    uint64_t bytes = 0;
+    bool retain = false;
+    kv_ram_plan_for(0, kv_host_mem_total_from(host, (d + "/meminfo").c_str(), NULL, NULL), -1, &bytes, &retain);
+    TEST_ASSERT(retain && bytes == 8ull * GiB);
+    char cmd[4300];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_l347_i3a_ram_plan(void) {
     uint64_t bytes = 0;
     bool retain = true;
@@ -14716,6 +14754,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l347_i3a_pool();
     test_l347_i3a_ram_tier();
     test_l347_i3a_ram_plan();
+    test_l338_host_mem_total();
     test_l347_i3a_odirect_roundtrip();
     test_l347_i3a_no_room();
     test_l347_i3a_copy_out();

@@ -457,6 +457,54 @@ void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted
     *uncommitted = (int)kc->writer->done.size();
 }
 
+uint64_t kv_cgroup_limit_parse(const char *text) {
+    if (!text) return 0u;
+    while (*text == ' ' || *text == '\t') text++;
+    if (*text < '0' || *text > '9') return 0u;   /* "max", empty, unreadable: no limit */
+    char *end = NULL;
+    const unsigned long long v = strtoull(text, &end, 10);
+    return end && end != text ? (uint64_t)v : 0u;
+}
+
+uint64_t kv_host_mem_total_from(uint64_t phys, const char *meminfo, const char *cgroup_root, const char *self_cgroup) {
+    uint64_t best = phys;
+    auto take = [&best](uint64_t v) { if (v && (!best || v < best)) best = v; };
+    uint64_t kib = 0;
+    if (meminfo && meminfo_kib(meminfo, "MemTotal:", &kib) == MEMINFO_FOUND) take(kib << 10);   /* LXCFS: the CT's */
+    /* cgroup v2: the process's path ("0::/a/b") and every memory.max from it up to the root (systemd MemoryMax, a
+     * container runtime's limit) */
+    char line[4096] = "";
+    FILE *fp = self_cgroup ? fopen(self_cgroup, "r") : NULL;
+    if (fp) {
+        while (fgets(line, sizeof line, fp))
+            if (strncmp(line, "0::", 3) == 0) break;
+            else line[0] = '\0';
+        fclose(fp);
+    }
+    if (cgroup_root && strncmp(line, "0::", 3) == 0) {
+        std::string path(line + 3);
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+        for (;;) {
+            char buf[64] = "";
+            FILE *m = fopen((std::string(cgroup_root) + path + (path == "/" ? "" : "/") + "memory.max").c_str(), "r");
+            if (m) {
+                if (fgets(buf, sizeof buf, m)) take(kv_cgroup_limit_parse(buf));
+                fclose(m);
+            }
+            if (path.empty() || path == "/") break;
+            const size_t slash = path.find_last_of('/');
+            path = slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash);
+        }
+    }
+    return best;
+}
+
+uint64_t kv_host_mem_total(void) {
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    const uint64_t phys = pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0u;
+    return kv_host_mem_total_from(phys, "/proc/meminfo", "/sys/fs/cgroup", "/proc/self/cgroup");
+}
+
 void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_t *bytes, bool *retain) {
     /* D9: the RAM tier exists only where host RAM is not the GPU's -- on a unified host an L2 copy would duplicate KV
      * in the pool the banks need; there the pool is only the copy-out ring */
