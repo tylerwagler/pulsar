@@ -228,11 +228,12 @@ int main(int argc, char **argv) {
           "a Mamba-2 layer; kv POOL %llu B a token an attention layer%s", (unsigned long long)ssm.bytes,
           (unsigned long long)ssm.capture_bytes, (unsigned long long)conv.bytes, (unsigned long long)kv.bytes,
           s->mtp_written ? "; the drafter's slot: kv POOL + mtp_pend FIXED (the parked row), the lane's hooks" : "");
+    /* L331 (dev 309ed8fd): Nemotron 3.5 Super VL takes images -- PULSAR_FAMILY_CAP_VISION; still no TP */
     const uint32_t want = PULSAR_FAMILY_CAP_CHAT | PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_SEGMENTS |
-                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC;
+                          PULSAR_FAMILY_CAP_PAYLOAD | PULSAR_FAMILY_CAP_SPEC | PULSAR_FAMILY_CAP_VISION;
     check(e->family->caps == want && e->family->spec == &PULSAR_DRIVER_SPEC_TARGET &&
               e->family->driver->mtp && e->family->driver->absorb == pulsar_drafter_lane_absorb,
-          "caps 0x%x (chat, banks, segments, payload, spec: the driver's verify target; no TP / images yet); the "
+          "caps 0x%x (chat, banks, segments, payload, spec: the driver's verify target; vision (L331); no TP yet); the "
           "driver declares its MTP module, its lockstep the drafter lane's (MTP or block, L298)", e->family->caps);
     pulsar_engine_close(e);
     fprintf(stderr, "NEMOTRON-FAMILY PROBE %s\n", n_fail ? "FAIL" : "PASS");
