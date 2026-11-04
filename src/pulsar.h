@@ -903,20 +903,35 @@ typedef struct {
     int assistant[2];  ///< the assistant-turn marker, n_assistant tokens
     /** Tokens in `assistant` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_assistant;
+    /** L351: the tokens that follow a user marker when that turn is a TOOL RESULT (Qwen's and Nemotron's templates
+     *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"), n_tool of them -- so the anchors
+     *  can tell the client's own turns from an agent loop's tool results. */
+    int tool[3];
+    /** Tokens in `tool` (0: the template has no such turn, or the tokenizer does not spell it). */
+    int n_tool;
 } pulsar_turn_markers;
 /** Fill `out` with the loaded tokenizer's turn markers (pulsar_turn_markers above).
  *  @param e the engine
  *  @param out receives the markers; zeroed when they are not spelled
  *  @return true when both markers are spelled; false when the family has no tokenizer (said once) */
 bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out);
-/** The role whose marker begins at v[i] of v[0..n): 1 = user, 2 = assistant, 0 = none.  A marker
- * whose tokens run past n does not match.  Pure host code. */
+/** The role whose marker begins at v[i] of v[0..n): 1 = user, 2 = assistant, 3 = a tool result (L351: a user marker
+ * followed by the n_tool `tool` tokens), 0 = none.  A marker whose tokens run past n does not match (a user marker whose
+ * tool tokens run past n is a user turn).  Pure host code. */
 /** @param m the markers (NULL: 0)
  *  @param v the tokens
  *  @param n their count
  *  @param i the index to test
- *  @return 1, 2 or 0 */
+ *  @return 1, 2, 3 or 0 */
 int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i);
+/** L311 / L351: a prompt's MESSAGE ENDPOINT -- the first assistant marker after its last user turn (a tool result,
+ * role 3, is not one), else its last marker.  An agent loop's requests within one turn all name the same endpoint,
+ * the point its next user turn branches from when the template re-renders that turn.  Pure host code.
+ *  @param m the markers (NULL: -1)
+ *  @param v the tokens
+ *  @param n their count
+ *  @return the endpoint's position, or -1 when no marker sits past position 0 */
+int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n);
 /** The ONE token that closes a reasoning block -- "</think>" as the loaded tokenizer spells it
  * (DeepSeek's special, Qwen's added token); -1 when it has none.  A front end that forces the
  * close feeds this id, never the text re-tokenized (L272 B11: BPE pieces on Qwen). */

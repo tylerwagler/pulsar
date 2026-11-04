@@ -285,6 +285,18 @@ typedef struct pulsar_family_tokenizer {
     int (*n_tokens)(pulsar_engine *e);
 } pulsar_family_tokenizer;
 
+/** L351: fill `m`'s tool-result suffix (pulsar_turn_markers::tool) for a template that renders a tool message as a
+ *  user turn: `opener` is that turn's rendered opening (e.g. "<|im_start|>user\n<tool_response>"), `tool_token` the
+ *  added token it ends in; the suffix is the opener's tokens after the user marker.  A family's turn_markers calls it
+ *  once its user marker is set.  n_tool stays 0 (no tool turns told apart) when the opener does not begin with the
+ *  user marker or the tool token is not one added token.
+ *  @param e          the engine
+ *  @param opener     the tool turn's rendered opening
+ *  @param tool_token the added token it ends in
+ *  @param m          the markers (n_user set); receives tool / n_tool */
+void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const char *tool_token,
+                                  pulsar_turn_markers *m);
+
 /** A family's bank pool (L251; every family's since L284 dd-banks -- DeepSeek's is its graph pool,
  * session_banks.cpp k_ds4_bank_ops): the server's per-bank bookkeeping.  engine_api.cpp's bank entries,
  * the TP worker's bank frames and the round core call these and nothing else, and the operations a

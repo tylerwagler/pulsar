@@ -4852,7 +4852,9 @@ typedef struct {
  *  complete messages before the generation header, the point an agent's side request (the same history plus a
  *  message of its own) and a re-rendered generation header branch from.  Only a split-invariant family's (any cut
  *  is its cold prefill's bytes, so the cut the record needs moves no byte); 0 for another family, a prompt with no
- *  marker past position 0, or one below the store's smallest checkpoint. */
+ *  marker past position 0, or one below the store's smallest checkpoint.  L351: the first assistant marker after the
+ *  last USER turn (a tool result is not one) -- an agent loop's requests in one turn all name it, so the record the
+ *  turn's first request leaves there survives its tool rounds and serves the next user turn. */
 /// @param e the engine (its family's split-invariance and turn markers)
 /// @param store the checkpoint store (its smallest grid point)
 /// @param prompt the prompt

@@ -34,10 +34,8 @@ uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store
     if (!e || !store || !store->ops || !store->ops->split_invariant || !prompt || prompt->len < 2) return 0u;
     pulsar_turn_markers m;
     if (!pulsar_chat_turn_markers(e, &m)) return 0u;
-    for (int i = prompt->len - 1; i > 0; i--)
-        if (pulsar_turn_marker_at(&m, prompt->v, prompt->len, i) != 0)
-            return (uint32_t)i >= store->ops->min_checkpoint(store->state) ? (uint32_t)i : 0u;
-    return 0u;
+    const int E = pulsar_turn_endpoint(&m, prompt->v, prompt->len);   /* L351: the turn's first reply */
+    return E > 0 && (uint32_t)E >= store->ops->min_checkpoint(store->state) ? (uint32_t)E : 0u;
 }
 
 /* L268: the image block a cut at `cut` would split -- [bs, be) with bs < cut < be -- or false.  The FIRST such

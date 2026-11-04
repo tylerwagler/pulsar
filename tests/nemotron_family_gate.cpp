@@ -178,6 +178,10 @@ int main(int argc, char **argv) {
         check(have && m.n_user == 2 && m.n_assistant == 2 && n_user == 1 && n_asst == 1,
               "turn markers: <|im_start|> + the role word's first token (\"user\"; \"ass\" of \"ass\" \"istant\"); one "
               "user and one assistant turn found in a rendered prompt");
+        /* L351: a tool result renders as a user turn opened by <tool_response> (16): the markers tell it apart */
+        check(have && m.n_tool >= 1 && m.tool[m.n_tool - 1] == 16 && m.n_tool <= 3,
+              "tool-result turns: the user marker's suffix ends in <tool_response> (16; %d tokens) -- role 3, not a "
+              "user turn, for the route anchor and the message endpoint", m.n_tool);
         pulsar_tokens_free(&t);
         check(pulsar_token_think_close(e) == 13, "the think close is </think> (13, a non-special added token)");
     }

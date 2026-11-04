@@ -581,6 +581,12 @@ bool server_slot_match_is_trivial(int common, int slot_pos,
  * bank, evicted an idle one and reloaded the chain from disk (301 provisions,
  * 188 evictions in three hours); the next real turn of a conversation whose
  * bank had been evicted came back from disk on another bank.
+ * L351: a TOOL RESULT is not a user turn here (pulsar_turn_marker_at's role 3):
+ * an agent loop renders each as "<|im_start|>user\n<tool_response>", and taking
+ * the last of those put the anchor inside the bank's last turn, past where the
+ * next user turn diverges (Nemotron re-renders that turn's replies without their
+ * reasoning) -- every opencode turn took a fresh bank and left a full copy (work
+ * box 2026-11-04: five ~400k banks, then the L332 hang).
  * -1 when the markers are unknown (server::turn_markers zeroed: the tokenizer
  * does not spell them), when the bank holds no completed exchange (a
  * first-turn bank: two unrelated conversations behind one system prompt share

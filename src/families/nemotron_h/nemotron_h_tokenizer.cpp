@@ -230,6 +230,8 @@ bool turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
         out->assistant[0] = start;
         out->assistant[1] = assistant.v[0];
         out->n_assistant = 2;
+        /* L351: nemotron_chat renders a tool message as a user turn opened by <tool_response> */
+        pulsar_turn_markers_add_tool(e, "<|im_start|>user\n<tool_response>", "<tool_response>", out);
     } else {
         static bool said = false;
         if (!said) {

@@ -1378,12 +1378,63 @@ bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
 int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
     if (!m || !v || i < 0) return 0;
     if (m->n_user > 0 && i + m->n_user <= n && v[i] == m->user[0] &&
-        (m->n_user < 2 || v[i + 1] == m->user[1]))
+        (m->n_user < 2 || v[i + 1] == m->user[1])) {
+        /* L351: a tool result rendered as a user turn */
+        const int t = i + m->n_user;
+        if (m->n_tool > 0 && t + m->n_tool <= n) {
+            int k = 0;
+            while (k < m->n_tool && v[t + k] == m->tool[k]) k++;
+            if (k == m->n_tool) return 3;
+        }
         return 1;
+    }
     if (m->n_assistant > 0 && i + m->n_assistant <= n && v[i] == m->assistant[0] &&
         (m->n_assistant < 2 || v[i + 1] == m->assistant[1]))
         return 2;
     return 0;
+}
+
+int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n) {
+    if (!m || !v || n < 2) return -1;
+    /* where the client's own last turn hands over to the model: the first assistant marker after its last USER turn
+     * (a tool result is not one).  An agent loop's later requests in that turn (tool results, the model again) all
+     * name the same position, so its record is the one the next user turn can resume at: a template that re-renders
+     * the turn's replies once the user speaks again (Nemotron's truncate_history_thinking drops their reasoning)
+     * diverges right after it.  Without a tool result after the last user turn this is the last marker, the
+     * generation header, as before L351. */
+    int last_user = -1;
+    for (int i = n - 1; i > 0 && last_user < 0; i--)
+        if (pulsar_turn_marker_at(m, v, n, i) == 1) last_user = i;
+    int E = -1;
+    if (last_user > 0)
+        for (int i = last_user + 1; i < n && E < 0; i++)
+            if (pulsar_turn_marker_at(m, v, n, i) == 2) E = i;
+    /* no assistant turn after it (a prompt that ends on the user's turn) or no user turn: the last marker */
+    for (int i = n - 1; E < 0 && i > 0; i--)
+        if (pulsar_turn_marker_at(m, v, n, i) != 0) E = i;
+    return E;
+}
+
+void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const char *tool_token,
+                                  pulsar_turn_markers *m) {
+    m->n_tool = 0;
+    const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
+    if (!t || !t->encode_rendered || !opener || !tool_token || m->n_user <= 0) return;
+    pulsar_tokens r = {0}, tok = {0};
+    t->encode_rendered(e, opener, NULL, 0, &r);
+    t->encode_rendered(e, tool_token, NULL, 0, &tok);
+    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE added token, so the render's
+     * own text after it cannot merge into it */
+    const int suffix = r.len - m->n_user;
+    bool ok = tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
+              r.v[r.len - 1] == tok.v[0];
+    for (int k = 0; ok && k < m->n_user; k++) ok = r.v[k] == m->user[k];
+    if (ok) {
+        for (int k = 0; k < suffix; k++) m->tool[k] = r.v[m->n_user + k];
+        m->n_tool = suffix;
+    }
+    pulsar_tokens_free(&r);
+    pulsar_tokens_free(&tok);
 }
 
 int pulsar_token_think_close(pulsar_engine *e) {

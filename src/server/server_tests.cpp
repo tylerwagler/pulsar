@@ -10013,6 +10013,67 @@ static void test_l311_route_header_anchor(void) {
     pulsar_tokens_free(&b);
 }
 
+/* L351: an agent loop's tool results are rendered as user turns ("<|im_start|>user\n<tool_response>"), and the work
+ * box's opencode / Nemotron conversation (2026-11-04) took a fresh bank every user turn: the bank's last-turn anchor
+ * was its last TOOL result, inside the turn that the next prompt re-renders (truncate_history_thinking drops the
+ * replies' reasoning), so the divergence fell below it.  A tool result is role 3 now: the anchor is the client's own
+ * last turn, the endpoint the first reply after it, and the next user turn continues in place. */
+static void test_l351_tool_turns(void) {
+    const int start = 151644, u = 872, a = 77091, nl = 198, tr = 151665;
+    pulsar_turn_markers q = {{start, u}, 2, {start, a}, 2};
+    q.tool[0] = nl;
+    q.tool[1] = tr;
+    q.n_tool = 2;
+    pulsar_tokens b = {0};
+    auto push = [&](std::initializer_list<int> ids) { for (int id : ids) pulsar_tokens_push(&b, id); };
+    push({start, 8948, 9});                 /* 0 system */
+    push({start, u, nl, 11, 12});           /* 3 user: the client's message */
+    push({start, a, nl, 20, 21, 22});       /* 8 assistant: reply 1 (a tool call) */
+    push({start, u, nl, tr, 30, 31});       /* 14 user + <tool_response>: a tool result */
+    push({start, a, nl, 40, 41});           /* 20 assistant: reply 2 (a tool call) */
+    push({start, u, nl, tr, 50});           /* 25 a tool result */
+    push({start, a, nl, 60, 61, 62, 63});   /* 30 assistant: the final reply */
+    /* the roles: a tool result is role 3, the client's turn 1; a user marker whose tool suffix runs past n is a user */
+    TEST_ASSERT(pulsar_turn_marker_at(&q, b.v, b.len, 3) == 1);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, b.v, b.len, 14) == 3 && pulsar_turn_marker_at(&q, b.v, b.len, 25) == 3);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, b.v, 16, 14) == 1);
+    TEST_ASSERT(pulsar_turn_marker_at(&q, b.v, b.len, 8) == 2 && pulsar_turn_marker_at(&q, b.v, b.len, 30) == 2);
+    /* without the tool suffix (a template that renders tools otherwise), every user marker is a user turn: as before */
+    pulsar_turn_markers plain = q;
+    plain.n_tool = 0;
+    TEST_ASSERT(pulsar_turn_marker_at(&plain, b.v, b.len, 14) == 1);
+    /* the bank's route anchor: its last USER turn (3), not the last tool result (25) */
+    TEST_ASSERT(server_route_turn_anchor(&b, b.len, &plain) == 25);
+    TEST_ASSERT(server_route_turn_anchor(&b, b.len, &q) == -1);   /* no assistant turn before the client's message */
+    /* a second user turn after a completed one: the anchor is that turn, past every earlier tool result */
+    pulsar_tokens b2 = {0};
+    for (int i = 0; i < b.len; i++) pulsar_tokens_push(&b2, b.v[i]);
+    const int u2 = b2.len;                                           /* 37 the client's next message */
+    for (int id : {start, u, nl, 70, start, a, nl, 80, start, u, nl, tr, 90, start, a, nl, 95, 96}) pulsar_tokens_push(&b2, id);
+    TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &q) == u2);
+    TEST_ASSERT(server_route_turn_anchor(&b2, b2.len, &plain) == u2 + 8);   /* L322 rule's old answer: the tool result */
+    /* the endpoint: the first reply after the client's last turn -- the same in every request of the turn */
+    TEST_ASSERT(pulsar_turn_endpoint(&q, b.v, b.len) == 8);
+    TEST_ASSERT(pulsar_turn_endpoint(&q, b.v, 25) == 8 && pulsar_turn_endpoint(&q, b.v, 14) == 8);
+    TEST_ASSERT(pulsar_turn_endpoint(&plain, b.v, b.len) == 30);   /* before L351: the last marker */
+    TEST_ASSERT(pulsar_turn_endpoint(&q, b2.v, b2.len) == u2 + 4);
+    /* a prompt ending on the client's turn (no reply after it): the last marker, as before */
+    TEST_ASSERT(pulsar_turn_endpoint(&q, b.v, 8) == 3);
+    TEST_ASSERT(pulsar_turn_endpoint(NULL, b.v, b.len) == -1);
+    /* the work box's verdict, in shape: the bank prefilled the whole turn (its terminal checkpoint re-prefilled the
+     * replies); the next user turn re-renders reply 1 without its reasoning and diverges just past its header (common
+     * = 8 + 3); the resume is the endpoint record at 8.  The route anchor is now the client's message: in place. */
+    const int common = u2 + 4 + 3, resume = u2 + 4;
+    const int anchor = server_route_anchor(&b2, b2.len, &q);
+    TEST_ASSERT(anchor == u2);
+    TEST_ASSERT(server_route_in_place(common, resume, b2.len, b2.len, 0, anchor));
+    /* the old markers (tool results as user turns): the anchor was the last tool result, past the divergence */
+    const int old_anchor = server_route_anchor(&b2, b2.len, &plain);
+    TEST_ASSERT(old_anchor > common && !server_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor));
+    pulsar_tokens_free(&b);
+    pulsar_tokens_free(&b2);
+}
+
 /* L322: the side-call shape (Claude Code's SUGGESTION MODE, 2026-10-24, Qwen at 178-193k).  Turn N ran on the bank and
  * its terminal checkpoint re-prefilled its reply; the side call (the conversation + ~340 tokens: a user turn, its
  * header) then ran in place -- it carries everything the bank prefilled -- and its own terminal checkpoint re-prefilled
@@ -14572,6 +14633,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l273_image_cold_cut();
     test_l275_route_in_place_through_last_turn();
     test_l311_route_header_anchor();
+    test_l351_tool_turns();
     test_l322_route_side_call();
     test_l325_deferred_tool_in_place();
     test_l326_responses_tool_search_in_place();
