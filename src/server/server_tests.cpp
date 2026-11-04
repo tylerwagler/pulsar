@@ -10070,6 +10070,17 @@ static void test_l351_tool_turns(void) {
     /* the old markers (tool results as user turns): the anchor was the last tool result, past the divergence */
     const int old_anchor = server_route_anchor(&b2, b2.len, &plain);
     TEST_ASSERT(old_anchor > common && !server_route_in_place(common, resume, b2.len, b2.len, 0, old_anchor));
+    /* the FIRST turn's bank (the repro of 2026-11-04): no user turn after an assistant one, so the last-turn anchor is
+     * -1 and the header anchor decides -- the header of the client's turn (8 + 1), not the tool round's (30 + 1) */
+    TEST_ASSERT(server_route_header_anchor(&b, b.len, &q) == 9);
+    TEST_ASSERT(server_route_header_anchor(&b, b.len, &plain) == 31);   /* before L351: the last header */
+    const int anchor1 = server_route_anchor(&b, b.len, &q);
+    TEST_ASSERT(anchor1 == 9);
+    /* turn 2 re-renders reply 1 without its reasoning: it matches through the header + "\n" (common 11) */
+    TEST_ASSERT(server_route_in_place(11, 8, b.len, b.len, 0, anchor1));
+    TEST_ASSERT(!server_route_in_place(11, 8, b.len, b.len, 0, server_route_anchor(&b, b.len, &plain)));
+    /* a request that stops short of the header (a side request inside the client's message) is not this turn */
+    TEST_ASSERT(!server_route_in_place(7, 3, b.len, b.len, 0, anchor1));
     pulsar_tokens_free(&b);
     pulsar_tokens_free(&b2);
 }

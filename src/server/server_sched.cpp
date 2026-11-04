@@ -619,6 +619,13 @@ int server_route_turn_anchor(const pulsar_tokens *bank, int prefilled, const pul
 int server_route_header_anchor(const pulsar_tokens *bank, int prefilled, const pulsar_turn_markers *m) {
     if (!bank || !bank->v || !m || m->n_assistant <= 0) return -1;
     if (prefilled > bank->len) prefilled = bank->len;
+    /* L351: the header of the client's last turn -- the first assistant marker after its last user turn
+     * (pulsar_turn_endpoint), not the last one: an agent loop's tool rounds put later headers in the bank, and the
+     * next user turn re-renders the turn from its FIRST reply (repro 2026-11-04: the first turn's bank, a tool round,
+     * then turn 2 diverged at that header + 1 while the anchor was the tool round's header, 6.5k tokens later) */
+    const int E = pulsar_turn_endpoint(m, bank->v, prefilled);
+    if (E >= 0 && pulsar_turn_marker_at(m, bank->v, prefilled, E) == 2) return E + m->n_assistant - 1;
+    /* no header after the last user turn (a prefill that stopped inside it): the last header, as before L351 */
     for (int i = prefilled - 1; i >= 0; i--)
         if (pulsar_turn_marker_at(m, bank->v, prefilled, i) == 2) return i + m->n_assistant - 1;
     return -1;
