@@ -67,7 +67,14 @@
 
 namespace {
 
-constexpr int kOut       = 32;   ///< outputs per CTA = two n-tiles
+constexpr int kOut       = 32;   ///< a CTA's lanes (blockDim.x) = the outputs a reduction half covers = two n-tiles
+/** L349: n-tiles a warp decodes per k-step against its A fragments loaded once -- 2 (32 outputs a CTA) or 4 (64): at
+ *  verify widths every row's hi + lo fragments are re-read from L2 by every CTA, ~4x the weight's bytes at 16 rows
+ *  at 32 outputs (85 % of the 1 -> 16-row cost, RTX 5000), so a wider CTA halves them.  The arithmetic of an output
+ *  is its warp's whatever the width: same k-tiles in the same order, the same warp-order reduction. */
+constexpr int kWideNT   = 4;
+/** L349: from this many rows a wide CTA's cost is priced at the verify ratio (gemv_wide), below at the decode one. */
+constexpr int kWideMinRows = 8;
 constexpr int kWarps     = 16;   ///< warps per CTA: k-tile w % 8 of every other 128-block (two block parities)
 constexpr int kPF        = 4;    ///< the trellis words' register prefetch ring, in k-steps
 constexpr int kRows      = 16;   ///< the MMA's M: every row block is 16 rows
@@ -276,9 +283,9 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 }
 
 /* 2. GEMV + EPILOGUE.  A flat grid over the set's projections (dense_set): CTA x of projection j owns its outputs
- * 32x..32x+31 over the whole of K. */
-/// GEMV + EPILOGUE at rate K2 (2 x bits per weight).  Flat grid over the set's n-tile pairs, block (32, kWarps):
-/// each CTA 32 outputs x all of K x all M <= 16 rows (L338: no split-K -- exllamav3's GEMV structure,
+ * TWx..TWx+TW-1 (TW = 16 NT: 32, or L349's wide 64) over the whole of K. */
+/// GEMV + EPILOGUE at rate K2 (2 x bits per weight).  Flat grid over the set's NT-tile groups, block (32, kWarps):
+/// each CTA 16 NT outputs x all of K x all M <= 16 rows (L338: no split-K -- exllamav3's GEMV structure,
 /// exl3_gemv_kernel.cuh); warp w takes k-tile w % 8 of the 128-blocks w / 8, w / 8 + 2, ... through a register
 /// prefetch ring (kPF steps: one coalesced trellis word per lane per 32 of each tile, the lane's windows by
 /// shuffle) with its A fragments and prescales one step ahead, never synchronising until the reduction; the warps
@@ -289,16 +296,21 @@ exl3_dense_prep_kernel(const dense_set P, const __nv_bfloat16 *__restrict__ xb, 
 /// A fragments, prescales and accumulators (rows 16 x pass ..), the reduction one pass at a time through a kRows-row
 /// buffer -- so a row's arithmetic is exactly a 16-row launch's of its block and the words are read once for them all.
 /// L340: the wait for the prep's planes follows the ring's first trellis loads (programmatic dependent launch).
+/// L349: NT n-tiles a warp decodes per step against its A fragments loaded once (2, or kWideNT where gemv_wide
+/// says): each output's arithmetic is its warp's at either width, the reduction 32 outputs at a time.
 /// @param M   rows, 1..PASSES x kRows
 /// @param K   input width
-template <int K2, int PASSES>
+template <int K2, int PASSES, int NT>
 __global__ void __launch_bounds__(kOut * kWarps)
 exl3_dense_kernel(const dense_set P, int M, int K) {
-    extern __shared__ float s_red[];                              /* [kWarps][min(M, kRows)][kOut], one pass at a time */
+    static_assert(NT == 2 || NT == 4, "a CTA is 32 or 64 outputs");
+    constexpr int TW = 16 * NT;                                   /* the CTA's outputs */
+    constexpr int PF = NT == 2 ? kPF : kPF / 2;                   /* the ring holds the same words per lane */
+    extern __shared__ float s_red[];                              /* [kWarps][min(M, kRows)][kOut], a pass and half at a time */
     __shared__ bool s_last;
     const int c = (int)blockIdx.x, j = proj_of(P, c);
     const dense_proj &p = proj_at(P, j);
-    const int bx = c - (j == 0 ? 0 : j == 1 ? P.end[0] : j == 2 ? P.end[1] : P.end[2]);   /* the 32-output tile */
+    const int bx = c - (j == 0 ? 0 : j == 1 ? P.end[0] : j == 2 ? P.end[1] : P.end[2]);   /* the TW-output tile */
     const int N = p.N, ntn = N >> 4;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     constexpr int NV = (W32 + 31) / 32;                           /* a tile's words per lane */
@@ -324,11 +336,11 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     }
 
     /* step s: block b0 + 2s, k-tile kti -- its two tiles' words (coalesced), its A fragments and prescales */
-    auto ld_w = [&](int s, uint32_t (&tw)[2][NV]) {
+    auto ld_w = [&](int s, uint32_t (&tw)[NT][NV]) {
         const int kt = (b0 + 2 * s) * 8 + kti;
 #pragma unroll
-        for (int jj = 0; jj < 2; ++jj) {
-            const uint32_t *t = p.trellis + ((size_t)kt * (size_t)ntn + (size_t)(bx * 2 + jj)) * W32;
+        for (int jj = 0; jj < NT; ++jj) {
+            const uint32_t *t = p.trellis + ((size_t)kt * (size_t)ntn + (size_t)(bx * NT + jj)) * W32;
 #pragma unroll
             for (int v = 0; v < NV; ++v) tw[jj][v] = v * 32 + lane < W32 ? __ldcs(t + v * 32 + lane) : 0u;
         }
@@ -351,9 +363,9 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
         }
     };
 
-    uint32_t pf[kPF][2][NV];
+    uint32_t pf[PF][NT][NV];
 #pragma unroll
-    for (int d = 0; d < kPF; ++d)
+    for (int d = 0; d < PF; ++d)
         if (d < nsteps) ld_w(d, pf[d]);
     pulsar_pdl_wait();   /* L340: above, only the weight; below, the prep's planes and prescales */
     /* pass 0's next-step fragments are double-buffered (nhi..); a later pass reloads its own right after its MMAs --
@@ -364,30 +376,30 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     for (int q = 0; q < PASSES; ++q)
         if (nsteps > 0) ld_a(0, q, ahi[q], alo[q], ia[q], ib[q]);
 
-    float acc[PASSES][2][2][4];
+    float acc[PASSES][NT][2][4];
 #pragma unroll
     for (int q = 0; q < PASSES; ++q)
 #pragma unroll
-        for (int jj = 0; jj < 2; ++jj)
+        for (int jj = 0; jj < NT; ++jj)
 #pragma unroll
             for (int h = 0; h < 2; ++h)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[q][jj][h][e] = 0.0f;
 
-    for (int s0 = 0; s0 < nsteps; s0 += kPF) {
+    for (int s0 = 0; s0 < nsteps; s0 += PF) {
 #pragma unroll
-        for (int d = 0; d < kPF; ++d) {
+        for (int d = 0; d < PF; ++d) {
             const int s = s0 + d;
             if (s >= nsteps) break;
-            uint32_t tw[2][NV];
+            uint32_t tw[NT][NV];
 #pragma unroll
-            for (int jj = 0; jj < 2; ++jj)
+            for (int jj = 0; jj < NT; ++jj)
 #pragma unroll
                 for (int v = 0; v < NV; ++v) tw[jj][v] = pf[d][jj][v];
-            if (s + kPF < nsteps) ld_w(s + kPF, pf[d]);
+            if (s + PF < nsteps) ld_w(s + PF, pf[d]);
             if (s + 1 < nsteps) ld_a(s + 1, 0, nhi, nlo, nia, nib);
 #pragma unroll
-            for (int jj = 0; jj < 2; ++jj) {
+            for (int jj = 0; jj < NT; ++jj) {
                 uint32_t st8[8];
                 if constexpr (R8)
                     exl3dev::run8_split<K2>(EXL3_RUN4_JOIN(word(tw[jj], lo[0]), word(tw[jj], hi[0]), sh[0]), 8 * lane, st8);
@@ -425,35 +437,40 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
         }
     }
 
-    /* cross-warp reduction in warp order, one warp per row, into the CTA's partial -- a pass at a time (L341) */
+    /* cross-warp reduction in warp order, one warp per row, into the CTA's partial -- a pass at a time (L341), and
+     * L349 a 32-output half at a time (the buffer is a narrow CTA's: kWarps x 16 x 32 f32 = 32 KB of Turing's 64) */
 #pragma unroll
     for (int q = 0; q < PASSES; ++q) {
         const int nr = nrp[q];
         if (nr == 0) break;
-        if (q > 0) __syncthreads();   /* every warp is past the last pass's reads of the buffer */
 #pragma unroll
-        for (int jj = 0; jj < 2; ++jj)
+        for (int hh = 0; hh < NT / 2; ++hh) {
+            if (q > 0 || hh > 0) __syncthreads();   /* every warp is past the last half's reads of the buffer */
 #pragma unroll
-            for (int h = 0; h < 2; ++h)
+            for (int j2 = 0; j2 < 2; ++j2)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const int rr = g + 8 * (e >> 1), col = jj * 16 + h * 8 + c2 + (e & 1);
-                    if (rr < nr) s_red[((size_t)warp * nr + rr) * kOut + col] = acc[q][jj][h][e];
-                }
-        __syncthreads();
-        for (int r = warp; r < nr; r += kWarps) {
-            float z = 0.0f;
+                for (int h = 0; h < 2; ++h)
 #pragma unroll
-            for (int w = 0; w < kWarps; ++w) z += s_red[((size_t)w * nr + r) * kOut + lane];
-            p.part[(size_t)(q * kRows + r) * (size_t)N + (size_t)(bx * kOut + lane)] = z;
+                    for (int e = 0; e < 4; ++e) {
+                        const int rr = g + 8 * (e >> 1), col = j2 * 16 + h * 8 + c2 + (e & 1);
+                        if (rr < nr) s_red[((size_t)warp * nr + rr) * kOut + col] = acc[q][2 * hh + j2][h][e];
+                    }
+            __syncthreads();
+            for (int r = warp; r < nr; r += kWarps) {
+                float z = 0.0f;
+#pragma unroll
+                for (int w = 0; w < kWarps; ++w) z += s_red[((size_t)w * nr + r) * kOut + lane];
+                p.part[(size_t)(q * kRows + r) * (size_t)N + (size_t)(bx * TW + hh * kOut + lane)] = z;
+            }
         }
     }
 
-    /* 4. the last of the 128-output block's 4 CTAs finishes it: H128, svh */
+    /* 4. the last of the 128-output block's 128 / TW CTAs finishes it: H128, svh */
     __threadfence();
     __syncthreads();
-    const int ob = bx >> 2;                               /* the 128-output block */
-    if (tid == 0) s_last = atomicInc(&p.ctr[ob], 3u) == 3u;
+    constexpr unsigned CPB = 128 / TW;                    /* the CTAs of a 128-output block */
+    const int ob = (bx * TW) >> 7;                        /* the 128-output block */
+    if (tid == 0) s_last = atomicInc(&p.ctr[ob], CPB - 1u) == CPB - 1u;
     __syncthreads();
     if (!s_last) return;
     __threadfence();
@@ -500,8 +517,53 @@ unsigned *counter_slice(cudaStream_t stream) {
     return t_slices[t_n++].p;
 }
 
+/// L349: whether a GEMV of c32 narrow CTAs at M rows takes the wide CTA, on a device of sms SMs (one CTA an SM: 512
+/// threads at the 128 registers their bounds allow fill a register file).  Priced in waves: the wide grid has half the
+/// CTAs, each costing r narrow ones -- r ~1.6 at 1 row (the A reads are small), ~1.33-1.46 from 8 rows (half of every
+/// row's A reads saved; RTX 5000, 2026-11-04).  So below kWideMinRows rows wide iff it needs at most half the waves,
+/// from it iff 1.4 x its waves < the narrow waves.  Measured on the 5000 that keeps every win (Gemma at 16 rows
+/// -11..-39 %, the heads -35 %, DeltaNet / shared down -12..-40 %, k/v, o, q global at 1 row -15..-20 %) and every
+/// loss out (a one-wave grid at 8 / 16 rows -- 2560->1280, Qwen shared gate/up, DeepSeek attn_q_a: +18..+46 % wide;
+/// q_proj window at 1 row on 48 SMs: +6 %).  The choice flips with the card, so the SM count is read, never assumed;
+/// the one authority for the grid and the instance.
+/// @param M    rows, 1..kMaxRows
+/// @param c32  the launch's CTAs at kOut outputs (every projection of the rate)
+/// @param sms  the device's SM count
+/// @return     true: 16 x kWideNT outputs a CTA, one pass only (two passes keep kOut: registers)
+bool gemv_wide(int M, int c32, int sms) {
+    if (M > kRows) return false;
+    const int c64 = c32 / (kWideNT / 2);   /* every stored N is a multiple of 128 */
+    const int w32 = (c32 + sms - 1) / sms, w64 = (c64 + sms - 1) / sms;
+    return M >= kWideMinRows ? 7 * w64 < 5 * w32 : 2 * w64 <= w32;
+}
+
+/// The calling device's SM count, read once per device.
+/// @return SMs, or 0 when the runtime cannot say (the caller refuses)
+int device_sms() {
+    static int s_sms[16] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
+    if (!s_sms[dev]) {
+        int n = 0;
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+        s_sms[dev] = n;
+    }
+    return s_sms[dev];
+}
+
+/// exl3_dense_kernel's instance at rate R: two passes (narrow), else one pass, wide or narrow.
+/// @tparam R   rate (2 x bits per weight)
+/// @param two  M > kRows
+/// @param wide gemv_wide's answer
+/// @return     the kernel
+template <int R>
+void (*gemv_instance(bool two, bool wide))(const dense_set, int, int) {
+    return two ? exl3_dense_kernel<R, 2, 2> : wide ? exl3_dense_kernel<R, 1, kWideNT> : exl3_dense_kernel<R, 1, 2>;
+}
+
 /// Launch exl3_dense_kernel at rate k2 (4, 6, 8, 10, 12 or 16, checked by the caller) with grid / block on stream.
 /// @param k2      rate (2 x bits per weight)
+/// @param wide    the 64-output CTA (gemv_wide; one pass only)
 /// @param grid    flat CTA count of the set
 /// @param block   (kOut, kWarps, 1)
 /// @param stream  the launch stream
@@ -509,18 +571,19 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param M       rows, 1..kMaxRows
 /// @param K       input width
 /// @return the launch's error
-cudaError_t gemv_launch(int k2, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P, int M,
-                        int K) {
+cudaError_t gemv_launch(int k2, bool wide, const dim3 &grid, const dim3 &block, cudaStream_t stream, const dense_set &P,
+                        int M, int K) {
     static_assert(kMaxRows == 2 * kRows, "the instances below are one and two passes");
     const size_t smem = (size_t)kWarps * (size_t)(M < kRows ? M : kRows) * kOut * sizeof(float);   /* a pass's rows */
     const bool two = M > kRows;   /* L341: the pass count is the instance's (M <= kMaxRows, checked) */
+    /* L349: wide = the 64-output CTA (gemv_wide; never with two passes) */
     void (*k)(const dense_set, int, int) =
-        k2 == 4  ? (two ? exl3_dense_kernel<4, 2>  : exl3_dense_kernel<4, 1>)
-      : k2 == 6  ? (two ? exl3_dense_kernel<6, 2>  : exl3_dense_kernel<6, 1>)
-      : k2 == 8  ? (two ? exl3_dense_kernel<8, 2>  : exl3_dense_kernel<8, 1>)
-      : k2 == 10 ? (two ? exl3_dense_kernel<10, 2> : exl3_dense_kernel<10, 1>)
-      : k2 == 12 ? (two ? exl3_dense_kernel<12, 2> : exl3_dense_kernel<12, 1>)
-                 : (two ? exl3_dense_kernel<16, 2> : exl3_dense_kernel<16, 1>);   /* k2 == 16, checked */
+        k2 == 4  ? gemv_instance<4>(two, wide)
+      : k2 == 6  ? gemv_instance<6>(two, wide)
+      : k2 == 8  ? gemv_instance<8>(two, wide)
+      : k2 == 10 ? gemv_instance<10>(two, wide)
+      : k2 == 12 ? gemv_instance<12>(two, wide)
+                 : gemv_instance<16>(two, wide);   /* k2 == 16, checked */
     /* L340: under the previous kernel's tail (the prep, or the last rate's GEMV): the kernel waits before its planes */
     return pulsar_launch_pdl(k, grid, block, smem, stream, P, M, K);
 }
@@ -647,6 +710,11 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
                 kMaxCounters);
         return -1;
     }
+    const int sms = device_sms();
+    if (sms <= 0) {
+        fprintf(stderr, "%s: the device's SM count is unreadable -- refusing\n", tag);
+        return -1;
+    }
     unsigned *ctr = counter_slice(stream);
     if (!ctr) {
         fprintf(stderr, "%s: no epilogue counter slice left for this (thread, device, stream) -- the pool holds %d "
@@ -691,16 +759,19 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
     for (int j0 = 0; j0 < n; ++j0) {
         if (done[j0]) continue;
         dense_set g{};
-        int m = 0, ctas = 0;
+        int m = 0, c32 = 0;
         for (int j = j0; j < n; ++j) {
             if (done[j] || p[j].k2 != p[j0].k2) continue;
             done[j] = true;
-            g.p[m] = all.p[j];
-            ctas += (all.p[j].N / kOut) * all.p[j].S;
-            g.end[m++] = ctas;
+            g.p[m++] = all.p[j];
+            c32 += (all.p[j].N / kOut) * all.p[j].S;
         }
+        const bool wide = gemv_wide(M, c32, sms);
+        const int tw = wide ? 16 * kWideNT : kOut;
+        int ctas = 0;
+        for (int i = 0; i < m; ++i) g.end[i] = ctas += (g.p[i].N / tw) * g.p[i].S;
         for (int i = m; i < kMaxProj; ++i) g.end[i] = INT_MAX;
-        const cudaError_t le = gemv_launch(p[j0].k2, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
+        const cudaError_t le = gemv_launch(p[j0].k2, wide, dim3((unsigned)ctas), dim3(kOut, kWarps, 1), stream, g, M, K);
         if (le != cudaSuccess) {
             fprintf(stderr, "%s: GEMV launch failed: %s\n", tag, cudaGetErrorString(le));
             return -3;
