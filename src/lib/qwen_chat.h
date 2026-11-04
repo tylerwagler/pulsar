@@ -318,9 +318,13 @@ private:
 /** Qwen's output grammar for the kit: `</think>` ends the reasoning the generation prompt opened (thinking
  * on); `<tool_call>` ... `</tool_call>` is a call; text after a call is content again (the prompt forbids
  * it; the client still sees it).  Reasoning and content are reported STRIPPED (the template strips both on
- * replay), so a turn the parser read re-renders to the bytes the model sampled. */
-/// @return the family's grammar (static storage)
-const out_grammar &qwen_output_grammar(void);
+ * replay), so a turn the parser read re-renders to the bytes the model sampled.
+ * L344: with thinking ON, a stray `</think>` in the content after the reasoning closed is dropped (as Nemotron's grammar
+ * drops it): a forced close (the thinking budget) leaves a model still reasoning to write its own close in the answer.
+ * With thinking OFF no reasoning was opened, so a literal `</think>` in the answer is the answer's text. */
+/// @param thinking  the turn opened in reasoning (the generation prompt's `<think>`)
+/// @return the family's grammar for that turn (static storage)
+const out_grammar &qwen_output_grammar(bool thinking);
 
 /** The sampled-text parser for one Qwen assistant turn: the kit's parser in Qwen's configuration. */
 class qwen_output_parser : public out_parser {

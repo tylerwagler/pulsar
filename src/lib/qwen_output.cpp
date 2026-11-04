@@ -7,9 +7,10 @@
 #include <stdio.h>
 #include <string.h>
 
-const out_grammar &qwen_output_grammar(void) {
+const out_grammar &qwen_output_grammar(bool thinking) {
     enum { THINK_END, CALL_OPEN, CALL_CLOSE };
-    static const out_grammar g = {
+    /* thinking off: the turn never opened reasoning, so `</think>` in the content is text */
+    static const out_grammar off = {
         /* .name        = */ "qwen",
         /* .markers     = */ {"</think>", "<tool_call>", "</tool_call>"},
         /* .transitions = */ {
@@ -22,7 +23,22 @@ const out_grammar &qwen_output_grammar(void) {
         /* .call_open   = */ "<tool_call>",
         /* .dropped     = */ {},
     };
-    return g;
+    /* thinking on (L344): the same, and a stray `</think>` after the reasoning closed is dropped (Nemotron's rule) */
+    static const out_grammar on = {
+        /* .name        = */ "qwen",
+        /* .markers     = */ {"</think>", "<tool_call>", "</tool_call>"},
+        /* .transitions = */ {
+            {OUT_REASONING, THINK_END, OUT_CONTENT, 0},
+            {OUT_CONTENT, THINK_END, OUT_CONTENT, 0},
+            {OUT_CONTENT, CALL_OPEN, OUT_CALL, 0},
+            {OUT_CALL, CALL_CLOSE, OUT_CONTENT, 0},
+        },
+        /* .reasoning   = */ OUT_TEXT_STRIP,
+        /* .content     = */ OUT_TEXT_STRIP,
+        /* .call_open   = */ "<tool_call>",
+        /* .dropped     = */ {},
+    };
+    return thinking ? on : off;
 }
 
 bool qwen_output_parser::init(bool thinking, const char *tools_json, char *err, size_t errlen) {
@@ -35,7 +51,7 @@ bool qwen_output_parser::init(bool thinking, const char *tools_json, char *err, 
             return false;
         }
     }
-    out_parser::init(&qwen_output_grammar(), &body_, thinking ? OUT_REASONING : OUT_CONTENT);
+    out_parser::init(&qwen_output_grammar(thinking), &body_, thinking ? OUT_REASONING : OUT_CONTENT);
     return true;
 }
 
