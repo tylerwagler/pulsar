@@ -305,7 +305,10 @@ __global__ void __launch_bounds__(kOut * kWarps)
 exl3_dense_kernel(const dense_set P, int M, int K) {
     static_assert(NT == 2 || NT == 4, "a CTA is 32 or 64 outputs");
     constexpr int TW = 16 * NT;                                   /* the CTA's outputs */
-    constexpr int PF = NT == 2 ? kPF : kPF / 2;                   /* the ring holds the same words per lane */
+    constexpr int PF = NT == 2 ? kPF : PASSES == 1 ? kPF / 2 : 1;  /* the ring: the same words per lane (wide, one pass) */
+    /* L349: pass 0's A one step ahead (nhi..) -- except wide with two passes, whose 64 accumulators leave no room:
+     * there every pass reloads its own right after its MMAs (the same values, issued later) */
+    constexpr bool A_AHEAD = !(PASSES == 2 && NT == kWideNT);
     extern __shared__ float s_red[];                              /* [kWarps][min(M, kRows)][kOut], a pass and half at a time */
     __shared__ bool s_last;
     const int c = (int)blockIdx.x, j = proj_of(P, c);
@@ -314,6 +317,9 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     const int N = p.N, ntn = N >> 4;
     constexpr int W32 = exl3dev::Rate<K2>::words32;
     constexpr int NV = (W32 + 31) / 32;                           /* a tile's words per lane */
+    /* L349: wide with two passes at two words a lane (K2 >= 10) has no register left for a prefetch ring: its
+     * words are loaded at the top of their own step (decoding the step's earlier tiles hides part of it) */
+    constexpr bool RING = !(PASSES == 2 && NT == kWideNT && NV > 1);
     const int lane = threadIdx.x, warp = threadIdx.y, tid = warp * kOut + lane;
     const int blocks = K >> 7;
     int nrp[PASSES];                                              /* each pass's real rows, 0..kRows */
@@ -366,7 +372,7 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
     uint32_t pf[PF][NT][NV];
 #pragma unroll
     for (int d = 0; d < PF; ++d)
-        if (d < nsteps) ld_w(d, pf[d]);
+        if (RING && d < nsteps) ld_w(d, pf[d]);
     pulsar_pdl_wait();   /* L340: above, only the weight; below, the prep's planes and prescales */
     /* pass 0's next-step fragments are double-buffered (nhi..); a later pass reloads its own right after its MMAs --
      * the same values, issued later, so the two-pass body stays inside the 128 registers 512 threads allow */
@@ -392,12 +398,16 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
             const int s = s0 + d;
             if (s >= nsteps) break;
             uint32_t tw[NT][NV];
+            if constexpr (RING) {
 #pragma unroll
-            for (int jj = 0; jj < NT; ++jj)
+                for (int jj = 0; jj < NT; ++jj)
 #pragma unroll
-                for (int v = 0; v < NV; ++v) tw[jj][v] = pf[d][jj][v];
-            if (s + PF < nsteps) ld_w(s + PF, pf[d]);
-            if (s + 1 < nsteps) ld_a(s + 1, 0, nhi, nlo, nia, nib);
+                    for (int v = 0; v < NV; ++v) tw[jj][v] = pf[d][jj][v];
+                if (s + PF < nsteps) ld_w(s + PF, pf[d]);
+            } else {
+                ld_w(s, tw);
+            }
+            if (A_AHEAD && s + 1 < nsteps) ld_a(s + 1, 0, nhi, nlo, nia, nib);
 #pragma unroll
             for (int jj = 0; jj < NT; ++jj) {
                 uint32_t st8[8];
@@ -427,12 +437,14 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
                     }
                 }
             }
+            if constexpr (A_AHEAD) {
 #pragma unroll
-            for (int e = 0; e < 4; ++e) { ahi[0][e] = nhi[e]; alo[0][e] = nlo[e]; }
-            ia[0] = nia;
-            ib[0] = nib;
+                for (int e = 0; e < 4; ++e) { ahi[0][e] = nhi[e]; alo[0][e] = nlo[e]; }
+                ia[0] = nia;
+                ib[0] = nib;
+            }
 #pragma unroll
-            for (int q = 1; q < PASSES; ++q)
+            for (int q = A_AHEAD ? 1 : 0; q < PASSES; ++q)
                 if (s + 1 < nsteps) ld_a(s + 1, q, ahi[q], alo[q], ia[q], ib[q]);
         }
     }
@@ -529,9 +541,8 @@ unsigned *counter_slice(cudaStream_t stream) {
 /// @param M    rows, 1..kMaxRows
 /// @param c32  the launch's CTAs at kOut outputs (every projection of the rate)
 /// @param sms  the device's SM count
-/// @return     true: 16 x kWideNT outputs a CTA, one pass only (two passes keep kOut: registers)
+/// @return     true: 16 x kWideNT outputs a CTA (two passes too: L349 follow-up, priced at the verify ratio)
 bool gemv_wide(int M, int c32, int sms) {
-    if (M > kRows) return false;
     const int c64 = c32 / (kWideNT / 2);   /* every stored N is a multiple of 128 */
     const int w32 = (c32 + sms - 1) / sms, w64 = (c64 + sms - 1) / sms;
     return M >= kWideMinRows ? 7 * w64 < 5 * w32 : 2 * w64 <= w32;
@@ -558,12 +569,13 @@ int device_sms() {
 /// @return     the kernel
 template <int R>
 void (*gemv_instance(bool two, bool wide))(const dense_set, int, int) {
-    return two ? exl3_dense_kernel<R, 2, 2> : wide ? exl3_dense_kernel<R, 1, kWideNT> : exl3_dense_kernel<R, 1, 2>;
+    return two ? (wide ? exl3_dense_kernel<R, 2, kWideNT> : exl3_dense_kernel<R, 2, 2>)
+               : (wide ? exl3_dense_kernel<R, 1, kWideNT> : exl3_dense_kernel<R, 1, 2>);
 }
 
 /// Launch exl3_dense_kernel at rate k2 (4, 6, 8, 10, 12 or 16, checked by the caller) with grid / block on stream.
 /// @param k2      rate (2 x bits per weight)
-/// @param wide    the 64-output CTA (gemv_wide; one pass only)
+/// @param wide    the 64-output CTA (gemv_wide)
 /// @param grid    flat CTA count of the set
 /// @param block   (kOut, kWarps, 1)
 /// @param stream  the launch stream
@@ -576,7 +588,7 @@ cudaError_t gemv_launch(int k2, bool wide, const dim3 &grid, const dim3 &block, 
     static_assert(kMaxRows == 2 * kRows, "the instances below are one and two passes");
     const size_t smem = (size_t)kWarps * (size_t)(M < kRows ? M : kRows) * kOut * sizeof(float);   /* a pass's rows */
     const bool two = M > kRows;   /* L341: the pass count is the instance's (M <= kMaxRows, checked) */
-    /* L349: wide = the 64-output CTA (gemv_wide; never with two passes) */
+    /* L349: wide = the 64-output CTA (gemv_wide) */
     void (*k)(const dense_set, int, int) =
         k2 == 4  ? gemv_instance<4>(two, wide)
       : k2 == 6  ? gemv_instance<6>(two, wide)

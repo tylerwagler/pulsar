@@ -1,6 +1,6 @@
 /* EXL3 dense-Linear microbenchmark (L251): the dense arm against pulsar's
  * MXFP8 decode GEMV and a plain wire-read roofline, at the dense shapes the
- * Qwen lane needs and a DeepSeek one, M = 1, 2, 4, 8, 16.
+ * Qwen lane needs and a DeepSeek one, M = 1, 2, 4, 8, 16 and the two-pass widths 17, 24, 32.
  *
  *   EXL3 K=2..5   ds4_exl3_dense_launch (split-K GEMV + epilogue), reading the
  *                 A8 slot the MXFP8 call below armed -- the same producer bytes
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     };
     const shape *shapes_p = gemma ? gemma_shapes : qwen_shapes;
     const int n_shapes = gemma ? (int)(sizeof gemma_shapes / sizeof *gemma_shapes) : (int)(sizeof qwen_shapes / sizeof *qwen_shapes);
-    const int widths[] = {1, 2, 4, 8, 16, 128, 512, 2048};
+    const int widths[] = {1, 2, 4, 8, 16, 17, 24, 32, 128, 512, 2048};   /* 17..32: the GEMV's two-pass verify widths (L341 / L349) */
     const int kMaxRows = 2048;
     const std::vector<int> rates = gemma ? std::vector<int>{8, 12} : std::vector<int>{4, 6, 8, 10};
 
@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
             pulsar_gpu_bf16_act_note(xb, M, K);
             /* MXFP8: decode rows up to the decode cap, prefill rows past it */
             const bool prefill = M > 16;
-            const int n_it = prefill ? (iters + 9) / 10 : iters;
+            const int n_it = M > 32 ? (iters + 9) / 10 : iters;   /* every GEMV width at full count */
             if (with_f8) {
                 pulsar_gpu_matmul_set_batch_decode_rows(prefill ? 0 : M);
                 bool f8_ok = true;
