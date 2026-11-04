@@ -48,6 +48,7 @@ constexpr int kMaxE = 1024;            ///< experts the one-block plan kernel sc
  * narrow Linear over the SMs, and four 64-k steps of weight loads in flight keep the read stream full */
 constexpr int kDenseWarps = 2;         ///< the dense decode kernel's warps a CTA: 16 weight rows each
 constexpr int kDenseU = 4;             ///< the dense decode kernel's 64-k steps of loads in flight
+constexpr int kDensePrefetch = 2;      ///< L340: the kDenseU-step groups of weight prefetched to L2 before the PDL wait
 
 /** Elements of K a chunk stages for NT n8 tiles: kStageBytes over 8 NT rows, a multiple of 64. */
 /// @tparam NT n8 activation tiles per CTA (1, 2 or kRoutedNT).
@@ -179,6 +180,16 @@ bf16_rows_dense_kernel(const __nv_bfloat16 *__restrict__ W, int out, int in, con
         xv[j] = j < nt && j * 8 + g < nr;
         xr[j] = X + (size_t)(xv[j] ? j * 8 + g : 0) * in + 16 * c;
     }
+    /* L340: the weight is the one thing no kernel on the stream writes -- its first chunks go to L2 under the
+     * producer's tail (a cache hint: no register, no byte of the result moves), then the wait for X */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#pragma unroll
+    for (int k = 0; k < 64 * U * kDensePrefetch; k += 64) {
+        if (k < in && v0) asm volatile("prefetch.global.L2 [%0];" :: "l"(w0 + k));
+        if (k < in && v1) asm volatile("prefetch.global.L2 [%0];" :: "l"(w1 + k));
+    }
+#endif
+    pulsar_pdl_wait();
     float acc[NT][4];
 #pragma unroll
     for (int j = 0; j < NT; ++j)
@@ -369,14 +380,15 @@ int pulsar_bf16_rows_linear_launch(const void *w, const uint16_t *x_bf16, int ro
      * mxfp8 decode arms do, L288 C1) */
     for (int r0 = 0; r0 < rows; r0 += PULSAR_BF16_ROWS_DECODE_MAX) {
         const int m = rows - r0 < PULSAR_BF16_ROWS_DECODE_MAX ? rows - r0 : PULSAR_BF16_ROWS_DECODE_MAX;
-        if (m > 8)
-            bf16_rows_dense_kernel<2, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
-                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
-                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
-        else
-            bf16_rows_dense_kernel<1, kDenseU><<<grid, 32 * kDenseWarps, 0, stream>>>(
-                W, out, in, X + (size_t)r0 * in, m, y ? y + (size_t)r0 * out : nullptr,
-                y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
+        /* L340: under the producer's tail (its rows' norm / emit triggers); the kernel waits before X */
+        const cudaError_t le = pulsar_launch_pdl(m > 8 ? bf16_rows_dense_kernel<2, kDenseU> : bf16_rows_dense_kernel<1, kDenseU>,
+                                                 grid, dim3(32 * kDenseWarps), 0, stream, W, out, in, X + (size_t)r0 * in, m,
+                                                 y ? y + (size_t)r0 * out : nullptr,
+                                                 y_bf16 ? reinterpret_cast<__nv_bfloat16 *>(y_bf16) + (size_t)r0 * out : nullptr);
+        if (le != cudaSuccess) {
+            fprintf(stderr, "pulsar: BF16 linear (bf16 rows): launch failed: %s\n", cudaGetErrorString(le));
+            return -3;
+        }
     }
     return launch_ok("dense") ? 0 : -3;
 }

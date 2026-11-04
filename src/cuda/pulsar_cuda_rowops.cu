@@ -2,6 +2,7 @@
  *  Row operations between a layer plan's blocks: residual add, RMSNorm, LayerNorm, emits and gathers. */
 /* Row operations between a layer plan's blocks (L295): contracts in pulsar_cuda_rowops.h. */
 #include "pulsar_cuda_rowops.h"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -44,6 +45,7 @@ __device__ __forceinline__ uint32_t f2bf(float f) { return (uint32_t)__bfloat16_
 __global__ void __launch_bounds__(kNormThreads)
 rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__restrict__ delta, uint64_t ld_delta,
                  uint32_t width, const uint4 *__restrict__ w, float eps, uint16_t *__restrict__ y, uint64_t ld_y) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     __shared__ float warp_ss[kNormThreads / 32];
     __shared__ float s_rstd;
     const uint64_t t = blockIdx.x;
@@ -115,6 +117,7 @@ rows_norm_kernel(uint16_t *__restrict__ res, uint64_t ld_res, const uint16_t *__
 __global__ void __launch_bounds__(kEmitThreads)
 rows_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width, const void *__restrict__ scale, int kind,
                  uint16_t *__restrict__ y, uint64_t ld_y) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     const uint64_t t = blockIdx.y;
     const uint32_t c = (blockIdx.x * kEmitThreads + threadIdx.x) * 4u;
     if (c >= width) return;
@@ -173,6 +176,7 @@ __device__ __forceinline__ uint32_t f2out(float f, int f16) {
 __global__ void __launch_bounds__(kEmitThreads)
 rows_bias_emit_kernel(const float *__restrict__ x, uint64_t ld_x, uint32_t width, const float *__restrict__ bias,
                       int act, uint16_t *__restrict__ y, uint64_t ld_y, int f16) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     const uint64_t t = blockIdx.y;
     const uint32_t c = (blockIdx.x * kEmitThreads + threadIdx.x) * 4u;
     if (c >= width) return;
@@ -217,6 +221,7 @@ rows_ln32_kernel(void *__restrict__ res_, uint64_t ld_res, const float *__restri
                  const float *__restrict__ bias, uint32_t width, const float *__restrict__ w,
                  const float *__restrict__ b, float eps, uint16_t *__restrict__ y, uint64_t ld_y, int f16,
                  float *__restrict__ yf, uint64_t ld_yf) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     __shared__ float warp_s[kNormThreads / 32];
     __shared__ float s_sum, s_sq;
     const uint64_t t = blockIdx.x;
@@ -268,6 +273,7 @@ rows_ln32_kernel(void *__restrict__ res_, uint64_t ld_res, const float *__restri
 __global__ void __launch_bounds__(kEmitThreads)
 rows_gather_f16_kernel(const uint4 *__restrict__ table, uint32_t n_vocab, uint32_t width, const int32_t *__restrict__ ids,
                        float scale, float *__restrict__ y, uint64_t ld_y) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     const uint64_t t = blockIdx.y;
     const uint32_t c8 = blockIdx.x * kEmitThreads + threadIdx.x;
     if (8u * c8 >= width) return;
@@ -436,6 +442,7 @@ struct chain_outs {
 __global__ void __launch_bounds__(kNormThreads)
 rows_norm_add_norms_kernel(const uint16_t *__restrict__ x, uint64_t ld_x, const uint4 *__restrict__ w_x,
                            uint16_t *__restrict__ res, uint64_t ld_res, uint32_t width, float eps, chain_outs outs) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     __shared__ float warp_s[kNormThreads / 32];
     __shared__ float s_out;
     const uint64_t t = blockIdx.x;
@@ -503,6 +510,7 @@ rows_sum2_norm_add_kernel(const float *__restrict__ a, uint64_t ld_a, const uint
                           const uint4 *__restrict__ w_s, uint16_t *__restrict__ res, uint64_t ld_res,
                           const uint16_t *__restrict__ scale, const uint4 *__restrict__ w_n, uint16_t *__restrict__ y,
                           uint64_t ld_y, uint32_t width, float eps) {
+    pulsar_pdl_trigger();   /* L340: the next linear may launch and stream its weights under this grid */
     __shared__ float warp_s[kNormThreads / 32];
     __shared__ float s_out;
     const uint64_t t = blockIdx.x;

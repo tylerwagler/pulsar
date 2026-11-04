@@ -22,6 +22,7 @@
  * The thread that computes an element is fixed by its (head, p, n), never by
  * the call's shape, so every schedule gives the same bytes. */
 #include "pulsar_cuda_mamba2.h"
+#include "pulsar_cuda_arch.cuh"
 #include "pulsar_cuda_sconv.cuh"
 
 #include <cuda_runtime.h>
@@ -345,6 +346,7 @@ mamba2_commit_kernel(float *__restrict__ ssm, const float *__restrict__ upd, uin
 __global__ void __launch_bounds__(1024)
 mamba2_norm_kernel(const uint16_t *__restrict__ y, uint32_t HP, const uint16_t *__restrict__ z, uint64_t ld_z,
                    const uint16_t *__restrict__ w, uint32_t ng, float eps, uint16_t *__restrict__ out, uint64_t ld_out) {
+    pulsar_pdl_trigger();   /* L340: out_proj may launch and stream its weights under this grid */
     __shared__ float wsum[32];
     __shared__ float total;
     const uint64_t row = blockIdx.x;
