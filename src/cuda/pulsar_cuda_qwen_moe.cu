@@ -196,7 +196,7 @@ static size_t moe_ws_layout(const pulsar_moe_block_shape *s, int T, void *base, 
     const size_t pairs = (size_t)T * s->top_k;
     const size_t S = (size_t)s->n_shared, smid = (size_t)s->shared_mid, H = (size_t)s->hidden;
     pulsar_moe_block_parts m{};
-    m.logits = (float *)b.take((size_t)T * s->n_logit_rows * 4);
+    m.logits = (float *)b.take((size_t)T * pulsar_router_logits_ld(s->n_logit_rows) * 4);   /* L336: the pitch */
     m.sel    = (int32_t *)b.take(pairs * 4);
     m.wts    = (float *)b.take(pairs * 4);
     m.gammas = (float *)b.take(S * T * 4);

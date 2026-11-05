@@ -587,7 +587,7 @@ typedef struct pulsar_moe_block_shape {
 } pulsar_moe_block_shape;
 /** The block's workspace, carved: the router's outputs, the routed part's region, the shared experts'. */
 typedef struct pulsar_moe_block_parts {
-    float *logits;      /**< [T][n_logit_rows] the router's logits */
+    float *logits;      /**< [T][pulsar_router_logits_ld(n_logit_rows)] the router's logits */
     int32_t *sel;       /**< [T][top_k] */
     float *wts;         /**< [T][top_k] */
     float *gammas;      /**< [n_shared][T] the shared experts' gates (pulsar_router_select_launch's planes) */

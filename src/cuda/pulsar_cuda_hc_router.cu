@@ -774,6 +774,12 @@ int pulsar_gpu_router_select_batch_tensor(
         l.table_rows = (int32_t)tid2eid_rows;
     }
     const pulsar_router_cfg c = ds4_router_cfg(n_expert, n_expert_used, expert_weight_scale);
+    /* L336: the select reads the logits at the router's pitch; this lane's matmul writes them n_expert apart */
+    if (pulsar_router_logit_pitch(&c) != (int)n_expert) {
+        fprintf(stderr, "pulsar: router select: %u experts' logits are %u floats apart, the router reads them %d apart "
+                        "-- refusing\n", n_expert, n_expert, pulsar_router_logit_pitch(&c));
+        return 0;
+    }
     return pulsar_router_select_launch(&c, &l, (const float *)logits->ptr, tokens ? (const int32_t *)tokens->ptr : NULL,
                                        (int)n_tokens, (int32_t *)selected->ptr, (float *)weights->ptr, NULL,
                                        probs ? (float *)probs->ptr : NULL, cudaStreamPerThread) == 0;

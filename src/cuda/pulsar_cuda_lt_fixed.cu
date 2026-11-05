@@ -1,5 +1,5 @@
 /** @file
- *  The fixed-algorithm fp16 cuBLASLt GEMM: one algorithm per shape and row class, its caches. */
+ *  The fixed-algorithm fp16 / bf16 cuBLASLt GEMM: one algorithm per shape and row class, its caches. */
 /* The fixed-algorithm fp16 GEMM (L321) -- see pulsar_cuda_lt_fixed.h for the contract. */
 #include "pulsar_cuda_lt_fixed.h"
 
@@ -23,6 +23,8 @@ constexpr size_t kWs = PULSAR_LT_FIXED_WORKSPACE;
 struct lt_shape {
     /// A's layout (pulsar_lt_a)
     int a, cls, K, N;
+    /// the element type of A and X (CUDA_R_16F or, L336, CUDA_R_16BF)
+    cudaDataType_t el;
     /** @var cls
      *  row class (pulsar_lt_rows) */
     /** @var K
@@ -41,6 +43,8 @@ struct lt_shape {
 struct lt_call {
     /// the owning shape's A layout (pulsar_lt_a)
     int a, cls, K, N, M, n, ldd;
+    /// the owning shape's element type
+    cudaDataType_t el;
     /** @var cls
      *  the owning shape's row class (pulsar_lt_rows) */
     /** @var K
@@ -55,10 +59,10 @@ struct lt_call {
      *  the call's output row pitch, in floats */
     /// slot in use
     bool valid;
-    /// A's layout (fp16, n columns of the weight); owned, destroyed on eviction
+    /// A's layout (the element type, n columns of the weight); owned, destroyed on eviction
     cublasLtMatrixLayout_t la, lb, ld;
     /** @var lb
-     *  X's layout (fp16 K x M, ld K); owned */
+     *  X's layout (the element type, K x M, ld K); owned */
     /** @var ld
      *  D's layout (f32 n x M, ld ldd); owned */
 };
@@ -79,27 +83,29 @@ int canon_rows(int cls) { return cls == PULSAR_LT_PROMPT ? (int)PULSAR_PREFILL_C
 /* A's layout for columns [0, n) of the weight: KN = n x K at ld N; NK = K x n at ld K (the op transposes it) */
 /** Creates A's cuBLASLt layout for weight columns [0, n): KN = n x K at ld N; NK = K x n at ld K.
  *  @param la out: the created layout (caller destroys)
+ *  @param el the element type
  *  @param a  pulsar_lt_a layout id
  *  @param K  reduction depth
  *  @param N  full output width (the KN row pitch)
  *  @param n  columns this layout covers */
-void a_layout(cublasLtMatrixLayout_t *la, int a, int K, int N, int n) {
-    if (a == PULSAR_LT_A_KN) cublasLtMatrixLayoutCreate(la, CUDA_R_16F, n, K, N);
-    else cublasLtMatrixLayoutCreate(la, CUDA_R_16F, K, n, K);
+void a_layout(cublasLtMatrixLayout_t *la, cudaDataType_t el, int a, int K, int N, int n) {
+    if (a == PULSAR_LT_A_KN) cublasLtMatrixLayoutCreate(la, el, n, K, N);
+    else cublasLtMatrixLayoutCreate(la, el, K, n, K);
 }
 
 /** Finds or builds the cached shape (descriptor + heuristic algorithm at canon_rows(cls) rows, reduction NONE).
+ *  @param el  the element type of A and X
  *  @param a   pulsar_lt_a layout id
  *  @param cls pulsar_lt_rows row class
  *  @param K   reduction depth
  *  @param N   full output width
  *  @param tag caller's name for the refusal message
  *  @return the shape, or NULL (refused on stderr: no algorithm) */
-const lt_shape *shape_for(int a, int cls, int K, int N, const char *tag) {
+const lt_shape *shape_for(cudaDataType_t el, int a, int cls, int K, int N, const char *tag) {
     for (lt_shape &sh : g_shapes)
-        if (sh.valid && sh.a == a && sh.cls == cls && sh.K == K && sh.N == N) return &sh;
+        if (sh.valid && sh.el == el && sh.a == a && sh.cls == cls && sh.K == K && sh.N == N) return &sh;
     lt_shape ns = {};
-    ns.a = a; ns.cls = cls; ns.K = K; ns.N = N;
+    ns.el = el; ns.a = a; ns.cls = cls; ns.K = K; ns.N = N;
     if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) return nullptr;
     if (a == PULSAR_LT_A_NK) {
         const cublasOperation_t t = CUBLAS_OP_T;
@@ -107,8 +113,8 @@ const lt_shape *shape_for(int a, int cls, int K, int N, const char *tag) {
     }
     const int R = canon_rows(cls);
     cublasLtMatrixLayout_t la, lb, ld;
-    a_layout(&la, a, K, N, N);
-    cublasLtMatrixLayoutCreate(&lb, CUDA_R_16F, K, R, K);
+    a_layout(&la, el, a, K, N, N);
+    cublasLtMatrixLayoutCreate(&lb, el, K, R, K);
     cublasLtMatrixLayoutCreate(&ld, CUDA_R_32F, N, R, N);
     cublasLtMatmulPreference_t pf;
     cublasLtMatmulPreferenceCreate(&pf);
@@ -124,7 +130,8 @@ const lt_shape *shape_for(int a, int cls, int K, int N, const char *tag) {
     cublasLtMatrixLayoutDestroy(ld);
     if (hs != CUBLAS_STATUS_SUCCESS || !got) {
         cublasLtMatmulDescDestroy(ns.op);
-        fprintf(stderr, "%s: no fixed-order cuBLASLt kernel for K=%d N=%d at %d rows -- refusing\n", tag, K, N, R);
+        fprintf(stderr, "%s: no fixed-order %s cuBLASLt kernel for K=%d N=%d at %d rows -- refusing\n", tag,
+                el == CUDA_R_16BF ? "bf16" : "fp16", K, N, R);
         return nullptr;
     }
     ns.algo = hr.algo;
@@ -134,7 +141,7 @@ const lt_shape *shape_for(int a, int cls, int K, int N, const char *tag) {
     if (slot.valid) {
         /* a call built on the evicted shape must not outlive it */
         for (lt_call &c : g_calls)
-            if (c.valid && c.a == slot.a && c.cls == slot.cls && c.K == slot.K && c.N == slot.N) {
+            if (c.valid && c.el == slot.el && c.a == slot.a && c.cls == slot.cls && c.K == slot.K && c.N == slot.N) {
                 cublasLtMatrixLayoutDestroy(c.la);
                 cublasLtMatrixLayoutDestroy(c.lb);
                 cublasLtMatrixLayoutDestroy(c.ld);
@@ -156,13 +163,13 @@ const lt_shape *shape_for(int a, int cls, int K, int N, const char *tag) {
  *  @return the call, or NULL (refused on stderr: the algorithm does not support it) */
 const lt_call *call_for(const lt_shape &sh, int M, int n, int ldd, const char *tag) {
     for (lt_call &c : g_calls)
-        if (c.valid && c.a == sh.a && c.cls == sh.cls && c.K == sh.K && c.N == sh.N && c.M == M && c.n == n &&
-            c.ldd == ldd)
+        if (c.valid && c.el == sh.el && c.a == sh.a && c.cls == sh.cls && c.K == sh.K && c.N == sh.N && c.M == M &&
+            c.n == n && c.ldd == ldd)
             return &c;
     lt_call nc = {};
-    nc.a = sh.a; nc.cls = sh.cls; nc.K = sh.K; nc.N = sh.N; nc.M = M; nc.n = n; nc.ldd = ldd;
-    a_layout(&nc.la, sh.a, sh.K, sh.N, n);
-    cublasLtMatrixLayoutCreate(&nc.lb, CUDA_R_16F, sh.K, M, sh.K);
+    nc.el = sh.el; nc.a = sh.a; nc.cls = sh.cls; nc.K = sh.K; nc.N = sh.N; nc.M = M; nc.n = n; nc.ldd = ldd;
+    a_layout(&nc.la, sh.el, sh.a, sh.K, sh.N, n);
+    cublasLtMatrixLayoutCreate(&nc.lb, sh.el, sh.K, M, sh.K);
     cublasLtMatrixLayoutCreate(&nc.ld, CUDA_R_32F, n, M, ldd);
     cublasLtMatmulHeuristicResult_t chk;
     const cublasStatus_t cs = cublasLtMatmulAlgoCheck(g_lt, sh.op, nc.la, nc.lb, nc.ld, nc.ld, &sh.algo, &chk);
@@ -186,10 +193,24 @@ const lt_call *call_for(const lt_shape &sh, int M, int n, int ldd, const char *t
     return &slot;
 }
 
-}  // namespace
-
-int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const void *a, int K, int N, int n_off, int n,
-                         const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag) {
+/** The fixed GEMM in either element type (pulsar_lt_fixed_gemm / _bf16: the header's contract).
+ *  @param el the element type of A and X (2 bytes each)
+ *  @return 0, -1 refused, -3 the GEMM failed */
+/// @param a_layout_id how A is stored (pulsar_lt_a)
+/// @param rows        the row class whose algorithm runs
+/// @param a           device weight A
+/// @param K           reduction depth
+/// @param N           A's full output width
+/// @param n_off       first output column of A to compute
+/// @param n           output columns
+/// @param x           device activations [M][K]
+/// @param M           activation rows
+/// @param d           device f32 output [M][ldd]
+/// @param ldd         d row pitch in floats
+/// @param stream      stream to launch on
+/// @param tag         caller's name for refusal messages
+int fixed_gemm(cudaDataType_t el, pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const void *a, int K, int N, int n_off,
+               int n, const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag) {
     if (!a || !x || !d || K <= 0 || N <= 0 || n <= 0 || n_off < 0 || n_off + n > N || M <= 0 || ldd < n) {
         fprintf(stderr, "%s: fixed GEMM: bad arguments (K=%d N=%d columns [%d, %d) M=%d ld %d) -- refusing\n", tag, K, N,
                 n_off, n_off + n, M, ldd);
@@ -205,10 +226,10 @@ int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const voi
         fprintf(stderr, "%s: the fixed GEMM's %zu B workspace refused -- refusing\n", tag, kWs);
         return -1;
     }
-    const lt_shape *sh = shape_for(a_layout_id, rows, K, N, tag);
+    const lt_shape *sh = shape_for(el, a_layout_id, rows, K, N, tag);
     const lt_call *c = sh ? call_for(*sh, M, n, ldd, tag) : nullptr;
     if (!c) return -1;
-    const uint16_t *ap = static_cast<const uint16_t *>(a);   /* fp16 elements */
+    const uint16_t *ap = static_cast<const uint16_t *>(a);   /* 2-byte elements (fp16 or bf16) */
     const void *a_cols = a_layout_id == PULSAR_LT_A_KN ? (const void *)(ap + n_off) : (const void *)(ap + (size_t)n_off * K);
     const float one = 1.0f, zero = 0.0f;
     /* L338: stream 0 here is the per-thread default stream (the engine builds --default-stream per-thread); cuBLAS,
@@ -221,4 +242,16 @@ int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const voi
         return -3;
     }
     return 0;
+}
+
+}  // namespace
+
+int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const void *a, int K, int N, int n_off, int n,
+                         const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag) {
+    return fixed_gemm(CUDA_R_16F, a_layout_id, rows, a, K, N, n_off, n, x, M, d, ldd, stream, tag);
+}
+
+int pulsar_lt_fixed_gemm_bf16(pulsar_lt_a a_layout_id, pulsar_lt_rows rows, const void *a, int K, int N, int n_off,
+                              int n, const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag) {
+    return fixed_gemm(CUDA_R_16BF, a_layout_id, rows, a, K, N, n_off, n, x, M, d, ldd, stream, tag);
 }

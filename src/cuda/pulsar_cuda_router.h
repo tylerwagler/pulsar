@@ -6,9 +6,12 @@
  * its shared experts are gated) and binds its layer's tensors (pulsar_router_layer: a selection bias, an image-slot
  * bias, a token-id table, a global scale); the engine owns the kernels.  Two launches:
  *
- *   logits   pulsar_router_logits_launch: bf16 rows x bf16 weight rows -> f32 logits, one fixed-order
- *            accumulation per (row, logit) whatever the batch width.  A family whose router weight takes another
- *            format computes its logits through the format front door (linear.cpp) instead.
+ *   logits   pulsar_router_logits_launch: bf16 rows x bf16 weight rows -> f32 logits [T][pulsar_router_logit_pitch],
+ *            one fixed-order accumulation per (row, logit) whatever the batch width -- per ARM (L336): decode / verify
+ *            rows on the CUDA-core kernel, prompt rows on the bf16 tensor cores (one fixed cuBLASLt algorithm), so
+ *            the two arms' logits differ in the last bits, like every other arm-sensitive launch.  A family whose
+ *            router weight takes another format computes its logits through the format front door (linear.cpp)
+ *            instead.
  *   select   pulsar_router_select_launch, one warp per row:
  *              score     s_e = f(l_e) over the routed logits l_0..l_{E-1} -- each logit read times logit_scale
  *                        (L338), then bf16-rounded when the family's decision is made on bf16 logits: softmax |
@@ -111,9 +114,24 @@ typedef struct pulsar_router_layer {
 /// @return E + S when the shared experts are logit-gated, else E
 int pulsar_router_logit_rows(const pulsar_router_cfg *c);
 
-/** logits [T][n_w + n_tail] f32 = x [T][hidden] (bf16) against bf16 weight rows w [n_w][hidden] then w_tail
- *  [n_tail][hidden] (NULL when n_tail is 0): f32 accumulation in one fixed order per (row, logit), so a row's logits
- *  do not depend on the rows beside it.  hidden % 8 == 0 and 16-byte aligned rows.  0 on success. */
+/** L336: the logits' row pitch for a router of `n_rows` logit rows -- rounded up to 4 floats, so every row starts
+ *  16-byte aligned (the tensor-core GEMM's output; Qwen's 513 rows at pitch 513 drew a 3x slower cuBLASLt kernel). */
+/// @param n_rows logit rows (pulsar_router_logit_rows)
+/// @return the pitch in floats (0 for n_rows <= 0)
+int pulsar_router_logits_ld(int n_rows);
+
+/** The logits' row pitch a router's buffers and launches use: pulsar_router_logits_ld(pulsar_router_logit_rows(c)). */
+/// @param c the router declaration (NULL: 0)
+/// @return the pitch in floats
+int pulsar_router_logit_pitch(const pulsar_router_cfg *c);
+
+/** logits [T][pulsar_router_logits_ld(n_w + n_tail)] f32 = x [T][hidden] (bf16) against bf16 weight rows w
+ *  [n_w][hidden] then w_tail [n_tail][hidden] (NULL when n_tail is 0), one fixed order per (row, logit) on each arm:
+ *  `prompt` rows (a prefill chunk's) run the routed rows as one bf16 tensor-core GEMM (pulsar_lt_fixed_gemm_bf16,
+ *  the prompt class's algorithm; sm_75, without bf16 tensor cores, keeps the kernel) and the tail rows on the
+ *  kernel; decode / verify rows run the CUDA-core kernel.  Either way a row's logits do not depend on the rows beside
+ *  it.  hidden % 8 == 0; 16-byte aligned rows and logits.  The columns past n_w + n_tail are not written.
+ *  0 on success. */
 /// @param x_bf16 device bf16 activations [T][hidden]
 /// @param T      token rows
 /// @param hidden hidden width (a multiple of 8)
@@ -121,20 +139,21 @@ int pulsar_router_logit_rows(const pulsar_router_cfg *c);
 /// @param n_w    rows in w (> 0)
 /// @param w_tail device bf16 trailing rows [n_tail][hidden] (the shared-expert gates), or NULL
 /// @param n_tail rows in w_tail (>= 0; non-zero exactly when w_tail is set)
-/// @param logits device f32 out [T][n_w + n_tail]
+/// @param prompt the rows are a prompt chunk's (the tensor-core arm), else decode / verify rows
+/// @param logits device f32 out [T][pulsar_router_logits_ld(n_w + n_tail)]
 /// @param stream stream to launch on
 /// @return 0, -1 refused (named on stderr), -3 launch failure
 int pulsar_router_logits_launch(const uint16_t *x_bf16, int T, int hidden, const uint16_t *w, int n_w,
-                                const uint16_t *w_tail, int n_tail, float *logits, cudaStream_t stream);
+                                const uint16_t *w_tail, int n_tail, bool prompt, float *logits, cudaStream_t stream);
 
-/** Route T rows from their logits [T][pulsar_router_logit_rows(c)]: selected [T][top_k] (pick order: descending
+/** Route T rows from their logits [T][pulsar_router_logit_pitch(c)]: selected [T][top_k] (pick order: descending
  *  selection score, or the table's order), weights [T][top_k], gammas [S][T] (one plane per gated shared expert;
  *  NULL when S == 0 or the gate is NONE), probs [T][E] = the unbiased scores (optional).  `tokens` [T] (device) is
  *  read by a layer with an alt_bias or a table (a table needs them).  Refuses (-1) a config or a shape without an
  *  instance; 0 on success. */
 /// @param c        the family's router declaration
 /// @param l        the layer's router tensors
-/// @param logits   device f32 [T][pulsar_router_logit_rows(c)]
+/// @param logits   device f32 [T][pulsar_router_logit_pitch(c)]
 /// @param tokens   device [T] token ids, or NULL (needed for a table)
 /// @param T        rows
 /// @param selected device out [T][top_k] expert ids

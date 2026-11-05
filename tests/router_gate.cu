@@ -4,7 +4,8 @@
  * table), Inkling-Small's, Nemotron 3.5 Super's and (L338) Gemma 4's (the logit scale, the per-expert scale) -- plus, when a fixture is given, Inkling's router on REAL router weights against
  * transformers' own InklingTopkRouter (tests/inkling_router_fixture.py).
  *
- *   A  logits: bf16 rows x bf16 weight rows (+ a tail) -> f32, vs double; a row's logits the same bytes at any T
+ *   A  logits: bf16 rows x bf16 weight rows (+ a tail) -> f32 at the pitch, vs double, on both arms (decode: the
+ *      CUDA-core kernel; prompt: the bf16 tensor-core GEMM, L336); a row's logits the same bytes at any T per arm
  *   B  select, per router: picks exact vs the host decision on the device's logits (a row whose k-th / (k+1)-th
  *      selection scores sit closer than the device's rounding is reported inconclusive, not graded), weights /
  *      gammas / scores vs double; batch-width neutrality (each row alone == its row in the batch, byte for byte)
@@ -275,7 +276,11 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
         pulsar_gpu_tensor_free(tp); pulsar_gpu_tensor_free(tt);
         return o;
     }
-    float *dlg = up(std::vector<float>(lg.begin(), lg.begin() + (size_t)T * R));
+    /* L336: the device reads the logits at the cfg's pitch */
+    const int P = pulsar_router_logit_pitch(&c);
+    std::vector<float> lgp((size_t)T * P, 0.0f);
+    for (int t = 0; t < T; t++) std::copy(lg.begin() + (size_t)t * R, lg.begin() + (size_t)(t + 1) * R, lgp.begin() + (size_t)t * P);
+    float *dlg = up(lgp);
     int32_t *dtok = up(std::vector<int32_t>(tok.begin(), tok.begin() + T));
     int32_t *dsel = (int32_t *)dalloc((size_t)T * K * 4);
     float *dw = (float *)dalloc((size_t)T * K * 4), *dg = S ? (float *)dalloc((size_t)S * T * 4) : nullptr,
@@ -297,44 +302,53 @@ static dev_out route(const router_case &rc, const std::vector<float> &lg, const 
 }
 
 static void section_logits(void) {
-    printf("A. router logits (bf16 x bf16 -> f32, fixed order)\n");
+    printf("A. router logits (bf16 x bf16 -> f32, fixed order, both arms)\n");
     struct shp { const char *name; int H, n_w, n_tail; };
     for (const shp &s : {shp{"Qwen 2560 x (512 + the shared gate row)", 2560, 512, 1},
                          shp{"Inkling 4096 x 258 (256 routed + 2 sink rows, one tensor)", 4096, 258, 0},
-                         shp{"Nemotron 4096 x 512 (no gate rows: an ungated shared expert)", 4096, 512, 0}}) {
-        const int T = 37, R = s.n_w + s.n_tail;
-        std::vector<uint16_t> x((size_t)T * s.H), w((size_t)R * s.H);
-        for (auto &v : x) v = f2bf((float)(0.7 * rndn()));
-        for (auto &v : w) v = f2bf((float)(0.02 * rndn()));
-        uint16_t *dx = up(x), *dw = up(w);
-        float *dl = (float *)dalloc((size_t)T * R * 4);
-        const uint16_t *tail = s.n_tail ? dw + (size_t)s.n_w * s.H : nullptr;
-        int rc = pulsar_router_logits_launch(dx, T, s.H, dw, s.n_w, tail, s.n_tail, dl, 0);
-        const auto L = down(dl, (size_t)T * R);
-        double worst = 0;
-        for (int t = 0; t < T; t++) {
-            std::vector<double> ref(R);
-            double mx = 0;
-            for (int e = 0; e < R; e++) {
-                double a = 0;
-                for (int k = 0; k < s.H; k++) a += (double)bf2f(x[(size_t)t * s.H + k]) * bf2f(w[(size_t)e * s.H + k]);
-                ref[e] = a;
-                mx = std::max(mx, fabs(a));
+                         shp{"Nemotron 4096 x 512 (no gate rows: an ungated shared expert)", 4096, 512, 0},
+                         shp{"Gemma 2816 x 128", 2816, 128, 0}})
+        for (const bool prompt : {false, true}) {
+            const char *arm = prompt ? "prompt arm" : "decode arm";
+            const int T = 37, R = s.n_w + s.n_tail, P = pulsar_router_logits_ld(R);
+            std::vector<uint16_t> x((size_t)T * s.H), w((size_t)R * s.H);
+            for (auto &v : x) v = f2bf((float)(0.7 * rndn()));
+            for (auto &v : w) v = f2bf((float)(0.02 * rndn()));
+            uint16_t *dx = up(x), *dw = up(w);
+            float *dl = (float *)dalloc((size_t)T * P * 4);
+            const uint16_t *tail = s.n_tail ? dw + (size_t)s.n_w * s.H : nullptr;
+            int rc = pulsar_router_logits_launch(dx, T, s.H, dw, s.n_w, tail, s.n_tail, prompt, dl, 0);
+            const auto L = down(dl, (size_t)T * P);
+            double worst = 0;
+            for (int t = 0; t < T; t++) {
+                std::vector<double> ref(R);
+                double mx = 0;
+                for (int e = 0; e < R; e++) {
+                    double a = 0;
+                    for (int k = 0; k < s.H; k++) a += (double)bf2f(x[(size_t)t * s.H + k]) * bf2f(w[(size_t)e * s.H + k]);
+                    ref[e] = a;
+                    mx = std::max(mx, fabs(a));
+                }
+                for (int e = 0; e < R; e++) worst = std::max(worst, fabs(L[(size_t)t * P + e] - ref[e]) / mx);
             }
-            for (int e = 0; e < R; e++) worst = std::max(worst, fabs(L[(size_t)t * R + e] - ref[e]) / mx);
+            CHECK(rc == 0 && worst < 1e-5, "%s, %s: vs double, max rel %.2e (f32 accumulation order)", s.name, arm,
+                  worst);
+            size_t diff = 0;
+            for (int Tn : {1, 8}) {
+                const int t0 = 5;
+                rc |= pulsar_router_logits_launch(dx + (size_t)t0 * s.H, Tn, s.H, dw, s.n_w, tail, s.n_tail, prompt,
+                                                  dl, 0);
+                const auto L2 = down(dl, (size_t)Tn * P);
+                for (int t = 0; t < Tn; t++)
+                    diff += memcmp(&L2[(size_t)t * P], &L[(size_t)(t0 + t) * P], (size_t)R * 4) != 0;
+            }
+            CHECK(rc == 0 && diff == 0, "%s, %s: T = 1 and T = 8 rows bit-identical to the T = %d run's", s.name, arm, T);
+            cudaFree(dx); cudaFree(dw); cudaFree(dl);
         }
-        CHECK(rc == 0 && worst < 1e-5, "%s: vs double, max rel %.2e (f32 accumulation order)", s.name, worst);
-        size_t diff = 0;
-        for (int Tn : {1, 8}) {
-            const int t0 = 5;
-            rc |= pulsar_router_logits_launch(dx + (size_t)t0 * s.H, Tn, s.H, dw, s.n_w, tail, s.n_tail, dl, 0);
-            const auto L2 = down(dl, (size_t)Tn * R);
-            diff += memcmp(L2.data(), &L[(size_t)t0 * R], L2.size() * 4) != 0;
-        }
-        CHECK(rc == 0 && diff == 0, "%s: T = 1 and T = 8 rows bit-identical to the T = %d run's", s.name, T);
-        cudaFree(dx); cudaFree(dw); cudaFree(dl);
-    }
-    CHECK(pulsar_router_logits_launch(nullptr, 1, 2560, nullptr, 512, nullptr, 0, nullptr, 0) != 0,
+    CHECK(pulsar_router_logits_ld(513) == 516 && pulsar_router_logits_ld(512) == 512 &&
+              pulsar_router_logits_ld(258) == 260 && pulsar_router_logits_ld(0) == 0,
+          "the logits pitch rounds the logit rows up to 4 floats");
+    CHECK(pulsar_router_logits_launch(nullptr, 1, 2560, nullptr, 512, nullptr, 0, false, nullptr, 0) != 0,
           "null rows are refused");
 }
 
@@ -557,15 +571,16 @@ static void section_inkling_mini(const char *path) {
               layer, E, K, S, sc[0]);
         if (!shape_ok) continue;
         uint16_t *dx = up(x), *dW = up(W);
-        float *dl = (float *)dalloc((size_t)T * R * 4), *db = up(bias), *dgs = up(std::vector<float>{sc[1]});
+        const int P = pulsar_router_logits_ld(R);
+        float *dl = (float *)dalloc((size_t)T * P * 4), *db = up(bias), *dgs = up(std::vector<float>{sc[1]});
         float *dw = (float *)dalloc((size_t)T * K * 4), *dg = (float *)dalloc((size_t)S * T * 4);
         int32_t *dsel = (int32_t *)dalloc((size_t)T * K * 4);
         pulsar_router_layer l{};
         l.bias = db;
         l.global_scale = dgs;
-        int rc = pulsar_router_logits_launch(dx, T, H, dW, R, nullptr, 0, dl, 0);
+        int rc = pulsar_router_logits_launch(dx, T, H, dW, R, nullptr, 0, true, dl, 0);   /* a prompt's rows */
         if (!rc) rc = pulsar_router_select_launch(&c, &l, dl, nullptr, T, dsel, dw, dg, nullptr, 0);
-        const auto L = down(dl, (size_t)T * R);
+        const auto L = down(dl, (size_t)T * P);
         const auto Sel = down(dsel, (size_t)T * K);
         const auto Wt = down(dw, (size_t)T * K);
         const auto G = down(dg, (size_t)S * T);
@@ -573,7 +588,7 @@ static void section_inkling_mini(const char *path) {
         for (int t = 0; t < T; t++) {
             double mx = 0;
             for (int e = 0; e < R; e++) mx = std::max(mx, (double)fabsf(rlg[(size_t)t * R + e]));
-            for (int e = 0; e < R; e++) lworst = std::max(lworst, fabs(L[(size_t)t * R + e] - rlg[(size_t)t * R + e]) / mx);
+            for (int e = 0; e < R; e++) lworst = std::max(lworst, fabs(L[(size_t)t * P + e] - rlg[(size_t)t * R + e]) / mx);
         }
         CHECK(rc == 0 && lworst < 1e-5, "layer %d: logits vs transformers' fp32 F.linear, max rel %.2e", layer, lworst);
         int set_bad = 0, inconclusive = 0;

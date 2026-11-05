@@ -36,9 +36,9 @@
  *     in bf16); the shared expert added to the back projection's output in f32 before the one bf16 rounding of the
  *     block's delta (vLLM adds two bf16 tensors).
  *
- * ROW KINDS (L284 #2): every arm-sensitive launch (the linears, the routed experts) runs rows [0, n_dec) on the decode
- * arms and [n_dec, n_rows) on the prompt arms; the router, the row ops, the Mamba-2 block and F1 are one arithmetic at
- * any row count.  So a prompt cut anywhere is the cold prefill's bytes (the plan is split-invariant), and a decode row
+ * ROW KINDS (L284 #2): every arm-sensitive launch (the linears, the router's logits (L336), the routed experts) runs
+ * rows [0, n_dec) on the decode arms and [n_dec, n_rows) on the prompt arms; the router's select, the row ops, the
+ * Mamba-2 block and F1 are one arithmetic at any row count.  So a prompt cut anywhere is the cold prefill's bytes (the plan is split-invariant), and a decode row
  * is the same bytes alone or batched.
  *
  * STATE (state_kinds.h; nemotron_h.h PULSAR_NEMOTRON_H_STATE_*): a Mamba-2 layer's SSM state (FIXED, a verify's DELTA
@@ -1094,8 +1094,13 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
     pulsar_router_layer rl{};
     rl.bias = (const float *)wp(st, L.router_select_bias, "nemotron_h router bias");
     const uint16_t *rw = (const uint16_t *)wp(st, L.router, "nemotron_h router");
+    /* L336: the logits take the row-kind segments (a prompt chunk's on the tensor cores); the select stays whole */
+    const size_t lg_ld = (size_t)pulsar_router_logit_pitch(&rc);
     if (!rw || !rl.bias ||
-        pulsar_router_logits_launch(xn, (int)n, E, rw, bs.n_logit_rows, NULL, 0, parts.logits, rs) != 0 ||
+        !arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            return pulsar_router_logits_launch(xn + (size_t)r0 * E, (int)rows, E, rw, bs.n_logit_rows, NULL, 0, prompt,
+                                               parts.logits + r0 * lg_ld, rs) == 0;
+        }) ||
         pulsar_router_select_launch(&rc, &rl, parts.logits, NULL, (int)n, parts.sel, parts.wts, NULL, NULL, rs) != 0)
         return refuse("the router refused");
     /* the routed experts through the core's front door (moe.cpp): up-only relu^2 on the latent, wrapped in the two
