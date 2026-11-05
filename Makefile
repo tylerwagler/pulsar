@@ -673,6 +673,10 @@ tests/router_gate: tests/router_gate.cu src/cuda/pulsar_cuda_router.h src/cuda/p
                    $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/router_gate.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+# L336: writes src/cuda/pulsar_cuda_lt_picks.inc (pulsar_lt_fixed's committed kernel choices) -- a measurement tool,
+# not a gate: run it on a quiet device, `tests/lt_picks --from-log <server log>` (the "fixed GEMM" lines name the shapes).
+tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 .PHONY: router-gate
 router-gate: tests/router_gate
 	@if [ -d "$(INKLING_MINI_DIR)" ] && [ -f "$(INKLING_MINI_REF)" ] && [ -x "$(INKLING_PY)" ]; then \
