@@ -1097,15 +1097,19 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
     const uint16_t *shared_gate_w = (const uint16_t *)wptr(st, L.sh_gate_scalar, "qwen shared_expert_gate");
     const pulsar_router_cfg rcfg = pulsar_qwen_router_cfg((int)s->n_expert, (int)s->n_expert_used);
     const pulsar_router_layer rlayer{};   /* no selection bias, no table, no global scale */
+    /* L336: the logits take the row-kind segments (a prompt chunk's on the tensor cores); the select stays whole */
+    const size_t lg_ld = (size_t)pulsar_router_logit_pitch(&rcfg);
     if (!router_w || !shared_gate_w ||
-        pulsar_router_logits_launch(x, (int)n, H, router_w, rcfg.n_expert, shared_gate_w, rcfg.n_shared, parts.logits,
-                                    0) != 0 ||
+        !arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            return pulsar_router_logits_launch(x + (size_t)r0 * H, (int)rows, H, router_w, rcfg.n_expert, shared_gate_w,
+                                               rcfg.n_shared, prompt, parts.logits + r0 * lg_ld, 0) == 0;
+        }) ||
         pulsar_router_select_launch(&rcfg, &rlayer, parts.logits, nullptr, (int)n, parts.sel, parts.wts, parts.gammas,
                                     nullptr, 0) != 0)
         return false;
     /* the routed experts through the core's front door (moe.cpp): the trunk's gate_up is ONE fused stack, the MTP
-     * layer's gate and up are two; under TP the rank reads its plan's range of whole experts.  L284 #2: the router
-     * above has no arm (one kernel at every row count, each row's logits / picks its own) and stays whole; the
+     * layer's gate and up are two; under TP the rank reads its plan's range of whole experts.  L284 #2: the router's
+     * select above has no arm (each row's picks its own) and stays whole, its logits (L336) and the
      * routed part and the shared expert take the row-kind segments -- a row's output reads its own x and picks
      * alone (the grouped GEMMs, the fold and the sum index each (row, pick)), the workspace is reused from 0 */
     const uint32_t K = s->n_expert_used;

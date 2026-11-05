@@ -220,14 +220,14 @@ static int qwen_router(const uint16_t *x, const uint16_t *wr, const uint16_t *ws
                        int32_t *sel, float *w, float *sg, int top_k = TOPK) {
     const pulsar_router_cfg c = pulsar_qwen_router_cfg(E, top_k);
     const pulsar_router_layer l{};
-    int rc = pulsar_router_logits_launch(x, T, hidden, wr, c.n_expert, wsg, c.n_shared, lg, 0);
+    int rc = pulsar_router_logits_launch(x, T, hidden, wr, c.n_expert, wsg, c.n_shared, false, lg, 0);
     if (!rc) rc = pulsar_router_select_launch(&c, &l, lg, nullptr, T, sel, w, sg, nullptr, 0);
     return rc;
 }
 
 static void section_router(void) {
     printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
-    const int T = 37;
+    const int T = 37, LP = pulsar_router_logits_ld(E + 1);   /* L336: the logits' pitch */
     std::vector<uint16_t> x = rnd_act(T, H, 0.6), wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
     /* the tie: token 0's rows 100..108 dominate, rows 7 and 300 are identical and
      * rank 10 / 11 -- exactly one of them makes the top-10, and it must be 7 */
@@ -237,11 +237,11 @@ static void section_router(void) {
         wr[(size_t)7 * H + k] = wr[(size_t)300 * H + k] = to_bf(0.05 * sgn);
     }
     uint16_t *dx = up(x), *dwr = up(wr), *dwsg = up(wsg);
-    float *lg = (float *)dalloc((size_t)T * (E + 1) * 4), *w = (float *)dalloc((size_t)T * TOPK * 4), *sg = (float *)dalloc(T * 4);
+    float *lg = (float *)dalloc((size_t)T * LP * 4), *w = (float *)dalloc((size_t)T * TOPK * 4), *sg = (float *)dalloc(T * 4);
     int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
     int rc = qwen_router(dx, dwr, dwsg, T, H, lg, sel, w, sg);
     CHECK(rc == 0, "launch T=%d", T);
-    const auto L = down(lg, (size_t)T * (E + 1));
+    const auto L = down(lg, (size_t)T * LP);
     const auto Sel = down(sel, (size_t)T * TOPK);
     const auto W = down(w, (size_t)T * TOPK);
     const auto SG = down(sg, T);
@@ -252,10 +252,10 @@ static void section_router(void) {
         router_logits(&x[(size_t)t * H], wr.data(), wsg.data(), ref.data());
         double sc = 0;
         for (int e = 0; e <= E; e++) sc = fmax(sc, fabs(ref[e]));
-        for (int e = 0; e <= E; e++) lmax = fmax(lmax, fabs(L[(size_t)t * (E + 1) + e] - ref[e]) / sc);
+        for (int e = 0; e <= E; e++) lmax = fmax(lmax, fabs(L[(size_t)t * LP + e] - ref[e]) / sc);
         int32_t hs[TOPK];
         double hw[TOPK], hsg;
-        router_select(&L[(size_t)t * (E + 1)], hs, hw, &hsg);
+        router_select(&L[(size_t)t * LP], hs, hw, &hsg);
         for (int k = 0; k < TOPK; k++) {
             sel_bad += hs[k] != Sel[(size_t)t * TOPK + k];
             w_bad += bf_ulps(W[(size_t)t * TOPK + k], hw[k]) > 1.0;
@@ -274,9 +274,10 @@ static void section_router(void) {
     for (int Tn : {1, 8}) {
         const int t0 = 5;
         rc = qwen_router(dx + (size_t)t0 * H, dwr, dwsg, Tn, H, lg, sel, w, sg);
-        const auto L2 = down(lg, (size_t)Tn * (E + 1));
+        const auto L2 = down(lg, (size_t)Tn * LP);
         const auto S2 = down(sel, (size_t)Tn * TOPK);
-        diff += memcmp(L2.data(), &L[(size_t)t0 * (E + 1)], L2.size() * 4) != 0;
+        for (int t = 0; t < Tn; t++)   /* the logit rows; the pitch's padding is not written */
+            diff += memcmp(&L2[(size_t)t * LP], &L[(size_t)(t0 + t) * LP], (size_t)(E + 1) * 4) != 0;
         diff += memcmp(S2.data(), &Sel[(size_t)t0 * TOPK], S2.size() * 4) != 0;
     }
     CHECK(diff == 0, "T = 1 and T = 8 rows bit-identical to the T = %d run's (logits and selection)", T);
@@ -906,7 +907,8 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
               "rel Frobenius %.2e (f32 reassociation, bar 1e-5)", T, split ? " split experts" : "", ep_worst);
     }
     /* the device's routing, from the router alone on the same rows */
-    float *lg = (float *)dalloc((size_t)T * (E + 1) * 4), *rw = (float *)dalloc((size_t)T * TOPK * 4), *rs = (float *)dalloc(T * 4);
+    const int LP = pulsar_router_logits_ld(E + 1);   /* L336: the logits' pitch */
+    float *lg = (float *)dalloc((size_t)T * LP * 4), *rw = (float *)dalloc((size_t)T * TOPK * 4), *rs = (float *)dalloc(T * 4);
     int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
     qwen_router(dx, router_w, shared_gate_w, T, H, lg, sel, rw, rs);
     const auto Sel = down(sel, (size_t)T * TOPK);

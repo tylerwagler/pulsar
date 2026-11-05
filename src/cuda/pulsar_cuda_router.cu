@@ -8,6 +8,7 @@
  * families now differ only in the cfg they declare. */
 #include "pulsar_cuda_router.h"
 #include "pulsar_cuda_arch.cuh"
+#include "pulsar_cuda_lt_fixed.h"
 
 #include <cuda_bf16.h>
 #include <math.h>
@@ -69,8 +70,8 @@ __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat1
     }
 }
 
-/** Router logits: logits[t][e] = dot(x[t], row e), row e < n_w from w, else w_tail[e - n_w].  Grid
- *  (ceil(n_rows / kLogitsWarps), ceil(T / TB)); block kLogitsWarps * 32 (one warp a logit row); no smem.
+/** Router logits: logits[t][e] = dot(x[t], row e) for e in [e0, n_rows), row e < n_w from w, else w_tail[e - n_w].
+ *  Grid (ceil((n_rows - e0) / kLogitsWarps), ceil(T / TB)); block kLogitsWarps * 32 (one warp a logit row); no smem.
  *  @tparam TB     tokens per CTA row (the launch picks it from the call's shape)
  *  @param x      bf16 activations [T][H], 16-byte aligned rows
  *  @param H      hidden width (a multiple of 8)
@@ -78,14 +79,17 @@ __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat1
  *  @param n_w    rows in w
  *  @param w_tail bf16 trailing rows [n_rows - n_w][H] (shared-expert gate rows), or NULL when none
  *  @param n_rows logit row width = n_w + tail rows
+ *  @param e0     first logit row computed (0, or n_w: the tail rows beside a prompt chunk's GEMM, L336)
+ *  @param ld     logits row pitch in floats (pulsar_router_logits_ld(n_rows))
  *  @param T      token rows
- *  @param logits f32 output [T][n_rows] */
+ *  @param logits f32 output [T][ld] */
 template <int TB>
 __global__ void __launch_bounds__(kLogitsWarps * 32)
 router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bfloat16 *__restrict__ w, int n_w,
-                     const __nv_bfloat16 *__restrict__ w_tail, int n_rows, int T, float *__restrict__ logits) {
+                     const __nv_bfloat16 *__restrict__ w_tail, int n_rows, int e0, int ld, int T,
+                     float *__restrict__ logits) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int e = blockIdx.x * kLogitsWarps + warp;
+    const int e = e0 + blockIdx.x * kLogitsWarps + warp;
     if (e >= n_rows) return;                      /* whole warps */
     const int t0 = blockIdx.y * TB;
     const int nt = min(TB, T - t0);
@@ -108,7 +112,7 @@ router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bflo
         float v = acc[tt];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-        if (lane == 0 && tt < nt) logits[(size_t)(t0 + tt) * n_rows + e] = v;
+        if (lane == 0 && tt < nt) logits[(size_t)(t0 + tt) * ld + e] = v;
     }
 }
 
@@ -145,7 +149,7 @@ struct router_args {
     pulsar_router_cfg c;
     /// the layer's router tensors (device pointers)
     pulsar_router_layer l;
-    int n_rows;               ///< logit row width
+    int ld;                   ///< logits row pitch in floats (pulsar_router_logits_ld)
 };
 
 /* One warp per row: each lane holds the NE / 32 experts lane, lane + 32, ...  The picks are the TOPK first experts in
@@ -161,7 +165,7 @@ struct router_args {
  *  @tparam NE   routed experts (a multiple of 32)
  *  @tparam TOPK picks per row (<= 32)
  *  @param a        cfg, layer and logit row width
- *  @param logits   f32 [T][a.n_rows]
+ *  @param logits   f32 [T][a.ld]
  *  @param tokens   device token ids [T], or NULL (read for alt_bias and a table)
  *  @param T        token rows
  *  @param selected expert ids out [T][TOPK], in pick order
@@ -185,7 +189,7 @@ router_select_kernel(router_args a, const float *__restrict__ logits, const int3
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = blockIdx.x * kSelectWarps + warp;
     if (t >= T) return;
-    const float *lg = logits + (size_t)t * a.n_rows;
+    const float *lg = logits + (size_t)t * a.ld;
     int32_t *sel = selected + (size_t)t * TOPK;
     float *w = weights + (size_t)t * TOPK;
     const int S = c.shared_gate == PULSAR_ROUTER_SHARED_NONE ? 0 : c.n_shared;
@@ -446,40 +450,67 @@ extern "C" int pulsar_router_logit_rows(const pulsar_router_cfg *c) {
     return c ? c->n_expert + (c->shared_gate == PULSAR_ROUTER_SHARED_NONE ? 0 : c->n_shared) : 0;
 }
 
+extern "C" int pulsar_router_logits_ld(int n_rows) { return n_rows > 0 ? (n_rows + 3) & ~3 : 0; }
+
+extern "C" int pulsar_router_logit_pitch(const pulsar_router_cfg *c) {
+    return pulsar_router_logits_ld(pulsar_router_logit_rows(c));
+}
+
 /// Launch router_logits_kernel<TB> (one instance per tokens-a-CTA-row the launch picks).
 /// @tparam TB tokens per CTA row
 template <int TB>
 static void logits_go(dim3 grid, cudaStream_t stream, const __nv_bfloat16 *x, int H, const __nv_bfloat16 *w, int n_w,
-                      const __nv_bfloat16 *w_tail, int n_rows, int T, float *logits) {
-    router_logits_kernel<TB><<<grid, kLogitsWarps * 32, 0, stream>>>(x, H, w, n_w, w_tail, n_rows, T, logits);
+                      const __nv_bfloat16 *w_tail, int n_rows, int e0, int ld, int T, float *logits) {
+    router_logits_kernel<TB><<<grid, kLogitsWarps * 32, 0, stream>>>(x, H, w, n_w, w_tail, n_rows, e0, ld, T, logits);
 }
 
 extern "C" int pulsar_router_logits_launch(const uint16_t *x_bf16, int T, int hidden, const uint16_t *w, int n_w,
-                                           const uint16_t *w_tail, int n_tail, float *logits, cudaStream_t stream) {
+                                           const uint16_t *w_tail, int n_tail, bool prompt, float *logits,
+                                           cudaStream_t stream) {
     if (!x_bf16 || !w || !logits || T <= 0 || hidden <= 0 || hidden % 8 || n_w <= 0 || n_tail < 0 ||
         (n_tail > 0) != (w_tail != nullptr)) {
         fprintf(stderr, "pulsar: router logits: %d rows of %d (a multiple of 8), %d + %d logit rows, or a null pointer "
                         "-- refusing\n", T, hidden, n_w, n_tail);
         return -1;
     }
-    if (((uintptr_t)x_bf16 | (uintptr_t)w | (uintptr_t)w_tail) & 15u) {
-        fprintf(stderr, "pulsar: router logits: bf16 rows must be 16-byte aligned -- refusing\n");
+    if (((uintptr_t)x_bf16 | (uintptr_t)w | (uintptr_t)w_tail | (uintptr_t)logits) & 15u) {
+        fprintf(stderr, "pulsar: router logits: bf16 rows and the logits must be 16-byte aligned -- refusing\n");
         return -1;
     }
-    const int n_rows = n_w + n_tail;
+    const int n_rows = n_w + n_tail, ld = pulsar_router_logits_ld(n_rows);
+    const auto *xb = (const __nv_bfloat16 *)x_bf16, *wb = (const __nv_bfloat16 *)w, *wt = (const __nv_bfloat16 *)w_tail;
+    /* L336: a prompt chunk's routed rows are one GEMM on the bf16 tensor cores (pulsar_lt_fixed_gemm_bf16, the prompt
+     * class's one algorithm: a row's logits are the same bytes wherever the prompt is cut), its tail rows (the shared
+     * gates, n_tail of them) the kernel below.  GB10, 4096 rows: Qwen 512 x 2560 3.67 -> ~0.3 ms a layer, Nemotron
+     * 512 x 4096 5.70 -> 0.32, Gemma 128 x 2816 1.05 -> 0.06.  sm_75 has no bf16 tensor cores: there the prompt rows
+     * stay on the kernel -- the arm the device can run, said once. */
+    int e0 = 0;
+    if (prompt) {
+        static bool said_cores = false;
+        if (pulsar_cuda_device_cc() >= 80) {
+            const int rc = pulsar_lt_fixed_gemm_bf16(PULSAR_LT_A_NK, PULSAR_LT_PROMPT, w, hidden, n_w, 0, n_w, x_bf16,
+                                                     T, logits, ld, stream, "pulsar: router logits");
+            if (rc) return rc;
+            if (n_tail == 0) return 0;
+            e0 = n_w;
+        } else if (!said_cores) {
+            said_cores = true;
+            fprintf(stderr, "pulsar: router logits: prompt rows on the CUDA cores (sm_%d has no bf16 tensor cores)\n",
+                    pulsar_cuda_device_cc());
+        }
+    }
     /* L349: tokens a CTA row by the call's shape (a token's logit is the same arithmetic at any TB).  A narrow router's
      * decode / verify call spreads its few tokens over more CTAs -- 128 logit rows are only 32 CTAs a token row:
      * RTX 5000, cold, Gemma 128 x 2816 T 1 / 4 / 8 / 16 13.4 / 25.1 / 42.0 / 42.6 us at TB 8 -> 9.2 / 11.5 / 14.7 /
      * 22.5.  A prompt chunk (fewer re-reads of the weight rows) and a 512-row router (already 128 CTAs) keep
      * kLogitsTB: on GB10 a Qwen 512 x 2560 router at TB 4 measured +4..+25 % at T 1-32 (noisy, not cleared). */
     const int TB = T >= 64 || n_rows >= 512 ? kLogitsTB : T <= 4 ? 1 : T <= 16 ? 2 : 4;
-    const dim3 grid((unsigned)((n_rows + kLogitsWarps - 1) / kLogitsWarps), (unsigned)((T + TB - 1) / TB));
-    const auto *xb = (const __nv_bfloat16 *)x_bf16, *wb = (const __nv_bfloat16 *)w, *wt = (const __nv_bfloat16 *)w_tail;
+    const dim3 grid((unsigned)((n_rows - e0 + kLogitsWarps - 1) / kLogitsWarps), (unsigned)((T + TB - 1) / TB));
     switch (TB) {
-    case 1: logits_go<1>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
-    case 2: logits_go<2>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
-    case 4: logits_go<4>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
-    default: logits_go<kLogitsTB>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
+    case 1: logits_go<1>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, e0, ld, T, logits); break;
+    case 2: logits_go<2>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, e0, ld, T, logits); break;
+    case 4: logits_go<4>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, e0, ld, T, logits); break;
+    default: logits_go<kLogitsTB>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, e0, ld, T, logits); break;
     }
     return launch_ok("logits") ? 0 : -3;
 }
@@ -510,7 +541,7 @@ extern "C" int pulsar_router_select_launch(const pulsar_router_cfg *c, const pul
                 (double)c->logit_scale);
         return -1;
     }
-    const router_args a{*c, *l, pulsar_router_logit_rows(c)};
+    const router_args a{*c, *l, pulsar_router_logit_pitch(c)};
     const unsigned grid = (unsigned)((T + kSelectWarps - 1) / kSelectWarps);
     const int E = c->n_expert, K = c->top_k;
 #define PULSAR_ROUTER_ARM(NE, TOPK)                                                                                   \

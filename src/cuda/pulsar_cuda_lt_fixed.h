@@ -1,5 +1,5 @@
 /** @file
- *  The fixed-algorithm fp16 cuBLASLt GEMM contract (row-count independent bytes). */
+ *  The fixed-algorithm fp16 / bf16 cuBLASLt GEMM contract (row-count independent bytes). */
 /* The fixed-algorithm fp16 GEMM (L321; L266's contract, out of qwen_exl3_dense_prefill.cu): D = f32(B . A) on the
  * fp16 tensor cores (sm_75+), cuBLASLt, f32 accumulate and output, with ONE algorithm per (A's layout, K, N, row
  * class) -- chosen once at the class's canonical row count with the reduction scheme pinned to NONE (no split-K), and
@@ -47,5 +47,24 @@ enum pulsar_lt_rows { PULSAR_LT_PROMPT = 0, PULSAR_LT_DECODE = 1 };
 /// @param tag      caller's name for refusal messages
 int pulsar_lt_fixed_gemm(pulsar_lt_a a_layout, pulsar_lt_rows rows, const void *a, int K, int N, int n_off, int n,
                          const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag);
+
+/** L336: pulsar_lt_fixed_gemm with bf16 A and X (the bf16 tensor cores: sm_80+; on sm_75 cuBLASLt has no such kernel
+ *  and the call refuses).  Same contract: one algorithm per (A's layout, K, N, row class), no split-K.
+ *  @return 0, -1 refused (named on stderr), -3 the GEMM failed. */
+/// @param a_layout how A is stored (pulsar_lt_a)
+/// @param rows     the row class whose algorithm runs
+/// @param a        device bf16 weight A
+/// @param K        reduction depth
+/// @param N        A's full output width
+/// @param n_off    first output column of A to compute
+/// @param n        output columns (n_off + n <= N)
+/// @param x        device bf16 activations [M][K]
+/// @param M        activation rows
+/// @param d        device f32 output [M][ldd]
+/// @param ldd      d row pitch in floats (>= n)
+/// @param stream   stream to launch on
+/// @param tag      caller's name for refusal messages
+int pulsar_lt_fixed_gemm_bf16(pulsar_lt_a a_layout, pulsar_lt_rows rows, const void *a, int K, int N, int n_off,
+                              int n, const void *x, int M, float *d, int ldd, cudaStream_t stream, const char *tag);
 
 #endif

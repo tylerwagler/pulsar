@@ -34,8 +34,9 @@
  *   - the routed weight folded into each expert's GeGLU row before its bf16 rounding (F7's fold), the routed sum kept
  *     f32 into one bf16 rounding; HF multiplies each bf16 expert output by its f32 weight and index-adds in bf16.
  *
- * ROW KINDS (L284 #2): every arm-sensitive launch (the linears, the routed experts) runs rows [0, n_dec) on the decode
- * arms and [n_dec, n_rows) on the prompt arms; the router, the row ops and F1 are one arithmetic at any row count.
+ * ROW KINDS (L284 #2): every arm-sensitive launch (the linears, the router's logits (L336), the routed experts) runs
+ * rows [0, n_dec) on the decode arms and [n_dec, n_rows) on the prompt arms; the router's select, the row ops and F1
+ * are one arithmetic at any row count.
  *
  * STATE (state_kinds.h; gemma4.h PULSAR_GEMMA4_STATE_*): a window layer's K|V ring (RING of W - 1 + verify rows
  * slots), a global layer's K|V pool (POOL).  The core allocates, prices, pages, walks and commits it. */
@@ -990,7 +991,13 @@ bool ffn(const g4_step *st, uint32_t il, uint8_t *base, const ffn_scratch &F) {
     pulsar_router_layer rl{};
     rl.expert_scale = (const float *)dptr(st->st->escale) + (size_t)il * s.n_expert;
     const uint16_t *rw = (const uint16_t *)wp(st, L.router, "gemma4 router");
-    if (!rw || pulsar_router_logits_launch(xr, (int)n, (int)E, rw, bs.n_logit_rows, NULL, 0, parts.logits, NULL) != 0 ||
+    /* L336: the logits take the row-kind segments (a prompt chunk's on the tensor cores, where the device has bf16
+     * ones); the select stays whole */
+    const size_t lg_ld = (size_t)pulsar_router_logit_pitch(&rc);
+    if (!rw || !arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t rows) {
+            return pulsar_router_logits_launch(xr + (size_t)r0 * E, (int)rows, (int)E, rw, bs.n_logit_rows, NULL, 0,
+                                               prompt, parts.logits + r0 * lg_ld, NULL) == 0;
+        }) ||
         pulsar_router_select_launch(&rc, &rl, parts.logits, NULL, (int)n, parts.sel, parts.wts, NULL, NULL, NULL) != 0)
         return failf("the router refused", il);
     /* the routed GeGLU experts on xm through the core's front door (moe.cpp): the EXL3 gate + up pair and down */
