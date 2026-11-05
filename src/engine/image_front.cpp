@@ -296,21 +296,21 @@ bool pulsar_image_refuse_orphans(const pulsar_engine *e, const pulsar_tokens *pr
     return true;
 }
 
-void pulsar_image_licence_decide(const pulsar_session *s, const pulsar_tokens *prompt,
-                                 const pulsar_image_ref *images, int n_images, pulsar_image_licence *out) {
+void pulsar_image_licence_decide(const pulsar_engine *e, const pulsar_tokens *live, const pulsar_image_identity *held_ids,
+                                 const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
+                                 pulsar_image_licence *out) {
     memset(out, 0, sizeof *out);
-    const pulsar_engine *e = s->engine;
-    /* The live history this prompt can keep: its common token prefix with the checkpoint (an echo that stops short
-     * of the live tail -- stripped reasoning, a rollback -- shares a prefix without extending it). */
-    const uint32_t live_len = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0u;
+    /* The history this prompt can keep: its common token prefix with it (an echo that stops short of the tail --
+     * stripped reasoning, a rollback -- shares a prefix without extending it). */
+    const uint32_t live_len = live ? (uint32_t)live->len : 0u;
     uint32_t ck = 0;
     const uint32_t lim = live_len < (uint32_t)prompt->len ? live_len : (uint32_t)prompt->len;
-    while (ck < lim && s->checkpoint.v[ck] == prompt->v[ck]) ck++;
+    while (ck < lim && live->v[ck] == prompt->v[ck]) ck++;
     out->live_len = live_len;
     out->common = ck;
-    /* The licence decides on an EXTENSION of the live tokens; a prompt that stops short or diverges is the family's
-     * seam / rebuild path, which re-enters with an extension or prefills cold. */
-    out->extends_live = s->checkpoint_valid && ck == live_len;
+    /* The licence decides on an EXTENSION of the history's tokens; a prompt that stops short or diverges is the
+     * family's seam / rebuild path, which re-enters with an extension or prefills cold. */
+    out->extends_live = live && ck == live_len;
     if (!out->extends_live) return;
     for (int i = 0; i < n_images && !out->straddles; i++) {
         int len = 0;
@@ -326,5 +326,23 @@ void pulsar_image_licence_decide(const pulsar_session *s, const pulsar_tokens *p
                                                      &held);
     out->n_held = held_ok ? (int)held.n : 0;
     out->held_end = held_ok ? pulsar_image_identity_end(&held) : 0u;
-    out->keep = !out->straddles && held_ok && pulsar_image_identity_equal(&s->live_images, &held);
+    pulsar_image_identity none;
+    none.n = 0;
+    out->keep = !out->straddles && held_ok && pulsar_image_identity_equal(held_ids ? held_ids : &none, &held);
+}
+
+bool pulsar_image_holds_below(const pulsar_engine *e, const pulsar_image_identity *held_ids,
+                              const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images, uint32_t G) {
+    for (int i = 0; i < n_images; i++) {
+        int len = 0;
+        (void)pulsar_image_block_extent(e, prompt->v, prompt->len, images[i].start_pos, &len);
+        if ((uint32_t)images[i].start_pos < G && (uint32_t)(images[i].start_pos + len) > G) return false;
+    }
+    pulsar_image_identity want, held;
+    held.n = 0;
+    if (held_ids) held = *held_ids;
+    if (!pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images, G, &want))
+        return false;
+    pulsar_image_identity_trim(&held, G);
+    return pulsar_image_identity_equal(&held, &want);
 }
