@@ -26,6 +26,54 @@ enum pulsar_lt_a { PULSAR_LT_A_KN = 0, PULSAR_LT_A_NK = 1 };
 /// PULSAR_LT_DECODE (PULSAR_GPU_MNEUTRAL_ROWS_MAX rows).
 enum pulsar_lt_rows { PULSAR_LT_PROMPT = 0, PULSAR_LT_DECODE = 1 };
 
+/** L336: one recorded kernel choice -- the committed table (pulsar_cuda_lt_picks.inc, written by tests/lt_picks) maps a
+ *  shape to the cuBLASLt algorithm that is fastest there AND keeps a row's bytes independent of the row count, so the
+ *  pick never depends on a timing taken at startup: bits change only when a new table is committed (and graded).  A
+ *  shape with no entry keeps cuBLASLt's first suggestion, the behaviour before the table.  Keyed by the device's
+ *  compute capability and cuBLASLt's version, since both change which kernels exist and what they compute. */
+typedef struct {
+    int cc;            ///< compute capability, major * 10 + minor (121 = GB10)
+    int lt_version;    ///< cublasLtGetVersion() the entry was measured with
+    int el;            ///< element type of A and X: 0 fp16, 1 bf16
+    int a;             ///< A's layout (pulsar_lt_a)
+    int cls;           ///< row class (pulsar_lt_rows)
+    int K, N;          ///< reduction depth, A's full output width
+    /** @var K
+     *  Reduction depth.
+     *  @var N
+     *  A's full output width. */
+    int algo_id;       ///< CUBLASLT_ALGO_CONFIG_ID
+    int tile;          ///< CUBLASLT_ALGO_CONFIG_TILE_ID
+    int stages;        ///< CUBLASLT_ALGO_CONFIG_STAGES_ID
+    int splitk;        ///< CUBLASLT_ALGO_CONFIG_SPLITK_NUM (1: none, the contract)
+    int reduction;     ///< CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME (NONE, the contract)
+    int swizzle;       ///< CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING
+    int custom;        ///< CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION
+    int inner;         ///< CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID
+    int cluster;       ///< CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID
+} pulsar_lt_pick;
+
+/** L336: the recorded pick for a shape on this device and cuBLASLt, or NULL when the table has none.
+ *  @param el  0 fp16, 1 bf16
+ *  @param a   pulsar_lt_a
+ *  @param cls pulsar_lt_rows
+ *  @param K   reduction depth
+ *  @param N   A's full output width
+ *  @return the table's entry, or NULL */
+const pulsar_lt_pick *pulsar_lt_pick_find(int el, int a, int cls, int K, int N);
+
+/** L336: fill a pick record from a cuBLASLt algorithm's config (tests/lt_picks writes the table with it).
+ *  @param algo the algorithm (cublasLtMatmulAlgo_t, passed as its address)
+ *  @param out  receives the config fields; the key fields are left as they were */
+void pulsar_lt_pick_from_algo(const void *algo, pulsar_lt_pick *out);
+
+/** L336: rebuild a recorded pick's algorithm (cublasLtMatmulAlgoInit + its config) for the fixed GEMM's types.
+ *  @param handle the cublasLtHandle_t (as its value)
+ *  @param p      the pick
+ *  @param algo   receives the cublasLtMatmulAlgo_t (its address)
+ *  @return true when cuBLASLt accepted the id and every config field */
+bool pulsar_lt_pick_algo(void *handle, const pulsar_lt_pick *p, void *algo);
+
 /** The cuBLASLt workspace every fixed GEMM may use (the module owns it). */
 #define PULSAR_LT_FIXED_WORKSPACE (32u << 20)
 
