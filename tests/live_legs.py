@@ -159,9 +159,15 @@ def main():
         if not legs:
             continue
         if key not in paths:
-            for n, l in legs:
-                l.g.check(False, "no --model %s=PATH for this leg" % key)
-            results += [(n, key, False, 0.0) for n, _ in legs]
+            # A leg NAMED with --legs must run: without its model it fails.  Unnamed, the tier picks its families by the
+            # --model it was given (L278 cut: `make gates` passes Qwen and Nemotron; DeepSeek's are live-legs-deepseek),
+            # so its legs are skipped and said -- failing them failed every battery since the cut (2026-11-05, #623).
+            if only:
+                for n, l in legs:
+                    l.g.check(False, "no --model %s=PATH for this leg" % key)
+                results += [(n, key, False, 0.0) for n, _ in legs]
+            else:
+                print("live-legs: no --model %s=PATH: skipping %s" % (key, ", ".join(n for n, _ in legs)), flush=True)
             continue
         print("\n##### live legs on %s (%s): %s" % (key, paths[key], ", ".join(n for n, _ in legs)), flush=True)
         out, model_secs[key] = run_model(key, paths[key], legs, a.binary, a.work, a.port, MODELS[key])
