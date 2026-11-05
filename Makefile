@@ -1075,12 +1075,19 @@ QWEN_REF_ANCHOR_DIR ?= $(call need_path,QWEN_REF_ANCHOR_DIR)
 # The high rows are the positions L251 traced to the model's own sensitivity (a random 0.67%-norm nudge of the
 # REFERENCE's own state flips story 4096 three times in four) -- known-high: top-1 enforced, KL informational and
 # graded for DIRECTION by the budgets.  The tolerance holds the confident rows with 3-5x headroom.
+# Story re-recorded 2026-11-05 at dev d671badc (L336: the router's prompt logits on the bf16 tensor cores), graded
+# CLOSER and adopted (Tyler: "Confirm, then accept"; battery #623, the 07aa3a19 control gpuq #625 = the old budget
+# to the bit, so the move is the router's alone):
+#   story  512 3.5e-4 | 2048 0.14 MATCH (its flip gone) | 4096 2.43 FLIP (ours 449, ref margin 1.28 in ours)
+#          4102 0.42 | 6144 3.13 FLIP (ours 883, gap 2.69) | 16388 1.4e-6 | 31183 8.2e-8   top-1 5/7
+#   confident depths net 1.25e-5 -> 1.47e-6 (-88 %); 2048 -84 %, 4102 -69 %; 512 +47 %, 4096 +24 %, 6144 +463 %.
+#   The flips sit at the known-high (model-sensitive) depths; the code budget is unchanged (it passed).
 QWEN_REF_TOL ?= 1e-3
 QWEN_KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-qwen-story.txt
 QWEN_KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-qwen-code.txt
 QWEN_REF_ANCHORS = --ref-dir $(QWEN_REF_ANCHOR_DIR) --ref-tol $(QWEN_REF_TOL) \
 	--kl-story $(QWEN_KL_BUDGET_STORY) --kl-code $(QWEN_KL_BUDGET_CODE) \
-	--story-known-high 2048,4096,4102,6144 --story-known-flip 2048 --code-known-high 512,3957
+	--story-known-high 2048,4096,4102,6144 --story-known-flip 4096,6144 --code-known-high 512,3957
 .PHONY: session-contract-gate-qwen session-contract-gate-ds session-contract-gate-nemotron
 session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
@@ -1456,10 +1463,12 @@ indexer-score-check: tests/indexer_score_test
 # Single-pass mHC hand-over (L218): the fused split collapses with the pre it
 # was handed and leaves its own behind; two chained calls vs a host oracle.
 # Built the way the engine builds the TU (--use_fast_math).  L295 F2: the TU's router select is the shared router's
-# (pulsar_router_select_launch), linked from its production object.
+# (pulsar_router_select_launch), linked from its production object -- with lt_fixed's, which its logits call (L336).
 tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile src/cuda/pulsar_cuda_router.o \
+                            src/cuda/pulsar_cuda_lt_fixed.o \
                             src/cuda/pulsar_cuda_hc_router.cu src/cuda/pulsar_cuda_internal.h src/pulsar_gpu.h
-	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $< src/cuda/pulsar_cuda_router.o
+	$(NVCC) -O3 --use_fast_math -arch=$(ATTN_GATE_ARCH) -Isrc -Isrc/cuda -o $@ $< src/cuda/pulsar_cuda_router.o \
+	  src/cuda/pulsar_cuda_lt_fixed.o -lcublasLt
 
 # attn_f16_kernel_test takes [n_tokens window n_head bench n_comp ratio top_k
 # raw_cap] and its own header argues the compressed and indexed halves matter --
