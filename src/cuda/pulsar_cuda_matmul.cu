@@ -3494,8 +3494,10 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
     void *ws = cuda_arena_take(&ar, wz, 256);
     if (!ws) return 0;
     const float al = 1.0f, be = 0.0f;
+    /* L298 (L338's rule): stream 0 is the engine's per-thread default stream; cuBLAS, built apart, reads 0 as the
+     * LEGACY stream -- outside a captured step's stream (status 14 under capture) */
     cublasStatus_t st = cublasLtMatmul(g_cublaslt, sh->op, &al, w, sh->la, xb, e->lb, &be,
-                                       out, e->ld, out, e->ld, &sh->algo, ws, wz, stream);
+                                       out, e->ld, out, e->ld, &sh->algo, ws, wz, stream ? stream : cudaStreamPerThread);
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "pulsar: cuBLASLt bf16 matmul failed: status %d\n", (int)st);
         return 0;
@@ -3666,8 +3668,10 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
         *e = q;
     }
     const float al = 1.0f, be = 0.0f;
+    /* L298: stream 0 is the engine's per-thread default stream; cuBLAS reads 0 as the LEGACY one, outside a capture
+     * on the per-thread stream (status 14) -- what kept the LiLiCorr head out of the draft pass's graph */
     const cublasStatus_t st = cublasLtMatmul(g_cublaslt, e->op, &al, b, e->la, a, e->lb, &be, c, e->lc, c, e->lc,
-                                             &e->algo, NULL, 0, stream);
+                                             &e->algo, NULL, 0, stream ? stream : cudaStreamPerThread);
     if (st != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "pulsar: batched bf16 GEMM (m %d n %d k %d batch %d) failed: status %d\n", m, n, k, batch,
                 (int)st);

@@ -1380,7 +1380,17 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
                                                             (uint16_t *)(base + D.pass) + (uint64_t)i * SL * E, E,
                                                             0) != 0))
                 return fail("the candidates' top-k refused");
-        if (!sel) return true;   /* LILICORR: its head after the graph; PLAIN: the chain on the host below */
+        /* L298: LILICORR's candidate head in the graph too (its lattice attention's batched GEMM captures since it
+         * launches on the per-thread stream); PLAIN: the chain on the host below */
+        if (lili)
+            return pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
+                                               (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
+                                               (const uint16_t *)(base + D.anchor), (const uint8_t *)(base + D.valid),
+                                               (float *)(base + D.scores), (int32_t *)(base + D.chain_ids),
+                                               (int32_t *)(base + D.chain_rows), base + D.head_ws, D.head_ws_bytes,
+                                               0) == 0 ||
+                   fail("the candidate head refused");
+        if (!sel) return true;
         /* the selector (pulsar_cuda_candsel.h), in the graph: hidden_projection over every row, then the scores and
          * the walk from each bank's carry over its slot rows 1 .. block - 1 */
         {
@@ -1417,20 +1427,11 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
     } else if (seg == 0) {
         ok = launches();
     }
-    /* LILICORR: the candidate head after the graph, its own launches: its lattice attention's cuBLASLt batched GEMM
-     * refuses inside a stream capture (status 14), so it runs eager behind the replay */
-    ok = ok && (!lili || pulsar_lilicorr_head_launch(&l->head, nb, (const int32_t *)(base + D.cand_id),
-                                            (const float *)(base + D.cand_lp), table, (const uint16_t *)(base + D.pass),
-                                            (const uint16_t *)(base + D.anchor), (const uint8_t *)(base + D.valid),
-                                            (float *)(base + D.scores), (int32_t *)(base + D.chain_ids),
-                                            (int32_t *)(base + D.chain_rows), base + D.head_ws, D.head_ws_bytes,
-                                            0) == 0 ||
-                fail("the candidate head refused"));
     if (ok && !l->announced) {
         l->announced = true;
         fprintf(stderr, "pulsar: block drafter: the draft pass (%u bank(s) of %u rows) runs %s, %s; its chain is the "
                         "head's walk\n", nb, B, key ? "as one captured graph a (banks, bound)" : "eager (dump)",
-                lili ? "the LiLiCorr candidate head behind it eager"
+                lili ? "the LiLiCorr candidate head inside it"
                      : plain ? "no chain head (each slot's top-k; the walk its top-1s)" : "the CandidateSelector inside it");
     }
     if (!ok) return false;

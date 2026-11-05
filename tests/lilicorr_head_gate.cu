@@ -14,6 +14,8 @@
  *   2. SCORES (information): max |kernel - vLLM| and |kernel - reference| over every round, in logits.
  *   3. BANKS: the rounds run 16 banks a launch and each alone; scores and chains must be bit-identical (every Linear is
  *      M-independent, the lattice GEMMs run one algorithm whatever their batch count).
+ *   3b. GRAPH (L298): the head captured into a CUDA graph on the per-thread stream, as the draft pass holds it, writes
+ *      the eager launch's bytes at 1, 8 and 16 banks (information: the eager and graphed time a launch).
  *   4. refusals: 0 banks, 17 banks, a short workspace, a Linear of the wrong shape.
  *   5. timing (information): one launch at 1 bank and at 16.
  *
@@ -248,6 +250,62 @@ static run_out run(const pulsar_lilicorr_head &h, const st_file &fx, int r0, int
     return o;
 }
 
+/* L298: rounds [r0, r0 + B) as one launch captured into a CUDA graph on the per-thread stream (as the draft pass's
+ * graph holds it) and replayed: its bytes must be the eager launch's (*same), and the two times per launch. */
+static void graph_leg(const pulsar_lilicorr_head &h, const st_file &fx, int r0, int B, bool *same, float *eager_ms,
+                      float *graph_ms) {
+    const run_out e = run(h, fx, r0, B, eager_ms);   /* eager, which also warms every shape's cache */
+    const st_tensor tc = fx.get("cand_local"), tl = fx.get("cand_logp"), te = fx.get("emb_rows"),
+                    tp = fx.get("pass_hidden"), ta = fx.get("anchor_hidden"), tv = fx.get("anchor_valid");
+    void *dc = upload(tc.data, tc.bytes), *dl = upload(tl.data, tl.bytes), *de = upload(te.data, te.bytes),
+         *dp = upload(tp.data, tp.bytes), *da = upload(ta.data, ta.bytes), *dv = upload(tv.data, tv.bytes);
+    const int32_t *cand = (const int32_t *)dc + (size_t)r0 * 56;
+    const float *lp = (const float *)dl + (size_t)r0 * 56;
+    const uint16_t *ph = (const uint16_t *)dp + (size_t)r0 * 7 * 4096, *ah = (const uint16_t *)da + (size_t)r0 * 4096;
+    const uint8_t *av = (const uint8_t *)dv + r0;
+    const uint64_t wsb = pulsar_lilicorr_head_ws_bytes(B);
+    void *ws;
+    float *sc;
+    int32_t *ids, *rows;
+    CUDA_OK(cudaMalloc(&ws, wsb));
+    CUDA_OK(cudaMalloc((void **)&sc, (size_t)B * 448 * 4));
+    CUDA_OK(cudaMalloc((void **)&ids, (size_t)B * 7 * 4));
+    CUDA_OK(cudaMalloc((void **)&rows, (size_t)B * 7 * 4));
+    CUDA_OK(cudaMemset(sc, 0, (size_t)B * 448 * 4));
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ge = nullptr;
+    CUDA_OK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    const int rc = pulsar_lilicorr_head_launch(&h, B, cand, lp, (const uint16_t *)de, ph, ah, av, sc, ids, rows, ws, wsb,
+                                               0);
+    const cudaError_t ec = cudaStreamEndCapture(cudaStreamPerThread, &g);
+    CHECK(rc == 0 && ec == cudaSuccess, "capturing the head at %d banks: launch %d, capture %s", B, rc,
+          cudaGetErrorString(ec));
+    *same = false;
+    if (rc == 0 && ec == cudaSuccess && cudaGraphInstantiate(&ge, g, 0) == cudaSuccess) {
+        CUDA_OK(cudaGraphLaunch(ge, cudaStreamPerThread));
+        CUDA_OK(cudaStreamSynchronize(cudaStreamPerThread));
+        std::vector<float> s2((size_t)B * 448);
+        std::vector<int32_t> i2((size_t)B * 7), r2((size_t)B * 7);
+        CUDA_OK(cudaMemcpy(s2.data(), sc, s2.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(i2.data(), ids, i2.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(r2.data(), rows, r2.size() * 4, cudaMemcpyDeviceToHost));
+        *same = !memcmp(s2.data(), e.scores.data(), s2.size() * 4) && i2 == e.ids && r2 == e.rows;
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+        cudaEventRecord(a, cudaStreamPerThread);
+        for (int i = 0; i < 20; i++) cudaGraphLaunch(ge, cudaStreamPerThread);
+        cudaEventRecord(b, cudaStreamPerThread);
+        CUDA_OK(cudaEventSynchronize(b));
+        cudaEventElapsedTime(graph_ms, a, b);
+        *graph_ms /= 20.0f;
+        cudaGraphExecDestroy(ge);
+    }
+    if (g) cudaGraphDestroy(g);
+    cudaFree(ws); cudaFree(sc); cudaFree(ids); cudaFree(rows);
+    cudaFree(dc); cudaFree(dl); cudaFree(de); cudaFree(dp); cudaFree(da); cudaFree(dv);
+}
+
 /* Grade one round's chain (candidate indices `mine`) against an expected one (`want`) with its own scores `wsc`
  * [7][8][8]: equal, or parted where `wsc` puts the two picks within kFloor.  Returns 0 equal, 1 excused, 2 a miss;
  * *gap = the expected scores' margin at the parting slot. */
@@ -339,6 +397,23 @@ int main(int argc, char **argv) {
     printf("SCORES: max |kernel - vLLM| %.4f, max |kernel - reference| %.4f (logits)\n", max_dv, max_dr);
     printf("BANKS: 16-bank launches vs one bank: chains differ in %d rounds, scores max diff %.3g\n", bank_bad, max_bank);
     CHECK(bank_bad == 0 && max_bank == 0.0f, "a round's scores depend on the banks beside it");
+
+    /* L298: the head captured into a graph (the draft pass's) writes the eager launch's bytes, at every bank count */
+    {
+        st_file fx0;
+        const bool have = fx0.open(std::string(argv[2]) + "/" + prompts[0] + ".safetensors");
+        CHECK(have, "no fixture %s for the graph leg", prompts[0].c_str());
+        const int R0 = have ? (int)(fx0.get("vllm_chain").bytes / 28) : 0;
+        for (int B : {1, 8, 16}) {
+            if (B > R0) continue;
+            bool same = false;
+            float te = 0.0f, tg = 0.0f;
+            graph_leg(h, fx0, 0, B, &same, &te, &tg);
+            printf("GRAPH: %2d bank(s): captured == eager %s; %.3f ms eager, %.3f ms graphed a launch\n", B,
+                   same ? "yes" : "NO", te, tg);
+            CHECK(same, "the captured head at %d banks writes other bytes than the eager one", B);
+        }
+    }
 
     /* refusals */
     {
