@@ -19,8 +19,8 @@
 # WARNS if the clone's HEAD != this sha (that check found the dev box and
 # the GB10 on different revisions the day it was written).
 #
-# 2026-11-05: upstream HEAD 954c8d7b (v4.8.1 + the SM100 blockwise K-major scale-copy fix), with the move to CUDA 13.5
-# (Tyler: "let's migrate to latest").
+# 2026-11-05: v4.8.1 (released 2026-10-20), with the move to CUDA 13.5 (Tyler: "let's migrate to latest"; the policy
+# below: the newest release tag.  main's HEAD adds only SM110 guards and an SM100 blockwise scale-copy fix so far).
 #
 # Before that: v4.8.0 (released 2026-09-22), bumped from v4.7.0 dcf215af on
 # 2026-09-23 (L244; Tyler: "it may have some improvements for us" -- the notes
@@ -37,4 +37,4 @@
 #
 # Point CUTLASS_DIR at a clone of this sha, or run `make cutlass`.
 url=https://github.com/NVIDIA/cutlass.git
-sha=954c8d7be60d730cc3f51e8f1ffe9850dce054d5
+sha=2c85f497547eb441f0fe80bfb0fb2e6f9add1719
