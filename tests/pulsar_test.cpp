@@ -5242,6 +5242,41 @@ static void test_lib_image_identity(void) {
     bad = all;
     bad.b[1].start = 7;              /* overlapping */
     TEST_ASSERT(!pulsar_image_identity_span(&bad, 0, 14, &first, &nb));
+
+    /* L350: the rules a resume keeps a bank's KV by, shared by the sync and the server's pricing -- on an engine whose
+     * family carries the toy geometry above */
+    static pulsar_family fam;
+    fam.vision = &v;
+    pulsar_engine *e = (pulsar_engine *)calloc(1, sizeof(pulsar_engine));
+    TEST_ASSERT(e != NULL);
+    if (!e) return;
+    e->family = &fam;
+    pulsar_tokens prompt = {ids, n, n};
+    /* a grid point: the bank's images below G must be the request's, and no request block may straddle G */
+    TEST_ASSERT(pulsar_image_holds_below(e, &all, &prompt, imgs, 2, 3));     /* below every block */
+    TEST_ASSERT(pulsar_image_holds_below(e, &all, &prompt, imgs, 2, 8));     /* block A whole, B not begun */
+    TEST_ASSERT(!pulsar_image_holds_below(e, &all, &prompt, imgs, 2, 10));   /* B straddles 10 */
+    TEST_ASSERT(pulsar_image_holds_below(e, &all, &prompt, imgs, 2, 12));
+    TEST_ASSERT(!pulsar_image_holds_below(e, &swapped, &prompt, imgs, 2, 8));   /* other bytes in A */
+    TEST_ASSERT(!pulsar_image_holds_below(e, NULL, &prompt, imgs, 2, 8));       /* a bank holding no image */
+    TEST_ASSERT(pulsar_image_holds_below(e, NULL, &prompt, imgs, 2, 3));
+    /* the licence: an extension of a history keeps it only when the held images are the request's */
+    int hist_ids[12];
+    memcpy(hist_ids, ids, sizeof hist_ids);
+    pulsar_tokens hist = {hist_ids, 12, 12};
+    pulsar_image_licence lic;
+    pulsar_image_licence_decide(e, &hist, &all, &prompt, imgs, 2, &lic);
+    TEST_ASSERT(lic.extends_live && lic.keep && lic.n_held == 2 && lic.common == 12);
+    pulsar_image_licence_decide(e, &hist, &swapped, &prompt, imgs, 2, &lic);
+    TEST_ASSERT(lic.extends_live && !lic.keep);
+    pulsar_image_licence_decide(e, &hist, NULL, &prompt, imgs, 2, &lic);
+    TEST_ASSERT(lic.extends_live && !lic.keep);
+    hist_ids[1] = 42;                  /* the history parts from the prompt: no extension to license */
+    pulsar_image_licence_decide(e, &hist, &all, &prompt, imgs, 2, &lic);
+    TEST_ASSERT(!lic.extends_live && lic.common == 1);
+    pulsar_image_licence_decide(e, NULL, &all, &prompt, imgs, 2, &lic);   /* no valid history */
+    TEST_ASSERT(!lic.extends_live);
+    free(e);
 }
 
 /* L292: the output head's captured graph must not replay one step's arm choice for another.  Every

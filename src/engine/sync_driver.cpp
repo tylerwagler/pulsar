@@ -55,28 +55,6 @@ static void sync_note_images(pulsar_session *s, const pulsar_tokens *prompt, con
         s->live_images.n = 0;
 }
 
-/* Does the KV below `G` hold exactly the request's images there -- and is G outside every block? */
-/// @param s        the session
-/// @param prompt   the request's prompt
-/// @param images   [n_images] the request's image refs
-/// @param n_images image refs
-/// @param G        the resume point, in tokens
-/// @return true when the held image identity below G is the request's and no block straddles G
-static bool sync_images_hold_below(const pulsar_session *s, const pulsar_tokens *prompt,
-                                   const pulsar_image_ref *images, int n_images, uint32_t G) {
-    for (int i = 0; i < n_images; i++) {
-        int len = 0;
-        (void)pulsar_image_block_extent(s->engine, prompt->v, prompt->len, images[i].start_pos, &len);
-        if ((uint32_t)images[i].start_pos < G && (uint32_t)(images[i].start_pos + len) > G) return false;
-    }
-    pulsar_image_identity want, held = s->live_images;
-    if (!pulsar_image_identity_build(s->engine->family->vision, s->engine, prompt->v, prompt->len, images, n_images,
-                                     G, &want))
-        return false;
-    pulsar_image_identity_trim(&held, G);
-    return pulsar_image_identity_equal(&held, &want);
-}
-
 bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
                                 int n_images, int past, pulsar_seam_stitch *out) {
     pulsar_prefix_match m;
@@ -162,7 +140,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     /* L268: an image request extends the live KV only under the licence */
     if (n_images > 0 && continuable) {
         pulsar_image_licence lic;
-        pulsar_image_licence_decide(s, prompt, images, n_images, &lic);
+        pulsar_image_licence_decide(e, &s->checkpoint, &s->live_images, prompt, images, n_images, &lic);
         if (lic.extends_live && !lic.keep) {
             fprintf(stderr, "pulsar: %s: image request: the live history's images are not this prompt's (%s) -- "
                             "not continuing it\n", ops->name,
@@ -198,7 +176,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         const pulsar_ckpt_record *rec = G ? pulsar_session_resume_record(s, live, G, prompt->len, &want) : NULL;
         /* L268: the KV below a grid point G is kept only when the bank's image records are the request's there, and G
          * is outside every block (its merged rows cannot be re-evaluated) */
-        if (G && !rec && !sync_images_hold_below(s, prompt, images, n_images, G)) {
+        if (G && !rec && !pulsar_image_holds_below(e, &s->live_images, prompt, images, n_images, G)) {
             fprintf(stderr, "pulsar: %s: bank %u's checkpoint at %u holds other images (or cuts a block) -- "
                             "prefilling from 0\n", ops->name, live, G);
             G = 0;

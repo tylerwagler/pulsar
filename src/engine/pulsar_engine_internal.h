@@ -2790,14 +2790,29 @@ typedef struct {
      *  Images inside the common prefix. */
     uint32_t held_end;   ///< the exclusive end of the last held block: a resume must restore at or above it
 } pulsar_image_licence;
-/// Decide the reuse licence of an image request against `s`'s live history.
-/// @param s         the session
+/// Decide the reuse licence of an image request against a bank's history: the sync's on the live bank, the server's
+/// pricing (pulsar_session_bank_resume_at, L350) on the bank it scores.
+/// @param e         the engine
+/// @param live      the bank's history (the view the sync may continue), or NULL when it holds none valid
+/// @param held_ids  the images that history holds (pulsar_session_bank_images), or NULL for none
 /// @param prompt    the expanded prompt
 /// @param images    the request's images, start_pos set
 /// @param n_images  entries in `images`
 /// @param out       receives the licence (zeroed first)
-void pulsar_image_licence_decide(const pulsar_session *s, const pulsar_tokens *prompt,
-                                 const pulsar_image_ref *images, int n_images, pulsar_image_licence *out);
+void pulsar_image_licence_decide(const pulsar_engine *e, const pulsar_tokens *live, const pulsar_image_identity *held_ids,
+                                 const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images,
+                                 pulsar_image_licence *out);
+/// L268 / L350: does a bank's KV below grid point `G` hold exactly the request's images there, with no request block
+/// straddling G -- the rule a resume at a grid checkpoint keeps the KV by (the sync's, and the server's pricing).
+/// @param e         the engine
+/// @param held_ids  the images the bank holds (pulsar_session_bank_images), or NULL for none
+/// @param prompt    the request's prompt
+/// @param images    [n_images] the request's image refs
+/// @param n_images  image refs
+/// @param G         the grid point, in tokens
+/// @return true when the held images below G are the request's and no block straddles G
+bool pulsar_image_holds_below(const pulsar_engine *e, const pulsar_image_identity *held_ids,
+                              const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images, uint32_t G);
 
 /* ---- L268: Qwen3.8-Flash-Next's own part of the image path (vision_qwen.cpp) ----
  * Preprocessing, from the checkpoint's preprocessor_config.json (HF Qwen2VLImageProcessor). */

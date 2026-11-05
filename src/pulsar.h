@@ -2052,11 +2052,17 @@ typedef struct {
  *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
  *  and the stitched prompt's length - 1, else nothing (0).  L334: both currencies (pulsar_bank_resume); the route's
  *  score and the cache read are `served`. */
+/** L350: an image request's resume reads its images as the sync does -- the licence for an extension, a record's
+ *  image identity, the images held below a grid point -- so a follow-up past an image block prices (and routes) at the
+ *  record the sync resumes from, and a bank holding other images prices at what the sync keeps of it. */
 /** @param s the session
  *  @param bank the bank
  *  @param prompt the request
+ *  @param images the request's images (start_pos set), or NULL for a text request
+ *  @param n_images entries in `images`
  *  @return where the sync starts and what it serves */
-pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
+pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
+                                                 const pulsar_image_ref *images, int n_images);
 /** Restore the installed bank to its grid checkpoint at `G` (the L264 notes above).
  *  @param s the session
  *  @param G the checkpoint position (> 0)

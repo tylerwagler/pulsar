@@ -1897,30 +1897,53 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return TokPos{st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit.raw()) : 0};
 }
-pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) {
+pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
+                                                 const pulsar_image_ref *images, int n_images) {
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
     if (!s || !prompt || prompt->len <= 0) return none;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);
     if (!t) return none;
+    if (!images) n_images = 0;
+    pulsar_engine *e = s->engine;
+    /* L350: the images the bank holds -- what the sync's image rules read on it */
+    const pulsar_image_identity *held = n_images > 0 ? pulsar_session_bank_images(s, bank, pulsar_session_live_bank(s))
+                                                     : NULL;
     /* every family's sync runs on the token-seam stitch (L115/L284): the bank's tokens up to the deepest shared
      * byte boundary, the prompt after it */
     pulsar_prefix_match m;
-    pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, &m);
-    /* an extension (or the same prompt) of a history the sync continues where it stands */
-    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw()))
-        return {TokPos::after(m.live_cut), m.prompt_cut};
+    pulsar_tokens_prefix_match(e, t->v, t->len, prompt->v, prompt->len, &m);
+    /* an extension (or the same prompt) of a history the sync continues where it stands -- an image request only
+     * under the licence, as the sync decides it (L268) */
+    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw())) {
+        bool keep = true;
+        if (n_images > 0) {
+            pulsar_image_licence lic;
+            pulsar_image_licence_decide(e, t, held, prompt, images, n_images, &lic);
+            keep = !lic.extends_live || lic.keep;
+        }
+        if (keep) return {TokPos::after(m.live_cut), m.prompt_cut};
+    }
     /* else the one resume rule over the stitched prompt (G <= the cut: below it the stitched prompt is the bank's
-     * own tokens) */
-    /* L350: priced from tokens alone -- text records only; the sync matches an image record's identity itself */
-    const uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(),
-                                                   pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw(),
-                                                   NULL);
+     * own tokens).  L350: an image request's records match by the request's image identity, and a grid point keeps
+     * the KV only where the bank's images are the request's below it -- the sync's own rules, so the cache read and
+     * the route's score are what the sync serves.  Across a token seam the request's blocks sit at other positions
+     * than the bank's: there it is priced from tokens alone (text records only), a count the sync can only beat. */
+    const int len = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
+    pulsar_image_identity want;
+    want.n = 0;
+    const bool by_images = n_images > 0 && !m.seamed &&
+                           pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images,
+                                                       (uint32_t)prompt->len, &want);
+    uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL);
+    if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want) &&
+        !pulsar_image_holds_below(e, held, prompt, images, n_images, G))
+        G = 0;
     const TokPos at{(int)G};
     /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
      * does (G was returned as the prompt-side count unconverted before) */
     if (at < TokPos::after(m.live_cut))
-        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, s->engine, t->v, at, prompt->v, prompt->len)};
+        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, e, t->v, at, prompt->v, prompt->len)};
     return {at, m.prompt_cut};
 }
 /* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a

@@ -389,7 +389,7 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
      * from 0 even with a grid checkpoint below the cut.  L318: a disk chain deeper than the bank's own resume loads
      * when L310 prices the read under the prefill it saves, as a request's does. */
     {
-        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical);
+        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical, NULL, 0);   /* its sync is text */
         const int resume = own.served.raw();
         char *path = NULL;
         pulsar_tokens effective = {0};
@@ -1044,7 +1044,9 @@ void server::gen_begin(session_slot *sl) {
         /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
          * starts -- the match itself when the sync continues the bank where it stands, else the grid
          * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
-        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt);
+        /* L350: with the request's images, so an image follow-up's cache read is the record the sync resumes from */
+        const pulsar_bank_resume own =
+            pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt, j->req.images, j->req.n_images);
         const PromptToks resume = own.served;
         memory_resume = resume.raw();
         /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
