@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr int kLogitsTB = 8;     ///< tokens per logits CTA row
+constexpr int kLogitsTB = 8;     ///< tokens per logits CTA row of a prompt chunk (fewer a decode call: the launch)
 constexpr int kLogitsWarps = 4;  ///< logit rows (warps) per logits CTA
 constexpr int kLogitsUnroll = 2; ///< weight chunks a lane loads ahead of their fmas
 constexpr int kSelectWarps = 4;  ///< rows (warps) per select CTA
@@ -38,7 +38,7 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
     }
 }
 
-/* One warp per logit row (rows n_w.. come from w_tail), kLogitsTB tokens per CTA row, kLogitsWarps rows per CTA.
+/* One warp per logit row (rows n_w.. come from w_tail), TB tokens per CTA row, kLogitsWarps rows per CTA.
  * Lane l owns the uint4 chunks l, l + 32, ... of the row and accumulates each token's partial in chunk order; the
  * xor tree then sums the lanes.  A token's logit is the same arithmetic at any T.  The chunks' weight loads are
  * issued kLogitsUnroll at a time ahead of their fmas, the fmas still in chunk order (L296 dec2, measured over 48
@@ -49,15 +49,17 @@ __device__ __forceinline__ void bf16x8(const uint4 &u, float f[8]) {
  *  @param x   bf16 activations [T][H]
  *  @param H   hidden width in elements (a multiple of 8)
  *  @param t0  first token of this CTA row
- *  @param nt  tokens present in this CTA row (<= kLogitsTB)
+ *  @tparam TB tokens per CTA row
+ *  @param nt  tokens present in this CTA row (<= TB)
  *  @param i   chunk index along the row (element 8 * i)
  *  @param acc the lane's per-token partial sums, accumulated in chunk order */
+template <int TB>
 __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat16 *__restrict__ x, int H, int t0,
-                                             int nt, int i, float (&acc)[kLogitsTB]) {
+                                             int nt, int i, float (&acc)[TB]) {
     float wf[8];
     bf16x8(wv, wf);
 #pragma unroll
-    for (int tt = 0; tt < kLogitsTB; ++tt) {
+    for (int tt = 0; tt < TB; ++tt) {
         if (tt < nt) {
             float xf[8];
             bf16x8(reinterpret_cast<const uint4 *>(x + (size_t)(t0 + tt) * H)[i], xf);
@@ -68,7 +70,8 @@ __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat1
 }
 
 /** Router logits: logits[t][e] = dot(x[t], row e), row e < n_w from w, else w_tail[e - n_w].  Grid
- *  (ceil(n_rows / kLogitsWarps), ceil(T / kLogitsTB)); block kLogitsWarps * 32 (one warp a logit row); no smem.
+ *  (ceil(n_rows / kLogitsWarps), ceil(T / TB)); block kLogitsWarps * 32 (one warp a logit row); no smem.
+ *  @tparam TB     tokens per CTA row (the launch picks it from the call's shape)
  *  @param x      bf16 activations [T][H], 16-byte aligned rows
  *  @param H      hidden width (a multiple of 8)
  *  @param w      bf16 weight rows [n_w][H]
@@ -77,18 +80,19 @@ __device__ __forceinline__ void logits_chunk(const uint4 &wv, const __nv_bfloat1
  *  @param n_rows logit row width = n_w + tail rows
  *  @param T      token rows
  *  @param logits f32 output [T][n_rows] */
+template <int TB>
 __global__ void __launch_bounds__(kLogitsWarps * 32)
 router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bfloat16 *__restrict__ w, int n_w,
                      const __nv_bfloat16 *__restrict__ w_tail, int n_rows, int T, float *__restrict__ logits) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int e = blockIdx.x * kLogitsWarps + warp;
     if (e >= n_rows) return;                      /* whole warps */
-    const int t0 = blockIdx.y * kLogitsTB;
-    const int nt = min(kLogitsTB, T - t0);
+    const int t0 = blockIdx.y * TB;
+    const int nt = min(TB, T - t0);
     const uint4 *w4 = reinterpret_cast<const uint4 *>(e < n_w ? w + (size_t)e * H : w_tail + (size_t)(e - n_w) * H);
-    float acc[kLogitsTB];
+    float acc[TB];
 #pragma unroll
-    for (int tt = 0; tt < kLogitsTB; ++tt) acc[tt] = 0.0f;
+    for (int tt = 0; tt < TB; ++tt) acc[tt] = 0.0f;
     const int nch = H / 8;
     int i = lane;
     for (; i + 32 * (kLogitsUnroll - 1) < nch; i += 32 * kLogitsUnroll) {
@@ -96,11 +100,11 @@ router_logits_kernel(const __nv_bfloat16 *__restrict__ x, int H, const __nv_bflo
 #pragma unroll
         for (int u = 0; u < kLogitsUnroll; ++u) wv[u] = w4[i + 32 * u];
 #pragma unroll
-        for (int u = 0; u < kLogitsUnroll; ++u) logits_chunk(wv[u], x, H, t0, nt, i + 32 * u, acc);
+        for (int u = 0; u < kLogitsUnroll; ++u) logits_chunk<TB>(wv[u], x, H, t0, nt, i + 32 * u, acc);
     }
-    for (; i < nch; i += 32) logits_chunk(w4[i], x, H, t0, nt, i, acc);
+    for (; i < nch; i += 32) logits_chunk<TB>(w4[i], x, H, t0, nt, i, acc);
 #pragma unroll
-    for (int tt = 0; tt < kLogitsTB; ++tt) {
+    for (int tt = 0; tt < TB; ++tt) {
         float v = acc[tt];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -442,6 +446,14 @@ extern "C" int pulsar_router_logit_rows(const pulsar_router_cfg *c) {
     return c ? c->n_expert + (c->shared_gate == PULSAR_ROUTER_SHARED_NONE ? 0 : c->n_shared) : 0;
 }
 
+/// Launch router_logits_kernel<TB> (one instance per tokens-a-CTA-row the launch picks).
+/// @tparam TB tokens per CTA row
+template <int TB>
+static void logits_go(dim3 grid, cudaStream_t stream, const __nv_bfloat16 *x, int H, const __nv_bfloat16 *w, int n_w,
+                      const __nv_bfloat16 *w_tail, int n_rows, int T, float *logits) {
+    router_logits_kernel<TB><<<grid, kLogitsWarps * 32, 0, stream>>>(x, H, w, n_w, w_tail, n_rows, T, logits);
+}
+
 extern "C" int pulsar_router_logits_launch(const uint16_t *x_bf16, int T, int hidden, const uint16_t *w, int n_w,
                                            const uint16_t *w_tail, int n_tail, float *logits, cudaStream_t stream) {
     if (!x_bf16 || !w || !logits || T <= 0 || hidden <= 0 || hidden % 8 || n_w <= 0 || n_tail < 0 ||
@@ -455,10 +467,20 @@ extern "C" int pulsar_router_logits_launch(const uint16_t *x_bf16, int T, int hi
         return -1;
     }
     const int n_rows = n_w + n_tail;
-    const dim3 grid((unsigned)((n_rows + kLogitsWarps - 1) / kLogitsWarps), (unsigned)((T + kLogitsTB - 1) / kLogitsTB));
-    router_logits_kernel<<<grid, kLogitsWarps * 32, 0, stream>>>((const __nv_bfloat16 *)x_bf16, hidden,
-                                                                 (const __nv_bfloat16 *)w, n_w,
-                                                                 (const __nv_bfloat16 *)w_tail, n_rows, T, logits);
+    /* L349: tokens a CTA row by the call's shape (a token's logit is the same arithmetic at any TB).  A narrow router's
+     * decode / verify call spreads its few tokens over more CTAs -- 128 logit rows are only 32 CTAs a token row:
+     * RTX 5000, cold, Gemma 128 x 2816 T 1 / 4 / 8 / 16 13.4 / 25.1 / 42.0 / 42.6 us at TB 8 -> 9.2 / 11.5 / 14.7 /
+     * 22.5.  A prompt chunk (fewer re-reads of the weight rows) and a 512-row router (already 128 CTAs) keep
+     * kLogitsTB: on GB10 a Qwen 512 x 2560 router at TB 4 measured +4..+25 % at T 1-32 (noisy, not cleared). */
+    const int TB = T >= 64 || n_rows >= 512 ? kLogitsTB : T <= 4 ? 1 : T <= 16 ? 2 : 4;
+    const dim3 grid((unsigned)((n_rows + kLogitsWarps - 1) / kLogitsWarps), (unsigned)((T + TB - 1) / TB));
+    const auto *xb = (const __nv_bfloat16 *)x_bf16, *wb = (const __nv_bfloat16 *)w, *wt = (const __nv_bfloat16 *)w_tail;
+    switch (TB) {
+    case 1: logits_go<1>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
+    case 2: logits_go<2>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
+    case 4: logits_go<4>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
+    default: logits_go<kLogitsTB>(grid, stream, xb, hidden, wb, n_w, wt, n_rows, T, logits); break;
+    }
     return launch_ok("logits") ? 0 : -3;
 }
 

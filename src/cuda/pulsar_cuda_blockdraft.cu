@@ -123,6 +123,8 @@ __global__ void stream_mean_kernel(const uint16_t *__restrict__ src, uint64_t ld
 
 /// Threads per top-k CTA (one CTA per row).
 constexpr int TOPK_THREADS = 256;
+/// Strided columns a top-k thread loads together before scanning them in order (L349).
+constexpr int TOPK_LOADS = 8;
 
 /* a > b in the selection order: the larger value, ties to the lower id */
 /// @param va first value.
@@ -159,26 +161,41 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_kernel(const uint16_t *__re
     for (int j = 0; j < KM; j++) { lv[j] = -INFINITY; li[j] = INT32_MAX; }
     const int kk = (int)k;
     float m = -INFINITY, s = 0.f;
-    for (uint32_t c = tid; c < n; c += TOPK_THREADS) {
-        const float v = bf(x[c]);
-        /* A -inf logit (masked) adds exp(-inf) = 0 -- skipped, because while the running max is still -inf the
-         * expression would be exp(-inf - -inf) = NaN (L335).  A finite max makes the skip exact (s + 0 == s); a NaN
-         * logit is not -inf and still poisons the sum. */
-        if (v > m) { s = s * expf(m - v) + 1.f; m = v; }
-        else if (v != -INFINITY) s += expf(v - m);
-        float lk = -INFINITY;
-        int32_t lik = INT32_MAX;
+    /* L349: the thread's next TOPK_LOADS strided columns load together, then run in column order below -- the
+     * same operations in the same order as one column at a time, with one memory round trip a batch instead of
+     * one a column (one CTA a row: 15 rows of 262144 left the scan latency-bound) */
+    for (uint32_t c0 = tid; c0 < n; c0 += TOPK_THREADS * TOPK_LOADS) {
+        float vb[TOPK_LOADS];
 #pragma unroll
-        for (int j = 0; j < KM; j++)
-            if (j == kk - 1) { lk = lv[j]; lik = li[j]; }
-        if (!before(v, (int32_t)c, lk, lik)) continue;
-        /* the insertion: from the list's end, shift each entry v outranks down one; v takes the first it does not */
-        bool placed = false;
+        for (int u = 0; u < TOPK_LOADS; u++) {
+            const uint32_t cu = c0 + (uint32_t)u * TOPK_THREADS;
+            vb[u] = cu < n ? bf(x[cu]) : 0.f;
+        }
 #pragma unroll
-        for (int j = KM - 1; j >= 0; j--) {
-            if (placed || j > kk - 1) continue;
-            if (j > 0 && before(v, (int32_t)c, lv[j - 1], li[j - 1])) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; }
-            else { lv[j] = v; li[j] = (int32_t)c; placed = true; }
+        for (int u = 0; u < TOPK_LOADS; u++) {
+            const uint32_t c = c0 + (uint32_t)u * TOPK_THREADS;
+            if (c >= n) break;
+            const float v = vb[u];
+            /* A -inf logit (masked) adds exp(-inf) = 0 -- skipped, because while the running max is still -inf the
+             * expression would be exp(-inf - -inf) = NaN (L335).  A finite max makes the skip exact (s + 0 == s); a NaN
+             * logit is not -inf and still poisons the sum. */
+            if (v > m) { s = s * expf(m - v) + 1.f; m = v; }
+            else if (v != -INFINITY) s += expf(v - m);
+            float lk = -INFINITY;
+            int32_t lik = INT32_MAX;
+#pragma unroll
+            for (int j = 0; j < KM; j++)
+                if (j == kk - 1) { lk = lv[j]; lik = li[j]; }
+            if (!before(v, (int32_t)c, lk, lik)) continue;
+            /* the insertion: from the list's end, shift each entry v outranks down one; v takes the first it does
+             * not */
+            bool placed = false;
+#pragma unroll
+            for (int j = KM - 1; j >= 0; j--) {
+                if (placed || j > kk - 1) continue;
+                if (j > 0 && before(v, (int32_t)c, lv[j - 1], li[j - 1])) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; }
+                else { lv[j] = v; li[j] = (int32_t)c; placed = true; }
+            }
         }
     }
     __shared__ float sm[TOPK_THREADS], ss[TOPK_THREADS];

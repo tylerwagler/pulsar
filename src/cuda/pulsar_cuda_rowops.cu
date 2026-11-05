@@ -521,28 +521,36 @@ rows_sum2_norm_add_kernel(const float *__restrict__ a, uint64_t ld_a, const uint
         ub[c][0] = f2bf(b0.x) | (f2bf(b0.y) << 16); ub[c][1] = f2bf(b0.z) | (f2bf(b0.w) << 16);
         ub[c][2] = f2bf(b1.x) | (f2bf(b1.y) << 16); ub[c][3] = f2bf(b1.z) | (f2bf(b1.w) << 16);
     }
+    /* L349: the four norm weights and the residual row load here, ahead of the four reductions -- each was a
+     * dependent round trip after its reduction on a one-CTA-a-row kernel's critical path */
+    uint4 *r4 = (uint4 *)(res + t * ld_res);
+    uint4 pwa[kChainChunks], pwb[kChainChunks], pws[kChainChunks], pwn[kChainChunks], pres[kChainChunks];
+#pragma unroll
+    for (int c = 0; c < kChainChunks; ++c) {
+        if (c >= nc) break;
+        const uint32_t i = threadIdx.x + c * kNormThreads;
+        pwa[c] = w_a[i]; pwb[c] = w_b[i]; pws[c] = w_s[i]; pwn[c] = w_n[i]; pres[c] = r4[i];
+    }
     const float ra = chain_rstd(chain_ss(ua, nc), width, eps, warp_s, &s_out);
     const float rb = chain_rstd(chain_ss(ub, nc), width, eps, warp_s, &s_out);
 #pragma unroll
     for (int c = 0; c < kChainChunks; ++c) {   /* ua := the sum of the two post-norms */
         if (c >= nc) break;
-        const uint32_t i = threadIdx.x + c * kNormThreads;
         uint32_t da[4], db[4];
-        chain_norm(ua[c], w_a[i], ra, da);
-        chain_norm(ub[c], w_b[i], rb, db);
+        chain_norm(ua[c], pwa[c], ra, da);
+        chain_norm(ub[c], pwb[c], rb, db);
         chain_add(da, db, nullptr);
 #pragma unroll
         for (int k = 0; k < 4; ++k) ua[c][k] = da[k];
     }
     const float rs = chain_rstd(chain_ss(ua, nc), width, eps, warp_s, &s_out);
-    uint4 *r4 = (uint4 *)(res + t * ld_res);
 #pragma unroll
     for (int c = 0; c < kChainChunks; ++c) {   /* ub := the updated residual */
         if (c >= nc) break;
         const uint32_t i = threadIdx.x + c * kNormThreads;
         uint32_t d[4];
-        chain_norm(ua[c], w_s[i], rs, d);
-        const uint4 v = r4[i];
+        chain_norm(ua[c], pws[c], rs, d);
+        const uint4 v = pres[c];
         ub[c][0] = v.x; ub[c][1] = v.y; ub[c][2] = v.z; ub[c][3] = v.w;
         chain_add(ub[c], d, scale);
         r4[i] = make_uint4(ub[c][0], ub[c][1], ub[c][2], ub[c][3]);
@@ -554,7 +562,7 @@ rows_sum2_norm_add_kernel(const float *__restrict__ a, uint64_t ld_a, const uint
         if (c >= nc) break;
         const uint32_t i = threadIdx.x + c * kNormThreads;
         uint32_t o[4];
-        chain_norm(ub[c], w_n[i], rn, o);
+        chain_norm(ub[c], pwn[c], rn, o);
         y4[i] = make_uint4(o[0], o[1], o[2], o[3]);
     }
 }
