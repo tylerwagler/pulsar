@@ -237,6 +237,6 @@ rounds. A duplicate-prefix census is exported (L324).
 - Batched and speculative decode are not bit-reproducible across load. A greedy
   near tie can flip with what else is co-scheduled. Under sampling the
   distribution is preserved.
-- Without `--kv-disk-space-mb` the disk KV cache has no size limit.
+- `--kv-disk-space-mb 0` leaves the disk KV cache with no size limit.
 - The default context (1M) is refused by a container whose trained context is
   smaller. Pass `--ctx` or `--rope-yarn`.
