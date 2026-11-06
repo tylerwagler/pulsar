@@ -1118,9 +1118,12 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     /* L354: a name resolves to the first match (model_find_tensor), so a stale shard left in the directory by a rebuild
      * would silently win.  The container says how many shards it has, and a name is declared once. */
     if (const char *ns = st_meta_get(primary, "pulsar.n_shards")) {
-        if (strtoull(ns, NULL, 10) != n)
-            st_die("safetensors: %s holds %llu shards; the container was built with %s -- refusing it", path,
-                   (unsigned long long)n, ns);
+        /* only the build's shards carry the key: one added after the build (Qwen's model-qhead) is not in its count */
+        uint64_t built = 0;
+        for (uint64_t i = 0; i < n; i++) built += st_meta_get(&shards[i], "pulsar.n_shards") != NULL;
+        if (strtoull(ns, NULL, 10) != built)
+            st_die("safetensors: %s holds %llu shards of the build; it was built with %s -- refusing the container", path,
+                   (unsigned long long)built, ns);
     }
     {
         pulsar_tensor **byname = (pulsar_tensor **)st_alloc((size_t)d.n * sizeof(*byname));
