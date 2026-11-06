@@ -1408,8 +1408,10 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
 /// @param c        the fit (caller holds server::mu)
 /// @param now_sec  server_now_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
-/** L353 no. 16: how many times a restore read its chain.  @param verify it was checked before the load
- *  @param retained the check's read stayed as the RAM copy the load reads  @return the reads */
+/** L353 no. 16: how many times a restore read its chain.
+ *  @param verify it was checked before the load
+ *  @param retained the check's read stayed as the RAM copy the load reads
+ *  @return the reads */
 uint64_t kv_restore_reads(bool verify, bool retained);
 /** The estimated read of `bytes`, `cached` of them in the RAM tier, at `now_sec`; false (and 0) before the first
  *  load.  Each cost's gap above its best halves every KV_READ_RELAX_SEC since the last load (L342). */
@@ -3812,7 +3814,9 @@ typedef struct spilled_history {
     int n_img;             ///< how many
 } spilled_history;
 /** L353 no. 8: whether restoring a spilled bank's history serves this request.
- *  @param was the history  @param prompt_text the request's text (may be NULL)  @param live_turn a live tool continuation
+ *  @param was the history
+ *  @param prompt_text the request's text (may be NULL)
+ *  @param live_turn a live tool continuation
  *  @return true when it continues the whole history or needs it */
 bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn);
 

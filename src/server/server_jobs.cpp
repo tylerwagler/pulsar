@@ -743,17 +743,17 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
 }
 
 /* The spilled bank's own history: the deepest stored chain it reproduces, when L310 prices its read under the prefill
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {
+    if (live_turn) return true;
+    return prompt_text && !strncmp(prompt_text, was->text, strlen(was->text));
+}
+
  * it saves -- what bank_switch read at once before L330.  false: nothing to restore (the bank stays empty, its job
  * resolves cold). */
 /// @param s    the server
 /// @param sl   the slot bound to the spilled bank
 /// @param was  the bank's history as spilled; its text moves into the restore on success
 /// @return true when a sliced restore started
-bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {
-    if (live_turn) return true;
-    return prompt_text && !strncmp(prompt_text, was->text, strlen(was->text));
-}
-
 static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
     gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
     memset(gr, 0, sizeof(*gr));
