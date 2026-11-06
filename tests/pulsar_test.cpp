@@ -1277,7 +1277,10 @@ static void test_image_chain_round_trip(void) {
         TEST_ASSERT(differing == 0);
     }
 
-    /* D: another image's hash -- the chain stops before the block, said by name */
+    char x_end[41] = "";   /* X's chain end, for E (D's restore overwrites the chain) */
+    if (nseg > 0) memcpy(x_end, chain[nseg - 1].key, 41);
+
+    /* D: another image's hash -- the chain stops before the block */
     pulsar_session *sd = NULL;
     TEST_ASSERT(pulsar_session_create(&sd, engine, ctx) == 0);
     err[0] = '\0';
@@ -1295,7 +1298,7 @@ static void test_image_chain_round_trip(void) {
     iy.bytes = other_png.data();
     iy.len = other_png.size();
     iy.start_pos = img.start_pos;
-    TEST_ASSERT(nseg > 0 && pulsar_segstore_drop_rp(st, chain[nseg - 1].key));
+    TEST_ASSERT(x_end[0] && pulsar_segstore_drop_rp(st, x_end));
     pulsar_session *sy = NULL;
     TEST_ASSERT(pulsar_session_create(&sy, engine, ctx) == 0);
     pulsar_image_ref iya = iy;
