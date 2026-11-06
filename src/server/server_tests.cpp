@@ -14568,7 +14568,7 @@ static void test_l353_image_keys(void) {
     auto put = [&](const char *parent, uint32_t a, uint32_t b, const char *t, const uint64_t *h, uint32_t n, char *out) {
         pulsar_segstore_job *job = NULL;
         const int rc = pulsar_segstore_reserve_images(st, parent, a, b, t, strlen(t), h, n, 16, 0, out, &job, err, sizeof err);
-        if (rc > 0) TEST_ASSERT(pulsar_segstore_commit(st, job, pulsar_segstore_job_write(job, err, sizeof err) == 0));
+        if (rc > 0) TEST_ASSERT(pulsar_segstore_commit(st, job, pulsar_segstore_job_write(job, err, sizeof err)));
         return rc;
     };
     TEST_ASSERT(put("", 0, 128, root, &X, 1, kx) > 0);
