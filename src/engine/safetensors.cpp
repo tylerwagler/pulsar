@@ -328,11 +328,13 @@ static uint32_t meta_code_for_type_name(const char *t) {
 /// @param b the blob
 /// @param[in,out] p at the value; past it after
 /// @param type its PULSAR_META_* code
+/// @param depth how deep in nested arrays this value sits (refused past JSON_MAX_NESTING)
 static void blob_value(st_blob *b, const char **p, uint32_t type, int depth);
 
 /// Encode one {"__array__", "n", "v"} metadata array (an empty one is refused).
 /// @param b the blob
 /// @param[in,out] p at the object; past it after
+/// @param depth how deep in nested arrays this value sits (refused past JSON_MAX_NESTING)
 static void blob_array(st_blob *b, const char **p, int depth) {
     /* {"__array__":"u32","n":N,"v":[...]}.
      * st_obj_key() always rescans from the object's '{', so every lookup starts
