@@ -1471,6 +1471,7 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
     out->seamed = false;
     if (!text || !a || !b) return;
     bool seamed = false;
+    bool mismatch = false;   /* an id mismatch at aligned cursors, not yet realigned */
     int i = 0, j = 0;          /* token cursors */
     size_t oa = 0, ob = 0;     /* byte offsets inside the current tokens */
     int best_i = 0, best_j = 0;
@@ -1478,10 +1479,13 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
     size_t la = 0, lb = 0;
     while (i < a_len && j < b_len) {
         if (oa == 0 && ob == 0) {
+            /* L353 no. 11: only a mismatch the cursors realign after is a seam; one that ends in a byte divergence isn't */
+            if (mismatch) seamed = true;
+            mismatch = false;
             best_i = i;
             best_j = j;
             if (a[i] == b[j]) { i++; j++; continue; }   /* aligned fast path */
-            seamed = true;   /* same bytes ahead, different boundaries */
+            mismatch = true;
         }
         if (oa == 0) {
             free(ta);
@@ -1500,7 +1504,11 @@ void pulsar_tokens_prefix_match_with(pulsar_token_text_fn text, void *ud,
         if (oa == la) { i++; oa = 0; }
         if (ob == lb) { j++; ob = 0; }
     }
-    if (oa == 0 && ob == 0) { best_i = i; best_j = j; }
+    if (oa == 0 && ob == 0) {
+        best_i = i;
+        best_j = j;
+        if (mismatch) seamed = true;
+    }
 done:
     free(ta);
     free(tb);

@@ -749,6 +749,11 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
 /// @param sl   the slot bound to the spilled bank
 /// @param was  the bank's history as spilled; its text moves into the restore on success
 /// @return true when a sliced restore started
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {
+    if (live_turn) return true;
+    return prompt_text && !strncmp(prompt_text, was->text, strlen(was->text));
+}
+
 static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
     gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
     memset(gr, 0, sizeof(*gr));
@@ -930,7 +935,13 @@ void server::gen_begin(session_slot *sl) {
      * reads, a Responses/Anthropic tool turn among them -- restores from its chain a slice per worker turn, and this
      * job resolves once it is in (gen_step_restore calls gen_begin again).  Before, bank_switch read the whole chain
      * inside this bind. */
-    if (was.text && gen_restore_spilled_start(s, sl, &was)) return;
+    /* L353 no. 8: only for a request that continues that history, or a live tool turn that needs it.  One that diverges
+     * below its end read the whole chain (up to 34 GiB) for a state it can't use; empty, the bank takes the normal pick,
+     * which finds the deepest chain the request does share. */
+    if (was.text && spilled_history_serves(&was, j->req.prompt_text, j->req.anthropic_live_call_ids.len > 0 ||
+                                                                         j->req.responses_live_call_ids.len > 0) &&
+        gen_restore_spilled_start(s, sl, &was))
+        return;
     free(was.text);
     const int old_pos = pulsar_session_pos(s->sess).raw();
     /* EVAL PIN: report no live common prefix, so every request re-prefills

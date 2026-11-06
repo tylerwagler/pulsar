@@ -3811,6 +3811,10 @@ typedef struct spilled_history {
     uint64_t hashes[64];   ///< its image records' content hashes, in order
     int n_img;             ///< how many
 } spilled_history;
+/** L353 no. 8: whether restoring a spilled bank's history serves this request.
+ *  @param was the history  @param prompt_text the request's text (may be NULL)  @param live_turn a live tool continuation
+ *  @return true when it continues the whole history or needs it */
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn);
 
 /** Userdata for the engine's prefill progress callback.
  *

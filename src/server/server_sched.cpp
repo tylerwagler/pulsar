@@ -2836,6 +2836,7 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
     pulsar_session *pool = s->sess;
     int best = -1;
     bool best_dom = false;
+    bool best_bound = false;
     uint64_t best_us = UINT64_MAX;
     KvBytes best_touched = KvBytes::max();
     for (int i = 0; i < s->n_slots; i++) {
@@ -2846,10 +2847,18 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
         if (live) continue;
         const KvBytes t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
         const bool dom = dominated && dominated[i];
-        if (best < 0 || (dom && !best_dom) ||
-            (dom == best_dom && (sl->last_serviced_us < best_us ||
-                                 (sl->last_serviced_us == best_us && t < best_touched)))) {
-            best = i; best_dom = dom; best_us = sl->last_serviced_us; best_touched = t;
+        /* L353 no. 10: a bank whose client is running a tool last: its turn continues the decoded frontier, which a chain
+         * can't reproduce, so spilling it turns that turn into a 409 */
+        bool bound;
+        {
+            pulsar::ScopedLock lk(&s->tool_mu);
+            bound = sl->responses_live.valid || sl->anthropic_live.valid;
+        }
+        if (best < 0 || (!bound && best_bound) ||
+            (bound == best_bound &&
+             ((dom && !best_dom) || (dom == best_dom && (sl->last_serviced_us < best_us ||
+                                                         (sl->last_serviced_us == best_us && t < best_touched)))))) {
+            best = i; best_dom = dom; best_bound = bound; best_us = sl->last_serviced_us; best_touched = t;
         }
     }
     return best;

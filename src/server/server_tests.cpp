@@ -9195,6 +9195,56 @@ static void test_l354_http_framing(void) {
     TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\":\"x\"} trailing", 64, &r, err, sizeof err));
 }
 
+#include <sys/resource.h>
+
+/* L353 no. 11's vocabulary: a token is its own text. */
+static char *l353_tok_text(void *ud, int tok, size_t *len) {
+    const char *const *v = (const char *const *)ud;
+    *len = strlen(v[tok]);
+    return strdup(v[tok]);
+}
+
+/* L353 nos. 8, 10, 11, 19. */
+static void test_l353_routing_fixes(void) {
+    /* 11: a seam is a mismatch the cursors realign after; a real divergence isn't one */
+    const char *const vocab[] = {"ab", "a", "b", "c"};
+    pulsar_prefix_match m;
+    const int live[] = {0, 3}, seam[] = {1, 2, 3}, diverge[] = {1, 3};
+    pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, seam, 3, &m);
+    TEST_ASSERT(m.seamed && m.live_cut.raw() == 2 && m.prompt_cut.raw() == 3);
+    pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, diverge, 2, &m);
+    TEST_ASSERT(!m.seamed && m.live_cut.raw() == 0);
+    pulsar_tokens_prefix_match_with(l353_tok_text, (void *)vocab, live, 2, live, 2, &m);
+    TEST_ASSERT(!m.seamed && m.live_cut.raw() == 2);
+    /* 8: a spilled history is restored only for a request that continues it, or a live tool turn */
+    char hist[] = "the history";
+    spilled_history was = {};
+    was.text = hist;
+    TEST_ASSERT(spilled_history_serves(&was, "the history and more", false));
+    TEST_ASSERT(spilled_history_serves(&was, "the history", false));
+    TEST_ASSERT(!spilled_history_serves(&was, "the hist0ry and more", false));
+    TEST_ASSERT(!spilled_history_serves(&was, "the his", false));
+    TEST_ASSERT(!spilled_history_serves(&was, NULL, false));
+    TEST_ASSERT(spilled_history_serves(&was, NULL, true));
+    /* 10, 19: a victim's order: not a bank a client's tool is running on; then a dead prefix; then the oldest */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.tool_mu, NULL);
+        s.n_slots = 3;
+        for (int i = 0; i < 3; i++) s.slots[i].provisioned = true;
+        s.slots[0].last_serviced_us = 10;   /* the oldest, its client running a tool */
+        s.slots[0].anthropic_live.valid = true;
+        s.slots[1].last_serviced_us = 20;
+        s.slots[2].last_serviced_us = 30;   /* the newest, but dead */
+        s.slots[2].hint_dead = true;
+        int order[PULSAR_SESSION_POOL_CAP];
+        const int n = guard_victim_order(&s, NULL, 0, order);
+        TEST_ASSERT(n == 3 && order[0] == 2 && order[1] == 1 && order[2] == 0);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+}
+
 /* L353 nos. 13, 16, 17, 20: the small ones. */
 static void test_l353_small_fixes(void) {
     /* 17: a load all from RAM doesn't set the disk's best; 16: a checked restore without retention read twice */
@@ -14737,7 +14787,6 @@ static void test_l334_positions_are_ints(void) {
     TEST_ASSERT(TokPos{-1}.is_none() && TokPos::none().raw() == -1);           /* the int field's -1 enters as none() */
 }
 
-#include <sys/resource.h>
 #include <malloc.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -15017,6 +15066,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_http_framing();
     test_l354_py_unprintable();
     test_l353_small_fixes();
+    test_l353_routing_fixes();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
