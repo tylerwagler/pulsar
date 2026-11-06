@@ -87,7 +87,7 @@ FAMILIES = {
         'stack': 'model.language_model.layers.1.experts.gate_proj',
     },
 }
-MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format')
+MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
                  'does not')
 SMALL_SIDE_FILE = 64 << 20      # side files up to this size are copied; larger ones are cloned sparse
@@ -219,6 +219,19 @@ def mutate(shards, family, row, what):
         edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {k: (dict(v, layout='f32') if k == cname else v)
                                                               for k, v in t.items()})
         return f'{stack} layout f32', [stack, cname]
+    if what == 'dup-name':   # L354: a name resolves to its first match, so a second declaration of one is refused
+        name = row['plain']
+        i, cname = find_tensor(shards, name)
+        if i is None:
+            sys.exit(f'loader_contract: {family} has no tensor {name}')
+        shards[i]['header'][cname + '.dup'] = shards[i]['header'][cname]
+        edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {**t, cname + '.dup': t[cname]})
+        return f'{name} declared twice', [name]
+    if what == 'shard-count':   # L354: a stale shard left by a rebuild, or a missing one, disagrees with the build's count
+        n = len(shards)
+        for s in shards:
+            s['header']['__metadata__']['pulsar.n_shards'] = str(n + 1)
+        return f'pulsar.n_shards says {n + 1}, the directory holds {n}', ['shards']
     sys.exit(f'loader_contract: unknown mutation {what}')
 
 
