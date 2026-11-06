@@ -452,9 +452,9 @@ struct pulsar_segstore {
     }
     /* L347 I2 (D5), L353: the eviction classes, lowest first -- (0) a dominated leaf (L323) and (1) any other leaf without
      * a restore point: rows that restore nothing past the chain's last restore point, and the next persist of a live
-     * bank rewrites any it needs; (2) a restore point inside a chain, neither flagged nor on a branch point: past
-     * classes 0 and 1 every leaf has a restore point, so a deeper one serves its chain; (3) a chain end's restore point:
-     * where its conversation resumes, its rows useless without it; (4) a flagged (anchor, periodic) or branch-point
+     * bank rewrites any it needs; (2) a superseded restore point, neither flagged nor on a branch point -- inside a
+     * chain, or a dominated tail's: past classes 0 and 1 every leaf has a restore point, so a deeper one serves its text;
+     * (3) a chain end's restore point: where its conversation resumes, its rows useless without it; (4) a flagged (anchor, periodic) or branch-point
      * restore point: where restores of many requests start.  -1: not a candidate (a segment with children and no
      * restore point; L347 I3b: a PINNED anchor's restore point, and so its rows).  Until L353 class (0) was every
      * unflagged restore point, so a full store drained its conversations' resume points and kept their dead rows. */
@@ -464,7 +464,7 @@ struct pulsar_segstore {
      *  @return its eviction class (above), -1 for none */
     static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch) {
         if (e.rp_bytes > 0u && (e.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u) return -1;   /* L347 I3b: pinned */
-        if (e.rp_bytes > 0u) return e.rp_flags != 0u || branch ? 4 : leaf ? 3 : 2;
+        if (e.rp_bytes > 0u) return e.rp_flags != 0u || branch ? 4 : leaf && !e.dominated ? 3 : 2;
         if (!leaf) return -1;
         return e.dominated ? 0 : 1;
     }

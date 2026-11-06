@@ -8159,6 +8159,8 @@ static void test_l323_tail_supersession(void) {
     }, &removed);
     TEST_ASSERT(l323_persist(st, 8400, 4096, true, tip) == 1);
     TEST_ASSERT(!removed.empty() && (removed[0] == std::string(t1, 40) || removed[0] == std::string(t2, 40)));
+    TEST_ASSERT(pulsar_segstore_contains(st, bkey));                       /* the old branch's rows stay */
+    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes > 0u);  /* and where it resumes (L353) */
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -8967,11 +8969,12 @@ static void test_l347_i2_older_ends_kept(void) {
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second newcomer", L323_STATE, 10, nk2));
     TEST_ASSERT(l347_ev_at(log, e2.key, false) == 1);
     TEST_ASSERT(pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u);
-    /* and on: the newcomers' rows, then the next unflagged one (5000's, older than 9200's), before the anchor */
-    for (int i = 0; i < 16 && pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u; i++) {
-        char text[32], nk3[41];
-        snprintf(text, sizeof text, "newcomer %d", i);
-        TEST_ASSERT(test_seg_put(st, "", 0, 128, text, L323_STATE, (uint8_t)(11 + i), nk3));
+    /* a newcomer that leaves room for the anchor alone: the newcomers' rows first, then the next unflagged one (5000's,
+     * older than 9200's), and the anchor stays */
+    TEST_ASSERT(pulsar_segstore_get(st, a.key, &g));
+    {
+        char nk3[41];
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, "the big one", used - g.file_bytes - g.rp_bytes - 1024, 11, nk3));
     }
     const int e1_rp = l347_ev_at(log, e1.key, true);
     TEST_ASSERT(e1_rp > 0 && l347_ev_at(log, nk, false) > 0 && l347_ev_at(log, nk, false) < e1_rp);
