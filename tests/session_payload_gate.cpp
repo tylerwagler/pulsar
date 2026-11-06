@@ -284,6 +284,76 @@ int GATE_ENTRY(int argc, char **argv) {
         fclose(fc);
     }
 
+    /* ---- L355: state the restores own, each stated directly ---- */
+    {
+        /* F16: a session nothing has stepped has no live row to read */
+        pulsar_session *d = NULL;
+        CHECK(pulsar_session_create(&d, e, ctx) == 0, "session D create failed");
+        g_sessions[2] = d;
+        float *none = (float *)malloc((size_t)width * sizeof(float));
+        CHECK(none != NULL, "alloc none");
+        CHECK(pulsar_session_copy_logits(d, none, width) == 0, "a fresh session returned logits nothing wrote");
+        free(none);
+
+        /* F13: a payload refused on its header leaves the speculation as it found it */
+        FILE *fh = tmpfile();
+        CHECK(fh != NULL, "tmpfile for the refused header failed");
+        CHECK(pulsar_session_save_payload(a, fh, err, sizeof err) == 0, "save 3: %s", err);
+        const long len3 = ftell(fh);
+        rewind(fh);
+        const int magic = fgetc(fh);
+        rewind(fh);
+        CHECK(fputc(magic ^ 0xFF, fh) != EOF, "header flip failed");
+        fflush(fh);
+        rewind(fh);
+        d->spec.spec_carry_valid = true;
+        CHECK(pulsar_session_load_payload(d, fh, (uint64_t)len3, err, sizeof err) != 0, "a broken header loaded");
+        CHECK(d->spec.spec_carry_valid, "a refused payload reset the speculation (%s)", err);
+        d->spec.spec_carry_valid = false;
+
+        /* F12: a payload's load installs its own frontier, so a batched step before it no longer locks the lanes */
+        rewind(fh);
+        CHECK(fputc(magic, fh) != EOF, "header restore failed");
+        fflush(fh);
+        rewind(fh);
+        d->mseq_dirty = true;
+        CHECK(pulsar_session_load_payload(d, fh, (uint64_t)len3, err, sizeof err) == 0, "load 3: %s", err);
+        CHECK(!d->mseq_dirty, "a loaded payload left mseq_dirty set");
+        fclose(fh);
+
+        /* F14: a restore point needs a frontier: after an invalidate the slot may stand, but the bank doesn't hold it */
+        const TokPos G = pulsar_session_checkpoint_best(d, TokPos{L});
+        CHECK(G > TokPos{0}, "the load left no checkpoint");
+        const uint64_t rpb = pulsar_session_restore_point_bytes(d, G);
+        uint8_t *rp = (uint8_t *)aligned_alloc(4096, (rpb + 4095u) / 4096u * 4096u);
+        CHECK(rp != NULL, "alloc rp");
+        CHECK(pulsar_session_copy_out_restore_point(d, G, NULL, rp, rpb, err, sizeof err) == 0, "copy out: %s", err);
+        pulsar_session_invalidate(d);
+        CHECK(pulsar_session_copy_out_restore_point(d, G, NULL, rp, rpb, err, sizeof err) != 0,
+              "an invalidated bank copied out a restore point");
+        free(rp);
+
+        /* F6: a saved view whose restore fails is a failure, and the installed bank stays: never a fresh view */
+        if (pulsar_session_bank_count(d) >= 2 && d->bank_carry && d->bank_carry_n >= 2) {
+            const uint32_t held = pulsar_session_live_bank(d);
+            const uint32_t other = held == 0u ? 1u : 0u;
+            pulsar_gpu_tensor *rows = d->dev.bank_rows;
+            const bool was_valid = d->bank_carry[other].valid;
+            d->bank_carry[other].valid = true;
+            d->dev.bank_rows = NULL;   /* the live row's copy, the one step that can fail, now does */
+            const bool restored = pulsar_session_bank_state_restore(d, other);
+            d->dev.bank_rows = rows;
+            d->bank_carry[other].valid = was_valid;
+            CHECK(!restored, "a failed restore of a saved view reported success");
+            CHECK(pulsar_session_live_bank(d) == held, "a failed restore moved the installed bank");
+            printf("a failed bank restore is a failure: bank %u stays installed\n", held);
+        } else {
+            printf("SKIP  the failed bank restore: one bank here (PULSAR_MSEQ_BANKS >= 2 runs it)\n");
+        }
+        pulsar_session_free(d);
+        g_sessions[2] = NULL;
+    }
+
     free(ref); free(got); free(base.v);
     printf("SESSION-PAYLOAD GATE: PASS (v%u, %llu B, comp fnv %016llx, logits identical)\n",
            (unsigned)PULSAR_SESSION_KV_PAYLOAD_VERSION, (unsigned long long)pbytes,

@@ -2320,6 +2320,12 @@ doxygen-gate:
 	  echo "DOXYGEN GATE: FAIL ($$(wc -l < docs/api/doxygen-warnings.log) lines)"; exit 1; fi; \
 	echo "DOXYGEN GATE: PASS (an empty warnings log)"
 
+# L355: what a request resumes from after a disconnect, a spill and a restart.  On its own servers: a budget override and a restart
+# don't fit live-legs' instances.  ~6 min.
+.PHONY: resume-fixes-live
+resume-fixes-live: pulsar-server
+	python3 tests/resume_fixes_live.py $(QWEN_GATE_MODEL) --binary ./pulsar-server
+
 # L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  On
 # its own server: its budget override can't share live-legs' hooks instance with preempt-exact's.  ~4 min.
 .PHONY: preempt-wedge-live
@@ -2757,7 +2763,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	cuda-runner-gate live-legs preempt-wedge-live server-kv-headroom-live
+	cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -3079,6 +3085,7 @@ gates-dev:
 	if [ $$resume -eq 1 ]; then \
 	  $(MAKE) --no-print-directory segstore-tsan || rc=1; \
 	  $(MAKE) --no-print-directory preempt-wedge-live CUDA_ARCH=sm_120f || rc=1; \
+	  $(MAKE) --no-print-directory resume-fixes-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \

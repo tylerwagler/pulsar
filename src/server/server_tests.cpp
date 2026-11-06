@@ -9268,6 +9268,8 @@ static void test_l353_small_fixes(void) {
     TEST_ASSERT(rc.cold_seen && rc.best_cold_ms_per_gib > 50.0);
     TEST_ASSERT(kv_restore_reads(true, false) == 2u && kv_restore_reads(true, true) == 1u &&
                 kv_restore_reads(false, false) == 1u);
+    /* 12, 21: with no writer, or none behind, nothing is waited for */
+    TEST_ASSERT(kv_cache_wait_written(NULL) == 0);
     /* 20: a dead prefix's reply gets no terminal sync */
     {
         server s;

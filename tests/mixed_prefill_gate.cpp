@@ -139,6 +139,11 @@ int GATE_ENTRY(int argc,char**argv){
     if(!classic_stream(C0, C0+K1, ref, ref_lg)){ fprintf(stderr,"GATE FAIL: classic-resume reference failed\n"); g_fail=1; free(ref_lg);free(mix_lg); goto done; }
     if(!mixed_stream(C0, K1, mix, NULL, mix_lg)){ fprintf(stderr,"GATE FAIL: mixed prefill failed (step_end/coherence)\n"); g_fail=1; free(ref_lg);free(mix_lg); goto done; }
     {
+        /* L355: both last-position vectors, to compare across builds: which path a toolchain moved */
+        if(const char *dump=getenv("PULSAR_MIXED_DUMP")){
+            FILE *f=fopen(dump,"wb");
+            if(f){ fwrite(ref_lg,sizeof(float),(size_t)vocab,f); fwrite(mix_lg,sizeof(float),(size_t)vocab,f); fclose(f); }
+        }
         /* (2) relative RMS of the last-position logit vectors. */
         double se=0, sr=0;
         for(int i=0;i<vocab;i++){ double d=(double)mix_lg[i]-ref_lg[i]; se+=d*d; sr+=(double)ref_lg[i]*ref_lg[i]; }

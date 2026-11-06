@@ -1,12 +1,43 @@
 # Pulsar 0.5.0 release notes
 
-0.5.0-rc1 covers everything on `dev` since `v0.4.2` (2026-08-03): about 1,450
-commits. Ledger rows (Lnnn) are named where a commit message gives one. The full
+0.5.0 covers everything on `dev` since `v0.4.2` (2026-08-03).  0.5.0-rc1 was about 1,450
+commits; what changed after it is under [Since rc1](#since-rc1). Ledger rows (Lnnn) are named where a commit message gives one. The full
 list is `git log v0.4.2..`.
 
 0.4.2 served one model, DeepSeek V4 Flash, from GGUF. 0.5.0 is a
 multi-family server that reads pulsar safetensors containers. Its production
 model is Qwen3.8-Flash-Next.
+
+## Since rc1
+
+**Upgrade notes.**
+
+- The server binds `127.0.0.1` by default.  Pass `--host` to expose it: it has no
+  authentication, and it logs a warning when bound past loopback.
+- `--kv-disk-space-mb` defaults to 131072; 0 is unbounded.  A full disk now evicts instead
+  of failing every write.
+- `max_tokens` below 1 is a 400 on every surface.  It used to answer 200 with nothing.
+- HTTP framing is stricter: a bare `\n\n` head, `Content-Length: 12x`, an over-long target
+  and bytes after the JSON body are refused.
+- Images over 178,956,970 pixels are refused, and concurrent decodes share a 16 GiB budget.
+- The encoder and Parse server has the 64-connection cap; `/v1/systemone` takes at most 64
+  questions and four contexts' worth of rendered tokens.
+- `pulsar-agent`: file tools refuse paths outside the starting directory
+  (`--allow-outside-workspace`); non-interactive `bash` is refused (`--allow-bash`); model
+  and tool text can't drive the terminal.  Interactive `bash` has no boundary.
+- The loader refuses repeated tensor names, a wrong shard count, a build shard without
+  `pulsar.kv_arch`, over-deep metadata and wrapping sizes.
+- Older disk KV segments are removed when the store opens.
+- Builds on CUDA 13.5 and CUTLASS v4.8.1.
+
+**Fixed.** Image-aware segment keys; a new session's anchor at the end of its system prompt; an
+eviction order that keeps resume points; a queue stall on a parked decoder; a race on the
+store's index; a disconnect during prefill keeping its bank; a spilled bank restored only for a
+request it serves.
+
+**Gates.** `warnings-gate`, `doxygen-gate`, `preempt-wedge-live` and `resume-fixes-live` are new.  A configured
+gate path that's missing fails, and `cuda-prefill-gate-cutlass-mxfp4` is manual: its artifact is
+on no box.  The coverage matrix tracks every registered family.
 
 ## New
 
