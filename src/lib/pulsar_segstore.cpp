@@ -483,7 +483,10 @@ struct pulsar_segstore {
             const size_t kids = n_children(kv.first);
             const int c = evict_class(kv.second, kids == 0u, kids >= 2u);
             if (c < 0) continue;
-            if (!victim || c < victim_class || (c == victim_class && kv.second.last_used < victim->last_used)) {
+            /* last_used is in seconds: a tie goes by key, so the same store evicts the same way every time */
+            if (!victim || c < victim_class ||
+                (c == victim_class && (kv.second.last_used < victim->last_used ||
+                                       (kv.second.last_used == victim->last_used && kv.first < victim->key)))) {
                 victim = &kv.second;
                 victim_class = c;
             }

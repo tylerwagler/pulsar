@@ -8141,7 +8141,7 @@ static void test_l323_tail_supersession(void) {
     TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && !sb.dominated);
     pulsar_segstore_close(st);
     /* eviction: the branch is made the OLDEST leaf (its header's last_used), so plain LRU would take it; the
-     * dominated tails go first all the same */
+     * dominated tails go first all the same (L353: and the branch keeps its end's restore point) */
     {
         char path[600];
         snprintf(path, sizeof path, "%s/%.40s.seg", dir, bkey);
@@ -8155,7 +8155,7 @@ static void test_l323_tail_supersession(void) {
     st = pulsar_segstore_open(dir, used + 200, 7, NULL, NULL);   /* room for nothing big: a put must evict */
     TEST_ASSERT(l323_persist(st, 8400, 4096, true, tip) == 1);
     TEST_ASSERT(pulsar_segstore_contains(st, bkey));                           /* the old branch's rows stay */
-    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes == 0u);     /* its dead end's restore point went */
+    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes > 0u);      /* and where it resumes */
     TEST_ASSERT(!pulsar_segstore_contains(st, t1) || !pulsar_segstore_contains(st, t2));   /* a dominated tail went */
     pulsar_segstore_close(st);
     l323_rmdir(dir);
@@ -8960,10 +8960,12 @@ static void test_l347_i2_older_ends_kept(void) {
     TEST_ASSERT(pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, e3.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
-    /* more pressure: the next unflagged one (5000's, older than 9200's) before the anchor */
+    /* more pressure: the first newcomer's rows, which restore nothing (L353), then the next unflagged one (5000's,
+     * older than 9200's), before the anchor */
     char nk2[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second newcomer", L323_STATE, 10, nk2));
-    TEST_ASSERT(l347_ev_at(log, e1.key, true) == 1);
+    TEST_ASSERT(l347_ev_at(log, nk, false) == 1);
+    TEST_ASSERT(l347_ev_at(log, e1.key, true) == 2);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
@@ -9043,6 +9045,8 @@ static void test_l347_i2_eviction_order(void) {
     TEST_ASSERT(pulsar_segstore_get(st, D, &g) && g.dominated);
     const uint64_t used = pulsar_segstore_used_bytes(st);
     pulsar_segstore_close(st);
+    l347_set_last_used(dir, L0, 1000);   /* of the chain ends, the dead end was used longest ago */
+    l347_set_last_used(dir, B, 2000);
     /* a store just big enough for it all, then a put of nearly the whole budget: everything evictable goes, in order */
     st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
     l347_evlog log;
@@ -9144,6 +9148,10 @@ static void test_l353_disk_full_evicts(void) {
     char a[41], b[41], c[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "old", 1000, 1, a));
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "newer", 1000, 2, b));
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a, 1000);
+    l347_set_last_used(dir, b, 2000);
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
     uint64_t disk[3] = { pulsar_segstore_used_bytes(st) + 1500, 0, (uint64_t)st };
     pulsar_segstore_set_disk_free(st, l353_disk_free, disk);
     /* 1500 free: a 1000-byte payload (+ header and text) fits and evicts nothing */
@@ -9176,31 +9184,36 @@ static void test_l353_disk_full_evicts(void) {
 /* L353: the chain a request picked is pinned across the persist that makes room for the displaced history
  * (gen_begin): at budget, that persist takes something else, or nothing -- never the picked chain's restore point. */
 static void test_l353_picked_chain_survives_the_evict_persist(void) {
-    char tmpl[] = "/tmp/pulsar-l353-pick.XXXXXX";
-    char *dir = l323_tmpdir(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
-    char picked[41], other[41];
-    TEST_ASSERT(test_seg_put(st, "", 0, 128, "picked", 300, 1, picked));
-    TEST_ASSERT(l323_put_rp(st, picked, 128));
-    TEST_ASSERT(test_seg_put(st, "", 0, 128, "other", 300, 2, other));
-    TEST_ASSERT(l323_put_rp(st, other, 128));
-    const uint64_t used = pulsar_segstore_used_bytes(st);
-    pulsar_segstore_close(st);
-    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
-    pulsar_segstore_seg chain[1];
-    TEST_ASSERT(pulsar_segstore_get(st, picked, &chain[0]));
-    pulsar_kvchain_pin(st, chain, 1, true);
-    /* the displaced history's persist, more than everything else holds: the other chain goes, the picked one stays */
-    char big[41];
-    (void)test_seg_put(st, "", 0, 128, "the displaced history", used, 3, big);
-    pulsar_segstore_seg g;
-    TEST_ASSERT(!pulsar_segstore_contains(st, other));
-    TEST_ASSERT(pulsar_segstore_get(st, picked, &g) && g.rp_bytes > 0u);
-    pulsar_kvchain_pin(st, chain, 1, false);
-    pulsar_segstore_close(st);
-    l323_rmdir(dir);
+    const auto picked_rp_survives = [](bool pin) {
+        char tmpl[] = "/tmp/pulsar-l353-pick.XXXXXX";
+        char *dir = l323_tmpdir(tmpl);
+        if (!dir) return false;
+        pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+        char picked[41], other[41];
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, "picked", 300, 1, picked));
+        TEST_ASSERT(l323_put_rp(st, picked, 128));
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, "other", 300, 2, other));
+        TEST_ASSERT(l323_put_rp(st, other, 128));
+        const uint64_t used = pulsar_segstore_used_bytes(st);
+        pulsar_segstore_close(st);
+        l347_set_last_used(dir, picked, 1000);   /* used longest ago: plain LRU takes it first */
+        l347_set_last_used(dir, other, 2000);
+        st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+        pulsar_segstore_seg chain[1];
+        TEST_ASSERT(pulsar_segstore_get(st, picked, &chain[0]));
+        if (pin) pulsar_kvchain_pin(st, chain, 1, true);
+        char big[41];
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, "the displaced history", 300, 3, big));
+        pulsar_segstore_seg g;
+        const bool kept = pulsar_segstore_get(st, picked, &g) && g.rp_bytes > 0u;
+        TEST_ASSERT(pin ? pulsar_segstore_get(st, other, &g) && g.rp_bytes == 0u : true);
+        if (pin) pulsar_kvchain_pin(st, chain, 1, false);
+        pulsar_segstore_close(st);
+        l323_rmdir(dir);
+        return kept;
+    };
+    TEST_ASSERT(!picked_rp_survives(false));   /* the hazard: unpinned, the persist takes the very point the load wants */
+    TEST_ASSERT(picked_rp_survives(true));
 }
 
 /* L264: releasing one chain's KV (the agent's /strip and /del) takes only the
