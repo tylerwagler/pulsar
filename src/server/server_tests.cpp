@@ -9147,6 +9147,25 @@ static void test_l354_admission_limits(void) {
     TEST_ASSERT(judge_total_tokens_ok(4 * 131072, 131072) && !judge_total_tokens_ok(4 * 131072 + 1, 131072));
 }
 
+std::string model_id_json_body(const char *id);
+std::string prometheus_label(const char *v);
+
+/* L354: an explicit cap below one token is refused on every surface (F19); a model id can't break the JSON or the metrics
+ * it is pasted into (F18). */
+static void test_l354_server_values(void) {
+    const char *zero = "{\"prompt\":\"x\",\"max_tokens\":0}", *neg = "{\"prompt\":\"x\",\"max_tokens\":-5}";
+    for (const char *body : {zero, neg}) {
+        request r;
+        char err[256] = "";
+        TEST_ASSERT(!parse_completion_request(NULL, body, 64, &r, err, sizeof err));
+        TEST_ASSERT(strstr(err, "max_tokens") != NULL);
+    }
+    TEST_ASSERT(model_id_json_body("plain") == "plain");
+    TEST_ASSERT(model_id_json_body("a\"b\\c\nd") == "a\\\"b\\\\c\\nd");
+    TEST_ASSERT(prometheus_label("plain") == "plain");
+    TEST_ASSERT(prometheus_label("a\"b\\c\nd") == "a\\\"b\\\\c\\nd");
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -14888,6 +14907,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_persist_skipped_under_the_floor();
     test_l354_completions_refusal_frees_controls();
     test_l354_admission_limits();
+    test_l354_server_values();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

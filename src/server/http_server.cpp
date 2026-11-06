@@ -10,6 +10,30 @@
 
 #include <string>
 
+/// L354: a model id's bytes inside a JSON string (it is operator-set, and a quote or a newline would break the document).
+/// @param id the id
+/// @return its escaped body, without the quotes
+std::string model_id_json_body(const char *id) {
+    buf b = {0};
+    json_escape_fragment_n(&b, id, strlen(id));
+    std::string out(b.ptr ? b.ptr : "");
+    buf_free(&b);
+    return out;
+}
+
+/// L354: a value for a Prometheus label: backslash, quote and newline escaped, as its text format defines.
+/// @param v the value
+/// @return the escaped value
+std::string prometheus_label(const char *v) {
+    std::string out;
+    for (; *v; v++) {
+        if (*v == '\\' || *v == '"') out += '\\';
+        if (*v == '\n') out += "\\n";
+        else out += *v;
+    }
+    return out;
+}
+
 
 
 /// Free a request's body and zero it.
@@ -362,7 +386,8 @@ void server::build_tp_health() {
  * mu (same discipline as /metrics — no engine calls on the client thread). */
 bool server::send_health(int fd) {
     auto *s = this;
-    const char *model = server_served_model_id(s);
+    const std::string model_json = model_id_json_body(server_served_model_id(s));   /* L354 */
+    const char *model = model_json.c_str();
     bool draining;
     int n_slots, running, waiting, capacity;
     time_t started;
@@ -439,8 +464,8 @@ bool server::send_version(int fd) {
         "{\"version\":\"%s\",\"engine\":\"pulsar\",\"cuda_arch\":\"sm_120f\","
         "\"model\":\"%s\",\"model_name\":\"%s\",\"context\":%d}\n",
         PULSAR_VERSION_STR,
-        server_served_model_id(s),
-        server_served_model_name(s),
+        model_id_json_body(server_served_model_id(s)).c_str(),
+        model_id_json_body(server_served_model_name(s)).c_str(),
         pulsar_session_ctx(s->sess));
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -553,7 +578,8 @@ bool server::send_metrics(int fd) {
      * m_slot_phase/m_slot_prefill_*, server_publish_metrics_snapshot —
      * refreshed at bind time and once per quantum, so gauges lag live state by
      * at most one quantum). */
-    const char *model = server_served_model_id(s);
+    const std::string model_label = prometheus_label(server_served_model_id(s));   /* L354 */
+    const char *model = model_label.c_str();
     pulsar_spec_metrics m;
     int n_slots;
     double slot_kv[PULSAR_SESSION_POOL_CAP];

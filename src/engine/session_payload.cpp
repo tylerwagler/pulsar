@@ -520,7 +520,10 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
     const uint32_t bank = pulsar_session_live_bank(this);
     pulsar_ckpt_slot_at at;
-    if (!dst || G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, bank, G, &at)) {
+    /* L354: the same gate as copy_out_segment's: after a rewind or an invalidate the store can still hold the slot, and a
+     * restore point of rows the bank no longer holds would resume a history it doesn't have */
+    if (!dst || !checkpoint_valid || G == 0u || G > (uint32_t)checkpoint.len || G % st->ops->resume_grid != 0u ||
+        !pulsar_ckpt_locate(st, bank, G, &at)) {
         payload_set_err(err, errlen, "copy-out restore point: the installed bank holds no checkpoint there");
         return 1;
     }
@@ -1123,7 +1126,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "session payload: a tensor-parallel session's payload is not mirrored");
         return 1;
     }
-    spec_lookahead_reset(s);
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const uint32_t bank = pulsar_session_live_bank(s);
     const uint32_t width = (uint32_t)pulsar_engine_logits_width(s->engine);
@@ -1202,6 +1204,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return drop();
     }
     /* Device writes begin: from here a failure leaves the bank holding nothing. */
+    /* L354: from here the bank is written.  A payload refused above leaves the speculation as it found it */
+    spec_lookahead_reset(s);
     segment_clear(s, st, bank);
     pulsar_gpu_tensor *front = NULL;
     auto fail = [&]() { pulsar_gpu_tensor_free(front); segment_clear(s, st, bank); return drop(); };

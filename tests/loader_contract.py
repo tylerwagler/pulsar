@@ -87,7 +87,8 @@ FAMILIES = {
         'stack': 'model.language_model.layers.1.experts.gate_proj',
     },
 }
-MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count')
+MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count', 'deep-array',
+             'dim-overflow')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
                  'does not')
 SMALL_SIDE_FILE = 64 << 20      # side files up to this size are copied; larger ones are cloned sparse
@@ -227,6 +228,22 @@ def mutate(shards, family, row, what):
         shards[i]['header'][cname + '.dup'] = shards[i]['header'][cname]
         edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {**t, cname + '.dup': t[cname]})
         return f'{name} declared twice', [name]
+    if what == 'deep-array':   # L354: pulsar.kv is a JSON string, so only the loader's own limit sees inside it
+        depth = 200000
+        deep = ('{"__array__":"array","n":1,"v":[' * depth) + '1' + (']}' * depth)
+        for s in shards:
+            meta = s['header'].get('__metadata__', {})
+            if 'pulsar.kv' in meta:
+                text = meta['pulsar.kv'].rstrip()
+                meta['pulsar.kv'] = text[:-1] + ',{"key":"probe.deep","type":"array","value":' + deep + '}]'
+                return f'a metadata array nested {depth} deep', ['nested past']
+        sys.exit(f'loader_contract: {family} has no pulsar.kv')
+    if what == 'dim-overflow':   # L354: a declared size that wraps to 0 is refused, not read as a tensor of 0 bytes
+        s = shards[0]
+        s['header']['probe.overflow'] = {'dtype': 'U8', 'shape': [0], 'data_offsets': [0, 0]}
+        edit_meta_json(s, 'pulsar.tensors', lambda t: {**t, 'probe.overflow': {
+            'gguf_name': 'probe.overflow', 'layout': 'mxfp8_lt', 'dims_ne': [2**53, 2**53]}})
+        return 'a tensor declared [2^53, 2^53]', ['overflow']
     if what == 'shard-count':   # L354: a stale shard left by a rebuild, or a missing one, disagrees with the build's count
         n = len(shards)
         for s in shards:
