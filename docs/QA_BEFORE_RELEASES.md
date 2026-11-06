@@ -154,7 +154,6 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `cuda-attn-gates` | 45 | |
 | `cuda-attn-pack-gate` | 5 | |
 | `indexer-hadamard-kernel-check` | 5 | |
-| `cuda-prefill-gate-cutlass-mxfp4` | 5 | skips loudly off-box |
 | `qwen-family-gate-device` | 60 | zero-weight containers |
 | `state-kinds-gate` | 5 | |
 | `vision-qwen-tower-gate` | 10 | |

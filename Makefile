@@ -2407,6 +2407,8 @@ cuda-prefill-gate:
 # The CUTLASS-MXFP4 half of the byte gate -- see CUTLASS_MXFP4_GATE_MODEL above.
 # L354: a configured path that isn't there FAILS.  It used to SKIP and exit 0, so a typo or an unmounted share printed
 # ALL GATES PASS with the only gate for this lane not run.  (Unset, need_path refuses already.)
+# L354: MANUAL, out of the battery: its artifact is on no box (L292 noted it 2026-10-13), and the SKIP had hidden that.  No served
+# family uses this lane, so nothing gates it; bringing it back means rebuilding the artifact and re-dumping the blob.
 cuda-prefill-gate-cutlass-mxfp4:
 	@if [ ! -d "$(CUTLASS_MXFP4_GATE_MODEL)" ]; then \
 		echo "FAIL  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
@@ -2753,7 +2755,7 @@ prefix-stability-gate: pulsar_test
 GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
+	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
 	cuda-runner-gate live-legs preempt-wedge-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
