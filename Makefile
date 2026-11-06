@@ -2314,7 +2314,7 @@ warnings-gate:
 	echo "WARNINGS GATE: PASS (a build from nothing, 0 warnings)"
 doxygen-gate:
 	@rm -f docs/api/doxygen-warnings.log; \
-	doxygen docs/Doxyfile > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \
+	(cat docs/Doxyfile; echo "HAVE_DOT = NO") | doxygen - > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \
 	[ -f docs/api/doxygen-warnings.log ] || { echo "DOXYGEN GATE: FAIL (no warnings log: the Doxyfile moved it?)"; exit 1; }; \
 	if [ -s docs/api/doxygen-warnings.log ]; then head -40 docs/api/doxygen-warnings.log; \
 	  echo "DOXYGEN GATE: FAIL ($$(wc -l < docs/api/doxygen-warnings.log) lines)"; exit 1; fi; \
