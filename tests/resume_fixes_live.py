@@ -69,7 +69,13 @@ def case_disconnect(a, g, work):
         if not g.check(phase_prefilling(srv), "the long prompt reached prefill"):
             s.close()
             return
-        time.sleep(1.0)
+        # past the first grid checkpoints, so there is something to keep: a hang-up before them keeps nothing, rightly
+        t0 = time.time()
+        while time.time() - t0 < 300 and "prefill chunk 8192/" not in srv.since(mark):
+            time.sleep(0.05)
+        if not g.check("prefill chunk 8192/" in srv.since(mark), "the prefill passed 8192 before the hang-up"):
+            s.close()
+            return
         s.close()
         t0 = time.time()
         while time.time() - t0 < 120 and "client disconnected during prefill" not in srv.since(mark):
@@ -139,15 +145,20 @@ def case_boundary(a, g, work):
     extra = ("--kv-disk-dir", kv)
     srv = Server(a.binary, a.model, work, "boundary-1", a.port, a.ctx, banks=a.banks, extra=extra)
     try:
-        # trim the text a word at a time to a prompt of exactly a grid multiple
-        text, n = STORY[:40000], 0
-        for _ in range(400):
-            st, d = srv.post_json("/v1/messages/count_tokens", {"model": "m", "messages": user(text)}, timeout=60)
+        # trim the text a word at a time to a prompt of exactly a grid multiple.  count_tokens counts its own render, so the
+        # chat prompt's offset from it is measured first
+        def count(t):
+            st, d = srv.post_json("/v1/messages/count_tokens", {"model": "m", "messages": user(t)}, timeout=60)
             if st != 200:
-                g.check(False, "count_tokens: HTTP %s" % st)
-                return
-            n = d["input_tokens"]
-            if n % GRID == 0:
+                raise RuntimeError("count_tokens: HTTP %s" % st)
+            return d["input_tokens"]
+        text = STORY[:40000]
+        offset = chat(srv, user(text))[1]["prompt_tokens"] - count(text)
+        srv.stop()   # that request's history would serve the real one: a clean store for it
+        shutil.rmtree(kv, ignore_errors=True)
+        srv = Server(a.binary, a.model, work, "boundary-1", a.port, a.ctx, banks=a.banks, extra=extra)
+        for _ in range(400):
+            if (count(text) + offset) % GRID == 0:
                 break
             text = text[:text.rfind(" ")]
         _, usage = chat(srv, user(text))

@@ -287,6 +287,7 @@ int GATE_ENTRY(int argc, char **argv) {
     /* ---- L355: state the restores own, each stated directly ---- */
     {
         /* F16: a session nothing has stepped has no live row to read */
+        pulsar_engine_set_bank_pool(2);   /* F6 below needs a second bank */
         pulsar_session *d = NULL;
         CHECK(pulsar_session_create(&d, e, ctx) == 0, "session D create failed");
         g_sessions[2] = d;
@@ -334,7 +335,10 @@ int GATE_ENTRY(int argc, char **argv) {
         free(rp);
 
         /* F6: a saved view whose restore fails is a failure, and the installed bank stays: never a fresh view */
-        if (pulsar_session_bank_count(d) >= 2 && d->bank_carry && d->bank_carry_n >= 2) {
+        pulsar_session_bank_state_save(d, pulsar_session_live_bank(d));
+        CHECK(pulsar_session_bank_count(d) >= 2 && d->bank_carry && d->bank_carry_n >= 2,
+              "the failed-restore check needs two banks (%d, carry %u)", pulsar_session_bank_count(d), d->bank_carry_n);
+        {
             const uint32_t held = pulsar_session_live_bank(d);
             const uint32_t other = held == 0u ? 1u : 0u;
             pulsar_gpu_tensor *rows = d->dev.bank_rows;
@@ -347,11 +351,10 @@ int GATE_ENTRY(int argc, char **argv) {
             CHECK(!restored, "a failed restore of a saved view reported success");
             CHECK(pulsar_session_live_bank(d) == held, "a failed restore moved the installed bank");
             printf("a failed bank restore is a failure: bank %u stays installed\n", held);
-        } else {
-            printf("SKIP  the failed bank restore: one bank here (PULSAR_MSEQ_BANKS >= 2 runs it)\n");
         }
         pulsar_session_free(d);
         g_sessions[2] = NULL;
+        pulsar_engine_set_bank_pool(1);
     }
 
     free(ref); free(got); free(base.v);
