@@ -1187,8 +1187,9 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
-        s->kv_cache_persist(sl, KV_PERSIST_EVICT);
-        stored = true;
+        bool no_room = false;
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT, nullptr, &no_room);
+        stored = !no_room;   /* L353 no. 14: skipped or short, the history is not on disk, and the log says so */
     }
     if (!stored && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -2896,6 +2897,8 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
      * as it was, so they hold across it */
     bool dominated[PULSAR_SESSION_POOL_CAP];
     s->dominated_slots(dominated);
+    /* L353 no. 19: a dead prefix (its session compacted) goes before a live conversation, as worker_evict_one's does */
+    for (int i = 0; i < s->n_slots; i++) dominated[i] = dominated[i] || s->slots[i].hint_dead;
     int m = 0;
     while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
         const int vi = s->guard_pick_victim(excl, n + m, dominated);

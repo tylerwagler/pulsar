@@ -449,6 +449,16 @@ int kv_cache_commit_written(kv_disk_cache *kc) {
     return n;
 }
 
+int kv_cache_wait_written(kv_disk_cache *kc) {
+    if (!kc || !kc->writer) return 0;
+    kv_writer *w = kc->writer;
+    {
+        pulsar::ScopedLock lk(&w->mu);
+        while (!w->queue.empty() || w->busy) pthread_cond_wait(&w->cv, &w->mu);
+    }
+    return kv_cache_commit_written(kc);
+}
+
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted) {
     *staged = 0;
     *uncommitted = 0;
@@ -912,6 +922,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                            reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor().raw() / gib,
                            avail ? "" : " (MemAvailable unreadable)", skipped);
             }
+            if (no_room) *no_room = true;   /* L353 no. 14: nothing was stored, and a caller may say so */
             return 0;
         }
     }
@@ -995,10 +1006,19 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
     const double u = (c->scy * d - b * c->swy) / det, w = (a * c->swy - b * c->scy) / det;
     c->cold_ms_per_gib = u > 0.0 ? u : 0.0;
     c->cached_ms_per_gib = w > 0.0 ? w : 0.0;
-    const bool first = c->loads == 1u;
-    if (first || c->cold_ms_per_gib < c->best_cold_ms_per_gib) c->best_cold_ms_per_gib = c->cold_ms_per_gib;
-    if (first || c->cached_ms_per_gib < c->best_cached_ms_per_gib) c->best_cached_ms_per_gib = c->cached_ms_per_gib;
+    /* L353 no. 17: a best only from a load that measured it: a load all from RAM says nothing of the disk, and its fit
+     * (u = w) seeded a best cold rate about 6x low that only ever fell */
+    if (bytes > cached && (!c->cold_seen || c->cold_ms_per_gib < c->best_cold_ms_per_gib)) {
+        c->best_cold_ms_per_gib = c->cold_ms_per_gib;
+        c->cold_seen = true;
+    }
+    if (cached > 0u && (!c->cached_seen || c->cached_ms_per_gib < c->best_cached_ms_per_gib)) {
+        c->best_cached_ms_per_gib = c->cached_ms_per_gib;
+        c->cached_seen = true;
+    }
 }
+
+uint64_t kv_restore_reads(bool verify, bool retained) { return verify && !retained ? 2u : 1u; }
 
 void kv_read_cost_touch(kv_read_cost *c, double now_sec) {
     if (now_sec > c->last_sec) c->last_sec = now_sec;
@@ -1011,8 +1031,10 @@ bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, dou
     /* L342: each cost's gap above its best halves every KV_READ_RELAX_SEC without a load */
     const double idle = now_sec - c->last_sec;
     const double keep = idle > 0.0 ? exp2(-idle / KV_READ_RELAX_SEC) : 1.0;
-    const double u = c->best_cold_ms_per_gib + (c->cold_ms_per_gib - c->best_cold_ms_per_gib) * keep;
-    const double w = c->best_cached_ms_per_gib + (c->cached_ms_per_gib - c->best_cached_ms_per_gib) * keep;
+    const double best_u = c->cold_seen ? c->best_cold_ms_per_gib : c->cold_ms_per_gib;
+    const double best_w = c->cached_seen ? c->best_cached_ms_per_gib : c->cached_ms_per_gib;
+    const double u = best_u + (c->cold_ms_per_gib - best_u) * keep;
+    const double w = best_w + (c->cached_ms_per_gib - best_w) * keep;
     *ms = (double)(bytes - cached) / KV_GIB * u + (double)cached / KV_GIB * w;
     return true;
 }
@@ -1205,9 +1227,16 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     char err[384];
     const bool checking = r->verify && r->verified < r->hit->n;
     if (!checking) r->touched = true;   /* the load writes the bank from its first segment on */
-    const int rc = checking
-        ? pulsar_kvchain_verify_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->verified, k, err, sizeof err)
-        : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    const auto slice = [&]() {
+        return checking
+            ? pulsar_kvchain_verify_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->verified, k, err, sizeof err)
+            : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    };
+    /* L353 no. 12: images come back to the pool at their commits.  A transient failure with writes in flight waits for
+     * them and tries once more: milliseconds, against a re-prefill from 0 */
+    (void)kv_cache_commit_written(&s->kv);
+    int rc = slice();
+    if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();
     const double ms = (server_now_sec() - t0) * 1000.0;
     r->read_ms += ms;
     r->slices++;
@@ -1263,7 +1292,9 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
     if (G == 0) return 0;
     const size_t text_bytes = strlen(text);
     pthread_mutex_lock(&s->mu);
-    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes, r->hit->cached, r->read_ms, server_now_sec());
+    /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
+    const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
+    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, server_now_sec());
     s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base) : 0u;
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);

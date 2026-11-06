@@ -645,7 +645,15 @@ void server::gen_prefill_abandon(session_slot *sl) {
             pthread_mutex_unlock(&s->mu);
         }
     }
-    s->gen_prefill_fail(sl);
+    /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
+     * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
+     * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
+    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
+    g->phase = GEN_DONE;
 }
 
 
@@ -744,6 +752,8 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
 static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
     gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
     memset(gr, 0, sizeof(*gr));
+    /* L353 no. 21: the spill's own files may still be in the writer's queue: the chain ends short without them */
+    (void)kv_cache_wait_written(&s->kv);
     const int G = s->kv_cache_find(was->text, was->hashes, was->n_img, &gr->hit);
     if (G <= 0 || s->kv_cache_price(&gr->hit, 0) == KV_RESTORE_RECOMPUTE) {
         free(gr);
@@ -2277,8 +2287,9 @@ bool server::terminal_checkpoint_step() {
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (!sl->terminal_pending) continue;
-        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete */
-        if (!sl->provisioned || sl->spilled || sl->active_job) {
+        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete; L353 no. 20: a
+         * dead prefix won't be resumed, so its reply isn't worth an uncancellable sync */
+        if (!sl->provisioned || sl->spilled || sl->active_job || sl->hint_dead) {
             sl->terminal_pending = false;
             continue;
         }

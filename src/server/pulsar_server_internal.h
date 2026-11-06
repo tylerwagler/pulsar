@@ -1378,6 +1378,8 @@ typedef struct {
     /// loads observed (kv_read_cost_observe calls that counted); 0 = unmeasured
     uint32_t loads;
     double cold_ms_per_gib, cached_ms_per_gib;   ///< the solved costs, valid from the first load
+    bool cold_seen;                  ///< L353 no. 17: a load with cold bytes has set best_cold_ms_per_gib
+    bool cached_seen;                ///< L353 no. 17: a load with cached bytes has set best_cached_ms_per_gib
     double best_cold_ms_per_gib;     ///< L342: the lowest cold_ms_per_gib has been (the relaxation's floor)
     double best_cached_ms_per_gib;   ///< L342: the lowest cached_ms_per_gib has been (the relaxation's floor)
     /// L342: server_now_sec() of the last load's start, slice or finish; 0 = never
@@ -1406,6 +1408,9 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
 /// @param c        the fit (caller holds server::mu)
 /// @param now_sec  server_now_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
+/** L353 no. 16: how many times a restore read its chain.  @param verify it was checked before the load
+ *  @param retained the check's read stayed as the RAM copy the load reads  @return the reads */
+uint64_t kv_restore_reads(bool verify, bool retained);
 /** The estimated read of `bytes`, `cached` of them in the RAM tier, at `now_sec`; false (and 0) before the first
  *  load.  Each cost's gap above its best halves every KV_READ_RELAX_SEC since the last load (L342). */
 /// @param c        the fit
@@ -4950,6 +4955,9 @@ void kv_cache_close(kv_disk_cache *kc);
 /// @param kc the cache
 /// @return segments indexed
 int kv_cache_commit_written(kv_disk_cache *kc);
+/** L353 nos. 12, 21: wait for the writer's queue to empty, then commit what it wrote.  A restore's next read or a spilled bank's
+ *  lookup needs them; the wait is the backlog's write time.  @param kc the cache  @return the files committed */
+int kv_cache_wait_written(kv_disk_cache *kc);
 /** L338: how much the background writer holds now: staged bytes not yet written, and finished jobs not yet
  *  committed (for /metrics and the tests). */
 /// @param kc        the cache

@@ -1389,6 +1389,14 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
         if ((uint64_t)r % PULSAR_KVPOOL_ALIGN != 0u) break;   /* the short read at EOF */
     }
     if (fd >= 0) close(fd);
+    /* L353 no. 13: a file that is there but can't be read now (EMFILE, ENOMEM, EIO) is no fault of its content: 1 would
+     * drop the key and everything under it */
+    if (rd_errno && rd_errno != ENOENT) {
+        snprintf(err, errlen, "%s %s can't be read now: %s", rp ? "restore point" : "segment", path.c_str(),
+                 strerror(rd_errno));
+        st->img_free(img);
+        return 2;
+    }
     const char *why = nullptr;
     if (rd_errno) why = strerror(rd_errno);
     else if (got != file_bytes) why = "its size is not the indexed size";
@@ -1620,6 +1628,7 @@ uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps) {
     if (rps) *rps = st ? st->rps_removed : 0u;
     return st ? st->segs_removed : 0u;
 }
+bool pulsar_segstore_retains(const pulsar_segstore *st) { return st && st->retain; }
 uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st) { return st ? st->writes_failed : 0u; }
 void pulsar_segstore_set_disk_free(pulsar_segstore *st, pulsar_segstore_disk_free_fn fn, void *ud) {
     if (!st) return;

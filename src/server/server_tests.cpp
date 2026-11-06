@@ -9195,6 +9195,65 @@ static void test_l354_http_framing(void) {
     TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\":\"x\"} trailing", 64, &r, err, sizeof err));
 }
 
+/* L353 nos. 13, 16, 17, 20: the small ones. */
+static void test_l353_small_fixes(void) {
+    /* 17: a load all from RAM doesn't set the disk's best; 16: a checked restore without retention read twice */
+    const uint64_t MiB = 1ull << 20;
+    const double T0 = 100.0;
+    kv_read_cost rc;
+    memset(&rc, 0, sizeof rc);
+    kv_read_cost_observe(&rc, 1024 * MiB, 1024 * MiB, 50.0, T0);     /* RAM: 50 ms a GiB */
+    TEST_ASSERT(!rc.cold_seen && rc.cached_seen);
+    kv_read_cost_observe(&rc, 1024 * MiB, 0, 500.0, T0);             /* the disk */
+    TEST_ASSERT(rc.cold_seen && rc.best_cold_ms_per_gib > 50.0);
+    TEST_ASSERT(kv_restore_reads(true, false) == 2u && kv_restore_reads(true, true) == 1u &&
+                kv_restore_reads(false, false) == 1u);
+    /* 20: a dead prefix's reply gets no terminal sync */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        s.pool_banks = 2;
+        s.n_slots = 1;
+        s.slots[0].provisioned = true;
+        s.slots[0].terminal_pending = true;
+        s.slots[0].hint_dead = true;
+        TEST_ASSERT(!s.terminal_checkpoint_step());
+        TEST_ASSERT(!s.slots[0].terminal_pending);
+    }
+    /* 13: a file that can't be opened now is transient (2): it and its descendants stay; a missing one is a fault (1) */
+    char tmpl[] = "/tmp/pulsar-l353-errno.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char key[41], err[256] = "";
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a segment", 256, 1, key));
+    struct rlimit was;
+    TEST_ASSERT(getrlimit(RLIMIT_NOFILE, &was) == 0);
+    const uint8_t *payload = NULL;
+    uint64_t bytes = 0;
+    std::vector<int> held;   /* every descriptor under the limit, so the store's open fails with EMFILE */
+    struct rlimit low = was;
+    low.rlim_cur = 64;
+    TEST_ASSERT(setrlimit(RLIMIT_NOFILE, &low) == 0);
+    for (;;) {
+        const int fd = open("/dev/null", O_RDONLY);
+        if (fd < 0) break;
+        held.push_back(fd);
+    }
+    const int rc_emfile = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
+    for (const int fd : held) close(fd);
+    TEST_ASSERT(setrlimit(RLIMIT_NOFILE, &was) == 0);
+    TEST_ASSERT(rc_emfile == 2);
+    char path[600];
+    snprintf(path, sizeof path, "%s/%.40s.seg", dir, key);
+    TEST_ASSERT(access(path, F_OK) == 0 && pulsar_segstore_contains(st, key));
+    TEST_ASSERT(unlink(path) == 0);
+    TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 1);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -14034,7 +14093,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 0);
     sl.kv_flags = 0u;   /* a request without the token took the bank: its history writes again */
     bool no_room = false;
-    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && !no_room);
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
     (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
@@ -14678,6 +14737,7 @@ static void test_l334_positions_are_ints(void) {
     TEST_ASSERT(TokPos{-1}.is_none() && TokPos::none().raw() == -1);           /* the int field's -1 enters as none() */
 }
 
+#include <sys/resource.h>
 #include <malloc.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -14956,6 +15016,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_server_values();
     test_l354_http_framing();
     test_l354_py_unprintable();
+    test_l353_small_fixes();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

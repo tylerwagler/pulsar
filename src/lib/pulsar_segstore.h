@@ -579,6 +579,9 @@ uint64_t pulsar_segstore_budget_bytes(const pulsar_segstore *st);
  *  @param rps receives the restore points removed, or NULL
  *  @return the segments removed */
 uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps);
+/** L353 no. 16: whether a part read from disk stays as its RAM copy (pulsar_segstore_set_ram's retain): a second read
+ *  of it then costs nothing.  @param st the store, or NULL  @return true when it does */
+bool pulsar_segstore_retains(const pulsar_segstore *st);
 /** L353: files copied out whose write failed, ever.  @param st the store, or NULL  @return the count (0 for NULL) */
 uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st);
 /** L353: reads the disk's free bytes.  @param ud context  @return the bytes */
