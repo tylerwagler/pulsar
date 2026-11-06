@@ -212,6 +212,16 @@ rounds. A duplicate-prefix census is exported (L324).
 
 ## Known limits
 
+- **CUDA 13.5 moved the DeepSeek Vision-Exp fixture's numbers.**  Its runtime libraries alone
+  do it: the previous binary moves the same way on them, and CUTLASS has no effect.  Across 25
+  prompts the top token's probability moved 0.13 on average, five top tokens changed, and mixed
+  and classic prefill now differ by 5.5% in logits (0.03% before).  Which build is closer to the
+  source is not established.  Qwen3.8-Flash-Next, the production model, is unmoved: the same 25
+  prompts return identical top-8 probabilities on both toolchains.
+- **`pulsar-agent`'s tool loop doesn't run on Qwen or on the DeepSeek fixture.**  Qwen emits its
+  native tool markup, which the agent's parser doesn't read; on the fixture its calls come out
+  invalid, on the previous build too.  So the agent's new workspace limits haven't had a real
+  run.
 - **Test coverage is uneven.** Only Qwen3.8-Flash-Next has good coverage
   (production and most live legs). DeepSeek Vision-Exp has broad battery gates,
   but no production use in this release. V4.1, Nemotron and Inkling are thinner.

@@ -10,7 +10,8 @@ Each case states the behaviour L353 fixed and reads it from the server's own log
   spill (nos. 8, 21)  A bank spilled under a low KV budget.  A request sharing only the start of its history doesn't read its
                       whole chain; a request continuing it does, to full depth straight after the spill.
   boundary (no. 15)   A prompt of exactly a grid multiple, persisted, re-sent on a fresh server.  A chain ending at the prompt's
-                      end can't be resumed: the pick comes from a point below it, and the reply's cached count says so.
+                      end can't be resumed: the pick comes from a point below it (the anchor at the end of a system prompt seen
+                      twice), and the reply's cached count says so.
 
 Exit 0 only when every check passed."""
 import argparse
@@ -58,7 +59,9 @@ def case_disconnect(a, g, work):
     srv = Server(a.binary, a.model, work, "disconnect", a.port, a.ctx, banks=a.banks)
     try:
         text = STORY[:120000]
-        body = json.dumps({"model": "m", "max_tokens": 1, "temperature": 0, "messages": user(text)}).encode()
+        # the same request as the re-send's, template options too: another render shares no prefix with it
+        body = json.dumps({"model": "m", "max_tokens": 1, "temperature": 0,
+                           "chat_template_kwargs": {"enable_thinking": False}, "messages": user(text)}).encode()
         mark = srv.mark()
         s = socket.create_connection(("127.0.0.1", a.port), timeout=10)
         s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: " +
@@ -143,25 +146,34 @@ def case_boundary(a, g, work):
     kv = os.path.join(work, "boundary-kv")
     shutil.rmtree(kv, ignore_errors=True)
     extra = ("--kv-disk-dir", kv)
+    system, tail = STORY[:30000], STORY[30000:34000]
+    def msgs(t):
+        return [{"role": "system", "content": system}, {"role": "user", "content": t}]
     srv = Server(a.binary, a.model, work, "boundary-1", a.port, a.ctx, banks=a.banks, extra=extra)
     try:
         # trim the text a word at a time to a prompt of exactly a grid multiple.  count_tokens counts its own render, so the
         # chat prompt's offset from it is measured first
         def count(t):
-            st, d = srv.post_json("/v1/messages/count_tokens", {"model": "m", "messages": user(t)}, timeout=60)
+            st, d = srv.post_json("/v1/messages/count_tokens", {"model": "m", "system": system, "messages": user(t)}, timeout=60)
             if st != 200:
                 raise RuntimeError("count_tokens: HTTP %s" % st)
             return d["input_tokens"]
-        text = STORY[:40000]
-        offset = chat(srv, user(text))[1]["prompt_tokens"] - count(text)
+        text = tail
+        offset = chat(srv, msgs(text))[1]["prompt_tokens"] - count(text)
         srv.stop()   # that request's history would serve the real one: a clean store for it
         shutil.rmtree(kv, ignore_errors=True)
         srv = Server(a.binary, a.model, work, "boundary-1", a.port, a.ctx, banks=a.banks, extra=extra)
+        # the system prompt's second sighting writes the anchor's restore point: the stored point below the prompt's end
+        mark = srv.mark()
+        chat(srv, msgs("Name the first character."))
+        chat(srv, msgs("Name the last character."))
+        if not g.check("-> write it" in srv.since(mark), "a second sighting wrote the anchor's restore point"):
+            return
         for _ in range(400):
             if (count(text) + offset) % GRID == 0:
                 break
             text = text[:text.rfind(" ")]
-        _, usage = chat(srv, user(text))
+        _, usage = chat(srv, msgs(text))
         if not g.check(usage["prompt_tokens"] % GRID == 0, "a prompt of exactly a grid multiple: %d" % usage["prompt_tokens"]):
             return
     finally:
@@ -169,7 +181,7 @@ def case_boundary(a, g, work):
     srv = Server(a.binary, a.model, work, "boundary-2", a.port, a.ctx, banks=a.banks, extra=extra)
     try:
         mark = srv.mark()
-        _, usage = chat(srv, user(text))
+        _, usage = chat(srv, msgs(text))
         r = resumes(srv.since(mark))
         print("# exact re-send on a fresh server: %s, usage %s" % (r[-1:], usage), flush=True)
         L = usage["prompt_tokens"]
