@@ -49,6 +49,7 @@ __pycache__/
 /tests/qwen_s4_gate
 /tests/router_gate
 /tests/lt_picks
+/tests/segstore_tsan
 /tests/bf16_rows_gate
 /tests/nvfp4_rows_gate
 /tests/lilicorr_head_gate

@@ -675,6 +675,15 @@ tests/router_gate: tests/router_gate.cu src/cuda/pulsar_cuda_router.h src/cuda/p
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 # L336: writes src/cuda/pulsar_cuda_lt_picks.inc (pulsar_lt_fixed's committed kernel choices) -- a measurement tool,
 # not a gate: run it on a quiet device, `tests/lt_picks --from-log <server log>` (the "fixed GEMM" lines name the shapes).
+# L353 no. 2: the store's index under ThreadSanitizer: client threads walk its trailers while the worker changes it.
+# Host only; built from source with its own flags, so it shares no objects with the server.
+tests/segstore_tsan: tests/segstore_tsan.cpp src/lib/pulsar_segstore.cpp src/lib/pulsar_segstore.h \
+                     src/lib/pulsar_kvdigest.cpp src/lib/pulsar_kvpool.cpp Makefile
+	$(CXX) -std=c++23 -O1 -g -fsanitize=thread -D_GNU_SOURCE -Isrc -Isrc/lib -o $@ tests/segstore_tsan.cpp \
+	  src/lib/pulsar_segstore.cpp src/lib/pulsar_kvdigest.cpp src/lib/pulsar_kvpool.cpp -lpthread
+.PHONY: segstore-tsan
+segstore-tsan: tests/segstore_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 .PHONY: router-gate

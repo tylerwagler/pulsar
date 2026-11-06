@@ -3,6 +3,7 @@
 pulsar-server.
 
     python3 tests/preempt_live.py MODEL exact    [--binary ./pulsar-server] [--work DIR] [--port 8314] [--margin 1.5]
+    python3 tests/preempt_live.py MODEL wedge    [--binary ./pulsar-server] [--work DIR] [--port 8314] [--margin 1.5]
     python3 tests/preempt_live.py MODEL pressure [--ctx 1048576 --banks 16 --n 12 --prompt 48000 --gen 128 --fit 3]
 
 exact     The guard's eager floor and one bank's KV bytes a token are read from a server of this --ctx / --banks
@@ -180,6 +181,92 @@ class PreemptLeg(Leg):
             print("  preempted %r\n  alone     %r" % (got[1][:300], alone[:300]))
 
 
+class PreemptWedgeLeg(Leg):
+    """L353 no. 5: a parked decoder holds no KV, so nothing may wait on its end.  A decodes; B preempts it and decodes; K,
+    small, ends beside B; H resumes K's bank with a prompt that fits the budget by its growth (need <= budget) and never
+    in all (K + need > budget).  While B runs H waits, rightly.  When B ends only the parked A is left: H must get its
+    503 and A come back.  Counted as busy, A kept H waiting, and H's refusal kept A parked: each on the other for ever,
+    with everything queued behind them."""
+    NAME = "preempt-wedge"
+    fresh = False
+    GEN_B = 1200
+
+    def __init__(self, g, work, margin=1.5, tag=None):
+        Leg.__init__(self, g, work)
+        self.margin, self.budget, self.res = margin, None, {}
+        self.h_text = ""
+
+    def warm(self, srv):
+        pr = probe(srv, srv.ctx)
+        if not self.g.check(pr is not None, "the shared server reports its guard budget and one bank's KV bytes"):
+            return
+        eager, per_tok = pr
+        lens = {}
+        for k, t in (("A", A_TEXT), ("B", B_TEXT), ("K", W_TEXT)):
+            st, _, u = chat(srv, t, 1)
+            lens[k] = u.get("prompt_tokens", 0) if st == 200 else 0
+        LA, LB, LK = lens["A"], lens["B"], lens["K"]
+        total = LB * self.margin
+        # H's growth is past what K leaves of the budget and within the budget: sized from a counted stretch of the story
+        rate = len(B_TEXT) / float(LB)
+        self.h_text = W_TEXT + STORY[78000:78000 + int((total - 0.3 * LK) * rate)]
+        st, _, u = chat(srv, self.h_text, 1)
+        LH = u.get("prompt_tokens", 0) if st == 200 else 0
+        need = LH - LK
+        if not self.g.check(LA + LB > total and LB + LK + self.GEN_B < total and LK + need > total and need <= total,
+                            "the frame: A %d + B %d past the budget's %.0f tokens, B + K + B's generation %d within it, "
+                            "H %d (K + %d) past it by growth within it" % (LA, LB, total, self.GEN_B, LH, need)):
+            return
+        self.budget = int(eager + per_tok * total)
+        self.g.note("eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok,
+                                                                                    self.budget / 2**30))
+
+    def hook_env(self):
+        return {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(self.budget)} if self.budget else None
+
+    def _bg(self, name, *args):
+        th = threading.Thread(target=lambda: self.res.__setitem__(name, chat(self.srv, *args)), daemon=True)
+        th.start()
+        return th
+
+    def hooked(self, srv):
+        self.srv = srv
+        mark = srv.mark()
+        ta = self._bg("A", A_TEXT, GEN_A)
+        t0 = time.time()
+        while time.time() - t0 < 600 and not slot_decoding(srv):
+            time.sleep(0.25)
+        time.sleep(1.0)
+        tb = self._bg("B", B_TEXT, self.GEN_B)
+        t0 = time.time()
+        while time.time() - t0 < 600 and "PREEMPTED" not in srv.since(mark):
+            time.sleep(0.25)
+        if not self.g.check("PREEMPTED" in srv.since(mark), "B preempted A"):
+            return
+        t0 = time.time()
+        while time.time() - t0 < 600 and not slot_decoding(srv):
+            time.sleep(0.25)
+        st, _, _ = chat(srv, W_TEXT, 1)
+        self.g.check(st == 200, "K answered beside B: %d" % st)
+        self.g.check(tb.is_alive(), "B is still decoding when H arrives (else A is back and nothing is parked)")
+        th = self._bg("H", self.h_text, 1)
+        t0 = time.time()
+        while time.time() - t0 < 120 and "queued until a busy bank" not in srv.since(mark) and th.is_alive():
+            time.sleep(0.1)
+        self.g.check("queued until a busy bank" in srv.since(mark),
+                     "H waited while B ran, on K's bank (the route that can wedge; a 503 from a fresh bank proves nothing)")
+        tb.join(1200)
+        self.g.check(not tb.is_alive() and self.res.get("B", (0,))[0] == 200, "B answered")
+        th.join(120)
+        self.g.check(not th.is_alive(), "H ended within 120 s of B's end, the parked A not counted as busy")
+        self.g.check(self.res.get("H", (0,))[0] == 503, "H refused 503: %s" % str(self.res.get("H", ("hung",))[0]))
+        ta.join(1200)
+        self.g.check(not ta.is_alive() and self.res.get("A", (0,))[0] == 200, "A readmitted and answered")
+        self.g.check("READMITTED" in srv.since(mark), "A's readmission in the log")
+        st, _, _ = chat(srv, W_TEXT[:2000], 1) if not th.is_alive() else (0, "", {})
+        self.g.check(st == 200, "the queue moves after it: %d" % st)
+
+
 def pressure(a):
     """N concurrent requests on a --ctx / --banks server, the budget overridden to `fit` requests (0: the real one)."""
     ok = True
@@ -249,8 +336,9 @@ if __name__ == "__main__":
         ap.add_argument("--fit", type=float, default=3.0, help="the KV budget overridden to this many requests (0: real)")
         ap.add_argument("--tag", default="run")
         sys.exit(pressure(ap.parse_args()))
-    argv = [x for x in sys.argv[1:] if x != "exact"]
+    leg_cls = PreemptWedgeLeg if len(sys.argv) > 2 and sys.argv[2] == "wedge" else PreemptLeg
+    argv = [x for x in sys.argv[1:] if x not in ("exact", "wedge")]
     from live_legs import standalone
-    sys.exit(standalone(PreemptLeg, argv, ctx=65536, banks=4, port=8314,
+    sys.exit(standalone(leg_cls, argv, ctx=65536, banks=4, port=8314,
                         add_args=lambda ap: (ap.add_argument("--margin", type=float, default=1.5),
                                              ap.add_argument("--tag", default="run"))))

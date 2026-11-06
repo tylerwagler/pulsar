@@ -51,6 +51,7 @@ LEGS = [
     ("prefix-turns-live-gate", "prefix_turns_live", "PrefixTurnsLeg", {"reply": 600, "tag": "gate"}, ("qwen",)),
     ("prefix-turns-side", "prefix_turns_live", "PrefixTurnsLeg", {"turns": 6, "side": True, "tag": "side"}, ("qwen",)),
     ("preempt-exact", "preempt_live", "PreemptLeg", {"margin": 1.25}, ("qwen",)),
+    ("preempt-wedge", "preempt_live", "PreemptWedgeLeg", {}, ("qwen",)),
     # L318 (make resume-deepest-live runs it alone)
     ("resume-deepest", "resume_deepest_live", "ResumeDeepestLeg", {}, ("qwen",)),
     # L322 (make sidecall-turns-live runs it alone)

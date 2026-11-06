@@ -16,6 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,6 +80,10 @@ struct pulsar_segstore {
     void *removed_ud = nullptr;
     /// Key -> index entry, every stored segment
     std::unordered_map<std::string, pulsar_segstore_seg> segs;
+    /// L353: guards the shape of `segs` against pulsar_segstore_foreach_trailer, the one call made off the store's
+    /// thread (a chat parse on a client thread): the store's thread holds it to add or erase an entry and reads `segs`
+    /// without it; the walk holds it only to copy what it needs, never across a file read
+    std::mutex segs_mu;
     std::unordered_map<std::string, std::vector<std::string>> children;   ///< parent key ("" = roots) -> child keys
     /// Sum of file_bytes and rp_bytes over segs, plus pending_rp: what the budget is checked against
     uint64_t used = 0;
@@ -320,7 +325,10 @@ struct pulsar_segstore {
     /** Add e to the index: segs, its parent's children, used. Does not refresh dominance.
      *  @param e the entry (file_bytes set) */
     void link(const pulsar_segstore_seg &e) {
-        segs[e.key] = e;
+        {
+            std::lock_guard<std::mutex> lk(segs_mu);
+            segs[e.key] = e;
+        }
         children[e.parent].push_back(e.key);
         used += e.file_bytes + e.rp_bytes;
     }
@@ -341,7 +349,10 @@ struct pulsar_segstore {
         heads.erase(key);
         img_drop(ram_rows, key);   /* L347 I3a: its RAM copies go with it */
         img_drop(ram_rp, key);
-        segs.erase(it);
+        {
+            std::lock_guard<std::mutex> lk(segs_mu);
+            segs.erase(it);
+        }
         if (parent.empty() || segs.count(parent)) refresh_dominated(parent);
     }
     /** Read a stored segment's own text from its file.
@@ -1497,10 +1508,19 @@ uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const 
 
 void pulsar_segstore_foreach_trailer(pulsar_segstore *st, pulsar_segstore_trailer_fn fn, void *ud) {
     if (!st || !fn) return;
-    for (auto &kv : st->segs) {
-        const pulsar_segstore_seg &e = kv.second;
-        if (!e.trailer_bytes) continue;
-        FILE *fp = fopen(st->path(kv.first.c_str()).c_str(), "rb");
+    /* A client thread's walk: copy the entries under the lock, read the files without it.  A segment evicted since
+     * the copy fails its fopen and is skipped; one evicted after it stays readable through the open file.  These
+     * fields never change once an entry is in the index. */
+    struct walk_entry { std::string key; uint64_t text_len, payload_bytes, trailer_bytes; };
+    std::vector<walk_entry> entries;
+    {
+        std::lock_guard<std::mutex> lk(st->segs_mu);
+        for (auto &kv : st->segs)
+            if (kv.second.trailer_bytes)
+                entries.push_back({kv.first, kv.second.text_len, kv.second.payload_bytes, kv.second.trailer_bytes});
+    }
+    for (const walk_entry &e : entries) {
+        FILE *fp = fopen(st->path(e.key.c_str()).c_str(), "rb");
         if (!fp) continue;
         std::string text(e.text_len, '\0');
         bool go = fseek(fp, (long)HDR, SEEK_SET) == 0 && fread(&text[0], 1, e.text_len, fp) == e.text_len &&
