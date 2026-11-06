@@ -252,10 +252,11 @@ def mutate(shards, family, row, what):
                 return f"{s['name']} without pulsar.kv_arch", ['pulsar.kv_arch']
         sys.exit(f'loader_contract: {family} has no second shard')
     if what == 'shard-count':   # L354: a stale shard left by a rebuild, or a missing one, disagrees with the build's count
-        n = len(shards)
-        for s in shards:
+        built = [s for s in shards if 'pulsar.n_shards' in s['header'].get('__metadata__', {})]
+        n = len(built)
+        for s in built:
             s['header']['__metadata__']['pulsar.n_shards'] = str(n + 1)
-        return f'pulsar.n_shards says {n + 1}, the directory holds {n}', ['shards']
+        return f'pulsar.n_shards says {n + 1}, the build holds {n}', ['shards']
     sys.exit(f'loader_contract: unknown mutation {what}')
 
 
