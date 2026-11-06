@@ -233,7 +233,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -3835,11 +3835,6 @@ tp-transport-test: tests/tp_transport_test
 
 # TP gate-scheduler test (slice 4b): host half of the CUDA gate machinery,
 # driven over the transport's TCP loopback with hook stubs.  No CUDA, no RDMA.
-tests/tp_sched_test: tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
-
-tp-sched-test: tests/tp_sched_test
-	./tests/tp_sched_test
 
 # TP NODE frame test (protocol v13): after bring-up every rank knows every
 # rank's host, build and TP address, over the pair and the 3-rank mesh paths.
@@ -3865,8 +3860,8 @@ tp-identity-test: tests/tp_identity_test
 # exchange and decode-slot reuse at n_embd 8192 (vec == 2*MSG, the RDMA
 # chunked-branch boundary) and 16384 (> 2*MSG, RDMA-registration reject size),
 # plus N decode tokens x 86 gates of slot-reuse soak.  Host-only: TCP loopback.
-tests/tp_wide_test: tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
+tests/tp_wide_test: tests/tp_wide_test.cpp tests/tp_sched_harness.cpp src/tp/pulsar_tp.cpp tests/tp_sched_harness.h src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -o $@ tests/tp_wide_test.cpp tests/tp_sched_harness.cpp src/tp/pulsar_tp.cpp
 
 tp-wide-test: tests/tp_wide_test
 	./tests/tp_wide_test
@@ -3897,11 +3892,6 @@ tp-cmd-stress-test: tests/tp_cmd_stress_test
 # decision rule (all-match vs first-mismatch stop) plus a few hundred leader
 # verify + commit rounds against a worker that mirrors the grade from the
 # drafts -- the grading+commit lockstep the real pair will run.  Host-only.
-tests/tp_verify_test: tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp_verify.h src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp.cpp
-
-tp-verify-test: tests/tp_verify_test
-	./tests/tp_verify_test
 
 # TP tiny-buffer regression (audit F9): the TCP fallback's alternating
 # write/read rounds must complete even when the socket buffers are clamped

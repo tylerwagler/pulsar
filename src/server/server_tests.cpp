@@ -9383,14 +9383,17 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     /* L354: a segment whose size disagrees with its header (a torn write) is removed at open, not left outside `used` */
     {
         pulsar_segstore *o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-        char torn[41], tp[600];
-        test_seg_payload tpay = { 10, 7 };
-        TEST_ASSERT(pulsar_segstore_put(o, "", 0, 128, "torn", 4, 10, test_seg_write, 0, NULL, &tpay, torn, err, sizeof err));
-        pulsar_segstore_close(o);
-        snprintf(tp, sizeof tp, "%s/%.40s.seg", dir, torn);
-        TEST_ASSERT(truncate(tp, 100) == 0);
-        o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-        TEST_ASSERT(!pulsar_segstore_contains(o, torn) && access(tp, F_OK) != 0);
+        for (const off_t cut : {(off_t)100, (off_t)170}) {   /* below its header; inside its payload */
+            char torn[41], tp[600];
+            test_seg_payload tpay = { 10, 7 };
+            TEST_ASSERT(pulsar_segstore_put(o, "", 0, 128, "torn", 4, 10, test_seg_write, 0, NULL, &tpay, torn, err,
+                                            sizeof err));
+            pulsar_segstore_close(o);
+            snprintf(tp, sizeof tp, "%s/%.40s.seg", dir, torn);
+            TEST_ASSERT(truncate(tp, cut) == 0);
+            o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
+            TEST_ASSERT(!pulsar_segstore_contains(o, torn) && access(tp, F_OK) != 0);
+        }
         pulsar_segstore_close(o);
     }
 

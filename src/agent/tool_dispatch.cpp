@@ -30,6 +30,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
+        /* L354: nobody is watching a non-interactive run: running a model's commands is asked for by name */
+        if (w->cfg->non_interactive && !w->cfg->allow_bash)
+            return xstrdup("Tool error: bash is refused in a non-interactive run (--allow-bash permits it)\n");
         int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
                                               60, 1, 3600);

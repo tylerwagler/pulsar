@@ -468,7 +468,7 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (n) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
-        agent_publish(w, body, n);
+        agent_publish_untrusted(w, body, n);
         if (body[n - 1] != '\n') agent_publish(w, "\n", 1);
         if (failed) agent_publish(w, "\x1b[0m", 4);
     }

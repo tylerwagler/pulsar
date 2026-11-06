@@ -326,6 +326,54 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
 
 
 
+/// The resolved workspace; empty: no boundary.
+static char g_workspace[PATH_MAX];
+
+void agent_workspace_init(bool allow_outside) {
+    g_workspace[0] = '\0';
+    if (allow_outside) return;
+    if (!realpath(".", g_workspace)) {
+        fprintf(stderr, "pulsar-agent: cannot resolve the working directory: %s\n", strerror(errno));
+        exit(1);
+    }
+}
+
+char *agent_workspace_refusal(const char *path) {
+    if (!g_workspace[0]) return NULL;
+    /* the deepest part of the path that exists, resolved (symlinks and ..); the rest must not climb back out */
+    std::string probe(path);
+    std::string rest;
+    char real[PATH_MAX];
+    bool inside = false;
+    for (;;) {
+        if (realpath(probe.empty() ? "." : probe.c_str(), real)) {
+            const size_t n = strlen(g_workspace);
+            inside = rest.find("..") == std::string::npos && !strncmp(real, g_workspace, n) &&
+                     (real[n] == '\0' || real[n] == '/' || (n == 1 && g_workspace[0] == '/'));
+            break;
+        }
+        const size_t slash = probe.find_last_of('/');
+        if (slash == std::string::npos) {
+            rest = probe + "/" + rest;
+            probe.clear();
+        } else if (slash == 0) {
+            rest = probe.substr(1) + "/" + rest;
+            probe = "/";
+        } else {
+            rest = probe.substr(slash + 1) + "/" + rest;
+            probe.resize(slash);
+        }
+    }
+    if (inside) return NULL;
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Tool error: ");
+    agent_buf_puts(&b, path);
+    agent_buf_puts(&b, " is outside the workspace ");
+    agent_buf_puts(&b, g_workspace);
+    agent_buf_puts(&b, " (--allow-outside-workspace permits it)\n");
+    return agent_buf_take(&b);
+}
+
 char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
@@ -354,6 +402,7 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     if (!content) return xstrdup("Tool error: write requires content\n");
     FILE *fp = fopen(path, "wb");
     if (!fp) {

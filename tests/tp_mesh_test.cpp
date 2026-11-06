@@ -416,7 +416,7 @@ static int run_mesh_rank(int rank, int n, const int *ports) {
               "rank %d: the bulk lane numbered an exchange at n=%d", rank, n);
     }
 
-    /* The leader's verify DECISION (pulsar_tp_verify_leader_round's direction):
+    /* The leader's verify DECISION (the row lane's direction):
      * rank 0 broadcasts VERIFY_COMMIT and every worker reads exactly the
      * leader's.  Before L335 the leader wrote only to its primary link (rank 1)
      * and a worker read one commit per mesh peer, so at n > 2 a worker blocked

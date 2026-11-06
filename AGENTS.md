@@ -64,7 +64,7 @@ GPU path calls — it is not dead CPU-backend code.
 
 Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph API).
 
-- `src/engine/` — 58 TUs + `pulsar_engine_internal.h`: the model layer and the
+- `src/engine/` — 59 TUs + `pulsar_engine_internal.h`: the model layer and the
   safetensors container reader (`model.cpp`, `safetensors.cpp`, `cursor.cpp`),
   the family registry and the DeepSeek / Qwen families (`family*.cpp`),
   tokenizers, weight binders (`weights.cpp`, `role_bind.cpp`), quant

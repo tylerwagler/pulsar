@@ -1548,10 +1548,24 @@ int pulsar_gpu_store_raw_kv_batch_packed_tensor(pulsar_gpu_tensor *raw_cache, co
      * allocation, and the function returned 0 SILENTLY: every V4 session failed
      * in layer 0's attention encode with no message anywhere. */
     const uint64_t rowbytes = pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim);
-    if (rowbytes == 0) return 0;
+    /* L354: every refusal says which operand and the numbers: this one's silence cost three days once */
+    if (rowbytes == 0) {
+        fprintf(stderr, "pulsar: packed-KV store refused: no row size for head_dim %llu\n", (unsigned long long)head_dim);
+        return 0;
+    }
     if (!raw_cache || !packed || raw_cap == 0 || (head_dim % PULSAR_WINKV_BLOCK) != 0u ||
         raw_cache->bytes < kv_banks * raw_cap * rowbytes ||
-        packed->bytes < (uint64_t)n_tokens * rowbytes) return 0;
+        packed->bytes < (uint64_t)n_tokens * rowbytes) {
+        fprintf(stderr, "pulsar: packed-KV store refused: ring %llu bytes (needs %llu = %llu banks x %llu rows x %llu), "
+                        "pack %llu bytes (needs %llu = %llu tokens x %llu), head_dim %llu (block %u)%s%s\n",
+                raw_cache ? (unsigned long long)raw_cache->bytes : 0ull,
+                (unsigned long long)kv_banks * raw_cap * rowbytes, (unsigned long long)kv_banks,
+                (unsigned long long)raw_cap, (unsigned long long)rowbytes,
+                packed ? (unsigned long long)packed->bytes : 0ull, (unsigned long long)n_tokens * rowbytes,
+                (unsigned long long)n_tokens, (unsigned long long)rowbytes, (unsigned long long)head_dim,
+                (unsigned)PULSAR_WINKV_BLOCK, raw_cache ? "" : "; no ring", packed ? "" : "; no pack");
+        return 0;
+    }
     if (n_tokens == 0) return 1;
     winkv_scatter_kernel<<<n_tokens, 64>>>((const uint8_t *)packed->ptr, (uint8_t *)raw_cache->ptr,
                                            pos0, n_tokens, head_dim, rowbytes,

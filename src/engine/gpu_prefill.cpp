@@ -1905,7 +1905,7 @@ bool gpu_graph_encode_layer_attention_batch(
      * packed rows attention will read.  This was pulsar_gpu_dsv4_fp8_kv_quantize_tensor
      * followed by attention reading the f32 staging directly -- so the chunk's own
      * KV was multiplied at 4 bytes/element while every later chunk read the same
-     * rows out of the ring at 584 B.
+     * rows out of the ring in their packed rows.
      *
      * This is now the ONLY quantise of these rows.  It used to argue that its
      * fast-math scale matched the ring store's, so the chunk's rows and the
@@ -2308,7 +2308,7 @@ bool gpu_graph_encode_layer_attention_batch(
                                                                        g->batch_kv_pack,
                                                                        /* Packed pool straight in.  This called
                                                                         * gpu_graph_attn_comp_read_cache -- a full
-                                                                        * dequantise of 584 B rows into a 2048 B f32
+                                                                        * dequantise of packed rows into a 2048 B f32
                                                                         * shadow, on the SHIPPED path, because the
                                                                         * consumer could not read packed.  The launcher
                                                                         * has ONE arm now (L166): the fp16 tier reads

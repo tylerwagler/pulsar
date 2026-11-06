@@ -141,6 +141,13 @@ void renderer_restore_text_attrs(agent_token_renderer *r) {
  *  @param s the character's bytes
  *  @param n byte count */
 static void renderer_write_complete_char_raw(agent_token_renderer *r, const char *s, size_t n) {
+    /* L354: a model's character the terminal would obey goes out as '?' */
+    char safe[4];
+    if (n <= sizeof safe) {
+        memcpy(safe, s, n);
+        agent_terminal_sanitize(safe, n);
+        s = safe;
+    }
     bool styled = r->use_color && renderer_has_text_attrs(r);
     if (styled && !r->color_open) {
         renderer_set_text_attrs(r);

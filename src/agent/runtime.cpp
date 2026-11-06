@@ -609,6 +609,7 @@ int main(int argc, char **argv) {
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
+    agent_workspace_init(cfg.allow_outside_workspace);
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
     /* the agent takes text: a family whose tokenizer and chat front this build lacks is refused here, by name */

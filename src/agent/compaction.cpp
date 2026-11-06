@@ -239,7 +239,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         size_t text_len = 0;
         char *text = pulsar_token_text(w->engine, token, &text_len);
         agent_buf_append(&summary, text, text_len);
-        agent_publish(w, text, text_len);
+        agent_publish_untrusted(w, text, text_len);
         free(text);
 
         double dt = agent_now_sec() - t0;

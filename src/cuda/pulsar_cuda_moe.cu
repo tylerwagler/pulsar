@@ -630,8 +630,8 @@ static int routed_moe_launch_cutlass_dispatch(
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
     if (!rc) {
-        static int said = 0;
-        if (!said) { said = 1; fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
+        static pulsar_shape_once seen = {};
+        if (pulsar_shape_once_first(&seen, pulsar_shape_key(n_tokens, n_expert), "MoE grouped GEMM")) { fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
                                        n_tokens, n_total_expert, n_expert); }
     }
     return rc;

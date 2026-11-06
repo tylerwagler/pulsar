@@ -67,6 +67,23 @@ bool chat_render_finish(const chat_render_out *out, char *err, size_t errlen) {
 
 namespace {
 
+/// L354: whether CPython's repr() escapes a code point (str.isprintable() is False).
+/// @param cp the code point
+/// @return true when it does
+bool py_unprintable(uint32_t cp) {
+    static const uint32_t ranges[][2] = {
+#include "py_unprintable.inc"
+    };
+    size_t lo = 0, hi = sizeof ranges / sizeof ranges[0];
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (cp > ranges[mid][1]) lo = mid + 1;
+        else if (cp < ranges[mid][0]) hi = mid;
+        else return true;
+    }
+    return false;
+}
+
 /// Python's repr() of a str: single quotes unless the text has a ' and no ", escapes as CPython writes them.
 /// @param s   the string (UTF-8; an invalid byte is copied as is)
 /// @param out receives the repr
@@ -84,7 +101,12 @@ void py_repr_str(const std::string &s, std::string *out) {
         else if (cp == '\n') snprintf(esc, sizeof esc, "\\n");
         else if (cp == '\r') snprintf(esc, sizeof esc, "\\r");
         else if (cp == '\t') snprintf(esc, sizeof esc, "\\t");
-        else if (cp < 0x20 || cp == 0x7f || (cp >= 0x80 && cp < 0xa0)) snprintf(esc, sizeof esc, "\\x%02x", cp);
+        else if (py_unprintable(cp)) {
+            /* L354: all of Python's repr(), not only the C0 and C1 controls: U+00A0 is \\xa0, U+2028 is \\u2028 */
+            if (cp < 0x100) snprintf(esc, sizeof esc, "\\x%02x", cp);
+            else if (cp < 0x10000) snprintf(esc, sizeof esc, "\\u%04x", cp);
+            else snprintf(esc, sizeof esc, "\\U%08x", cp);
+        }
         if (esc[0]) out->append(esc);
         else out->append(s, i, k ? (size_t)k : 1);
         i += k ? (size_t)k : 1;

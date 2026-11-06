@@ -348,6 +348,27 @@ void agent_wake_locked(agent_worker *w) {
 
 
 
+void agent_terminal_sanitize(char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if ((c < 0x20 && c != '\n' && c != '\t' && c != '\r') || c == 0x7f) {
+            s[i] = '?';
+        } else if (c == 0xc2 && i + 1 < n && (unsigned char)s[i + 1] >= 0x80 && (unsigned char)s[i + 1] < 0xa0) {
+            s[i] = '?';
+            s[++i] = '?';
+        }
+    }
+}
+
+void agent_publish_untrusted(agent_worker *w, const char *s, size_t n) {
+    if (!n) return;
+    char *copy = (char *)xmalloc(n);
+    memcpy(copy, s, n);
+    agent_terminal_sanitize(copy, n);
+    agent_publish(w, copy, n);
+    free(copy);
+}
+
 /* Queue rendered output for the UI thread.  The worker never writes directly
  * to the terminal, which keeps linenoise redraws serialized in one place. */
 void agent_publish(agent_worker *w, const char *s, size_t n) {

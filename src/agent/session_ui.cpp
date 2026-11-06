@@ -530,7 +530,7 @@ static void agent_history_publish_limited(agent_worker *w, const char *p,
     if (truncated)
         agent_publish(w, "\n... earlier history truncated; showing tail ...\n",
                       strlen("\n... earlier history truncated; showing tail ...\n"));
-    agent_publish(w, start, (size_t)(end - start));
+    agent_publish_untrusted(w, start, (size_t)(end - start));
     if (end > start && end[-1] != '\n') agent_publish(w, "\n", 1);
 }
 
@@ -595,7 +595,7 @@ static void agent_history_render_assistant(agent_worker *w,
                       "\n... earlier assistant history truncated; showing tail ...\n",
                       strlen("\n... earlier assistant history truncated; showing tail ...\n"));
         (void)rendered_truncated;
-        agent_publish(w, tail_start, (size_t)(tail_text + tail_len - tail_start));
+        agent_publish_untrusted(w, tail_start, (size_t)(tail_text + tail_len - tail_start));
         if (tail_len && tail_text[tail_len - 1] != '\n') agent_publish(w, "\n", 1);
         if (use_color) agent_publish(w, "\x1b[0m", 4);
         free(tail_text);

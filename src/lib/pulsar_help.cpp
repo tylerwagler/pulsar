@@ -318,6 +318,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
+    opt(fp, c, "--allow-outside-workspace", "File tools may leave the directory the agent started in. Default: they refuse.");
+    opt(fp, c, "--allow-bash", "With --non-interactive: allow the bash tool. Default: refused. Interactive bash has no boundary.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
@@ -521,7 +523,7 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
     } else if (tool == PULSAR_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
         opt(fp, c, "interactive", "./pulsar-agent");
-        opt(fp, c, "one shot", "./pulsar-agent --non-interactive -p \"Create /tmp/hello.c\"");
+        opt(fp, c, "one shot", "./pulsar-agent --non-interactive --allow-outside-workspace -p \"Create /tmp/hello.c\"");
     } else if (tool == PULSAR_HELP_BENCH || topic_is(topic, "benchmark")) {
         opt(fp, c, "csv", "./pulsar-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
         opt(fp, c, "prefill only", "./pulsar-bench --prompt-file long.txt --gen-tokens 0");
