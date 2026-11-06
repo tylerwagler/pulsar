@@ -1142,6 +1142,45 @@ static void test_image_prefill_interrupt_resumes(void) {
 
 
 
+/// L353: a solid-colour RGB PNG, stored (uncompressed) deflate: another image of a chosen size for the image gates.
+/// @param w width @param h height @param r red @param g green @param b blue
+/// @return the file's bytes
+static std::vector<unsigned char> test_solid_png(uint32_t w, uint32_t h, uint8_t r, uint8_t g, uint8_t b) {
+    std::vector<unsigned char> raw;
+    for (uint32_t y = 0; y < h; y++) {
+        raw.push_back(0);
+        for (uint32_t x = 0; x < w; x++) { raw.push_back(r); raw.push_back(g); raw.push_back(b); }
+    }
+    uint32_t a1 = 1, a2 = 0;
+    for (unsigned char c : raw) { a1 = (a1 + c) % 65521; a2 = (a2 + a1) % 65521; }
+    std::vector<unsigned char> z = {0x78, 0x01};
+    for (size_t at = 0; at < raw.size();) {
+        const size_t n = std::min<size_t>(raw.size() - at, 65535);
+        z.push_back(at + n == raw.size());
+        z.push_back(n & 255); z.push_back(n >> 8); z.push_back(~n & 255); z.push_back((~n >> 8) & 255);
+        z.insert(z.end(), raw.begin() + (long)at, raw.begin() + (long)(at + n));
+        at += n;
+    }
+    const uint32_t ad = a2 << 16 | a1;
+    for (int s = 24; s >= 0; s -= 8) z.push_back((ad >> s) & 255);
+    std::vector<unsigned char> out = {137, 80, 78, 71, 13, 10, 26, 10};
+    auto be = [](std::vector<unsigned char> &v, uint32_t x) { for (int s = 24; s >= 0; s -= 8) v.push_back((x >> s) & 255); };
+    auto chunk = [&](const char *t, const std::vector<unsigned char> &d) {
+        be(out, (uint32_t)d.size());
+        std::vector<unsigned char> c(t, t + 4);
+        c.insert(c.end(), d.begin(), d.end());
+        uint32_t crc = 0xffffffffu;
+        for (unsigned char x : c) { crc ^= x; for (int k = 0; k < 8; k++) crc = crc >> 1 ^ (0xedb88320u & -(crc & 1u)); }
+        out.insert(out.end(), c.begin(), c.end());
+        be(out, ~crc);
+    };
+    std::vector<unsigned char> ih;
+    be(ih, w); be(ih, h);
+    ih.insert(ih.end(), {8, 2, 0, 0, 0});
+    chunk("IHDR", ih); chunk("IDAT", z); chunk("IEND", {});
+    return out;
+}
+
 /* L281 (c): a disk chain carries an image conversation's rows past the image, with the image's record, and a restore
  * loads past the block only for the same image.  Persist the prompt's chain into a scratch store, restore it into a
  * fresh session with the image's hash -- it stands past the block, and the licence reuses it: extending it equals the
@@ -1242,8 +1281,58 @@ static void test_image_chain_round_trip(void) {
     const int Gd = sd && text ? pulsar_kvchain_restore(st, engine, sd, text, tlen, &wrong, 1, 0, chain,
                                                         PULSAR_KVCHAIN_MAX, &nseg, err, sizeof err) : -1;
     fprintf(stderr, "image-chain gate: restore with another image stands at %d -- %s\n", Gd, err);
-    TEST_ASSERT(Gd >= 0 && Gd <= img.start_pos && strstr(err, "a different image"));
+    TEST_ASSERT(Gd >= 0 && Gd <= img.start_pos);
     if (sd) pulsar_session_free(sd);
+
+    /* E (L353): another image of the SAME SIZE over the same text.  X's end restore point is gone (an unflagged one is
+     * evicted first); Y's persist must not write Y's state onto X's rows, and each image restores only its own: either
+     * nothing past its block, or bytes equal to its own cold prefill. */
+    std::vector<unsigned char> other_png = test_solid_png(128, 128, 40, 200, 90);
+    pulsar_image_ref iy = {0};
+    iy.bytes = other_png.data();
+    iy.len = other_png.size();
+    iy.start_pos = img.start_pos;
+    TEST_ASSERT(nseg > 0 && pulsar_segstore_drop_rp(st, chain[nseg - 1].key));
+    pulsar_session *sy = NULL;
+    TEST_ASSERT(pulsar_session_create(&sy, engine, ctx) == 0);
+    pulsar_image_ref iya = iy;
+    bool oky = sy && pulsar_session_sync_mm(sy, &prompt, &iya, 1, err, sizeof err) == 0;
+    TEST_ASSERT(oky);
+    pulsar_kvchain_persist_result py;
+    memset(&py, 0, sizeof py);
+    if (oky) pulsar_kvchain_persist(st, engine, sy, 0, PULSAR_KVCHAIN_TAIL | PULSAR_KVCHAIN_RP, NULL, &inl, &py);
+    fprintf(stderr, "image-chain gate: the same-size other image persisted %d segment(s) to %d%s%s\n", py.written, py.end,
+            py.err[0] ? " -- " : "", py.err);
+    if (sy) pulsar_session_free(sy);
+    const uint64_t hash_y = pulsar_image_hash(&iy);
+    for (int which = 0; which < 2; which++) {
+        const uint64_t h = which ? hash_y : right;
+        pulsar_image_ref ir = which ? iy : img, ic2 = ir;
+        pulsar_session *se = NULL, *sf = NULL;
+        TEST_ASSERT(pulsar_session_create(&se, engine, ctx) == 0 && pulsar_session_create(&sf, engine, ctx) == 0);
+        err[0] = '\0';
+        const int Ge = se && text ? pulsar_kvchain_restore(st, engine, se, text, tlen, &h, 1, 0, chain, PULSAR_KVCHAIN_MAX,
+                                                            &nseg, err, sizeof err) : -1;
+        fprintf(stderr, "image-chain gate: same-size image %c restores to %d%s%s\n", which ? 'Y' : 'X', Ge,
+                err[0] ? " -- " : "", err);
+        TEST_ASSERT(Ge >= 0);
+        if (which) TEST_ASSERT(Ge == py.end);   /* Y was stored, not dropped as "already held" */
+        else TEST_ASSERT(Ge <= img.start_pos);  /* X's end state is gone, and Y's is not X's */
+        const bool oke = se && sf && pulsar_session_sync_mm(se, &longer, &ir, 1, err, sizeof err) == 0 &&
+                         pulsar_session_copy_logits(se, reused, vocab) == vocab &&
+                         pulsar_session_sync_mm(sf, &longer, &ic2, 1, err, sizeof err) == 0 &&
+                         pulsar_session_copy_logits(sf, cold, vocab) == vocab;
+        TEST_ASSERT(oke);
+        if (oke) {
+            int differing = 0;
+            for (int i = 0; i < vocab; i++) differing += memcmp(&reused[i], &cold[i], sizeof(float)) != 0;
+            fprintf(stderr, "image-chain gate: same-size image %c restored + extended vs its cold: %d/%d logits differ\n",
+                    which ? 'Y' : 'X', differing, vocab);
+            TEST_ASSERT(differing == 0);
+        }
+        if (se) pulsar_session_free(se);
+        if (sf) pulsar_session_free(sf);
+    }
 
     free(text);
     free(reused);

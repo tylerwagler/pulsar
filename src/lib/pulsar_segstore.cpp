@@ -692,27 +692,38 @@ void pulsar_segstore_set_ram(pulsar_segstore *st, pulsar_kvpool *pool, bool reta
     st->retain = pool != nullptr && retain;
 }
 
-void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]) {
+void pulsar_segstore_child_key_images(const char *parent, const char *text, size_t len, const uint64_t *hashes,
+                                      uint32_t n, char out[41]) {
     pulsar::Sha1 h;
     if (parent && parent[0]) h.update(parent, 40);
     h.update(text, len);
+    for (uint32_t i = 0; i < n; i++) h.update(&hashes[i], sizeof hashes[i]);   /* L353 */
     uint8_t d[20];
     h.final(d);
     pulsar::Sha1::hex20(d, out);
 }
 
+void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]) {
+    pulsar_segstore_child_key_images(parent, text, len, nullptr, 0u, out);
+}
+
 int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
                            pulsar_segstore_seg *chain, int cap) {
+    return pulsar_segstore_lookup_images(st, text, len, want, nullptr, 0u, chain, cap);
+}
+
+int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+                                  const uint64_t *hashes, uint32_t n, pulsar_segstore_seg *chain, int cap) {
     if (!st || !text || cap <= 0) return 0;
     /* Depth-first over the children whose key the request's own bytes
      * reproduce; the deepest accepted end wins (by G, then by text). */
-    struct frame { std::string key; uint64_t end; int depth; };
+    struct frame { std::string key; uint64_t end; int depth; uint32_t used; };   /* used: image hashes consumed (L353) */
     std::vector<frame> stack;
     std::vector<std::string> path(cap), best_path;
     int best_depth = 0;
     uint32_t best_G = 0;
     uint64_t best_end = 0;
-    stack.push_back({"", 0, 0});
+    stack.push_back({"", 0, 0, 0u});
     while (!stack.empty()) {
         const frame f = stack.back();
         stack.pop_back();
@@ -732,9 +743,16 @@ int pulsar_segstore_lookup(pulsar_segstore *st, const char *text, size_t len, co
         for (const std::string &c : ch->second) {
             const pulsar_segstore_seg &cs = st->segs[c];
             if (f.end + cs.text_len > len) continue;
-            char k[41];
-            pulsar_segstore_child_key(f.key.c_str(), text + f.end, cs.text_len, k);
-            if (c == k) stack.push_back({c, f.end + cs.text_len, f.depth + 1});
+            /* L353: the span holds some run of the request's next images (none for a text span): the key says which */
+            for (uint32_t m = 0; f.used + m <= n; m++) {
+                char k[41];
+                pulsar_segstore_child_key_images(f.key.c_str(), text + f.end, cs.text_len,
+                                                 hashes ? hashes + f.used : nullptr, m, k);
+                if (c == k) {
+                    stack.push_back({c, f.end + cs.text_len, f.depth + 1, f.used + m});
+                    break;
+                }
+            }
         }
     }
     for (int i = 0; i < best_depth; i++) chain[i] = st->segs[best_path[i]];
@@ -833,6 +851,14 @@ static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, cons
 int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
                             size_t text_len, uint64_t payload_bytes, uint64_t trailer_bytes, char key_out[41],
                             pulsar_segstore_job **job_out, char *err, size_t errlen) {
+    return pulsar_segstore_reserve_images(st, parent, G_prev, G, text, text_len, nullptr, 0u, payload_bytes, trailer_bytes,
+                                          key_out, job_out, err, errlen);
+}
+
+int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
+                                   size_t text_len, const uint64_t *hashes, uint32_t n_hashes, uint64_t payload_bytes,
+                                   uint64_t trailer_bytes, char key_out[41], pulsar_segstore_job **job_out, char *err,
+                                   size_t errlen) {
     *job_out = nullptr;
     if (!st || G <= G_prev || (G_prev == 0) != (!parent || !parent[0])) {
         snprintf(err, errlen, "segment put: a root starts at 0 and only a root has no parent");
@@ -848,7 +874,7 @@ int pulsar_segstore_reserve(pulsar_segstore *st, const char *parent, uint32_t G_
         return -1;
     }
     char key[41];
-    pulsar_segstore_child_key(parent, text, text_len, key);
+    pulsar_segstore_child_key_images(parent, text, text_len, hashes, n_hashes, key);
     memcpy(key_out, key, 41);
     /* the same text is the same segment: stored, or being written (its write carries what this one would) */
     if (st->pending.count(std::string(key, 40)) || pulsar_segstore_contains(st, key)) return 0;

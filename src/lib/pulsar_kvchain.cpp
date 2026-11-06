@@ -9,6 +9,8 @@
 #include <string.h>
 
 namespace {
+/// L353: image blocks a key or a parent lookup covers at most (a request's are capped alike, kv_cache_find_req).
+constexpr int KVCHAIN_IMAGES_MAX = 64;
 /** A non-owning pulsar_tokens over t[from, to); its `v` aliases t's storage and must not be freed.
  *  @param t source tokens
  *  @param from first index (inclusive)
@@ -69,11 +71,19 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     }
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
+    /* L353: the key covers the span's images: same-size images render the same text */
+    uint64_t hashes[KVCHAIN_IMAGES_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, KVCHAIN_IMAGES_MAX);
+    if (n_hashes < 0) {
+        free(text);
+        snprintf(r->err, sizeof(r->err), "segment [%d,%d): its image records could not be read", G_prev, G);
+        return PUT_FAILED;
+    }
     pulsar_segstore_job *job = NULL;
     const uint64_t need = pulsar_segstore_seg_file_bytes(text_len, payload, tbytes);
     const int rc = reserve_with_room(writer, need, [&]() {
-        return pulsar_segstore_reserve(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, payload, tbytes,
-                                       key_out, &job, r->err, sizeof(r->err));
+        return pulsar_segstore_reserve_images(st, parent, (uint32_t)G_prev, (uint32_t)G, text, text_len, hashes,
+                                              (uint32_t)n_hashes, payload, tbytes, key_out, &job, r->err, sizeof(r->err));
     }, r);
     if (rc <= 0) {   /* held or being written (0), or refused (-1 / -2, err) */
         free(text);
@@ -244,7 +254,12 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         char *full = pulsar_kvtext_render_tokens_text(e, &head, &full_len);
         const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
-        const int c = full ? pulsar_segstore_lookup(st, full, full_len, &grid_end, chain, PULSAR_KVCHAIN_MAX) : 0;
+        /* L353: this history's own images: another image's chain over the same text is not its parent */
+        uint64_t hashes[KVCHAIN_IMAGES_MAX];
+        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, KVCHAIN_IMAGES_MAX);
+        const int c = full && n_hashes >= 0 ? pulsar_segstore_lookup_images(st, full, full_len, &grid_end, hashes,
+                                                                            (uint32_t)n_hashes, chain, PULSAR_KVCHAIN_MAX)
+                                            : 0;
         free(full);
         if (c > 0 && (int)chain[c - 1].G <= deepest) {
             const pulsar_tokens upto = view(toks, 0, (int)chain[c - 1].G);
@@ -296,33 +311,9 @@ int pulsar_kvchain_find(pulsar_segstore *st, const char *text, size_t text_len, 
     if (err && errlen) err[0] = '\0';
     if (!st || !text) return 0;
     const pulsar_segstore_end state_end = { 0u, true };   /* L323: a restore needs the state at the chain's end */
-    int n = pulsar_segstore_lookup(st, text, text_len, &state_end, chain, cap);
-    /* L281: how far the request's images let the chain go -- every segment's image records must be the request's
-     * next images, by content and in order; the chain stops at the last segment below the first that is not */
-    {
-        int k = 0;   /* the request's next image */
-        for (int i = 0; i < n; i++) {
-            uint64_t pb = 0, rec[64];
-            uint32_t nr = 0;
-            FILE *fp = pulsar_segstore_open_payload(st, chain[i].key, &pb);
-            const int prc = fp ? pulsar_session_segment_images(fp, pb, rec, 64, &nr) : 1;
-            if (fp) fclose(fp);
-            bool match = prc == 0 && nr <= 64;
-            for (uint32_t r = 0; match && r < nr; r++) {   /* k advances only past an image that matched */
-                match = k < n_images && image_hashes && image_hashes[k] == rec[r];
-                if (match) k++;
-            }
-            if (!match) {
-                if (err && errlen)
-                    snprintf(err, errlen, "chain stops at %u: segment [%u,%u) holds %s (image %d of the request)",
-                             i ? chain[i - 1].G : 0u, chain[i].G_prev, chain[i].G,
-                             prc != 0 ? "unreadable image records" : k >= n_images ? "an image the request does not carry"
-                                                                                     : "a different image", k);
-                n = i;
-                break;
-            }
-        }
-    }
+    /* L281 / L353: the keys cover the images, so the chain stops at the first block that is not the request's */
+    int n = pulsar_segstore_lookup_images(st, text, text_len, &state_end, image_hashes,
+                                          n_images > 0 ? (uint32_t)n_images : 0u, chain, cap);
     while (n > 0 && chain[n - 1].rp_bytes == 0) n--;   /* L347: back to the last restore point below an image cut */
     if (n == 0 || (int)chain[n - 1].G < min_tokens) return 0;
     if (bytes) *bytes = pulsar_kvchain_load_bytes(chain, n);

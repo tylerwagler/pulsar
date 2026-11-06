@@ -14554,6 +14554,47 @@ static void test_l335_request_without_family_dies_at_enqueue(void) {
     }) == 0);
 }
 
+/* L353: same text, different images: different segments, and each request walks only its own (no model: store-level) */
+static void test_l353_image_keys(void) {
+    char tmpl[] = "/tmp/pulsar-l353.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    pulsar_segstore *st = dir ? pulsar_segstore_open(dir, 0, 7, NULL, NULL) : NULL;
+    TEST_ASSERT(st != NULL);
+    if (!st) return;
+    const uint64_t X = 0x1111u, Y = 0x2222u;
+    const char *root = "SYS <image> ", *tail = "question", *both = "SYS <image> question";
+    char err[256] = "", kx[41], ky[41], kt[41], cx[41], cy[41];
+    auto put = [&](const char *parent, uint32_t a, uint32_t b, const char *t, const uint64_t *h, uint32_t n, char *out) {
+        pulsar_segstore_job *job = NULL;
+        const int rc = pulsar_segstore_reserve_images(st, parent, a, b, t, strlen(t), h, n, 16, 0, out, &job, err, sizeof err);
+        if (rc > 0) TEST_ASSERT(pulsar_segstore_commit(st, job, pulsar_segstore_job_write(job, err, sizeof err) == 0));
+        return rc;
+    };
+    TEST_ASSERT(put("", 0, 128, root, &X, 1, kx) > 0);
+    TEST_ASSERT(put("", 0, 128, root, &Y, 1, ky) > 0);      /* before L353: "already stored", and Y's state went on X's rows */
+    TEST_ASSERT(strcmp(kx, ky) != 0);
+    TEST_ASSERT(put("", 0, 128, root, NULL, 0, kt) > 0);    /* the same bytes with no image is its own entry too */
+    TEST_ASSERT(strcmp(kt, kx) != 0 && strcmp(kt, ky) != 0);
+    char plain[41];
+    pulsar_segstore_child_key("", root, strlen(root), plain);
+    TEST_ASSERT(strcmp(plain, kt) == 0);                    /* a text span's key is what it always was */
+    TEST_ASSERT(put(kx, 128, 256, tail, NULL, 0, cx) > 0);
+    TEST_ASSERT(put(ky, 128, 256, tail, NULL, 0, cy) > 0);
+    TEST_ASSERT(put("", 0, 128, root, &X, 1, kx) == 0);     /* the same image again is the same segment */
+    pulsar_segstore_seg c[4];
+    const size_t L = strlen(both);
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &X, 1, c, 4) == 2 && !strcmp(c[1].key, cx));
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &Y, 1, c, 4) == 2 && !strcmp(c[1].key, cy));
+    const uint64_t Z = 0x3333u;
+    TEST_ASSERT(pulsar_segstore_lookup_images(st, both, L, NULL, &Z, 1, c, 4) == 1 && !strcmp(c[0].key, kt));   /* text only */
+    TEST_ASSERT(pulsar_segstore_lookup(st, both, L, NULL, c, 4) == 1 && !strcmp(c[0].key, kt));
+    pulsar_segstore_close(st);
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
 /* L334 fix: a toy vocabulary for the seam walks -- id i spells l334_vocab[i] ("" = a control token). */
 static const char *const l334_vocab[] = {"<ctl>", "X", "a", "b", "c", "d", "ab", "abc", "bc", "cd", "bcd", "Y", "Z"};
 enum { L334_CTL, L334_X, L334_A, L334_B, L334_C, L334_D, L334_AB, L334_ABC, L334_BC, L334_CD, L334_BCD, L334_Y,
@@ -14616,6 +14657,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l335_random_id_refuses_loudly();
     test_l335_grammar_compiler_is_write_once();
     test_l334_server_positions();
+    test_l353_image_keys();
     test_l334_prompt_held_across_a_seam();
     test_mem_floor_is_derived_from_the_watermarks();
     test_guard_budget_reads_live_memavailable();

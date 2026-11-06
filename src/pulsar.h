@@ -1116,15 +1116,14 @@ int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap);
 /** @param s the session
  *  @return the persistable end; 0 without a valid checkpoint */
 TokPos pulsar_session_persist_end(pulsar_session *s);
-/** L281: the image records a stored segment carries (`fp` at its payload, `bytes` long), read without loading it:
- *  their content hashes, in order, up to `cap` (*n_out of them; a v2 segment carries none).  0 on success. */
-/** @param fp the stream at the segment's payload (it is read forward)
- *  @param bytes the segment's size
- *  @param hashes receives up to cap hashes
+/** L353: the content hashes of the image blocks inside [G_prev, G), in position order: what a segment's key covers.
+ *  @param s the session
+ *  @param G_prev the span's start
+ *  @param G the span's end
+ *  @param hashes receives them
  *  @param cap slots at hashes
- *  @param n_out receives the count written
- *  @return 0, or 1 on a malformed or other-version segment */
-int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out);
+ *  @return how many, or -1 when the session's records are out of order or there are more than cap */
+int pulsar_session_span_image_hashes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *hashes, int cap);
 /** Where the last pulsar_session_sync started evaluating: the grid snapshot
  * position it resumed from, 0 when it prefilled from the start, none() when the
  * call did not resume (nothing to evaluate, or a checkpoint that was not a

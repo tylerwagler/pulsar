@@ -437,25 +437,14 @@ static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
     return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes + sizeof(uint64_t);
 }
 
-/* L281: a stored segment's image records, read from its payload's head without loading it.  The bytes are the
- * payload digest's to vouch for; this only decides how far a restore goes, and the load that follows re-reads and
- * checks everything. */
-int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out) {
-    *n_out = 0;
-    uint32_t h[SEGMENT_U32_FIELDS];
-    if (!fp || bytes < sizeof(h) || fread(h, sizeof(uint32_t), SEGMENT_U32_FIELDS, fp) != SEGMENT_U32_FIELDS) return 1;
-    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[7] <= h[6]) return 1;
-    if (h[1] != PULSAR_SESSION_SEGMENT_VERSION) return 1;
-    if (fseek(fp, (long)((uint64_t)(h[7] - h[6]) * sizeof(uint32_t)), SEEK_CUR) != 0) return 1;
+/* L353: a span's image content hashes, which its segment's key covers (pulsar_segstore_child_key_images) */
+int pulsar_session_span_image_hashes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *hashes, int cap) {
+    const pulsar_image_block *first = NULL;
     uint32_t n = 0;
-    if (fread(&n, sizeof(n), 1, fp) != 1 || n > PULSAR_IMAGE_BLOCKS_MAX) return 1;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t rec[SEGMENT_IMAGE_U32];
-        if (fread(rec, sizeof(uint32_t), SEGMENT_IMAGE_U32, fp) != SEGMENT_IMAGE_U32) return 1;
-        if (i < cap) hashes[i] = (uint64_t)rec[2] | (uint64_t)rec[3] << 32;
-    }
-    *n_out = n;
-    return 0;
+    if (!s || !segment_images(s, (uint32_t)G_prev.raw(), (uint32_t)G.raw(), &first, &n)) return -1;
+    if ((int)n > cap) return -1;
+    for (uint32_t i = 0; i < n; i++) hashes[i] = first[i].content;
+    return (int)n;
 }
 
 uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes) {
