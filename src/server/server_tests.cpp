@@ -9089,7 +9089,7 @@ static void test_l353_parked_decoder_frees_nothing(void) {
     sl.provisioned = false;
     TEST_ASSERT(!server_slot_end_frees_kv(&sl));
     int k = 0;
-    const KvBytes t = kvb(10), d = kvb(10), b = kvb(15);   /* touched + growth past the budget; no victims */
+    const KvBytes t{10}, d{10}, b{15};   /* touched + growth past the budget; no victims */
     TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, true, &k) == PROMPT_KV_WAIT);
     TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
 }
