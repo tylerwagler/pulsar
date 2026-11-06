@@ -65,8 +65,6 @@ bool chat_render_finish(const chat_render_out *out, char *err, size_t errlen) {
     return true;
 }
 
-namespace {
-
 /// L354: whether CPython's repr() escapes a code point (str.isprintable() is False).
 /// @param cp the code point
 /// @return true when it does
@@ -84,6 +82,7 @@ bool py_unprintable(uint32_t cp) {
     return false;
 }
 
+namespace {
 /// Python's repr() of a str: single quotes unless the text has a ' and no ", escapes as CPython writes them.
 /// @param s   the string (UTF-8; an invalid byte is copied as is)
 /// @param out receives the repr
