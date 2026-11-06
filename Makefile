@@ -2307,8 +2307,8 @@ warnings-gate:
 	[ ! -f local.mk ] || cp local.mk "$$d/"; \
 	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
 	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
-	n=$$(grep -c ': warning:' "$$d/build.log"); \
-	grep ': warning:' "$$d/build.log" | sort -u | head -40; \
+	grep ': warning:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
+	head -40 "$$d/warnings"; \
 	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
 	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
 	echo "WARNINGS GATE: PASS (a build from nothing, 0 warnings)"
