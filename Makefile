@@ -3038,6 +3038,7 @@ gates-dev:
 	  $(MAKE) --no-print-directory scratch-poison-gate CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	fi; \
 	if [ $$resume -eq 1 ]; then \
+	  $(MAKE) --no-print-directory segstore-tsan || rc=1; \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \

@@ -258,7 +258,8 @@ class PreemptWedgeLeg(Leg):
         tb.join(1200)
         self.g.check(not tb.is_alive() and self.res.get("B", (0,))[0] == 200, "B answered")
         th.join(120)
-        self.g.check(not th.is_alive(), "H ended within 120 s of B's end, the parked A not counted as busy")
+        if not self.g.check(not th.is_alive(), "H ended within 120 s of B's end, the parked A not counted as busy"):
+            return   # the wedge: A stays parked for as long as anyone waits
         self.g.check(self.res.get("H", (0,))[0] == 503, "H refused 503: %s" % str(self.res.get("H", ("hung",))[0]))
         ta.join(1200)
         self.g.check(not ta.is_alive() and self.res.get("A", (0,))[0] == 200, "A readmitted and answered")
