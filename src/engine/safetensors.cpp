@@ -971,10 +971,6 @@ static bool st_is_shard(const char *n) {
     return l >= e && strcmp(n + l - e, kExt) == 0;
 }
 
-/// Open a shard directory or single file into m (refuses by longjmp).
-/// @param[out] m the model
-/// @param path the directory or file
-/// @param gpu_mapping map MAP_SHARED (else MAP_PRIVATE)
 /** qsort: tensors by name (length, then bytes).  @param a a pulsar_tensor *const *  @param b likewise
  *  @return the order */
 static int st_cmp_tensor_name(const void *a, const void *b) {
@@ -983,6 +979,10 @@ static int st_cmp_tensor_name(const void *a, const void *b) {
     return memcmp(x->name.ptr, y->name.ptr, x->name.len);
 }
 
+/// Open a shard directory or single file into m (refuses by longjmp).
+/// @param[out] m the model
+/// @param path the directory or file
+/// @param gpu_mapping map MAP_SHARED (else MAP_PRIVATE)
 static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     /* Two shapes, one loader: a DIRECTORY of shards, or a single file that IS
      * the whole checkpoint.  The engine does not care which -- the tensor table

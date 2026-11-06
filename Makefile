@@ -51,7 +51,7 @@ CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS ?= -Xcompiler -Wall,-Wextra -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 NVCCFLAGS += $(PULSAR_DEPFLAGS)
 # Append-only hook for probe builds (e.g. L003's tile sweep:
 #   make pulsar NVCC_EXTRA='-DPULSAR_MXFP4_TILE_M=64')
@@ -93,7 +93,7 @@ $(shell mkdir -p $(dir $(CUDA_FLAG_STAMP)) 2>/dev/null; \
 # 2026-08-23).  Override CUTLASS_DIR to point anywhere; `make cutlass` clones
 # the pinned sha if you have nothing.
 CUTLASS_DIR ?= $(CURDIR)/cutlass
-CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+CUTLASS_INC ?= -isystem $(CUTLASS_DIR)/include -isystem $(CUTLASS_DIR)/tools/util/include
 CUTLASS_PIN_SHA := $(shell sed -n 's/^sha=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
 CUTLASS_PIN_URL := $(shell sed -n 's/^url=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
 
@@ -2295,6 +2295,31 @@ server-kv-admission-live: pulsar-server
 # itself (a quiet gpuq job, production stopped); the Nemotron mini, ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
+# L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
+# of this tree (tracked and new files, so uncommitted edits count) from nothing, so an object already built can't hide a
+# warning, and greps the log.  CUTLASS is -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both
+# run before the runner: a build's memory beside the accounting gate would fail it.
+.PHONY: warnings-gate doxygen-gate
+warnings-gate:
+	@d=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-warnings-XXXXXX) || exit 1; \
+	trap 'rm -rf "$$d"' EXIT; \
+	git ls-files -co --exclude-standard -z | tar --null -T - -cf - | tar -xf - -C "$$d" || exit 1; \
+	[ ! -f local.mk ] || cp local.mk "$$d/"; \
+	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
+	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
+	n=$$(grep -c ': warning:' "$$d/build.log"); \
+	grep ': warning:' "$$d/build.log" | sort -u | head -40; \
+	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
+	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
+	echo "WARNINGS GATE: PASS (a build from nothing, 0 warnings)"
+doxygen-gate:
+	@rm -f docs/api/doxygen-warnings.log; \
+	doxygen docs/Doxyfile > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \
+	[ -f docs/api/doxygen-warnings.log ] || { echo "DOXYGEN GATE: FAIL (no warnings log: the Doxyfile moved it?)"; exit 1; }; \
+	if [ -s docs/api/doxygen-warnings.log ]; then head -40 docs/api/doxygen-warnings.log; \
+	  echo "DOXYGEN GATE: FAIL ($$(wc -l < docs/api/doxygen-warnings.log) lines)"; exit 1; fi; \
+	echo "DOXYGEN GATE: PASS (an empty warnings log)"
+
 # L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  On
 # its own server: its budget override can't share live-legs' hooks instance with preempt-exact's.  ~4 min.
 .PHONY: preempt-wedge-live
@@ -2380,13 +2405,13 @@ cuda-prefill-gate:
 		$(PREFILL_BASELINE_REF_SHORT)
 
 # The CUTLASS-MXFP4 half of the byte gate -- see CUTLASS_MXFP4_GATE_MODEL above.
-# SKIPs LOUDLY when the artifact is absent (the same choice the vision gates make
-# without VISION_MODEL): a box without it has no CUTLASS-MXFP4 expert coverage,
-# and saying so beats a FAIL that reads like a numerics regression.
+# L354: a configured path that isn't there FAILS.  It used to SKIP and exit 0, so a typo or an unmounted share printed
+# ALL GATES PASS with the only gate for this lane not run.  (Unset, need_path refuses already.)
 cuda-prefill-gate-cutlass-mxfp4:
 	@if [ ! -d "$(CUTLASS_MXFP4_GATE_MODEL)" ]; then \
-		echo "SKIP  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
+		echo "FAIL  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
 		echo "      NO CUTLASS MXFP4 routed-expert coverage in this run."; \
+		exit 1; \
 	else \
 		set -e; \
 		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
@@ -2725,7 +2750,7 @@ prefix-stability-gate: pulsar_test
 # per model, are the last section (live-legs) but one: L319's server-kv-headroom-live after them (it balloons the box's
 # memory, so it runs alone, ~2.5 min).  Each section's wall time is printed
 # against its budget (docs/QA_BEFORE_RELEASES.md, "Battery wall time").
-GATE_TARGETS =unit-test-gate agent-test-gate \
+GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
@@ -2962,8 +2987,8 @@ gates-dev:
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
-	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
-	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*) render=1 ;; esac; \
+	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*|src/lib/pulsar_kvdigest*|src/lib/pulsar_kvpool*) resume=1 ;; esac; \
+	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
 	      case "$$p" in src/engine/family_deepseek*|src/engine/kv_state_ds4*|src/engine/spec_dspark*|src/engine/gpu_*|src/cuda/pulsar_cuda_csa2*|src/cuda/pulsar_cuda_dspark*|src/cuda/mmq/ds4_mmq*|src/cuda/mmq/ds4_mmid*|src/cuda/mmq/ds4_mxfp8*|src/cuda/mmq/ds4_quantize*|src/server/deepseek_*|src/server/parser_deepseek*|tests/live_legs.py) ds4legs=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \

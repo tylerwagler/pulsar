@@ -667,6 +667,7 @@ struct pulsar_grouped_scratch_layout {
  *  @return the grouped FFN's scratch layout */
 static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
                                                          int in_dim, int mid_dim, int out_dim){
+  (void)out_dim;
   pulsar_grouped_scratch_layout L{};
   const size_t a = 256; size_t off = 0;
   int sm = grouped_sm_count();

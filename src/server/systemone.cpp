@@ -405,8 +405,8 @@ bool server_judge_step(server *s) {
     return true;
 }
 
-/* L354: what one request may ask of the judge.  Every question renders the whole state, so without a bound a body of
- * small questions under one large state holds questions x state tokens and queues as many prefills. */
+/** L354: the questions one request may ask the judge.  Every question renders the whole state, so without a bound a body
+ *  of small questions under one large state holds questions x state tokens and queues as many prefills. */
 #define PULSAR_JUDGE_MAX_QUESTIONS 64
 /// @param n_questions the questions asked
 /// @return true when a request may ask that many

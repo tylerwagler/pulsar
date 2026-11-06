@@ -1738,11 +1738,11 @@ int ds4_mmq_iq2_xxs_moe_d2r_single_launch(const void *W_soa,
     if (narrow) {
         gateup_iq2_d2r_pair_kernel<kNTileNarrow><<<grid, block, 0, stream>>>(
             W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
-            out, out, M, K, (int)ne_get_rows, n_experts);
+            out, nullptr, M, K, (int)ne_get_rows, n_experts);
     } else {
         gateup_iq2_d2r_pair_kernel<kNTile><<<grid, block, 0, stream>>>(
             W_soa, W_soa, (const block_mx_act_mmq *)act, ids_dst, expert_bounds, work, n_items,
-            out, out, M, K, (int)ne_get_rows, n_experts);
+            out, nullptr, M, K, (int)ne_get_rows, n_experts);
     }
     err = cudaGetLastError();
     if (err != cudaSuccess) {

@@ -3985,8 +3985,6 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
     if (!cuda_ok(cudaGetLastError(), "f32->bf16 weight convert launch")) { (void)cudaFree(dst); return NULL; }
     const auto ins = g_f32w_bf16.emplace(key, dst);
     fc->node.store(&*ins.first, std::memory_order_release);
-    static uint64_t total = 0;
-    total += n * 2;
     static int announced = 0;
     if (!announced) {
         announced = 1;

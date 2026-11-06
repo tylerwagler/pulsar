@@ -458,6 +458,18 @@ extern "C" int pulsar_router_logit_pitch(const pulsar_router_cfg *c) {
 
 /// Launch router_logits_kernel<TB> (one instance per tokens-a-CTA-row the launch picks).
 /// @tparam TB tokens per CTA row
+/// @param grid   the launch's grid
+/// @param stream the stream it runs on
+/// @param x      the activations
+/// @param H      their row width
+/// @param w      the weight rows
+/// @param n_w    how many
+/// @param w_tail the last, partial weight row
+/// @param n_rows the rows to score
+/// @param e0     the first expert
+/// @param ld     the logits' row pitch
+/// @param T      the tile size
+/// @param logits receives them
 template <int TB>
 static void logits_go(dim3 grid, cudaStream_t stream, const __nv_bfloat16 *x, int H, const __nv_bfloat16 *w, int n_w,
                       const __nv_bfloat16 *w_tail, int n_rows, int e0, int ld, int T, float *logits) {

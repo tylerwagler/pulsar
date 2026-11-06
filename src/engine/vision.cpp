@@ -847,14 +847,7 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
  * by the dispatcher -- the caller fails loudly, it does not guess.
  * ------------------------------------------------------------------------- */
 
-/// Decode a PNG to RGB8, alpha dropped (Pillow's convert("RGB")).
-/// @param bytes the encoded image
-/// @param len its length
-/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
-/// @param[out] w_out width
-/// @param[out] h_out height
-/// @return 1, or 0 when it does not decode or is refused
-/* L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
+/** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
  * reference tooling opens decodes here too.  A body cap is not a pixel cap: a solid 32000 x 32000 PNG is 2.9 MiB of body
  * and took 6.6 GiB of RSS to decode (measured, CT 124) before every image is scaled down to the model's canvas anyway. */
 #define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
@@ -869,6 +862,13 @@ bool vision_decode_admits(uint64_t width, uint64_t height) {
     return true;
 }
 
+/// Decode a PNG to RGB8, alpha dropped (Pillow's convert("RGB")).
+/// @param bytes the encoded image
+/// @param len its length
+/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
+/// @param[out] w_out width
+/// @param[out] h_out height
+/// @return 1, or 0 when it does not decode or is refused
 static int vision_decode_png(const uint8_t *bytes, size_t len,
                              uint8_t **rgb_out, int *w_out, int *h_out) {
     png_image image;

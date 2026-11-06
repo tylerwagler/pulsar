@@ -859,13 +859,6 @@ struct pulsar_segstore_job {
     std::string final_path;  ///< `<dir>/<key>.seg` or `.rp`
 };
 
-/** Room in the budget for `need` more bytes, evicting by the classes (never `keep` / `keep2`).
- *  @param st    the store
- *  @param need  the bytes
- *  @param freed bytes the write releases when it commits (a replaced restore point)
- *  @param keep  a key to spare
- *  @param keep2 a second key to spare (NULL = none)
- *  @return true when they fit */
 /** L353: the disk's free bytes for the store, or UINT64_MAX when unreadable.  @param st the store
  *  @return the bytes */
 static uint64_t disk_free_bytes(const pulsar_segstore *st) {
@@ -875,6 +868,13 @@ static uint64_t disk_free_bytes(const pulsar_segstore *st) {
     return (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize;
 }
 
+/** Room in the budget for `need` more bytes, evicting by the classes (never `keep` / `keep2`).
+ *  @param st    the store
+ *  @param need  the bytes
+ *  @param freed bytes the write releases when it commits (a replaced restore point)
+ *  @param keep  a key to spare
+ *  @param keep2 a second key to spare (NULL = none)
+ *  @return true when they fit */
 static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, const char *keep, const char *keep2) {
     while (st->budget && st->used + st->reserved - freed + need > st->budget)
         if (!st->evict_one(keep, keep2)) break;

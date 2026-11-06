@@ -162,6 +162,8 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `blockdraft-gate` | 5 | |
 | `nvfp4-rows-gate` | 10 | |
 | `lilicorr-head-gate` | 10 | |
+| `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
+| `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
 | `cuda-runner-gate [DeepSeek V4]` | 1150 | L278 cut (2026-11-03): only the entries needing DS4 internals or the fixture blobs (`--needs=ds4,fixtures`); 2 engine opens.  Re-set from the first measured battery |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
