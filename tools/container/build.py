@@ -596,7 +596,7 @@ def cmd_audit(args):
         end = max((h['data_offsets'][1] for h in hdr.values()), default=0)
         if buf_off % ALIGN or size != buf_off + end:
             bad.append(f)
-        for k in ('pulsar.format', 'pulsar.tensors', 'pulsar.experts'):
+        for k in ('pulsar.format', 'pulsar.tensors'):   # pulsar.experts is optional: the loader reads none, and a shard added after the build (model-qhead) has none
             if k not in md:
                 nod.append((f, k))
         if 'pulsar.kv' in md:
