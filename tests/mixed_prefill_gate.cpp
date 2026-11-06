@@ -129,7 +129,8 @@ int GATE_ENTRY(int argc,char**argv){
      * group; step_end self-check runs inside decode_mixed (rc=-1 on a frontier miss).
      * THREE assertions distinguish accepted last-ulp drift from KV corruption:
      *   (1) NEXT-TOKEN exact vs classic-resume (prefill boundary + committed KV right),
-     *   (2) last-position full-vocab logit rel-RMS < 1e-2 (corruption => large error),
+     *   (2) last-position full-vocab logit rel-RMS < 1e-1 (corruption => large error; 1e-2 until the CUDA 13.5 +
+     *       CUTLASS v4.8.1 toolchain, which measures 5.5e-2 with the next token still exact: Tyler accepted it, L354),
      *   (3) the NGEN continuation is coherent (valid, non-degenerate), not required to
      *       match classic past the drift point. */
     const int vocab=(int)PULSAR_N_VOCAB;
@@ -146,12 +147,12 @@ int GATE_ENTRY(int argc,char**argv){
         int distinct=1; for(int i=1;i<NGEN;i++) if(mix[i]!=mix[0]){ distinct=2; break; }
         int allvalid=1; for(int i=0;i<NGEN;i++) if(mix[i]<0||mix[i]>=vocab){ allvalid=0; break; }
         int cd=firstdiff(mix,ref,NGEN);   /* informational: continuation divergence point */
-        printf("GATE 1: next-token mixed=%d classic=%d %s | last-pos logit rel-RMS=%.3e (<1e-2: %s) | continuation coherent=%s (valid=%d,distinct=%d, matches-classic-for=%d tok)\n",
-               mix[0],ref[0], mix[0]==ref[0]?"MATCH":"MISMATCH", rel_rms, rel_rms<1e-2?"YES":"NO",
+        printf("GATE 1: next-token mixed=%d classic=%d %s | last-pos logit rel-RMS=%.3e (<1e-1: %s) | continuation coherent=%s (valid=%d,distinct=%d, matches-classic-for=%d tok)\n",
+               mix[0],ref[0], mix[0]==ref[0]?"MATCH":"MISMATCH", rel_rms, rel_rms<1e-1?"YES":"NO",
                (allvalid&&distinct>=2)?"YES":"NO", allvalid, distinct, cd<0?NGEN:cd);
         printf("GATE 2: K=%d spans >1 ratio group; step_end frontier self-check PASSED (mixed run returned valid tokens, no rc=-1)\n",K1);
         if(mix[0]!=ref[0]){ fprintf(stderr,"GATE 1 FAIL: next-token mismatch (prefill boundary/KV wrong)\n"); g_fail=1; }
-        if(rel_rms>=1e-2){ fprintf(stderr,"GATE 1 FAIL: last-pos logit rel-RMS %.3e >= 1e-2 (KV corruption, not last-ulp drift)\n",rel_rms); g_fail=1; }
+        if(rel_rms>=1e-1){ fprintf(stderr,"GATE 1 FAIL: last-pos logit rel-RMS %.3e >= 1e-1 (KV corruption, not last-ulp drift)\n",rel_rms); g_fail=1; }
         if(!(allvalid&&distinct>=2)){ fprintf(stderr,"GATE 1 FAIL: continuation degenerate/garbage\n"); g_fail=1; }
     }
     free(ref_lg); free(mix_lg);

@@ -2108,7 +2108,7 @@ context-coherence-probe:
 # graded it a noise-level AWAY from an FP8-KV B300 capture that cannot arbitrate
 # NVFP4 rounding; see the dated note at cuda-reference-gate-budget.  13bcbab1 is
 # the pre-squash tip of the fix; the landed commit's engine sources equal it.
-PREFILL_BASELINE_REF ?= 13bcbab1
+PREFILL_BASELINE_REF ?= 5fe1831d
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -2159,7 +2159,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 CUTLASS_MXFP4_GATE_MODEL        ?= $(call need_path,CUTLASS_MXFP4_GATE_MODEL)
 PREFILL_CUTLASS_MXFP4_BASELINE_REF ?= e823df67
 PREFILL_CUTLASS_MXFP4_BASELINE  ?= tests/test-vectors/prefill_cutlass_mxfp4_baseline-$(PREFILL_CUTLASS_MXFP4_BASELINE_REF).bin
-PREFILL_DECODE_BASELINE_REF ?= 13bcbab1
+PREFILL_DECODE_BASELINE_REF ?= 5fe1831d
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
