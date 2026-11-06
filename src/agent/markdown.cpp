@@ -1114,7 +1114,7 @@ static void renderer_markdown_clear_pending(agent_token_renderer *r) {
 
 
 
-/** @brief Write held '*' or '`' bytes as literal text (into the code block when inside one) and clear them.
+/** @brief Write held star or backtick bytes as literal text (into the code block when inside one) and clear them.
  *  @param r the renderer */
 static void renderer_markdown_emit_pending_literals(agent_token_renderer *r) {
     char c;
