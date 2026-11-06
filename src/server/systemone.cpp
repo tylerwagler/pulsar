@@ -405,6 +405,19 @@ bool server_judge_step(server *s) {
     return true;
 }
 
+/* L354: what one request may ask of the judge.  Every question renders the whole state, so without a bound a body of
+ * small questions under one large state holds questions x state tokens and queues as many prefills. */
+#define PULSAR_JUDGE_MAX_QUESTIONS 64
+/// @param n_questions the questions asked
+/// @return true when a request may ask that many
+static bool judge_question_count_ok(size_t n_questions) { return n_questions <= PULSAR_JUDGE_MAX_QUESTIONS; }
+/// @param total_tokens the request's rendered tokens so far
+/// @param ctx          one bank's context
+/// @return true when the request is within four contexts' worth
+static bool judge_total_tokens_ok(uint64_t total_tokens, int ctx) {
+    return total_tokens <= 4u * (uint64_t)(ctx > 0 ? ctx : 0);
+}
+
 void server_judge_http(server *s, int fd, const char *body, size_t len) {
     server_judge *J = s->judge;
     if (!J) {
@@ -424,6 +437,13 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
                             "indent=1)) and a non-empty \"questions\" array");
         return;
     }
+    if (!judge_question_count_ok(qs->a.size())) {
+        char e[128];
+        snprintf(e, sizeof e, "/v1/systemone: %zu questions; a request asks at most %d", qs->a.size(),
+                 PULSAR_JUDGE_MAX_QUESTIONS);
+        http_error(fd, 400, e);
+        return;
+    }
     std::string state;
     if (st->kind == pyjson_value::STR) state = st->s;
     else judge_dump_indent1(*st, 0, &state);
@@ -436,6 +456,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         pthread_cond_destroy(&jb->cv);
         delete jb;
     };
+    uint64_t total_tokens = 0;
     for (size_t i = 0; i < qs->a.size(); i++) {
         const pyjson_value &qv = qs->a[i];
         const pyjson_value *kv = qv.get("kind"), *qq = qv.get("question"), *ov = qv.get("options");
@@ -486,6 +507,15 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         if (t.len >= s->pool_ctx_size - 1) {
             snprintf(e, sizeof e, "/v1/systemone: question %zu is %d tokens; the context is %d", i, t.len,
                      s->pool_ctx_size);
+            pulsar_tokens_free(&t);
+            http_error(fd, 400, e);
+            free_job();
+            return;
+        }
+        total_tokens += (uint64_t)t.len;
+        if (!judge_total_tokens_ok(total_tokens, s->pool_ctx_size)) {
+            snprintf(e, sizeof e, "/v1/systemone: the questions render %llu tokens; a request holds at most %llu",
+                     (unsigned long long)total_tokens, 4ull * (unsigned long long)s->pool_ctx_size);
             pulsar_tokens_free(&t);
             http_error(fd, 400, e);
             free_job();

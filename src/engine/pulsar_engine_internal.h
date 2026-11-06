@@ -4720,6 +4720,9 @@ char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len);
 /// @param bank  the bank
 /// @return true when the whole saved view was installed.
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** L354: whether `bank` has a saved view (a false pulsar_bank_carry_restore_view then is a failure, not a fresh bank).
+ *  @param s the session  @param bank the bank  @return true when one is saved */
+bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
  *  synced on).  Every family's restore of such a bank installs it. */
@@ -5191,6 +5194,9 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst
 /// @param dst_h destination height
 /// @return the resized f32 planes (caller frees), or NULL
 float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, int dst_h);
+/** L354: whether an image of these dimensions may be decoded (said on stderr when not).
+ *  @param width pixels  @param height pixels  @return true when its pixels are within the limit */
+bool vision_decode_admits(uint64_t width, uint64_t height);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

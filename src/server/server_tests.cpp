@@ -9110,6 +9110,41 @@ static void test_l353_parked_decoder_frees_nothing(void) {
     TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
 }
 
+/* L354: a refusal frees what the parse read: a thinking control's raw value is the body's size, and repeated refusals
+ * must not grow the heap (F1).  Both early returns: the logprobs refusal and the missing prompt. */
+static void test_l354_completions_refusal_frees_controls(void) {
+    const std::string big(8u << 20, 'x');
+    const std::string bodies[2] = {
+        "{\"prompt\":\"x\",\"thinking\":\"" + big + "\",\"logprobs\":true}",
+        "{\"thinking\":\"" + big + "\"}",
+    };
+    for (const std::string &body : bodies) {
+        const auto held = []() { const struct mallinfo2 m = mallinfo2(); return (uint64_t)m.uordblks + (uint64_t)m.hblkhd; };
+        const uint64_t before = held();
+        for (int i = 0; i < 8; i++) {
+            request r;
+            char err[256] = "";
+            TEST_ASSERT(!parse_completion_request(NULL, body.c_str(), 64, &r, err, sizeof err));
+            TEST_ASSERT(err[0] != '\0');
+        }
+        TEST_ASSERT(held() < before + (8u << 20));
+    }
+}
+
+/* L354: an image's declared pixels are admitted before a decode allocates them (F2; on a real server,
+ * tests/encode_admission_live.py), and the judge's request budget (F4). */
+static void test_l354_admission_limits(void) {
+    TEST_ASSERT(vision_decode_admits(2048, 1664));
+    TEST_ASSERT(vision_decode_admits(13377, 13377));          /* 178,944,129 pixels */
+    TEST_ASSERT(!vision_decode_admits(13378, 13378));
+    TEST_ASSERT(!vision_decode_admits(32000, 32000));
+    TEST_ASSERT(!vision_decode_admits(0, 10) && !vision_decode_admits(10, 0));
+    TEST_ASSERT(!vision_decode_admits(UINT32_MAX, UINT32_MAX));
+    TEST_ASSERT(judge_question_count_ok(1) && judge_question_count_ok(PULSAR_JUDGE_MAX_QUESTIONS));
+    TEST_ASSERT(!judge_question_count_ok(PULSAR_JUDGE_MAX_QUESTIONS + 1));
+    TEST_ASSERT(judge_total_tokens_ok(4 * 131072, 131072) && !judge_total_tokens_ok(4 * 131072 + 1, 131072));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -14848,6 +14883,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
     test_persist_skipped_under_the_floor();
+    test_l354_completions_refusal_frees_controls();
+    test_l354_admission_limits();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

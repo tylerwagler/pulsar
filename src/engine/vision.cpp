@@ -854,6 +854,21 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
 /// @param[out] w_out width
 /// @param[out] h_out height
 /// @return 1, or 0 when it does not decode or is refused
+/* L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
+ * reference tooling opens decodes here too.  A body cap is not a pixel cap: a solid 32000 x 32000 PNG is 2.9 MiB of body
+ * and took 6.6 GiB of RSS to decode (measured, CT 124) before every image is scaled down to the model's canvas anyway. */
+#define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
+
+bool vision_decode_admits(uint64_t width, uint64_t height) {
+    if (width == 0 || height == 0 || width > PULSAR_VISION_MAX_DECODED_PIXELS ||
+        height > PULSAR_VISION_MAX_DECODED_PIXELS / width) {
+        fprintf(stderr, "pulsar: vision: refusing an image of %llu x %llu pixels: the limit is %llu pixels\n",
+                (unsigned long long)width, (unsigned long long)height, PULSAR_VISION_MAX_DECODED_PIXELS);
+        return false;
+    }
+    return true;
+}
+
 static int vision_decode_png(const uint8_t *bytes, size_t len,
                              uint8_t **rgb_out, int *w_out, int *h_out) {
     png_image image;
@@ -866,8 +881,7 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
      * was 0), while Pillow's .convert("RGB") discards the alpha outright.  The
      * gate caught exactly that on an RGBA PNG. */
     image.format = PNG_FORMAT_RGBA;
-    if (image.width == 0 || image.height == 0 ||
-        image.width > (png_uint_32)INT32_MAX || image.height > (png_uint_32)INT32_MAX) {
+    if (!vision_decode_admits(image.width, image.height)) {
         png_image_free(&image);
         return 0;
     }
@@ -935,6 +949,10 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, bytes, (unsigned long)len);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    if (!vision_decode_admits(cinfo.image_width, cinfo.image_height)) {
         jpeg_destroy_decompress(&cinfo);
         return 0;
     }

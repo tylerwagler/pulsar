@@ -39,11 +39,24 @@ def main():
         runner_gates |= set(re.findall(r'"([a-z][a-z0-9-]+)"', m.group(1)))
     rows, gaps, bad = [], [], []
     per_gate = []   # (line, kind, target, family): the na and gate-level gap rows
+    # L354: the matrix tracks FAMILIES; every other family in the registry says so, by name and row, or the check fails
+    registry = [x.lower() for x in re.findall(r'&PULSAR_FAMILY_(\w+),', open('src/engine/family.cpp').read())]
+    if not registry:
+        bad.append('src/engine/family.cpp: no family registry found')
+    untracked = {}
     for n, line in enumerate(open('tests/contracts.tsv'), 1):
         line = line.rstrip('\n')
         if not line or line.startswith('#'):
             continue
         f = line.split('\t')
+        if f[0] == 'untracked':
+            if len(f) < 4 or not re.match(r'L\d+', f[2]) or not f[3].strip():
+                bad.append(f'contracts.tsv:{n}: an untracked row is: untracked, family, Lnnn, note')
+            elif f[1] in FAMILIES or f[1] not in registry:
+                bad.append(f'contracts.tsv:{n}: {f[1]!r} is tracked or not in the registry: no untracked row')
+            else:
+                untracked[f[1]] = f[2]
+            continue
         if f[0] == 'na' or (f[0] == 'gap' and len(f) > 1 and f[1] not in CONTRACTS):
             ok = len(f) >= 4 and f[2] in FAMILIES and (f[0] == 'na' or re.match(r'L\d+', f[3]))
             if not ok or not (f[4] if f[0] == 'gap' and len(f) > 4 else f[3]).strip():
@@ -121,6 +134,13 @@ def main():
     for n, kind, target, fam in per_gate:
         if kind == 'gap':
             print(f'    gap: {target} x {fam}')
+    for fam in registry:
+        if fam in FAMILIES:
+            continue
+        if fam in untracked:
+            print(f'  NOT TRACKED: {fam} has no row in this matrix -- {untracked[fam]}')
+        else:
+            bad.append(f'family {fam} is in the registry, not tracked here, and has no untracked row')
     for b in bad:
         print(f'  FAIL  {b}')
     print('COVERAGE MATRIX ' + ('PASS' if not bad else f'FAIL ({len(bad)})'))

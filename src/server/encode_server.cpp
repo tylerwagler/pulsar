@@ -591,8 +591,15 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
         a->srv = &srv;
         a->fd = fd;
         pthread_mutex_lock(&srv.mu);
-        srv.clients++;
+        const bool at_cap = srv.clients >= PULSAR_SERVER_MAX_CLIENTS;   /* L354: the chat server's gate */
+        if (!at_cap) srv.clients++;
         pthread_mutex_unlock(&srv.mu);
+        if (at_cap) {
+            free(a);
+            http_error_retry(fd, 503, "too many connections", HTTP_RETRY_BUSY_S);
+            close(fd);
+            continue;
+        }
         pthread_t th;
         if (pthread_create(&th, NULL, client, a) != 0) {
             pthread_mutex_lock(&srv.mu);

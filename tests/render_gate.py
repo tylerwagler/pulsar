@@ -184,7 +184,9 @@ def main():
             json.dump([dict(id=c, what=w, reference=a, pulsar=b) for c, w, a, b in diffs], f, indent=1)
     if stderr.strip():
         print(stderr.strip().splitlines()[-1])
-    sys.exit(1 if diffs else 0)
+    if same == 0:
+        print("render gate: FAIL -- nothing was compared (L354: zero conversations is not a pass)")
+    sys.exit(1 if diffs or same == 0 else 0)
 
 
 if __name__ == "__main__":

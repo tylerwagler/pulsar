@@ -975,6 +975,14 @@ static bool st_is_shard(const char *n) {
 /// @param[out] m the model
 /// @param path the directory or file
 /// @param gpu_mapping map MAP_SHARED (else MAP_PRIVATE)
+/** qsort: tensors by name (length, then bytes).  @param a a pulsar_tensor *const *  @param b likewise
+ *  @return the order */
+static int st_cmp_tensor_name(const void *a, const void *b) {
+    const pulsar_tensor *x = *(pulsar_tensor *const *)a, *y = *(pulsar_tensor *const *)b;
+    if (x->name.len != y->name.len) return x->name.len < y->name.len ? -1 : 1;
+    return memcmp(x->name.ptr, y->name.ptr, x->name.len);
+}
+
 static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     /* Two shapes, one loader: a DIRECTORY of shards, or a single file that IS
      * the whole checkpoint.  The engine does not care which -- the tensor table
@@ -1082,6 +1090,24 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         st_add_expert_stacks(&d, &shards[i]);
     }
     if (d.n == 0) st_die("safetensors: %s declares no tensors", path);
+    /* L354: a name resolves to the first match (model_find_tensor), so a stale shard left in the directory by a rebuild
+     * would silently win.  The container says how many shards it has, and a name is declared once. */
+    if (const char *ns = st_meta_get(primary, "pulsar.n_shards")) {
+        if (strtoull(ns, NULL, 10) != n)
+            st_die("safetensors: %s holds %llu shards; the container was built with %s -- refusing it", path,
+                   (unsigned long long)n, ns);
+    }
+    {
+        pulsar_tensor **byname = (pulsar_tensor **)st_alloc((size_t)d.n * sizeof(*byname));
+        for (uint64_t i = 0; i < d.n; i++) byname[i] = &d.v[i];
+        qsort(byname, (size_t)d.n, sizeof(*byname), st_cmp_tensor_name);
+        for (uint64_t i = 1; i < d.n; i++) {
+            if (st_cmp_tensor_name(&byname[i - 1], &byname[i]) == 0)
+                st_die("safetensors: %s declares tensor %.*s twice -- refusing the container", path,
+                       (int)byname[i]->name.len, byname[i]->name.ptr);
+        }
+        free(byname);
+    }
     m->tensors = d.v;
     m->n_tensors = d.n;
     m->version = 0;

@@ -6,6 +6,9 @@
 #   family     deepseek4 | qwen4_exp | all (family-neutral: runs for every family, or needs no model)
 #   tier       battery (make gates) | dev (gates-dev only) | manual (neither; say why in the note)
 #
+# A family in the registry (src/engine/family.cpp) that this matrix does not track is an `untracked` row, naming the
+# ledger row that closes it: untracked, family, Lnnn, note.
+#
 # A contract x family cell with no battery gate must appear as a `gap` row naming the ledger row that closes it --
 # the check fails on an undeclared hole, so a gap is written down, not remembered.
 #
@@ -81,3 +84,8 @@ na	render-gate	qwen4_exp	DeepSeek V4.1's encoder goldens; Qwen's template is qwe
 na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
 na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
 na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates
+untracked	inkling	L354	parked family; its forward is not wired
+untracked	nemotron_h	L354	served at work; its gates are not in this matrix yet
+untracked	nemotron_enc	L354	served on CT 131; its gates are not in this matrix yet
+untracked	nemotron_parse	L354	served on CT 131; its gates are not in this matrix yet
+untracked	gemma4	L354	served on CT 130; its gates are not in this matrix yet

@@ -1772,9 +1772,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                          "%s is not supported on /v1/completions; use "
                          "/v1/chat/completions with logprobs:true", key);
                 free(key);
-                free(prompt);
-                request_free(r);
-                return false;
+                goto bad;   /* the controls read so far go with it */
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -1788,8 +1786,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     if (*p != '}') goto bad;
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
-        request_free(r);
-        return false;
+        goto bad;
     }
     /* L284 P2: a completion is a RAW continuation on every family (OpenAI's and vLLM's /v1/completions): no
      * chat template, no thinking block, and nothing before the prompt (neither family's HF tokenizer adds a
