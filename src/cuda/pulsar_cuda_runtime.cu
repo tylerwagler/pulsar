@@ -1525,11 +1525,11 @@ uint64_t pulsar_gpu_tensor_alloc_bytes_current(void) {
  * allocation code this way: the price and the allocation are one function. */
 /// This thread's dry-run allocation state (see above): active flag, requested and managed byte totals, fake cursor.
 static thread_local struct {
-    int      active;
-    uint64_t bytes;          /* every dry allocation, requested bytes */
-    uint64_t managed_bytes;  /* the cudaMallocManaged subset */
-    uintptr_t cursor;        /* fake address space so placeholders are distinct */
-} g_dry;
+    int      active;         ///< a dry run is on
+    uint64_t bytes;          ///< every dry allocation, requested bytes
+    uint64_t managed_bytes;  ///< the cudaMallocManaged subset
+    uintptr_t cursor;        ///< fake address space so placeholders are distinct
+} g_dry;                     ///< this thread's state
 
 /// Starts a dry run on this thread: allocations hand out placeholders and total their bytes.
 void pulsar_gpu_tensor_dry_begin(void) {

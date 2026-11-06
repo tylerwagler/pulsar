@@ -43,9 +43,9 @@ const pulsar_dsml_syntax *pulsar_dsml_canonical(bool v41) {
  * the rows the attribute encoder writes; the rest are decode-only. */
 /// The entity table (see the comment above): entity text, its character, and whether the encoder writes it.
 static const struct {
-    const char *entity;
-    char ch;
-    bool encode;
+    const char *entity;   ///< the entity text
+    char ch;              ///< its character
+    bool encode;          ///< written when encoding
 } dsml_entities[] = {
     {"&amp;", '&', true},
     {"&lt;", '<', true},
@@ -53,6 +53,8 @@ static const struct {
     {"&quot;", '"', true},
     {"&apos;", '\'', false},
 };
+/** @var dsml_entities
+ *  The table above. */
 
 
 

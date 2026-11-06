@@ -17,7 +17,10 @@
  * strings a checkpoint declares, and the native layouts carry their dtype's
  * name because that is what a histogram of a checkpoint should print. */
 /// Tensor layout names <-> PULSAR_TENSOR_* ids (tensor_type_name and its inverse).
-static const struct { const char *name; uint32_t id; } pulsar_layout_names[] = {
+static const struct {
+    const char *name;   ///< the layout's name
+    uint32_t id;        ///< its PULSAR_TENSOR_* id
+} pulsar_layout_names[] = {
     {"f32",            PULSAR_TENSOR_F32},
     {"i32",            PULSAR_TENSOR_I32},
     {"bf16",           PULSAR_TENSOR_BF16},
@@ -35,6 +38,8 @@ static const struct { const char *name; uint32_t id; } pulsar_layout_names[] = {
     {"exl3m_k8",       PULSAR_TENSOR_EXL3M_K8},
     {"nvfp4",          PULSAR_TENSOR_NVFP4},
 };
+/** @var pulsar_layout_names
+ *  The table above. */
 
 
 
