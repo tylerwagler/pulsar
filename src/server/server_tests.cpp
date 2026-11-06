@@ -9131,6 +9131,8 @@ static void test_l354_completions_refusal_frees_controls(void) {
     }
 }
 
+bool vision_decode_admits(uint64_t width, uint64_t height);   /* the engine's, out of the public API */
+
 /* L354: an image's declared pixels are admitted before a decode allocates them (F2; on a real server,
  * tests/encode_admission_live.py), and the judge's request budget (F4). */
 static void test_l354_admission_limits(void) {
@@ -14611,6 +14613,7 @@ static void test_l334_positions_are_ints(void) {
     TEST_ASSERT(TokPos{-1}.is_none() && TokPos::none().raw() == -1);           /* the int field's -1 enters as none() */
 }
 
+#include <malloc.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
