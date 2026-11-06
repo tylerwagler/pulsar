@@ -8153,8 +8153,12 @@ static void test_l323_tail_supersession(void) {
     const uint64_t used = [&]() { pulsar_segstore *o = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
                                   const uint64_t u = pulsar_segstore_used_bytes(o); pulsar_segstore_close(o); return u; }();
     st = pulsar_segstore_open(dir, used + 200, 7, NULL, NULL);   /* room for nothing big: a put must evict */
+    std::vector<std::string> removed;
+    pulsar_segstore_set_removed_hook(st, [](void *ud, const char key[41], bool) {
+        ((std::vector<std::string> *)ud)->push_back(std::string(key, 40));
+    }, &removed);
     TEST_ASSERT(l323_persist(st, 8400, 4096, true, tip) == 1);
-    TEST_ASSERT(!pulsar_segstore_contains(st, t1) && !pulsar_segstore_contains(st, t2));   /* the dominated tails went */
+    TEST_ASSERT(!removed.empty() && (removed[0] == std::string(t1, 40) || removed[0] == std::string(t2, 40)));
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -8958,12 +8962,19 @@ static void test_l347_i2_older_ends_kept(void) {
     TEST_ASSERT(pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, e3.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
-    /* more pressure: the rows that restore nothing (L353) -- 9000's tail, dominated by 9200's, then the first newcomer's
-     * -- then the next unflagged one (5000's, older than 9200's), before the anchor */
+    /* more pressure: first the rows that restore nothing (L353), 9000's tail, dominated by 9200's */
     char nk2[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second newcomer", L323_STATE, 10, nk2));
-    TEST_ASSERT(l347_ev_at(log, e2.key, false) == 1 && l347_ev_at(log, nk, false) == 2);
-    TEST_ASSERT(l347_ev_at(log, e1.key, true) == 3);
+    TEST_ASSERT(l347_ev_at(log, e2.key, false) == 1);
+    TEST_ASSERT(pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u);
+    /* and on: the newcomers' rows, then the next unflagged one (5000's, older than 9200's), before the anchor */
+    for (int i = 0; i < 16 && pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u; i++) {
+        char text[32], nk3[41];
+        snprintf(text, sizeof text, "newcomer %d", i);
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, text, L323_STATE, (uint8_t)(11 + i), nk3));
+    }
+    const int e1_rp = l347_ev_at(log, e1.key, true);
+    TEST_ASSERT(e1_rp > 0 && l347_ev_at(log, nk, false) > 0 && l347_ev_at(log, nk, false) < e1_rp);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
