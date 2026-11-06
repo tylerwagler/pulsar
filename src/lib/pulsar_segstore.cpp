@@ -648,7 +648,7 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
             retired_bytes += stat_ok ? (uint64_t)sb.st_size : 0u;
         }
         /* L354: a segment of this store whose size disagrees with its header can never load, and sat outside `used` */
-        if (stat_ok && ((ok && !sized) || (uint64_t)sb.st_size < HDR) && ::unlink(p.c_str()) == 0)
+        if (stat_ok && ok && !sized && ::unlink(p.c_str()) == 0)
             st->logf("segment %s removed: torn (%llu bytes)", de->d_name, (unsigned long long)sb.st_size);
         if (!sized || !head_ok) continue;
         e.file_bytes = (uint64_t)sb.st_size;

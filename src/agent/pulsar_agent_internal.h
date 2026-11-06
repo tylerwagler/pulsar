@@ -211,9 +211,6 @@ char *agent_workspace_refusal(const char *path);
  *  UTF-8 form of the C1 controls) with '?', so model or tool text can't move the cursor or reach OSC 52.
  *  @param s the bytes  @param n how many */
 void agent_terminal_sanitize(char *s, size_t n);
-/** L354: agent_publish for text a model or a tool wrote: sanitized first.
- *  @param w the worker  @param s the text  @param n its bytes */
-void agent_publish_untrusted(agent_worker *w, const char *s, size_t n);
 
 /** Lifecycle state of the agent's single worker thread. Drives what the TUI
  * shows in the status line, so every long-running phase gets its own value
@@ -1010,6 +1007,9 @@ void agent_wake_locked(agent_worker *w);
  *  @param s bytes to queue (copied)
  *  @param n byte count; 0 is a no-op */
 void agent_publish(agent_worker *w, const char *s, size_t n);
+/** L354: agent_publish for text a model or a tool wrote: sanitized first.
+ *  @param w the worker  @param s the text  @param n its bytes */
+void agent_publish_untrusted(agent_worker *w, const char *s, size_t n);
 /** printf-style agent_publish.
  *  @param w   the worker
  *  @param fmt printf format, then its arguments */

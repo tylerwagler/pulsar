@@ -3833,9 +3833,6 @@ tests/tp_transport_test: tests/tp_transport_test.cpp src/tp/pulsar_tp.cpp src/tp
 tp-transport-test: tests/tp_transport_test
 	./tests/tp_transport_test
 
-# TP gate-scheduler test (slice 4b): host half of the CUDA gate machinery,
-# driven over the transport's TCP loopback with hook stubs.  No CUDA, no RDMA.
-
 # TP NODE frame test (protocol v13): after bring-up every rank knows every
 # rank's host, build and TP address, over the pair and the 3-rank mesh paths.
 # Host-only: no CUDA, no RDMA.

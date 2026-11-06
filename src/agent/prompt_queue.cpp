@@ -362,11 +362,13 @@ void agent_terminal_sanitize(char *s, size_t n) {
 
 void agent_publish_untrusted(agent_worker *w, const char *s, size_t n) {
     if (!n) return;
-    char *copy = (char *)xmalloc(n);
+    char stack[1024];
+    char *copy = n <= sizeof stack ? stack : (char *)malloc(n);
+    if (!copy) return;   /* out of memory: nothing unsanitized goes out */
     memcpy(copy, s, n);
     agent_terminal_sanitize(copy, n);
     agent_publish(w, copy, n);
-    free(copy);
+    if (copy != stack) free(copy);
 }
 
 /* Queue rendered output for the UI thread.  The worker never writes directly

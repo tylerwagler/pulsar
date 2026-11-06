@@ -1,5 +1,7 @@
 /** @file
  *  pulsar-agent: tool argument parsing and the file tools' helpers. */
+#include <limits.h>
+#include <string>
 #include "pulsar_agent_internal.h"
 
 
@@ -376,6 +378,9 @@ char *agent_workspace_refusal(const char *path) {
 
 char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
+    if (path && path[0]) {
+        if (char *refused = agent_workspace_refusal(path)) return refused;
+    }
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
     int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
                                         1, 1, INT_MAX);
@@ -432,6 +437,7 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
 char *agent_tool_list(const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     DIR *dir = opendir(path);
     if (!dir) {
         agent_buf b = {0};

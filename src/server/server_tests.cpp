@@ -9166,6 +9166,16 @@ static void test_l354_server_values(void) {
     TEST_ASSERT(prometheus_label("a\"b\\c\nd") == "a\\\"b\\\\c\\nd");
 }
 
+bool py_unprintable(uint32_t cp);
+
+/* L354 (F28): the table is CPython's str.isprintable(), negated (tools/gen_py_unprintable.py). */
+static void test_l354_py_unprintable(void) {
+    for (uint32_t cp : {0x00u, 0x1fu, 0x7fu, 0x80u, 0x9fu, 0xa0u, 0xadu, 0x378u, 0x2028u, 0x2029u, 0x200bu, 0x3000u, 0xd800u, 0xe000u, 0xfeffu,
+                        0x10ffffu})
+        TEST_ASSERT(py_unprintable(cp));
+    for (uint32_t cp : {0x20u, 0x41u, 0x7eu, 0xa1u, 0xe9u, 0x4e2du, 0x1f600u}) TEST_ASSERT(!py_unprintable(cp));
+}
+
 /* L354 (F17): one reading of a request's framing. */
 static void test_l354_http_framing(void) {
     const auto cl = [](const char *h) { return content_length(h, strlen(h)); };
@@ -9383,7 +9393,7 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     /* L354: a segment whose size disagrees with its header (a torn write) is removed at open, not left outside `used` */
     {
         pulsar_segstore *o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
-        for (const off_t cut : {(off_t)100, (off_t)170}) {   /* below its header; inside its payload */
+        for (const off_t cut : {(off_t)170}) {   /* inside its payload (a file with no header of ours is left alone) */
             char torn[41], tp[600];
             test_seg_payload tpay = { 10, 7 };
             TEST_ASSERT(pulsar_segstore_put(o, "", 0, 128, "torn", 4, 10, test_seg_write, 0, NULL, &tpay, torn, err,
@@ -14945,6 +14955,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_admission_limits();
     test_l354_server_values();
     test_l354_http_framing();
+    test_l354_py_unprintable();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
