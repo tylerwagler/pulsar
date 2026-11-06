@@ -667,6 +667,7 @@ struct pulsar_grouped_scratch_layout {
  *  @return the grouped FFN's scratch layout */
 static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
                                                          int in_dim, int mid_dim, int out_dim){
+  (void)out_dim;
   pulsar_grouped_scratch_layout L{};
   const size_t a = 256; size_t off = 0;
   int sm = grouped_sm_count();
@@ -1536,9 +1537,9 @@ int pulsar_cutlass_expert_ffn_gemv_small(
    * GEMV indexes (slot < n_slots, kb < mid_dim/32) only, and mid_dim % 128 == 0
    * makes mid_kbp == mid_dim/32, so the epilogue writes every position it
    * reads.  No memset. */
-  const int   x_kbp      = pulsar_mx_rup((int)(in_dim / 32u), 4);
+  const int   x_kbp      = pulsar_mx_kbp((int)in_dim);
   const size_t midq_elems = (size_t)n_slots * mid_dim;
-  const int   mid_kbp      = pulsar_mx_rup((int)(mid_dim / 32u), 4);
+  const int   mid_kbp      = pulsar_mx_kbp((int)mid_dim);
   const size_t midsf_bytes = pulsar_mx_sf_slab_bytes(n_slots, mid_kbp);
   const size_t midq_bytes = midq_elems + midsf_bytes;
   const size_t need = (midq_bytes + 3u) / 4u;
@@ -1691,7 +1692,7 @@ int pulsar_cutlass_gemv_gateup(
     void *emit_q, void *emit_sf, int emit_kbp) {
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
   const bool emit = emit_q != NULL;
-  if (emit && (mid_dim % 32 || !emit_sf || emit_kbp != pulsar_mx_rup(mid_dim / 32, 4))) return 1;
+  if (emit && (mid_dim % 32 || !emit_sf || emit_kbp != pulsar_mx_kbp(mid_dim))) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
 
@@ -1735,7 +1736,7 @@ int pulsar_cutlass_gemv_down(
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
   /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
    * VEC32 swizzle), or the call refuses. */
-  if (!mid_q || !mid_sf || mid_kbp != pulsar_mx_rup(mid_dim / 32, 4)) {
+  if (!mid_q || !mid_sf || mid_kbp != pulsar_mx_kbp(mid_dim)) {
     static int said = 0;
     if (!said) { said = 1; fprintf(stderr, "pulsar: fp4 down GEMV: no producer E4M3 for mid (mid_dim=%d n_slots=%u) -- refusing\n", mid_dim, n_slots); }
     return 1;

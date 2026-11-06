@@ -85,7 +85,7 @@ model.  Record pass/fail against the release commit:
   indexed, decode-batch, one-row), banked cross-session KV-leak isolation
   (modelless).
 - `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
-  `PREFILL_BASELINE_REF` blob (default `13bcbab1`, the L292 NVFP4
+  `PREFILL_BASELINE_REF` blob (default `5fe1831d`, the CUDA 13.5 toolchain; before it `13bcbab1`, the L292 NVFP4
   exact-divide fix; provenance in `tests/test-vectors/`).  **The baseline
   build must be able to load the shipped artifact**: a baseline ref that
   predates the artifact's layouts or payload version cannot run at all, and
@@ -154,7 +154,6 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `cuda-attn-gates` | 45 | |
 | `cuda-attn-pack-gate` | 5 | |
 | `indexer-hadamard-kernel-check` | 5 | |
-| `cuda-prefill-gate-cutlass-mxfp4` | 5 | skips loudly off-box |
 | `qwen-family-gate-device` | 60 | zero-weight containers |
 | `state-kinds-gate` | 5 | |
 | `vision-qwen-tower-gate` | 10 | |
@@ -162,11 +161,14 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `blockdraft-gate` | 5 | |
 | `nvfp4-rows-gate` | 10 | |
 | `lilicorr-head-gate` | 10 | |
+| `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
+| `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
 | `cuda-runner-gate [DeepSeek V4]` | 1150 | L278 cut (2026-11-03): only the entries needing DS4 internals or the fixture blobs (`--needs=ds4,fixtures`); 2 engine opens.  Re-set from the first measured battery |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
 | `live-legs [nemotron]` | 420 | kv-dup, opencode-turns: warm + fresh.  L326: 240 -> 420, measured 365 s (#456: L324's kv-dup leg +~49 s, the warm load cold-cache 214 s vs 136) + 15% |
+| `preempt-wedge-live` | 300 | L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back. |
 | `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon, the Nemotron mini |
 | `host-only gates (longest)` | 90 | overlap the runner |
 | `suite total` | 3000 | the target: <= ~50 min, the live legs included |

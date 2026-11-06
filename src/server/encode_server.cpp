@@ -576,6 +576,7 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
         else
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)",
                        c.id, c.kind == K_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
+    server_warn_if_exposed(cfg->host);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)", cfg->host, cfg->port,
                PULSAR_VERSION_STR);
     while (!g_stop_requested) {
@@ -591,8 +592,15 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
         a->srv = &srv;
         a->fd = fd;
         pthread_mutex_lock(&srv.mu);
-        srv.clients++;
+        const bool at_cap = srv.clients >= PULSAR_SERVER_MAX_CLIENTS;   /* L354: the chat server's gate */
+        if (!at_cap) srv.clients++;
         pthread_mutex_unlock(&srv.mu);
+        if (at_cap) {
+            free(a);
+            http_error_retry(fd, 503, "too many connections", HTTP_RETRY_BUSY_S);
+            close(fd);
+            continue;
+        }
         pthread_t th;
         if (pthread_create(&th, NULL, client, a) != 0) {
             pthread_mutex_lock(&srv.mu);

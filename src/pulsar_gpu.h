@@ -4426,8 +4426,15 @@ typedef struct {
     uint64_t aligner_w1, aligner_b1, aligner_w2, aligner_b2;
     /** Per transformer block: its norm1, attn.wqkv (+ bias), attn.wo (+ bias), norm2 and MLP w1 / w2 tensors. */
     struct {
-        uint64_t norm1, wqkv, wqkv_bias, wo, wo_bias, norm2, w1, w2;
-    } block[PULSAR_VISION_LAYERS];
+        uint64_t norm1;       ///< pre-attention norm
+        uint64_t wqkv;        ///< fused QKV
+        uint64_t wqkv_bias;   ///< its bias
+        uint64_t wo;          ///< attention output
+        uint64_t wo_bias;     ///< its bias
+        uint64_t norm2;       ///< pre-MLP norm
+        uint64_t w1;          ///< MLP gate and up
+        uint64_t w2;          ///< MLP down
+    } block[PULSAR_VISION_LAYERS];   ///< per transformer block
     uint32_t n_layers;              ///< must be PULSAR_VISION_LAYERS
     uint32_t text_dim;              ///< the aligner's output width (the text model's n_embd)
 } pulsar_vision_offsets;

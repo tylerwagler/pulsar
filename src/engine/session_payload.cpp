@@ -437,25 +437,14 @@ static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
     return (uint64_t)RESTORE_POINT_U32_FIELDS * sizeof(uint32_t) + st->slot_bytes + sizeof(uint64_t);
 }
 
-/* L281: a stored segment's image records, read from its payload's head without loading it.  The bytes are the
- * payload digest's to vouch for; this only decides how far a restore goes, and the load that follows re-reads and
- * checks everything. */
-int pulsar_session_segment_images(FILE *fp, uint64_t bytes, uint64_t *hashes, uint32_t cap, uint32_t *n_out) {
-    *n_out = 0;
-    uint32_t h[SEGMENT_U32_FIELDS];
-    if (!fp || bytes < sizeof(h) || fread(h, sizeof(uint32_t), SEGMENT_U32_FIELDS, fp) != SEGMENT_U32_FIELDS) return 1;
-    if (h[0] != PULSAR_SESSION_SEGMENT_MAGIC || h[7] <= h[6]) return 1;
-    if (h[1] != PULSAR_SESSION_SEGMENT_VERSION) return 1;
-    if (fseek(fp, (long)((uint64_t)(h[7] - h[6]) * sizeof(uint32_t)), SEEK_CUR) != 0) return 1;
+/* L353: a span's image content hashes, which its segment's key covers (pulsar_segstore_child_key_images) */
+int pulsar_session_span_image_hashes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *hashes, int cap) {
+    const pulsar_image_block *first = NULL;
     uint32_t n = 0;
-    if (fread(&n, sizeof(n), 1, fp) != 1 || n > PULSAR_IMAGE_BLOCKS_MAX) return 1;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t rec[SEGMENT_IMAGE_U32];
-        if (fread(rec, sizeof(uint32_t), SEGMENT_IMAGE_U32, fp) != SEGMENT_IMAGE_U32) return 1;
-        if (i < cap) hashes[i] = (uint64_t)rec[2] | (uint64_t)rec[3] << 32;
-    }
-    *n_out = n;
-    return 0;
+    if (!s || !segment_images(s, (uint32_t)G_prev.raw(), (uint32_t)G.raw(), &first, &n)) return -1;
+    if ((int)n > cap) return -1;
+    for (uint32_t i = 0; i < n; i++) hashes[i] = first[i].content;
+    return (int)n;
 }
 
 uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *state_bytes) {
@@ -531,7 +520,10 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
     const uint32_t bank = pulsar_session_live_bank(this);
     pulsar_ckpt_slot_at at;
-    if (!dst || G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_locate(st, bank, G, &at)) {
+    /* L354: the same gate as copy_out_segment's: after a rewind or an invalidate the store can still hold the slot, and a
+     * restore point of rows the bank no longer holds would resume a history it doesn't have */
+    if (!dst || !checkpoint_valid || G == 0u || G > (uint32_t)checkpoint.len || G % st->ops->resume_grid != 0u ||
+        !pulsar_ckpt_locate(st, bank, G, &at)) {
         payload_set_err(err, errlen, "copy-out restore point: the installed bank holds no checkpoint there");
         return 1;
     }
@@ -862,6 +854,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     if (last) pulsar_ckpt_commit(st, bank, at.slot, G);
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
+    s->mseq_dirty = false;   /* L354: as load_payload */
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
      * drafter window with it), else the store's alone (Qwen: its sync owns the rest) */
     const pulsar_family_bank_ops *bops = s->engine->family->banks;
@@ -1134,7 +1127,6 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         payload_set_err(err, errlen, "session payload: a tensor-parallel session's payload is not mirrored");
         return 1;
     }
-    spec_lookahead_reset(s);
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const uint32_t bank = pulsar_session_live_bank(s);
     const uint32_t width = (uint32_t)pulsar_engine_logits_width(s->engine);
@@ -1213,6 +1205,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return drop();
     }
     /* Device writes begin: from here a failure leaves the bank holding nothing. */
+    /* L354: from here the bank is written.  A payload refused above leaves the speculation as it found it */
+    spec_lookahead_reset(s);
     segment_clear(s, st, bank);
     pulsar_gpu_tensor *front = NULL;
     auto fail = [&]() { pulsar_gpu_tensor_free(front); segment_clear(s, st, bank); return drop(); };
@@ -1261,6 +1255,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->prefill_frontier = (int)PF;   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
     s->checkpoint_valid = true;
     s->logits_stale = false;
+    s->mseq_dirty = false;   /* L354: the frontier is this payload's now, whatever batched step ran before it */
     spec_lookahead_reset(s);
     kvp_spec_unpack(spec_rec, &s->spec);
     return 0;

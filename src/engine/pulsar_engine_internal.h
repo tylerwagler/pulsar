@@ -1199,9 +1199,9 @@ typedef struct {
     struct {
         pulsar_tensor *norm1;    ///< pre-attention RMSNorm
         pulsar_tensor *wqkv;     ///< fused QKV (dim -> 3*dim), with bias
-        pulsar_tensor *wqkv_bias;
+        pulsar_tensor *wqkv_bias;   ///< its bias
         pulsar_tensor *wo;       ///< attention output projection (dim -> dim), with bias
-        pulsar_tensor *wo_bias;
+        pulsar_tensor *wo_bias;     ///< its bias
         pulsar_tensor *norm2;    ///< pre-MLP RMSNorm
         pulsar_tensor *w1;       ///< SwiGLU gate+up (dim -> 2*inter), NO bias
         pulsar_tensor *w2;       ///< SwiGLU down (inter -> dim), NO bias
@@ -1273,7 +1273,11 @@ static_assert(PULSAR_MSEQ_MAX <= PULSAR_GPU_MNEUTRAL_ROWS_MAX,
 #include "kv_state.h"
 /* L295 F3: declared session state -- a family's state kinds, the core's alloc / paging / kv-state / capture. */
 #include "state_kinds.h"
-uint32_t pulsar_layer_compress_ratio(uint32_t il);   /* the frontier hook below needs it */
+/** Attention compression is read from the model's metadata after validating that it matches the exact layout expected for
+ *  the loaded model shape.
+ *  @param il the layer, < PULSAR_N_LAYER (else dies)
+ *  @return the layer's compression ratio (tokens per compressed row; 0 = window only) */
+uint32_t pulsar_layer_compress_ratio(uint32_t il);
 
 /** Declares the rows of every GEMM / MoE call issued inside its scope as
  * DECODE rows (pulsar_gpu_matmul_set_batch_decode_rows, pulsar_gpu.h): they
@@ -1887,12 +1891,13 @@ typedef struct {
         pulsar_gpu_tensor *kv;               ///< f32 [cap][(n_hc+1)*dim]: the `wkv` output
         unsigned char *host_rows[PULSAR_ENGRAM_MAX_LAYERS];   ///< [cap][24][264] gather targets
         uint64_t *ids[PULSAR_ENGRAM_MAX_LAYERS];              ///< [cap][24] the staged row ids
-        pulsar_engram_gather *pending[PULSAR_ENGRAM_MAX_LAYERS];
+        pulsar_engram_gather *pending[PULSAR_ENGRAM_MAX_LAYERS];   ///< the staged step's gathers, per layer
         uint32_t pending_n;                  ///< rows of the staged step (0 = none)
-        uint32_t cap, n_banks;
+        uint32_t cap;                        ///< rows a step holds
+        uint32_t n_banks;                    ///< banks the rings cover
         int32_t *ring_tok;                   ///< [n_banks][PULSAR_ENGRAM_RING]
         uint32_t *ring_pos;                  ///< [n_banks][PULSAR_ENGRAM_RING], UINT32_MAX = empty
-    } engram;
+    } engram;                                ///< the Engram drafter's state
 } pulsar_gpu_graph;
 
 /** Positions of token history each bank's Engram ring keeps (a power of two
@@ -2896,6 +2901,7 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
 typedef struct pulsar_session_dev_rows {
     pulsar_gpu_tensor *live;        ///< [W] f32: the live row
     bool host_stale;                ///< pulsar_session::logits is behind `live`
+    bool live_valid;                ///< L354: something has written `live` for the view installed
     pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
     /// Banks bank_rows holds a row for.
     uint32_t n_banks;
@@ -3150,12 +3156,12 @@ struct pulsar_session {
      *  time; the batch then seeds every bank in one pass
      *  (gpu_graph_dspark_seed_rows_banked). */
     struct {
-        bool active;
-        uint32_t n;
-        uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];
-        uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];
+        bool active;                                     ///< a seed is deferred
+        uint32_t n;                                      ///< rows
+        uint32_t src_row[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< each row's source row
+        uint32_t bank[PULSAR_SPEC_LOGITS_ROWS + 1];      ///< each row's bank
         int32_t next_tok[PULSAR_SPEC_LOGITS_ROWS + 1];   ///< the token after each row (a drafter that pairs rows with their successor, L272 P1)
-    } seed_defer;
+    } seed_defer;                                        ///< the drafter seed deferred to the next launch
     pulsar_gpu_graph *graph;  ///< L272 P6: the DeepSeek family's device state (KV, scratch, bank views), owned by its create / destroy; NULL on any other family
     /** L295 F4: the core row-step driver's buffers (step_driver.h) -- the base of the family's own session state
      *  (Qwen: pulsar_qwen_state) on a family that runs on the driver; NULL on a DeepSeek session. */
@@ -3749,12 +3755,6 @@ extern int g_pulsar_lock_fd;
 /// @return true for PULSAR_BACKEND_CUDA.
 bool pulsar_backend_uses_graph(pulsar_backend backend);
 void pulsar_die(const char *msg);
-/** Attention compression is read from GGUF metadata after validating that it
- * matches the exact layout expected for the loaded model shape.
- */
-/// @param il  the layer, < PULSAR_N_LAYER (else dies)
-/// @return the layer's compression ratio (tokens per compressed row; 0 = window only).
-uint32_t pulsar_layer_compress_ratio(uint32_t il);
 /** The layer's row of the CSA2 attention layout table (ratio, sources, mode). */
 /// @param il  the layer
 /// @return the row (static storage).
@@ -4720,6 +4720,9 @@ char *pulsar_engine_token_text_fn(void *ud, int token, size_t *len);
 /// @param bank  the bank
 /// @return true when the whole saved view was installed.
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
+/** L354: whether `bank` has a saved view (a false pulsar_bank_carry_restore_view then is a failure, not a fresh bank).
+ *  @param s the session  @param bank the bank  @return true when one is saved */
+bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
  *  synced on).  Every family's restore of such a bank installs it. */
@@ -5191,6 +5194,19 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst
 /// @param dst_h destination height
 /// @return the resized f32 planes (caller frees), or NULL
 float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, int dst_h);
+/** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
+ *  reference tooling opens decodes here too. */
+#define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
+/** L354: the bytes all concurrent decodes may hold: one thread decodes per Parse connection, so the per-image cap alone is
+ *  64 x 1.25 GiB.  A chat server decodes on its one worker and never meets it. */
+#define PULSAR_VISION_DECODE_BUDGET_BYTES (16ull << 30)
+/** L354: hold `bytes` of the decode budget.  @param bytes what the decode allocates  @return false (said) when over it */
+bool vision_decode_reserve(uint64_t bytes);
+/** L354: give back what vision_decode_reserve held.  @param bytes the same count */
+void vision_decode_release(uint64_t bytes);
+/** L354: whether an image of these dimensions may be decoded (said on stderr when not).
+ *  @param width pixels  @param height pixels  @return true when its pixels are within the limit */
+bool vision_decode_admits(uint64_t width, uint64_t height);
 int vision_decode_rgb(const uint8_t *bytes, size_t len,
                       uint8_t **rgb_out, int *w_out, int *h_out);
 

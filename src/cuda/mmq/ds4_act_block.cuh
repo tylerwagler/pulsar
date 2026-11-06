@@ -54,9 +54,9 @@ struct block_mx_act_mmq {
     // q8_1 interpretations, kept so the union's size and alignment are
     // unchanged and so any surviving vendored code still type-checks.
     union {
-        float d4[4];    // 1 scale per 32 values -- ue8m0 byte as float (E4M3 path)
-        half2 ds4[4];   // upstream q8_1: 16-bit scale + 16-bit partial sum per 32
-        half  d2s6[8];  // upstream q8_1: scale per 64 + partial sums
+        float d4[4];    ///< 1 scale per 32 values -- ue8m0 byte as float (E4M3 path)
+        half2 ds4[4];   ///< upstream q8_1: 16-bit scale + 16-bit partial sum per 32
+        half  d2s6[8];  ///< upstream q8_1: scale per 64 + partial sums
     };
     int8_t qs[DS4_ACT_BLOCK_VALS];   ///< e4m3 bit patterns (NOT int8 magnitudes)
 };

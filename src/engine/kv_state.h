@@ -412,7 +412,8 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
 /// @param src the bank whose state is adopted
 /// @param T   the position adopted, in tokens
 /// @param r   src's record at T, or NULL for src's grid checkpoint at T
-/// @return true when dst stands at T
+/// @return true when dst stands at T.  A record is copied when a slot holds it; a recycled slot too small keeps no copy, and
+///         the bank's next resume at T then falls to its grid checkpoint (L354: a miss, never other state)
 bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The

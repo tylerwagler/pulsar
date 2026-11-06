@@ -1378,6 +1378,8 @@ typedef struct {
     /// loads observed (kv_read_cost_observe calls that counted); 0 = unmeasured
     uint32_t loads;
     double cold_ms_per_gib, cached_ms_per_gib;   ///< the solved costs, valid from the first load
+    bool cold_seen;                  ///< L353 no. 17: a load with cold bytes has set best_cold_ms_per_gib
+    bool cached_seen;                ///< L353 no. 17: a load with cached bytes has set best_cached_ms_per_gib
     double best_cold_ms_per_gib;     ///< L342: the lowest cold_ms_per_gib has been (the relaxation's floor)
     double best_cached_ms_per_gib;   ///< L342: the lowest cached_ms_per_gib has been (the relaxation's floor)
     /// L342: server_now_sec() of the last load's start, slice or finish; 0 = never
@@ -1406,6 +1408,11 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
 /// @param c        the fit (caller holds server::mu)
 /// @param now_sec  server_now_sec() now; an earlier reading is ignored
 void kv_read_cost_touch(kv_read_cost *c, double now_sec);
+/** L353 no. 16: how many times a restore read its chain.
+ *  @param verify it was checked before the load
+ *  @param retained the check's read stayed as the RAM copy the load reads
+ *  @return the reads */
+uint64_t kv_restore_reads(bool verify, bool retained);
 /** The estimated read of `bytes`, `cached` of them in the RAM tier, at `now_sec`; false (and 0) before the first
  *  load.  Each cost's gap above its best halves every KV_READ_RELAX_SEC since the last load (L342). */
 /// @param c        the fit
@@ -2534,6 +2541,7 @@ struct server {
     uint64_t m_kv_disk_fs_free;       ///< L276: ... the directory's filesystem, free bytes (statvfs)
     uint64_t m_kv_disk_fs_size;       ///< L276: ... and its size
     uint64_t m_kv_disk_segs_removed;  ///< L276: ... segments removed, ever
+    uint64_t m_kv_disk_writes_failed;  ///< L353: ... files copied out whose write failed, ever
     uint64_t m_kv_disk_rps_removed;   ///< L276: ... restore points removed without their segment, ever
     /// L276: segments persists copied out for writing, by trigger (kv_persist_trigger_names)
     uint64_t m_kv_disk_persisted[KV_PERSIST_TRIGGERS];
@@ -3805,6 +3813,12 @@ typedef struct spilled_history {
     uint64_t hashes[64];   ///< its image records' content hashes, in order
     int n_img;             ///< how many
 } spilled_history;
+/** L353 no. 8: whether restoring a spilled bank's history serves this request.
+ *  @param was the history
+ *  @param prompt_text the request's text (may be NULL)
+ *  @param live_turn a live tool continuation
+ *  @return true when it continues the whole history or needs it */
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn);
 
 /** Userdata for the engine's prefill progress callback.
  *
@@ -4127,7 +4141,7 @@ typedef struct {
     const char *trace_path;        ///< request trace file; NULL disables tracing
     const char *kv_disk_dir;       ///< directory for the on-disk KV cache
     bool kv_disk_disable;          ///< turn the disk cache off entirely
-    uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
+    uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB (0 = unbounded)
     int64_t kv_ram_mb;             ///< L347 I3a: --kv-ram-mb, the host pool in MiB (< 0: kv_ram_plan_for's default)
     kv_cache_options kv_cache;     ///< checkpoint placement policy
     /** L321: every -m in order (engine.model_path is the first); more than one opens them as one engine group in
@@ -4165,6 +4179,8 @@ void buf_putc(buf *b, char c);
 void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...);
 char *buf_take(buf *b);
+/** L354: say so at startup when a server with no authentication binds past loopback.  @param host the bind address */
+void server_warn_if_exposed(const char *host);
 void buf_free(buf *b);
 /* json_ws / json_lit / json_string[_n] / json_number / json_int / json_bool /
  * json_skip_value / json_raw_value are declared in pulsar_json.h (included
@@ -4947,6 +4963,9 @@ void kv_cache_close(kv_disk_cache *kc);
 /// @param kc the cache
 /// @return segments indexed
 int kv_cache_commit_written(kv_disk_cache *kc);
+/** L353 nos. 12, 21: wait for the writer's queue to empty, then commit what it wrote.  A restore's next read or a spilled bank's
+ *  lookup needs them; the wait is the backlog's write time.  @param kc the cache  @return the files committed */
+int kv_cache_wait_written(kv_disk_cache *kc);
 /** L338: how much the background writer holds now: staged bytes not yet written, and finished jobs not yet
  *  committed (for /metrics and the tests). */
 /// @param kc        the cache
@@ -4993,6 +5012,16 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
  *  @return the cut in tokens, 0 for none */
 int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
+/** L353: where a persisted shared prefix ends: the FIRST user marker -- the system prompt and tools, what conversations
+ *  of one client share however their first messages differ.  A function of the prompt's tokens alone, so the restore
+ *  point's place never depends on what the store or the banks hold.  (kv_cache_chat_anchor_pos, the LAST user marker
+ *  before the first assistant, stays routing's "related conversations" ceiling: Claude Code's first turn is two user
+ *  messages with the typed text in the first, so that one lies past what conversations share.)
+ *  @param kc     the cache (its min_tokens)
+ *  @param prompt the request's tokens
+ *  @param m      the template's turn markers
+ *  @return the marker's position, -1 when there is none or it sits below min_tokens */
+int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,

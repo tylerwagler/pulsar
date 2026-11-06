@@ -2,7 +2,7 @@
  * TP wide-embd / soak test (branch tensor_parallel; audit F4 + F8 host half).
  *
  * Host-only: no CUDA, no RDMA -- the pair rides the transport's TCP fallback
- * over 127.0.0.1 (forked leader/worker, same shape as tp_sched_test).
+ * over 127.0.0.1 (forked leader/worker, the harness in tests/tp_sched_harness.cpp).
  *
  * What this covers that the fixed-n_embd=4096 tests cannot:
  *
@@ -36,7 +36,7 @@
 #include <unistd.h>
 
 #include "tp/pulsar_tp.h"
-#include "tp/pulsar_tp_sched.h"
+#include "tp_sched_harness.h"
 
 static int g_failures = 0;
 #define CHECK(cond, ...)                                                     \

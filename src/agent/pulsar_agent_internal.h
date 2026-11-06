@@ -195,7 +195,22 @@ typedef struct {
     agent_generation_options gen;   ///< prompt + sampling options for each turn
     const char *chdir_path;         ///< directory to run tools from; NULL = inherit the caller's cwd
     bool non_interactive;           ///< one-shot: run the prompt to completion and exit, no TUI
+    bool allow_outside_workspace;   ///< L354: file tools may leave the directory the agent started in
+    bool allow_bash;                ///< L354: non-interactive runs may use the bash tool
 } agent_config;
+
+/** L354: fix the workspace the file tools stay inside: the working directory now (after --chdir), resolved.
+ *  @param allow_outside true turns the boundary off */
+void agent_workspace_init(bool allow_outside);
+/** L354: the file tools' boundary: a path resolved through its symlinks must lie inside the workspace.  A path that doesn't
+ *  exist yet is judged by its deepest existing parent.
+ *  @param path the tool's path
+ *  @return NULL when allowed, else the tool's error text (malloc'd; the caller returns it) */
+char *agent_workspace_refusal(const char *path);
+/** L354: overwrite in place the bytes a terminal would obey (ESC and the other controls but newline, tab and return; the
+ *  UTF-8 form of the C1 controls) with '?', so model or tool text can't move the cursor or reach OSC 52.
+ *  @param s the bytes  @param n how many */
+void agent_terminal_sanitize(char *s, size_t n);
 
 /** Lifecycle state of the agent's single worker thread. Drives what the TUI
  * shows in the status line, so every long-running phase gets its own value
@@ -992,6 +1007,9 @@ void agent_wake_locked(agent_worker *w);
  *  @param s bytes to queue (copied)
  *  @param n byte count; 0 is a no-op */
 void agent_publish(agent_worker *w, const char *s, size_t n);
+/** L354: agent_publish for text a model or a tool wrote: sanitized first.
+ *  @param w the worker  @param s the text  @param n its bytes */
+void agent_publish_untrusted(agent_worker *w, const char *s, size_t n);
 /** printf-style agent_publish.
  *  @param w   the worker
  *  @param fmt printf format, then its arguments */

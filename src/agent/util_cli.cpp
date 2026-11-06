@@ -190,6 +190,10 @@ agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--allow-outside-workspace")) {
+            c.allow_outside_workspace = true;
+        } else if (!strcmp(arg, "--allow-bash")) {
+            c.allow_bash = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {

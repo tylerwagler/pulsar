@@ -149,6 +149,7 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
             fprintf(stderr, "pulsar: GPU synchronize after chunked prefill failure also failed\n");
         return false;
     }
+    if (last) s->dev.live_valid = true;
     if (last) s->dev.host_stale = true;   /* L302: the head wrote the live row on the device */
     s->prefill_frontier = (int)(pos0 + rows);
     return true;

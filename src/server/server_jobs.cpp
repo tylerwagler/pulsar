@@ -645,7 +645,15 @@ void server::gen_prefill_abandon(session_slot *sl) {
             pthread_mutex_unlock(&s->mu);
         }
     }
-    s->gen_prefill_fail(sl);
+    /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
+     * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
+     * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
+    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
+    g->phase = GEN_DONE;
 }
 
 
@@ -734,6 +742,11 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
                (double)h->cached / (1024.0 * 1024.0));
 }
 
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {
+    if (live_turn) return true;
+    return prompt_text && !strncmp(prompt_text, was->text, strlen(was->text));
+}
+
 /* The spilled bank's own history: the deepest stored chain it reproduces, when L310 prices its read under the prefill
  * it saves -- what bank_switch read at once before L330.  false: nothing to restore (the bank stays empty, its job
  * resolves cold). */
@@ -744,6 +757,8 @@ static void gen_restore_start(session_slot *sl, gen_restore *gr) {
 static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
     gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
     memset(gr, 0, sizeof(*gr));
+    /* L353 no. 21: the spill's own files may still be in the writer's queue: the chain ends short without them */
+    (void)kv_cache_wait_written(&s->kv);
     const int G = s->kv_cache_find(was->text, was->hashes, was->n_img, &gr->hit);
     if (G <= 0 || s->kv_cache_price(&gr->hit, 0) == KV_RESTORE_RECOMPUTE) {
         free(gr);
@@ -920,7 +935,13 @@ void server::gen_begin(session_slot *sl) {
      * reads, a Responses/Anthropic tool turn among them -- restores from its chain a slice per worker turn, and this
      * job resolves once it is in (gen_step_restore calls gen_begin again).  Before, bank_switch read the whole chain
      * inside this bind. */
-    if (was.text && gen_restore_spilled_start(s, sl, &was)) return;
+    /* L353 no. 8: only for a request that continues that history, or a live tool turn that needs it.  One that diverges
+     * below its end read the whole chain (up to 34 GiB) for a state it can't use; empty, the bank takes the normal pick,
+     * which finds the deepest chain the request does share. */
+    if (was.text && spilled_history_serves(&was, j->req.prompt_text, j->req.anthropic_live_call_ids.len > 0 ||
+                                                                         j->req.responses_live_call_ids.len > 0) &&
+        gen_restore_spilled_start(s, sl, &was))
+        return;
     free(was.text);
     const int old_pos = pulsar_session_pos(s->sess).raw();
     /* EVAL PIN: report no live common prefix, so every request re-prefills
@@ -1108,9 +1129,11 @@ void server::gen_begin(session_slot *sl) {
     if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (sync_from_zero || pick != RESUME_OWN)) {
         /* The sync from a miss, an adopt and a chain load each replace the bank's history.  Persist it first (only
          * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
-         * touched first, so making room for the persist evicts other leaves. */
-        if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
+         * pinned across it, so making room for the persist can't evict what was just picked (L353: touching it only
+         * reordered it, and a full store took its restore point; kv_restore_begin pins it for the load). */
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, true);
         s->kv_cache_persist(sl, KV_PERSIST_EVICT);
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, false);
     }
     /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
      * every later persist of the bank reads its X-Pulsar-KV tokens */
@@ -1304,9 +1327,11 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
      * 2048-token margin and alignment, so a ~2K preamble has one too), and the
      * phase runs only on the preamble's SECOND sighting: an earlier request's
      * rows cover it and no restore point stands at the cut
-     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  A sync from
-     * token 0 only: a request a restore point at the cut serves loads it (the
-     * resume pick, L318) and resumes at or past the cut.
+     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  L353: at the
+     * preamble (kv_cache_preamble_pos), from any resume below the cut: a request
+     * that adopted a shallower grid point from a bank passes the cut too, and a
+     * request a restore point at the cut serves loads it (the resume pick, L318)
+     * and resumes at or past the cut.
      * L347 I3b (D10, X-Pulsar-KV): a read-only request writes no anchor unless it says pin-anchor; a pin-anchor
      * request pins the restore point the store holds at its cut (whatever it resumed from), else writes it on this,
      * its FIRST sighting -- a read-only caller trickles no rows, so it could never see a second -- pinned. */
@@ -1316,12 +1341,14 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens &&
         (!(kvf & KV_HDR_READ_ONLY) || pin_anchor))
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers);
+        /* L353: a pin-anchor's place is its caller's prompt shape (the judge: one user message), as L347 pinned it */
+        const int anchor = pin_anchor ? kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers)
+                                      : kv_cache_preamble_pos(&s->kv, prompt_for_sync, &s->turn_markers);
         int cut = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
         if (cut >= prompt_for_sync->len) cut = 0;
         if (pin_anchor && cut > 0 && s->kv_cache_pin_anchor(prompt_for_sync, cut)) cut = 0;   /* stored: pinned now */
-        /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
-        cold_store_len = resumed_at == TokPos{0} ? cut : 0;
+        /* L334: the live side (what is computed, not what is counted).  A pin-anchor: from token 0, as L347 pinned it */
+        cold_store_len = (pin_anchor ? resumed_at == TokPos{0} : resumed_at < TokPos{cut}) ? cut : 0;
     }
     /* An image request's cold phase covers the shared preamble only, and the
      * cut sits at or below the first user turn, so no image block begins
@@ -2271,8 +2298,9 @@ bool server::terminal_checkpoint_step() {
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (!sl->terminal_pending) continue;
-        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete */
-        if (!sl->provisioned || sl->spilled || sl->active_job) {
+        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete; L353 no. 20: a
+         * dead prefix won't be resumed, so its reply isn't worth an uncancellable sync */
+        if (!sl->provisioned || sl->spilled || sl->active_job || sl->hint_dead) {
             sl->terminal_pending = false;
             continue;
         }

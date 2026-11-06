@@ -69,6 +69,27 @@ static void st_die(const char *fmt, ...) {
     st_refuse_or_die(buf);
 }
 
+/// L354: a checked product for the byte models: a declared size that wraps is refused, not read as a small one.
+/// @param a a factor
+/// @param b a factor
+/// @return a * b
+static uint64_t st_mul(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    if (__builtin_mul_overflow(a, b, &r))
+        st_die("safetensors: declared dimensions overflow (%llu x %llu) -- refusing the container", (unsigned long long)a, (unsigned long long)b);
+    return r;
+}
+/// L354: a checked sum, as st_mul.
+/// @param a a term
+/// @param b a term
+/// @return a + b
+static uint64_t st_add(uint64_t a, uint64_t b) {
+    uint64_t r = 0;
+    if (__builtin_add_overflow(a, b, &r))
+        st_die("safetensors: declared dimensions overflow (%llu + %llu) -- refusing the container", (unsigned long long)a, (unsigned long long)b);
+    return r;
+}
+
 /// st_refuse_or_die with `what 'path': strerror(errno)`. Does not return.
 /// @param what the failed operation
 /// @param path the file
@@ -307,12 +328,14 @@ static uint32_t meta_code_for_type_name(const char *t) {
 /// @param b the blob
 /// @param[in,out] p at the value; past it after
 /// @param type its PULSAR_META_* code
-static void blob_value(st_blob *b, const char **p, uint32_t type);
+/// @param depth how deep in nested arrays this value sits (refused past JSON_MAX_NESTING)
+static void blob_value(st_blob *b, const char **p, uint32_t type, int depth);
 
 /// Encode one {"__array__", "n", "v"} metadata array (an empty one is refused).
 /// @param b the blob
 /// @param[in,out] p at the object; past it after
-static void blob_array(st_blob *b, const char **p) {
+/// @param depth how deep in nested arrays this value sits (refused past JSON_MAX_NESTING)
+static void blob_array(st_blob *b, const char **p, int depth) {
     /* {"__array__":"u32","n":N,"v":[...]}.
      * st_obj_key() always rescans from the object's '{', so every lookup starts
      * from `obj` -- not from wherever the previous value left off. */
@@ -340,7 +363,7 @@ static void blob_array(st_blob *b, const char **p) {
     if (*q == ']') st_die("safetensors: metadata array v is empty but n=%llu",
                           (unsigned long long)n);
     for (uint64_t i = 0; i < n; i++) {
-        blob_value(b, &q, etype);
+        blob_value(b, &q, etype, depth + 1);
         json_ws(&q);
         if (i + 1 < n) {
             if (*q != ',') st_die("safetensors: metadata array v is short");
@@ -353,7 +376,9 @@ static void blob_array(st_blob *b, const char **p) {
     *p = q;
 }
 
-static void blob_value(st_blob *b, const char **p, uint32_t type) {
+static void blob_value(st_blob *b, const char **p, uint32_t type, int depth) {
+    /* L354: pulsar.kv arrives as a JSON string, so the scanner's nesting limit never sees inside it */
+    if (depth > JSON_MAX_NESTING) st_die("safetensors: a metadata array is nested past %d levels -- refusing the container", JSON_MAX_NESTING);
     const char *q = *p;
     json_ws(&q);
     switch (type) {
@@ -372,7 +397,7 @@ static void blob_value(st_blob *b, const char **p, uint32_t type) {
         break;
     }
     case PULSAR_META_ARRAY:
-        blob_array(b, &q);
+        blob_array(b, &q, depth);
         break;
     case PULSAR_META_FLOAT32: {
         double v = 0.0;
@@ -562,7 +587,7 @@ static uint32_t st_layout_type(const char *layout, const char *dtype, const char
 /// @return bytes; refuses a bad shape or a type with no byte model
 static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
     uint64_t elements = 1;
-    for (uint32_t i = 0; i < nd; i++) elements *= dim[i];
+    for (uint32_t i = 0; i < nd; i++) elements = st_mul(elements, dim[i]);
     switch (type) {
     case PULSAR_TENSOR_F32:
     case PULSAR_TENSOR_I32:
@@ -581,10 +606,10 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
         if (cols % 32) st_die("safetensors: MXFP8 tensor has a non-multiple-of-32 input dim");
         uint64_t kb_pad = ((cols / 32) + 3) / 4 * 4;
         if (type == PULSAR_TENSOR_MXFP8_LT) {
-            uint64_t rows_pad = (rows + 127) / 128 * 128;
-            return rows * cols + rows_pad * kb_pad;
+            uint64_t rows_pad = st_mul((st_add(rows, 127)) / 128, 128);
+            return st_add(st_mul(rows, cols), st_mul(rows_pad, kb_pad));
         }
-        return rows * cols + rows * (cols / 32);
+        return st_add(st_mul(rows, cols), st_mul(rows, cols / 32));
     }
     case PULSAR_TENSOR_NVFP4: {
         /* L298: one [in, out] Linear (ne order), pulsar_nvfp4_layout the byte model */
@@ -604,7 +629,7 @@ static uint64_t st_bytes_for(uint32_t type, const uint64_t *dim, uint32_t nd) {
         uint64_t trellis = 0, scales = 0, stride = 0;
         if (k2 && nd == 2 && exl3_linear_layout(dim[0], dim[1], k2, &trellis, &scales, &stride)) return stride;
         if (k2 && nd == 3 && exl3_expert_layout(dim[0], dim[1], k2, &trellis, &scales, &stride))
-            return stride * dim[2];
+            return st_mul(stride, dim[2]);
         if (k2) st_die("safetensors: EXL3 dense tensor has a bad shape (%u dims, in %llu, out %llu)", nd,
                        (unsigned long long)(nd > 0 ? dim[0] : 0), (unsigned long long)(nd > 1 ? dim[1] : 0));
         st_die("safetensors: no byte model for tensor type %u", type);
@@ -662,7 +687,7 @@ static void dir_push(st_dir *d, const char *gguf_name, uint32_t type,
     t->rel_offset = 0;
     t->abs_offset = abs_offset;
     t->elements = 1;
-    for (uint32_t i = 0; i < nd; i++) t->elements *= dim[i];
+    for (uint32_t i = 0; i < nd; i++) t->elements = st_mul(t->elements, dim[i]);
     t->bytes = bytes;
     t->ext_map = base;
     t->ext_size = shard_size;
@@ -939,7 +964,7 @@ static void st_build_kv(pulsar_model *m, const st_shard *s) {
         kv->key.len = strlen(key);
         kv->type = type;
         kv->value_pos = b.len;
-        blob_value(&b, &q, type);
+        blob_value(&b, &q, type, 0);
 
         if (!json_skip_value(&p)) st_die("safetensors: pulsar.kv entry bad");
         json_ws(&p);
@@ -969,6 +994,14 @@ static bool st_is_shard(const char *n) {
     const size_t e = sizeof(kExt) - 1;
     const size_t l = strlen(n);
     return l >= e && strcmp(n + l - e, kExt) == 0;
+}
+
+/** qsort: tensors by name (length, then bytes).  @param a a pulsar_tensor *const *  @param b likewise
+ *  @return the order */
+static int st_cmp_tensor_name(const void *a, const void *b) {
+    const pulsar_tensor *x = *(pulsar_tensor *const *)a, *y = *(pulsar_tensor *const *)b;
+    if (x->name.len != y->name.len) return x->name.len < y->name.len ? -1 : 1;
+    return memcmp(x->name.ptr, y->name.ptr, x->name.len);
 }
 
 /// Open a shard directory or single file into m (refuses by longjmp).
@@ -1069,6 +1102,10 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     if (const char *arch = st_meta_get(primary, "pulsar.kv_arch")) {
         for (uint64_t i = 0; i < n; i++) {
             const char *k = st_meta_get(&shards[i], "pulsar.kv_arch");
+            /* L354: a shard of the build has to carry it; one added after the build (no pulsar.n_shards) carries neither */
+            if (!k && st_meta_get(&shards[i], "pulsar.n_shards"))
+                st_die("safetensors: %s has no pulsar.kv_arch, and a shard of this build must -- refusing the container",
+                       shards[i].name);
             if (k && strcmp(k, arch) != 0)
                 st_die("safetensors: %s's pulsar.kv_arch differs from the primary shard's (%s): a shard of another "
                        "build -- refusing the container", shards[i].name, primary->name);
@@ -1082,6 +1119,27 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
         st_add_expert_stacks(&d, &shards[i]);
     }
     if (d.n == 0) st_die("safetensors: %s declares no tensors", path);
+    /* L354: a name resolves to the first match (model_find_tensor), so a stale shard left in the directory by a rebuild
+     * would silently win.  The container says how many shards it has, and a name is declared once. */
+    if (const char *ns = st_meta_get(primary, "pulsar.n_shards")) {
+        /* only the build's shards carry the key: one added after the build (Qwen's model-qhead) is not in its count */
+        uint64_t built = 0;
+        for (uint64_t i = 0; i < n; i++) built += st_meta_get(&shards[i], "pulsar.n_shards") != NULL;
+        if (strtoull(ns, NULL, 10) != built)
+            st_die("safetensors: %s holds %llu shards of the build; it was built with %s -- refusing the container", path,
+                   (unsigned long long)built, ns);
+    }
+    {
+        pulsar_tensor **byname = (pulsar_tensor **)st_alloc((size_t)d.n * sizeof(*byname));
+        for (uint64_t i = 0; i < d.n; i++) byname[i] = &d.v[i];
+        qsort(byname, (size_t)d.n, sizeof(*byname), st_cmp_tensor_name);
+        for (uint64_t i = 1; i < d.n; i++) {
+            if (st_cmp_tensor_name(&byname[i - 1], &byname[i]) == 0)
+                st_die("safetensors: %s declares tensor %.*s twice -- refusing the container", path,
+                       (int)byname[i]->name.len, byname[i]->name.ptr);
+        }
+        free(byname);
+    }
     m->tensors = d.v;
     m->n_tensors = d.n;
     m->version = 0;

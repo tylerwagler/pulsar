@@ -17,7 +17,9 @@
 #include "pyjson.h"
 
 namespace {
+/// @cond
 #include "bpe_unicode_tables.inc"
+/// @endcond
 }
 
 /// A loaded byte-level BPE vocabulary (HF tokenizer.json or tiktoken ranks): the opaque handle of

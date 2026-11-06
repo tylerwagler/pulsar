@@ -724,10 +724,18 @@ static void decl_bank_save(pulsar_session *s, uint32_t bank) {
  *  @return false out of range */
 static bool decl_bank_restore(pulsar_session *s, uint32_t bank) {
     if (!s || !s->states || bank >= s->states->n_banks) return false;
+    const uint32_t held = s->states->live_bank;
     s->states->live_bank = bank;
     /* a bank nothing was saved for: the fresh view (its first sync resets the bank and prefills cold) */
-    if (!pulsar_bank_carry_restore_view(s, bank)) pulsar_bank_carry_fresh_view(s);
-    return true;
+    if (!pulsar_bank_carry_saved(s, bank)) {
+        pulsar_bank_carry_fresh_view(s);
+        return true;
+    }
+    /* L354: a saved one whose restore failed is a failure, not a fresh bank: the view stays as it was (all or nothing,
+     * L335), and so does the installed bank */
+    if (pulsar_bank_carry_restore_view(s, bank)) return true;
+    s->states->live_bank = held;
+    return false;
 }
 
 /** pulsar_family_bank_ops::kv_store.  @param s the session

@@ -186,6 +186,12 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
 
 
 
+void server_warn_if_exposed(const char *host) {
+    if (strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0 && strcmp(host, "::1") != 0)
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: bound to %s with no authentication: anyone who can reach it can use it",
+                   host);
+}
+
 /// @brief A strictly positive int option value; exits(2) with a log line on anything else.
 /// @param s the value text
 /// @param opt the option's name, for the message
@@ -646,7 +652,7 @@ static server_config parse_options(int argc, char **argv) {
             .model_path = "model",
             .backend = default_server_backend(),
         },
-        .host = "0.0.0.0",
+        .host = "127.0.0.1",   /* L354: no auth, so exposing it is a choice: --host */
         .port = 8000,
         /* v0.3.0 default: 1M context with overcommit ON (see
          * server_overcommit_enabled). Every session is grow-to-1M-capable, but
@@ -659,6 +665,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 1048576,
         .default_tokens = 393216,
     };
+    c.kv_disk_space_mb = 131072;   /* L354: a default that bounds it; an explicit 0 is unbounded */
     c.judge_banks = -1;   /* L338 P2.4: one reserved bank when the container carries an adapter */
     c.reasoning_default = -1;   /* L338 P4: the family's default unless --reasoning */
     c.kv_cache = kv_cache_default_options();
@@ -747,7 +754,7 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_dir = NULL;
             c.kv_disk_disable = true;
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
-            c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.kv_disk_space_mb = (uint64_t)parse_index_arg(need_arg(&i, argc, argv, arg), arg);   /* 0 is unbounded */
         } else if (!strcmp(arg, "--kv-ram-mb")) {
             c.kv_ram_mb = parse_int_arg(need_arg(&i, argc, argv, arg), arg);   /* >= 1, else the start is refused */
         } else if (!strcmp(arg, "--kv-pinned-max-mb")) {   /* L347 I3b: the pinned anchors' budget */
@@ -1662,6 +1669,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
+    server_warn_if_exposed(cfg.host);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)",
                cfg.host, cfg.port, PULSAR_VERSION_STR);
 

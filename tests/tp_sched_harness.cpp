@@ -5,7 +5,7 @@
  * See pulsar_tp_sched.h for the contract and the exchange-counter `e` rule.
  */
 
-#include "tp/pulsar_tp_sched.h"
+#include "tp_sched_harness.h"
 
 #include <stdarg.h>
 #include <stdio.h>

@@ -66,7 +66,7 @@
 /// Magic of a .seg file's header: "PSG1".
 #define PULSAR_SEGSTORE_MAGIC   0x31475350u   /* "PSG1" */
 /// Store format version; v3 (L347): rows-only payloads, the state in the key's .rp.  Older versions are removed at open.
-#define PULSAR_SEGSTORE_VERSION 4u            /* v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store */
+#define PULSAR_SEGSTORE_VERSION 5u            /* v5 (L353): a key covers the span's image content hashes; v2 (L323): the header carries the payload's state bytes; v3 (L347): no state part (the word is 0), the state at G is the key's .rp; v4 (L347 I3a): the payloads' digest is pulsar_kvdigest v2, sealed and checked by the store */
 /// Magic of a .rp file's header: "PRP1" (L347).
 #define PULSAR_SEGSTORE_RP_MAGIC   0x31505250u   /* "PRP1" */
 /// Restore point file format version; v2 (L347 I2): the header's word at 12 is the restore point's flags; v3 (L347
@@ -197,6 +197,33 @@ void pulsar_segstore_set_ram(pulsar_segstore *st, pulsar_kvpool *pool, bool reta
 /** The key rule, the one authority for it. */
 void pulsar_segstore_child_key(const char *parent, const char *text, size_t len, char out[41]);
 
+/** L353: a segment's key: its parent, its text, and the content hashes of the image blocks in its span.  An image block
+ *  renders as a fixed placeholder, so without the hashes two same-size images share every key: "the same key is the
+ *  same state" needs them.  With n == 0 it is pulsar_segstore_child_key.
+ *  @param parent parent key, or "" for a root
+ *  @param text   the span's text
+ *  @param len    bytes of `text`
+ *  @param hashes [n] the span's image content hashes, in position order
+ *  @param n      hashes
+ *  @param out    receives the 40 hex digits and a NUL */
+void pulsar_segstore_child_key_images(const char *parent, const char *text, size_t len, const uint64_t *hashes,
+                                      uint32_t n, char out[41]);
+
+/** L353: pulsar_segstore_lookup for a request carrying images: each child's key is reproduced from the request's bytes
+ *  and its next unconsumed image hashes, so a chain passes a block only for that block's image, and stops at it for any
+ *  other (or for a request with none).  One rule for the persist's parent, a restore and a text request.
+ *  @param st     the store
+ *  @param text   the request's text
+ *  @param len    bytes of `text`
+ *  @param want   which ends are accepted, or NULL for any
+ *  @param hashes [n] the request's image content hashes, in position order; NULL with n == 0 for none
+ *  @param n      hashes
+ *  @param chain  receives the deepest accepted chain, root first
+ *  @param cap    entries `chain` holds
+ *  @return segments in `chain`, 0 when none */
+int pulsar_segstore_lookup_images(pulsar_segstore *st, const char *text, size_t len, const pulsar_segstore_end *want,
+                                  const uint64_t *hashes, uint32_t n, pulsar_segstore_seg *chain, int cap);
+
 /// @param st    the store
 /// @param text  the request's rendered text
 /// @param len   bytes of `text`
@@ -255,6 +282,27 @@ bool pulsar_segstore_put(pulsar_segstore *st, const char *parent, uint32_t G_pre
  *  skips it, a child may name it as parent) and its parent is never evicted; lookups do not see it until the commit.
  *  pulsar_segstore_put is the three in a row, its parts written through memory streams. */
 typedef struct pulsar_segstore_job pulsar_segstore_job;
+/** L353: pulsar_segstore_reserve for a span holding image blocks: the key covers their content hashes.
+ *  @param hashes [n_hashes] the span's image content hashes, in position order; the rest as pulsar_segstore_reserve
+ *  @param n_hashes hashes
+ *  @return as pulsar_segstore_reserve */
+/// @param st            the store
+/// @param parent        parent key, or "" for a root
+/// @param G_prev        the span's start
+/// @param G             the span's end
+/// @param text          the span's text
+/// @param text_len      bytes of `text`
+/// @param payload_bytes the rows' bytes
+/// @param trailer_bytes the trailer's bytes
+/// @param key_out       receives the key
+/// @param job_out       receives the job
+/// @param err           receives a reason on failure
+/// @param errlen        size of `err`
+int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint32_t G_prev, uint32_t G, const char *text,
+                                   size_t text_len, const uint64_t *hashes, uint32_t n_hashes, uint64_t payload_bytes,
+                                   uint64_t trailer_bytes, char key_out[41], pulsar_segstore_job **job_out, char *err,
+                                   size_t errlen);
+
 /// @param st            the store
 /// @param parent        the parent's key, "" for a root (stored, or pending)
 /// @param G_prev        the segment's first token position (the parent's G)
@@ -476,7 +524,9 @@ uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const 
  *  @return false to stop the walk */
 typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, size_t text_len,
                                            void *ud);
-/** Run `fn` over every segment that carries a trailer, in index order.
+/** Run `fn` over every segment that carries a trailer, in index order.  L353: the one call safe off the store's thread
+ *  (a chat parse's): it copies the entries under a lock and reads the files without it, so one evicted meanwhile is
+ *  skipped.
  *  @param st the store, or NULL (no-op)
  *  @param fn the visitor
  *  @param ud context for `fn` */
@@ -529,6 +579,16 @@ uint64_t pulsar_segstore_budget_bytes(const pulsar_segstore *st);
  *  @param rps receives the restore points removed, or NULL
  *  @return the segments removed */
 uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps);
+/** L353 no. 16: whether a part read from disk stays as its RAM copy (pulsar_segstore_set_ram's retain): a second read
+ *  of it then costs nothing.  @param st the store, or NULL  @return true when it does */
+bool pulsar_segstore_retains(const pulsar_segstore *st);
+/** L353: files copied out whose write failed, ever.  @param st the store, or NULL  @return the count (0 for NULL) */
+uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st);
+/** L353: reads the disk's free bytes.  @param ud context  @return the bytes */
+typedef uint64_t (*pulsar_segstore_disk_free_fn)(void *ud);
+/** L353: read the disk's free bytes through `fn` in place of statvfs (a test's small disk).
+ *  @param st the store, or NULL (no-op)  @param fn the reader (NULL = statvfs)  @param ud context for `fn` */
+void pulsar_segstore_set_disk_free(pulsar_segstore *st, pulsar_segstore_disk_free_fn fn, void *ud);
 /** The number of segments the store holds.
  *  @param st the store, or NULL (0)
  *  @return the segment count */

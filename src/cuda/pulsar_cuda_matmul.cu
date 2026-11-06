@@ -2348,9 +2348,8 @@ static int cuda_attention_output_a_mx_gemm(
      * cuBLASLt, so check it rather than trust the key. */
     mxfp8_gact_cache_t *gc = gact_find_rows(heads->ptr, row0 + n_tokens, n_groups, group_dim);
     if (!gc || !gc->valid || gc->kbp != KBp) {
-        static int said_ga = 0;
-        if (!said_ga) {
-            said_ga = 1;
+        static pulsar_shape_once seen_ga = {};
+        if (pulsar_shape_once_first(&seen_ga, pulsar_shape_key(group_dim, n_groups), "grouped E4M3 encoding")) {
             fprintf(stderr, "pulsar: NO grouped E4M3 ENCODING for attn-out 'a' (tensor-core arm, "
                             "n_tokens=%u row0=%u) -- the attention producer did not emit it; the "
                             "f32 quantise fallback was deleted (L158).  Refusing.\n", n_tokens, row0);
@@ -3854,9 +3853,8 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
     uint64_t row0 = 0;
     const mxfp8_act_cache_t *hw = act_slot_find_window(x->ptr, n_tok, in_dim, &row0);
     if (!hw || !hw->valid_b || !hw->xb) {
-        static int said = 0;
-        if (!said) {
-            said = 1;
+        static pulsar_shape_once seen_b = {};
+        if (pulsar_shape_once_first(&seen_b, pulsar_shape_key(in_dim, n_tok), "bf16 activation encoding")) {
             fprintf(stderr, "pulsar: NO bf16 ENCODING for the activation of a bf16-weight GEMM "
                             "(n_tok=%llu in_dim=%llu) -- no producer emitted it; the f32->bf16 "
                             "convert was deleted (L159).  Refusing.\n",
@@ -3985,8 +3983,6 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
     if (!cuda_ok(cudaGetLastError(), "f32->bf16 weight convert launch")) { (void)cudaFree(dst); return NULL; }
     const auto ins = g_f32w_bf16.emplace(key, dst);
     fc->node.store(&*ins.first, std::memory_order_release);
-    static uint64_t total = 0;
-    total += n * 2;
     static int announced = 0;
     if (!announced) {
         announced = 1;

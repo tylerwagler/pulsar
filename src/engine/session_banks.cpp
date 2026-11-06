@@ -151,18 +151,32 @@ static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
      * stitched, ran nothing, and the decode refused "frontier not position-true ...
      * n_comp 0 want 658").  Either way, per-bank frontier truth is now installed, so
      * the multiseq superset poison no longer applies to this bank. */
-    if (!pulsar_bank_carry_restore_view(s, bank) && bank != held) pulsar_bank_carry_fresh_view(s);
+    if (pulsar_bank_carry_saved(s, bank)) {
+        /* L354: a saved one whose restore failed is a failure, not a fresh bank: back to the bank the view is synced on */
+        if (!pulsar_bank_carry_restore_view(s, bank)) {
+            if (s->graph->banks.n_banks != 0 && gpu_graph_bank_repoint(s->graph, held))
+                gpu_graph_bank_counters_install(s->graph, held);
+            return false;
+        }
+    } else if (bank != held) {
+        pulsar_bank_carry_fresh_view(s);
+    }
     s->mseq_dirty = false;
     return true;
 }
 
 void pulsar_bank_carry_fresh_view(pulsar_session *s) {
+    s->dev.live_valid = false;   /* L354: the live row is the previous bank's */
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->logits_stale = true;
     s->prefill_frontier = 0;
     s->live_images.n = 0;
     spec_lookahead_reset(s);   /* no shadow was saved: the fresh bank has no pendings, carry or quench */
+}
+
+bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank) {
+    return s && s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid;
 }
 
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {

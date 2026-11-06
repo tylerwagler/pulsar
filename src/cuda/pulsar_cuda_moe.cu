@@ -630,8 +630,8 @@ static int routed_moe_launch_cutlass_dispatch(
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
     if (!rc) {
-        static int said = 0;
-        if (!said) { said = 1; fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
+        static pulsar_shape_once seen = {};
+        if (pulsar_shape_once_first(&seen, pulsar_shape_key(n_tokens, n_expert), "MoE grouped GEMM")) { fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
                                        n_tokens, n_total_expert, n_expert); }
     }
     return rc;
@@ -1530,7 +1530,7 @@ static int routed_moe_launch_exl3(
      * emitted into the mid tensor's E4M3 slot (the producer rule for the down); gate z in the up buffer and up z
      * in the mid buffer, pairs x mid f32 each */
     const exl3_moe_stacks st{NULL, gt, ut, dt, k2g, k2d, (int)n_total_expert, (int)expert_in_dim,
-                             (int)expert_mid_dim, (int)out_dim};
+                             (int)expert_mid_dim, (int)out_dim, {}};
     const exl3_moe_bufs bufs{(float *)up->ptr, (float *)mid->ptr, (float *)down->ptr,
                              exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, mid_q, mid_sf, mid_kbp}};
     if (exl3_moe_routed_launch(st, selected_ptr, (const float *)weights->ptr, (int)n_tokens, (int)n_expert, clamp,
@@ -1600,6 +1600,8 @@ static int routed_moe_launch(
         const pulsar_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens) {
+    (void)gate_row_bytes;   /* an EXL3 stack is stored per its own layout, not by these */
+    (void)down_row_bytes;
     if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||

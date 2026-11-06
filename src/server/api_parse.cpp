@@ -97,6 +97,18 @@ int parse_sampling_key(const char *key, const char **p, request *r) {
  * the loaded family's half -- thinking, the prompt, its tokens (L267). */
 
 /* One thinking / effort control, kept as sent for the family (chat_control). */
+/// L354: a request's explicit cap is at least one token: 0 (and a negative, which json_int folds to 0) used to answer 200 with
+/// nothing and finish_reason "length".
+/// @param max_tokens the parsed value
+/// @param err        receives the refusal
+/// @param errlen     bytes at err
+/// @return true when it is a usable cap
+static bool max_tokens_ok(int max_tokens, char *err, size_t errlen) {
+    if (max_tokens > 0) return true;
+    snprintf(err, errlen, "max_tokens must be at least 1");
+    return false;
+}
+
 /// Keep one thinking / effort control as sent, for the family.
 /// @param p    the parse cursor, at the control's value (advanced past it)
 /// @param c    the conversation the control is kept on
@@ -280,7 +292,7 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
             ok = json_string(&p, &r->model);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            ok = json_int(&p, &r->max_tokens);
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
         } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
             ok = skr > 0;
         } else if (!strcmp(key, "logprobs")) {
@@ -322,6 +334,9 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
         json_ws(&p);
     }
     if (*p != '}') return false;
+    p++;
+    json_ws(&p);
+    if (*p) return false;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
         return false;
@@ -492,7 +507,7 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
             ok = json_string(&p, &r->model);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            ok = json_int(&p, &r->max_tokens);
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
         } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
             ok = skr > 0;
         } else if (!strcmp(key, "stream")) {
@@ -515,6 +530,9 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
         goto bad;
@@ -1537,7 +1555,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
             ok = json_string(&p, &r->model);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            ok = json_int(&p, &r->max_tokens);
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
         } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
             ok = skr > 0;
         } else if (!strcmp(key, "stream")) {
@@ -1570,6 +1588,9 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_input) {
         snprintf(err, errlen, "missing input");
         goto bad;
@@ -1721,7 +1742,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_int(&p, &r->max_tokens) || !max_tokens_ok(r->max_tokens, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -1772,9 +1793,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                          "%s is not supported on /v1/completions; use "
                          "/v1/chat/completions with logprobs:true", key);
                 free(key);
-                free(prompt);
-                request_free(r);
-                return false;
+                goto bad;   /* the controls read so far go with it */
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -1786,10 +1805,12 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
-        request_free(r);
-        return false;
+        goto bad;
     }
     /* L284 P2: a completion is a RAW continuation on every family (OpenAI's and vLLM's /v1/completions): no
      * chat template, no thinking block, and nothing before the prompt (neither family's HF tokenizer adds a

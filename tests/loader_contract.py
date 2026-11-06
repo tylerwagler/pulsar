@@ -87,7 +87,8 @@ FAMILIES = {
         'stack': 'model.language_model.layers.1.experts.gate_proj',
     },
 }
-MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format')
+MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count', 'deep-array',
+             'dim-overflow', 'no-kv-arch')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
                  'does not')
 SMALL_SIDE_FILE = 64 << 20      # side files up to this size are copied; larger ones are cloned sparse
@@ -219,6 +220,43 @@ def mutate(shards, family, row, what):
         edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {k: (dict(v, layout='f32') if k == cname else v)
                                                               for k, v in t.items()})
         return f'{stack} layout f32', [stack, cname]
+    if what == 'dup-name':   # L354: a name resolves to its first match, so a second declaration of one is refused
+        name = row['plain']
+        i, cname = find_tensor(shards, name)
+        if i is None:
+            sys.exit(f'loader_contract: {family} has no tensor {name}')
+        shards[i]['header'][cname + '.dup'] = shards[i]['header'][cname]
+        edit_meta_json(shards[i], 'pulsar.tensors', lambda t: {**t, cname + '.dup': t[cname]})
+        return f'{name} declared twice', [name]
+    if what == 'deep-array':   # L354: pulsar.kv is a JSON string, so only the loader's own limit sees inside it
+        depth = 200000
+        deep = ('{"__array__":"array","n":1,"v":[' * depth) + '1' + (']}' * depth)
+        for s in shards:
+            meta = s['header'].get('__metadata__', {})
+            if 'pulsar.kv' in meta:
+                text = meta['pulsar.kv'].rstrip()
+                meta['pulsar.kv'] = text[:-1] + ',{"key":"probe.deep","type":"array","value":' + deep + '}]'
+                return f'a metadata array nested {depth} deep', ['nested past']
+        sys.exit(f'loader_contract: {family} has no pulsar.kv')
+    if what == 'dim-overflow':   # L354: a declared size that wraps to 0 is refused, not read as a tensor of 0 bytes
+        s = shards[0]
+        s['header']['probe.overflow'] = {'dtype': 'U8', 'shape': [0], 'data_offsets': [0, 0]}
+        edit_meta_json(s, 'pulsar.tensors', lambda t: {**t, 'probe.overflow': {
+            'gguf_name': 'probe.overflow', 'layout': 'mxfp8_lt', 'dims_ne': [2**53, 2**53]}})
+        return 'a tensor declared [2^53, 2^53]', ['overflow']
+    if what == 'no-kv-arch':   # L354: every shard of the build carries the architecture keys
+        for s in shards:
+            meta = s['header'].get('__metadata__', {})
+            if 'pulsar.kv_arch' in meta and 'pulsar.kv' not in meta:
+                del meta['pulsar.kv_arch']
+                return f"{s['name']} without pulsar.kv_arch", ['pulsar.kv_arch']
+        sys.exit(f'loader_contract: {family} has no second shard')
+    if what == 'shard-count':   # L354: a stale shard left by a rebuild, or a missing one, disagrees with the build's count
+        built = [s for s in shards if 'pulsar.n_shards' in s['header'].get('__metadata__', {})]
+        n = len(built)
+        for s in built:
+            s['header']['__metadata__']['pulsar.n_shards'] = str(n + 1)
+        return f'pulsar.n_shards says {n + 1}, the build holds {n}', ['shards']
     sys.exit(f'loader_contract: unknown mutation {what}')
 
 

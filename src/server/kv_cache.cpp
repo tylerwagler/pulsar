@@ -449,6 +449,16 @@ int kv_cache_commit_written(kv_disk_cache *kc) {
     return n;
 }
 
+int kv_cache_wait_written(kv_disk_cache *kc) {
+    if (!kc || !kc->writer) return 0;
+    kv_writer *w = kc->writer;
+    {
+        pulsar::ScopedLock lk(&w->mu);
+        while (!w->queue.empty() || w->busy) pthread_cond_wait(&w->cv, &w->mu);
+    }
+    return kv_cache_commit_written(kc);
+}
+
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted) {
     *staged = 0;
     *uncommitted = 0;
@@ -700,6 +710,16 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
+int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
+    if (!prompt || !m || m->n_user <= 0) return -1;
+    for (int i = 0; i < prompt->len; i++) {
+        const int role = pulsar_turn_marker_at(m, prompt->v, prompt->len, i);
+        if (role == 2) return -1;   /* an assistant turn before any user turn: no preamble this rule can name */
+        if (role == 1) return i >= kc->opt.min_tokens ? i : -1;
+    }
+    return -1;
+}
+
 int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid) {
     if (grid <= 0 || anchor < kc->opt.min_tokens) return 0;
     const int cut = anchor - anchor % grid;
@@ -762,6 +782,7 @@ void server::kv_cache_publish_store() {
     const int segments = pulsar_segstore_count(kv.st);
     const uint64_t ram = pulsar_segstore_ram_bytes(kv.st), ram_pool = kv.ram ? pulsar_kvpool_size(kv.ram) : 0;
     const uint64_t segs_removed = pulsar_segstore_removed(kv.st, &rps_removed);
+    const uint64_t writes_failed = pulsar_segstore_writes_failed(kv.st);
     struct statvfs fs;   /* L276: the store's budget is not the disk's -- a full filesystem refuses stores */
     const bool fs_ok = kv.dir && statvfs(kv.dir, &fs) == 0;
     pthread_mutex_lock(&mu);
@@ -778,6 +799,7 @@ void server::kv_cache_publish_store() {
     m_kv_disk_fs_size = fs_ok ? (uint64_t)fs.f_blocks * (uint64_t)fs.f_frsize : 0;
     m_kv_disk_segs_removed = segs_removed;
     m_kv_disk_rps_removed = rps_removed;
+    m_kv_disk_writes_failed = writes_failed;
     pthread_mutex_unlock(&mu);
 }
 
@@ -826,7 +848,11 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     size_t len = 0;
     char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
     kv_chain_hit hit;
-    const int D = text ? kv_cache_find(text, NULL, 0, &hit) : 0;
+    /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
+     * overstated the gain and logged a warning a persist */
+    uint64_t hashes[64];
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes, 64);
+    const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
     uint64_t rp = pulsar_session_restore_point_bytes(s->sess, TokPos{E});
@@ -881,8 +907,11 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
      * device reads stream through the session's pinned buffer, which allocates nothing) -- over the floor.  Else
      * it is SKIPPED, counted and said: the history stays live in its bank, only its disk copy is not written now
      * (a later persist of the same bank writes every segment the store lacks).  A documented outcome, not a
-     * fallback: no other write path runs. */
-    {
+     * fallback: no other write path runs.
+     * L353: never a spill's: a spill is what the guard runs to get back over the floor, so refusing it under the floor
+     * kept GiBs resident and answered 503.  It frees far more than its text renders take, and the floor (its
+     * reserve) holds room for a persist. */
+    if (why != KV_PERSIST_SPILL) {
         const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
         const uint64_t need = server_persist_host_bytes(toks ? toks->len : 0);
         const uint64_t avail = server_mem_available_bytes();
@@ -897,7 +926,7 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                            reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor().raw() / gib,
                            avail ? "" : " (MemAvailable unreadable)", skipped);
             }
-            if (no_room) *no_room = true;   /* nothing was stored: a spill must not free the bank (L347) */
+            if (no_room) *no_room = true;   /* L353 no. 14: nothing was stored, and a caller may say so */
             return 0;
         }
     }
@@ -981,10 +1010,19 @@ void kv_read_cost_observe(kv_read_cost *c, uint64_t bytes, uint64_t cached, doub
     const double u = (c->scy * d - b * c->swy) / det, w = (a * c->swy - b * c->scy) / det;
     c->cold_ms_per_gib = u > 0.0 ? u : 0.0;
     c->cached_ms_per_gib = w > 0.0 ? w : 0.0;
-    const bool first = c->loads == 1u;
-    if (first || c->cold_ms_per_gib < c->best_cold_ms_per_gib) c->best_cold_ms_per_gib = c->cold_ms_per_gib;
-    if (first || c->cached_ms_per_gib < c->best_cached_ms_per_gib) c->best_cached_ms_per_gib = c->cached_ms_per_gib;
+    /* L353 no. 17: a best only from a load that measured it: a load all from RAM says nothing of the disk, and its fit
+     * (u = w) seeded a best cold rate about 6x low that only ever fell */
+    if (bytes > cached && (!c->cold_seen || c->cold_ms_per_gib < c->best_cold_ms_per_gib)) {
+        c->best_cold_ms_per_gib = c->cold_ms_per_gib;
+        c->cold_seen = true;
+    }
+    if (cached > 0u && (!c->cached_seen || c->cached_ms_per_gib < c->best_cached_ms_per_gib)) {
+        c->best_cached_ms_per_gib = c->cached_ms_per_gib;
+        c->cached_seen = true;
+    }
 }
+
+uint64_t kv_restore_reads(bool verify, bool retained) { return verify && !retained ? 2u : 1u; }
 
 void kv_read_cost_touch(kv_read_cost *c, double now_sec) {
     if (now_sec > c->last_sec) c->last_sec = now_sec;
@@ -997,8 +1035,10 @@ bool kv_read_cost_ms(const kv_read_cost *c, uint64_t bytes, uint64_t cached, dou
     /* L342: each cost's gap above its best halves every KV_READ_RELAX_SEC without a load */
     const double idle = now_sec - c->last_sec;
     const double keep = idle > 0.0 ? exp2(-idle / KV_READ_RELAX_SEC) : 1.0;
-    const double u = c->best_cold_ms_per_gib + (c->cold_ms_per_gib - c->best_cold_ms_per_gib) * keep;
-    const double w = c->best_cached_ms_per_gib + (c->cached_ms_per_gib - c->best_cached_ms_per_gib) * keep;
+    const double best_u = c->cold_seen ? c->best_cold_ms_per_gib : c->cold_ms_per_gib;
+    const double best_w = c->cached_seen ? c->best_cached_ms_per_gib : c->cached_ms_per_gib;
+    const double u = best_u + (c->cold_ms_per_gib - best_u) * keep;
+    const double w = best_w + (c->cached_ms_per_gib - best_w) * keep;
     *ms = (double)(bytes - cached) / KV_GIB * u + (double)cached / KV_GIB * w;
     return true;
 }
@@ -1061,7 +1101,14 @@ int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     uint64_t hashes[HASHES_MAX];
     const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
-    return kv_cache_find(req->prompt_text, hashes, n_images, hit);
+    const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
+    /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
+     * of the last row).  The next stored point below it can: look again without the last segment's last byte. */
+    if (G < req->prompt.len || G <= 0) return G;
+    const uint64_t cut = hit->chain[hit->n - 1].text_end;
+    if (cut == 0u) return 0;
+    std::string shorter(req->prompt_text, (size_t)cut - 1u);
+    return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
 
 kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {
@@ -1191,9 +1238,16 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     char err[384];
     const bool checking = r->verify && r->verified < r->hit->n;
     if (!checking) r->touched = true;   /* the load writes the bank from its first segment on */
-    const int rc = checking
-        ? pulsar_kvchain_verify_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->verified, k, err, sizeof err)
-        : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    const auto slice = [&]() {
+        return checking
+            ? pulsar_kvchain_verify_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->verified, k, err, sizeof err)
+            : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
+    };
+    /* L353 no. 12: images come back to the pool at their commits.  A transient failure with writes in flight waits for
+     * them and tries once more: milliseconds, against a re-prefill from 0 */
+    (void)kv_cache_commit_written(&s->kv);
+    int rc = slice();
+    if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();
     const double ms = (server_now_sec() - t0) * 1000.0;
     r->read_ms += ms;
     r->slices++;
@@ -1249,7 +1303,9 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
     if (G == 0) return 0;
     const size_t text_bytes = strlen(text);
     pthread_mutex_lock(&s->mu);
-    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes, r->hit->cached, r->read_ms, server_now_sec());
+    /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
+    const uint64_t reads = kv_restore_reads(r->verify, pulsar_segstore_retains(s->kv.st));
+    kv_read_cost_observe(&s->kv.meter.read, r->hit->bytes * reads, r->hit->cached * reads, r->read_ms, server_now_sec());
     s->kv.meter.restored_tokens += G > r->base ? (uint64_t)(G - r->base) : 0u;
     pthread_mutex_unlock(&s->mu);
     const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);

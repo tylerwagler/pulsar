@@ -720,7 +720,42 @@ static void test_worker_progress_uses_session_total(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* L354 (F5): the file tools' boundary, and what reaches the terminal. */
+static void test_agent_workspace_and_terminal(void) {
+    char tmpl[] = "/tmp/pulsar-agent-ws.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char old[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(old, sizeof old) != NULL);
+    AGENT_TEST_ASSERT(chdir(dir) == 0);
+    AGENT_TEST_ASSERT(mkdir("sub", 0700) == 0);
+    AGENT_TEST_ASSERT(symlink("/etc", "out") == 0);
+    agent_workspace_init(false);
+    const auto refused = [](const char *p) { char *e = agent_workspace_refusal(p); const bool r = e != NULL; free(e); return r; };
+    AGENT_TEST_ASSERT(!refused("."));
+    AGENT_TEST_ASSERT(!refused("sub"));
+    AGENT_TEST_ASSERT(!refused("new.txt"));
+    AGENT_TEST_ASSERT(!refused("sub/deep/new.txt"));
+    AGENT_TEST_ASSERT(refused("/etc/passwd"));
+    AGENT_TEST_ASSERT(refused(".."));
+    AGENT_TEST_ASSERT(refused("sub/../../x"));
+    AGENT_TEST_ASSERT(refused("missing/../../x"));
+    AGENT_TEST_ASSERT(refused("out/passwd"));
+    AGENT_TEST_ASSERT(refused("out/new.txt"));
+    agent_workspace_init(true);
+    AGENT_TEST_ASSERT(!refused("/etc/passwd"));
+    AGENT_TEST_ASSERT(chdir(old) == 0);
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+    char t[] = "a\x1b[2Jb\n\tc\r\x07\x7f\xc2\x9b" "1m\xc3\xa9";
+    agent_terminal_sanitize(t, strlen(t));
+    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc\r????" "1m\xc3\xa9"));
+}
+
 static void pulsar_agent_unit_tests_run(void) {
+    test_agent_workspace_and_terminal();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -815,6 +850,7 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     const char *old = agent_tool_arg_value(call, "old");
     const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
@@ -1009,6 +1045,7 @@ char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,

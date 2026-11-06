@@ -13,6 +13,7 @@ session core (`src/engine/family.h`; the registry is `k_families` in
 | `nemotron_h` | Nemotron-3.5 Super | `src/families/nemotron_h/` |
 | `nemotron_enc` | Nemotron-3.5 Embed-8B / Rerank-8B (encoders) | `src/families/nemotron_enc/` |
 | `nemotron_parse` | Nemotron-3.5 Parse (page parser) | `src/families/nemotron_parse/` |
+| `gemma4` | Gemma 4 | `src/families/gemma4/` |
 
 What each family implements is its `PULSAR_FAMILY_CAP_*` mask (banks, spec,
 payload, rewind, vision, TP, imatrix, chat, segments, mixed prefill, encode,
@@ -64,7 +65,7 @@ GPU path calls — it is not dead CPU-backend code.
 
 Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph API).
 
-- `src/engine/` — 58 TUs + `pulsar_engine_internal.h`: the model layer and the
+- `src/engine/` — 59 TUs + `pulsar_engine_internal.h`: the model layer and the
   safetensors container reader (`model.cpp`, `safetensors.cpp`, `cursor.cpp`),
   the family registry and the DeepSeek / Qwen families (`family*.cpp`),
   tokenizers, weight binders (`weights.cpp`, `role_bind.cpp`), quant

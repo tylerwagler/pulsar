@@ -488,7 +488,7 @@ int pulsar_tp_attach_slab(pulsar_tp *tp, void *base, char *err, size_t errlen);
 /// @param tp    the transport
 /// @param layer layer index
 /// @param gate  PULSAR_TP_GATE_ATTN or PULSAR_TP_GATE_FFN
-/// @param seq   the exchange counter `e` (pulsar_tp_sched.h)
+/// @param seq   the exchange counter
 /// @return 1 on success, 0 on failure
 int pulsar_tp_gate_exchange(pulsar_tp *tp, uint32_t layer, uint32_t gate,
                             uint64_t seq);

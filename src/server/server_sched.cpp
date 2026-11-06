@@ -782,6 +782,9 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
             if (!sl->gen || (sl->gen->phase != GEN_DECODE_INIT && sl->gen->phase != GEN_DECODE)) continue;
+            /* L353: a parked decoder steps nothing, so it never abandons: waiting on it would wait for ever (and a
+             * head refused for KV holds its readmission back).  It ends once it is back. */
+            if (sl->preempted) continue;
             const bool writer_failed = sl->gen->writer.failed;
             if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
             const int common = s->slot_common_prefix(sl, &j->req.prompt);
@@ -1184,8 +1187,9 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
-        s->kv_cache_persist(sl, KV_PERSIST_EVICT);
-        stored = true;
+        bool no_room = false;
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT, nullptr, &no_room);
+        stored = !no_room;   /* L353 no. 14: skipped or short, the history is not on disk, and the log says so */
     }
     if (!stored && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -2832,6 +2836,7 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
     pulsar_session *pool = s->sess;
     int best = -1;
     bool best_dom = false;
+    bool best_bound = false;
     uint64_t best_us = UINT64_MAX;
     KvBytes best_touched = KvBytes::max();
     for (int i = 0; i < s->n_slots; i++) {
@@ -2842,10 +2847,18 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
         if (live) continue;
         const KvBytes t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
         const bool dom = dominated && dominated[i];
-        if (best < 0 || (dom && !best_dom) ||
-            (dom == best_dom && (sl->last_serviced_us < best_us ||
-                                 (sl->last_serviced_us == best_us && t < best_touched)))) {
-            best = i; best_dom = dom; best_us = sl->last_serviced_us; best_touched = t;
+        /* L353 no. 10: a bank whose client is running a tool last: its turn continues the decoded frontier, which a chain
+         * can't reproduce, so spilling it turns that turn into a 409 */
+        bool bound;
+        {
+            pulsar::ScopedLock lk(&s->tool_mu);
+            bound = sl->responses_live.valid || sl->anthropic_live.valid;
+        }
+        if (best < 0 || (!bound && best_bound) ||
+            (bound == best_bound &&
+             ((dom && !best_dom) || (dom == best_dom && (sl->last_serviced_us < best_us ||
+                                                         (sl->last_serviced_us == best_us && t < best_touched)))))) {
+            best = i; best_dom = dom; best_bound = bound; best_us = sl->last_serviced_us; best_touched = t;
         }
     }
     return best;
@@ -2893,6 +2906,8 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
      * as it was, so they hold across it */
     bool dominated[PULSAR_SESSION_POOL_CAP];
     s->dominated_slots(dominated);
+    /* L353 no. 19: a dead prefix (its session compacted) goes before a live conversation, as worker_evict_one's does */
+    for (int i = 0; i < s->n_slots; i++) dominated[i] = dominated[i] || s->slots[i].hint_dead;
     int m = 0;
     while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
         const int vi = s->guard_pick_victim(excl, n + m, dominated);
@@ -2937,6 +2952,15 @@ static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta
     return busy_may_free ? PROMPT_KV_WAIT : PROMPT_KV_REFUSE;
 }
 
+/* L353: whether a bound job's end makes room for a prompt.  A parked (preempted) decoder's physical is already freed,
+ * so its end frees nothing; counted as busy it kept a prompt that can never fit waiting on it, while that prompt's
+ * refusal kept it parked (the worker's readmission waits for the head) -- each on the other, and the queue behind them. */
+/// @param c the slot
+/// @return true when its job's end leaves a bank the guard can take
+static bool server_slot_end_frees_kv(const session_slot *c) {
+    return c->provisioned && !c->spilled && c->active_job && !c->preempted;
+}
+
 prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill,
                                           KvBytes *need) {
     auto *s = this;
@@ -2956,8 +2980,7 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
     /* a bank bound to a job now is a victim once that job ends */
     bool busy = false;
-    for (int i = 0; i < s->n_slots && !busy; i++)
-        busy = &s->slots[i] != sl && s->slots[i].provisioned && !s->slots[i].spilled && s->slots[i].active_job;
+    for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
     return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_budget(), drop, n_victims, busy,
                                     n_spill);

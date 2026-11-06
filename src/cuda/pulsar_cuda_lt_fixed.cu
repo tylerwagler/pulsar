@@ -74,13 +74,13 @@ struct lt_call {
      *  D's layout (f32 n x M, ld ldd); owned */
 };
 /// Shape cache, 32 slots, replaced round-robin (evicting a shape also drops its calls).
-lt_shape g_shapes[32];
+thread_local lt_shape g_shapes[32];
 /// Next g_shapes slot to fill.
-int g_shapes_next;
+thread_local int g_shapes_next;
 /// Call cache, 128 slots, replaced round-robin.
-lt_call g_calls[128];
+thread_local lt_call g_calls[128];
 /// Next g_calls slot to fill.
-int g_calls_next;
+thread_local int g_calls_next;
 
 /// The row class's canonical row count, the one its algorithm is chosen at.
 /// @param cls pulsar_lt_rows row class

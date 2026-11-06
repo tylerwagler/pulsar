@@ -161,8 +161,16 @@ typedef struct {
     /** @var pulsar_block_head::layer
      *  The two lattice layers (bind layer i = lattice layer i): attention and MLP, each pre-norm, Linears with biases. */
     struct {
-        pulsar_tensor *attn_norm, *attn_in, *attn_in_b, *attn_out, *attn_out_b;
-        pulsar_tensor *mlp_norm, *mlp_up, *mlp_up_b, *mlp_down, *mlp_down_b;
+        pulsar_tensor *attn_norm;   ///< attention pre-norm
+        pulsar_tensor *attn_in;   ///< attention input projection
+        pulsar_tensor *attn_in_b;   ///< its bias
+        pulsar_tensor *attn_out;   ///< attention output projection
+        pulsar_tensor *attn_out_b;   ///< its bias
+        pulsar_tensor *mlp_norm;   ///< MLP pre-norm
+        pulsar_tensor *mlp_up;   ///< MLP up projection
+        pulsar_tensor *mlp_up_b;   ///< its bias
+        pulsar_tensor *mlp_down;   ///< MLP down projection
+        pulsar_tensor *mlp_down_b;   ///< its bias
     } layer[2];
     /** @var pulsar_block_head::logit_scale
      *  The scores' scale (config lilicorr_logit_scale, 8). */

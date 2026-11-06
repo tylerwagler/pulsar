@@ -51,7 +51,7 @@ CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS ?= -Xcompiler -Wall,-Wextra -O3 -g -lineinfo --use_fast_math --default-stream per-thread $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 NVCCFLAGS += $(PULSAR_DEPFLAGS)
 # Append-only hook for probe builds (e.g. L003's tile sweep:
 #   make pulsar NVCC_EXTRA='-DPULSAR_MXFP4_TILE_M=64')
@@ -93,7 +93,7 @@ $(shell mkdir -p $(dir $(CUDA_FLAG_STAMP)) 2>/dev/null; \
 # 2026-08-23).  Override CUTLASS_DIR to point anywhere; `make cutlass` clones
 # the pinned sha if you have nothing.
 CUTLASS_DIR ?= $(CURDIR)/cutlass
-CUTLASS_INC ?= -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+CUTLASS_INC ?= -isystem $(CUTLASS_DIR)/include -isystem $(CUTLASS_DIR)/tools/util/include
 CUTLASS_PIN_SHA := $(shell sed -n 's/^sha=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
 CUTLASS_PIN_URL := $(shell sed -n 's/^url=//p' $(CURDIR)/cutlass.pin 2>/dev/null)
 
@@ -233,7 +233,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-sched-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -675,6 +675,15 @@ tests/router_gate: tests/router_gate.cu src/cuda/pulsar_cuda_router.h src/cuda/p
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 # L336: writes src/cuda/pulsar_cuda_lt_picks.inc (pulsar_lt_fixed's committed kernel choices) -- a measurement tool,
 # not a gate: run it on a quiet device, `tests/lt_picks --from-log <server log>` (the "fixed GEMM" lines name the shapes).
+# L353 no. 2: the store's index under ThreadSanitizer: client threads walk its trailers while the worker changes it.
+# Host only; built from source with its own flags, so it shares no objects with the server.
+tests/segstore_tsan: tests/segstore_tsan.cpp src/lib/pulsar_segstore.cpp src/lib/pulsar_segstore.h \
+                     src/lib/pulsar_kvdigest.cpp src/lib/pulsar_kvpool.cpp Makefile
+	$(CXX) -std=c++23 -O1 -g -fsanitize=thread -D_GNU_SOURCE -Isrc -Isrc/lib -o $@ tests/segstore_tsan.cpp \
+	  src/lib/pulsar_segstore.cpp src/lib/pulsar_kvdigest.cpp src/lib/pulsar_kvpool.cpp -lpthread
+.PHONY: segstore-tsan
+segstore-tsan: tests/segstore_tsan
+	TSAN_OPTIONS=halt_on_error=1 ./tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 .PHONY: router-gate
@@ -2092,6 +2101,8 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
+# MOVED 13bcbab1 -> 5fe1831d on 2026-11-06 (L354), BY TYLER'S OVERRIDE: the CUDA 13.5 + CUTLASS v4.8.1 toolchain moved the
+# depths with a small tail (see the blob's .md and the dated note at cuda-reference-gate-budget).
 # MOVED f5bea7aa -> 13bcbab1 on 2026-10-13 (L292), BY TYLER'S OVERRIDE, not by
 # the CLOSER rule above.  The 0731 NVFP4 KV row's two divides are IEEE
 # (__fdiv_rn) instead of fast-math MUFU.RCP x FMUL, which makes the device row
@@ -2099,7 +2110,7 @@ context-coherence-probe:
 # graded it a noise-level AWAY from an FP8-KV B300 capture that cannot arbitrate
 # NVFP4 rounding; see the dated note at cuda-reference-gate-budget.  13bcbab1 is
 # the pre-squash tip of the fix; the landed commit's engine sources equal it.
-PREFILL_BASELINE_REF ?= 13bcbab1
+PREFILL_BASELINE_REF ?= 5fe1831d
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -2150,7 +2161,7 @@ PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_B
 CUTLASS_MXFP4_GATE_MODEL        ?= $(call need_path,CUTLASS_MXFP4_GATE_MODEL)
 PREFILL_CUTLASS_MXFP4_BASELINE_REF ?= e823df67
 PREFILL_CUTLASS_MXFP4_BASELINE  ?= tests/test-vectors/prefill_cutlass_mxfp4_baseline-$(PREFILL_CUTLASS_MXFP4_BASELINE_REF).bin
-PREFILL_DECODE_BASELINE_REF ?= 13bcbab1
+PREFILL_DECODE_BASELINE_REF ?= 5fe1831d
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
@@ -2284,6 +2295,37 @@ server-kv-admission-live: pulsar-server
 # itself (a quiet gpuq job, production stopped); the Nemotron mini, ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
+# L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
+# of this tree (tracked and new files, so uncommitted edits count) from nothing, so an object already built can't hide a
+# warning, and greps the log.  CUTLASS is -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both
+# run before the runner: a build's memory beside the accounting gate would fail it.
+.PHONY: warnings-gate doxygen-gate
+warnings-gate:
+	@d=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-warnings-XXXXXX) || exit 1; \
+	trap 'rm -rf "$$d"' EXIT; \
+	git ls-files -co --exclude-standard -z | tar --null -T - -cf - | tar -xf - -C "$$d" || exit 1; \
+	[ ! -f local.mk ] || cp local.mk "$$d/"; \
+	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
+	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
+	grep ': warning:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
+	head -40 "$$d/warnings"; \
+	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
+	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
+	echo "WARNINGS GATE: PASS (a build from nothing, 0 warnings)"
+doxygen-gate:
+	@rm -f docs/api/doxygen-warnings.log; \
+	(cat docs/Doxyfile; echo "HAVE_DOT = NO") | doxygen - > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \
+	[ -f docs/api/doxygen-warnings.log ] || { echo "DOXYGEN GATE: FAIL (no warnings log: the Doxyfile moved it?)"; exit 1; }; \
+	if [ -s docs/api/doxygen-warnings.log ]; then head -40 docs/api/doxygen-warnings.log; \
+	  echo "DOXYGEN GATE: FAIL ($$(wc -l < docs/api/doxygen-warnings.log) lines)"; exit 1; fi; \
+	echo "DOXYGEN GATE: PASS (an empty warnings log)"
+
+# L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  On
+# its own server: its budget override can't share live-legs' hooks instance with preempt-exact's.  ~4 min.
+.PHONY: preempt-wedge-live
+preempt-wedge-live: pulsar-server
+	python3 tests/preempt_live.py $(QWEN_GATE_MODEL) wedge --binary ./pulsar-server
+
 .PHONY: server-kv-headroom-live
 server-kv-headroom-live: pulsar-server
 	python3 tests/server_kv_headroom_live.py $(KV_HEADROOM_MODEL) --binary ./pulsar-server
@@ -2363,13 +2405,15 @@ cuda-prefill-gate:
 		$(PREFILL_BASELINE_REF_SHORT)
 
 # The CUTLASS-MXFP4 half of the byte gate -- see CUTLASS_MXFP4_GATE_MODEL above.
-# SKIPs LOUDLY when the artifact is absent (the same choice the vision gates make
-# without VISION_MODEL): a box without it has no CUTLASS-MXFP4 expert coverage,
-# and saying so beats a FAIL that reads like a numerics regression.
+# L354: a configured path that isn't there FAILS.  It used to SKIP and exit 0, so a typo or an unmounted share printed
+# ALL GATES PASS with the only gate for this lane not run.  (Unset, need_path refuses already.)
+# L354: MANUAL, out of the battery: its artifact is on no box (L292 noted it 2026-10-13), and the SKIP had hidden that.  No served
+# family uses this lane, so nothing gates it; bringing it back means rebuilding the artifact and re-dumping the blob.
 cuda-prefill-gate-cutlass-mxfp4:
 	@if [ ! -d "$(CUTLASS_MXFP4_GATE_MODEL)" ]; then \
-		echo "SKIP  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
+		echo "FAIL  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
 		echo "      NO CUTLASS MXFP4 routed-expert coverage in this run."; \
+		exit 1; \
 	else \
 		set -e; \
 		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
@@ -2489,6 +2533,10 @@ cuda-reference-gate: tests/gates_runner
 # it cannot arbitrate FP4 rounding.  The exact divide makes the device row equal
 # the host recipe (rule 7).  Next re-grade: an NVFP4-KV B300 capture (#42).  This
 # is not a precedent: any other AWAY grade still means reject, not re-record.
+#
+# 2026-11-06 (L354), a second exception, Tyler's: the CUDA 13.5 + CUTLASS v4.8.1 toolchain graded story NET +0.78% (1.958e-5 ->
+# 1.973e-5), all of it depth 4102 (2.162e-6 -> 2.316e-6), every top-1 matching, code unmoved.  "we're not gonna stay pinned
+# on an old toolchain. just regrade it and reset the baseline."  The cause inside the toolchain was not split.
 .PHONY: cuda-reference-gate-budget
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
@@ -2704,12 +2752,12 @@ prefix-stability-gate: pulsar_test
 # per model, are the last section (live-legs) but one: L319's server-kv-headroom-live after them (it balloons the box's
 # memory, so it runs alone, ~2.5 min).  Each section's wall time is printed
 # against its budget (docs/QA_BEFORE_RELEASES.md, "Battery wall time").
-GATE_TARGETS =unit-test-gate agent-test-gate \
+GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
+	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	cuda-runner-gate live-legs server-kv-headroom-live
+	cuda-runner-gate live-legs preempt-wedge-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -2739,7 +2787,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # with spec_sampling alone running 2x2500 trajectories; it is the wrong tool to
 # sit and watch after every edit.  (This said "17 gates" as a second copy of a
 # fact that lives in GATE_TARGETS and had drifted to 10; the list is the count.)
-# These four are the ones that actually catch a numerics or dispatch regression:
+# These five are the ones that actually catch a numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
 #   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
 #   cuda-frontier-gate       frontier logits across banks
@@ -2749,7 +2797,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # full TRAJ is required for statistical power, so quick mode leaves it out
 # rather than run it under-powered and call it a pass.
 # NOT a substitute for `make gates` before a merge.
-GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-frontier-gate \
+GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-chunk-neutrality-gate cuda-frontier-gate \
                       cuda-mixed-neutrality-gate
 
 gates-quick:
@@ -2941,8 +2989,8 @@ gates-dev:
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
-	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*) resume=1 ;; esac; \
-	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*) render=1 ;; esac; \
+	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*|src/lib/pulsar_kvdigest*|src/lib/pulsar_kvpool*) resume=1 ;; esac; \
+	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
 	      case "$$p" in src/engine/family_deepseek*|src/engine/kv_state_ds4*|src/engine/spec_dspark*|src/engine/gpu_*|src/cuda/pulsar_cuda_csa2*|src/cuda/pulsar_cuda_dspark*|src/cuda/mmq/ds4_mmq*|src/cuda/mmq/ds4_mmid*|src/cuda/mmq/ds4_mxfp8*|src/cuda/mmq/ds4_quantize*|src/server/deepseek_*|src/server/parser_deepseek*|tests/live_legs.py) ds4legs=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
@@ -3029,6 +3077,8 @@ gates-dev:
 	  $(MAKE) --no-print-directory scratch-poison-gate CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	fi; \
 	if [ $$resume -eq 1 ]; then \
+	  $(MAKE) --no-print-directory segstore-tsan || rc=1; \
+	  $(MAKE) --no-print-directory preempt-wedge-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
@@ -3785,14 +3835,6 @@ tests/tp_transport_test: tests/tp_transport_test.cpp src/tp/pulsar_tp.cpp src/tp
 tp-transport-test: tests/tp_transport_test
 	./tests/tp_transport_test
 
-# TP gate-scheduler test (slice 4b): host half of the CUDA gate machinery,
-# driven over the transport's TCP loopback with hook stubs.  No CUDA, no RDMA.
-tests/tp_sched_test: tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_sched_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
-
-tp-sched-test: tests/tp_sched_test
-	./tests/tp_sched_test
-
 # TP NODE frame test (protocol v13): after bring-up every rank knows every
 # rank's host, build and TP address, over the pair and the 3-rank mesh paths.
 # Host-only: no CUDA, no RDMA.
@@ -3817,8 +3859,8 @@ tp-identity-test: tests/tp_identity_test
 # exchange and decode-slot reuse at n_embd 8192 (vec == 2*MSG, the RDMA
 # chunked-branch boundary) and 16384 (> 2*MSG, RDMA-registration reject size),
 # plus N decode tokens x 86 gates of slot-reuse soak.  Host-only: TCP loopback.
-tests/tp_wide_test: tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp src/tp/pulsar_tp_sched.h src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_wide_test.cpp src/tp/pulsar_tp_sched.cpp src/tp/pulsar_tp.cpp
+tests/tp_wide_test: tests/tp_wide_test.cpp tests/tp_sched_harness.cpp src/tp/pulsar_tp.cpp tests/tp_sched_harness.h src/tp/pulsar_tp.h
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -o $@ tests/tp_wide_test.cpp tests/tp_sched_harness.cpp src/tp/pulsar_tp.cpp
 
 tp-wide-test: tests/tp_wide_test
 	./tests/tp_wide_test
@@ -3849,11 +3891,6 @@ tp-cmd-stress-test: tests/tp_cmd_stress_test
 # decision rule (all-match vs first-mismatch stop) plus a few hundred leader
 # verify + commit rounds against a worker that mirrors the grade from the
 # drafts -- the grading+commit lockstep the real pair will run.  Host-only.
-tests/tp_verify_test: tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp_verify.h src/tp/pulsar_tp.cpp src/tp/pulsar_tp.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -o $@ tests/tp_verify_test.cpp src/tp/pulsar_tp_verify.cpp src/tp/pulsar_tp.cpp
-
-tp-verify-test: tests/tp_verify_test
-	./tests/tp_verify_test
 
 # TP tiny-buffer regression (audit F9): the TCP fallback's alternating
 # write/read rounds must complete even when the socket buffers are clamped

@@ -10,6 +10,30 @@
 
 #include <string>
 
+/// L354: a model id's bytes inside a JSON string (it is operator-set, and a quote or a newline would break the document).
+/// @param id the id
+/// @return its escaped body, without the quotes
+std::string model_id_json_body(const char *id) {
+    buf b = {0};
+    json_escape_fragment_n(&b, id, strlen(id));
+    std::string out(b.ptr ? b.ptr : "");
+    buf_free(&b);
+    return out;
+}
+
+/// L354: a value for a Prometheus label: backslash, quote and newline escaped, as its text format defines.
+/// @param v the value
+/// @return the escaped value
+std::string prometheus_label(const char *v) {
+    std::string out;
+    for (; *v; v++) {
+        if (*v == '\\' || *v == '"') out += '\\';
+        if (*v == '\n') out += "\\n";
+        else out += *v;
+    }
+    return out;
+}
+
 
 
 /// Free a request's body and zero it.
@@ -29,10 +53,7 @@ static ssize_t header_end(const char *p, size_t n) {
     for (size_t i = 3; i < n; i++) {
         if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
     }
-    for (size_t i = 1; i < n; i++) {
-        if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
-    }
-    return -1;
+    return -1;   /* L354: CRLFCRLF only: a second reading of where the head ends is what a smuggled request needs */
 }
 
 
@@ -54,15 +75,21 @@ static long content_length(const char *h, size_t n) {
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
-        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+        /* L354: the name up to the colon, spaces before the colon included (a space there used to hide the header) */
+        const char *colon = (const char *)memchr(line, ':', len);
+        size_t nlen = colon ? (size_t)(colon - line) : 0u;
+        while (nlen && isspace((unsigned char)line[nlen - 1])) nlen--;
+        if (nlen == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0) {
             return -1;
         }
-        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            const char *v = line + 15;
+        if (nlen == 14 && strncasecmp(line, "Content-Length", 14) == 0) {
+            const char *v = colon + 1;
             while (v < line + len && isspace((unsigned char)*v)) v++;
             char *vend = NULL;
             long parsed = strtol(v, &vend, 10);
             if (vend == v || parsed < 0) return -1;
+            while (vend < line + len && isspace((unsigned char)*vend)) vend++;
+            if (vend != line + len) return -1;   /* L354: "12x" is not 12 */
             if (seen && parsed != clen) return -1;
             seen = 1;
             clen = parsed;
@@ -165,6 +192,13 @@ bool read_http_request(int fd, http_request *r) {
         i++;
     }
     line[i] = '\0';
+    /* L354: a request line or a target too long to hold is refused, not truncated to another target */
+    if (i + 1 >= sizeof(line) && b.ptr[i] != '\n') goto fail;
+    {
+        const char *sp = strchr(line, ' ');
+        const char *sp2 = sp ? strchr(sp + 1, ' ') : NULL;
+        if (sp && (sp2 ? (size_t)(sp2 - sp - 1) : strlen(sp + 1)) > 255u) goto fail;
+    }
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q;
     q = strchr(r->path, '?');
@@ -362,7 +396,8 @@ void server::build_tp_health() {
  * mu (same discipline as /metrics — no engine calls on the client thread). */
 bool server::send_health(int fd) {
     auto *s = this;
-    const char *model = server_served_model_id(s);
+    const std::string model_json = model_id_json_body(server_served_model_id(s));   /* L354 */
+    const char *model = model_json.c_str();
     bool draining;
     int n_slots, running, waiting, capacity;
     time_t started;
@@ -439,8 +474,8 @@ bool server::send_version(int fd) {
         "{\"version\":\"%s\",\"engine\":\"pulsar\",\"cuda_arch\":\"sm_120f\","
         "\"model\":\"%s\",\"model_name\":\"%s\",\"context\":%d}\n",
         PULSAR_VERSION_STR,
-        server_served_model_id(s),
-        server_served_model_name(s),
+        model_id_json_body(server_served_model_id(s)).c_str(),
+        model_id_json_body(server_served_model_name(s)).c_str(),
         pulsar_session_ctx(s->sess));
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -553,7 +588,8 @@ bool server::send_metrics(int fd) {
      * m_slot_phase/m_slot_prefill_*, server_publish_metrics_snapshot —
      * refreshed at bind time and once per quantum, so gauges lag live state by
      * at most one quantum). */
-    const char *model = server_served_model_id(s);
+    const std::string model_label = prometheus_label(server_served_model_id(s));   /* L354 */
+    const char *model = model_label.c_str();
     pulsar_spec_metrics m;
     int n_slots;
     double slot_kv[PULSAR_SESSION_POOL_CAP];
@@ -624,6 +660,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long kv_disk_fs_free = (unsigned long long)s->m_kv_disk_fs_free;
     const unsigned long long kv_disk_fs_size = (unsigned long long)s->m_kv_disk_fs_size;
     const unsigned long long kv_disk_segs_removed = (unsigned long long)s->m_kv_disk_segs_removed;
+    const unsigned long long kv_disk_writes_failed = (unsigned long long)s->m_kv_disk_writes_failed;
     const unsigned long long kv_disk_rps_removed = (unsigned long long)s->m_kv_disk_rps_removed;
     unsigned long long kv_disk_persisted[KV_PERSIST_TRIGGERS], kv_disk_rp_persisted[KV_PERSIST_TRIGGERS];
     for (int i = 0; i < KV_PERSIST_TRIGGERS; i++) {
@@ -1201,6 +1238,10 @@ bool server::send_metrics(int fd) {
                  "released, or dropped as bad.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_segments_removed_total counter\n");
     buf_printf(&b, "pulsar:kv_disk_segments_removed_total %llu\n", kv_disk_segs_removed);
+    buf_puts(&b, "# HELP pulsar:kv_disk_writes_failed_total Files copied out for the disk KV store whose write failed; the "
+                 "persisted counters count them at their copy-out.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_writes_failed_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_writes_failed_total %llu\n", kv_disk_writes_failed);
     buf_puts(&b, "# HELP pulsar:kv_disk_restore_points_removed_total Restore points the disk KV store removed without "
                  "their segment.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_restore_points_removed_total counter\n");
