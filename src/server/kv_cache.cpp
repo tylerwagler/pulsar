@@ -772,6 +772,7 @@ void server::kv_cache_publish_store() {
     const int segments = pulsar_segstore_count(kv.st);
     const uint64_t ram = pulsar_segstore_ram_bytes(kv.st), ram_pool = kv.ram ? pulsar_kvpool_size(kv.ram) : 0;
     const uint64_t segs_removed = pulsar_segstore_removed(kv.st, &rps_removed);
+    const uint64_t writes_failed = pulsar_segstore_writes_failed(kv.st);
     struct statvfs fs;   /* L276: the store's budget is not the disk's -- a full filesystem refuses stores */
     const bool fs_ok = kv.dir && statvfs(kv.dir, &fs) == 0;
     pthread_mutex_lock(&mu);
@@ -788,6 +789,7 @@ void server::kv_cache_publish_store() {
     m_kv_disk_fs_size = fs_ok ? (uint64_t)fs.f_blocks * (uint64_t)fs.f_frsize : 0;
     m_kv_disk_segs_removed = segs_removed;
     m_kv_disk_rps_removed = rps_removed;
+    m_kv_disk_writes_failed = writes_failed;
     pthread_mutex_unlock(&mu);
 }
 
@@ -891,8 +893,11 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
      * device reads stream through the session's pinned buffer, which allocates nothing) -- over the floor.  Else
      * it is SKIPPED, counted and said: the history stays live in its bank, only its disk copy is not written now
      * (a later persist of the same bank writes every segment the store lacks).  A documented outcome, not a
-     * fallback: no other write path runs. */
-    {
+     * fallback: no other write path runs.
+     * L353: never a spill's: a spill is what the guard runs to get back over the floor, so refusing it under the floor
+     * kept GiBs resident and answered 503.  It frees far more than its text renders take, and the floor (its
+     * reserve) holds room for a persist. */
+    if (why != KV_PERSIST_SPILL) {
         const pulsar_tokens *toks = pulsar_session_tokens(s->sess);
         const uint64_t need = server_persist_host_bytes(toks ? toks->len : 0);
         const uint64_t avail = server_mem_available_bytes();
@@ -907,7 +912,6 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
                            reason, (double)avail / gib, (double)need / gib, (double)server_mem_floor().raw() / gib,
                            avail ? "" : " (MemAvailable unreadable)", skipped);
             }
-            if (no_room) *no_room = true;   /* nothing was stored: a spill must not free the bank (L347) */
             return 0;
         }
     }

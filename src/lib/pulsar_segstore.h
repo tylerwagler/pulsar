@@ -524,7 +524,9 @@ uint64_t pulsar_segstore_release(pulsar_segstore *st, const char tip[41], const 
  *  @return false to stop the walk */
 typedef bool (*pulsar_segstore_trailer_fn)(FILE *fp, uint64_t trailer_bytes, const char *text, size_t text_len,
                                            void *ud);
-/** Run `fn` over every segment that carries a trailer, in index order.
+/** Run `fn` over every segment that carries a trailer, in index order.  L353: the one call safe off the store's thread
+ *  (a chat parse's): it copies the entries under a lock and reads the files without it, so one evicted meanwhile is
+ *  skipped.
  *  @param st the store, or NULL (no-op)
  *  @param fn the visitor
  *  @param ud context for `fn` */
@@ -577,6 +579,13 @@ uint64_t pulsar_segstore_budget_bytes(const pulsar_segstore *st);
  *  @param rps receives the restore points removed, or NULL
  *  @return the segments removed */
 uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps);
+/** L353: files copied out whose write failed, ever.  @param st the store, or NULL  @return the count (0 for NULL) */
+uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st);
+/** L353: reads the disk's free bytes.  @param ud context  @return the bytes */
+typedef uint64_t (*pulsar_segstore_disk_free_fn)(void *ud);
+/** L353: read the disk's free bytes through `fn` in place of statvfs (a test's small disk).
+ *  @param st the store, or NULL (no-op)  @param fn the reader (NULL = statvfs)  @param ud context for `fn` */
+void pulsar_segstore_set_disk_free(pulsar_segstore *st, pulsar_segstore_disk_free_fn fn, void *ud);
 /** The number of segments the store holds.
  *  @param st the store, or NULL (0)
  *  @return the segment count */

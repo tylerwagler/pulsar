@@ -1108,9 +1108,11 @@ void server::gen_begin(session_slot *sl) {
     if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (sync_from_zero || pick != RESUME_OWN)) {
         /* The sync from a miss, an adopt and a chain load each replace the bank's history.  Persist it first (only
          * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
-         * touched first, so making room for the persist evicts other leaves. */
-        if (pick == RESUME_DISK) pulsar_segstore_touch(s->kv.st, disk_hit->chain, disk_hit->n);
+         * pinned across it, so making room for the persist can't evict what was just picked (L353: touching it only
+         * reordered it, and a full store took its restore point; kv_restore_begin pins it for the load). */
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, true);
         s->kv_cache_persist(sl, KV_PERSIST_EVICT);
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, false);
     }
     /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
      * every later persist of the bank reads its X-Pulsar-KV tokens */

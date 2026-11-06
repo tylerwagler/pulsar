@@ -624,6 +624,7 @@ bool server::send_metrics(int fd) {
     const unsigned long long kv_disk_fs_free = (unsigned long long)s->m_kv_disk_fs_free;
     const unsigned long long kv_disk_fs_size = (unsigned long long)s->m_kv_disk_fs_size;
     const unsigned long long kv_disk_segs_removed = (unsigned long long)s->m_kv_disk_segs_removed;
+    const unsigned long long kv_disk_writes_failed = (unsigned long long)s->m_kv_disk_writes_failed;
     const unsigned long long kv_disk_rps_removed = (unsigned long long)s->m_kv_disk_rps_removed;
     unsigned long long kv_disk_persisted[KV_PERSIST_TRIGGERS], kv_disk_rp_persisted[KV_PERSIST_TRIGGERS];
     for (int i = 0; i < KV_PERSIST_TRIGGERS; i++) {
@@ -1201,6 +1202,10 @@ bool server::send_metrics(int fd) {
                  "released, or dropped as bad.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_segments_removed_total counter\n");
     buf_printf(&b, "pulsar:kv_disk_segments_removed_total %llu\n", kv_disk_segs_removed);
+    buf_puts(&b, "# HELP pulsar:kv_disk_writes_failed_total Files copied out for the disk KV store whose write failed; the "
+                 "persisted counters count them at their copy-out.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_writes_failed_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_writes_failed_total %llu\n", kv_disk_writes_failed);
     buf_puts(&b, "# HELP pulsar:kv_disk_restore_points_removed_total Restore points the disk KV store removed without "
                  "their segment.\n");
     buf_puts(&b, "# TYPE pulsar:kv_disk_restore_points_removed_total counter\n");

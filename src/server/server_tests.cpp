@@ -9032,13 +9032,13 @@ static void test_l347_i2_eviction_order(void) {
     pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
     char L0[41], B[41], D[41], P[41], A[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a dead end", 300, 1, L0));
-    TEST_ASSERT(l323_put_rp(st, L0, 128));                                   /* class 0 */
+    TEST_ASSERT(l323_put_rp(st, L0, 128));                                   /* a chain end's: class 3 */
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a shared prefix", 300, 2, B));
-    TEST_ASSERT(l323_put_rp(st, B, 128));                                    /* a branch point's: class 3 */
+    TEST_ASSERT(l323_put_rp(st, B, 128));                                    /* a branch point's: class 4 */
     TEST_ASSERT(test_seg_put(st, B, 128, 256, "its tail", 300, 3, D));       /* dominated by P */
     TEST_ASSERT(test_seg_put(st, B, 128, 256, "its tail goes on", 300, 4, P));
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "an anchor", 300, 5, A));
-    TEST_ASSERT(l347_put_rp(st, A, 128, PULSAR_SEGSTORE_RP_ANCHOR));         /* class 3 */
+    TEST_ASSERT(l347_put_rp(st, A, 128, PULSAR_SEGSTORE_RP_ANCHOR));         /* class 4 */
     pulsar_segstore_seg g;
     TEST_ASSERT(pulsar_segstore_get(st, D, &g) && g.dominated);
     const uint64_t used = pulsar_segstore_used_bytes(st);
@@ -9052,11 +9052,11 @@ static void test_l347_i2_eviction_order(void) {
     const int l0_rp = l347_ev_at(log, L0, true), d = l347_ev_at(log, D, false), b_rp = l347_ev_at(log, B, true);
     const int p = l347_ev_at(log, P, false), l0 = l347_ev_at(log, L0, false), b = l347_ev_at(log, B, false);
     const int a_rp = l347_ev_at(log, A, true), a = l347_ev_at(log, A, false);
-    TEST_ASSERT(l0_rp == 0);                     /* the dead end's restore point first */
-    TEST_ASSERT(d == 1);                         /* then the dominated leaf */
-    TEST_ASSERT(b_rp == 2);                      /* B is no branch point any more: its restore point next */
-    TEST_ASSERT(p > b_rp && l0 > b_rp && b > p);  /* then the leaves, LRU; B a leaf once P is gone */
-    TEST_ASSERT(a_rp > p && a_rp > l0 && a_rp > b && a > a_rp);   /* the anchor's restore point last, then its rows */
+    TEST_ASSERT(d == 0);                         /* L353: dead rows first: the dominated leaf */
+    TEST_ASSERT(p == 1);                         /* then the rows-only leaf */
+    TEST_ASSERT(l0_rp == 2 && l0 == 3);          /* then the chain ends' restore points, LRU, each with its rows */
+    TEST_ASSERT(b_rp == 4 && b == 5);            /* B is no branch point any more, and a chain end once P is gone */
+    TEST_ASSERT(a_rp == 6 && a == 7);            /* the anchor's restore point last, then its rows */
     TEST_ASSERT((int)log.ev.size() == 8 && pulsar_segstore_count(st) == 1);
     /* L276: the store's own count of what it removed agrees with the hook's -- five segments, three restore points
      * alone (L0, B, A) -- and the budget it reports is the one it was opened with */
@@ -9064,6 +9064,141 @@ static void test_l347_i2_eviction_order(void) {
     TEST_ASSERT(pulsar_segstore_removed(st, &rps_removed) == 5 && rps_removed == 3);
     TEST_ASSERT(pulsar_segstore_budget_bytes(st) == used);
     TEST_ASSERT(pulsar_segstore_removed(NULL, &rps_removed) == 0 && rps_removed == 0 && pulsar_segstore_budget_bytes(NULL) == 0);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L353: a parked decoder's end frees nothing, so a prompt can't wait on it (the wedge: tests/preempt_live.py's
+ * preempt-wedge leg, on a real server): with it the only job bound, the verdict for a prompt no spill helps is REFUSE. */
+static void test_l353_parked_decoder_frees_nothing(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    int dummy = 0;
+    sl.provisioned = true;
+    sl.active_job = (job *)&dummy;
+    TEST_ASSERT(server_slot_end_frees_kv(&sl));
+    sl.preempted = true;
+    TEST_ASSERT(!server_slot_end_frees_kv(&sl));
+    sl.preempted = false;
+    sl.spilled = true;
+    TEST_ASSERT(!server_slot_end_frees_kv(&sl));
+    sl.spilled = false;
+    sl.active_job = NULL;
+    TEST_ASSERT(!server_slot_end_frees_kv(&sl));
+    sl.active_job = (job *)&dummy;
+    sl.provisioned = false;
+    TEST_ASSERT(!server_slot_end_frees_kv(&sl));
+    int k = 0;
+    const KvBytes t = kvb(10), d = kvb(10), b = kvb(15);   /* touched + growth past the budget; no victims */
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, true, &k) == PROMPT_KV_WAIT);
+    TEST_ASSERT(server_prompt_kv_verdict(t, d, b, NULL, 0, false, &k) == PROMPT_KV_REFUSE);
+}
+
+/* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
+ * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
+static void test_l353_eviction_keeps_chain_ends(void) {
+    char tmpl[] = "/tmp/pulsar-l353-ev.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char chat[3][41], dead[6][41];
+    for (int i = 0; i < 3; i++) {
+        char text[32];
+        snprintf(text, sizeof text, "chat %d", i);
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, text, 300, (uint8_t)(1 + i), chat[i]));
+        TEST_ASSERT(l323_put_rp(st, chat[i], 128));
+    }
+    uint64_t dead_bytes = pulsar_segstore_used_bytes(st);
+    for (int i = 0; i < 6; i++) {
+        char text[32];
+        snprintf(text, sizeof text, "dead rows %d", i);
+        TEST_ASSERT(test_seg_put(st, "", 0, 128, text, 300, (uint8_t)(10 + i), dead[i]));
+    }
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    dead_bytes = used - dead_bytes;
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    char big[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "the newcomer", dead_bytes - 256, 30, big));
+    for (int i = 0; i < 6; i++) TEST_ASSERT(!pulsar_segstore_contains(st, dead[i]));
+    pulsar_segstore_seg g;
+    for (int i = 0; i < 3; i++) TEST_ASSERT(pulsar_segstore_get(st, chat[i], &g) && g.rp_bytes > 0u);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L353: a full disk evicts as a full budget does, whatever else fills it; with nothing left to take the write is
+ * refused and the store still holds what it had.  A failed write is counted. */
+static uint64_t l353_disk_free(void *ud) {
+    const uint64_t *d = (const uint64_t *)ud;   /* {size, foreign bytes} of a small disk; the store's are below */
+    const uint64_t held = d[2] ? pulsar_segstore_used_bytes((pulsar_segstore *)d[2]) : 0u;
+    return d[0] > d[1] + held ? d[0] - d[1] - held : 0u;
+}
+static void test_l353_disk_full_evicts(void) {
+    char tmpl[] = "/tmp/pulsar-l353-df.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);   /* no budget at all: only the disk bounds it */
+    char a[41], b[41], c[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "old", 1000, 1, a));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "newer", 1000, 2, b));
+    uint64_t disk[3] = { pulsar_segstore_used_bytes(st) + 1500, 0, (uint64_t)st };
+    pulsar_segstore_set_disk_free(st, l353_disk_free, disk);
+    /* 1500 free: a 1000-byte payload (+ header and text) fits and evicts nothing */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "fits", 1000, 3, c));
+    TEST_ASSERT(pulsar_segstore_count(st) == 3);
+    /* someone else fills the disk: the next write takes the oldest leaf, and the store goes on */
+    disk[1] = 1000;
+    char d[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "after the foreign file", 1000, 4, d));
+    TEST_ASSERT(!pulsar_segstore_contains(st, a) && pulsar_segstore_contains(st, d));
+    /* a disk nothing of ours can clear: refused, and what stays stays */
+    disk[1] = disk[0];
+    char e[41];
+    const int before = pulsar_segstore_count(st);
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 1000, 5, e));
+    TEST_ASSERT(before >= 1 && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    pulsar_segstore_set_disk_free(st, NULL, NULL);
+    /* a failed write counts */
+    TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
+    char key[41], err[256];
+    pulsar_segstore_job *job = NULL;
+    const int rc = pulsar_segstore_reserve(st, "", 0, 128, "fails", 5, 64, 0, key, &job, err, sizeof err);
+    TEST_ASSERT(rc > 0 && job);
+    if (job) TEST_ASSERT(!pulsar_segstore_commit(st, job, false));
+    TEST_ASSERT(pulsar_segstore_writes_failed(st) == 1 && !pulsar_segstore_contains(st, key));
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
+/* L353: the chain a request picked is pinned across the persist that makes room for the displaced history
+ * (gen_begin): at budget, that persist takes something else, or nothing -- never the picked chain's restore point. */
+static void test_l353_picked_chain_survives_the_evict_persist(void) {
+    char tmpl[] = "/tmp/pulsar-l353-pick.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char picked[41], other[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "picked", 300, 1, picked));
+    TEST_ASSERT(l323_put_rp(st, picked, 128));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "other", 300, 2, other));
+    TEST_ASSERT(l323_put_rp(st, other, 128));
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    pulsar_segstore_seg chain[1];
+    TEST_ASSERT(pulsar_segstore_get(st, picked, &chain[0]));
+    pulsar_kvchain_pin(st, chain, 1, true);
+    /* the displaced history's persist, more than everything else holds: the other chain goes, the picked one stays */
+    char big[41];
+    (void)test_seg_put(st, "", 0, 128, "the displaced history", used, 3, big);
+    pulsar_segstore_seg g;
+    TEST_ASSERT(!pulsar_segstore_contains(st, other));
+    TEST_ASSERT(pulsar_segstore_get(st, picked, &g) && g.rp_bytes > 0u);
+    pulsar_kvchain_pin(st, chain, 1, false);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -13677,6 +13812,11 @@ static void test_persist_skipped_under_the_floor(void) {
     TEST_ASSERT(s.m_persist_skipped == 1);
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_PROMPT) == 0);
     TEST_ASSERT(s.m_persist_skipped == 2);
+    /* L353: never a spill: it is the guard's way back over the floor.  It passes the check (no store here, so it stores
+     * nothing, and with nothing refused its bank may go) */
+    bool no_room = true;
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_SPILL, nullptr, &no_room) == 0 && !no_room);
+    TEST_ASSERT(s.m_persist_skipped == 2);
     (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
@@ -13767,7 +13907,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 0);
     sl.kv_flags = 0u;   /* a request without the token took the bank: its history writes again */
     bool no_room = false;
-    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
+    TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && !no_room);
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
     (void)server_mem_floor_init(0, kvb(0));
     pthread_mutex_destroy(&s.mu);
@@ -14683,6 +14823,10 @@ static void pulsar_server_unit_tests_run(void) {
     test_guard_budget_reads_live_memavailable();
     test_guard_discrete_reads_the_device();
     test_persist_skipped_under_the_floor();
+    test_l353_eviction_keeps_chain_ends();
+    test_l353_disk_full_evicts();
+    test_l353_picked_chain_survives_the_evict_persist();
+    test_l353_parked_decoder_frees_nothing();
     test_prefill_mem_step_tries_remedies_first();
     test_stall_watchdog_rules();
     test_stall_dump_meminfo_and_phase_names();

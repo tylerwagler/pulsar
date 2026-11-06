@@ -782,6 +782,9 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
             if (!sl->gen || (sl->gen->phase != GEN_DECODE_INIT && sl->gen->phase != GEN_DECODE)) continue;
+            /* L353: a parked decoder steps nothing, so it never abandons: waiting on it would wait for ever (and a
+             * head refused for KV holds its readmission back).  It ends once it is back. */
+            if (sl->preempted) continue;
             const bool writer_failed = sl->gen->writer.failed;
             if (!writer_failed && !gen_client_disconnected(sl->active_job->fd)) continue;
             const int common = s->slot_common_prefix(sl, &j->req.prompt);
@@ -2937,6 +2940,15 @@ static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta
     return busy_may_free ? PROMPT_KV_WAIT : PROMPT_KV_REFUSE;
 }
 
+/* L353: whether a bound job's end makes room for a prompt.  A parked (preempted) decoder's physical is already freed,
+ * so its end frees nothing; counted as busy it kept a prompt that can never fit waiting on it, while that prompt's
+ * refusal kept it parked (the worker's readmission waits for the head) -- each on the other, and the queue behind them. */
+/// @param c the slot
+/// @return true when its job's end leaves a bank the guard can take
+static bool server_slot_end_frees_kv(const session_slot *c) {
+    return c->provisioned && !c->spilled && c->active_job && !c->preempted;
+}
+
 prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, int *order, int *n_spill,
                                           KvBytes *need) {
     auto *s = this;
@@ -2956,8 +2968,7 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
     /* a bank bound to a job now is a victim once that job ends */
     bool busy = false;
-    for (int i = 0; i < s->n_slots && !busy; i++)
-        busy = &s->slots[i] != sl && s->slots[i].provisioned && !s->slots[i].spilled && s->slots[i].active_job;
+    for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
     return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_budget(), drop, n_victims, busy,
                                     n_spill);

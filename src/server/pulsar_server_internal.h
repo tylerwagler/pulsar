@@ -2534,6 +2534,7 @@ struct server {
     uint64_t m_kv_disk_fs_free;       ///< L276: ... the directory's filesystem, free bytes (statvfs)
     uint64_t m_kv_disk_fs_size;       ///< L276: ... and its size
     uint64_t m_kv_disk_segs_removed;  ///< L276: ... segments removed, ever
+    uint64_t m_kv_disk_writes_failed;  ///< L353: ... files copied out whose write failed, ever
     uint64_t m_kv_disk_rps_removed;   ///< L276: ... restore points removed without their segment, ever
     /// L276: segments persists copied out for writing, by trigger (kv_persist_trigger_names)
     uint64_t m_kv_disk_persisted[KV_PERSIST_TRIGGERS];
