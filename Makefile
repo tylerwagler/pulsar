@@ -2293,6 +2293,12 @@ server-kv-admission-live: pulsar-server
 # itself (a quiet gpuq job, production stopped); the Nemotron mini, ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
+# L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  On
+# its own server: its budget override can't share live-legs' hooks instance with preempt-exact's.  ~4 min.
+.PHONY: preempt-wedge-live
+preempt-wedge-live: pulsar-server
+	python3 tests/preempt_live.py $(QWEN_GATE_MODEL) wedge --binary ./pulsar-server
+
 .PHONY: server-kv-headroom-live
 server-kv-headroom-live: pulsar-server
 	python3 tests/server_kv_headroom_live.py $(KV_HEADROOM_MODEL) --binary ./pulsar-server
@@ -2718,7 +2724,7 @@ GATE_TARGETS =unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	cuda-prefill-gate-cutlass-mxfp4 qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	cuda-runner-gate live-legs server-kv-headroom-live
+	cuda-runner-gate live-legs preempt-wedge-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -3039,6 +3045,7 @@ gates-dev:
 	fi; \
 	if [ $$resume -eq 1 ]; then \
 	  $(MAKE) --no-print-directory segstore-tsan || rc=1; \
+	  $(MAKE) --no-print-directory preempt-wedge-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory resume-deepest-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory sidecall-turns-live CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory kv-dup-live CUDA_ARCH=sm_120f || rc=1; \
