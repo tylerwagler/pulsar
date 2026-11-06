@@ -3,7 +3,7 @@
 #
 #   contract   session | loader | spec (greedy == spec, multi-bank verify) | spec-dist (the sampled distribution)
 #              | reference | chat | server | tp | kernel:<name>; a gate checking several lists them, comma-separated
-#   family     deepseek4 | qwen4_exp | all (family-neutral: runs for every family, or needs no model)
+#   family     deepseek4 | qwen4_exp | nemotron_h | gemma4 | all (family-neutral: runs for every family, or needs no model)
 #   tier       battery (make gates) | dev (gates-dev only) | manual (neither; say why in the note)
 #
 # A family in the registry (src/engine/family.cpp) that this matrix does not track is an `untracked` row, naming the
@@ -85,7 +85,50 @@ na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hos
 na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
 na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates
 untracked	inkling	L354	parked family; its forward is not wired
-untracked	nemotron_h	L354	served at work; its gates are not in this matrix yet
 untracked	nemotron_enc	L354	served on CT 131; its gates are not in this matrix yet
 untracked	nemotron_parse	L354	served on CT 131; its gates are not in this matrix yet
-untracked	gemma4	L354	served on CT 130; its gates are not in this matrix yet
+# L354: the two other served families.  What they run in the battery is what the log shows; the rest is written down here.
+nemotron-chat-gate	chat	nemotron_h	battery	tokenize / render / parser vs HF goldens
+na	nemotron-chat-gate	deepseek4	Nemotron's template and tokenizer; DeepSeek's template is render-gate
+na	nemotron-chat-gate	qwen4_exp	Nemotron's template and tokenizer; Qwen's is qwen-chat-gate
+na	nemotron-chat-gate	gemma4	Nemotron's template and tokenizer; Gemma's chat is a gap below
+gap	runner:cuda-mixed-neutrality-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-mixed-neutrality-gate-wide	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-mixed-prefill-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-frontier-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-rewind-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-accounting-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-evict-restore-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-session-payload-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-bank-spec-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	runner:cuda-decode-reference-gate-story	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	qwen-ref-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	cuda-chat-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	qwen-image-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+na	runner:cuda-dspark-batch-gate	nemotron_h	DeepSeek's DSpark drafter; Nemotron drafts by block
+na	runner:cuda-tp-head-split-gate	nemotron_h	TP is on demand, for a model too big for one Spark; none is served for Nemotron
+na	qwen-family-gate-device	nemotron_h	Qwen's zero-weight wiring; Nemotron's load has its own family gate
+na	qwen-chat-gate	nemotron_h	Qwen's template and tokenizer vs HF goldens
+na	render-gate	nemotron_h	DeepSeek V4.1's encoder goldens
+gap	tp	nemotron_h	L354	TP is on demand; no gate until one is served
+gap	runner:cuda-mixed-neutrality-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-mixed-neutrality-gate-wide	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-mixed-prefill-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-frontier-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-rewind-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-accounting-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-evict-restore-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-session-payload-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-bank-spec-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	runner:cuda-decode-reference-gate-story	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	qwen-ref-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	cuda-chat-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	qwen-image-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+na	runner:cuda-dspark-batch-gate	gemma4	DeepSeek's DSpark drafter; Gemma drafts by block
+na	runner:cuda-tp-head-split-gate	gemma4	TP is on demand, for a model too big for one Spark; none is served for Gemma
+na	qwen-family-gate-device	gemma4	Qwen's zero-weight wiring; Gemma's load has its own family gate
+na	qwen-chat-gate	gemma4	Qwen's template and tokenizer vs HF goldens
+na	render-gate	gemma4	DeepSeek V4.1's encoder goldens
+gap	tp	gemma4	L354	TP is on demand; no gate until one is served
+gap	chat	gemma4	L354	no chat gate vs HF goldens in the battery for Gemma
+note	gemma4	no Gemma model in the battery: its counts are family-neutral (all) gates, none has run a Gemma fixture

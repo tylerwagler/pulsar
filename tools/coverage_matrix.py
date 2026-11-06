@@ -17,7 +17,7 @@ import re
 import sys
 
 CONTRACTS = ('session', 'loader', 'spec', 'spec-dist', 'reference', 'chat', 'server', 'tp')
-FAMILIES = ('deepseek4', 'qwen4_exp')
+FAMILIES = ('deepseek4', 'qwen4_exp', 'nemotron_h', 'gemma4')
 
 
 def make_list(text, var):
@@ -44,11 +44,15 @@ def main():
     if not registry:
         bad.append('src/engine/family.cpp: no family registry found')
     untracked = {}
+    notes = []   # what a count in the matrix does not say
     for n, line in enumerate(open('tests/contracts.tsv'), 1):
         line = line.rstrip('\n')
         if not line or line.startswith('#'):
             continue
         f = line.split('\t')
+        if f[0] == 'note':
+            notes.append(f'{f[1]}: {f[2]}')
+            continue
         if f[0] == 'untracked':
             if len(f) < 4 or not re.match(r'L\d+', f[2]) or not f[3].strip():
                 bad.append(f'contracts.tsv:{n}: an untracked row is: untracked, family, Lnnn, note')
@@ -134,6 +138,8 @@ def main():
     for n, kind, target, fam in per_gate:
         if kind == 'gap':
             print(f'    gap: {target} x {fam}')
+    for n_ in notes:
+        print(f'  NOTE: {n_}')
     for fam in registry:
         if fam in FAMILIES:
             continue

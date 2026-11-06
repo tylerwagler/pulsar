@@ -76,7 +76,7 @@ static void st_die(const char *fmt, ...) {
 static uint64_t st_mul(uint64_t a, uint64_t b) {
     uint64_t r = 0;
     if (__builtin_mul_overflow(a, b, &r))
-        st_die("safetensors: declared dimensions overflow (%llu x %llu)", (unsigned long long)a, (unsigned long long)b);
+        st_die("safetensors: declared dimensions overflow (%llu x %llu) -- refusing the container", (unsigned long long)a, (unsigned long long)b);
     return r;
 }
 /// L354: a checked sum, as st_mul.
@@ -86,7 +86,7 @@ static uint64_t st_mul(uint64_t a, uint64_t b) {
 static uint64_t st_add(uint64_t a, uint64_t b) {
     uint64_t r = 0;
     if (__builtin_add_overflow(a, b, &r))
-        st_die("safetensors: declared dimensions overflow (%llu + %llu)", (unsigned long long)a, (unsigned long long)b);
+        st_die("safetensors: declared dimensions overflow (%llu + %llu) -- refusing the container", (unsigned long long)a, (unsigned long long)b);
     return r;
 }
 
@@ -376,7 +376,7 @@ static void blob_array(st_blob *b, const char **p, int depth) {
 
 static void blob_value(st_blob *b, const char **p, uint32_t type, int depth) {
     /* L354: pulsar.kv arrives as a JSON string, so the scanner's nesting limit never sees inside it */
-    if (depth > JSON_MAX_NESTING) st_die("safetensors: a metadata array is nested past %d levels", JSON_MAX_NESTING);
+    if (depth > JSON_MAX_NESTING) st_die("safetensors: a metadata array is nested past %d levels -- refusing the container", JSON_MAX_NESTING);
     const char *q = *p;
     json_ws(&q);
     switch (type) {
