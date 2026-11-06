@@ -1304,9 +1304,11 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
      * 2048-token margin and alignment, so a ~2K preamble has one too), and the
      * phase runs only on the preamble's SECOND sighting: an earlier request's
      * rows cover it and no restore point stands at the cut
-     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  A sync from
-     * token 0 only: a request a restore point at the cut serves loads it (the
-     * resume pick, L318) and resumes at or past the cut.
+     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  L353: at the
+     * preamble (kv_cache_preamble_pos), from any resume below the cut: a request
+     * that adopted a shallower grid point from a bank passes the cut too, and a
+     * request a restore point at the cut serves loads it (the resume pick, L318)
+     * and resumes at or past the cut.
      * L347 I3b (D10, X-Pulsar-KV): a read-only request writes no anchor unless it says pin-anchor; a pin-anchor
      * request pins the restore point the store holds at its cut (whatever it resumed from), else writes it on this,
      * its FIRST sighting -- a read-only caller trickles no rows, so it could never see a second -- pinned. */
@@ -1316,12 +1318,14 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens &&
         (!(kvf & KV_HDR_READ_ONLY) || pin_anchor))
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers);
+        /* L353: a pin-anchor's place is its caller's prompt shape (the judge: one user message), as L347 pinned it */
+        const int anchor = pin_anchor ? kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers)
+                                      : kv_cache_preamble_pos(&s->kv, prompt_for_sync, &s->turn_markers);
         int cut = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
         if (cut >= prompt_for_sync->len) cut = 0;
         if (pin_anchor && cut > 0 && s->kv_cache_pin_anchor(prompt_for_sync, cut)) cut = 0;   /* stored: pinned now */
-        /* L334: a sync from token 0 (the live side: what is computed, not what is counted) */
-        cold_store_len = resumed_at == TokPos{0} ? cut : 0;
+        /* L334: the live side (what is computed, not what is counted).  A pin-anchor: from token 0, as L347 pinned it */
+        cold_store_len = (pin_anchor ? resumed_at == TokPos{0} : resumed_at < TokPos{cut}) ? cut : 0;
     }
     /* An image request's cold phase covers the shared preamble only, and the
      * cut sits at or below the first user turn, so no image block begins

@@ -700,6 +700,16 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
+int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
+    if (!prompt || !m || m->n_user <= 0) return -1;
+    for (int i = 0; i < prompt->len; i++) {
+        const int role = pulsar_turn_marker_at(m, prompt->v, prompt->len, i);
+        if (role == 2) return -1;   /* an assistant turn before any user turn: no preamble this rule can name */
+        if (role == 1) return i >= kc->opt.min_tokens ? i : -1;
+    }
+    return -1;
+}
+
 int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid) {
     if (grid <= 0 || anchor < kc->opt.min_tokens) return 0;
     const int cut = anchor - anchor % grid;

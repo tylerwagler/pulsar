@@ -4993,6 +4993,16 @@ int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *l
  *  @return the cut in tokens, 0 for none */
 int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid);
 int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
+/** L353: where a persisted shared prefix ends: the FIRST user marker -- the system prompt and tools, what conversations
+ *  of one client share however their first messages differ.  A function of the prompt's tokens alone, so the restore
+ *  point's place never depends on what the store or the banks hold.  (kv_cache_chat_anchor_pos, the LAST user marker
+ *  before the first assistant, stays routing's "related conversations" ceiling: Claude Code's first turn is two user
+ *  messages with the typed text in the first, so that one lies past what conversations share.)
+ *  @param kc     the cache (its min_tokens)
+ *  @param prompt the request's tokens
+ *  @param m      the template's turn markers
+ *  @return the marker's position, -1 when there is none or it sits below min_tokens */
+int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m);
 /* Trivial-match classifier for the memory-token resolver (defined in
  * server_sched.cpp; unit-tested in server_tests.cpp). */
 bool server_slot_match_is_trivial(int common, int slot_pos,

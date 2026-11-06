@@ -7444,6 +7444,26 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     pulsar_tokens_push(&claude, 5);
     pulsar_tokens_push(&claude, assistant);
     TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &claude, &m) == 4);
+    /* L353: the persist's preamble is the FIRST user marker, the routing anchor stays the last: Claude Code's two-message
+     * first turn (typed text in the first) and Codex's (environment first) */
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &claude, &m) == 4);
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &codex, &m) == -1);   /* its first marker, 2, is below min_tokens (4) */
+    pulsar_tokens two = {0};
+    for (int t : {1, 2, 3, 4, 5, 6}) pulsar_tokens_push(&two, t);
+    pulsar_tokens_push(&two, user);        /* 6: reminders + the typed text */
+    pulsar_tokens_push(&two, 7);
+    pulsar_tokens_push(&two, user);        /* 8: the environment block */
+    pulsar_tokens_push(&two, 8);
+    pulsar_tokens_push(&two, assistant);
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &two, &m) == 6);
+    TEST_ASSERT(kv_cache_chat_anchor_pos(&kc, &two, &m) == 8);
+    pulsar_tokens early = {0};
+    for (int t : {1, 2, 3, 4, 5}) pulsar_tokens_push(&early, t);
+    pulsar_tokens_push(&early, assistant); /* no user turn before the assistant's */
+    pulsar_tokens_push(&early, user);
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &early, &m) == -1);
+    pulsar_tokens_free(&two);
+    pulsar_tokens_free(&early);
 
     /* L272 B5: Qwen's markers are two tokens, <|im_start|> plus the role word; the
      * anchor is the position of the marker's first token */
