@@ -2,7 +2,7 @@
 """preamble_anchor_live.py -- L353: new conversations of one client share their system prompt, and a restore point at its
 end serves them, on a real pulsar-server.
 
-    python3 tests/preamble_anchor_live.py MODEL --binary ./pulsar-server --work DIR [--port 8325] [--preamble 40000]
+    python3 tests/preamble_anchor_live.py MODEL --binary ./pulsar-server --work DIR [--port 8325] [--preamble 40000] [--block 20000]
                                           [--ctx 65536] [--tag NAME]
 
 Claude Code's new-session shape: a long system prompt, a first user message (shared reminders, then the typed text), a
@@ -32,11 +32,13 @@ class PreambleAnchorLeg(Leg):
     NAME = "preamble-anchor"
     fresh = True
 
-    def __init__(self, g, work, preamble=40000, tag="preamble"):
+    def __init__(self, g, work, preamble=40000, block=20000, tag="preamble"):
         Leg.__init__(self, g, work)
         self.system = ("[%s] You are a careful reader of the story below.\n\n" % tag) + STORY[:preamble]
+        # as in Claude Code: a long shared block AFTER the typed text, so a bank's grid is thinned where sessions part
+        # and no bank holds a checkpoint near the system prompt's end by chance
         self.shared = "<reminder>Answer in one short sentence.</reminder>\n"
-        self.block = "<environment>Working directory: /tmp/%s</environment>" % tag
+        self.block = "<environment>Working directory: /tmp/%s\n%s</environment>" % (tag, STORY[preamble:preamble + block])
         self.reply = None
 
     def body(self, k):
@@ -85,6 +87,7 @@ class PreambleAnchorLeg(Leg):
 
 def _args(ap):
     ap.add_argument("--preamble", type=int, default=40000)
+    ap.add_argument("--block", type=int, default=20000)
     ap.add_argument("--tag", default="preamble")
 
 

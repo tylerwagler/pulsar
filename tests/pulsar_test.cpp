@@ -1200,7 +1200,10 @@ static void test_image_chain_round_trip(void) {
         char *text = (char *)xmalloc(TEXT_MAX);
         size_t n = 0;
         for (int r = 0; r < 40; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Background note %d. ", r);
-        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Here is " PULSAR_IMAGE_PLACEHOLDER " to discuss. ");
+        /* L353: the family's own placeholder (a served family's chain is the one this gate is for) */
+        const pulsar_family_vision *fv = engine->family ? engine->family->vision : NULL;
+        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Here is %s to discuss. ",
+                              fv && fv->placeholder_text ? fv->placeholder_text : PULSAR_IMAGE_PLACEHOLDER);
         for (int r = 0; r < 700 && n < TEXT_MAX - 128; r++)
             n += (size_t)snprintf(text + n, TEXT_MAX - n, "A sentence about the picture, number %d. ", r);
         pulsar_tokenize_rendered_chat(engine, text, &raw);
