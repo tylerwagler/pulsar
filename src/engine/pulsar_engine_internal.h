@@ -5195,6 +5195,16 @@ uint8_t *vision_pil_resize_rgb(const uint8_t *src, int src_w, int src_h, int dst
 /// @param dst_h destination height
 /// @return the resized f32 planes (caller frees), or NULL
 float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, int dst_h);
+/** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
+ *  reference tooling opens decodes here too. */
+#define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
+/** L354: the bytes all concurrent decodes may hold: one thread decodes per Parse connection, so the per-image cap alone is
+ *  64 x 1.25 GiB.  A chat server decodes on its one worker and never meets it. */
+#define PULSAR_VISION_DECODE_BUDGET_BYTES (16ull << 30)
+/** L354: hold `bytes` of the decode budget.  @param bytes what the decode allocates  @return false (said) when over it */
+bool vision_decode_reserve(uint64_t bytes);
+/** L354: give back what vision_decode_reserve held.  @param bytes the same count */
+void vision_decode_release(uint64_t bytes);
 /** L354: whether an image of these dimensions may be decoded (said on stderr when not).
  *  @param width pixels  @param height pixels  @return true when its pixels are within the limit */
 bool vision_decode_admits(uint64_t width, uint64_t height);

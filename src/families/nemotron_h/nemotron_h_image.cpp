@@ -51,7 +51,7 @@ bool pulsar_nemotron_h_image_prepare(const pulsar_nemotron_h_vision_shape *s, co
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
     if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) {
-        snprintf(err, errlen, "the image could not be decoded (PNG or JPEG)");
+        snprintf(err, errlen, "the image could not be decoded (PNG or JPEG, at most %llu pixels)", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     pulsar_nemotron_h_tile(s, w, h, &img->wp, &img->hp);

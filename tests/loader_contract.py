@@ -88,7 +88,7 @@ FAMILIES = {
     },
 }
 MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count', 'deep-array',
-             'dim-overflow')
+             'dim-overflow', 'no-kv-arch')
 REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
                  'does not')
 SMALL_SIDE_FILE = 64 << 20      # side files up to this size are copied; larger ones are cloned sparse
@@ -244,6 +244,13 @@ def mutate(shards, family, row, what):
         edit_meta_json(s, 'pulsar.tensors', lambda t: {**t, 'probe.overflow': {
             'gguf_name': 'probe.overflow', 'layout': 'mxfp8_lt', 'dims_ne': [2**53, 2**53]}})
         return 'a tensor declared [2^53, 2^53]', ['overflow']
+    if what == 'no-kv-arch':   # L354: every shard of the build carries the architecture keys
+        for s in shards:
+            meta = s['header'].get('__metadata__', {})
+            if 'pulsar.kv_arch' in meta and 'pulsar.kv' not in meta:
+                del meta['pulsar.kv_arch']
+                return f"{s['name']} without pulsar.kv_arch", ['pulsar.kv_arch']
+        sys.exit(f'loader_contract: {family} has no second shard')
     if what == 'shard-count':   # L354: a stale shard left by a rebuild, or a missing one, disagrees with the build's count
         n = len(shards)
         for s in shards:

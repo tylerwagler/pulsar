@@ -20,6 +20,7 @@
  * therefore zero-mask ids >= vocab_size the way the reference's
  * ParallelEmbedding does (gather row 0, then zero the row); every sentinel
  * position is overwritten before the decoder layers see it. */
+#include <atomic>
 #include "pulsar_engine_internal.h"
 
 #include <math.h>
@@ -284,7 +285,7 @@ bool vision_ds4_expand(const pulsar_image_ref *img, pulsar_tokens *out, char *er
     const int block_at = out->len;      /* the block start, before any of it is appended */
     pulsar_vision_prepared prep = {};
     if (!vision_prepare_image(img->bytes, img->len, &args, block_at, (int)PULSAR_N_VOCAB, &prep)) {
-        snprintf(err, errlen, "an image could not be decoded or is not one the vision tower accepts");
+        snprintf(err, errlen, "an image could not be decoded (PNG or JPEG, at most %llu pixels) or is not one the vision tower accepts", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     bool ok = true;
@@ -847,10 +848,29 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
  * by the dispatcher -- the caller fails loudly, it does not guess.
  * ------------------------------------------------------------------------- */
 
-/** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
- * reference tooling opens decodes here too.  A body cap is not a pixel cap: a solid 32000 x 32000 PNG is 2.9 MiB of body
- * and took 6.6 GiB of RSS to decode (measured, CT 124) before every image is scaled down to the model's canvas anyway. */
-#define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
+/** L354: the bytes the decodes in flight hold. */
+static std::atomic<uint64_t> g_decode_bytes{0};
+
+bool vision_decode_reserve(uint64_t bytes) {
+    const uint64_t before = g_decode_bytes.fetch_add(bytes);
+    if (before + bytes <= PULSAR_VISION_DECODE_BUDGET_BYTES) return true;
+    g_decode_bytes.fetch_sub(bytes);
+    fprintf(stderr, "pulsar: vision: refusing a decode of %llu MiB: %llu MiB are in flight (budget %llu MiB)\n",
+            (unsigned long long)(bytes >> 20), (unsigned long long)(before >> 20),
+            (unsigned long long)(PULSAR_VISION_DECODE_BUDGET_BYTES >> 20));
+    return false;
+}
+
+void vision_decode_release(uint64_t bytes) { g_decode_bytes.fetch_sub(bytes); }
+
+/** L354: a decode's hold on the budget, for all of its returns. */
+struct decode_hold {
+    uint64_t bytes;   ///< what it holds
+    bool ok;          ///< the reserve succeeded
+    /// @param b the bytes to hold
+    explicit decode_hold(uint64_t b) : bytes(b), ok(vision_decode_reserve(b)) {}
+    ~decode_hold() { if (ok) vision_decode_release(bytes); }
+};
 
 bool vision_decode_admits(uint64_t width, uint64_t height) {
     if (width == 0 || height == 0 || width > PULSAR_VISION_MAX_DECODED_PIXELS ||
@@ -882,6 +902,11 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
      * gate caught exactly that on an RGBA PNG. */
     image.format = PNG_FORMAT_RGBA;
     if (!vision_decode_admits(image.width, image.height)) {
+        png_image_free(&image);
+        return 0;
+    }
+    const decode_hold hold((uint64_t)image.width * image.height * 7u);   /* RGBA, then RGB beside it */
+    if (!hold.ok) {
         png_image_free(&image);
         return 0;
     }
@@ -934,8 +959,10 @@ static void vision_jpeg_output_message(j_common_ptr cinfo) { (void)cinfo; }
 /// @param[out] w_out width
 /// @param[out] h_out height
 /// @return 1, or 0 when it does not decode or is refused
-static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
-                              uint8_t **rgb_out, int *w_out, int *h_out) {
+/// @param[out] held_out the decode budget it reserved (the wrapper releases it)
+static int vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
+                              uint8_t **rgb_out, int *w_out, int *h_out,
+                                    uint64_t *held_out) {
     struct jpeg_decompress_struct cinfo;
     struct vision_jpeg_error jerr;
     memset(&cinfo, 0, sizeof cinfo);   /* so the longjmp path's destroy is a no-op */
@@ -956,6 +983,13 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
         jpeg_destroy_decompress(&cinfo);
         return 0;
     }
+    /* no destructor may cross libjpeg's longjmp: the wrapper below releases what this reports */
+    const uint64_t held = (uint64_t)cinfo.image_width * cinfo.image_height * 3u;
+    if (!vision_decode_reserve(held)) {
+        jpeg_destroy_decompress(&cinfo);
+        return 0;
+    }
+    *held_out = held;
     if (cinfo.jpeg_color_space == JCS_CMYK || cinfo.jpeg_color_space == JCS_YCCK) {
         jpeg_destroy_decompress(&cinfo);
         return 0;
@@ -988,6 +1022,21 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
     *h_out = ch;
     *rgb_out = buf;
     return 1;
+}
+
+/// Decode a JPEG to RGB8 (CMYK / YCCK refused).
+/// @param bytes the encoded image
+/// @param len its length
+/// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
+/// @param[out] w_out width
+/// @param[out] h_out height
+/// @return 1, or 0 when it does not decode or is refused
+static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
+                              uint8_t **rgb_out, int *w_out, int *h_out) {
+    uint64_t held = 0;
+    const int r = vision_decode_jpeg_inner(bytes, len, rgb_out, w_out, h_out, &held);
+    if (held) vision_decode_release(held);
+    return r;
 }
 
 /* Formats the server accepts today: PNG and JPEG.  A GIF/WebP/... payload is

@@ -61,7 +61,7 @@ bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
     if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) {
-        snprintf(err, errlen, "the image could not be decoded (PNG or JPEG)");
+        snprintf(err, errlen, "the image could not be decoded (PNG or JPEG, at most %llu pixels)", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     int rh = 0, rw = 0;
@@ -368,7 +368,7 @@ static bool qwen_image_expand(const pulsar_engine *e, const pulsar_image_ref *im
                               size_t errlen) {
     uint32_t h = 0, w = 0;
     if (!qwen_image_grid(e, img, &h, &w)) {
-        snprintf(err, errlen, "an image could not be decoded or is not one the vision tower accepts");
+        snprintf(err, errlen, "an image could not be decoded (PNG or JPEG, at most %llu pixels) or is not one the vision tower accepts", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     for (uint32_t i = 0; i < h * w; i++) pulsar_tokens_push(out, qwen_pad_id(e));

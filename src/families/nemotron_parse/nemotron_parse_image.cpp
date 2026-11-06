@@ -131,7 +131,7 @@ bool pulsar_nemotron_parse_page_prepare(const pulsar_nemotron_parse_shape *s, co
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
     if (!vision_decode_rgb(bytes, len, &rgb, &w, &h) || w <= 0 || h <= 0) {
-        if (err) snprintf(err, errlen, "the image is not a PNG or JPEG this engine decodes");
+        if (err) snprintf(err, errlen, "the image is not a PNG or JPEG of at most %llu pixels", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     /* _resize_with_aspect_ratio (LongestMaxSizeHW): the original's own int truncations */

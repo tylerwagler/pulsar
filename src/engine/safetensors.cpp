@@ -1102,6 +1102,10 @@ static void st_open(pulsar_model *m, const char *path, bool gpu_mapping) {
     if (const char *arch = st_meta_get(primary, "pulsar.kv_arch")) {
         for (uint64_t i = 0; i < n; i++) {
             const char *k = st_meta_get(&shards[i], "pulsar.kv_arch");
+            /* L354: a shard of the build has to carry it; one added after the build (no pulsar.n_shards) carries neither */
+            if (!k && st_meta_get(&shards[i], "pulsar.n_shards"))
+                st_die("safetensors: %s has no pulsar.kv_arch, and a shard of this build must -- refusing the container",
+                       shards[i].name);
             if (k && strcmp(k, arch) != 0)
                 st_die("safetensors: %s's pulsar.kv_arch differs from the primary shard's (%s): a shard of another "
                        "build -- refusing the container", shards[i].name, primary->name);

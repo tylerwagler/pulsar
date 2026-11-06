@@ -481,7 +481,7 @@ bool expand(const pulsar_engine *e, const pulsar_image_ref *img, pulsar_tokens *
     const pulsar_nemotron_h_vision *v = vision_of(e);
     uint32_t wp = 0, hp = 0;
     if (!v || !tile_of(v, img, &wp, &hp)) {
-        snprintf(err, errlen, "an image could not be decoded or is not one the vision tower accepts");
+        snprintf(err, errlen, "an image could not be decoded (PNG or JPEG, at most %llu pixels) or is not one the vision tower accepts", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
     const uint32_t n = wp * hp / (v->shape.merge * v->shape.merge);

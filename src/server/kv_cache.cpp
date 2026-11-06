@@ -848,7 +848,11 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     size_t len = 0;
     char *text = pulsar_kvtext_render_tokens_text(s->engine, &head, &len);
     kv_chain_hit hit;
-    const int D = text ? kv_cache_find(text, NULL, 0, &hit) : 0;
+    /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
+     * overstated the gain and logged a warning a persist */
+    uint64_t hashes[64];
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes, 64);
+    const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
     uint64_t rp = pulsar_session_restore_point_bytes(s->sess, TokPos{E});
@@ -1097,7 +1101,14 @@ int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     uint64_t hashes[HASHES_MAX];
     const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
-    return kv_cache_find(req->prompt_text, hashes, n_images, hit);
+    const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
+    /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
+     * of the last row).  The next stored point below it can: look again without the last segment's last byte. */
+    if (G < req->prompt.len || G <= 0) return G;
+    const uint64_t cut = hit->chain[hit->n - 1].text_end;
+    if (cut == 0u) return 0;
+    std::string shorter(req->prompt_text, (size_t)cut - 1u);
+    return kv_cache_find(shorter.c_str(), hashes, n_images, hit);
 }
 
 kv_restore_verdict server::kv_cache_price(const kv_chain_hit *hit, int base) {

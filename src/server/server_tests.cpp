@@ -9132,6 +9132,8 @@ static void test_l354_completions_refusal_frees_controls(void) {
 }
 
 bool vision_decode_admits(uint64_t width, uint64_t height);   /* the engine's, out of the public API */
+bool vision_decode_reserve(uint64_t bytes);
+void vision_decode_release(uint64_t bytes);
 
 /* L354: an image's declared pixels are admitted before a decode allocates them (F2; on a real server,
  * tests/encode_admission_live.py), and the judge's request budget (F4). */
@@ -9142,6 +9144,14 @@ static void test_l354_admission_limits(void) {
     TEST_ASSERT(!vision_decode_admits(32000, 32000));
     TEST_ASSERT(!vision_decode_admits(0, 10) && !vision_decode_admits(10, 0));
     TEST_ASSERT(!vision_decode_admits(UINT32_MAX, UINT32_MAX));
+    /* the budget all decodes in flight share */
+    TEST_ASSERT(vision_decode_reserve(10ull << 30));
+    TEST_ASSERT(vision_decode_reserve(6ull << 30));
+    TEST_ASSERT(!vision_decode_reserve(1));
+    vision_decode_release(6ull << 30);
+    TEST_ASSERT(vision_decode_reserve(1));
+    vision_decode_release(1);
+    vision_decode_release(10ull << 30);
     TEST_ASSERT(judge_question_count_ok(1) && judge_question_count_ok(PULSAR_JUDGE_MAX_QUESTIONS));
     TEST_ASSERT(!judge_question_count_ok(PULSAR_JUDGE_MAX_QUESTIONS + 1));
     TEST_ASSERT(judge_total_tokens_ok(4 * 131072, 131072) && !judge_total_tokens_ok(4 * 131072 + 1, 131072));
