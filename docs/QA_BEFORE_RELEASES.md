@@ -85,7 +85,7 @@ model.  Record pass/fail against the release commit:
   indexed, decode-batch, one-row), banked cross-session KV-leak isolation
   (modelless).
 - `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
-  `PREFILL_BASELINE_REF` blob (default `13bcbab1`, the L292 NVFP4
+  `PREFILL_BASELINE_REF` blob (default `5fe1831d`, the CUDA 13.5 toolchain; before it `13bcbab1`, the L292 NVFP4
   exact-divide fix; provenance in `tests/test-vectors/`).  **The baseline
   build must be able to load the shipped artifact**: a baseline ref that
   predates the artifact's layouts or payload version cannot run at all, and

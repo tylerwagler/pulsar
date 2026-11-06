@@ -2101,6 +2101,8 @@ context-coherence-probe:
 # Controls run at the same time: the tree itself grades +0.00%, and the
 # SUPERSEDED arithmetic grades +48.88% FURTHER and FAILS -- so the gate rejects
 # regression as well as accepting improvement.
+# MOVED 13bcbab1 -> 5fe1831d on 2026-11-06 (L354), BY TYLER'S OVERRIDE: the CUDA 13.5 + CUTLASS v4.8.1 toolchain moved the
+# depths with a small tail (see the blob's .md and the dated note at cuda-reference-gate-budget).
 # MOVED f5bea7aa -> 13bcbab1 on 2026-10-13 (L292), BY TYLER'S OVERRIDE, not by
 # the CLOSER rule above.  The 0731 NVFP4 KV row's two divides are IEEE
 # (__fdiv_rn) instead of fast-math MUFU.RCP x FMUL, which makes the device row
@@ -2504,6 +2506,10 @@ cuda-reference-gate: tests/gates_runner
 # it cannot arbitrate FP4 rounding.  The exact divide makes the device row equal
 # the host recipe (rule 7).  Next re-grade: an NVFP4-KV B300 capture (#42).  This
 # is not a precedent: any other AWAY grade still means reject, not re-record.
+#
+# 2026-11-06 (L354), a second exception, Tyler's: the CUDA 13.5 + CUTLASS v4.8.1 toolchain graded story NET +0.78% (1.958e-5 ->
+# 1.973e-5), all of it depth 4102 (2.162e-6 -> 2.316e-6), every top-1 matching, code unmoved.  "we're not gonna stay pinned
+# on an old toolchain. just regrade it and reset the baseline."  The cause inside the toolchain was not split.
 .PHONY: cuda-reference-gate-budget
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
