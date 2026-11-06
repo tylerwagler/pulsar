@@ -17,7 +17,7 @@ import re
 import sys
 
 CONTRACTS = ('session', 'loader', 'spec', 'spec-dist', 'reference', 'chat', 'server', 'tp')
-FAMILIES = ('deepseek4', 'qwen4_exp', 'nemotron_h', 'gemma4')
+FAMILIES = ('deepseek4', 'qwen4_exp', 'nemotron_h', 'gemma4', 'nemotron_enc', 'nemotron_parse', 'inkling')
 
 
 def make_list(text, var):

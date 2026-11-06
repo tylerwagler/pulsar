@@ -1113,6 +1113,9 @@ void server::gen_begin(session_slot *sl) {
         if (s->kv.enabled && mem < j->req.prompt.len) {
             disk_hit = (kv_chain_hit *)server_xmalloc(sizeof(kv_chain_hit));
             disk_at = s->kv_cache_find_req(&j->req, disk_hit);
+            /* L353 no. 15: a chain ending at the prompt's end can't be resumed: a load leaves no record there and a resume stops
+             * short of the last row, so the bank resets.  It was read in full, reported as cached, and prefilled from 0 */
+            if (disk_at >= j->req.prompt.len) disk_at = 0;
             if (disk_at > mem) disk_v = s->kv_cache_price(disk_hit, mem);
         }
         pick = server_resume_pick(own, adopt_at, disk_at, disk_v);

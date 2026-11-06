@@ -84,9 +84,6 @@ na	render-gate	qwen4_exp	DeepSeek V4.1's encoder goldens; Qwen's template is qwe
 na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
 na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
 na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates
-untracked	inkling	L354	parked family; its forward is not wired
-untracked	nemotron_enc	L354	served on CT 131; its gates are not in this matrix yet
-untracked	nemotron_parse	L354	served on CT 131; its gates are not in this matrix yet
 # L354: the two other served families.  What they run in the battery is what the log shows; the rest is written down here.
 nemotron-chat-gate	chat	nemotron_h	battery	tokenize / render / parser vs HF goldens
 na	nemotron-chat-gate	deepseek4	Nemotron's template and tokenizer; DeepSeek's template is render-gate
@@ -132,3 +129,70 @@ na	render-gate	gemma4	DeepSeek V4.1's encoder goldens
 gap	tp	gemma4	L354	TP is on demand; no gate until one is served
 gap	chat	gemma4	L354	no chat gate vs HF goldens in the battery for Gemma
 note	gemma4	no Gemma model in the battery: its counts are family-neutral (all) gates, none has run a Gemma fixture
+# L354: the families no battery model runs.
+gap	chat	inkling	L354	parked: its forward is not wired, so no session can run
+gap	chat	nemotron_enc	L354	an encoder: no chat, no decode, no session contract of its own
+gap	chat	nemotron_parse	L354	the OCR parser: its own decoder loop, no chat lane
+gap	tp	inkling	L354	parked: its forward is not wired, so no session can run
+gap	tp	nemotron_enc	L354	an encoder: no chat, no decode, no session contract of its own
+gap	tp	nemotron_parse	L354	the OCR parser: its own decoder loop, no chat lane
+na	cuda-chat-smoke-gate	inkling	parked: its forward is not wired, so no session can run
+na	cuda-chat-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	cuda-chat-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	nemotron-chat-gate	inkling	parked: its forward is not wired, so no session can run
+na	nemotron-chat-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	nemotron-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-chat-gate	inkling	parked: its forward is not wired, so no session can run
+na	qwen-chat-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-family-gate-device	inkling	parked: its forward is not wired, so no session can run
+na	qwen-family-gate-device	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-family-gate-device	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-image-smoke-gate	inkling	parked: its forward is not wired, so no session can run
+na	qwen-image-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-image-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-ref-gate	inkling	parked: its forward is not wired, so no session can run
+na	qwen-ref-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-ref-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	render-gate	inkling	parked: its forward is not wired, so no session can run
+na	render-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	render-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-accounting-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-accounting-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-accounting-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-bank-spec-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-bank-spec-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-bank-spec-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-decode-reference-gate-story	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-decode-reference-gate-story	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-decode-reference-gate-story	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-dspark-batch-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-dspark-batch-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-dspark-batch-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-evict-restore-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-evict-restore-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-evict-restore-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-frontier-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-frontier-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-frontier-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-mixed-neutrality-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-mixed-neutrality-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-mixed-neutrality-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-mixed-neutrality-gate-wide	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-mixed-neutrality-gate-wide	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-mixed-neutrality-gate-wide	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-mixed-prefill-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-mixed-prefill-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-mixed-prefill-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-rewind-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-rewind-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-rewind-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-session-payload-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-session-payload-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-session-payload-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-tp-head-split-gate	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-tp-head-split-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-tp-head-split-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+note	nemotron_enc	no nemotron_enc model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+note	nemotron_parse	no nemotron_parse model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+note	inkling	no inkling model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
