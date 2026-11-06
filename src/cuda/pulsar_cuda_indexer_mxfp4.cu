@@ -71,7 +71,9 @@
 /// Compressed rows per scorer block.
 #define IDX_NTILE     128u         /* compressed rows per block */
 /// 32-wide K slabs (MMA k32 steps, one ue8m0 scale each) per head row.
-#define IDX_KSLABS    (IDX_HEAD_DIM / 32u)   /* 4 */
+#define IDX_KSLABS    PULSAR_MXKV_NBLK(IDX_HEAD_DIM)   /* 4; L354: the row's geometry is pulsar_gpu.h's */
+static_assert(IDX_KSLABS == 4u, "the index-K row's scale bytes");
+static_assert(PULSAR_MXKV_FP4_ROWBYTES(IDX_HEAD_DIM) == IDX_HEAD_DIM / 2u + IDX_KSLABS, "the index-K row's bytes");
 /* Shared rows are PADDED off the bank period.  A 128-byte row stride is exactly
  * 32 words = the bank count, so every row starts in bank 0: the eight lanes of
  * an m16n8 group read eight different rows at the same k, and all eight hit the
@@ -369,7 +371,7 @@ static void idx_scores_mxfp4_kernel(
              * Caught 2026-09-01 by repairing this tier's correctness gate,
              * which had not compiled since f9fbafe (L137).  The gate now pins
              * the relationship at 1.0 and mutation-fails if it drifts. */
-            sSFB[c * IDX_KSLABS + u] = row[64u + u];
+            sSFB[c * IDX_KSLABS + u] = row[IDX_HEAD_DIM / 2u + u];
         }
     }
     __syncthreads();
