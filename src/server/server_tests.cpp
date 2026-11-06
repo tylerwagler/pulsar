@@ -8141,7 +8141,7 @@ static void test_l323_tail_supersession(void) {
     TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && !sb.dominated);
     pulsar_segstore_close(st);
     /* eviction: the branch is made the OLDEST leaf (its header's last_used), so plain LRU would take it; the
-     * dominated tails go first all the same (L353: and the branch keeps its end's restore point) */
+     * dominated tails go first all the same */
     {
         char path[600];
         snprintf(path, sizeof path, "%s/%.40s.seg", dir, bkey);
@@ -8154,9 +8154,7 @@ static void test_l323_tail_supersession(void) {
                                   const uint64_t u = pulsar_segstore_used_bytes(o); pulsar_segstore_close(o); return u; }();
     st = pulsar_segstore_open(dir, used + 200, 7, NULL, NULL);   /* room for nothing big: a put must evict */
     TEST_ASSERT(l323_persist(st, 8400, 4096, true, tip) == 1);
-    TEST_ASSERT(pulsar_segstore_contains(st, bkey));                           /* the old branch's rows stay */
-    TEST_ASSERT(pulsar_segstore_get(st, bkey, &sb) && sb.rp_bytes > 0u);      /* and where it resumes */
-    TEST_ASSERT(!pulsar_segstore_contains(st, t1) || !pulsar_segstore_contains(st, t2));   /* a dominated tail went */
+    TEST_ASSERT(!pulsar_segstore_contains(st, t1) && !pulsar_segstore_contains(st, t2));   /* the dominated tails went */
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -8960,12 +8958,12 @@ static void test_l347_i2_older_ends_kept(void) {
     TEST_ASSERT(pulsar_segstore_get(st, e1.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, e3.key, &g) && g.rp_bytes > 0u);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u && g.rp_flags == PULSAR_SEGSTORE_RP_ANCHOR);
-    /* more pressure: the first newcomer's rows, which restore nothing (L353), then the next unflagged one (5000's,
-     * older than 9200's), before the anchor */
+    /* more pressure: the rows that restore nothing (L353) -- 9000's tail, dominated by 9200's, then the first newcomer's
+     * -- then the next unflagged one (5000's, older than 9200's), before the anchor */
     char nk2[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second newcomer", L323_STATE, 10, nk2));
-    TEST_ASSERT(l347_ev_at(log, nk, false) == 1);
-    TEST_ASSERT(l347_ev_at(log, e1.key, true) == 2);
+    TEST_ASSERT(l347_ev_at(log, e2.key, false) == 1 && l347_ev_at(log, nk, false) == 2);
+    TEST_ASSERT(l347_ev_at(log, e1.key, true) == 3);
     TEST_ASSERT(pulsar_segstore_get(st, a.key, &g) && g.rp_bytes > 0u);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
