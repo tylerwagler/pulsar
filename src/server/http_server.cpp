@@ -53,10 +53,7 @@ static ssize_t header_end(const char *p, size_t n) {
     for (size_t i = 3; i < n; i++) {
         if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n') return (ssize_t)(i + 1);
     }
-    for (size_t i = 1; i < n; i++) {
-        if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
-    }
-    return -1;
+    return -1;   /* L354: CRLFCRLF only: a second reading of where the head ends is what a smuggled request needs */
 }
 
 
@@ -78,15 +75,21 @@ static long content_length(const char *h, size_t n) {
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
-        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+        /* L354: the name up to the colon, spaces before the colon included (a space there used to hide the header) */
+        const char *colon = (const char *)memchr(line, ':', len);
+        size_t nlen = colon ? (size_t)(colon - line) : 0u;
+        while (nlen && isspace((unsigned char)line[nlen - 1])) nlen--;
+        if (nlen == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0) {
             return -1;
         }
-        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            const char *v = line + 15;
+        if (nlen == 14 && strncasecmp(line, "Content-Length", 14) == 0) {
+            const char *v = colon + 1;
             while (v < line + len && isspace((unsigned char)*v)) v++;
             char *vend = NULL;
             long parsed = strtol(v, &vend, 10);
             if (vend == v || parsed < 0) return -1;
+            while (vend < line + len && isspace((unsigned char)*vend)) vend++;
+            if (vend != line + len) return -1;   /* L354: "12x" is not 12 */
             if (seen && parsed != clen) return -1;
             seen = 1;
             clen = parsed;
@@ -189,6 +192,13 @@ bool read_http_request(int fd, http_request *r) {
         i++;
     }
     line[i] = '\0';
+    /* L354: a request line or a target too long to hold is refused, not truncated to another target */
+    if (i + 1 >= sizeof(line) && b.ptr[i] != '\n') goto fail;
+    {
+        const char *sp = strchr(line, ' ');
+        const char *sp2 = sp ? strchr(sp + 1, ' ') : NULL;
+        if (sp && (sp2 ? (size_t)(sp2 - sp - 1) : strlen(sp + 1)) > 255u) goto fail;
+    }
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q;
     q = strchr(r->path, '?');

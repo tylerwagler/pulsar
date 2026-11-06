@@ -334,6 +334,9 @@ bool parse_chat_conversation_openai(const char *body, chat_conversation *c, requ
         json_ws(&p);
     }
     if (*p != '}') return false;
+    p++;
+    json_ws(&p);
+    if (*p) return false;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
         return false;
@@ -527,6 +530,9 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
         goto bad;
@@ -1582,6 +1588,9 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_input) {
         snprintf(err, errlen, "missing input");
         goto bad;
@@ -1796,6 +1805,9 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
         goto bad;

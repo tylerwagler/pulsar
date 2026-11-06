@@ -2785,7 +2785,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # with spec_sampling alone running 2x2500 trajectories; it is the wrong tool to
 # sit and watch after every edit.  (This said "17 gates" as a second copy of a
 # fact that lives in GATE_TARGETS and had drifted to 10; the list is the count.)
-# These four are the ones that actually catch a numerics or dispatch regression:
+# These five are the ones that actually catch a numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
 #   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
 #   cuda-frontier-gate       frontier logits across banks
@@ -2795,7 +2795,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # full TRAJ is required for statistical power, so quick mode leaves it out
 # rather than run it under-powered and call it a pass.
 # NOT a substitute for `make gates` before a merge.
-GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-frontier-gate \
+GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-chunk-neutrality-gate cuda-frontier-gate \
                       cuda-mixed-neutrality-gate
 
 gates-quick:

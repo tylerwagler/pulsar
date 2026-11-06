@@ -732,6 +732,7 @@ struct pulsar_tp {
     uint64_t timeout_sec;
     /// Latched once the group can no longer be trusted; every later operation refuses.
     std::atomic<bool> failed{false};
+    std::atomic<bool> row_abort_sent{false};   ///< L354: this transport's "send once", not the process's
     /* The cross-rank logits identity tally (leader only; L243). */
     /// Peer acks checked against the leader's logits digest.
     uint64_t identity_frames;
@@ -1933,10 +1934,9 @@ static void tp_row_proxy_fail(pulsar_tp *tp) {
 
 void pulsar_tp_row_lane_abort(pulsar_tp *tp, const char *why) {
     if (!tp) return;
-    static std::atomic<bool> sent{false};
     pulsar_tp_mark_failed(tp);
     tp_row_err_latch(tp, 2u);
-    if (sent.exchange(true)) return;
+    if (tp->row_abort_sent.exchange(true)) return;
     fprintf(stderr, "pulsar-tp: rank %d aborts the pair's row lane: %s\n", tp->rank,
             why ? why : "(no reason)");
     tp_row_abort_msg m;

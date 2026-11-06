@@ -4128,7 +4128,7 @@ typedef struct {
     const char *trace_path;        ///< request trace file; NULL disables tracing
     const char *kv_disk_dir;       ///< directory for the on-disk KV cache
     bool kv_disk_disable;          ///< turn the disk cache off entirely
-    uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB
+    uint64_t kv_disk_space_mb;     ///< disk-cache budget in MiB (0 = unbounded)
     int64_t kv_ram_mb;             ///< L347 I3a: --kv-ram-mb, the host pool in MiB (< 0: kv_ram_plan_for's default)
     kv_cache_options kv_cache;     ///< checkpoint placement policy
     /** L321: every -m in order (engine.model_path is the first); more than one opens them as one engine group in
@@ -4166,6 +4166,8 @@ void buf_putc(buf *b, char c);
 void buf_puts(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...);
 char *buf_take(buf *b);
+/** L354: say so at startup when a server with no authentication binds past loopback.  @param host the bind address */
+void server_warn_if_exposed(const char *host);
 void buf_free(buf *b);
 /* json_ws / json_lit / json_string[_n] / json_number / json_int / json_bool /
  * json_skip_value / json_raw_value are declared in pulsar_json.h (included

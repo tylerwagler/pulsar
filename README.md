@@ -146,7 +146,7 @@ hf download ElytronAI/DeepSeek-v4-Flash --local-dir /path/to/DeepSeek-v4-Flash
 
 `-m` takes a shard directory or a single file. Without `-m` the server looks for
 `./model` or `./model.safetensors`, then the same names under `$PULSAR_MODEL_DIR`.
-The server listens on `0.0.0.0:8000` by default and has **no authentication**: run
+The server listens on `127.0.0.1:8000` by default and has **no authentication**: to expose it, pass `--host` and run
 it on a network you control, or bind it with `--host 127.0.0.1` and put your own
 authenticating proxy in front.
 
@@ -157,7 +157,7 @@ Flags a user normally sets:
 | `-m, --model PATH` | `./model`, then `$PULSAR_MODEL_DIR/model` | The container. Repeat it to host several encoder / Parse models in one process. |
 | `-c, --ctx N` | 1048576 | Context per session. A context past the model's trained positions is refused. |
 | `--rope-yarn F` | off | YaRN scaling over a native rope (Qwen: `4` = 1M positions). Refused under TP and by families without a rope. |
-| `--host H` / `--port N` | `0.0.0.0` / `8000` | Bind address. |
+| `--host H` / `--port N` | `127.0.0.1` / `8000` | Bind address. |
 | `--kv-disk-dir DIR` | `$XDG_CACHE_HOME/pulsar/kv-<model>` (else `~/.cache/pulsar/...`) | Disk KV cache directory. `""` disables it. |
 | `--no-kv-disk` | | Disable the disk KV cache. |
 | `--kv-disk-space-mb N` | no limit | Disk KV budget. |

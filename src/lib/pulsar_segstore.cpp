@@ -647,6 +647,10 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
             retired++;
             retired_bytes += stat_ok ? (uint64_t)sb.st_size : 0u;
         }
+        /* L354: a segment of this store whose size disagrees with its header can never load, and sat outside `used` */
+        if (ok && stat_ok && !sized && ::unlink(p.c_str()) == 0)
+            st->logf("segment %.40s removed: %llu bytes, its header says %llu", e.key, (unsigned long long)sb.st_size,
+                     (unsigned long long)(HDR + e.text_len + e.payload_bytes + e.trailer_bytes));
         if (!sized || !head_ok) continue;
         e.file_bytes = (uint64_t)sb.st_size;
         st->link(e);
@@ -1081,9 +1085,10 @@ uint64_t pulsar_segstore_image_bytes(uint64_t file_bytes) { return pulsar_kvpool
  * bytes, over the rest), off the store's thread; the image goes to "<final>.tmp.<pid>" with O_DIRECT -- straight from
  * the image, which is granule-aligned and padded, so the write is whole granules; the file is then cut to its true
  * size (ftruncate: the file's bytes are exactly the store's layout, no pad on disk) -- and renamed into place.
- * NO fsync and no directory fsync: an O_DIRECT write is on the device when it returns, and a file a crash tore (the
- * rename's metadata lost, a tmp left behind) is refused when the store opens (tmp files removed, every file's size
- * checked against its header) or when it is read (the payload's digest). */
+ * NO fsync and no directory fsync, on purpose (1.4 GB/s fsynced against 2.5 GB/s, L347): this is a cache, and a crash
+ * costs a re-prefill.  O_DIRECT bypasses the page cache, not the device's write cache, and the rename's metadata isn't
+ * ordered against the data, so a crash can leave a torn file (L354: the old comment claimed otherwise).  Each is caught:
+ * a tmp file or a wrong size when the store opens (removed), a torn payload when it is read (its digest). */
 bool pulsar_segstore_job_write(pulsar_segstore_job *job, char *err, size_t errlen) {
     pulsar_kvdigest_seal(job->img.p + job->payload_off, job->payload_bytes);
     char tmp[64];

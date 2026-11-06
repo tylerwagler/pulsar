@@ -854,6 +854,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     if (last) pulsar_ckpt_commit(st, bank, at.slot, G);
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
+    s->mseq_dirty = false;   /* L354: as load_payload */
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
      * drafter window with it), else the store's alone (Qwen: its sync owns the rest) */
     const pulsar_family_bank_ops *bops = s->engine->family->banks;
@@ -1254,6 +1255,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     s->prefill_frontier = (int)PF;   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
     s->checkpoint_valid = true;
     s->logits_stale = false;
+    s->mseq_dirty = false;   /* L354: the frontier is this payload's now, whatever batched step ran before it */
     spec_lookahead_reset(s);
     kvp_spec_unpack(spec_rec, &s->spec);
     return 0;

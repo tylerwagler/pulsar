@@ -28,7 +28,7 @@ The topics are `runtime`, `steering`, `api`, `kv-cache`, `thinking` and `all`.
 | `-m, --model PATH` | `./model`, `./model.safetensors`, then the same names under `$PULSAR_MODEL_DIR` | The container: a shard directory or one file. It can be given up to 8 times, but only for encoder and Parse models; a chat model serves alone. |
 | `-c, --ctx N` | 1048576 | Context per session (bank). A context past the model's trained positions is refused (`pulsar_session_create`). |
 | `--rope-yarn F` | off | YaRN scaling at factor F (1..64) over a container whose rope is native. Qwen: `4` gives 1M positions. A container that declares YaRN accepts only its own factor. Refused by families without a rope and under TP. The default disk KV directory gets a `-rope-yarnF` suffix. |
-| `--host HOST` | `0.0.0.0` | Bind address. There is no authentication. |
+| `--host HOST` | `127.0.0.1` | Bind address. There is no authentication, so exposing it is a choice. |
 | `--port N` | 8000 | |
 | `--kv-disk-dir DIR` | see [Disk KV cache](#disk-kv-cache) | `""` disables the cache. The last disk-KV flag on the line wins. |
 | `--no-kv-disk` | | Disable the disk KV cache. |

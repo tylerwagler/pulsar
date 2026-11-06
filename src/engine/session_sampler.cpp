@@ -38,6 +38,7 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     d.lp = pulsar_gpu_tensor_alloc(PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_logprob_row));
     d.chain_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_CHAINS_MAX * PULSAR_GPU_CHAIN_SLOTS_MAX * sizeof(int32_t));
     d.host_stale = false;
+    d.live_valid = false;   /* L354: nothing has written the live row: the readers refuse */
     d.step_rows = NULL;
     d.step_n = 0;
     if (d.live && d.bank_rows && d.scratch && d.out && d.mask && d.lp && d.chain_out) return true;
@@ -67,6 +68,7 @@ bool pulsar_session::live_from_rows(const pulsar_gpu_tensor *rows, uint32_t row)
         return false;
     }
     dev.host_stale = true;
+    dev.live_valid = true;
     return true;
 }
 
@@ -75,10 +77,15 @@ bool pulsar_session::live_from_host(const float *row) {
     if (row != logits) memcpy(logits, row, rb);
     if (!pulsar_gpu_tensor_write(dev.live, 0, logits, rb)) return false;
     dev.host_stale = false;
+    dev.live_valid = true;
     return true;
 }
 
 const float *pulsar_session::live_host() {
+    if (!dev.live_valid) {
+        fprintf(stderr, "pulsar: session: no live row to read (nothing stepped on this bank yet)\n");
+        return NULL;
+    }
     if (dev.host_stale) {
         if (!pulsar_gpu_tensor_read(dev.live, 0, logits, (uint64_t)engine->logits_width() * sizeof(float))) {
             fprintf(stderr, "pulsar: session: the live row's readback failed\n");
@@ -109,6 +116,7 @@ bool pulsar_session::live_restore_bank(uint32_t bank) {
     if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.live, 0, dev.bank_rows, (uint64_t)bank * rb, rb))
         return false;
     dev.host_stale = true;
+    dev.live_valid = true;
     return true;
 }
 

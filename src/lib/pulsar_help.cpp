@@ -346,7 +346,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 /// @param c  the colour set
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
-    opt(fp, c, "--host HOST", "Bind address. Default: 0.0.0.0 (all interfaces; use 127.0.0.1 for loopback-only)");
+    opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1 (loopback; 0.0.0.0 exposes it, with no auth)");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
@@ -375,7 +375,7 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
     opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget in MiB. Default: unbounded unless set.");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget in MiB. Default: 131072; 0 is unbounded (a full disk still evicts).");
     opt(fp, c, "--kv-ram-mb N", "Disk KV host pool in MiB (pinned at startup): the RAM tier restores read before disk, and the copy-out buffers. Default: 25% of RAM, at most 16384, on a discrete GPU; 1024 (copy-out only, no RAM tier) on unified memory.");
     opt(fp, c, "--kv-pinned-max-mb N", "Budget in MiB for pinned anchors (X-Pulsar-KV: pin-anchor): never evicted while under it; past it the least recently used loses its pin. Default: 2048.");
     fputc('\n', fp);

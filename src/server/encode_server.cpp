@@ -576,6 +576,7 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
         else
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: %s, POST %s (%u floats an input, inputs up to %u tokens)",
                        c.id, c.kind == K_EMBED ? "embedder" : "reranker", kind_path(c.kind), c.dim, c.cap);
+    server_warn_if_exposed(cfg->host);
     server_log(PULSAR_LOG_DEFAULT, "pulsar-server: listening on http://%s:%d (pulsar %s)", cfg->host, cfg->port,
                PULSAR_VERSION_STR);
     while (!g_stop_requested) {

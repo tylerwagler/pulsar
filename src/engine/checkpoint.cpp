@@ -627,6 +627,13 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
                 w->tokens_cap = T;
             }
             memcpy(w->tokens, r->tokens, (size_t)T * sizeof(int32_t));
+            /* L354: the record says which images it merged: r's, not whatever w last held */
+            if (r->img && r->img->n > 0) {
+                if (!w->img) w->img = (pulsar_image_identity *)xmalloc(sizeof(pulsar_image_identity));
+                *w->img = *r->img;
+            } else if (w->img) {
+                w->img->n = 0;
+            }
             if (ckpt_copy(st, ckpt_rec_place(st, w), from, staged)) {
                 w->bank = dst;
                 w->kind = r->kind;

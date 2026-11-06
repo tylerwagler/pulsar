@@ -9166,6 +9166,25 @@ static void test_l354_server_values(void) {
     TEST_ASSERT(prometheus_label("a\"b\\c\nd") == "a\\\"b\\\\c\\nd");
 }
 
+/* L354 (F17): one reading of a request's framing. */
+static void test_l354_http_framing(void) {
+    const auto cl = [](const char *h) { return content_length(h, strlen(h)); };
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n") == 12);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nContent-Length: 12 \r\n\r\n") == 12);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nContent-Length: 12x\r\n\r\n") < 0);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nContent-Length: 12\r\nContent-Length: 12x\r\n\r\n") < 0);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nContent-Length : 12x\r\n\r\n") < 0);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n") < 0);
+    TEST_ASSERT(cl("POST / HTTP/1.1\r\nTransfer-Encoding : chunked\r\n\r\n") < 0);
+    TEST_ASSERT(cl("POST /a:b HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    const char *crlf = "GET / HTTP/1.1\r\n\r\n", *lf = "GET / HTTP/1.1\n\n";
+    TEST_ASSERT(header_end(crlf, strlen(crlf)) == (ssize_t)strlen(crlf));
+    TEST_ASSERT(header_end(lf, strlen(lf)) < 0);
+    request r;
+    char err[256] = "";
+    TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\":\"x\"} trailing", 64, &r, err, sizeof err));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -9360,6 +9379,20 @@ static void test_l264_segstore_eviction_and_hygiene(void) {
     }, &seen);
     TEST_ASSERT(seen.n == 1 && seen.text_ok && seen.bytes_ok);
     pulsar_segstore_close(st);
+
+    /* L354: a segment whose size disagrees with its header (a torn write) is removed at open, not left outside `used` */
+    {
+        pulsar_segstore *o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
+        char torn[41], tp[600];
+        test_seg_payload tpay = { 10, 7 };
+        TEST_ASSERT(pulsar_segstore_put(o, "", 0, 128, "torn", 4, 10, test_seg_write, 0, NULL, &tpay, torn, err, sizeof err));
+        pulsar_segstore_close(o);
+        snprintf(tp, sizeof tp, "%s/%.40s.seg", dir, torn);
+        TEST_ASSERT(truncate(tp, 100) == 0);
+        o = pulsar_segstore_open(dir, 0, 1, NULL, NULL);
+        TEST_ASSERT(!pulsar_segstore_contains(o, torn) && access(tp, F_OK) != 0);
+        pulsar_segstore_close(o);
+    }
 
     /* a crashed write's tmp file and an orphan (parent gone) are cleaned at open */
     char path[600];
@@ -14908,6 +14941,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_completions_refusal_frees_controls();
     test_l354_admission_limits();
     test_l354_server_values();
+    test_l354_http_framing();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

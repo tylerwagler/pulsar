@@ -166,6 +166,7 @@ static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
 }
 
 void pulsar_bank_carry_fresh_view(pulsar_session *s) {
+    s->dev.live_valid = false;   /* L354: the live row is the previous bank's */
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->logits_stale = true;
