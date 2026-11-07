@@ -37,7 +37,8 @@ ap.add_argument("--port", type=int, default=8198)
 ap.add_argument("--ctx", type=int, default=1048576)
 ap.add_argument("--banks", type=int, default=4)
 ap.add_argument("--headroom-gib", type=float, default=0.5, help="MemAvailable above the floor the server starts with")
-VARIANCE_GIB = 0.5   # the balloon's slack for the probe-vs-guarded cost variance (see the balloon below)
+VARIANCE_GIB = 0.5   # the balloon's slack for the probe-vs-guarded cost variance (see the balloon below): the floor of it
+VARIANCE_REL = 0.025  # L357: and 2.5 % of the server's own cost -- Nemotron 3.5 Super (90.4 GiB) started 1.34 GiB above its probe
 ap.add_argument("--slack-gib", type=float, default=0.5, help="how far under the floor MemAvailable may dip (unpriced)")
 ap.add_argument("--abort-gib", type=float, default=1.0, help="a dip this far under the floor ends the run as a FAIL")
 ap.add_argument("--timeout", type=int, default=1500)
@@ -200,10 +201,12 @@ try:
 
     # ---- the balloon: all but the floor + headroom, before the guarded server starts
     time.sleep(5)
-    # L347: + VARIANCE_GIB.  The guarded server's cost differs from the probe's from run to run (battery #590 started
+    # L347: + a variance slack.  The guarded server's cost differs from the probe's from run to run (battery #590 started
     # 0.16 GiB short of the asked headroom, #592 0.6 GiB short -- below the floor, and the server rightly refused to
-    # start); every check below is against the headroom the guarded server MEASURES, so the slack only keeps it above 0.
-    want = mem_available() - cost - FLOOR - (a.headroom_gib + VARIANCE_GIB) * GiB
+    # start; L357 #656, Nemotron 3.5 Super: 1.34 GiB short); every check below is against the headroom the guarded
+    # server MEASURES, so the slack only keeps it above 0.  It scales with the server, a 90 GiB one varying more.
+    variance = max(VARIANCE_GIB * GiB, VARIANCE_REL * cost)
+    want = mem_available() - cost - FLOOR - a.headroom_gib * GiB - variance
     check(want > 0, "room for a balloon of %.2f GiB" % (want / GiB))
     if want > 0:
         mb = mmap.mmap(-1, int(want), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_POPULATE", 0))
@@ -211,7 +214,8 @@ try:
         chunk = b"\x01" * (64 << 20)
         for off in range(0, len(mb) - len(chunk) + 1, len(chunk)):   # resident whatever MAP_POPULATE did
             mb[off:off + len(chunk)] = chunk
-    print("balloon %.2f GiB: MemAvailable now %.2f GiB" % (want / GiB, mem_available() / GiB), flush=True)
+    print("balloon %.2f GiB (variance slack %.2f GiB): MemAvailable now %.2f GiB" % (want / GiB, variance / GiB, mem_available() / GiB),
+          flush=True)
 
     # ---- H: the guarded server's ceiling is its measured headroom
     p, log = start("guarded")
