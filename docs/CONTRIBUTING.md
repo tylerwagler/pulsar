@@ -3,10 +3,27 @@
 Read `ENGINEERING-RULES.md` in this directory first: one path or an error (no
 fallbacks), no dead code kept, producers emit and consumers never convert,
 zero build warnings, and a landing is one squashed commit gated by the tier
-its paths call for: `make gates` (the full battery, once per landing series
-on numeric paths) or `make gates-dev` (the iteration tier; see
-`ENGINEERING-RULES.md` §10 and `QA_BEFORE_RELEASES.md`). Those rules apply to
-every change on `dev`.
+its paths call for (`ENGINEERING-RULES.md` §10, `QA_BEFORE_RELEASES.md`
+section 2). Those rules apply to every change on `dev`.
+
+The tests run in three tiers, listed in `tests/manifest.toml` and run by
+`tests/run.py`:
+
+- `make check`: no GPU, no model time. It runs beside a serving production
+  box. Run it on every commit.
+- `make kernels`: a GPU, no model.
+- `make release`: the real models, production down. It runs every tier.
+  Run it once per landing series on numeric paths.
+
+`make gates-dev` is the iteration tier: a fast subset chosen from the paths
+you touched. It is not a release gate. `make gates`, the old full battery,
+runs the same targets as `make release` until it is retired.
+
+Each run leaves its logs and `results.json` in `.build/tests/<tier>-<sha>/`.
+A test that cannot run its check fails by name; a `SKIP` line is listed
+under "NOT FULLY RUN". Tests read the published containers from the Hugging
+Face cache (set the paths in `local.mk`; `local.mk.example` lists them), and
+build no model pieces of their own.
 
 Pulsar changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
@@ -35,7 +52,8 @@ make cuda-spark
 ```
 
 The C test runner is `pulsar_test`. Running it without arguments is equivalent to
-`--all`:
+`--all`. `make release` runs it as `unit-test-gate` (`--gating`, on the
+Qwen container in `QWEN_GATE_MODEL`):
 
 ```sh
 make test
@@ -73,10 +91,11 @@ PULSAR_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
 PULSAR_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
 
-For kernel or GPU-path changes, also run the CUDA smoke regression:
+For kernel or GPU-path changes, also run the kernel tier (it includes the
+CUDA smoke regression, `make cuda-regression`):
 
 ```sh
-make cuda-regression
+make kernels
 ```
 
 ## Quality Checks For Quantization Changes
