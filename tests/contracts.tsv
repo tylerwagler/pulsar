@@ -37,7 +37,6 @@ runner:cuda-accounting-gate	session	deepseek4	battery
 runner:cuda-evict-restore-gate	session	deepseek4	battery
 runner:cuda-session-payload-gate	session	deepseek4	battery
 loader-contract-gate	loader	all	battery	header clones + named mutants, both families
-qwen-family-gate-device	loader	qwen4_exp	battery	zero-weight wiring
 runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
 runner:cuda-bank-spec-gate	spec	deepseek4	battery
 runner:cuda-dspark-batch-gate	spec	deepseek4	battery
@@ -72,7 +71,6 @@ na	runner:cuda-rewind-gate	qwen4_exp	pulsar_session_rewind: Qwen's GDN state is 
 gap	runner:cuda-accounting-gate	qwen4_exp	L284	Qwen's QSA KV and indexer keys are demand-paged managed tensors priced by the same touched-KV number (L270); the gate reads DeepSeek's raw/comp/index tensors and rewinds -- a public-API physical-vs-touched leg is owed (session-contract B5 checks only the pricing)
 na	runner:cuda-evict-restore-gate	qwen4_exp	per-bank physical eviction and restore: Qwen's family bank pool refuses eviction by design (session-contract B5 asserts the refusal)
 gap	runner:cuda-session-payload-gate	qwen4_exp	L284	whole-session payloads: Qwen has no PAYLOAD cap yet (the L284 payload workstream)
-na	qwen-family-gate-device	deepseek4	Qwen's zero-weight wiring check; DeepSeek's loader contract is loader-contract-gate
 na	runner:cuda-bank-spec-gate	qwen4_exp	DSpark's per-bank speculative state (s->spec, its checkpoints) through DeepSeek's session; Qwen's MTP verify per bank is session-contract B6, its greedy == spec and distribution cuda-spec-sampling-gate
 na	runner:cuda-dspark-batch-gate	qwen4_exp	the DSpark drafter's batched redraft; Qwen's drafter is MTP (pulsar_engine_drafter)
 gap	runner:cuda-decode-reference-gate-story	qwen4_exp	L284	decode rows at served widths vs the reference: Qwen's verify step takes <= 16 rows (24/32 refused) and the gate's exact-width range is DeepSeek's cuBLASLt boundary -- needs the family's served widths
@@ -101,7 +99,6 @@ gap	cuda-chat-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on 
 gap	qwen-image-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 na	runner:cuda-dspark-batch-gate	nemotron_h	DeepSeek's DSpark drafter; Nemotron drafts by block
 na	runner:cuda-tp-head-split-gate	nemotron_h	TP is on demand, for a model too big for one Spark; none is served for Nemotron
-na	qwen-family-gate-device	nemotron_h	Qwen's zero-weight wiring; Nemotron's load has its own family gate
 na	qwen-chat-gate	nemotron_h	Qwen's template and tokenizer vs HF goldens
 gap	tp	nemotron_h	L354	TP is on demand; no gate until one is served
 gap	runner:cuda-mixed-neutrality-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
@@ -119,7 +116,6 @@ gap	cuda-chat-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma
 gap	qwen-image-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 na	runner:cuda-dspark-batch-gate	gemma4	DeepSeek's DSpark drafter; Gemma drafts by block
 na	runner:cuda-tp-head-split-gate	gemma4	TP is on demand, for a model too big for one Spark; none is served for Gemma
-na	qwen-family-gate-device	gemma4	Qwen's zero-weight wiring; Gemma's load has its own family gate
 na	qwen-chat-gate	gemma4	Qwen's template and tokenizer vs HF goldens
 gap	tp	gemma4	L354	TP is on demand; no gate until one is served
 gap	chat	gemma4	L354	no chat gate vs HF goldens in the battery for Gemma
@@ -140,9 +136,6 @@ na	nemotron-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no ch
 na	qwen-chat-gate	inkling	parked: its forward is not wired, so no session can run
 na	qwen-chat-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	qwen-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
-na	qwen-family-gate-device	inkling	parked: its forward is not wired, so no session can run
-na	qwen-family-gate-device	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
-na	qwen-family-gate-device	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
 na	qwen-image-smoke-gate	inkling	parked: its forward is not wired, so no session can run
 na	qwen-image-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	qwen-image-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane

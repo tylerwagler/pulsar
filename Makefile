@@ -964,16 +964,6 @@ tests/exl3_dequant_gate: tests/exl3_dequant_gate.cpp src/engine/exl3_trellis.h \
 exl3-dequant-gate: tests/exl3_dequant_gate
 	./tests/exl3_dequant_gate tests/test-vectors/exl3
 
-# L251 S1: the Qwen4-exp family skeleton -- load, layer plan, weight bind,
-# session-state sizing at the 1.5-2M-token target, and the by-name refusal of
-# every step -- over ZERO-WEIGHT containers made from the HF checkpoint's own
-# headers and config (tests/qwen_family_container.py: sparse files, the bodies
-# holes), plus six mutants the loader must refuse by name.
-# qwen-family-gate-device adds a real session on the GPU (the battery's entry):
-# an 8-token forward that stages the ~61 GiB of zeros it touches through the
-# production fd route, never the page cache (L329: tests/qwen_family_gate.cpp).
-QWEN_HF_DIR   ?= $(call need_path,QWEN_HF_DIR)
-QWEN_GATE_DIR ?= /var/tmp/qwen-family-gate-$(USER)
 # The adaptive draft depth rule (src/engine/spec_depth.h), shared by DSpark and the Qwen MTP drafter.
 .PHONY: spec-depth-gate
 tests/spec_depth_gate: tests/spec_depth_gate.cpp src/engine/spec_depth.h Makefile
@@ -982,20 +972,6 @@ spec-depth-gate: tests/spec_depth_gate
 	./tests/spec_depth_gate
 
 
-.PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
-qwen-family-containers:
-	@test -f $(QWEN_HF_DIR)/model.safetensors.index.json || { \
-	  echo "REFUSING: QWEN_HF_DIR=$(QWEN_HF_DIR) is not the Qwen3.8-Flash-Next HF checkpoint (headers + config are read)"; exit 1; }
-	@mkdir -p $(QWEN_GATE_DIR) && \
-	cp $(QWEN_HF_DIR)/tokenizer.json $(QWEN_HF_DIR)/generation_config.json $(QWEN_GATE_DIR)/ && \
-	python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/good.safetensors && \
-	for m in arch shape tensor layer-type s4-format ple-rows; do \
-	  python3 tests/qwen_family_container.py $(QWEN_HF_DIR) $(QWEN_GATE_DIR)/$$m.safetensors --mutate $$m || exit 1; \
-	done
-qwen-family-gate: tests/qwen_family_gate qwen-family-containers
-	@./tests/qwen_family_gate $(QWEN_GATE_DIR); rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
-qwen-family-gate-device: tests/qwen_family_gate qwen-family-containers
-	@./tests/qwen_family_gate $(QWEN_GATE_DIR) --gpu; rc=$$?; rm -f $(QWEN_GATE_DIR)/*.safetensors $(QWEN_GATE_DIR)/*-ple.rows; exit $$rc
 # L295 F3: the declared state kinds (src/engine/state_kinds.h) over two stub declarations -- an Inkling-shaped one (SConv
 # conv state, window rings, global pools) and one grading every capture mode -- model-free, seconds
 # (tests/state_kinds_gate.cpp).  In gates-dev's family tier and the battery.
@@ -2646,7 +2622,7 @@ prefix-stability-gate: pulsar_test
 GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate \
+	state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
 	cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -2986,7 +2962,6 @@ gates-dev:
 	  $(MAKE) --no-print-directory exl3-moe-epilogue-gate exl3-dense-gate exl3-moe-prefill-gate exl3-half-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$family -eq 1 ]; then \
-	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory state-kinds-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory loader-contract-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory nemotron-family-gate CUDA_ARCH=sm_120f || rc=1; \
@@ -3134,8 +3109,6 @@ tests/vision_hc_gate.o: tests/vision_hc_gate.cpp src/engine/pulsar_engine_intern
 tests/vision_visible_gate.o: tests/vision_visible_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_visible_gate.cpp
 
-tests/qwen_family_gate.o: tests/qwen_family_gate.cpp src/engine/pulsar_engine_internal.h src/engine/family.h src/engine/family_qwen.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/qwen_family_gate.cpp
 
 tests/state_kinds_gate.o: tests/state_kinds_gate.cpp src/engine/pulsar_engine_internal.h src/engine/state_kinds.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/state_kinds_gate.cpp
@@ -3329,8 +3302,6 @@ tests/vision_hc_gate: tests/vision_hc_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 tests/vision_visible_gate: tests/vision_visible_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/qwen_family_gate: tests/qwen_family_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/state_kinds_gate: tests/state_kinds_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3821,7 +3792,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/qwen_family_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

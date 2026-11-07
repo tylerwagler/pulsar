@@ -63,6 +63,11 @@ FAMILIES = {
         'plain': 'model.language_model.layers.1.mlp.gate.weight',   # the router, bf16 [2560, 512]
         'kv': 'qwen4_exp.num_hidden_layers',
         'stack': 'model.language_model.layers.3.mlp.experts.gate_up_proj',
+        'extras': (
+            ('layer-type', ({'key': 'qwen4_exp.layer_types', 'type': 'array',
+                             'value': {'__array__': 'string', 'n': 48,
+                                       'v': ['sliding_attention'] + (['linear_attention'] * 3 + ['full_attention']) * 11 + ['linear_attention'] * 3}},)),
+        ),
     },
     'nemotron_h': {   # L296 N1: the 5-block mini and Nemotron 3.5 Super alike (HF blocks 0 Mamba-2, 1 MoE in both)
         'tensor': 'language_model.backbone.layers.0.mixer.in_proj.weight',   # a dense linear (bf16 / EXL3 / mxfp8)

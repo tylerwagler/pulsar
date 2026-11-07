@@ -154,7 +154,6 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `cuda-attn-gates` | 45 | |
 | `cuda-attn-pack-gate` | 5 | |
 | `indexer-hadamard-kernel-check` | 5 | |
-| `qwen-family-gate-device` | 60 | zero-weight containers |
 | `state-kinds-gate` | 5 | |
 | `vision-qwen-tower-gate` | 10 | |
 | `blockdraft-gate` | 5 | |
@@ -225,7 +224,6 @@ The slowest sub-gates:
 | 70 | cuda-prefill-gate | the byte gate's five depths, cold |
 | 67 | cuda-decode-reference-gate-code | as the story gate, 3 depths |
 | 66 / 43 | cuda-row-neutrality-gate-deeper [Qwen4-exp] / DeepSeek | ~10k-token probe |
-| 65 | qwen-family-gate-device (make target) | seven zero-weight containers, the loader refusals, one device session |
 | 49 / 46 | session-contract-gate [Qwen4-exp] / DeepSeek | |
 | 47, 30, 30 | cuda-dspark-batch-gate-wide / -depth4 / -depth1 | each a full model reload for its draft depth (~22 s of each) |
 | 45 / 41 | cuda-reference-gate-story [Qwen4-exp] / DeepSeek | |
