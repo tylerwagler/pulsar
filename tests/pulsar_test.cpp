@@ -559,7 +559,7 @@ static bool test_topk_contains(const int *top, int k, int id);
 typedef struct {
     char id[96];
     int ctx;
-    int vocab_size;
+    int logits_width;   ///< pulsar_engine_logits_width: the row copy_logits fills (Qwen pads it past the tokenizer table)
     int gen_steps;
     pulsar_tokens prompt;
     float *ref_logits;
@@ -680,8 +680,8 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
                                                   bool assert_thresholds) {
     int ref_top[TEST_MPP_EQ_TOPK];
     int cand_top[TEST_MPP_EQ_TOPK];
-    test_logits_topk(tc->ref_logits, tc->vocab_size, ref_top, TEST_MPP_EQ_TOPK);
-    test_logits_topk(cand_logits, tc->vocab_size, cand_top, TEST_MPP_EQ_TOPK);
+    test_logits_topk(tc->ref_logits, tc->logits_width, ref_top, TEST_MPP_EQ_TOPK);
+    test_logits_topk(cand_logits, tc->logits_width, cand_top, TEST_MPP_EQ_TOPK);
 
     int overlap = 0;
     int top5_overlap = 0;
@@ -714,7 +714,7 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
         delta_abs[i] = 0.0f;
     }
 
-    for (int i = 0; i < tc->vocab_size; i++) {
+    for (int i = 0; i < tc->logits_width; i++) {
         if (!isfinite(tc->ref_logits[i]) || !isfinite(cand_logits[i])) {
             nonfinite++;
             continue;
@@ -727,7 +727,7 @@ static test_mpp_eq_result test_compare_mpp_logits(const test_mpp_eq_case *tc,
                         (int)i, tc->ref_logits[i], cand_logits[i]);
     }
 
-    const float rms = (float)sqrt(sumsq / (double)tc->vocab_size);
+    const float rms = (float)sqrt(sumsq / (double)tc->logits_width);
     const float top_abs = test_top_union_max_abs(tc->ref_logits, cand_logits,
                                                  ref_top, cand_top, TEST_MPP_EQ_TOPK);
     const bool same_top1 = ref_top[0] >= 0 && ref_top[0] == cand_top[0];
@@ -771,11 +771,16 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
     TEST_ASSERT(pulsar_session_create(&session, engine, tc->ctx) == 0);
     if (!session) return false;
 
-    char err[160];
+    char err[256] = {0};
     bool ok = pulsar_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
+    if (!ok) fprintf(stderr, "pulsar-test: Tensor equivalence %s: the %d-token sync refused: %s\n", tc->id,
+                     tc->prompt.len, err);
     TEST_ASSERT(ok);
     if (ok) {
-        ok = pulsar_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
+        const int copied = pulsar_session_copy_logits(session, logits, tc->logits_width);
+        ok = copied == tc->logits_width;
+        if (!ok) fprintf(stderr, "pulsar-test: Tensor equivalence %s: copy_logits gave %d of %d floats\n", tc->id,
+                         copied, tc->logits_width);
         TEST_ASSERT(ok);
     }
 
@@ -784,6 +789,7 @@ static bool test_mpp_capture(pulsar_engine *engine, const test_mpp_eq_case *tc,
         const int token = pulsar_session_argmax(session);
         gen[n++] = token;
         if (n < tc->gen_steps && pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
+            fprintf(stderr, "pulsar-test: Tensor equivalence %s: eval of step %d refused: %s\n", tc->id, n, err);
             ok = false;
             TEST_ASSERT(false);
         }
@@ -827,6 +833,44 @@ static const unsigned char test_reuse_png[] = {
 };
 
 
+/* L357: an image gate's prompt in the LOADED family's spelling -- `before`, the family's image placeholder (its vision
+ * front's placeholder_text: the string its chat renderer emits for an image part, e.g. Qwen's
+ * <|vision_start|><|image_pad|><|vision_end|>), then `after` -- tokenised as rendered chat and expanded to the
+ * image's block.  A family with no vision front, or an artifact that cannot take the image, FAILS the gate by name:
+ * a SKIP that exits 0 would pass a model the gate never ran on.
+ * @param engine the engine @param gate the gate's name, for the failure line
+ * @param before the text ahead of the image @param after the text behind it
+ * @param img the image; its block's start position is written @param prompt receives the expanded tokens
+ * @return false when the gate cannot run on this model (said, and asserted) */
+static bool test_image_prompt(pulsar_engine *engine, const char *gate, const std::string &before,
+                              const std::string &after, pulsar_image_ref *img, pulsar_tokens *prompt) {
+    const pulsar_family_vision *fv = engine->family ? engine->family->vision : NULL;
+    if (!fv || !fv->placeholder_text) {
+        fprintf(stderr, "%s gate FAILED: the loaded family (%s) has no vision front, so it cannot take an image\n",
+                gate, engine->family ? engine->family->name : "none");
+        TEST_ASSERT(!"the image gate's model takes no images");
+        return false;
+    }
+    if (!engine->vision_ready) {
+        fprintf(stderr, "%s gate FAILED: the %s artifact has no vision tower bound, so it cannot take an image\n", gate,
+                engine->family->name);
+        TEST_ASSERT(!"the image gate's artifact has no vision tower");
+        return false;
+    }
+    const std::string text = before + fv->placeholder_text + after;
+    pulsar_tokens raw = {0};
+    pulsar_tokenize_rendered_chat(engine, text.c_str(), &raw);
+    char err[384] = {0};
+    const bool ok = pulsar_expand_image_placeholders(engine, &raw, 0, img, 1, prompt, err, sizeof err);
+    pulsar_tokens_free(&raw);
+    if (!ok) {
+        fprintf(stderr, "%s gate FAILED: the image prompt (placeholder \"%s\") does not expand: %s\n", gate,
+                fv->placeholder_text, err[0] ? err : "this artifact cannot take images");
+        TEST_ASSERT(!"the image gate's prompt does not expand");
+    }
+    return ok;
+}
+
 /* L226 gate: the encoded-span cache must be TRANSPARENT.  Two cold syncs of the
  * same image prompt, in two sessions: the first runs the ViT (cache miss), the
  * second is served from the cached aligner rows (cache hit).  Full-vocab logits,
@@ -839,22 +883,11 @@ static void test_image_span_cache_is_transparent(void) {
     img.bytes = (uint8_t *)test_reuse_png;
     img.len = sizeof test_reuse_png;
 
-    pulsar_tokens raw = {0};
-    {
-        char text[4096];
-        size_t n = (size_t)snprintf(text, sizeof text, "describe " PULSAR_IMAGE_PLACEHOLDER " in one line. ");
-        for (int r = 0; r < 6 && n < sizeof text - 64; r++)
-            n += (size_t)snprintf(text + n, sizeof text - n,
-                                  "The quick brown fox jumps over the lazy dog. ");
-        pulsar_tokenize_rendered_chat(engine, text, &raw);
-    }
-    char err[256] = {0};
+    std::string tail = " in one line. ";
+    for (int r = 0; r < 6; r++) tail += "The quick brown fox jumps over the lazy dog. ";
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
-        fprintf(stderr, "image-span-cache gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
-        pulsar_tokens_free(&raw);
-        return;
-    }
+    if (!test_image_prompt(engine, "image-span-cache", "describe ", tail, &img, &prompt)) return;
+    char err[256] = {0};
 
     const int vocab = pulsar_engine_logits_width(engine);
     float *first = (float *)xmalloc((size_t)vocab * sizeof(float));
@@ -890,7 +923,6 @@ static void test_image_span_cache_is_transparent(void) {
     free(first);
     free(second);
     pulsar_tokens_free(&prompt);
-    pulsar_tokens_free(&raw);
 }
 
 
@@ -905,7 +937,7 @@ static void test_image_span_cache_is_transparent(void) {
  * bytes (same geometry, different pixels) is its own case below.
  *
  * MODEL-DEPENDENT: needs an artifact with a bound vision tower.  A text-only
- * artifact SKIPS loudly rather than passing quietly. */
+ * artifact FAILS by name (test_image_prompt), never a quiet pass. */
 
 static void test_image_conversation_reuse_matches_cold(void) {
     pulsar_engine *engine = test_get_engine();
@@ -918,28 +950,17 @@ static void test_image_conversation_reuse_matches_cold(void) {
      * server renders for one image with a question after it.  The placeholder
      * text is tokenised exactly as the renderer tokenises it (special_token_at
      * resolves it to the vocab's image id). */
-    pulsar_tokens turn1_raw = {0};
     /* The image sits early and a longer text tail follows, which is the shape in
      * which reuse is licensed at all: the start of a resumed prefill must be a
      * resume-grid multiple at or above the image block (so no merged row is
      * re-evaluated) and inside the checkpoint.  With the images near the frontier
      * there is no such grid point and the engine correctly rebuilds cold -- the
      * served test's boundary. */
-    {
-        char text[4096];
-        size_t n = (size_t)snprintf(text, sizeof text, "describe " PULSAR_IMAGE_PLACEHOLDER " in one line. ");
-        for (int r = 0; r < 24 && n < sizeof text - 64; r++)
-            n += (size_t)snprintf(text + n, sizeof text - n,
-                                  "The quick brown fox jumps over the lazy dog. ");
-        pulsar_tokenize_rendered_chat(engine, text, &turn1_raw);
-    }
-    char err[256] = {0};
+    std::string tail = " in one line. ";
+    for (int r = 0; r < 24; r++) tail += "The quick brown fox jumps over the lazy dog. ";
     pulsar_tokens turn1 = {0};
-    if (!pulsar_expand_image_placeholders(engine, &turn1_raw, 0, &img, 1, &turn1, err, sizeof err)) {
-        fprintf(stderr, "image-reuse gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
-        pulsar_tokens_free(&turn1_raw);
-        return;
-    }
+    if (!test_image_prompt(engine, "image-reuse", "describe ", tail, &img, &turn1)) return;
+    char err[256] = {0};
     TEST_ASSERT(img.start_pos > 0);   /* text comes first, so the block is not at 0 */
 
     /* Turn 2 = turn 1 + a few more text tokens (the client's next question). */
@@ -972,6 +993,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
     pulsar_session *sb = NULL;
     TEST_ASSERT(pulsar_session_create(&sb, engine, 4096) == 0);
     bool okb = sb && pulsar_session_sync_mm(sb, &turn2, &img, 1, err, sizeof err) == 0;
+    if (!okb) fprintf(stderr, "  cold turn-2 sync refused: %s\n", err);
     TEST_ASSERT(okb);
     if (okb) {
         okb = pulsar_session_copy_logits(sb, cold_logits, vocab) == vocab;
@@ -996,7 +1018,6 @@ static void test_image_conversation_reuse_matches_cold(void) {
     free(cold_logits);
     pulsar_tokens_free(&turn1);
     pulsar_tokens_free(&turn2);
-    pulsar_tokens_free(&turn1_raw);
 }
 
 
@@ -1007,7 +1028,7 @@ static void test_image_conversation_reuse_matches_cold(void) {
  * only at a grid point outside every block, so no resumed quantum may start from 0 (the failure this guards: a stop
  * right after a block resumed from the grid point inside it, i.e. from 0).
  *
- * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
+ * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact FAILS by name (test_image_prompt). */
 struct test_quantum {
     int start;    /* the position the quantum began at: the planner's first event (-1 until it arrives) */
     int chunks;   /* chunks landed past it */
@@ -1026,26 +1047,15 @@ static void test_image_prefill_interrupt_resumes(void) {
     pulsar_image_ref img = {0};
     img.bytes = (uint8_t *)test_reuse_png;
     img.len = sizeof test_reuse_png;
-    /* ~600 tokens of text, the image, then a tail long enough for several prefill chunks after it */
-    pulsar_tokens raw = {0};
-    {
-        enum { TEXT_MAX = 96 * 1024 };
-        char *text = (char *)xmalloc(TEXT_MAX);
-        size_t n = 0;
-        for (int r = 0; r < 60; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Earlier context line %d. ", r);
-        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Look at " PULSAR_IMAGE_PLACEHOLDER " and then read on. ");
-        for (int r = 0; r < 900 && n < TEXT_MAX - 128; r++)
-            n += (size_t)snprintf(text + n, TEXT_MAX - n, "The quick brown fox jumps over the lazy dog %d. ", r);
-        pulsar_tokenize_rendered_chat(engine, text, &raw);
-        free(text);
-    }
-    char err[256] = {0};
+    /* ~600 tokens of text, the image, then a tail long enough for several prefill chunks after it: ~17k tokens,
+     * four or more chunks at Qwen's 4096-row steps (three quanta are the floor asserted below) */
+    std::string before, after = " and then read on. ";
+    for (int r = 0; r < 60; r++) before += "Earlier context line " + std::to_string(r) + ". ";
+    before += "Look at ";
+    for (int r = 0; r < 1400; r++) after += "The quick brown fox jumps over the lazy dog " + std::to_string(r) + ". ";
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
-        fprintf(stderr, "image-interrupt gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
-        pulsar_tokens_free(&raw);
-        return;
-    }
+    if (!test_image_prompt(engine, "image-interrupt", before, after, &img, &prompt)) return;
+    char err[256] = {0};
     const int vocab = pulsar_engine_logits_width(engine);
     float *cold = (float *)xmalloc((size_t)vocab * sizeof(float));
     float *resumed = (float *)xmalloc((size_t)vocab * sizeof(float));
@@ -1056,6 +1066,7 @@ static void test_image_prefill_interrupt_resumes(void) {
     pulsar_image_ref im = img;
     bool okc = sc && pulsar_session_sync_mm(sc, &prompt, &im, 1, err, sizeof err) == 0 &&
                pulsar_session_copy_logits(sc, cold, vocab) == vocab;
+    if (!okc) fprintf(stderr, "  the cold image prefill failed: %s\n", err);
     TEST_ASSERT(okc);
     if (sc) pulsar_session_free(sc);
 
@@ -1094,7 +1105,6 @@ static void test_image_prefill_interrupt_resumes(void) {
     free(cold);
     free(resumed);
     pulsar_tokens_free(&prompt);
-    pulsar_tokens_free(&raw);
 }
 
 
@@ -1144,35 +1154,21 @@ static std::vector<unsigned char> test_solid_png(uint32_t w, uint32_t h, uint8_t
  * cold prefill byte for byte -- then restore with another hash: the chain stops before the block (it is in the first
  * segment, so nothing loads), said by name.
  *
- * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact SKIPS loudly. */
+ * MODEL-DEPENDENT: needs a bound vision tower; a text-only artifact FAILS by name (test_image_prompt). */
 static void test_image_chain_round_trip(void) {
     pulsar_engine *engine = test_get_engine();
     if (!engine) return;
     pulsar_image_ref img = {0};
     img.bytes = (uint8_t *)test_reuse_png;
     img.len = sizeof test_reuse_png;
-    pulsar_tokens raw = {0};
-    {
-        enum { TEXT_MAX = 64 * 1024 };
-        char *text = (char *)xmalloc(TEXT_MAX);
-        size_t n = 0;
-        for (int r = 0; r < 40; r++) n += (size_t)snprintf(text + n, TEXT_MAX - n, "Background note %d. ", r);
-        /* L353: the family's own placeholder (a served family's chain is the one this gate is for) */
-        const pulsar_family_vision *fv = engine->family ? engine->family->vision : NULL;
-        n += (size_t)snprintf(text + n, TEXT_MAX - n, "Here is %s to discuss. ",
-                              fv && fv->placeholder_text ? fv->placeholder_text : PULSAR_IMAGE_PLACEHOLDER);
-        for (int r = 0; r < 700 && n < TEXT_MAX - 128; r++)
-            n += (size_t)snprintf(text + n, TEXT_MAX - n, "A sentence about the picture, number %d. ", r);
-        pulsar_tokenize_rendered_chat(engine, text, &raw);
-        free(text);
-    }
-    char err[384] = {0};
+    /* L353: the family's own placeholder (a served family's chain is the one this gate is for) */
+    std::string before, after = " to discuss. ";
+    for (int r = 0; r < 40; r++) before += "Background note " + std::to_string(r) + ". ";
+    before += "Here is ";
+    for (int r = 0; r < 700; r++) after += "A sentence about the picture, number " + std::to_string(r) + ". ";
     pulsar_tokens prompt = {0};
-    if (!pulsar_expand_image_placeholders(engine, &raw, 0, &img, 1, &prompt, err, sizeof err)) {
-        fprintf(stderr, "image-chain gate SKIPPED: %s\n", err[0] ? err : "this artifact cannot take images");
-        pulsar_tokens_free(&raw);
-        return;
-    }
+    if (!test_image_prompt(engine, "image-chain", before, after, &img, &prompt)) return;
+    char err[384] = {0};
     pulsar_tokens longer = {0};
     pulsar_tokens_copy(&longer, &prompt);
     for (int t = 700; t < 740; t++) pulsar_tokens_push(&longer, t);
@@ -1308,26 +1304,6 @@ static void test_image_chain_round_trip(void) {
     }
     pulsar_tokens_free(&longer);
     pulsar_tokens_free(&prompt);
-    pulsar_tokens_free(&raw);
-}
-
-static bool test_mpp_capture_logits_only(pulsar_engine *engine,
-                                         const test_mpp_eq_case *tc,
-                                         float *logits) {
-    pulsar_session *session = NULL;
-    TEST_ASSERT(pulsar_session_create(&session, engine, tc->ctx) == 0);
-    if (!session) return false;
-
-    char err[160];
-    bool ok = pulsar_session_sync(session, &tc->prompt, err, sizeof(err)) == 0;
-    TEST_ASSERT(ok);
-    if (ok) {
-        ok = pulsar_session_copy_logits(session, logits, tc->vocab_size) == tc->vocab_size;
-        TEST_ASSERT(ok);
-    }
-
-    pulsar_session_free(session);
-    return ok;
 }
 
 static bool test_mpp_eq_case_selected(const char *id) {
@@ -1362,7 +1338,7 @@ static int test_load_mpp_cases(pulsar_engine *engine, test_mpp_eq_case *cases, i
         test_mpp_eq_case *tc = &cases[ncase++];
         snprintf(tc->id, sizeof(tc->id), "%s", vc.id);
         tc->ctx = vc.ctx;
-        tc->vocab_size = pulsar_engine_vocab_size(engine);
+        tc->logits_width = pulsar_engine_logits_width(engine);
         tc->gen_steps = vc.nsteps < TEST_VEC_MAX_STEPS ? vc.nsteps : TEST_VEC_MAX_STEPS;
         pulsar_encode_chat_prompt(engine, "", prompt_text, PULSAR_THINK_NONE, &tc->prompt);
         free(prompt_text);
@@ -1424,8 +1400,8 @@ static void test_run_mpp_candidate(const char *label,
     test_mpp_summary_init(&summary, label);
     pulsar_engine *cand_engine = test_open_engine();
     if (cand_engine) {
-        const int vocab_size = ncase > 0 ? cases[0].vocab_size : 0;
-        float *cand_logits = (float *)malloc((size_t)vocab_size * sizeof(cand_logits[0]));
+        const int width = ncase > 0 ? cases[0].logits_width : 0;
+        float *cand_logits = (float *)malloc((size_t)width * sizeof(cand_logits[0]));
         TEST_ASSERT(cand_logits != NULL);
         if (cand_logits) {
             for (int i = 0; i < ncase; i++) {
@@ -1474,7 +1450,7 @@ static void test_mpp_equivalence(void) {
     TEST_ASSERT(ncase > 0);
     for (int i = 0; i < ncase; i++) {
         test_mpp_eq_case *tc = &cases[i];
-        tc->ref_logits = (float *)malloc((size_t)tc->vocab_size * sizeof(tc->ref_logits[0]));
+        tc->ref_logits = (float *)malloc((size_t)tc->logits_width * sizeof(tc->ref_logits[0]));
         TEST_ASSERT(tc->ref_logits != NULL);
         if (!tc->ref_logits) continue;
         TEST_ASSERT(test_mpp_capture(ref_engine, tc,
