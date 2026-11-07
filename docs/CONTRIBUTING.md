@@ -62,8 +62,8 @@ What they cover:
   `tests/long_context_story_prompt.txt`. The model must retrieve spelled-out
   person-number assignments from a long prose prompt and return `Name=number`
   lines that the test parses.
-- `--tool-call-quality`: exercises actual model behavior for DSML tool-call
-  emission in both fast and exact paths.
+- `--tool-call-quality`: exercises actual model behavior for tool-call emission,
+  read by the loaded family's own output parser (L357: no longer DSML-only).
 
 Point the runner at a checkpoint directory:
 
