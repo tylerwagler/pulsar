@@ -1042,6 +1042,20 @@ bank-adopt-gate-nemotron: tests/bank_adopt_gate
 .PHONY: bank-residency-gate-qwen
 bank-residency-gate-qwen: tests/bank_residency_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/bank_residency_gate $(QWEN_GATE_MODEL)
+# L357: the family-neutral ports of cuda-frontier-gate, cuda-accounting-gate and cuda-head-graph-replay-gate (runner
+# gates bank-isolation-gate, kv-accounting-gate, graph-eager-gate; these targets run one by hand): an idle bank
+# untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row (the declared
+# state, byte for byte); touched KV == the physical a fill takes and a bank free returns (cudaMemGetInfo); a replayed
+# decode / verify step graph == the eager step at the same row count.
+.PHONY: bank-isolation-gate-qwen kv-accounting-gate-qwen graph-eager-gate-nemotron
+bank-isolation-gate-qwen: tests/bank_isolation_gate
+	./tests/bank_isolation_gate $(QWEN_GATE_MODEL)
+kv-accounting-gate-qwen: tests/kv_accounting_gate
+	./tests/kv_accounting_gate $(QWEN_GATE_MODEL)
+# Qwen's driver does not stage its steps (they never graph), so the graph-eager gate grades a family whose driver does
+# (the runner hosts it on the LiLiCorr pack)
+graph-eager-gate-nemotron: tests/graph_eager_gate
+	./tests/graph_eager_gate $(LILICORR_GATE_MODEL)
 # L278 contract 2, the loader, for every family: each served container's sparse HEADER CLONE must open, and each
 # mutant of it (unknown arch, a missing key / tensor, a transposed shape, a dtype no reader takes, a stack layout no
 # arm reads) must be REFUSED BY NAME with the open returning -- never an exit (tests/loader_contract.py,
@@ -2388,7 +2402,8 @@ RUNNER_GATES = payload_frontier_gate bank_residency_gate multiseq_frontier_gate 
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
                comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
                decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
-               sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate
+               sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate bank_isolation_gate \
+               kv_accounting_gate graph_eager_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
 tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h src/engine/pulsar_engine_internal.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	@mkdir -p tests/runner
@@ -2411,7 +2426,9 @@ GATE_RUNNER_FLAGS ?=
 # binds to the last --model before it).
 # L317: Nemotron's LiLiCorr pack is hosted for the legs that loaded it themselves (block-spec, scratch-poison,
 # bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
-RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) --gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate
+# L357: and graph-eager-gate, whose graphed driver steps Qwen does not take (its driver stages none: SKIPped there).
+RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
+	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate
 # L278 battery cut (2026-11-03, Tyler): the DeepSeek primary runs only the entries nothing else can -- DeepSeek V4's
 # mechanism gates (DS4: evict / restore, accounting, session payload, mixed prefill, rewind, frontier, ...) and the
 # fixture-blob gates (its prefill / decode bit-exact baselines); every other entry runs on the hosted Qwen and Nemotron.
@@ -3202,6 +3219,23 @@ tests/bank_residency_gate.o: tests/bank_residency_gate.cpp tests/gate_entry.h te
 tests/bank_residency_gate: tests/bank_residency_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+# L357: the three ports read the declared state (tests/gate_fixture.h), so they see the engine's internal headers
+tests/bank_isolation_gate.o: tests/bank_isolation_gate.cpp tests/gate_entry.h tests/gate_util.h tests/gate_fixture.h \
+		src/pulsar.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/bank_isolation_gate: tests/bank_isolation_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/kv_accounting_gate.o: tests/kv_accounting_gate.cpp tests/gate_entry.h tests/gate_util.h tests/gate_fixture.h \
+		src/pulsar.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/kv_accounting_gate: tests/kv_accounting_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+tests/graph_eager_gate.o: tests/graph_eager_gate.cpp tests/gate_entry.h tests/gate_util.h tests/gate_fixture.h \
+		src/pulsar.h
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+tests/graph_eager_gate: tests/graph_eager_gate.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
 # L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out (the family has
 # no tokenizer or renderer yet, S5, so the CLI's text path refuses by design).  Decode the emitted
 # ids with qwen_generate_decode.py.  Needs a real container and a prompt's tokens.bin on disk.
@@ -3283,7 +3317,8 @@ tests/tp_plan_build_test: tests/tp_plan_build_test.o $(CORE_OBJS)
 tp-plan-build-test: tests/tp_plan_build_test
 	./tests/tp_plan_build_test
 # L296 N9: the chained-MTP drafter on a container (tests/mtp_spec_gate.cpp; reads the drafter's numbers and the state)
-tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/spec_mtp.h
+tests/mtp_spec_gate.o: tests/mtp_spec_gate.cpp tests/gate_entry.h tests/gate_util.h tests/gate_fixture.h src/pulsar.h \
+                       src/engine/spec_mtp.h
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/mtp_spec_gate: tests/mtp_spec_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3647,7 +3682,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

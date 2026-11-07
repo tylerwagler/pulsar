@@ -43,8 +43,8 @@
  * p + 1), `positions` rows (default all but the last). */
 #include "pulsar.h"
 #include "gate_entry.h"
-#include "gate_util.h"
-#include "pulsar_engine_internal.h"   /* the drafter's numbers, the pendings, the declared state, the lane's probe */
+#include "gate_fixture.h"           /* gate_bank_state: the declared state */
+#include "pulsar_engine_internal.h"   /* the drafter's numbers, the pendings, the lane's probe */
 #include "spec_mtp.h"
 #include "spec_block.h"
 
@@ -194,68 +194,6 @@ static int first_diff(const std::vector<int32_t> &a, const std::vector<int32_t> 
     const size_t n = a.size() < b.size() ? a.size() : b.size();
     for (size_t i = 0; i < n; i++) if (a[i] != b[i]) return (int)i;
     return a.size() == b.size() ? -1 : (int)n;
-}
-
-/* A bank's declared state, read off the device as the frontier `rows` describes it: slots [k0, k1), each resident
- * decl's bank bytes (FIXED, RING whole; STAGED: the open block's rows below the frontier -- a rejected verify row past
- * it is no state) and the whole rows below the frontier of each pool (a drafter slot trails the trunk by one row: its
- * caller passes one row fewer).  One piece per (slot, decl), named, so a difference says where it is. */
-struct state_piece {
-    std::string name;
-    std::vector<uint8_t> bytes;
-};
-static std::vector<state_piece> bank_state(pulsar_session *s, uint32_t b, uint32_t k0, uint32_t k1, uint32_t rows) {
-    std::vector<state_piece> out;
-    /* L339: the bank's state is its tensors with its pending delta rows applied (state_kinds.h THE FOLD) -- a reader
-     * outside a trunk step flushes first */
-    if (!pulsar_state_fold_flush(s->states, b) || !pulsar_gpu_synchronize()) return out;
-    const pulsar_state_set *ss = s->states;
-    const pulsar_state_plan *p = ss->plan;
-    bool ok = true;
-    for (uint32_t k = k0; ok && k < k1; k++) {
-        for (uint32_t id = 0; ok && id < p->n_decl; id++) {
-            const pulsar_state_decl *d = &p->decl[id];
-            if (!(p->slot[k] >> id & 1u)) continue;
-            const pulsar_gpu_tensor *t;
-            uint64_t off, n;
-            if (d->kind == PULSAR_STATE_POOL) {
-                n = (uint64_t)rows / d->tokens * d->bytes;
-                t = pulsar_state_pool(ss, k, id, b);
-                off = 0;
-            } else {
-                n = d->kind == PULSAR_STATE_STAGED ? (uint64_t)(rows % d->tokens) * d->bytes
-                                                    : pulsar_state_decl_bank_bytes(d);
-                t = pulsar_state_tensor(ss, k, id);
-                off = (uint64_t)b * pulsar_state_decl_bank_bytes(d);
-            }
-            state_piece pc;
-            pc.name = std::string(d->name) + "@" + std::to_string(k);
-            pc.bytes.resize(n);
-            ok = t && (n == 0 || pulsar_gpu_tensor_read(t, off, pc.bytes.data(), n) != 0);
-            out.push_back(std::move(pc));
-        }
-    }
-    if (!ok) out.clear();
-    return out;
-}
-
-/* the pieces' bytes and the first piece that differs ("" = none) */
-static std::string state_diff(const std::vector<state_piece> &a, const std::vector<state_piece> &b, size_t *bytes) {
-    *bytes = 0;
-    for (const state_piece &p : a) *bytes += p.bytes.size();
-    if (a.empty() || a.size() != b.size()) return "the state did not read";
-    for (size_t i = 0; i < a.size(); i++) {
-        if (a[i].name != b[i].name || a[i].bytes.size() != b[i].bytes.size()) return a[i].name;
-        size_t at = 0, last = 0, n = 0;
-        for (size_t x = 0; x < a[i].bytes.size(); x++)
-            if (a[i].bytes[x] != b[i].bytes[x]) {
-                if (n++ == 0) at = x;
-                last = x;
-            }
-        if (n) return a[i].name + " (" + std::to_string(n) + " bytes from offset " + std::to_string(at) + " to " +
-                      std::to_string(last) + " of " + std::to_string(a[i].bytes.size()) + ")";
-    }
-    return "";
 }
 
 /* four plain decode steps after the stream: the session's logits each step */
@@ -534,12 +472,13 @@ static int exact(pulsar_engine *e, int n, const char *only) {
             CHECK(sp_s->states->bank_pos[0] == len && tw->states->bank_pos[0] == len,
                   "M3 prompt %zu: both at %u tokens (%u, %u)", i, len, sp_s->states->bank_pos[0], tw->states->bank_pos[0]);
             size_t nb = 0, nd = 0;
-            const std::string tdiff = state_diff(bank_state(sp_s, 0, 0, p->n_trunk, len), bank_state(tw, 0, 0, p->n_trunk, len), &nb);
+            const std::string tdiff = gate_state_diff(gate_bank_state(sp_s, 0, 0, p->n_trunk, len),
+                                                      gate_bank_state(tw, 0, 0, p->n_trunk, len), &nb);
             CHECK(tdiff.empty(), "M3 prompt %zu: the trunk's state after the rollbacks == the plain twin's, byte for byte "
                   "(%zu bytes: every slot's recurrent / conv state and pool rows%s%s)", i, nb,
                   tdiff.empty() ? "" : "; differs: ", tdiff.c_str());
-            const std::string ddiff = state_diff(bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
-                                                 bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
+            const std::string ddiff = gate_state_diff(gate_bank_state(sp_s, 0, p->n_trunk, p->n_slots, len - 1u),
+                                                      gate_bank_state(tw, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
             if (block)   /* L298: the context rings and the anchor -- a rejected row never enters them, every context
                           * row is the decode arms' (M-independent) bytes: the plain twin's exactly */
                 CHECK(ddiff.empty(), "M3 prompt %zu: the block drafter's context (its K|V rings and anchor) == the plain "
@@ -594,9 +533,10 @@ static int exact(pulsar_engine *e, int n, const char *only) {
         if (ok) {
             const pulsar_state_plan *p = wa->states->plan;
             size_t nt = 0, nd = 0;
-            const std::string tdiff = state_diff(bank_state(wa, 0, 0, p->n_trunk, len), bank_state(co, 0, 0, p->n_trunk, len), &nt);
-            const std::string ddiff = state_diff(bank_state(wa, 0, p->n_trunk, p->n_slots, len - 1u),
-                                                 bank_state(co, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
+            const std::string tdiff = gate_state_diff(gate_bank_state(wa, 0, 0, p->n_trunk, len),
+                                                      gate_bank_state(co, 0, 0, p->n_trunk, len), &nt);
+            const std::string ddiff = gate_state_diff(gate_bank_state(wa, 0, p->n_trunk, p->n_slots, len - 1u),
+                                                      gate_bank_state(co, 0, p->n_trunk, p->n_slots, len - 1u), &nd);
             CHECK(tdiff.empty() && ddiff.empty(), "M6 prompt %zu: the reused session's state == the cold sync's, byte for "
                   "byte (trunk %zu bytes%s%s; drafter %zu bytes%s%s)", i, nt, tdiff.empty() ? "" : ", differs: ",
                   tdiff.c_str(), nd, ddiff.empty() ? "" : ", differs: ", ddiff.c_str());

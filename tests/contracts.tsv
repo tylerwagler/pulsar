@@ -38,6 +38,9 @@ runner:cuda-evict-restore-gate	session	deepseek4	battery
 runner:cuda-session-payload-gate	session	deepseek4	battery
 runner:payload-frontier-gate	session	all	battery	L357: the payload round trip through the public API, every family with payloads
 runner:bank-residency-gate	session	all	battery	L357: free, re-allocate, reload a bank: byte-identical decode
+runner:bank-isolation-gate	session	all	battery	L357: an idle installed bank's declared state untouched by its neighbours' batched steps; batch order and a batchmate's position invisible to a row (cuda-frontier-gate's intent, every driver family)
+runner:kv-accounting-gate	session	all	battery	L357: touched KV growth == the device's physical growth over a fill, and a bank free returns its trunk pools (cuda-accounting-gate's intent, no rewind leg)
+runner:graph-eager-gate	session	all	battery	L357: replayed decode / verify step graphs == the eager steps at the same row count; needs graphed driver steps (SKIP on Qwen, whose driver stages none; runs on the hosted Nemotron)
 loader-contract-gate	loader	all	battery	header clones + named mutants, both families
 runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
 runner:cuda-bank-spec-gate	spec	deepseek4	battery

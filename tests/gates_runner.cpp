@@ -63,9 +63,10 @@
  * not the whole table.
  *
  * `--needs=a,b` (L278 battery cut, 2026-11-03) restricts a model -- the primary too, before any `--model` -- to the table
- * entries whose needs include at least one of those (ds4, tokenizer, spec, dspark, rewind, fixtures, vision, block): the
- * battery runs the DeepSeek primary with `--needs=ds4,fixtures`, the gates only it can run, since every other entry also
- * runs on the hosted families.  The table's needs column stays the one authority; no list of gate names.
+ * entries whose needs include at least one of those (ds4, tokenizer, spec, dspark, rewind, fixtures, vision, block,
+ * graphs): the battery runs the DeepSeek primary with `--needs=ds4,fixtures`, the gates only it can run, since every
+ * other entry also runs on the hosted families.  The table's needs column stays the one authority; no list of gate
+ * names.
  *
  * PULSAR_GATES_SECTIONS=FILE (make gates): one line `cuda-runner-gate [<family>] SECONDS` per hosted model is
  * appended to FILE -- the per-model sections of the battery's wall-time budget (docs/QA_BEFORE_RELEASES.md).
@@ -115,6 +116,9 @@ int gate_scratch_poison_gate_main(int, char **);
 int gate_sync_budget_gate_main(int, char **);
 int gate_mtp_spec_gate_main(int, char **);
 int gate_bank_adopt_gate_main(int, char **);
+int gate_bank_isolation_gate_main(int, char **);
+int gate_kv_accounting_gate_main(int, char **);
+int gate_graph_eager_gate_main(int, char **);
 
 /* ---- the engine broker ------------------------------------------------- */
 
@@ -220,7 +224,8 @@ typedef int (*gate_entry_fn)(int, char **);
 /* What a gate needs of the model it runs on (L278).  Each is read from the opened model through a public query,
  * never from its family's name -- except NEED_DS4_INTERNALS, which is what it says: the gate reads DeepSeek V4's
  * session graph through pulsar_engine_internal.h / gate_fixture.h, so it is that family's mechanism gate.  A gate
- * moves off it by being rewritten on the public API (as session-contract and row-neutrality are). */
+ * moves off it by being rewritten on the public API (as session-contract and row-neutrality are).  NEED_STEP_GRAPHS
+ * (L357) is read from the family's driver ops too, there being no public query for it. */
 enum {
     NEED_DS4_INTERNALS = 1u << 0,   /* DeepSeek V4's session graph */
     NEED_TOKENIZER     = 1u << 1,   /* chat text: pulsar_engine_has_tokenizer */
@@ -230,6 +235,9 @@ enum {
     NEED_FIXTURES      = 1u << 5,   /* the blobs on the command line, which are the PRIMARY model's */
     NEED_VISION        = 1u << 6,   /* images: pulsar_engine_has_vision */
     NEED_BLOCK         = 1u << 7,   /* a block drafter (L298 LiLiCorr, L299 DFlash2): pulsar_engine_drafter == BLOCK */
+    NEED_STEP_GRAPHS   = 1u << 8,   /* L357: the core driver graphs its decode / verify steps (the family's driver ops
+                                     * stage them, step_driver.cpp graphable) -- read from pulsar_driver_ops::stage,
+                                     * the second reach past the public queries (there is no query for it) */
 };
 #define DS4 NEED_DS4_INTERNALS
 
@@ -243,6 +251,7 @@ static const char *need_name(uint32_t bit) {
     case NEED_FIXTURES:      return "the command line's fixture blobs (captured from the primary model)";
     case NEED_VISION:        return "a vision tower (images)";
     case NEED_BLOCK:         return "a block drafter (LiLiCorr, DFlash2)";
+    case NEED_STEP_GRAPHS:   return "graphed driver steps (the family's driver ops stage its decode / verify steps)";
     }
     return "?";
 }
@@ -272,6 +281,7 @@ static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
     static const struct { const char *name; uint32_t bit; } k[] = {
         {"ds4", NEED_DS4_INTERNALS}, {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"dspark", NEED_DSPARK},
         {"rewind", NEED_REWIND}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION}, {"block", NEED_BLOCK},
+        {"graphs", NEED_STEP_GRAPHS},
     };
     *out = 0;
     for (const char *p = list; *p;) {
@@ -411,12 +421,13 @@ static int host_model(hosted_model *hm, const char *path, bool primary) {
     if (pulsar_engine_can_rewind(e)) hm->has |= NEED_REWIND;
     if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
     if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK) hm->has |= NEED_BLOCK;
+    if (e->family->driver && e->family->driver->stage) hm->has |= NEED_STEP_GRAPHS;
     if (primary) hm->has |= NEED_FIXTURES;
-    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
            hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
            hm->has & NEED_DSPARK ? " dspark" : "", hm->has & NEED_BLOCK ? " block" : "",
            hm->has & NEED_REWIND ? " rewind" : "", hm->has & NEED_VISION ? " vision" : "",
-           hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
+           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "", hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
     fflush(stdout);
     return 0;
 }
@@ -526,7 +537,7 @@ int main(int argc, char **argv) {
             const char *bad = argv[i] + 8;
             if (!parse_needs(argv[i] + 8, &cur->needs_any, &bad)) {
                 fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (ds4, tokenizer, spec, dspark, rewind, "
-                                "fixtures, vision, block)\n", argv[i] + 8, bad);
+                                "fixtures, vision, block, graphs)\n", argv[i] + 8, bad);
                 return 2;
             }
             i += 1;
@@ -649,6 +660,15 @@ int main(int argc, char **argv) {
          * another bank's published state and prefills the rest is the cold prefill byte for byte -- EXT, SIDE, SAME,
          * and the lender still resumes its own */
         {"bank-adopt-gate",           gate_bank_adopt_gate_main,        4, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        /* L357: the family-neutral ports of three DeepSeek mechanism gates above (cuda-frontier-gate,
+         * cuda-accounting-gate, cuda-head-graph-replay-gate), on the declared state and the core step driver: an idle
+         * bank untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row;
+         * touched KV == the physical a fill takes and a bank free returns; a replayed decode / verify step graph ==
+         * the eager step at the same row count */
+        {"bank-isolation-gate",       gate_bank_isolation_gate_main,    3, NULL, NULL, {NULL}, 0},
+        {"kv-accounting-gate",        gate_kv_accounting_gate_main,     2, NULL, NULL, {NULL}, 0},
+        {"graph-eager-gate",          gate_graph_eager_gate_main,       4, NULL, NULL, {NULL},
+         NEED_SPEC | NEED_STEP_GRAPHS},
     };
     /* Configuration A at a pinned draft depth (the gate sets spec_depth; the broker runs it on the default group's
      * engine, spec_depth_shareable -- 2026-10-14, three model loads per battery before). */
