@@ -111,16 +111,18 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
         return false;
     }
     /* L357: the sync resumes from the deepest point the family keeps at or below n -- Qwen keeps deeper ones than the
-     * grid checkpoint (2026-11-07: 480 for a sync to 500, against checkpoint_best's 384) -- so the origin is asserted
-     * to be a resume (above 0, at most n), not a given point; that the resumed run IS the cold computation is asserted
-     * byte for byte in the depth loop */
+     * grid checkpoint (2026-11-07: 480 for a sync to 500, against checkpoint_best's 384), or continues the bank's
+     * live prefix -- so the origin is reported, not prescribed; that the resumed run IS the cold computation is
+     * asserted byte for byte in the depth loop */
+    /* none() (-1): the sync continued the bank's own live prefix and evaluated nothing from a snapshot -- a resume
+     * too; only a start past the target is not one */
     const int O = pulsar_session_resume_origin(s).raw();
-    if (O <= 0 || O > (int)n) {
-        fprintf(stderr, "decode reference: the sync to %u resumed from %d (checkpoint_best %d): not a resume\n", n, O, G);
+    if (O > (int)n) {
+        fprintf(stderr, "decode reference: the sync to %u resumed from %d (checkpoint_best %d), past its target\n", n, O, G);
         return false;
     }
     pulsar_session_bank_state_save(s, 0);
-    *origin = O;
+    *origin = O < 0 ? (int)n : O;
     return true;
 }
 
@@ -163,11 +165,17 @@ int GATE_ENTRY(int argc, char **argv) {
     int n_kf = 0;
     for (int a = 4; a < argc; a++) {
         if (!strcmp(argv[a], "--known-flip") && a + 1 < argc) {
-            for (char *p = strtok(argv[++a], ","); p && n_kf < (int)MAX_DEPTHS; p = strtok(NULL, ","))
+            /* L357: strtok on a COPY -- the runner hands this gate and the prefill reference gate the same string,
+             * and splitting it in place truncated the later gate's known-flip list to its first depth */
+            char *own = strdup(argv[++a]);
+            for (char *p = strtok(own, ","); p && n_kf < (int)MAX_DEPTHS; p = strtok(NULL, ","))
                 known_flip[n_kf++] = (uint32_t)atoi(p);
+            free(own);
         } else {
             n_w = 0;
-            for (char *p = strtok(argv[a], ","); p && n_w < 8; p = strtok(NULL, ",")) widths[n_w++] = (uint32_t)atoi(p);
+            char *own = strdup(argv[a]);
+            for (char *p = strtok(own, ","); p && n_w < 8; p = strtok(NULL, ",")) widths[n_w++] = (uint32_t)atoi(p);
+            free(own);
         }
     }
     for (int i = 0; i < n_w; i++) {
