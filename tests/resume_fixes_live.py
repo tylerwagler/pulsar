@@ -10,8 +10,7 @@ Each case states the behaviour L353 fixed and reads it from the server's own log
   spill (nos. 8, 21)  A bank spilled under a low KV budget.  A request sharing only the start of its history doesn't read its
                       whole chain; a request continuing it does, to full depth straight after the spill.
   boundary (no. 15)   A prompt of exactly a grid multiple, persisted, re-sent on a fresh server.  A chain ending at the prompt's
-                      end can't be resumed: the pick comes from a point below it (the anchor at the end of a system prompt seen
-                      twice), and the reply's cached count says so.
+                      end can't be resumed: the pick comes from a point below it (one on a shared system prompt), and the reply's cached count says so.
 
 Exit 0 only when every check passed."""
 import argparse
@@ -163,11 +162,12 @@ def case_boundary(a, g, work):
         srv.stop()   # that request's history would serve the real one: a clean store for it
         shutil.rmtree(kv, ignore_errors=True)
         srv = Server(a.binary, a.model, work, "boundary-1", a.port, a.ctx, banks=a.banks, extra=extra)
-        # the system prompt's second sighting writes the anchor's restore point: the stored point below the prompt's end
-        mark = srv.mark()
+        # the first request leaves a restore point on the system prompt's grid, the stored point below the prompt's end
         chat(srv, msgs("Name the first character."))
+        mark = srv.mark()
         chat(srv, msgs("Name the last character."))
-        if not g.check("-> write it" in srv.since(mark), "a second sighting wrote the anchor's restore point"):
+        r = resumes(srv.since(mark))
+        if not g.check(bool(r) and r[-1][2] > 0, "a stored point stands on the shared system prompt: %s" % (r[-1:],)):
             return
         for _ in range(400):
             if (count(text) + offset) % GRID == 0:
