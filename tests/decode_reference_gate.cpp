@@ -110,13 +110,17 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
         fprintf(stderr, "decode reference: resume sync to %u failed: %s\n", n, err);
         return false;
     }
-    if (pulsar_session_resume_origin(s).raw() != G) {
-        fprintf(stderr, "decode reference: the sync to %u resumed from %d, not the restored checkpoint %d\n", n,
-                pulsar_session_resume_origin(s).raw(), G);
+    /* L357: the sync resumes from the deepest point the family keeps at or below n -- Qwen keeps deeper ones than the
+     * grid checkpoint (2026-11-07: 480 for a sync to 500, against checkpoint_best's 384) -- so the origin is asserted
+     * to be a resume (above 0, at most n), not a given point; that the resumed run IS the cold computation is asserted
+     * byte for byte in the depth loop */
+    const int O = pulsar_session_resume_origin(s).raw();
+    if (O <= 0 || O > (int)n) {
+        fprintf(stderr, "decode reference: the sync to %u resumed from %d (checkpoint_best %d): not a resume\n", n, O, G);
         return false;
     }
     pulsar_session_bank_state_save(s, 0);
-    *origin = G;
+    *origin = O;
     return true;
 }
 
