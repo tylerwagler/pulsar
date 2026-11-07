@@ -124,7 +124,7 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 <!-- battery-budget -->
 | section | budget s | holds |
 |---|---:|---|
-| `unit-test-gate` | 175 | `pulsar_test --gating`: three model loads |
+| `unit-test-gate` | 240 | `pulsar_test --gating`: three model loads, on the served Qwen pack since L357 (was DeepSeek; it absorbed the 120 s `image-chain-qwen` target, whose test `--gating` runs).  An estimate, re-set from the first battery |
 | `agent-test-gate` | 10 | host |
 | `cuda-regression` | 70 | ten model-free kernel gates, concurrent |
 | `cuda-kv-rows-pack-gate` | 10 | |

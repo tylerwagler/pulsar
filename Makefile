@@ -1372,8 +1372,8 @@ seam-check:
 # DIFFERENT artifacts' logits whenever the battery named the Vision-Exp one,
 # reporting 129280/129280 differing at every depth -- a FAIL with no information
 # in it.  Naming the served artifact makes the default and the practice one fact.
-# This one variable is the battery's model authority: `unit-test-gate` and
-# `unit-test-gate-server` both pass it as PULSAR_TEST_MODEL.
+# This one variable names the DeepSeek artifact for the gates that still load it.  `unit-test-gate` and gates-dev's
+# pulsar_test runs load the served Qwen pack (QWEN_GATE_MODEL) instead since L357 (DeepSeek is smoke-only, 2026-11-07).
 #
 # SAFETENSORS, 2026-09-21: the GGUF container is retired, so this names the
 # artifact itself -- the per-layer-shard safetensors checkpoint the engine reads
@@ -2369,12 +2369,12 @@ cuda-runner-gate: tests/gates_runner
 # battery (it lands in the same pass/fail fold).
 # 2026-10-14: --gating, every test but the informational ones (logprob-vectors: a drift dashboard whose mismatches
 # can never fail the suite, at the price of its own model load).  `make test` still runs everything.
-# L357: L353 no. 1 (image segment keys) escaped onto served Qwen while this leg ran only on the DeepSeek fixture.
-.PHONY: image-chain-qwen
-image-chain-qwen: pulsar_test
-	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" ./pulsar_test --image-chain
+# L357: on the served Qwen pack (QWEN_GATE_MODEL), not the DeepSeek fixture: L353 no. 1 (image segment keys) escaped onto
+# served Qwen while the image tests ran only on DeepSeek, which is smoke-only since 2026-11-07.  --gating runs the image
+# tests (--image-chain among them), so they need no target of their own.  PULSAR_TEST_QWEN_TOKENIZER names the same
+# checkpoint for the server unit tests' host-side tokenizer (src/server/server_tests.cpp reads it on its own).
 unit-test-gate: pulsar_test
-	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
+	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
 
 # The AGENT's host-only unit suite (the DSML parser/detector over every syntax
 # row, the edit anchors, and the KV store's stripped-checkpoint refusal).  It is
@@ -2409,7 +2409,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	image-chain-qwen model-smoke cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
+	model-smoke cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -2687,9 +2687,9 @@ gates-dev:
 	$(MAKE) --no-print-directory seam-check CUDA_ARCH=sm_120f || rc=1; \
 	$(MAKE) --no-print-directory cuda-reap-router-audit CUDA_ARCH=sm_120f \
 	      FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
-	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT) || rc=1; \
+	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT) || rc=1; \
 	if [ $$server -eq 1 ]; then \
-	  PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
+	  PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test $(GATES_DEV_UNIT_SERVER) || rc=1; \
 	  $(MAKE) -j$(GATE_JOBS) --no-print-directory cuda-chat-smoke-gate CUDA_ARCH=sm_120f \
 	        FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
 	fi; \

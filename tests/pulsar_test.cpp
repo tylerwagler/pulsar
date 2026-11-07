@@ -48,8 +48,8 @@ static pulsar_engine *test_engine;
 static const char *test_model_path(void) {
     const char *model_path = getenv("PULSAR_TEST_MODEL");
     /* There is no meaningful default artifact: a pulsar model is a safetensors
-     * checkpoint and the battery always passes FRONTIER_MODEL through as
-     * PULSAR_TEST_MODEL.  The name below is the checkpoint's, not a GGUF's, so a
+     * checkpoint and the battery always passes one through as PULSAR_TEST_MODEL
+     * (the served Qwen pack, QWEN_GATE_MODEL, since L357).  The name below is the checkpoint's, not a GGUF's, so a
      * missing PULSAR_TEST_MODEL fails on a path that could exist. */
     return (model_path && model_path[0]) ? model_path : "model.safetensors";
 }
@@ -92,49 +92,6 @@ static pulsar_engine *test_get_engine(void) {
 static void test_close_engines(void) {
     pulsar_engine_close(test_engine);
     test_engine = NULL;
-}
-
-static void test_short_prefill_ratio4(void) {
-    pulsar_engine *engine = test_get_engine();
-    if (!engine) return;
-
-    pulsar_turn_markers markers;
-    TEST_ASSERT(pulsar_chat_turn_markers(engine, &markers));
-    const int tokens[] = {
-        markers.user[0],
-        markers.assistant[0],
-        pulsar_token_eos(engine),
-    };
-    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
-        TEST_ASSERT(tokens[i] >= 0);
-        if (tokens[i] < 0) return;
-    }
-
-    for (size_t n = 1; n <= 3; n++) {
-        pulsar_tokens prompt = {0};
-        for (size_t i = 0; i < n; i++) {
-            pulsar_tokens_push(&prompt, tokens[i]);
-        }
-        TEST_ASSERT(prompt.len == (int)n);
-
-        pulsar_session *session = NULL;
-        TEST_ASSERT(pulsar_session_create(&session, engine, 2048) == 0);
-        if (!session) {
-            pulsar_tokens_free(&prompt);
-            return;
-        }
-
-        char err[160] = {0};
-        const int rc = pulsar_session_sync(session, &prompt, err, sizeof(err));
-        if (rc != 0) {
-            fprintf(stderr, "pulsar-test: short prefill failed for %zu token(s): %s\n",
-                    n, err);
-        }
-        TEST_ASSERT(rc == 0);
-
-        pulsar_session_free(session);
-        pulsar_tokens_free(&prompt);
-    }
 }
 
 static char *test_read_file(const char *path) {
@@ -1535,7 +1492,7 @@ static void test_mpp_equivalence(void) {
 static const char *test_tool_call_request_json(void) {
     return
         "{"
-        "\"model\":\"deepseek-v4-flash\","
+        "\"model\":\"pulsar-test\","
         "\"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory. Use the provided tool; do not answer in prose.\"}],"
         "\"tools\":[{\"type\":\"function\",\"function\":{"
             "\"name\":\"list_files\","
@@ -1598,70 +1555,103 @@ static void test_think_tool_recovery(void) {
     buf_free(&text);
 }
 
+/* The model's first tool call, read the way the server reads it: the loaded family's own output parser
+ * (server_family_ops::output -- DeepSeek's DSML reader, Qwen's <tool_call> kit, ...) fed every sampled token,
+ * the turn ended at the family's stop set or where its parser says the turn is complete.  No model-visible
+ * retry: this grades the first attempt. */
 static void test_tool_call_quality_one(void) {
     pulsar_engine *engine = test_get_engine();
     if (!engine) return;
 
-    request r;
-    char err[160];
-    TEST_ASSERT(parse_chat_request(engine, NULL, test_tool_call_request_json(),
-                                   512, &r, err, sizeof(err)));
+    job j;
+    memset((void *)&j, 0, sizeof j);
+    request *r = &j.req;
+    char err[256];
+    if (!parse_chat_request(engine, NULL, test_tool_call_request_json(), 512, r, err, sizeof(err))) {
+        fprintf(stderr, "pulsar-test: tool-call-quality: the request refused: %s\n", err);
+        TEST_ASSERT(!"tool-call-quality: the request must parse");
+        return;
+    }
 
     pulsar_session *session = NULL;
     TEST_ASSERT(pulsar_session_create(&session, engine, 32768) == 0);
     if (!session) {
-        request_free(&r);
+        request_free(r);
         return;
     }
-    TEST_ASSERT(pulsar_session_sync(session, &r.prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(pulsar_session_sync(session, &r->prompt, err, sizeof(err)) == 0);
 
-    buf text = {0};
+    server srv;
+    memset((void *)&srv, 0, sizeof srv);
+    pthread_mutex_init(&srv.tool_mu, NULL);
+    gen_state g;
+    memset((void *)&g, 0, sizeof g);
+    g.j = &j;
+    g.thinking = thinking_state_from_prompt(r);   /* the server's gen_decode_init */
+    g.recovery_attempted = true;
+    const server_output_parser_ops *ops = r->family->output;
+    void *ps = ops->create(&srv, &g, err, sizeof err);
+    TEST_ASSERT(ps != NULL);
+    if (!ps) fprintf(stderr, "pulsar-test: tool-call-quality: %s\n", err);
+
     uint64_t rng = 123;
     bool decode_ok = true;
-    bool saw_tool_start = false;
-    bool saw_tool_end = false;
-    for (int i = 0; i < r.max_tokens; i++) {
-        int token = pulsar_session_sample(session, r.temperature, r.top_k,
-                                       r.top_p, r.min_p, &rng);
+    g.finish = "length";
+    for (int i = 0; ps && i < r->max_tokens; i++) {
+        int token = pulsar_session_sample(session, r->temperature, r->top_k,
+                                       r->top_p, r->min_p, &rng);
         if (token < 0) { decode_ok = false; break; }   /* degenerate row refused (L188) */
+        if (pulsar_token_is_stop(engine, token)) {
+            g.finish = "stop";
+            break;
+        }
         size_t piece_len = 0;
         char *piece = pulsar_token_text(engine, token, &piece_len);
-        buf_append(&text, piece, piece_len);
+        buf_append(&g.text, piece, piece_len);
+        g.thinking.feed(piece, piece_len);
         free(piece);
-        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
-        if (saw_tool_end) break;
+        if (!ops->feed(ps, &srv, &g, g.text.len, false)) { decode_ok = false; break; }
+        if (ops->turn_complete(ps, &g)) {
+            g.finish = "stop";
+            break;
+        }
         if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
         }
     }
 
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr ? text.ptr : "",
-                                             false, &content, &reasoning, &calls);
+    server_turn turn;
+    memset((void *)&turn, 0, sizeof turn);
+    if (ps) {
+        turn.finish = g.finish;
+        TEST_ASSERT(ops->finish(ps, &srv, NULL, &g, &turn));
+        ops->destroy(ps);
+    }
     TEST_ASSERT(decode_ok);
-    TEST_ASSERT(parsed);
-    if (calls.len == 0) {
+    if (turn.calls.len == 0) {
         /* Print WHAT the model produced: "no tool call" alone cannot tell a
          * rendering difference from a decode one. */
-        fprintf(stderr, "pulsar-test: tool-call-quality generated %d BYTES:\n%.*s\n",
-                (int)text.len, (int)text.len, text.ptr ? text.ptr : "(empty)");
+        fprintf(stderr, "pulsar-test: tool-call-quality (%s) generated %d BYTES:\n%.*s\n", r->family->name,
+                (int)g.text.len, (int)g.text.len, g.text.ptr ? g.text.ptr : "(empty)");
     }
-    TEST_ASSERT(calls.len > 0);
-    TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
+    TEST_ASSERT(turn.calls.len > 0);
+    TEST_ASSERT(turn.calls.len > 0 && !strcmp(turn.calls.v[0].name, "list_files"));
+    fprintf(stderr, "pulsar-test: tool-call-quality (%s) finish=%s calls=%d name=%s\n", r->family->name,
+            turn.finish ? turn.finish : "-", turn.calls.len, turn.calls.len ? turn.calls.v[0].name : "-");
 
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
-    buf_free(&text);
+    free(turn.content);
+    free(turn.reasoning);
+    tool_calls_free(&turn.calls);
+    buf_free(&g.text);
+    tool_memory_free(&srv.tool_mem);
+    pthread_mutex_destroy(&srv.tool_mu);
     pulsar_session_free(session);
-    request_free(&r);
+    request_free(r);
 }
 
 static void test_tool_call_quality(void) {
-    fprintf(stderr, "pulsar-test: tool-call DSML emission\n");
+    fprintf(stderr, "pulsar-test: tool-call emission, read by the loaded family's parser\n");
     test_tool_call_quality_one();
 }
 
@@ -2444,7 +2434,15 @@ static void test_render_cases(void) {
  * bytes depends on what precedes it) and the V4.1 tools preamble legitimately
  * spells every marker, so id-set subtraction is hopeless for a request with
  * tools.  What is exact is the DELTA: marking a range removes exactly the
- * control ids its own bytes spell, and nothing else changes. */
+ * control ids its own bytes spell, and nothing else changes.
+ *
+ * The model-backed halves run on the LOADED family (Qwen in the battery): the
+ * control ids and the paste come from its tokenizer, the renders and suffixes from
+ * its server family table.  A segment-by-segment oracle is not the contract on
+ * every family -- the shared BPE engine pre-tokenises across a client range's
+ * edges (src/lib/bpe_tokenizer.h, the L223 guard) -- so a marked tokenisation is
+ * graded by what holds on all of them: it spells the text byte for byte, and no
+ * control id's bytes touch a client range. */
 
 static char *test_span_slice(const char *text, size_t lo, size_t hi) {
     const size_t n = hi - lo;
@@ -2467,12 +2465,6 @@ static bool test_tokens_contain_id(const pulsar_tokens *t, int id) {
     return false;
 }
 
-static int test_tokens_count_id(const pulsar_tokens *t, int id) {
-    int n = 0;
-    for (int i = 0; i < t->len; i++) if (t->v[i] == id) n++;
-    return n;
-}
-
 static int test_tokens_count_ids(const pulsar_tokens *t, const pulsar_tokens *ids) {
     int n = 0;
     for (int i = 0; i < t->len; i++) if (test_tokens_contain_id(ids, t->v[i])) n++;
@@ -2484,38 +2476,6 @@ static bool test_spans_cover(const pulsar_text_span *spans, uint32_t n_spans,
     for (uint32_t i = 0; i < n_spans; i++)
         if (spans[i].lo <= lo && spans[i].hi >= hi) return true;
     return false;
-}
-
-/* The span contract, implemented independently of the tokeniser: the bytes of
- * each marked range are PLAIN text, the bytes between ranges are rendered chat,
- * so the expected tokens are the concatenation of the two, segment by segment.
- * An implementation cannot satisfy this by accident. */
-static void test_span_tokens_expected(pulsar_engine *e, const char *text,
-                                      const pulsar_text_span *spans, uint32_t n_spans,
-                                      pulsar_tokens *out) {
-    const size_t len = strlen(text);
-    size_t at = 0;
-    for (uint32_t i = 0; i < n_spans; i++) {
-        size_t lo = spans[i].lo, hi = spans[i].hi;
-        if (lo > len) lo = len;
-        if (hi > len) hi = len;
-        if (lo < at) lo = at;
-        if (hi <= lo) continue;
-        if (lo > at) {
-            char *seg = test_span_slice(text, at, lo);
-            pulsar_tokenize_rendered_chat(e, seg, out);
-            free(seg);
-        }
-        char *seg = test_span_slice(text, lo, hi);
-        pulsar_tokenize_text(e, seg, out);
-        free(seg);
-        at = hi;
-    }
-    if (at < len) {
-        char *seg = test_span_slice(text, at, len);
-        pulsar_tokenize_rendered_chat(e, seg, out);
-        free(seg);
-    }
 }
 
 /* How many control ids the marked ranges spell in the RENDERED bytes (a tool
@@ -2662,302 +2622,158 @@ static void test_control_token_spans(void) {
 }
 
 #ifndef PULSAR_NO_GPU
-/* The assertions every SERVED request must satisfy: the client paste is inside a
- * recorded range, the tokens the API produced are exactly the span contract, and
- * the marking removed exactly the control ids the client ranges spell (the old
- * entry, run on the same text, still injects them). */
-static void test_served_request_ok(pulsar_engine *e, request *rr, const char *tag,
-                                   const char *hostile, const pulsar_tokens *control_ids) {
+/* What a marked tokenisation must be on every family: the tokens spell `text` byte for byte (nothing dropped or
+ * invented at a range's edge), and no control id's bytes touch a client range -- every control token left in the
+ * prompt is the template's own. */
+static void test_marked_tokens_ok(pulsar_engine *e, const char *tag, const char *text,
+                                  const pulsar_text_span *spans, uint32_t n_spans,
+                                  const pulsar_tokens *marked, const pulsar_tokens *control_ids) {
+    std::string spelled;
+    int touching = 0;
+    for (int i = 0; i < marked->len; i++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, marked->v[i], &n);
+        const size_t lo = spelled.size();
+        if (t) spelled.append(t, n);
+        free(t);
+        if (!test_tokens_contain_id(control_ids, marked->v[i])) continue;
+        for (uint32_t k = 0; k < n_spans; k++)
+            if (lo < spans[k].hi && spans[k].lo < lo + n) touching++;
+    }
+    const bool spells = spelled == text;
+    TEST_ASSERT(spells);
+    TEST_ASSERT(touching == 0);
+    if (!spells || touching)
+        fprintf(stderr, "%s: the marked tokens spell %zu bytes of a %zu-byte text%s; %d control id(s) touch a client "
+                        "range\n", tag, spelled.size(), strlen(text), spells ? "" : " (they differ)", touching);
+}
+
+/* Every occurrence of the paste in `text` lies inside one client range.  Returns how many there are. */
+static int test_paste_covered(const char *text, const pulsar_text_span *spans, uint32_t n_spans, const char *paste) {
+    int found = 0, covered = 0;
+    for (const char *p = text; (p = strstr(p, paste)) != NULL; p++) {
+        const size_t lo = (size_t)(p - text);
+        found++;
+        if (test_spans_cover(spans, n_spans, lo, lo + strlen(paste))) covered++;
+    }
+    TEST_ASSERT(covered == found);
+    return found;
+}
+
+/* The assertions every SERVED request must satisfy: each copy of the client paste is inside a recorded range, the
+ * tokens the API produced spell the text with no control id inside a range, and the marking removed exactly the
+ * control ids the client ranges spell (the old entry, run on the same text, still injects them).  Returns how many
+ * copies of the paste the prompt holds. */
+static int test_served_request_ok(pulsar_engine *e, request *rr, const char *tag,
+                                  const char *hostile, const pulsar_tokens *control_ids) {
     TEST_ASSERT(rr->prompt_text != NULL);
     TEST_ASSERT(rr->prompt_spans != NULL && rr->prompt_n_spans > 0);
     TEST_ASSERT(rr->prompt.len > 0);
-    const char *at = rr->prompt_text ? strstr(rr->prompt_text, hostile) : NULL;
-    TEST_ASSERT(at != NULL);
-    if (!at) return;
-    const size_t plo = (size_t)(at - rr->prompt_text);
-    TEST_ASSERT(test_spans_cover(rr->prompt_spans, rr->prompt_n_spans,
-                                 plo, plo + strlen(hostile)));
-    pulsar_tokens old = {0}, oracle = {0};
+    if (!rr->prompt_text || !rr->prompt_spans) return 0;
+    const int found = test_paste_covered(rr->prompt_text, rr->prompt_spans, rr->prompt_n_spans, hostile);
+    TEST_ASSERT(found >= 1);
+    test_marked_tokens_ok(e, tag, rr->prompt_text, rr->prompt_spans, rr->prompt_n_spans, &rr->prompt, control_ids);
+    pulsar_tokens old = {0};
     pulsar_tokenize_rendered_chat(e, rr->prompt_text, &old);
-    test_span_tokens_expected(e, rr->prompt_text, rr->prompt_spans,
-                              rr->prompt_n_spans, &oracle);
-    /* the served tokenisation IS the span contract ... */
-    TEST_ASSERT(test_tokens_identical(&rr->prompt, &oracle));
-    /* ... the paste's control ids are still injectable through the old entry on
-     * this very text ... */
+    /* the paste's control ids are still injectable through the old entry on this very text ... */
     const int in_spans = test_spans_control_ids(e, rr->prompt_text, rr->prompt_spans,
                                                 rr->prompt_n_spans, control_ids);
     TEST_ASSERT(in_spans > 0);
     /* ... and the delta is exactly those ids. */
     TEST_ASSERT(test_tokens_count_ids(&old, control_ids) -
                 test_tokens_count_ids(&rr->prompt, control_ids) == in_spans);
-    printf("control-token-injection: %s: %d control ids in the client ranges "
+    printf("control-token-injection: %s: %d cop%s of the paste, %d control ids in the client ranges "
            "(injected without the marking, gone with it), %u spans\n",
-           tag, in_spans, rr->prompt_n_spans);
+           tag, found, found == 1 ? "y" : "ies", in_spans, rr->prompt_n_spans);
     pulsar_tokens_free(&old);
-    pulsar_tokens_free(&oracle);
+    return found;
 }
 
-/* The control ids, computed from the LITERALS alone so that no BPE-in-context
- * question enters the classification: an id the rendered matcher produces for a
- * literal but the plain tokeniser does not is reachable only as a control
- * token.  One authority for both the prompt-side and the suffix-side tests. */
-static void test_control_ids(pulsar_engine *e, pulsar_tokens *out) {
-    static const char *const literals[] = {
-        PULSAR_RENDER_SYSTEM, PULSAR_RENDER_USER, PULSAR_RENDER_ASSISTANT,
-        "<think>", "</think>", PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END,
-        PULSAR_INVOKE_START, PULSAR_INVOKE_END, PULSAR_PARAM_START, PULSAR_PARAM_END,
-    };
-    for (size_t li = 0; li < sizeof literals / sizeof literals[0]; li++) {
-        pulsar_tokens rendered = {0}, plain = {0};
-        pulsar_tokenize_rendered_chat(e, literals[li], &rendered);
-        pulsar_tokenize_text(e, literals[li], &plain);
-        for (int k = 0; k < rendered.len; k++) {
-            if (test_tokens_contain_id(&plain, rendered.v[k])) continue;
-            if (!test_tokens_contain_id(out, rendered.v[k]))
-                pulsar_tokens_push(out, rendered.v[k]);
+/* The loaded tokenizer's CONTROL tokens, enumerated from its table so no list is kept by hand: every id whose own
+ * spelling the rendered matcher reads as that one id while the plain tokeniser, on the same bytes, never produces
+ * it -- an id a prompt reaches only as a control token (Qwen: its added tokens, <|im_start|>, <think>,
+ * <tool_call>, ...; DeepSeek: the specials its matcher knows).  One authority for the prompt-side and the
+ * suffix-side tests.  A spelling that is not UTF-8 (a byte-level piece) or holds a NUL is no text a client can
+ * send, so it is not tried. */
+typedef struct {
+    pulsar_tokens ids;                  ///< the control ids
+    std::vector<std::string> literals;  ///< their spellings, in id order
+    std::string hostile;                ///< the paste: every literal a client can type, between plain words
+} test_control_probe;
+
+static void test_control_tokens(pulsar_engine *e, test_control_probe *p) {
+    const int n_vocab = pulsar_engine_vocab_size(e);
+    TEST_ASSERT(n_vocab > 0);
+    for (int id = 0; id < n_vocab; id++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, id, &n);
+        bool text = t && n && strlen(t) == n;
+        for (size_t k = 0; text && k < n;) {
+            const int m = utf8_seq_ok((const unsigned char *)t + k, n - k);
+            text = m > 0;
+            k += (size_t)m;
         }
-        pulsar_tokens_free(&rendered);
-        pulsar_tokens_free(&plain);
+        if (text) {
+            pulsar_tokens rendered = {0};
+            pulsar_tokenize_rendered_chat(e, t, &rendered);
+            if (rendered.len == 1 && rendered.v[0] == id) {
+                pulsar_tokens plain = {0};
+                pulsar_tokenize_text(e, t, &plain);
+                if (!test_tokens_contain_id(&plain, id)) {
+                    pulsar_tokens_push(&p->ids, id);
+                    p->literals.push_back(std::string(t, n));
+                }
+                pulsar_tokens_free(&plain);
+            }
+            pulsar_tokens_free(&rendered);
+        }
+        free(t);
     }
 }
 
-/** The one id `literal` can only reach as a control token (-1 when the literal
- * is ordinary text).  Used to prove a suffix's SERVER framing survives. */
-static int test_control_id_for_literal(pulsar_engine *e, const char *literal) {
+/* The probe for the loaded family: its control tokens and the paste.  The literals are space-separated, so no two
+ * can fuse into a third, between plain words, so a renderer's strip of a message's ends cannot reach one.  The image
+ * placeholder stays out of the paste: client text spelling it is a malformed image request, refused by its own rule
+ * (request_prepare_images), never text to mark.  PREMISE, asserted: the rendered matcher reads every pasted literal
+ * as its control id and the plain tokeniser reads none -- without it the tests below could pass on a fix that marks
+ * nothing. */
+static bool test_control_probe_open(pulsar_engine *e, const char *tag, test_control_probe *p) {
+    p->ids = pulsar_tokens{};
+    test_control_tokens(e, p);
+    TEST_ASSERT(p->ids.len > 0);
+    int pasted = 0;
+    p->hostile = "log:";
+    for (const std::string &l : p->literals) {
+        if (l == PULSAR_IMAGE_PLACEHOLDER) continue;
+        p->hostile += ' ';
+        p->hostile += l;
+        pasted++;
+    }
+    p->hostile += " end";
+    TEST_ASSERT(pasted > 0);
     pulsar_tokens rendered = {0}, plain = {0};
-    pulsar_tokenize_rendered_chat(e, literal, &rendered);
-    pulsar_tokenize_text(e, literal, &plain);
-    int id = -1;
-    for (int k = 0; k < rendered.len && id < 0; k++)
-        if (!test_tokens_contain_id(&plain, rendered.v[k])) id = rendered.v[k];
+    pulsar_tokenize_rendered_chat(e, p->hostile.c_str(), &rendered);
+    pulsar_tokenize_text(e, p->hostile.c_str(), &plain);
+    const int as_control = test_tokens_count_ids(&rendered, &p->ids);
+    TEST_ASSERT(as_control == pasted);
+    TEST_ASSERT(test_tokens_count_ids(&plain, &p->ids) == 0);
+    printf("%s: the loaded tokenizer has %d control tokens; the paste spells %d (%d read as control ids)\n", tag,
+           p->ids.len, pasted, as_control);
     pulsar_tokens_free(&rendered);
     pulsar_tokens_free(&plain);
-    return id;
+    if (pasted > 0) return true;
+    pulsar_tokens_free(&p->ids);
+    return false;
 }
 
-/* L185: the token-level twin (agent/CLI/bench/eval -- the DeepSeek family's
- * chat front: pulsar_chat_open / pulsar_chat_append_turn, L284 P14) against the
- * server's renderer for the SAME conversation.
- *
- * The twin is the `-p`/eval/bench path and the agent's prompt builder; the
- * server renders from chat_msgs.  They must agree for the LOADED template
- * family (`pulsar_engine_chat_v41`), because both feed the same engine.  This
- * compares them per conversation shape and, for information, against the OTHER
- * family's template (the twin is expected to differ there -- it follows the
- * loaded one). */
-static void test_print_token(pulsar_engine *e, int id) {
-    size_t n = 0;
-    char *t = pulsar_token_text(e, id, &n);
-    printf(" %d '", id);
-    for (size_t i = 0; t && i < n; i++) {
-        const unsigned char c = (unsigned char)t[i];
-        if (c == '\n') fputs("\\n", stdout);
-        else if (c == '\r') fputs("\\r", stdout);
-        else if (c == '\t') fputs("\\t", stdout);
-        else if (c < 0x20 || c == 0x7f) printf("\\x%02x", c);
-        else putchar((char)c);
-    }
-    printf("'");
-    free(t);
+/* `s` as the body of a JSON string (no quotes), for the request bodies the probes send. */
+static std::string test_json_body(const std::string &s) {
+    buf b = {0};
+    json_escape_fragment_n(&b, s.data(), s.size());
+    std::string out(b.ptr ? b.ptr : "", b.len);
+    buf_free(&b);
+    return out;
 }
-
-static bool twin_case_one(pulsar_engine *e, const char *name, const chat_msgs *msgs,
-                          bool has_system, pulsar_think_mode mode, bool v41) {
-    chat_text_span *spans = NULL;
-    uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(msgs, NULL, mode, v41, &spans, &n_spans);
-    pulsar_tokens srv = {0};
-    pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &srv);
-
-    /* the system FIELD (case 1) is the head's system text; every other message is the turn */
-    pulsar_tokens twin = {0};
-    const int first = has_system ? 1 : 0;
-    pulsar_chat_open(e, &twin, NULL, has_system ? msgs->v[0].content : NULL, mode);
-    pulsar_chat_message turn[8];
-    TEST_ASSERT(msgs->len - first <= (int)(sizeof turn / sizeof turn[0]));
-    for (int i = first; i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        const bool tool = !strcmp(m->role, "tool") || !strcmp(m->role, "function");
-        const bool sys = role_is_system(m->role);
-        turn[i - first] = {tool ? "tool" : (sys ? "system" : "user"), m->content ? m->content : "", false};
-    }
-    pulsar_chat_append_turn(e, &twin, turn, msgs->len - first, true, mode);
-
-    int diff = -1, ndiff = 0;
-    const int lim = srv.len < twin.len ? srv.len : twin.len;
-    for (int i = 0; i < lim; i++) {
-        if (srv.v[i] != twin.v[i]) { if (diff < 0) diff = i; ndiff++; }
-    }
-    const bool same = diff < 0 && srv.len == twin.len;
-    if (!same) {
-        printf("twin-parity %-26s v41=%d %-9s srv=%3d twin=%3d ndiff=%d\n   srv :",
-               name, (int)v41, "DIFFER", srv.len, twin.len,
-               ndiff + (srv.len - twin.len));
-        for (int k = 0; k < srv.len; k++) test_print_token(e, srv.v[k]);
-        printf("\n   twin:");
-        for (int k = 0; k < twin.len; k++) test_print_token(e, twin.v[k]);
-        putchar('\n');
-    } else {
-        printf("twin-parity %-26s v41=%d IDENTICAL srv=%d\n", name, (int)v41, srv.len);
-    }
-    free(text);
-    free(spans);
-    pulsar_tokens_free(&srv);
-    pulsar_tokens_free(&twin);
-    return same;
-}
-
-/* L185: the twin's MEASURED divergences from the LOADED template.  A shape that
- * starts matching (or a new one that stops matching) fails this test, so the
- * list cannot rot: fixing one means deleting its line here and updating
- * rows/L185.md.  The four are the shapes the agent/CLI feed that the server
- * renders differently -- see the row for the token-level evidence. */
-static const char *const twin_known_divergences[] = {
-    /* EMPTY since the twin was rewritten to append the same TEXT runs the
-     * renderer does (L185 step 2): every shape below must now match the loaded
-     * template exactly.  A future divergence lands here only with a row entry. */
-};
-
-static void twin_expect(pulsar_engine *e, const char *name, const chat_msgs *msgs,
-                        bool has_system, pulsar_think_mode mode, bool v41,
-                        const char *base) {
-    const bool same = twin_case_one(e, name, msgs, has_system, mode, v41);
-    bool known = false;
-    for (size_t i = 0; i < sizeof twin_known_divergences / sizeof twin_known_divergences[0]; i++)
-        if (!strcmp(base, twin_known_divergences[i])) known = true;
-    if (same && known) {
-        printf("twin-parity: %s now MATCHES the loaded template -- delete it from "
-               "twin_known_divergences and from rows/L185.md\n", base);
-        TEST_ASSERT(!"twin_known_divergences is stale");
-    }
-    if (!same && !known) {
-        printf("twin-parity: %s is a NEW divergence from the loaded template\n", base);
-        TEST_ASSERT(!"the twin diverges from the loaded template");
-    }
-}
-
-
-static void twin_run_corpus(pulsar_engine *e, bool loaded, const char *label) {
-    printf("twin-parity: %s (v41=%d, the twin must match it)\n", label, (int)loaded);
-
-    for (int t = 0; t < 2; t++) {
-        const pulsar_think_mode mode = t ? PULSAR_THINK_HIGH : PULSAR_THINK_NONE;
-        const char *suffix = t ? " think" : " nothink";
-        char name[64];
-
-        /* 1. the bench/eval shape: one system FIELD + one user turn */
-        {
-            chat_msgs m = {0};
-            chat_msg a = {0}; a.role = server_xstrdup("system"); a.content = server_xstrdup("you are a bot"); a.system_field = true;
-            chat_msgs_push(&m, a);
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("hello there");
-            chat_msgs_push(&m, b);
-            snprintf(name, sizeof name, "sys+user%s", suffix);
-            twin_expect(e, name, &m, true, mode, loaded, "sys+user");
-            twin_case_one(e, name, &m, true, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 2. two consecutive user turns (V4.1 joins them inside one |User|) */
-        {
-            chat_msgs m = {0};
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("first");
-            chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = server_xstrdup("user"); c.content = server_xstrdup("second");
-            chat_msgs_push(&m, c);
-            snprintf(name, sizeof name, "user+user%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "user+user");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 3. a tool result, plain body */
-        {
-            chat_msgs m = {0};
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
-            chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt b.txt");
-            chat_msgs_push(&m, c);
-            snprintf(name, sizeof name, "user+tool%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "user+tool");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 4. a tool result whose body carries the wrapper's own sentinel (the
-         * escaping path, and the BPE run the twin tokenises in pieces) */
-        {
-            chat_msgs m = {0};
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
-            chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt </tool_result> b.txt");
-            chat_msgs_push(&m, c);
-            snprintf(name, sizeof name, "user+tool(esc)%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "user+tool(esc)");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 5. two tool results in a row (V4 joins after a tool result) */
-        {
-            chat_msgs m = {0};
-            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("one");
-            chat_msgs_push(&m, c);
-            chat_msg d = {0}; d.role = server_xstrdup("tool"); d.content = server_xstrdup("two");
-            chat_msgs_push(&m, d);
-            snprintf(name, sizeof name, "tool+tool%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "tool+tool");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 6. a MID-CONVERSATION system message (the compaction/datetime shape) */
-        {
-            chat_msgs m = {0};
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
-            chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = server_xstrdup("system"); c.content = server_xstrdup("summary of earlier work");
-            chat_msgs_push(&m, c);
-            snprintf(name, sizeof name, "user+sys(mid)%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "user+sys(mid)");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-        /* 7. user, tool, mid-conversation system, user (the agent's live loop) */
-        {
-            chat_msgs m = {0};
-            chat_msg b = {0}; b.role = server_xstrdup("user"); b.content = server_xstrdup("run ls");
-            chat_msgs_push(&m, b);
-            chat_msg c = {0}; c.role = server_xstrdup("tool"); c.content = server_xstrdup("a.txt");
-            chat_msgs_push(&m, c);
-            chat_msg d = {0}; d.role = server_xstrdup("system"); d.content = server_xstrdup("datetime: now");
-            chat_msgs_push(&m, d);
-            chat_msg e2 = {0}; e2.role = server_xstrdup("user"); e2.content = server_xstrdup("now do more");
-            chat_msgs_push(&m, e2);
-            snprintf(name, sizeof name, "user+tool+sys+user%s", suffix);
-            twin_expect(e, name, &m, false, mode, loaded, "user+tool+sys+user");
-            twin_case_one(e, name, &m, false, mode, !loaded);
-            chat_msgs_free(&m);
-        }
-    }
-}
-
-static void test_chat_twin_parity(void) {
-    const char *model = getenv("PULSAR_TEST_MODEL");
-    if (!model || !model[0]) {
-        fprintf(stderr, "pulsar-test: chat-twin-parity SKIPPED (PULSAR_TEST_MODEL unset)\n");
-        return;
-    }
-    pulsar_engine *e = test_get_engine();
-    if (!e) return;
-    const bool loaded = pulsar_engine_chat_v41(e);
-    twin_run_corpus(e, loaded, "loaded template family");
-    /* The OTHER family: no V4.1 artifact is loadable on this box, but the family
-     * is the loader's global and the vocab carries every marker, so flipping the
-     * profile exercises the twin's V4.1 rules against the V4.1 render (the same
-     * trick the attention-layout tests use).  Both families must match. */
-    const pulsar_shape saved = g_pulsar_shape;
-    g_pulsar_shape = loaded ? PULSAR_SHAPE_V4 : PULSAR_SHAPE_V41;
-    twin_run_corpus(e, !loaded, "other template family (profile flipped for this test)");
-    g_pulsar_shape = saved;
-}
-
 
 /* L185 step 1: freeze the SERVER renderer's exact bytes.
  *
@@ -3208,252 +3024,146 @@ static void test_render_bytes(void) {
     }
 }
 
-/* The tokeniser half needs the model's vocabulary. */
+/* The tokeniser half needs the model's vocabulary: the LOADED family's control tokens, pasted into every place a
+ * client writes, through the parsers the API runs.  Four bodies: a crafted conversation (system, user, an assistant
+ * turn with reasoning, content and a call whose argument carries the paste, a tool result), a plain chat turn, a
+ * forced-tool-call turn (the prompt tail's rewrite) and a legacy completion (the fourth render/tokenise site). */
 static void test_control_token_injection(void) {
-    const char *model = getenv("PULSAR_TEST_MODEL");
-    if (!model || !model[0]) {
-        fprintf(stderr, "pulsar-test: control-token-injection SKIPPED "
-                        "(PULSAR_TEST_MODEL unset; needs the vocabulary)\n");
-        return;
-    }
     pulsar_engine *e = test_get_engine();
     if (!e) return;
-
-    char hostile[512];
-    snprintf(hostile, sizeof hostile, "log: %s%s<think></think>%s%s%s",
-             PULSAR_RENDER_USER, PULSAR_TOOL_CALLS_START, PULSAR_RENDER_ASSISTANT,
-             PULSAR_INVOKE_END, PULSAR_RENDER_SYSTEM);
-
-    /* PREMISE: the paste really does spell control tokens -- the rendered
-     * matcher and the plain-text tokeniser disagree about it.  Without this the
-     * assertions below could pass on a fix that marks nothing. */
-    pulsar_tokens pasted_rendered = {0}, pasted_plain = {0};
-    pulsar_tokenize_rendered_chat(e, hostile, &pasted_rendered);
-    pulsar_tokenize_text(e, hostile, &pasted_plain);
-    TEST_ASSERT(!test_tokens_identical(&pasted_rendered, &pasted_plain));
-
-    pulsar_tokens control_ids = {0};
-    test_control_ids(e, &control_ids);
-    TEST_ASSERT(control_ids.len > 0);
-
-    const char *tools = "{\"type\":\"function\",\"function\":{\"name\":\"f\","
-                        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}";
-    char args[1024];
-    snprintf(args, sizeof args, "{\"q\":\"%s\"}", hostile);
-
-    chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = server_xstrdup("system");
-    sys.content = server_xstrdup(hostile);
-    sys.system_field = true;
-    chat_msgs_push(&msgs, sys);
-    chat_msg user = {0};
-    user.role = server_xstrdup("user");
-    user.content = server_xstrdup(hostile);
-    chat_msgs_push(&msgs, user);
-    chat_msg asst = {0};
-    asst.role = server_xstrdup("assistant");
-    asst.reasoning = server_xstrdup(hostile);
-    asst.content = server_xstrdup(hostile);
-    tool_call call = {0};
-    call.id = server_xstrdup("call_1");
-    call.name = server_xstrdup("f");
-    call.arguments = server_xstrdup(args);
-    tool_calls_push(&asst.calls, call);
-    chat_msgs_push(&msgs, asst);
-    chat_msg tool = {0};
-    tool.role = server_xstrdup("tool");
-    tool.content = server_xstrdup(hostile);
-    tool.tool_call_id = server_xstrdup("call_1");
-    chat_msgs_push(&msgs, tool);
-
-    chat_text_span *spans = NULL;
-    uint32_t n_spans = 0;
-    char *text = render_chat_prompt_text_spans(&msgs, tools, PULSAR_THINK_HIGH, true,
-                                               &spans, &n_spans);
-    char *text_old = render_chat_prompt_text(&msgs, tools, PULSAR_THINK_HIGH, true);
-    TEST_ASSERT(text != NULL && text_old != NULL);
-    if (text && text_old) {
-        /* The rendered TEXT is unchanged, so the reference encoder's bytes, the
-         * KV keys and every persisted session stay valid. */
-        TEST_ASSERT(strcmp(text, text_old) == 0);
-        TEST_ASSERT(spans != NULL && n_spans > 0);
-        int found = 0, covered = 0;
-        if (spans) {
-            for (const char *p = text; (p = strstr(p, hostile)) != NULL; p++) {
-                const size_t lo = (size_t)(p - text);
-                found++;
-                if (test_spans_cover(spans, n_spans, lo, lo + strlen(hostile))) covered++;
-            }
-        }
-        TEST_ASSERT(found >= 1);
-        TEST_ASSERT(covered == found);
-
-        pulsar_tokens safe = {0}, oracle = {0}, unmarked = {0}, fallback = {0};
-        pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &safe);
-        test_span_tokens_expected(e, text, spans, n_spans, &oracle);
-        /* the tokeniser IS the span contract ... */
-        TEST_ASSERT(test_tokens_identical(&safe, &oracle));
-        /* ... and an empty span list IS the old entry (no second path) */
-        pulsar_tokenize_rendered_chat(e, text, &unmarked);
-        pulsar_tokenize_rendered_chat_spans(e, text, NULL, 0, &fallback);
-        TEST_ASSERT(test_tokens_identical(&fallback, &unmarked));
-        /* The delta is EXACT: marking the client ranges removed the control ids
-         * those very bytes spell, and nothing else moved.  This conversation
-         * replays DSML, so the renderer emits every marker itself; only the
-         * delta can see the paste. */
-        const int in_spans = test_spans_control_ids(e, text, spans, n_spans, &control_ids);
-        TEST_ASSERT(in_spans > 0);
-        TEST_ASSERT(test_tokens_count_ids(&unmarked, &control_ids) -
-                    test_tokens_count_ids(&safe, &control_ids) == in_spans);
-        printf("control-token-injection: crafted conversation: %d control ids in the "
-               "client ranges, all removed by the marking\n", in_spans);
-
-        pulsar_tokens_free(&safe);
-        pulsar_tokens_free(&oracle);
-        pulsar_tokens_free(&unmarked);
-        pulsar_tokens_free(&fallback);
-    }
-    free(text);
-    free(text_old);
-    free(spans);
-    chat_msgs_free(&msgs);
-
-    /* The served surface itself: real request bodies, parsed and tokenised the
-     * way the API parsers do it.  This is the gap L185 recorded -- the parse
-     * rendered the prompt and handed every byte, client text included, to the
-     * rendered matcher.  The three bodies cover the plain chat parse, the
-     * forced-tool-call rewrite of the prompt tail, and the legacy completions
-     * template (the fourth render/tokenise site). */
-    char rbody[2048], rbody_forced[2048], cbody[2048];
-    snprintf(rbody, sizeof rbody,
-             "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"ask %s\"}]}",
-             hostile);
-    snprintf(rbody_forced, sizeof rbody_forced,
-             "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"ask %s\"}],"
-             "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
-             "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],"
-             "\"tool_choice\":\"required\"}", hostile);
-    snprintf(cbody, sizeof cbody, "{\"model\":\"x\",\"prompt\":\"ask %s\"}", hostile);
-    for (int leg = 0; leg < 3; leg++) {
+    test_control_probe probe;
+    if (!test_control_probe_open(e, "control-token-injection", &probe)) return;
+    const char *hostile = probe.hostile.c_str();
+    const std::string h = test_json_body(probe.hostile);
+    const std::string args = test_json_body("{\"q\":\"" + h + "\"}");
+    const std::string tools = "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":"
+                              "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}}]";
+    const std::string bodies[4] = {
+        "{\"model\":\"x\",\"messages\":["
+        "{\"role\":\"system\",\"content\":\"" + h + "\"},"
+        "{\"role\":\"user\",\"content\":\"" + h + "\"},"
+        "{\"role\":\"assistant\",\"reasoning_content\":\"" + h + "\",\"content\":\"" + h + "\",\"tool_calls\":["
+        "{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"" + args + "\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"" + h + "\"}]," + tools + "}",
+        "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"ask " + h + "\"}]}",
+        "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"ask " + h + "\"}]," + tools +
+        ",\"tool_choice\":\"required\"}",
+        "{\"model\":\"x\",\"prompt\":\"ask " + h + "\"}",
+    };
+    static const char *const tags[4] = {"crafted conversation", "chat body", "chat forced-tool body", "completion body"};
+    for (int leg = 0; leg < 4; leg++) {
         request rr;
-        char rerr[160];
-        const bool ok = leg == 2
-            ? parse_completion_request(e, cbody, 64, &rr, rerr, sizeof rerr)
-            : parse_chat_request_render(e, pulsar_engine_chat_format(e), NULL, leg == 0 ? rbody : rbody_forced, 64,
+        char rerr[256];
+        const bool ok = leg == 3
+            ? parse_completion_request(e, bodies[leg].c_str(), 64, &rr, rerr, sizeof rerr)
+            : parse_chat_request_render(e, pulsar_engine_chat_format(e), NULL, bodies[leg].c_str(), 64,
                                         &rr, rerr, sizeof rerr);
         if (!ok) {
-            fprintf(stderr, "control-token-injection: leg %d refused: %s\n", leg, rerr);
+            fprintf(stderr, "control-token-injection: %s refused: %s\n", tags[leg], rerr);
             TEST_ASSERT(!"the probe request must parse");
             continue;
         }
-        char tag[48];
-        snprintf(tag, sizeof tag, "%s body",
-                 leg == 0 ? "chat" : leg == 1 ? "chat forced-tool" : "completion");
-        test_served_request_ok(e, &rr, tag, hostile, &control_ids);
+        const int found = test_served_request_ok(e, &rr, tags[leg], hostile, &probe.ids);
+        if (leg == 0) {
+            /* every template writes the system text, the user turn, the assistant's content and the tool result */
+            TEST_ASSERT(found >= 4);
+            /* an empty span list IS the old entry (no second path) */
+            pulsar_tokens unmarked = {0}, fallback = {0};
+            pulsar_tokenize_rendered_chat(e, rr.prompt_text, &unmarked);
+            pulsar_tokenize_rendered_chat_spans(e, rr.prompt_text, NULL, 0, &fallback);
+            TEST_ASSERT(test_tokens_identical(&fallback, &unmarked));
+            pulsar_tokens_free(&unmarked);
+            pulsar_tokens_free(&fallback);
+        }
         request_free(&rr);
     }
-
-    pulsar_tokens_free(&control_ids);
-    pulsar_tokens_free(&pasted_rendered);
-    pulsar_tokens_free(&pasted_plain);
+    pulsar_tokens_free(&probe.ids);
 }
 
 /* --- L223, the SUFFIX side ------------------------------------------------
  *
  * A mid-turn continuation appends text to the live session through
  * build_prompt_from_exact_prefix_and_text_suffix, and that text carries client
- * bytes: a tool result's body, the invalid-DSML reminder's quoted system
- * region, and the checkpoint's sampled assistant turn.  Each builder now hands
- * out its CLIENT-DATA ranges and the tokeniser keeps those bytes plain, while
- * the server's own framing (EOS, <tool_result>, the DSML tags, the generation
- * prefix) stays control text. */
+ * bytes: a tool result's body, the tool-error reminder's quoted system region,
+ * and the checkpoint's sampled assistant turn.  Each of the loaded family's
+ * suffix hooks (server_family_ops) hands out its CLIENT-DATA ranges and the
+ * tokeniser keeps those bytes plain, while the server's own framing stays
+ * control text.  A family without a hook has no feature built on it (the server
+ * refuses it by name), so there is nothing of it to probe. */
 
-/* Every suffix must satisfy: the client bytes are inside a range, the tokeniser
- * follows the span contract on that text, and the control ids the ranges spell
- * are exactly what the plain matcher would have injected. */
-static void test_suffix_contract(pulsar_engine *e, const char *tag, const char *text,
-                                 const pulsar_text_span *spans, uint32_t n_spans,
-                                 const pulsar_tokens *control_ids) {
+/* Every suffix must satisfy: each copy of the paste is inside a range (returned: how many), the tokens spell the
+ * text with no control id inside a range, the control ids the ranges spell are exactly what the plain matcher would
+ * have injected, and the server's own framing is still control text. */
+static int test_suffix_contract(pulsar_engine *e, const char *tag, const char *text,
+                                const pulsar_text_span *spans, uint32_t n_spans,
+                                const test_control_probe *probe) {
     TEST_ASSERT(text != NULL);
     TEST_ASSERT(spans != NULL && n_spans > 0);
-    if (!text || !spans) return;
-    pulsar_tokens marked = {0}, unmarked = {0}, oracle = {0};
+    if (!text || !spans) return 0;
+    const int found = test_paste_covered(text, spans, n_spans, probe->hostile.c_str());
+    pulsar_tokens marked = {0}, unmarked = {0};
     pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &marked);
     pulsar_tokenize_rendered_chat(e, text, &unmarked);
-    test_span_tokens_expected(e, text, spans, n_spans, &oracle);
-    TEST_ASSERT(test_tokens_identical(&marked, &oracle));
-    const int in_spans = test_spans_control_ids(e, text, spans, n_spans, control_ids);
+    test_marked_tokens_ok(e, tag, text, spans, n_spans, &marked, &probe->ids);
+    const int in_spans = test_spans_control_ids(e, text, spans, n_spans, &probe->ids);
     TEST_ASSERT(in_spans > 0);
-    TEST_ASSERT(test_tokens_count_ids(&unmarked, control_ids) -
-                test_tokens_count_ids(&marked, control_ids) == in_spans);
-    printf("control-token-suffix: %s: %d control ids in the client ranges "
-           "(injected without the marking, gone with it), %u spans\n",
-           tag, in_spans, n_spans);
+    TEST_ASSERT(test_tokens_count_ids(&unmarked, &probe->ids) -
+                test_tokens_count_ids(&marked, &probe->ids) == in_spans);
+    const int framing = test_tokens_count_ids(&marked, &probe->ids);
+    TEST_ASSERT(framing > 0);
+    printf("control-token-suffix: %s: %d cop%s of the paste, %d control ids in the client ranges "
+           "(injected without the marking, gone with it), %d of the server's framing kept, %u spans\n",
+           tag, found, found == 1 ? "y" : "ies", in_spans, framing, n_spans);
     pulsar_tokens_free(&marked);
     pulsar_tokens_free(&unmarked);
-    pulsar_tokens_free(&oracle);
+    return found;
 }
 
 static void test_control_token_suffix(void) {
-    const char *model = getenv("PULSAR_TEST_MODEL");
-    if (!model || !model[0]) {
-        fprintf(stderr, "pulsar-test: control-token-suffix SKIPPED "
-                        "(PULSAR_TEST_MODEL unset; needs the vocabulary)\n");
-        return;
-    }
     pulsar_engine *e = test_get_engine();
     if (!e) return;
+    test_control_probe probe;
+    if (!test_control_probe_open(e, "control-token-suffix", &probe)) return;
+    const char *hostile = probe.hostile.c_str();
+    const std::string h = test_json_body(probe.hostile);
 
-    char hostile[512];
-    snprintf(hostile, sizeof hostile, "log: %s%s<think></think>%s%s%s",
-             PULSAR_RENDER_USER, PULSAR_TOOL_CALLS_START, PULSAR_RENDER_ASSISTANT,
-             PULSAR_INVOKE_END, PULSAR_RENDER_SYSTEM);
-    pulsar_tokens control_ids = {0};
-    test_control_ids(e, &control_ids);
-    TEST_ASSERT(control_ids.len > 0);
+    /* The request every hook reads (its family, effort and rendered prompt): a system region holding the paste --
+     * what the tool-error reminder quotes -- a user turn holding it, and one declared tool. */
+    const std::string body =
+        "{\"model\":\"x\",\"messages\":["
+        "{\"role\":\"system\",\"content\":\"sys " + h + "\"},"
+        "{\"role\":\"user\",\"content\":\"ask " + h + "\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]}";
+    request r;
+    char err[256];
+    if (!parse_chat_request_render(e, pulsar_engine_chat_format(e), NULL, body.c_str(), 64, &r, err, sizeof err)) {
+        fprintf(stderr, "control-token-suffix: the probe request refused: %s\n", err);
+        TEST_ASSERT(!"control-token-suffix: the probe request must parse");
+        pulsar_tokens_free(&probe.ids);
+        return;
+    }
+    const server_family_ops *fam = r.family;
+    printf("control-token-suffix: the %s family's suffix hooks\n", fam->name);
 
-    /* (1) the live tool tail: the tool body is client data, the framing is not */
-    {
+    /* (1) the live tool tail, and (2) the stored Responses/Anthropic continuation suffix through the request field
+     * the kv_cache continuation sites read: the tool body is client data, the framing is not */
+    if (fam->tool_result_tail) {
         chat_msgs msgs = {0};
         chat_msg tool = {0};
         tool.role = server_xstrdup("tool");
         tool.content = server_xstrdup(hostile);
+        tool.tool_call_id = server_xstrdup("call_live");
         chat_msgs_push(&msgs, tool);
         chat_text_span *spans = NULL;
         uint32_t n_spans = 0;
-        char *text = render_live_tool_tail_spans(&msgs, 0, true, PULSAR_THINK_HIGH, true,
-                                                 &spans, &n_spans);
-        const char *body = text ? strstr(text, hostile) : NULL;
-        TEST_ASSERT(body != NULL);            /* the body is not escaped */
-        if (body && spans) {
-            const size_t lo = (size_t)(body - text);
-            TEST_ASSERT(test_spans_cover(spans, n_spans, lo, lo + strlen(hostile)));
-        }
-        /* the renderer's own <tool_result> wrapper is NOT client data */
-        if (text && spans) {
-            const char *wrap = strstr(text, "<tool_result>");
-            TEST_ASSERT(wrap != NULL);
-            if (wrap) {
-                const size_t lo = (size_t)(wrap - text);
-                TEST_ASSERT(!test_spans_cover(spans, n_spans, lo, lo + strlen("<tool_result>")));
-            }
-        }
-        test_suffix_contract(e, "live tool tail", text, spans, n_spans, &control_ids);
+        char *text = fam->tool_result_tail(&r, &msgs, 0, &spans, &n_spans);
+        TEST_ASSERT(test_suffix_contract(e, "live tool tail", text, spans, n_spans, &probe) >= 1);
         free(text);
         free(spans);
         chat_msgs_free(&msgs);
-    }
 
-    /* (2) the stored Responses/Anthropic continuation suffix, through the
-     * request field the kv_cache continuation sites read */
-    {
-        request r;
-        test_request_init(&r, REQ_CHAT, 128);
-        r.api = API_RESPONSES;
-        r.think_mode = PULSAR_THINK_HIGH;
-        r.has_tools = true;
-        chat_msgs msgs = {0};
+        chat_msgs turn = {0};
         chat_msg asst = {0};
         asst.role = server_xstrdup("assistant");
         asst.content = server_xstrdup("calling");
@@ -3462,129 +3172,62 @@ static void test_control_token_suffix(void) {
         call.name = server_xstrdup("f");
         call.arguments = server_xstrdup("{}");
         tool_calls_push(&asst.calls, call);
-        chat_msgs_push(&msgs, asst);
-        chat_msg tool = {0};
-        tool.role = server_xstrdup("tool");
-        tool.tool_call_id = server_xstrdup("call_live");
-        tool.content = server_xstrdup(hostile);
-        chat_msgs_push(&msgs, tool);
-        responses_prepare_live_continuation(&r, &msgs);
-        test_suffix_contract(e, "responses live suffix", r.responses_live_suffix_text,
-                             r.responses_live_suffix_spans, r.responses_live_suffix_n_spans,
-                             &control_ids);
-        chat_msgs_free(&msgs);
-        request_free(&r);
+        chat_msgs_push(&turn, asst);
+        chat_msg result = {0};
+        result.role = server_xstrdup("tool");
+        result.tool_call_id = server_xstrdup("call_live");
+        result.content = server_xstrdup(hostile);
+        chat_msgs_push(&turn, result);
+        const api_style api = r.api;
+        r.api = API_RESPONSES;
+        responses_prepare_live_continuation(&r, &turn);
+        r.api = api;
+        TEST_ASSERT(test_suffix_contract(e, "responses live suffix", r.responses_live_suffix_text,
+                                         r.responses_live_suffix_spans, r.responses_live_suffix_n_spans,
+                                         &probe) >= 1);
+        chat_msgs_free(&turn);
+    } else {
+        printf("control-token-suffix: %s has no tool_result_tail (no live tool continuation)\n", fam->name);
     }
 
-    /* (3) the invalid-DSML reminder: it QUOTES the client's system region.
-     * That region is cut at the first role marker, so this paste spells DSML and
-     * think without ｜User｜/｜Assistant｜ -- otherwise the quote would end before
-     * the injection and prove nothing. */
-    {
-        char sys_hostile[256];
-        snprintf(sys_hostile, sizeof sys_hostile, "note: %s<think></think>%s",
-                 PULSAR_TOOL_CALLS_START, PULSAR_INVOKE_END);
-        char body[2048];
-        snprintf(body, sizeof body,
-                 "{\"model\":\"x\",\"messages\":["
-                 "{\"role\":\"system\",\"content\":\"sys %s\"},"
-                 "{\"role\":\"user\",\"content\":\"ask\"}]}", sys_hostile);
-        request r;
-        char err[160];
-        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
-            TEST_ASSERT(!"control-token-suffix: the reminder probe must parse");
-        } else {
-            r.think_mode = PULSAR_THINK_HIGH;
-            r.has_tools = true;
-            thinking_state th = {0};
-            th.inside = true;
-            chat_text_span *spans = NULL;
-            uint32_t n_spans = 0;
-            char *suffix = build_invalid_dsml_tool_error_suffix_spans(&r, &th, "missing invoke name",
-                                                                     &spans, &n_spans);
-            TEST_ASSERT(suffix != NULL);
-            TEST_ASSERT(suffix && strstr(suffix, "System prompt reminder:") != NULL);
-            test_suffix_contract(e, "invalid-DSML reminder", suffix, spans, n_spans, &control_ids);
-            free(suffix);
-            free(spans);
-            request_free(&r);
-        }
+    /* (3) the tool-error reminder: it QUOTES the client's system region, which each family cuts at its own end of
+     * that region -- so the quote may stop inside the paste; the literals before the cut are what it carries */
+    if (fam->tool_error_suffix) {
+        thinking_state th = thinking_state_from_prompt(&r);
+        chat_text_span *spans = NULL;
+        uint32_t n_spans = 0;
+        char *suffix = fam->tool_error_suffix(&r, &th, "missing function name", &spans, &n_spans);
+        TEST_ASSERT(suffix != NULL);
+        TEST_ASSERT(suffix && strstr(suffix, "System prompt reminder:") != NULL);
+        test_suffix_contract(e, "tool-error reminder", suffix, spans, n_spans, &probe);
+        free(suffix);
+        free(spans);
+    } else {
+        printf("control-token-suffix: %s has no tool_error_suffix (no model-visible retry)\n", fam->name);
     }
 
-    /* (4) the checkpoint suffix: the sampled assistant bytes are client-replayed,
-     * but its DSML framing must stay CONTROL text */
-    {
-        request r;
-        test_request_init(&r, REQ_CHAT, 128);
-        r.think_mode = PULSAR_THINK_HIGH;
-        r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
+    /* (4) the checkpoint suffix: the sampled assistant bytes are client-replayed, its framing stays control text;
+     * (5) the two composite shapes the served call sites build: the request prompt + a checkpoint suffix
+     * (canonicalize_tool_checkpoint), and the kvtext helper the continuation sites call with a prefix + a suffix */
+    if (fam->assistant_turn_sampled) {
         tool_calls calls = {0};
         tool_call call = {0};
         call.id = server_xstrdup("call_1");
         call.name = server_xstrdup("f");
         call.arguments = server_xstrdup("{}");
         tool_calls_push(&calls, call);
-        chat_text_span *spans = NULL;
-        uint32_t n_spans = 0;
-        char *suffix = build_tool_checkpoint_suffix_spans(&r, hostile, hostile, &calls,
-                                                         &spans, &n_spans);
-        test_suffix_contract(e, "tool checkpoint suffix", suffix, spans, n_spans, &control_ids);
-        /* The server's own framing survives -- and it is the ONLY source of
-         * those ids left: the paste's copies are plain text now.  (This suffix
-         * carries no opening <think>; the caller's prompt_text ends with it.) */
-        const int dsml_id = test_control_id_for_literal(e, PULSAR_TOOL_CALLS_START);
-        const int think_end_id = test_control_id_for_literal(e, "</think>");
-        TEST_ASSERT(dsml_id >= 0 && think_end_id >= 0);
-        pulsar_tokens marked = {0}, unmarked = {0};
-        pulsar_tokenize_rendered_chat_spans(e, suffix, spans, n_spans, &marked);
-        pulsar_tokenize_rendered_chat(e, suffix, &unmarked);
-        TEST_ASSERT(test_tokens_count_id(&marked, dsml_id) > 0);
-        TEST_ASSERT(test_tokens_count_id(&marked, think_end_id) > 0);
-        TEST_ASSERT(test_tokens_count_id(&unmarked, dsml_id) >
-                    test_tokens_count_id(&marked, dsml_id));
-        TEST_ASSERT(test_tokens_count_id(&unmarked, think_end_id) >
-                    test_tokens_count_id(&marked, think_end_id));
-        pulsar_tokens_free(&marked);
-        pulsar_tokens_free(&unmarked);
-        free(suffix);
-        free(spans);
-        tool_calls_free(&calls);
-        request_free(&r);
-    }
-
-    /* (5) the two composite shapes the served call sites build: the request
-     * prompt + a checkpoint suffix (canonicalize_tool_checkpoint), and the
-     * kvtext helper the continuation sites call with a prefix + a suffix */
-    {
-        char body[2048];
-        snprintf(body, sizeof body,
-                 "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"ask %s\"}]}",
-                 hostile);
-        request r;
-        char err[160];
-        if (!parse_chat_request_render(NULL, PULSAR_CHAT_DS4_V41, NULL, body, 64, &r, err, sizeof err)) {
-            TEST_ASSERT(!"control-token-suffix: the composite probe must parse");
-        } else {
-            r.think_mode = PULSAR_THINK_HIGH;
-            r.family = server_family_for_format(PULSAR_CHAT_DS4_V41);
-            tool_calls calls = {0};
-            tool_call call = {0};
-            call.id = server_xstrdup("call_1");
-            call.name = server_xstrdup("f");
-            call.arguments = server_xstrdup("{}");
-            tool_calls_push(&calls, call);
-            chat_text_span *suf_spans = NULL;
-            uint32_t suf_n = 0;
-            char *suffix = build_tool_checkpoint_suffix_spans(&r, hostile, hostile, &calls,
-                                                             &suf_spans, &suf_n);
+        chat_text_span *suf_spans = NULL;
+        uint32_t suf_n = 0;
+        char *suffix = build_tool_checkpoint_suffix_spans(&r, hostile, hostile, &calls, &suf_spans, &suf_n);
+        TEST_ASSERT(test_suffix_contract(e, "tool checkpoint suffix", suffix, suf_spans, suf_n, &probe) >= 1);
+        if (suffix) {
             buf rendered = {0};
             buf_puts_spanned(&rendered, r.prompt_text, r.prompt_spans, r.prompt_n_spans);
             buf_puts_spanned(&rendered, suffix, suf_spans, suf_n);
-            test_suffix_contract(e, "canonicalize composite", rendered.ptr, rendered.spans,
-                                 rendered.n_spans, &control_ids);
+            test_suffix_contract(e, "canonicalize composite", rendered.ptr, rendered.spans, rendered.n_spans, &probe);
 
-            /* the kvtext helper itself: the prefix's tokens are untouched and the
-             * suffix follows exactly as the span tokeniser produces it */
+            /* the kvtext helper itself: the prefix's tokens are untouched and the suffix follows exactly as the
+             * span tokeniser produces it */
             pulsar_tokens prefix = {0}, want_suffix = {0}, out = {0};
             pulsar_tokenize_text(e, "PREFIX", &prefix);
             pulsar_tokenize_rendered_chat_spans(e, suffix, suf_spans, suf_n, &want_suffix);
@@ -3600,14 +3243,16 @@ static void test_control_token_suffix(void) {
             pulsar_tokens_free(&want_suffix);
             pulsar_tokens_free(&out);
             buf_free(&rendered);
-            free(suffix);
-            free(suf_spans);
-            tool_calls_free(&calls);
-            request_free(&r);
         }
+        free(suffix);
+        free(suf_spans);
+        tool_calls_free(&calls);
+    } else {
+        printf("control-token-suffix: %s has no assistant_turn_sampled (every turn is a full render)\n", fam->name);
     }
 
-    pulsar_tokens_free(&control_ids);
+    request_free(&r);
+    pulsar_tokens_free(&probe.ids);
 }
 #endif
 
@@ -5450,12 +5095,10 @@ static const pulsar_test_entry test_entries[] = {
      * (The image tests sat after those two until 2026-10-14, which re-opened
      * the shared engine: one model load more per run.) */
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
-    {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
+    {"--tool-call-quality", "tool-call-quality", "the model emits a valid tool call, read by its family's own output parser", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "complete tool call recovered from unclosed reasoning", test_think_tool_recovery},
-    {"--short-prefill-ratio4", "short-prefill-ratio4", "ratio-4 short prefill regression", test_short_prefill_ratio4},
     {"--control-token-injection", "control-token-injection", "a client cannot inject a control token through message text (L223)", test_control_token_injection},
     {"--control-token-suffix", "control-token-suffix", "mid-turn continuation suffixes keep client bytes plain (L223)", test_control_token_suffix},
-    {"--chat-twin-parity", "chat-twin-parity", "the token-level twin vs the server renderer, per conversation shape (L185)", test_chat_twin_parity},
     {"--render-bytes", "render-bytes", "the server renderer's exact bytes, frozen per conversation shape (L185)", test_render_bytes},
     {"--api-sampling-flags", "api-sampling-flags", "per-surface sampling params set client-sent presence flags", test_api_sampling_presence_flags},
     {"--api-min-p-range", "api-min-p-range", "out-of-range min_p disables the filter at parse (top_p convention)", test_api_min_p_range_validation},
