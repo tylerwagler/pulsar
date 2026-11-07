@@ -1885,7 +1885,9 @@ context-coherence-probe:
 # graded it a noise-level AWAY from an FP8-KV B300 capture that cannot arbitrate
 # NVFP4 rounding; see the dated note at cuda-reference-gate-budget.  13bcbab1 is
 # the pre-squash tip of the fix; the landed commit's engine sources equal it.
-PREFILL_BASELINE_REF ?= 5fe1831d
+PREFILL_BASELINE_REF ?= d3e488fe
+# L357: the byte baselines are Qwen's (the production model), recorded by BASELINE_MODEL's dump at the ref.
+BASELINE_MODEL ?= $(QWEN_GATE_MODEL)
 # The baseline blob is COMMITTED (L046): a fresh clone can run cuda-prefill-gate
 # with no bootstrap step, and the gate's guarantee no longer depends on a loose
 # file surviving in somebody's tree. The name carries the anchor ref, and the
@@ -1912,9 +1914,9 @@ PREFILL_BASELINE_REF ?= 5fe1831d
 # the Vision-Exp blob the battery names (the f5bea7aa one it replaced was dumped
 # by a clean dev checkout's own binary; this one by `cuda-prefill-gate-baseline` at the
 # ref, see its .md).
-PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
-PREFILL_DECODE_BASELINE_REF ?= 5fe1831d
-PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
+PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-qwen-$(PREFILL_BASELINE_REF).bin
+PREFILL_DECODE_BASELINE_REF ?= d3e488fe
+PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-qwen-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
 PREFILL_DECODE_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_DECODE_BASELINE_REF) 2>/dev/null || echo $(PREFILL_DECODE_BASELINE_REF))
 PREFILL_BASELINE_WT  ?= temp/wt-prefill-baseline
@@ -2186,7 +2188,7 @@ cuda-prefill-decode-gate-baseline:
 	cp tests/long_context_story_prompt.txt $(PREFILL_DECODE_BASELINE_WT)/tests/
 	$(MAKE) -C $(PREFILL_DECODE_BASELINE_WT) tests/prefill_bitexact_gate \
 		CUDA_ARCH=sm_120f CUTLASS_DIR=$(abspath $(CUTLASS_DIR))
-	cd $(PREFILL_DECODE_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(FRONTIER_MODEL)) \
+	cd $(PREFILL_DECODE_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(BASELINE_MODEL)) \
 		--dump-decode $(abspath $(PREFILL_DECODE_BASELINE))
 	git worktree remove --force $(PREFILL_DECODE_BASELINE_WT)
 	@echo "decode baseline ($(PREFILL_DECODE_BASELINE_REF)) -> $(PREFILL_DECODE_BASELINE)"
@@ -2250,10 +2252,10 @@ PULSAR_REF_ANCHORS = --ref-dir "$(PULSAR_REF_DIR)" --ref-tol $(PULSAR_REF_TOL) \
 # binary still builds (LEG C of tools/tp-pair-engine-grade.sh runs it on every
 # rank of a pair, and it takes --dump-kl to record a budget).
 cuda-reference-gate: tests/gates_runner
-	@./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
+	@./tests/gates_runner $(RUNNER_PRIMARY_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-		$(PULSAR_REF_ANCHORS) --only=cuda-reference-gate-story,cuda-reference-gate-code
+		$(RUNNER_PRIMARY_ANCHORS) --only=cuda-reference-gate-story,cuda-reference-gate-code
 
 # Re-record the KL budgets from the CURRENT tree.  Same discipline as
 # PREFILL_BASELINE_REF: do this only when a change has been GRADED CLOSER to the
@@ -2309,7 +2311,7 @@ cuda-prefill-gate-baseline:
 	cp tests/long_context_story_prompt.txt $(PREFILL_BASELINE_WT)/tests/
 	$(MAKE) -C $(PREFILL_BASELINE_WT) tests/prefill_bitexact_gate \
 		CUDA_ARCH=sm_120f CUTLASS_DIR=$(abspath $(CUTLASS_DIR))
-	cd $(PREFILL_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(FRONTIER_MODEL)) \
+	cd $(PREFILL_BASELINE_WT) && ./tests/prefill_bitexact_gate $(abspath $(BASELINE_MODEL)) \
 		--dump $(abspath $(PREFILL_BASELINE))
 	git worktree remove --force $(PREFILL_BASELINE_WT)
 	@echo "baseline ($(PREFILL_BASELINE_REF)) -> $(PREFILL_BASELINE)"
@@ -2380,7 +2382,7 @@ SPEC_TF_POSITIONS ?= 2000
 # source is compiled a second time with its entry renamed (GATE_ENTRY) and the
 # engine calls routed to the runner's broker (PULSAR_GATE_RUNNER); the
 # standalone binaries above are the same sources built without those defines.
-RUNNER_GATES = multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe token_seam_gate \
+RUNNER_GATES = payload_frontier_gate bank_residency_gate multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe token_seam_gate \
                multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
                bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
                mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
@@ -2409,20 +2411,23 @@ GATE_RUNNER_FLAGS ?=
 # binds to the last --model before it).
 # L317: Nemotron's LiLiCorr pack is hosted for the legs that loaded it themselves (block-spec, scratch-poison,
 # bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
-RUNNER_HOSTED_ARGS ?= --model $(QWEN_GATE_MODEL) $(QWEN_REF_ANCHORS) \
-                      --model $(LILICORR_GATE_MODEL) --gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate
+RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) --gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate
 # L278 battery cut (2026-11-03, Tyler): the DeepSeek primary runs only the entries nothing else can -- DeepSeek V4's
 # mechanism gates (DS4: evict / restore, accounting, session payload, mixed prefill, rewind, frontier, ...) and the
 # fixture-blob gates (its prefill / decode bit-exact baselines); every other entry runs on the hosted Qwen and Nemotron.
 # RUNNER_PRIMARY_ARGS= runs the primary's whole table again.  gates-dev calls the runner itself and is unaffected.
-RUNNER_PRIMARY_ARGS ?= --needs=ds4,fixtures
+RUNNER_PRIMARY_ARGS ?=
+# L357 (Tyler 2026-11-07): Qwen, the production model, is the primary and runs the whole table; DeepSeek left the
+# runner (smoke only), so its DS4 mechanism gates no longer run anywhere.
+RUNNER_PRIMARY_MODEL ?= $(QWEN_GATE_MODEL)
+RUNNER_PRIMARY_ANCHORS ?= $(QWEN_REF_ANCHORS)
 # L317: the seed of the chunk-neutrality sample is the sha the battery runs at (successive batteries rotate through
 # the schedules; one sha always runs the same ones).
 cuda-runner-gate: tests/gates_runner
-	PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner $(FRONTIER_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
+	PULSAR_GATE_CHUNK_SEED=$(GATE_BUILD_REF) ./tests/gates_runner $(RUNNER_PRIMARY_MODEL) --prefill-baseline $(PREFILL_BASELINE) \
 		--prefill-ref $(PREFILL_BASELINE_REF_SHORT) \
 		--decode-baseline $(PREFILL_DECODE_BASELINE) --decode-ref $(PREFILL_DECODE_BASELINE_REF_SHORT) \
-		$(PULSAR_REF_ANCHORS) $(RUNNER_PRIMARY_ARGS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
+		$(RUNNER_PRIMARY_ANCHORS) $(RUNNER_PRIMARY_ARGS) $(RUNNER_HOSTED_ARGS) $(GATE_RUNNER_FLAGS)
 
 # Every release-blocking gate, in one command.
 #
@@ -2448,6 +2453,10 @@ cuda-runner-gate: tests/gates_runner
 # battery (it lands in the same pass/fail fold).
 # 2026-10-14: --gating, every test but the informational ones (logprob-vectors: a drift dashboard whose mismatches
 # can never fail the suite, at the price of its own model load).  `make test` still runs everything.
+# L357: L353 no. 1 (image segment keys) escaped onto served Qwen while this leg ran only on the DeepSeek fixture.
+.PHONY: image-chain-qwen
+image-chain-qwen: pulsar_test
+	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" ./pulsar_test --image-chain
 unit-test-gate: pulsar_test
 	PULSAR_TEST_MODEL="$(FRONTIER_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
 
@@ -2487,7 +2496,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
+	image-chain-qwen cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of
@@ -2502,7 +2511,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate nemotron-vision-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
 	spec-depth-gate \
-	loader-contract-gate prefix-stability-gate
+	loader-contract-gate prefix-stability-gate segstore-tsan
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the

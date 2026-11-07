@@ -133,9 +133,12 @@ static bool decode_rows(pulsar_session *s, const int *toks, uint32_t d, uint32_t
     char err[256];
     const uint32_t steps = serial ? w : 1u, per = serial ? 1u : w;
     for (uint32_t k = 0; ok && k < steps; k++) {
+        /* L357: the serial truth is plain decode steps (the row commits and the bank advances), as
+         * verify_width_probe --serial plain: on Qwen a one-row verify leaves the bank where it was; on DeepSeek the
+         * two are the same decode row */
         if (pulsar_session_decode_mixed(s, rq + k * per, per, lg + (size_t)k * per * (size_t)width,
                                         (int)(per * (uint32_t)width), &nr,
-                                        PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) != 0) {
+                                        serial ? 0u : PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) != 0) {
             fprintf(stderr, "decode step (d %u, w %u, %s %u): %s\n", d, w, serial ? "serial" : "wide", k, err);
             ok = false;
         }

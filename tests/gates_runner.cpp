@@ -91,6 +91,8 @@ int gate_mseq_rewind_probe_main(int, char **);
 int gate_token_seam_gate_main(int, char **);
 int gate_multiseq_decode_gate_main(int, char **);
 int gate_bank_spec_gate_main(int, char **);
+int gate_payload_frontier_gate_main(int, char **);
+int gate_bank_residency_gate_main(int, char **);
 int gate_dspark_batch_gate_main(int, char **);
 int gate_accounting_gate_main(int, char **);
 int gate_bank_evict_restore_gate_main(int, char **);
@@ -573,6 +575,9 @@ int main(int argc, char **argv) {
      * critical values and loses sensitivity accordingly). */
     const gate_spec group_default[] = {
         {"cuda-frontier-gate",        gate_multiseq_frontier_gate_main, 3, NULL, NULL, {NULL}, DS4},
+        /* L357: the family-neutral payload round trip and evict / restore, which the DS4 ones above stood in for */
+        {"payload-frontier-gate",     gate_payload_frontier_gate_main,  2, NULL, NULL, {NULL}, 0},
+        {"bank-residency-gate",       gate_bank_residency_gate_main,    4, NULL, NULL, {NULL}, 0},
         {"cuda-rewind-gate",          gate_rewind_frontier_gate_main,   1, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
         {"cuda-mseq-rewind-gate",     gate_mseq_rewind_probe_main,      4, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
         {"cuda-seam-gate",            gate_token_seam_gate_main,        3, NULL, NULL, {NULL}, NEED_TOKENIZER},
@@ -804,10 +809,10 @@ int main(int argc, char **argv) {
         /* L262: decode rows at every served width (1..32) against the same blobs -- the fidelity grade for
          * width-dependent decode arithmetic.  A blob's near-tie row is the prefill reference gate's known flip too. */
         gate_spec dref_story = {ref_names[2], gate_decode_reference_gate_main, 2, NULL, NULL,
-                                {story_ref, story_tok, NULL}, DS4};
+                                {story_ref, story_tok, NULL}, 0};
         spec_append(&dref_story, "--known-flip", ma->story_flip);
         gate_spec dref_code = {ref_names[3], gate_decode_reference_gate_main, 2, NULL, NULL,
-                               {code_ref, code_tok, NULL}, DS4};
+                               {code_ref, code_tok, NULL}, 0};
         spec_append(&dref_code, "--known-flip", ma->code_flip);
 
         for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) RUN(group_default[i]);

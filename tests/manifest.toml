@@ -11,7 +11,6 @@
 release = 3000
 
 [sections]
-"cuda-runner-gate [DeepSeek V4]" = 1150
 "cuda-runner-gate [Qwen4-exp]" = 720
 "cuda-runner-gate [Nemotron-H]" = 300
 "live-legs [qwen]" = 1500
@@ -96,6 +95,11 @@ budget = 10
 name = "lilicorr-head-gate"
 tier = "kernels"
 budget = 10
+
+[[test]]
+name = "image-chain-qwen"
+tier = "release"
+budget = 120
 
 [[test]]
 name = "cuda-runner-gate"
@@ -234,3 +238,8 @@ tier = "check"
 overlap = true
 budget = 90
 
+[[test]]
+name = "segstore-tsan"
+tier = "check"
+overlap = true
+budget = 90

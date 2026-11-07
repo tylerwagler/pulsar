@@ -36,6 +36,8 @@ runner:cuda-multiseq-gate-nodspark	session	all	battery	the same with speculation
 runner:cuda-accounting-gate	session	deepseek4	battery
 runner:cuda-evict-restore-gate	session	deepseek4	battery
 runner:cuda-session-payload-gate	session	deepseek4	battery
+runner:payload-frontier-gate	session	all	battery	L357: the payload round trip through the public API, every family with payloads
+runner:bank-residency-gate	session	all	battery	L357: free, re-allocate, reload a bank: byte-identical decode
 loader-contract-gate	loader	all	battery	header clones + named mutants, both families
 runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
 runner:cuda-bank-spec-gate	spec	deepseek4	battery
