@@ -6,7 +6,7 @@ Each case is a token layout -- text runs and image runs (an image run is h' x w'
 config it reads (vision_config.spatial_merge_size).  pulsar_test --lib-image-rope rebuilds the same image records and
 requires pulsar_image_rope3 to give the same triple at every row.
 
-    ~/venvs/q38/bin/python tests/image_rope_goldens.py > tests/test-vectors/image-rope-goldens.bin
+    ~/tools/venvs/q38/bin/python tests/image_rope_goldens.py > tests/test-vectors/image-rope-goldens.bin
 """
 import struct
 import sys

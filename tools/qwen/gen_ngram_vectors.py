@@ -15,7 +15,7 @@ Output (little endian):
   u32 n_seq; n_seq x (u32 n, i32 ids[n], u64 rows[n][16])
   u32 n_check; n_check x (u64 row, 320 bytes)
 
-  ~/venvs/q38/bin/python gen_ngram_vectors.py OUT [--max-seq N] [--small]
+  ~/tools/venvs/q38/bin/python gen_ngram_vectors.py OUT [--max-seq N] [--small]
 """
 import argparse, json, os, random, struct, sys
 

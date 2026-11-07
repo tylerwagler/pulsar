@@ -14,7 +14,7 @@
 # QWEN (DFlash2) and NEMOTRON (LiLiCorr).  Measured 2026-10-21 (gpuq #426): base PASS, all 10 mutant legs FAIL.
 set -u
 mode=${1:?build|run}; T=${2:?tree}; R=${3:?out dir}
-M="CUDA_ARCH=sm_120f CUTLASS_DIR=${CUTLASS_DIR:-$HOME/cutlass}"
+M="CUDA_ARCH=sm_120f CUTLASS_DIR=${CUTLASS_DIR:-$HOME/tools/cutlass}"
 if [ "$mode" = run ]; then QWEN=${QWEN:?set QWEN to the Qwen DFlash2 container}; NEMOTRON=${NEMOTRON:?set NEMOTRON to the Nemotron LiLiCorr container}; fi
 mut() {   # name file sed-expr targets...
   local n=$1 f=$2 e=$3; shift 3
