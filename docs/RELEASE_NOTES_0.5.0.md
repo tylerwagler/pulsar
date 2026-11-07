@@ -231,7 +231,8 @@ rounds. A duplicate-prefix census is exported (L324).
   is smoke-only since 2026-11-07: it left the gate runner, and the gates that graded
   its own mechanisms (rewind, compressor state, DSpark batching, the TP head split,
   mixed prefill) were retired with it. Nemotron is thinner, and V4.1 and Inkling have no gate of their own.
-  The encoder and Parse families are gated by hand. See the README's model table.
+  The encoder and Parse families are gated by hand, beside `make model-smoke` (every
+  published model starts and answers one request of its kind). See the README's model table.
 - **Nemotron 3.5 Super image input is not in this release.** Its vision front is
   not wired, and an image is refused by name. DeepSeek V4.1 and Inkling take no
   images either.

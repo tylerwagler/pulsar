@@ -1956,6 +1956,21 @@ live-legs-deepseek: pulsar-server
 	python3 tests/live_legs.py --binary ./pulsar-server --work $(LIVE_LEGS_WORK)-deepseek \
 	  --model deepseek=$(FRONTIER_MODEL) $(if $(LIVE_LEGS),--legs $(LIVE_LEGS),)
 
+# L357: the published-model smoke (tests/model_smoke_live.py): every model we publish starts on a pulsar-server of its
+# own, one at a time, and answers the one request its kind serves -- a chat model "7+5" (thinking off) with 12, an
+# embedder a vector of its advertised dimension, a reranker Paris above bananas for "capital of France", the parser a
+# 200 on a text-free PNG.  A model that does not start FAILS by name; no skips.  DeepSeek V4 (smoke-only since
+# 2026-11-07) gets its release check here.  The SMOKE_* models are the published retrieval and Gemma containers.
+SMOKE_GEMMA_MODEL ?= $(call need_path,SMOKE_GEMMA_MODEL)
+SMOKE_EMBED_MODEL ?= $(call need_path,SMOKE_EMBED_MODEL)
+SMOKE_RERANK_MODEL ?= $(call need_path,SMOKE_RERANK_MODEL)
+SMOKE_PARSE_MODEL ?= $(call need_path,SMOKE_PARSE_MODEL)
+SMOKE_MODELS ?= $(QWEN_GATE_MODEL) $(FRONTIER_MODEL) $(LILICORR_GATE_MODEL) $(SMOKE_GEMMA_MODEL) \
+	$(SMOKE_EMBED_MODEL) $(SMOKE_RERANK_MODEL) $(SMOKE_PARSE_MODEL)
+MODEL_SMOKE_WORK ?= $(CURDIR)/.build/model-smoke
+model-smoke: pulsar-server
+	python3 tests/model_smoke_live.py $(SMOKE_MODELS) --binary ./pulsar-server --work $(MODEL_SMOKE_WORK)
+
 # L280: a prompt's KV is admitted against the 2b guard's budget before it lands (spill first / preempt the newest
 # decoder, L314 / 503), never past it into memory pressure.  A real server on a SMALL model (the guard's budget lowered
 # through its test hook to 2.2 conversations), so it fits beside a running production server; ~2 min.  Family-neutral.
@@ -2394,7 +2409,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	image-chain-qwen cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
+	image-chain-qwen model-smoke cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of

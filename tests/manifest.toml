@@ -102,6 +102,11 @@ tier = "release"
 budget = 120
 
 [[test]]
+name = "model-smoke"
+tier = "release"
+budget = 900
+
+[[test]]
 name = "cuda-runner-gate"
 tier = "release"
 

@@ -140,6 +140,7 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `lilicorr-head-gate` | 10 | |
 | `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
 | `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
+| `model-smoke` | 900 | L357: seven published models, each its own server load (Qwen, DeepSeek, Nemotron, Gemma, embed, rerank, parse) and one request; an estimate, re-set from the first battery |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
