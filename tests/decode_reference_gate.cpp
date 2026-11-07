@@ -88,9 +88,9 @@ static double maxabs_of(const float *a, const float *b, int n) {
  * is ASSERTED in this gate, not argued: the depth's widest wide run is the one cold run, repeated at the end
  * through this path and compared byte for byte (see the depth loop). */
 static bool prefix_cold(pulsar_session *s, const int *toks, uint32_t n) {
-    if (!gate_populate_bank(s, 0, toks, (int)n, NULL, "decode reference prefix")) return false;
-    pulsar_session_bank_state_save(s, 0);   /* the carry a later run re-installs after its multiseq step */
-    return true;
+    /* L357: the family-generic bank sync (it saves the bank's carry, which a later run re-installs after its
+     * multiseq step); gate_populate_bank reached DeepSeek's session graph, NULL on Qwen */
+    return gate_bank_sync(s, 0, toks, (int)n, NULL, "decode reference prefix");
 }
 static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *origin) {
     char err[256];
@@ -229,7 +229,7 @@ int GATE_ENTRY(int argc, char **argv) {
         pulsar_session *s = NULL;
         const int ctx = (int)(((d + 4095u) / 4096u + 1u) * 4096u);
         if (pulsar_session_create(&s, e, ctx) != 0) { fprintf(stderr, "session create failed (ctx %d)\n", ctx); rc = 1; break; }
-        if (!gate_pool_fits(s, 2) || !prefix_cold(s, toks, d - wmax) ||
+        if (!gate_bank_pool_fits(s, 2) || !prefix_cold(s, toks, d - wmax) ||
             !decode_rows(s, toks, d, wmax, cold_all, width, false)) {
             pulsar_session_free(s);
             rc = 1;
