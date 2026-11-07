@@ -102,10 +102,9 @@ static bool prefix_resumed(pulsar_session *s, const int *toks, uint32_t n, int *
         fprintf(stderr, "decode reference: no grid checkpoint at or below %u -- the cold prefill left none\n", n);
         return false;
     }
-    if (pulsar_session_restore_checkpoint(s, TokPos{G}, err, sizeof err) != 0) {
-        fprintf(stderr, "decode reference: %s\n", err);
-        return false;
-    }
+    /* L357: no explicit restore -- a family that restores a grid checkpoint only as a sync resumes from it (Qwen)
+     * refuses one; the sync below resumes from the deepest checkpoint at or below n on every family, and the
+     * origin check after it asserts it was G */
     pulsar_tokens p = { .v = (int *)toks, .len = (int)n, .cap = (int)n };
     if (pulsar_session_sync(s, &p, err, sizeof err) != 0) {
         fprintf(stderr, "decode reference: resume sync to %u failed: %s\n", n, err);
