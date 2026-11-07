@@ -91,28 +91,13 @@ model.  Record pass/fail against the release commit:
   predates the artifact's layouts or payload version cannot run at all, and
   the gate cannot certify the release.  Rebuild the blob with
   `make cuda-prefill-gate-baseline` after bumping the ref.
-- `make cuda-evict-restore-gate` — bank evict/restore bit-identity.
-- `make cuda-rewind-gate` — compressor frontier position-truth across ghost
-  rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
-  ratio-128 boundary, plus the value leg (a ghost rewind must not contaminate
-  re-emitted comp rows) and the ratio-128 undo walk (L124).
-- `make cuda-mseq-rewind-gate` — a rewind must clamp BOTH frontier
-  representations. L120 clamped the scalars; the served path validates the next
-  multiseq step against the PER-BANK slots (ms_n_comp[bank]), which rewind did
-  not touch, so a rewound bank decoded again with no bank switch-away between
-  was rejected with production's own "frontier not position-true". Reproduces
-  that deterministically and asserts both copies agree.
 - `make cuda-seam-gate` — token-boundary seams keep the live KV (L115).
   Discovers a seam pair from the model's own vocabulary, then pins the byte
   walk, the sync rescue, the shorter-echo shape, and a fork across seams.
   Needs `PULSAR_MSEQ_BANKS>=2` for its fork leg (the target sets it).
-- `make cuda-frontier-gate`, `make cuda-multiseq-gate`,
-  `make cuda-multiseq-gate-nodspark` — multiseq isolation and throughput.
-- `make cuda-bank-spec-gate`, `make cuda-accounting-gate`,
-  `make cuda-algo-stability-gate` — bank/spec interaction, admission
-  accounting exactness, cuBLASLt M-independence.
-- `make cuda-mixed-prefill-gate`, `make cuda-mixed-neutrality-gate` — mixed
-  decode+prefill batching neutrality.
+- `make cuda-multiseq-gate`, `make cuda-multiseq-gate-nodspark` — multiseq
+  isolation and throughput.
+- `make cuda-algo-stability-gate` — cuBLASLt M-independence.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
 **The battery runs the production drafters (L305, 2026-10-21).**  Qwen's hosted model and every Qwen gate default
@@ -155,7 +140,6 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `lilicorr-head-gate` | 10 | |
 | `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
 | `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
-| `cuda-runner-gate [DeepSeek V4]` | 1150 | L278 cut (2026-11-03): only the entries needing DS4 internals or the fixture blobs (`--needs=ds4,fixtures`); 2 engine opens.  Re-set from the first measured battery |
 | `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
 | `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
@@ -213,16 +197,12 @@ The slowest sub-gates:
 | 231 | unit-test-gate (make target) | the pulsar_test compile (~40 s) and FIVE model loads (shared, logprob-vectors, tensor-equivalence x2, the image tests re-opening the shared one) |
 | 225 | cuda-chunk-neutrality-gate [Qwen4-exp] | as above on the hosted Qwen |
 | 171 / 150 | cuda-spec-sampling-gate [Qwen4-exp] / DeepSeek | 1,250 trajectories per mode (L163) |
-| 107 | cuda-accounting-gate | prefill to 64k in three levels |
-| 78 | cuda-head-graph-replay-gate | three 120-step runs (eager, graphs, eager) |
 | 70 | cuda-prefill-gate | the byte gate's five depths, cold |
 | 67 | cuda-decode-reference-gate-code | as the story gate, 3 depths |
 | 66 / 43 | cuda-row-neutrality-gate-deeper [Qwen4-exp] / DeepSeek | ~10k-token probe |
 | 49 / 46 | session-contract-gate [Qwen4-exp] / DeepSeek | |
-| 47, 30, 30 | cuda-dspark-batch-gate-wide / -depth4 / -depth1 | each a full model reload for its draft depth (~22 s of each) |
 | 45 / 41 | cuda-reference-gate-story [Qwen4-exp] / DeepSeek | |
 | 42, 29 | cuda-multiseq-gate-nodspark [Qwen4-exp] / DeepSeek | the drafter-off engine's open |
-| 20 | cuda-tp-head-split-gate | its own model load (drafter off), and one more for the gates after it |
 
 **2026-10-14 (work/battery-trim).  No release-blocking gate left the battery; one informational test did
 (`pulsar_test --logprob-vectors`, below):**
@@ -262,8 +242,6 @@ not hygiene):
   ("no valid checkpoint to snapshot"); on Qwen an ALL_ROWS step is a verify step that does not advance the
   bank, so the next step is refused ("not its run's next position").  An engine API for a teacher-forced
   multi-row decode on a classic session is the lever (~-300 s across both families).
-- cuda-accounting-gate's 64k peak (107 s): levels 8k/16k/32k would halve it.
-- cuda-head-graph-replay-gate's run C (26 s): it only proves eager determinism, the premise of B == A.
 - The spec-sampling oracles' 1,250 trajectories per mode (L163 already halved them).
 
 **Outside `make gates` (2026-10-13; L317 moved the live legs into it):** the landing scripts' extra legs (run after `make gates`:

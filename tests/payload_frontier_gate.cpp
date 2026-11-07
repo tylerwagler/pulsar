@@ -1,6 +1,6 @@
 /* L284: the session payload's round trip at a live FRONTIER, on real weights, through the public API only --
  * so it runs on any family with PULSAR_FAMILY_CAP_PAYLOAD: the one kv-state payload (session_payload.cpp), Qwen's
- * and DeepSeek's (whose byte-level gate is session_payload_gate).
+ * and DeepSeek's.
  *
  * The frontier is off the grid and past the prefill (a prompt of P tokens, then -- a model with spec rounds --
  * N_PRE greedy tokens speculated, then D decoded), which is the state a payload exists for: neither a grid

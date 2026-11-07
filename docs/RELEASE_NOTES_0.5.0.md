@@ -227,8 +227,10 @@ rounds. A duplicate-prefix census is exported (L324).
   invalid, on the previous build too.  So the agent's new workspace limits haven't had a real
   run.
 - **Test coverage is uneven.** Only Qwen3.8-Flash-Next has good coverage
-  (production and most live legs). DeepSeek Vision-Exp has broad battery gates,
-  but no production use in this release. Nemotron is thinner, and V4.1 and Inkling have no gate of their own.
+  (the gate runner's primary, production and most live legs). DeepSeek Vision-Exp
+  is smoke-only since 2026-11-07: it left the gate runner, and the gates that graded
+  its own mechanisms (rewind, compressor state, DSpark batching, the TP head split,
+  mixed prefill) were retired with it. Nemotron is thinner, and V4.1 and Inkling have no gate of their own.
   The encoder and Parse families are gated by hand. See the README's model table.
 - **Nemotron 3.5 Super image input is not in this release.** Its vision front is
   not wired, and an image is refused by name. DeepSeek V4.1 and Inkling take no
@@ -236,8 +238,7 @@ rounds. A duplicate-prefix census is exported (L324).
 - **VMM (CUDA virtual memory management) for KV was explored and paused.** KV
   stays on managed, demand-paged memory.
 - Qwen tensor parallelism has not been graded on a real pair in the battery. It
-  is a declared gap in `tests/contracts.tsv`, as are Qwen whole-session payloads
-  and mixed-prefill neutrality.
+  is a declared gap in `tests/contracts.tsv`.
 - Batched and speculative decode are not bit-reproducible across load. A greedy
   near tie can flip with what else is co-scheduled. Under sampling the
   distribution is preserved.

@@ -78,20 +78,10 @@ static inline long gate_first_diff(const float *a, const float *b, long n) {
 /* L260: the per-row bound for a decode row compared ACROSS the width-exact
  * boundary (pulsar_gpu_matmul_decode_exact_rows): KL(narrow || wide) over the
  * softmax.  Measured worst rows, width 12/16 vs narrower (2026-10-02, all three
- * cuBLASLt decode arms): 4.7e-2 on the B300 reference text, 0.39 on GATE 5R's
- * replayed-prompt rows.  Used by the dspark-batch and algo-stability gates.
- * L262: GATE 5R no longer uses it (its replayed off-distribution rows reached
- * 0.82 at 8c76d808 while the reference text moved < 0.05) -- 5R separates
- * corruption with GATE_5R_FLOOR_FRACTION, and FIDELITY across widths is graded
+ * cuBLASLt decode arms): 4.7e-2 on the B300 reference text, 0.39 on replayed-prompt
+ * rows.  Used by the algo-stability gate; FIDELITY across widths is graded
  * against the B300 reference by cuda-decode-reference-gate-*. */
 #define GATE_DECODE_WIDTH_KL_TOL 1.0
-
-/* L262 GATE 5R: a graded row passes when its KL vs the solo row is at most this
- * fraction of the step's own cross-bank floor (the smallest KL of a row against
- * ANOTHER bank's row at the same position -- what a bank / frontier / KV mix-up
- * produces), measured in the same step.  4: at 8c76d808 the worst graded row was
- * 0.82 against a floor of 8.49 (ratio 0.097). */
-#define GATE_5R_FLOOR_FRACTION 0.25
 
 /* L262 cuda-decode-reference-gate-*: a w-wide decode step's last row, against
  * the SAME tokens over the SAME prefill decoded as w one-row steps (the width

@@ -14,7 +14,7 @@
  * one cannot be, and pretending otherwise would either fail honest code or
  * force a meaningless threshold.
  *
- * MODEL-DEPENDENT, GPU-resident (like session_payload_gate).
+ * MODEL-DEPENDENT, GPU-resident.
  *
  * usage: ./tests/vision_tower_gate MODEL GOLDENS
  */

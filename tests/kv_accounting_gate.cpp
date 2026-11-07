@@ -24,7 +24,7 @@
  *       freed bytes are the trunk's -- read from the declared state (gate_fixture.h), the one reach past the API.
  * The increments CANCEL the session's eager floor (the fixed state, the checkpoint slabs, the scratch), so what
  * moves is the demand-paged pools.  Measured on the whole device: run it on a quiet box (the battery's discipline).
- * A runner gate (tests/gates_runner.cpp `kv-accounting-gate`); DeepSeek's is cuda-accounting-gate. */
+ * A runner gate (tests/gates_runner.cpp `kv-accounting-gate`). */
 #include "pulsar.h"
 #include "gate_entry.h"
 #include "gate_fixture.h"   /* the declared state: the trunk's share of a bank's pools (K2) */

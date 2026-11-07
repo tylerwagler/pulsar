@@ -12,8 +12,8 @@
  *       touched KV is what it was
  *   R3  bank 1 (freed and restored) and bank 2 (never freed) each sync the same extension Q of the prompt and
  *       decode 16 greedy tokens: the logits after the sync and after every step are byte-identical
- * DeepSeek's pool has its own gate (bank_evict_restore_gate); this one runs on any family that declares banks and
- * segments. */
+ * It runs on any family that declares banks and segments (it replaced DeepSeek's evict / restore gate, retired with
+ * DeepSeek's runner seat in L357). */
 #include "pulsar.h"
 #include "segment_file_io.h"   /* L347 I3a: segments to and from files through the copy-out */
 #include "gate_entry.h"

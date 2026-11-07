@@ -57,8 +57,7 @@
  * L160 (2026-09-04): the sampled-distribution arm runs its trajectories as
  * BANKED BATCHES through the server's batched lane -- the same round_begin /
  * decode_mixed(ALL_ROWS) / round_end / redraft_batch sequence server_sched.cpp
- * runs for co-scheduled clients (tests/dspark_batch_gate.cpp drives it the same
- * way).  Every trajectory still starts from the SAME snapshot (each bank is
+ * runs for co-scheduled clients.  Every trajectory still starts from the SAME snapshot (each bank is
  * repointed, invalidated and loaded from it) and draws from the SAME per-
  * trajectory rng stream as before, so the emitted tokens and alpha are what the
  * serial loop produced -- 16 plain trajectories or 4 speculative ones per

@@ -8,7 +8,7 @@
  *
  *   (1) bank 1 COHERENT vs a classic from-zero prefill of the same K tokens:
  *       next token exact, last-position full-vocab logit rel-RMS < 1e-2 (the
- *       mixed_prefill_gate oracle -- KV corruption is large, last-ulp drift is
+ *       retired mixed_prefill_gate's oracle -- KV corruption is large, last-ulp drift is
  *       not), and its greedy continuation coherent (reported, first token must
  *       match);
  *   (2) bank 0's decode row NEUTRAL: its logits equal the same row decoded alone

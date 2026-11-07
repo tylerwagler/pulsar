@@ -233,7 +233,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -244,8 +244,6 @@ help:
 	@echo "  make cuda-regression     Kernel smokes vs synthetic slabs (modelless)"
 	@echo "  make cuda-attn-gates     fp16 attention correctness gates: kernel oracle,"
 	@echo "                           banked KV-leak isolation, one-row launch (modelless)"
-	@echo "  make cuda-frontier-gate  Multiseq frontier-isolation gate (needs the model;"
-	@echo "                           FRONTIER_MODEL, set in local.mk)"
 	@echo "  make cuda-multiseq-gate  Multiseq-vs-solo token-stream gate + aggregate"
 	@echo "                           throughput at N=1..3 (needs the model)"
 	@echo "  make cuda-multiseq-gate-nodspark"
@@ -1038,11 +1036,11 @@ bank-adopt-gate-nemotron: tests/bank_adopt_gate
 	./tests/bank_adopt_gate $(NEMOTRON_GATE_MODEL)
 # L284 #3: a family pool's bank physical residency (tests/bank_residency_gate.cpp): free_physical returns an idle
 # bank's KV (touched + MemAvailable), alloc_physical + its segment chain bring it back, and its greedy continuation
-# is byte-identical to a bank never freed.  DeepSeek's is cuda-evict-restore-gate.
+# is byte-identical to a bank never freed.
 .PHONY: bank-residency-gate-qwen
 bank-residency-gate-qwen: tests/bank_residency_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/bank_residency_gate $(QWEN_GATE_MODEL)
-# L357: the family-neutral ports of cuda-frontier-gate, cuda-accounting-gate and cuda-head-graph-replay-gate (runner
+# L357: the family-neutral ports of DeepSeek's retired frontier, accounting and head-graph-replay gates (runner
 # gates bank-isolation-gate, kv-accounting-gate, graph-eager-gate; these targets run one by hand): an idle bank
 # untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row (the declared
 # state, byte for byte); touched KV == the physical a fill takes and a bank free returns (cudaMemGetInfo); a replayed
@@ -1295,7 +1293,7 @@ tests/hc_carry_kernel_test: tests/hc_carry_kernel_test.cu Makefile src/cuda/puls
 # attn_f16_banked_test took a "p" argument selecting packed comp banks over
 # f32 ones; the comp format parameter is gone from the kernels (2026-08-18), so
 # there is one mode and one invocation.
-cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
+cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/hc_carry_kernel_test tests/sampler_device_gate tests/nt_crossover_sweep tests/exl3_dense_gate tests/exl3_dense_bench tests/exl3_dense_xcheck tests/vision_router_gate tests/vision_hc_gate tests/rope_tail_format_gate
 	./tests/attn_f16_kernel_test
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4          # compressed tail
 	./tests/attn_f16_kernel_test 40 24 32 x 8 4 3        # indexed top-k selection
@@ -1360,11 +1358,9 @@ decode-kernel-census:
 seam-check:
 	@python3 tools/seam_check.py
 
-# Multiseq frontier-isolation gate (engine-side wrong-bank wiring; see the
-# header of tests/multiseq_frontier_gate.c).  MODEL-DEPENDENT — run manually
-# on the GB10, not part of `make test`.  Discipline before running: no
-# pulsar-server/pulsar_test process, `sync; echo 3 > /proc/sys/vm/drop_caches`,
-# check `free -g` headroom (the model is ~87 GB).
+# The DeepSeek model the standalone DeepSeek targets below run on.  MODEL-DEPENDENT -- run manually on the GB10, not
+# part of `make test`.  Discipline before running: no pulsar-server/pulsar_test process,
+# `sync; echo 3 > /proc/sys/vm/drop_caches`, check `free -g` headroom (the model is ~87 GB).
 #
 # VISION-EXP, not 0731 (2026-09-21, Tyler: "we should NOT be using that as the
 # battery model.  we haven't been using that model in a long time").  The
@@ -1384,27 +1380,6 @@ seam-check:
 # and the promotion lane swaps shards in.  Every gate takes this as a PATH, so
 # one line moved the whole battery off GGUF.
 FRONTIER_MODEL ?= $(call need_path,FRONTIER_MODEL)
-# 3 banks, not 2: clause (c) binds the graph's device views to an idle third
-# bank while the two-bank step runs, so a frontier access that resolves
-# through cur_bank has somewhere to land that the step must not touch.
-cuda-frontier-gate: tests/multiseq_frontier_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_frontier_gate $(FRONTIER_MODEL)
-
-# L120 rewind position-truth gate: compressor frontier pair == pos/ratio
-# across ghost-tail rewinds and incremental continuations (see the header of
-# tests/rewind_frontier_gate.cpp).  MODEL-DEPENDENT — same discipline as the
-# frontier gate.
-cuda-rewind-gate: tests/rewind_frontier_gate
-	./tests/rewind_frontier_gate $(FRONTIER_MODEL)
-
-# L120's other half: a rewind must clamp the PER-BANK frontier as well as the
-# scalars, or the next multiseq step on that bank is rejected with production's
-# "frontier not position-true".  MODEL-DEPENDENT.
-# Pooled on purpose: leg 2 exercises the boundary-stash escape, and the stash is
-# allocated with the bank pool.  The runner cannot set this (one shared process,
-# pool size cached before this gate's entry), so THIS target is the vehicle.
-cuda-mseq-rewind-gate: tests/mseq_rewind_probe
-	PULSAR_MSEQ_BANKS=4 ./tests/mseq_rewind_probe $(FRONTIER_MODEL)
 
 # L115 token-seam gate: sampled-vs-canonical boundary drift keeps the live
 # KV (see the header of tests/token_seam_gate.cpp).  MODEL-DEPENDENT.
@@ -1414,7 +1389,7 @@ cuda-seam-gate: tests/token_seam_gate
 # Tier-2 multiseq gate: co-scheduling neutrality, mixed-entry byte identity,
 # ALL_ROWS head mode, stale-classic guard (see the header of
 # tests/multiseq_decode_gate.cpp).  MODEL-DEPENDENT — run manually on the GB10
-# with the same memory discipline as the frontier gate.
+# with the memory discipline above.
 cuda-multiseq-gate: tests/multiseq_decode_gate
 	PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 3 64
 
@@ -1425,49 +1400,11 @@ cuda-multiseq-gate: tests/multiseq_decode_gate
 cuda-multiseq-gate-nodspark: tests/multiseq_decode_gate
 	PULSAR_MSEQ_BANKS=2 PULSAR_GATE_NO_DSPARK=1 ./tests/multiseq_decode_gate $(FRONTIER_MODEL) 2 64
 
-# Tier-2 PATH A / Option F: fused DSpark speculation on a BANK (N=1 spec-on-
-# bank == classic, N=2 spec-time-slice with warm per-bank rings, mseq_dirty
-# cheap resume).  See tests/bank_spec_gate.c.  MODEL-DEPENDENT, drafter-merged
-# model, same memory discipline as the gates above; hold temp/gpu.lock.
-cuda-bank-spec-gate: tests/bank_spec_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/bank_spec_gate $(FRONTIER_MODEL) 32
-
-# L150: the batched redraft (one drafter pass over every bank of a tick) must
-# equal the serialized per-bank redraft byte for byte -- draft ids, confidence
-# bits, trims -- on the server-shaped lane, greedy and sampled, at the default
-# depth and at depth 1 (the single-row attention fast path). Drafter-merged
-# model, 3 banks.
 # L151: measurement, not a gate -- the M-independent nt kernels vs the
 # tensor-core arms per dense shape at M = 1..16 (real weights). Decides the
 # default row cap.
 cuda-nt-sweep: tests/nt_crossover_sweep
 	./tests/nt_crossover_sweep $(FRONTIER_MODEL) 4
-
-cuda-dspark-batch-gate: tests/dspark_batch_gate
-	PULSAR_MSEQ_BANKS=3 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 8 0
-	PULSAR_MSEQ_BANKS=3 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 6 1
-	PULSAR_MSEQ_BANKS=10 ./tests/dspark_batch_gate $(FRONTIER_MODEL) 4 2 10
-
-# Tier-2 overcommit accounting-exactness gate (task #55, increment 1): the
-# exact-frontier touched-KV number the eviction guard triggers on must track the
-# real cudaMemGetInfo physical delta of the demand-paged comp/index growth.  See
-# tests/accounting_gate.c.  MODEL-DEPENDENT, same memory discipline as the gates
-# above (hold temp/gpu.lock, drop_caches, no other pulsar process); fills stay
-# modest (peak ~64k tokens) and do not exercise eviction.
-cuda-accounting-gate: tests/accounting_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/accounting_gate $(FRONTIER_MODEL)
-
-# Tier-2 increment 2b bank evict/restore bit-identity + reclaim gate (the
-# memory-safety core; no OOM risk). See tests/bank_evict_restore_gate.c.
-cuda-evict-restore-gate: tests/bank_evict_restore_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/bank_evict_restore_gate $(FRONTIER_MODEL)
-
-# Session payload SAVE -> LOAD round trip. Nothing covered this before
-# 2026-08-18, and the gap hid a raw-ring stride bug that read past the end of
-# the ring allocation. Compares the comp caches byte-for-byte and then decodes
-# one token from both sessions -- a byte-copy payload owes exact equality.
-cuda-session-payload-gate: tests/session_payload_gate
-	./tests/session_payload_gate $(FRONTIER_MODEL)
 
 # L216: the Vision-Exp image-layout math (grid/shrink/block) graded against
 # goldens generated by RUNNING the checkpoint's inference/image_processor.py.
@@ -1611,11 +1548,6 @@ cuda-algo-stability-gate: tests/algo_stability_gate
 cuda-algo-stability-gate-deep: tests/algo_stability_gate
 	PULSAR_MSEQ_BANKS=16 ./tests/algo_stability_gate $(FRONTIER_MODEL) deep
 
-# plan-34 phase-2 inc 3: K-row single-bank prefill through the mixed entry —
-# coherence vs classic, K>ratio boundary, tensor-core speed. MODEL-DEPENDENT.
-cuda-mixed-prefill-gate: tests/mixed_prefill_gate
-	PULSAR_MSEQ_BANKS=2 ./tests/mixed_prefill_gate $(FRONTIER_MODEL)
-
 # L260 fusion phase A: a FROM-ZERO prefill run co-scheduled with a decode row in
 # one mixed step -- coherent vs classic from zero, decode row neutral.
 cuda-mixed-zero-prefill-gate: tests/mixed_zero_prefill_gate
@@ -1626,10 +1558,6 @@ cuda-mixed-zero-prefill-gate: tests/mixed_zero_prefill_gate
 # matching a classic prefill.
 cuda-fused-step-gate: tests/fused_step_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/fused_step_gate $(FRONTIER_MODEL)
-# L292: the captured output-head graph replays only for a head of the same row kinds -- pure decode and fused steps
-# of one head width alternate, and every headed row of the graph lane equals the eager lane's byte for byte.
-cuda-head-graph-replay-gate: tests/head_graph_replay_gate
-	PULSAR_MSEQ_BANKS=4 ./tests/head_graph_replay_gate $(FRONTIER_MODEL)
 # L260: decode rows at widths 1/4/9/16 graded against the reference blobs (report only).
 decode-reference-gate: tests/decode_reference_gate
 	PULSAR_MSEQ_BANKS=2 ./tests/decode_reference_gate $(FRONTIER_MODEL) $(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin
@@ -1676,22 +1604,6 @@ CONTAINER_PY ?= python3
 container-tests:
 	cd tools/container && for t in test_exl3_rates.py test_deepseek.py test_qwen.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
-
-# plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
-# fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
-# a co-scheduled prefill), gate 2 prefill correctness, gate 3 MoE two-pass split.
-# PULSAR_GATE_ROWS_FATAL (L152/L153): every row of a 10- and a 16-row multi-run
-# step must match its solo run byte for byte.  GATE 5 alone checks last rows at
-# 6 total, and the wide variant skips GATE 5 above the cap -- the 9..16-row
-# range where L152 lived had no battery gate until this.
-cuda-mixed-neutrality-gate: tests/mixed_neutrality_gate
-	PULSAR_MSEQ_BANKS=3 PULSAR_GATE_ROWS_FATAL="5,5 8,8" ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
-
-# Wide variant: 12 decode banks exercises the armed M-neutral kernel range past
-# 8 (the l048-ntcap-16 coverage) — NT instantiations 9..16 and the MoE
-# non-grouped path at those widths, same byte-identity demand as the 2-bank run.
-cuda-mixed-neutrality-gate-wide: tests/mixed_neutrality_gate
-	PULSAR_GATE_NDEC=12 PULSAR_MSEQ_BANKS=13 ./tests/mixed_neutrality_gate $(FRONTIER_MODEL)
 
 # ---- client-side serving gates (stdlib Python; need a RUNNING pulsar-server) ----
 # These measure what a client experiences, so they talk HTTP to an already-started
@@ -2218,15 +2130,6 @@ cuda-prefill-decode-gate-baseline:
 # quietly succeeds when its fixture is absent is worse than no gate, which is
 # exactly the hole L078's golden fixture fell into.
 #
-# Tolerance 1e-4 clears the six mid rows with 10-100x headroom (measured
-# 2026-08-21 on a provenanced binary: 3.5e-7 .. 9.9e-6, top-1 matched).
-# --known-high names the three rows whose KL is a documented, not-yet-explained
-# outlier -- shallow and file-end positions where a flat next-token
-# distribution amplifies small numeric differences (ledger L080).  They keep
-# the TOP-1 contract and lose only the KL ceiling; a blanket tolerance loose
-# enough to pass them would be ~1e4x too loose for the mid rows and would
-# protect nothing.
-PULSAR_REF_TOL ?= 1e-4
 # Per-depth KL budgets: the gate grades DIRECTION against these (closer to the
 # source = pass).  Absent, it falls back to the absolute-ceiling check only,
 # which cannot see direction -- see the 2026-08-24 note in
@@ -2246,14 +2149,6 @@ KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-code.txt
 # FAIL in the runner, never a skip -- stage the capture or override with an
 # empty value to skip deliberately (PULSAR_REF_DIR=).
 PULSAR_REF_DIR ?= $(call need_path,PULSAR_REF_DIR)
-# The capture's documented depths, passed to the runner as this model's data (L278: the runner holds none).  The
-# anchors are the SERVED model's (Vision-Exp, L240, 2026-09-23): the story blob's documented argmax flip is the
-# file-end row 30464 (ours 6712 at 24.06 over 915 at 23.54; the source had them 0.125 apart at a 2.4-nat
-# position) -- the 0731 artifact flipped at 512 instead, and that row MATCHES for Vision-Exp.  Known-high rows keep
-# top-1 and lose only the KL ceiling (L080).  The gate says "drop it" by name when an exemption stops being needed.
-PULSAR_REF_ANCHORS = --ref-dir "$(PULSAR_REF_DIR)" --ref-tol $(PULSAR_REF_TOL) \
-	--kl-story $(KL_BUDGET_STORY) --kl-code $(KL_BUDGET_CODE) \
-	--story-known-high 512,30464 --story-known-flip 30464 --code-known-high 3840
 # ⚠ ONE SHELL, DELIBERATELY.  Each make recipe LINE gets its own shell, so an
 # `exit 0` in a guard on the first line exits only that line and make runs the
 # rest anyway -- which is exactly how the first version of this target failed
@@ -2301,8 +2196,7 @@ cuda-reference-gate-budget:
 		echo "REFUSING: set PULSAR_REF_DIR to the reference-capture dir"; exit 1; fi
 #
 # Report-only on purpose (no KL_TOL, no outlier anchors): a record run measures,
-# it does not grade, so the documented outlier depths keep their ONE home beside
-# the capture (PULSAR_REF_ANCHORS) and a row that would fail the grade still gets recorded.
+# it does not grade, so a row that would fail the grade still gets recorded.
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-reference \
 		$(PULSAR_REF_DIR)/story.ref.bin $(PULSAR_REF_DIR)/story.tokens.bin \
@@ -2356,12 +2250,6 @@ cuda-row-neutrality-gate-deep: tests/mseq_short_ctx_probe
 # tier and the ranking kernel past the 2048-row bucket, on logits.
 cuda-row-neutrality-gate-deeper: tests/mseq_short_ctx_probe
 	./tests/mseq_short_ctx_probe $(FRONTIER_MODEL) 4200
-# L168: the ratio-4 compressor state after an unaligned whole-prompt prefill
-# (n_tokens % 4 = 1, 2, 3) has the decode store's layout and content; L171: the
-# rewind projection ring did not read the rebuild's scratch.
-# MODEL-DEPENDENT, ~1 min.
-cuda-comp-state-gate: tests/comp_state_gate
-	./tests/comp_state_gate $(FRONTIER_MODEL)
 # L183: a prompt's logits do not depend on its chunking (cold, 6-row first
 # chunk, two mid-size chunks, off-grid warm resume -- frontier + one decode step
 # byte-identical).  The plain-weight GEMM arm's fixed reduction order is what
@@ -2396,12 +2284,10 @@ SPEC_TF_POSITIONS ?= 2000
 # source is compiled a second time with its entry renamed (GATE_ENTRY) and the
 # engine calls routed to the runner's broker (PULSAR_GATE_RUNNER); the
 # standalone binaries above are the same sources built without those defines.
-RUNNER_GATES = payload_frontier_gate bank_residency_gate multiseq_frontier_gate rewind_frontier_gate mseq_rewind_probe token_seam_gate \
-               multiseq_decode_gate bank_spec_gate dspark_batch_gate accounting_gate \
-               bank_evict_restore_gate algo_stability_gate mixed_prefill_gate \
-               mixed_neutrality_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
-               comp_state_gate chunk_neutrality_gate vision_chunk_gate session_payload_gate tp_head_split_gate \
-               decode_reference_gate session_contract_gate chat_decode_smoke head_graph_replay_gate \
+RUNNER_GATES = payload_frontier_gate bank_residency_gate token_seam_gate \
+               multiseq_decode_gate algo_stability_gate spec_sampling_gate mseq_short_ctx_probe prefill_bitexact_gate \
+               chunk_neutrality_gate vision_chunk_gate \
+               decode_reference_gate session_contract_gate chat_decode_smoke \
                sync_budget_gate scratch_poison_gate mtp_spec_gate bank_adopt_gate bank_isolation_gate \
                kv_accounting_gate graph_eager_gate
 RUNNER_OBJS = $(RUNNER_GATES:%=tests/runner/%.o)
@@ -2429,13 +2315,11 @@ GATE_RUNNER_FLAGS ?=
 # L357: and graph-eager-gate, whose graphed driver steps Qwen does not take (its driver stages none: SKIPped there).
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
 	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate
-# L278 battery cut (2026-11-03, Tyler): the DeepSeek primary runs only the entries nothing else can -- DeepSeek V4's
-# mechanism gates (DS4: evict / restore, accounting, session payload, mixed prefill, rewind, frontier, ...) and the
-# fixture-blob gates (its prefill / decode bit-exact baselines); every other entry runs on the hosted Qwen and Nemotron.
-# RUNNER_PRIMARY_ARGS= runs the primary's whole table again.  gates-dev calls the runner itself and is unaffected.
+# Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
+# itself and is unaffected.
 RUNNER_PRIMARY_ARGS ?=
 # L357 (Tyler 2026-11-07): Qwen, the production model, is the primary and runs the whole table; DeepSeek left the
-# runner (smoke only), so its DS4 mechanism gates no longer run anywhere.
+# runner (smoke only), and its mechanism gates were retired with it (the family-neutral ports above carry their intent).
 RUNNER_PRIMARY_MODEL ?= $(QWEN_GATE_MODEL)
 RUNNER_PRIMARY_ANCHORS ?= $(QWEN_REF_ANCHORS)
 # L317: the seed of the chunk-neutrality sample is the sha the battery runs at (successive batteries rotate through
@@ -2500,10 +2384,7 @@ prefix-stability-gate: pulsar_test
 # The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
 # tests/gates_runner.cpp) -- one 92 GB model load per engine configuration
 # instead of one per gate.  Their individual targets below remain for
-# iterating on one gate; the battery is the runner.  L220 folded the last
-# exception in: cuda-session-payload-gate is now a runner function too (its
-# v10 digest corruption case included), so the battery no longer pays a
-# separate engine load for it.  L317: so did lilicorr-spec-gate and dflash2-spec-gate
+# iterating on one gate; the battery is the runner.  L317: so did lilicorr-spec-gate and dflash2-spec-gate
 # (block-spec-gate on the hosted Nemotron and Qwen); the live legs, one shared server
 # per model, are the last section (live-legs) but one: L319's server-kv-headroom-live after them (it balloons the box's
 # memory, so it runs alone, ~2.5 min).  Each section's wall time is printed
@@ -2533,7 +2414,7 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
 # silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-mseq-rewind-gate cuda-vision-chunk-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
+.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-vision-chunk-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
 # pre-merge instrument -- every target in GATE_TARGETS, each loading the model,
@@ -2543,15 +2424,15 @@ HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate 
 # These five are the ones that actually catch a numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
 #   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
-#   cuda-frontier-gate       frontier logits across banks
-#   cuda-mixed-neutrality-gate  the small-n_tok / m-neutral split shapes
+#   bank-isolation-gate-qwen   an idle bank untouched by its neighbours' batched steps
+#   session-contract-gate-qwen the session contract, batched rows == single (B1-B6)
 #   cuda-attn-gates          attention kernel + bank isolation
 # SPEC_TRAJ shortens the sampling gate's chi-square when it is included; the
 # full TRAJ is required for statistical power, so quick mode leaves it out
 # rather than run it under-powered and call it a pass.
 # NOT a substitute for `make gates` before a merge.
-GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-chunk-neutrality-gate cuda-frontier-gate \
-                      cuda-mixed-neutrality-gate
+GATES_QUICK_TARGETS = cuda-attn-gates cuda-prefill-gate cuda-chunk-neutrality-gate bank-isolation-gate-qwen \
+                      session-contract-gate-qwen
 
 gates-quick:
 	@rc=0; passed=""; failed=""; \
@@ -2693,19 +2574,19 @@ GATES_DEV_UNIT_SERVER ?= --server --api-sampling-flags --api-min-p-range --api-l
 # which is where an attention/compressor row change shows up as a logits delta.
 # L317: the row-neutrality probe's depths (-deep ~2.2k, -deeper ~10k tokens) and algo-stability's -deep are gates-dev
 # entries of the runner (the battery runs one depth of each): attention and kernel-dispatch paths run them.
-GATES_DEV_ATTN   = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-vision-chunk-gate
+GATES_DEV_ATTN   = session-contract-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-vision-chunk-gate
 # kernel dispatch: row-kind/batch-composition neutrality and the width sweep.
-GATES_DEV_CUDA   = cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate \
+GATES_DEV_CUDA   = session-contract-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep \
                    cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper
 # engine lanes: the batched driver, the spec lane, the bank pool.
-GATES_DEV_ENGINE = cuda-multiseq-gate cuda-bank-spec-gate cuda-dspark-batch-gate cuda-evict-restore-gate cuda-session-payload-gate
-GATES_DEV_SERVER = cuda-seam-gate cuda-session-payload-gate
+GATES_DEV_ENGINE = cuda-multiseq-gate bank-isolation-gate bank-residency-gate payload-frontier-gate
+GATES_DEV_SERVER = cuda-seam-gate payload-frontier-gate
 # vision: the host gates below do the real work (they need no model); the runner
 # sub-gates pin the prefill lane an image span rides and (L283) its chunk-start invariance.
-GATES_DEV_VISION = cuda-mixed-prefill-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
+GATES_DEV_VISION = session-contract-gate cuda-row-neutrality-gate-deep cuda-vision-chunk-gate
 # Nothing recognizable changed (or a clean tree): the conservative core -- the
 # dispatch/neutrality gates that fail on the widest class of numerics breaks.
-GATES_DEV_DEFAULT= cuda-mixed-neutrality-gate cuda-algo-stability-gate cuda-row-neutrality-gate-deep cuda-multiseq-gate
+GATES_DEV_DEFAULT= session-contract-gate cuda-algo-stability-gate cuda-row-neutrality-gate-deep cuda-multiseq-gate
 
 .PHONY: gates-dev
 gates-dev:
@@ -2931,15 +2812,6 @@ tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gp
 tests/vision_router_gate.o: tests/vision_router_gate.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/vision_router_gate.cpp
 
-tests/multiseq_frontier_gate.o: tests/multiseq_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/multiseq_frontier_gate.cpp
-
-tests/rewind_frontier_gate.o: tests/rewind_frontier_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/rewind_frontier_gate.cpp
-
-tests/mseq_rewind_probe.o: tests/mseq_rewind_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mseq_rewind_probe.cpp
-
 tests/resume_suffix_probe.o: tests/resume_suffix_probe.cpp src/pulsar.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/resume_suffix_probe.cpp
 
@@ -2952,33 +2824,16 @@ tests/multiseq_decode_gate.o: tests/multiseq_decode_gate.cpp tests/gate_util.h s
 tests/mseq_rowcost_probe.o: tests/mseq_rowcost_probe.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mseq_rowcost_probe.cpp
 
-tests/bank_spec_gate.o: tests/bank_spec_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_spec_gate.cpp
-
-tests/dspark_batch_gate.o: tests/dspark_batch_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/dspark_batch_gate.cpp
-
 tests/bank_carry_identity.o: tests/bank_carry_identity.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_carry_identity.cpp
 
 tests/nt_crossover_sweep.o: tests/nt_crossover_sweep.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/nt_crossover_sweep.cpp
 
-tests/accounting_gate.o: tests/accounting_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/accounting_gate.cpp
-
-tests/comp_state_gate.o: tests/comp_state_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/comp_state_gate.cpp
 tests/chunk_neutrality_gate.o: tests/chunk_neutrality_gate.cpp tests/gate_entry.h src/pulsar.h src/lib/pulsar_segstore.h src/lib/pulsar_kvchain.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/chunk_neutrality_gate.cpp
 tests/vision_chunk_gate.o: tests/vision_chunk_gate.cpp tests/gate_entry.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_chunk_gate.cpp
-
-tests/bank_evict_restore_gate.o: tests/bank_evict_restore_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h tests/segment_file_io.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/bank_evict_restore_gate.cpp
-
-tests/session_payload_gate.o: tests/session_payload_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/session_payload_gate.cpp
 
 tests/vision_image_gate.o: tests/vision_image_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/vision_image_gate.cpp
@@ -3026,23 +2881,15 @@ tests/vision_merge_gate.o: tests/vision_merge_gate.cpp src/engine/pulsar_engine_
 tests/algo_stability_gate.o: tests/algo_stability_gate.cpp tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/algo_stability_gate.cpp
 
-tests/mixed_prefill_gate.o: tests/mixed_prefill_gate.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_prefill_gate.cpp
-
 tests/mixed_zero_prefill_gate.o: tests/mixed_zero_prefill_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_zero_prefill_gate.cpp
 
 tests/fused_step_gate.o: tests/fused_step_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/fused_step_gate.cpp
-tests/head_graph_replay_gate.o: tests/head_graph_replay_gate.cpp tests/gate_fixture.h tests/gate_util.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/head_graph_replay_gate.cpp
 tests/verify_width_probe.o: tests/verify_width_probe.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/verify_width_probe.cpp
 tests/decode_reference_gate.o: tests/decode_reference_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/decode_reference_gate.cpp
-
-tests/mixed_neutrality_gate.o: tests/mixed_neutrality_gate.cpp tests/gate_fixture.h src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/mixed_neutrality_gate.cpp
 
 # Public-API only (pulsar.h): the gate must build unchanged against the baseline
 # ref's tree, so it must not depend on engine internals that may have drifted.
@@ -3115,15 +2962,6 @@ tests/sampler_device_gate: tests/sampler_device_gate.o tests/sampler_host_ref.o 
 tests/vision_router_gate: tests/vision_router_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/multiseq_frontier_gate: tests/multiseq_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/rewind_frontier_gate: tests/rewind_frontier_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/mseq_rewind_probe: tests/mseq_rewind_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
 tests/resume_suffix_probe: tests/resume_suffix_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -3136,10 +2974,6 @@ tests/multiseq_decode_gate: tests/multiseq_decode_gate.o src/lib/pulsar_help.o $
 tests/mseq_rowcost_probe: tests/mseq_rowcost_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/bank_spec_gate: tests/bank_spec_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/dspark_batch_gate: tests/dspark_batch_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L260: the batched spec lane, byte-reproducible, for before/after identity of a bank-switch bookkeeping change
 # (not a gate: run it on both trees and diff; tests/bank_carry_identity.cpp).
 tests/bank_carry_identity: tests/bank_carry_identity.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3157,20 +2991,9 @@ tests/fixed_tile_gemm_probe: tests/fixed_tile_gemm_probe.o tests/fixed_tile_gemm
 cuda-fixed-tile-probe: tests/fixed_tile_gemm_probe
 	./tests/fixed_tile_gemm_probe $(FRONTIER_MODEL)
 
-tests/accounting_gate: tests/accounting_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
 tests/chunk_neutrality_gate: tests/chunk_neutrality_gate.o src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/vision_chunk_gate: tests/vision_chunk_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/comp_state_gate: tests/comp_state_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/bank_evict_restore_gate: tests/bank_evict_restore_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/session_payload_gate: tests/session_payload_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/vision_image_gate: tests/vision_image_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3444,25 +3267,16 @@ tests/vision_merge_gate: tests/vision_merge_gate.o src/lib/pulsar_help.o $(CORE_
 tests/algo_stability_gate: tests/algo_stability_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/mixed_prefill_gate: tests/mixed_prefill_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
 tests/mixed_zero_prefill_gate: tests/mixed_zero_prefill_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/fused_step_gate: tests/fused_step_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/head_graph_replay_gate: tests/head_graph_replay_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
 tests/verify_width_probe: tests/verify_width_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/decode_reference_gate: tests/decode_reference_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-
-tests/mixed_neutrality_gate: tests/mixed_neutrality_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/prefill_bitexact_gate: tests/prefill_bitexact_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
@@ -3682,7 +3496,7 @@ test: pulsar_test seam-check
 clean:
 	rm -rf .build
 	rm -rf tests/runner
-	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_frontier_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/bank_spec_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/accounting_gate tests/bank_evict_restore_gate tests/session_payload_gate tests/algo_stability_gate tests/mixed_prefill_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/head_graph_replay_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/mixed_neutrality_gate tests/comp_state_gate tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/dspark_batch_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
+	rm -f tests/gates_runner pulsar pulsar-server pulsar-bench pulsar-eval pulsar-agent pulsar_test pulsar_agent_test src/engine/*.o src/families/*/*.o src/families/*/*.d src/tp/*.o src/agent/*.o src/server/*.o src/cuda/*.o src/cuda/mmq/*.o src/cuda/mmq/test/*.o src/cli/*.o src/lib/*.o src/vendor/*.o $(XGRAMMAR_OBJS) $(XGRAMMAR_OBJS:.o=.d) tests/*.o src/engine/*.d src/agent/*.d src/server/*.d src/cuda/*.d src/cuda/mmq/*.d src/cuda/mmq/test/*.d src/cli/*.d src/lib/*.d src/vendor/*.d tests/*.d tests/vision_visible_gate tests/vision_hc_gate tests/vision_image_gate tests/vision_placeholder_gate tests/vision_image_sync_gate tests/vision_chunk_gate tests/cuda_long_context_smoke tests/moe_route_bounds_gate tests/expert_table_gate tests/multiseq_decode_gate tests/prefill_bitexact_gate tests/spec_sampling_gate tests/spec_sampling_gate_wide tests/algo_stability_gate tests/mixed_zero_prefill_gate tests/fused_step_gate tests/draft_refusal_gate tests/scratch_poison_gate tests/scratch_poison_gate_mutant tests/gates_runner_mutant_* tests/mutant/family_qwen_s4_l307.cpp tests/mutant/family_qwen_s4_l307.o tests/mutant/family_qwen_s4_l307.d tests/decode_reference_gate tests/verify_width_probe tests/spec_teacher_forced_probe tests/attn_f16_kernel_test tests/attn_f16_banked_test tests/kv_rows_pack_gate tests/kv_rows_pack_gate_fastmath tests/sampler_device_gate tests/nt_crossover_sweep tests/vision_router_gate tests/router_gate tests/bf16_rows_gate tests/nvfp4_rows_gate tests/lilicorr_head_gate tests/inkling_family_gate tests/nemotron_family_gate tests/nemotron_fwd_gate tests/nemotron_enc_gate tests/nemotron_parse_gate tests/rowops_gate tests/state_kinds_gate tests/payload_frontier_gate tests/prompt_end_gate tests/bank_adopt_gate tests/bank_residency_gate tests/bank_isolation_gate tests/kv_accounting_gate tests/graph_eager_gate
 
 # Pull in the generated header dependencies.  `-include` (not `include`) so a
 # tree with no .d files yet -- a fresh clone, or right after `make clean` -- is

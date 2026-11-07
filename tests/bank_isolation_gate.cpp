@@ -16,7 +16,7 @@
  *   I3  a batchmate's position: bank 0 prefilled MOVE tokens longer (its rows at other positions; the step keeps its
  *       width), bank 1 as before -- bank 1's logits at every step and its whole state after are byte-identical to the
  *       first run's: a row's position reaches only its own row
- * DeepSeek's compressor-ratio scenarios (a ratio group closing on one bank only) stay with cuda-frontier-gate; this
+ * DeepSeek's compressor-ratio scenarios (a ratio group closing on one bank only) left with its frontier gate (L357); this
  * gate reads the declared state, so it refuses a family without one by name.  A runner gate (tests/gates_runner.cpp
  * `bank-isolation-gate`). */
 #include "pulsar.h"

@@ -129,8 +129,8 @@ int GATE_ENTRY(int argc, char **argv) {
      * and the MoE takes the GEMV at any width there.  {1,2,4,5,8,16} spans
      * every one of them (5 vs 8 straddles the ro arm; 8 and 16 keep the
      * historical L152 9..16 band sampled on both sides), and the dropped
-     * width's own instantiation is asserted byte-identical against a solo row
-     * by cuda-mixed-neutrality-gate-wide (12 decode banks, fatal).
+     * width's own instantiation was asserted byte-identical against a solo row
+     * by DeepSeek's mixed-neutrality gate (12 decode banks), retired in L357.
      * 16 is PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
     const int widths[] = {1, 2, 4, 5, 8, 16};
     const int nW = (int)(sizeof(widths) / sizeof(widths[0]));

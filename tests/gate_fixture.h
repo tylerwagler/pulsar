@@ -1,13 +1,12 @@
-/* Shared fixture for the multi-bank engine gates (algo_stability_gate,
- * mixed_neutrality_gate, multiseq_decode_gate).  Before 2026-09-02 (L153) each
- * carried its own copy of: read the story prompt, tokenize it, and populate a
- * bank -- repoint the graph's views, invalidate, classic sync, capture the
- * bank's frontier counters, take the argmax.  Three copies of a fixture that
- * MUST agree (the gates compare each other's shapes) with nothing enforcing it.
+/* Shared fixture for the multi-bank engine gates (fused_step_gate, mixed_zero_prefill_gate, prefill_chunk_census_probe,
+ * and the declared-state readers bank_isolation_gate, kv_accounting_gate, mtp_spec_gate).  Before 2026-09-02 (L153)
+ * each gate carried its own copy of: read the story prompt, tokenize it, and populate a bank -- repoint the
+ * graph's views, invalidate, classic sync, capture the bank's frontier counters, take the argmax.  Three
+ * copies of a fixture that MUST agree (the gates compare each other's shapes) with nothing enforcing it.
  *
  * L278: this is the ENGINE-INTERNAL part -- the helpers that reach into DeepSeek V4's session graph (s->graph,
- * gpu_graph_*), for the gates that grade that family's mechanisms (the runner's NEED_DS4_INTERNALS), and (L357) the
- * reader of a bank's declared state (state_kinds.h: every family on the core step driver, never DeepSeek), for the
+ * gpu_graph_*), for the standalone gates that grade that family's mechanisms (none is in the runner since L357), and
+ * the reader of a bank's declared state (state_kinds.h: every family on the core step driver, never DeepSeek), for the
  * gates that compare state bytes.  Everything that needs only the public API lives in tests/gate_util.h, included
  * here, so a family-generic gate that compares only logits takes that header and none of this.
  *

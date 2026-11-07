@@ -62,11 +62,9 @@
  * the gates that used to load it themselves (the Nemotron LiLiCorr drafter, spec, scratch and adopt legs) runs those,
  * not the whole table.
  *
- * `--needs=a,b` (L278 battery cut, 2026-11-03) restricts a model -- the primary too, before any `--model` -- to the table
- * entries whose needs include at least one of those (ds4, tokenizer, spec, dspark, rewind, fixtures, vision, block,
- * graphs): the battery runs the DeepSeek primary with `--needs=ds4,fixtures`, the gates only it can run, since every
- * other entry also runs on the hosted families.  The table's needs column stays the one authority; no list of gate
- * names.
+ * `--needs=a,b` (L278) restricts a model -- the primary too, before any `--model` -- to the table entries whose needs
+ * include at least one of those (tokenizer, spec, fixtures, vision, block, graphs).  The table's needs column stays the
+ * one authority; no list of gate names.
  *
  * PULSAR_GATES_SECTIONS=FILE (make gates): one line `cuda-runner-gate [<family>] SECONDS` per hosted model is
  * appended to FILE -- the per-model sections of the battery's wall-time budget (docs/QA_BEFORE_RELEASES.md).
@@ -86,32 +84,19 @@
 #include "gate_util.h"
 
 /* One entry per gate source, named by the Makefile from the file stem. */
-int gate_multiseq_frontier_gate_main(int, char **);
-int gate_rewind_frontier_gate_main(int, char **);
-int gate_mseq_rewind_probe_main(int, char **);
 int gate_token_seam_gate_main(int, char **);
 int gate_multiseq_decode_gate_main(int, char **);
-int gate_bank_spec_gate_main(int, char **);
 int gate_payload_frontier_gate_main(int, char **);
 int gate_bank_residency_gate_main(int, char **);
-int gate_dspark_batch_gate_main(int, char **);
-int gate_accounting_gate_main(int, char **);
-int gate_bank_evict_restore_gate_main(int, char **);
 int gate_algo_stability_gate_main(int, char **);
-int gate_mixed_prefill_gate_main(int, char **);
-int gate_mixed_neutrality_gate_main(int, char **);
 int gate_spec_sampling_gate_main(int, char **);
 int gate_mseq_short_ctx_probe_main(int, char **);
-int gate_comp_state_gate_main(int, char **);
 int gate_chunk_neutrality_gate_main(int, char **);
 int gate_vision_chunk_gate_main(int, char **);
 int gate_prefill_bitexact_gate_main(int, char **);
-int gate_session_payload_gate_main(int, char **);
-int gate_tp_head_split_gate_main(int, char **);
 int gate_decode_reference_gate_main(int, char **);
 int gate_session_contract_gate_main(int, char **);
 int gate_chat_decode_smoke_main(int, char **);
-int gate_head_graph_replay_gate_main(int, char **);
 int gate_scratch_poison_gate_main(int, char **);
 int gate_sync_budget_gate_main(int, char **);
 int gate_mtp_spec_gate_main(int, char **);
@@ -142,9 +127,9 @@ static uint32_t prefill_chunk_resolved(uint32_t v) { return v ? v : PULSAR_PREFI
 /* The draft depth a session STARTS at is not part of the engine's shape: it is
  * one engine field (pulsar_engine::spec_depth) read when a session drafts its
  * first round (pulsar_spec_depth_start), never at open.  So a gate that pins
- * the depth (the dspark batch legs: 1, 4, 2) runs on the live engine with that
+ * the depth (block-spec-gate's depths 1..5) runs on the live engine with that
  * field set, instead of paying a model load per depth (three per battery until
- * 2026-10-14).  main() refuses PULSAR_SPEC_DEPTH in the environment, so an
+ * 2026-10-14; the block drafter's lane pins its depths the same way).  main() refuses PULSAR_SPEC_DEPTH in the environment, so an
  * option of 0 resolves to 0 (the drafter's own depth) here exactly as it does
  * in pulsar_engine_open; a depth outside [0, 16] -- which the engine would
  * clamp -- is not shared. */
@@ -222,32 +207,24 @@ void gate_engine_close(pulsar_engine *e) {
 typedef int (*gate_entry_fn)(int, char **);
 
 /* What a gate needs of the model it runs on (L278).  Each is read from the opened model through a public query,
- * never from its family's name -- except NEED_DS4_INTERNALS, which is what it says: the gate reads DeepSeek V4's
- * session graph through pulsar_engine_internal.h / gate_fixture.h, so it is that family's mechanism gate.  A gate
- * moves off it by being rewritten on the public API (as session-contract and row-neutrality are).  NEED_STEP_GRAPHS
- * (L357) is read from the family's driver ops too, there being no public query for it. */
+ * never from its family's name.  NEED_STEP_GRAPHS (L357) is read from the family's driver ops, there being no public
+ * query for it.  (L357, 2026-11-07: DeepSeek V4 left the runner, and its mechanism gates -- NEED_DS4_INTERNALS,
+ * NEED_DSPARK, NEED_REWIND -- with it.) */
 enum {
-    NEED_DS4_INTERNALS = 1u << 0,   /* DeepSeek V4's session graph */
-    NEED_TOKENIZER     = 1u << 1,   /* chat text: pulsar_engine_has_tokenizer */
-    NEED_SPEC          = 1u << 2,   /* speculative rounds: pulsar_engine_has_spec_rounds */
-    NEED_DSPARK        = 1u << 3,   /* the DSpark drafter and its depth knob: pulsar_engine_drafter */
-    NEED_REWIND        = 1u << 4,   /* pulsar_session_rewind: pulsar_engine_can_rewind */
-    NEED_FIXTURES      = 1u << 5,   /* the blobs on the command line, which are the PRIMARY model's */
-    NEED_VISION        = 1u << 6,   /* images: pulsar_engine_has_vision */
-    NEED_BLOCK         = 1u << 7,   /* a block drafter (L298 LiLiCorr, L299 DFlash2): pulsar_engine_drafter == BLOCK */
-    NEED_STEP_GRAPHS   = 1u << 8,   /* L357: the core driver graphs its decode / verify steps (the family's driver ops
+    NEED_TOKENIZER     = 1u << 0,   /* chat text: pulsar_engine_has_tokenizer */
+    NEED_SPEC          = 1u << 1,   /* speculative rounds: pulsar_engine_has_spec_rounds */
+    NEED_FIXTURES      = 1u << 2,   /* the blobs on the command line, which are the PRIMARY model's */
+    NEED_VISION        = 1u << 3,   /* images: pulsar_engine_has_vision */
+    NEED_BLOCK         = 1u << 4,   /* a block drafter (L298 LiLiCorr, L299 DFlash2): pulsar_engine_drafter == BLOCK */
+    NEED_STEP_GRAPHS   = 1u << 5,   /* L357: the core driver graphs its decode / verify steps (the family's driver ops
                                      * stage them, step_driver.cpp graphable) -- read from pulsar_driver_ops::stage,
                                      * the second reach past the public queries (there is no query for it) */
 };
-#define DS4 NEED_DS4_INTERNALS
 
 static const char *need_name(uint32_t bit) {
     switch (bit) {
-    case NEED_DS4_INTERNALS: return "DeepSeek V4's session graph (a DeepSeek mechanism gate)";
     case NEED_TOKENIZER:     return "a tokenizer and chat renderer";
     case NEED_SPEC:          return "speculative rounds";
-    case NEED_DSPARK:        return "the DSpark drafter";
-    case NEED_REWIND:        return "session rewind";
     case NEED_FIXTURES:      return "the command line's fixture blobs (captured from the primary model)";
     case NEED_VISION:        return "a vision tower (images)";
     case NEED_BLOCK:         return "a block drafter (LiLiCorr, DFlash2)";
@@ -279,9 +256,8 @@ typedef struct {
 /* `--needs=` names to NEED_* bits: false (and the bad name in *bad) on a name the table does not use. */
 static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
     static const struct { const char *name; uint32_t bit; } k[] = {
-        {"ds4", NEED_DS4_INTERNALS}, {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"dspark", NEED_DSPARK},
-        {"rewind", NEED_REWIND}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION}, {"block", NEED_BLOCK},
-        {"graphs", NEED_STEP_GRAPHS},
+        {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION},
+        {"block", NEED_BLOCK}, {"graphs", NEED_STEP_GRAPHS},
     };
     *out = 0;
     for (const char *p = list; *p;) {
@@ -414,20 +390,16 @@ static int host_model(hosted_model *hm, const char *path, bool primary) {
         return 1;
     }
     snprintf(hm->family, sizeof hm->family, "%s", pulsar_engine_family_name(e));
-    if (pulsar_engine_family(e) == PULSAR_FAMILY_ID_DEEPSEEK4) hm->has |= NEED_DS4_INTERNALS;
     if (pulsar_engine_has_tokenizer(e)) hm->has |= NEED_TOKENIZER;
     if (pulsar_engine_has_spec_rounds(e)) hm->has |= NEED_SPEC;
-    if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_DSPARK) hm->has |= NEED_DSPARK;
-    if (pulsar_engine_can_rewind(e)) hm->has |= NEED_REWIND;
     if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
     if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK) hm->has |= NEED_BLOCK;
     if (e->family->driver && e->family->driver->stage) hm->has |= NEED_STEP_GRAPHS;
     if (primary) hm->has |= NEED_FIXTURES;
-    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
            hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
-           hm->has & NEED_DSPARK ? " dspark" : "", hm->has & NEED_BLOCK ? " block" : "",
-           hm->has & NEED_REWIND ? " rewind" : "", hm->has & NEED_VISION ? " vision" : "",
-           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "", hm->has & NEED_DS4_INTERNALS ? " ds4-internals" : "");
+           hm->has & NEED_BLOCK ? " block" : "", hm->has & NEED_VISION ? " vision" : "",
+           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "");
     fflush(stdout);
     return 0;
 }
@@ -536,8 +508,8 @@ int main(int argc, char **argv) {
         if (!strncmp(argv[i], "--needs=", 8)) {
             const char *bad = argv[i] + 8;
             if (!parse_needs(argv[i] + 8, &cur->needs_any, &bad)) {
-                fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (ds4, tokenizer, spec, dspark, rewind, "
-                                "fixtures, vision, block, graphs)\n", argv[i] + 8, bad);
+                fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (tokenizer, spec, fixtures, vision, block, "
+                                "graphs)\n", argv[i] + 8, bad);
                 return 2;
             }
             i += 1;
@@ -585,28 +557,16 @@ int main(int argc, char **argv) {
      * alpha converges in a few hundred rounds, the chi-square keeps its
      * critical values and loses sensitivity accordingly). */
     const gate_spec group_default[] = {
-        {"cuda-frontier-gate",        gate_multiseq_frontier_gate_main, 3, NULL, NULL, {NULL}, DS4},
-        /* L357: the family-neutral payload round trip and evict / restore, which the DS4 ones above stood in for */
+        /* L357: the family-neutral payload round trip and bank free / reload */
         {"payload-frontier-gate",     gate_payload_frontier_gate_main,  2, NULL, NULL, {NULL}, 0},
         {"bank-residency-gate",       gate_bank_residency_gate_main,    4, NULL, NULL, {NULL}, 0},
-        {"cuda-rewind-gate",          gate_rewind_frontier_gate_main,   1, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
-        {"cuda-mseq-rewind-gate",     gate_mseq_rewind_probe_main,      4, NULL, NULL, {NULL}, DS4 | NEED_REWIND},
         {"cuda-seam-gate",            gate_token_seam_gate_main,        3, NULL, NULL, {NULL}, NEED_TOKENIZER},
         {"cuda-multiseq-gate",        gate_multiseq_decode_gate_main,   3, NULL, NULL, {"3", "64", NULL}, NEED_TOKENIZER},
-        {"cuda-bank-spec-gate",       gate_bank_spec_gate_main,         2, NULL, NULL, {"32", NULL}, DS4 | NEED_SPEC},
-        {"cuda-dspark-batch-gate",    gate_dspark_batch_gate_main,      3, NULL, NULL, {"8", "0", NULL}, DS4 | NEED_DSPARK},
-        {"cuda-accounting-gate",      gate_accounting_gate_main,        2, NULL, NULL, {NULL}, DS4},
-        {"cuda-evict-restore-gate",   gate_bank_evict_restore_gate_main, 2, NULL, NULL, {NULL}, DS4},
         {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}, NEED_TOKENIZER},
         /* L175: the same 1..16 width sweep with bank 0 at ~2200 tokens, so the
          * indexed lane is engaged while the row-count-keyed dispatches vary.
          * L317: a gates-dev depth (cuda / matmul / indexer paths); the battery keeps the short sweep above. */
         {"cuda-algo-stability-gate-deep", gate_algo_stability_gate_main, 16, NULL, NULL, {"deep", NULL}, NEED_TOKENIZER, DEV},
-        {"cuda-mixed-prefill-gate",   gate_mixed_prefill_gate_main,     2, NULL, NULL, {NULL}, DS4},
-        {"cuda-mixed-neutrality-gate", gate_mixed_neutrality_gate_main, 3, "PULSAR_GATE_ROWS_FATAL", "5,5 8,8", {NULL}, DS4},
-        {"cuda-mixed-neutrality-gate-wide", gate_mixed_neutrality_gate_main, 13, "PULSAR_GATE_NDEC", "12", {NULL}, DS4},
-        /* L292: the captured output-head graph replays only for a head of the same row kinds (pure decode vs fused) */
-        {"cuda-head-graph-replay-gate", gate_head_graph_replay_gate_main, 4, NULL, NULL, {NULL}, DS4},
         {"cuda-spec-sampling-gate",   gate_spec_sampling_gate_main,    16, NULL, NULL, {"0.95", "0", "1250", NULL}, NEED_SPEC | NEED_TOKENIZER},
         {"cuda-row-neutrality-gate",  gate_mseq_short_ctx_probe_main,   2, NULL, NULL, {NULL}, NEED_TOKENIZER},
         /* L170: the same probe past 2048 tokens, where the top-k selection is
@@ -620,19 +580,6 @@ int main(int argc, char **argv) {
          * bucket): the 1-row indexer scorer vs the N-row tier (L173) and the
          * ranking kernel past the 2048 boundary, on logits. */
         {"cuda-row-neutrality-gate-deeper", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"4200", NULL}, NEED_TOKENIZER, DEV},
-        /* L168: the ratio-4 compressor state after an unaligned whole-prompt
-         * prefill has the decode store's layout (complete group at 0..3,
-         * partial rows at 4 + phase) and its content, at r = 1, 2, 3. */
-        {"cuda-comp-state-gate",      gate_comp_state_gate_main,        1, NULL, NULL, {NULL}, DS4},
-        /* L175: the same assertions on the banked layout (per-layer caches are
-         * bank views with a pool, owning allocations without one). */
-        {"cuda-comp-state-gate-banked", gate_comp_state_gate_main,      2, NULL, NULL, {NULL}, DS4},
-        /* L220: the SAVE -> LOAD round trip (comp-cache bytes + same-token
-         * logits, then the v10 digest on a one-byte flip).  Same default
-         * configuration as this group, so it reuses the broker's engine
-         * instead of paying its own 92 GB load (the Makefile's last
-         * not-yet-folded target).  1 bank: the classic payload layout. */
-        {"cuda-session-payload-gate", gate_session_payload_gate_main,    1, NULL, NULL, {NULL}, DS4},
         /* L272 P5 / L278: the session contract every family meets (chunks C1-C5, banks B1-B6), public API only --
          * it runs on every hosted model, on the default configuration's engine. */
         {"session-contract-gate",     gate_session_contract_gate_main,  4, NULL, NULL, {NULL}, 0},
@@ -660,8 +607,8 @@ int main(int argc, char **argv) {
          * another bank's published state and prefills the rest is the cold prefill byte for byte -- EXT, SIDE, SAME,
          * and the lender still resumes its own */
         {"bank-adopt-gate",           gate_bank_adopt_gate_main,        4, NULL, NULL, {NULL}, NEED_TOKENIZER},
-        /* L357: the family-neutral ports of three DeepSeek mechanism gates above (cuda-frontier-gate,
-         * cuda-accounting-gate, cuda-head-graph-replay-gate), on the declared state and the core step driver: an idle
+        /* L357: the family-neutral ports of three retired DeepSeek mechanism gates (bank frontier isolation, KV
+         * accounting, head graph replay), on the declared state and the core step driver: an idle
          * bank untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row;
          * touched KV == the physical a fill takes and a bank free returns; a replayed decode / verify step graph ==
          * the eager step at the same row count */
@@ -670,28 +617,12 @@ int main(int argc, char **argv) {
         {"graph-eager-gate",          gate_graph_eager_gate_main,       4, NULL, NULL, {NULL},
          NEED_SPEC | NEED_STEP_GRAPHS},
     };
-    /* Configuration A at a pinned draft depth (the gate sets spec_depth; the broker runs it on the default group's
-     * engine, spec_depth_shareable -- 2026-10-14, three model loads per battery before). */
-    const gate_spec group_depth1[] = {
-        {"cuda-dspark-batch-gate-depth1", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "1", NULL}, DS4 | NEED_DSPARK},
-        /* L177: the widest admissible speculative step -- 3 banks x (1 + 4) = 15
-         * rows, one under PULSAR_SPEC_ROW_BUDGET -- batched == serialized. */
-        {"cuda-dspark-batch-gate-depth4", gate_dspark_batch_gate_main, 3, NULL, NULL, {"6", "4", NULL}, DS4 | NEED_DSPARK},
-        /* L260: one redraft group of 10 banks (> 8) and 20 drafter rows (> 16), graded,
-         * plus the byte-exact markov bank identity; depth 2 keeps the 30 verify rows inside the slab */
-        {"cuda-dspark-batch-gate-wide", gate_dspark_batch_gate_main, 10, NULL, NULL, {"4", "2", "10", NULL}, DS4 | NEED_DSPARK},
-    };
     /* Configuration B: drafter off -- the prefill gates below pin the chunk
      * to the default grid, so they share this engine (two opens per hosted
      * model: A, B). */
     const gate_spec group_nodspark[] = {
         {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}, NEED_TOKENIZER},
     };
-    /* L241 (slice 4g): a rank's attn_q_b / attn_output_a row slices are byte-identical pieces of the whole projection
-     * on both GEMM arms.  Configuration B (drafter off, default grid) -- it ran last in A until 2026-10-14 and cost
-     * two model loads there (its own, then A's again for the decode-reference gates).  It registers row slices on
-     * the live engine's weights, so it runs LAST on B, after every gate that reads those weights whole. */
-    const gate_spec tp_head_split = {"cuda-tp-head-split-gate", gate_tp_head_split_gate_main, 1, NULL, NULL, {NULL}, DS4};
     const gate_spec prefill = {"cuda-prefill-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                {"--check", prefill_baseline, prefill_ref, NULL}, NEED_FIXTURES};
     /* L181: one classic decode step after each unaligned prefill, byte-compared
@@ -734,12 +665,10 @@ int main(int argc, char **argv) {
 #define KNOWN(spec) do { if (n_known < (int)(sizeof known / sizeof known[0])) { known_dev[n_known] = (spec).dev; \
         known[n_known++] = (spec).name; } } while (0)
     for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) KNOWN(group_default[i]);
-    for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) KNOWN(group_depth1[i]);
     for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) KNOWN(group_nodspark[i]);
     KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality); KNOWN(chunk_neutrality_full); KNOWN(vision_chunk);
 #undef KNOWN
     for (int i = 0; i < 4; i++) known[n_known++] = ref_names[i];
-    known[n_known++] = tp_head_split.name;   /* runs last: after the reference gates, on B */
     if (validate_names(g_only, "--only", known, n_known) ||
         validate_names(g_except, "--except", known, n_known)) return 2;
     for (int h = 0; h < n_models; h++)
@@ -843,7 +772,6 @@ int main(int argc, char **argv) {
             RUN(dref_story);
             RUN(dref_code);
         }
-        for (size_t i = 0; i < sizeof group_depth1 / sizeof group_depth1[0]; i++) RUN(group_depth1[i]);
         for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
         RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality); RUN(chunk_neutrality_full); RUN(vision_chunk);
         bool ref_selected = false;
@@ -866,7 +794,6 @@ int main(int argc, char **argv) {
             printf("\n  SKIP  cuda-reference-gate, cuda-decode-reference-gate [%s]: no --ref-dir for this model\n"
                    "        (blobs live outside the repo; without them these gates grade nothing)\n", hm.family);
         }
-        RUN(tp_head_split);
         if (sections) {
             /* the battery's per-model section (make gates' budget table); the model's engine opens are in it */
             FILE *sf = fopen(sections, "a");

@@ -64,14 +64,10 @@ __pycache__/
 /tests/tp_cmd_stress_test
 /tests/tp_slab_gpu_probe
 /tests/tp_dmabuf_probe
-/tests/multiseq_frontier_gate
 /tests/qwen_family_gate
 /tests/multiseq_decode_gate
-/tests/bank_spec_gate
-/tests/accounting_gate
 /tests/prefill_bitexact_gate
 /tests/dense_cutlass_probe
-/tests/mseq_rewind_probe
 /tests/mseq_rowcost_probe
 /tests/resume_suffix_probe
 /tests/token_seam_gate
@@ -86,20 +82,15 @@ __pycache__/
 
 # --- working files (see CLAUDE.md: all temp/scratch files live here) ---
 /temp/
-/tests/bank_evict_restore_gate
-/tests/session_payload_gate
 /tests/payload_frontier_gate
 /tests/prompt_end_gate
 /tests/bank_adopt_gate
 /tests/bank_residency_gate
 /tests/kv4_pack_gate
-/tests/rewind_frontier_gate
 /tests/algo_stability_gate
-/tests/mixed_prefill_gate
 /tests/mixed_zero_prefill_gate
 /tests/fused_step_gate
 /tests/decode_reference_probe
-/tests/mixed_neutrality_gate
 
 # ad-hoc pre-cutover backup binaries
 *.bak-preoop
@@ -135,7 +126,6 @@ docs/api/
 /tests/indexer_hadamard_kernel_test
 tests/gates_runner
 tests/runner/
-tests/dspark_batch_gate
 /tests/engram_hash_test
 /tests/exl3_dequant_gate
 /tests/attn_layout_test
@@ -200,7 +190,6 @@ tests/dspark_batch_gate
 /tests/nemotron_enc_tok_gate
 tests/api-golden/out.txt
 tests/sse-golden/out.txt
-/tests/comp_state_gate
 /tests/vision_image_gate
 /tests/vision_image_sync_gate
 /tests/chat_decode_smoke
@@ -235,4 +224,3 @@ tests/sse-golden/out.txt
 /tests/bank_isolation_gate
 /tests/kv_accounting_gate
 /tests/graph_eager_gate
-/tests/head_graph_replay_gate
