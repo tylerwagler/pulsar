@@ -71,9 +71,10 @@ static inline bool gate_populate_bank(pulsar_session *s, uint32_t bank, const in
     return true;
 }
 
-/* The pool must hold at least `need` banks; false + a message otherwise. */
+/* The pool must hold at least `need` banks; false + a message otherwise.  L357: through the public count -- the
+ * DeepSeek graph it read (s->graph) is NULL on every other family, so this segfaulted there. */
 static inline bool gate_pool_fits(pulsar_session *s, uint32_t need) {
-    const uint32_t have = gpu_graph_bank_pool_count(s->graph);
+    const uint32_t have = (uint32_t)pulsar_session_bank_count(s);
     if (have >= need) return true;
     fprintf(stderr, "pool too small: %u < %u (set PULSAR_MSEQ_BANKS)\n", have, need);
     return false;
