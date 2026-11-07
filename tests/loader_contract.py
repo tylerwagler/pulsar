@@ -64,14 +64,6 @@ FAMILIES = {
         'kv': 'qwen4_exp.num_hidden_layers',
         'stack': 'model.language_model.layers.3.mlp.experts.gate_up_proj',
     },
-    'inkling': {   # L295 E1: the 3-layer mini (layer 1 is MoE) and Inkling-Small alike
-        'tensor': 'model.llm.layers.1.attn.wk_dv.weight',   # a packed (EXL3) projection
-        # a role-bound family names a MISSING tensor by its bind record (role_bind.h): the container's name is gone
-        'tensor_record': 'role attn_k, block layers, layer 1',
-        'plain': 'model.llm.layers.1.mlp.gate.weight',      # the router, bf16 [4096 -> 258]
-        'kv': 'inkling.hidden_size',
-        'stack': 'model.llm.layers.1.mlp.experts.gate_proj',
-    },
     'nemotron_h': {   # L296 N1: the 5-block mini and Nemotron 3.5 Super alike (HF blocks 0 Mamba-2, 1 MoE in both)
         'tensor': 'language_model.backbone.layers.0.mixer.in_proj.weight',   # a dense linear (bf16 / EXL3 / mxfp8)
         'tensor_record': 'role ssm_in, block layers, layer 0',

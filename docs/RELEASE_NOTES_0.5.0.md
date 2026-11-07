@@ -218,13 +218,17 @@ rounds. A duplicate-prefix census is exported (L324).
   and classic prefill now differ by 5.5% in logits (0.03% before).  Which build is closer to the
   source is not established.  Qwen3.8-Flash-Next, the production model, is unmoved: the same 25
   prompts return identical top-8 probabilities on both toolchains.
+- **No test covers Inkling or DeepSeek V4.1 any more, nor Tessera's kernel against its upstream build.**  Their gates
+  read checkpoints and fixtures that were removed, and were dropped: `inkling-chat-gate`, `inkling-family-gate`,
+  `tessera-kernel-gate`, `render-gate`, the Engram row gates and the V4.1 TP plan.  Both families' code still ships
+  and is untested.  `render-gate` was DeepSeek's reference render check, so DeepSeek has none now.
 - **`pulsar-agent`'s tool loop doesn't run on Qwen or on the DeepSeek fixture.**  Qwen emits its
   native tool markup, which the agent's parser doesn't read; on the fixture its calls come out
   invalid, on the previous build too.  So the agent's new workspace limits haven't had a real
   run.
 - **Test coverage is uneven.** Only Qwen3.8-Flash-Next has good coverage
   (production and most live legs). DeepSeek Vision-Exp has broad battery gates,
-  but no production use in this release. V4.1, Nemotron and Inkling are thinner.
+  but no production use in this release. Nemotron is thinner, and V4.1 and Inkling have no gate of their own.
   The encoder and Parse families are gated by hand. See the README's model table.
 - **Nemotron 3.5 Super image input is not in this release.** Its vision front is
   not wired, and an image is refused by name. DeepSeek V4.1 and Inkling take no

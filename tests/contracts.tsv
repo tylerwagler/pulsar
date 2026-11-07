@@ -46,7 +46,6 @@ runner:cuda-reference-gate-story	reference	all	battery	each hosted model's ancho
 runner:cuda-decode-reference-gate-story	reference	deepseek4	battery
 qwen-ref-gate	reference	qwen4_exp	manual	vs the BF16 source: a quant-quality reading, not a regression grade
 qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens
-render-gate	chat	deepseek4	battery	bytes vs the V4.1 reference encoder's goldens (shared hub)
 unit-test-gate	server	all	battery	pulsar_test incl. --server (Qwen hooks: 4 tests)
 api-golden-gate	server	all	battery	DeepSeek and Qwen request rows
 sse-golden-gate	server	all	battery	DeepSeek walk + the Qwen leg through the family parser ops, 4 protocol shapes
@@ -59,7 +58,6 @@ cuda-regression	kernel:gdn,exl3,exl3-half,qsa,s4,moe-route,expert-table	all	batt
 cuda-attn-gates	kernel:attn-f16,hc,vision,rope	deepseek4	battery
 vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
 vision-qwen-tower-gate	kernel:vision-tower	qwen4_exp	battery	vs HF stage dumps, the reference's bf16 floor (L268)
-tessera-kernel-gate	kernel:tessera	qwen4_exp	battery	byte-identical to Tessera 37742e0f's own build, dense + MoE, E=32 and E=512 (L255)
 qwen-image-smoke-gate	server	qwen4_exp	manual	one image question end to end; a model load of its own
 #
 # gaps: a contract x family cell with no battery gate, and the row that closes it
@@ -80,7 +78,6 @@ na	runner:cuda-dspark-batch-gate	qwen4_exp	the DSpark drafter's batched redraft;
 gap	runner:cuda-decode-reference-gate-story	qwen4_exp	L284	decode rows at served widths vs the reference: Qwen's verify step takes <= 16 rows (24/32 refused) and the gate's exact-width range is DeepSeek's cuBLASLt boundary -- needs the family's served widths
 na	qwen-ref-gate	deepseek4	Qwen against its BF16 source (a quant-quality reading); DeepSeek's quality is graded against the B300 by the reference gates
 na	qwen-chat-gate	deepseek4	Qwen's template / tokenizer vs HF goldens; DeepSeek's template is render-gate
-na	render-gate	qwen4_exp	DeepSeek V4.1's encoder goldens; Qwen's template is qwen-chat-gate
 na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
 na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
 na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates
@@ -106,7 +103,6 @@ na	runner:cuda-dspark-batch-gate	nemotron_h	DeepSeek's DSpark drafter; Nemotron 
 na	runner:cuda-tp-head-split-gate	nemotron_h	TP is on demand, for a model too big for one Spark; none is served for Nemotron
 na	qwen-family-gate-device	nemotron_h	Qwen's zero-weight wiring; Nemotron's load has its own family gate
 na	qwen-chat-gate	nemotron_h	Qwen's template and tokenizer vs HF goldens
-na	render-gate	nemotron_h	DeepSeek V4.1's encoder goldens
 gap	tp	nemotron_h	L354	TP is on demand; no gate until one is served
 gap	runner:cuda-mixed-neutrality-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 gap	runner:cuda-mixed-neutrality-gate-wide	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
@@ -125,7 +121,6 @@ na	runner:cuda-dspark-batch-gate	gemma4	DeepSeek's DSpark drafter; Gemma drafts 
 na	runner:cuda-tp-head-split-gate	gemma4	TP is on demand, for a model too big for one Spark; none is served for Gemma
 na	qwen-family-gate-device	gemma4	Qwen's zero-weight wiring; Gemma's load has its own family gate
 na	qwen-chat-gate	gemma4	Qwen's template and tokenizer vs HF goldens
-na	render-gate	gemma4	DeepSeek V4.1's encoder goldens
 gap	tp	gemma4	L354	TP is on demand; no gate until one is served
 gap	chat	gemma4	L354	no chat gate vs HF goldens in the battery for Gemma
 note	gemma4	no Gemma model in the battery: its counts are family-neutral (all) gates, none has run a Gemma fixture
@@ -154,9 +149,6 @@ na	qwen-image-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no
 na	qwen-ref-gate	inkling	parked: its forward is not wired, so no session can run
 na	qwen-ref-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	qwen-ref-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
-na	render-gate	inkling	parked: its forward is not wired, so no session can run
-na	render-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
-na	render-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
 na	runner:cuda-accounting-gate	inkling	parked: its forward is not wired, so no session can run
 na	runner:cuda-accounting-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	runner:cuda-accounting-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
@@ -196,3 +188,4 @@ na	runner:cuda-tp-head-split-gate	nemotron_parse	the OCR parser: its own decoder
 note	nemotron_enc	no nemotron_enc model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
 note	nemotron_parse	no nemotron_parse model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
 note	inkling	no inkling model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+gap	chat	deepseek4	L355	no reference render check: render-gate read the removed V4.1 encoder, and V4's own encoder differs from this renderer (<｜System｜>)

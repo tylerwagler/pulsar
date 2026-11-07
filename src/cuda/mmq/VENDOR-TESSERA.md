@@ -63,13 +63,8 @@ so the device code stays upstream's byte for byte.  Re-check at each re-sync.
 
 ## The gate
 
-`make tessera-kernel-gate` runs `tests/tessera_kernel_gate` on each of
-`TESSERA_FIXTURES` (the Makefile names the two the bar counts; they are not in
-the repo, so set the variable to where yours live), fixtures from
-`tools/tessera/kernel_fixture.py`, which runs **Tessera's
-own build** of this kernel (its torch extension) on Qwen3.8-Flash-Next layer-12
-weights. The gate passes only when every output byte matches and pulsar's
-split-K choice equals Tessera's `dense_k_split`.
+None since 2026-11-06. `tessera-kernel-gate` held this kernel byte-identical to Tessera's own build, on
+fixtures the box no longer holds, and was dropped. Its last pass is in the git history; re-sync with care.
 
 ## Re-syncing
 

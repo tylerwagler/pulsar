@@ -157,7 +157,6 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `qwen-family-gate-device` | 60 | zero-weight containers |
 | `state-kinds-gate` | 5 | |
 | `vision-qwen-tower-gate` | 10 | |
-| `tessera-kernel-gate` | 10 | |
 | `blockdraft-gate` | 5 | |
 | `nvfp4-rows-gate` | 10 | |
 | `lilicorr-head-gate` | 10 | |

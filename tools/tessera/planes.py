@@ -1,7 +1,7 @@
 """planes.py -- the kernel-ready planes of a Tessera expert stack, by Tessera's own load-time prep (L255).
 
 The one place pulsar's tools turn encoded unit blobs into the arrays src/cuda/mmq/pulsar_tessera.cu reads:
-tests/tessera_kernel_gate's fixture (kernel_fixture.py) and the container builder (overlay_layer.py) both come
+the container builder (overlay_layer.py) comes
 through here, so the engine is fed exactly the planes the byte gate proved.  Value family (BF16 grid, folded).
 
 Made with Tessera by Robert Tand - https://github.com/RobTand/tessera

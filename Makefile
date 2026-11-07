@@ -662,13 +662,7 @@ qwen-s4-gate: tests/qwen_s4_gate
 
 # L295 F2: the shared MoE router (src/cuda/pulsar_cuda_router.cu) -- every router a family declares (Qwen's, DeepSeek's
 # through its tensor binding, Inkling-Small's) vs the double reference in the gate: picks, weights, sink / sigmoid
-# gammas, batch-width neutrality, rule 9, refusals.  Model-free; plus, where the Inkling mini checkpoint and its
-# fp32 reference are on the box, the router on REAL Inkling router weights vs transformers' own InklingTopkRouter
-# (the fixture is generated each run by tests/inkling_router_fixture.py on the CPU, into .build/).  Without them the
-# real-weights section SKIPS LOUDLY and the rest still grades.
-INKLING_MINI_DIR ?= $(call need_path,INKLING_MINI_DIR)
-INKLING_MINI_REF ?= $(call need_path,INKLING_MINI_REF)
-INKLING_PY ?= $(call need_path,INKLING_PY)
+# gammas, batch-width neutrality, rule 9, refusals.  Model-free.
 tests/router_gate: tests/router_gate.cu src/cuda/pulsar_cuda_router.h src/cuda/pulsar_cuda_qwen.h $(CUDA_OBJS) \
                    $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/router_gate.cu \
@@ -688,16 +682,7 @@ tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsa
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 .PHONY: router-gate
 router-gate: tests/router_gate
-	@if [ -d "$(INKLING_MINI_DIR)" ] && [ -f "$(INKLING_MINI_REF)" ] && [ -x "$(INKLING_PY)" ]; then \
-		mkdir -p .build && \
-		CUDA_VISIBLE_DEVICES= $(INKLING_PY) tests/inkling_router_fixture.py $(INKLING_MINI_DIR) $(INKLING_MINI_REF) \
-			.build/inkling-router.bin && \
-		./tests/router_gate .build/inkling-router.bin; \
-	else \
-		echo "SKIP  router-gate E: no Inkling mini ($(INKLING_MINI_DIR)), reference ($(INKLING_MINI_REF)) or python"; \
-		echo "      ($(INKLING_PY)) on this box -- NO real-weights Inkling router coverage in this run."; \
-		./tests/router_gate; \
-	fi
+	./tests/router_gate
 
 # L251: the Gated DeltaNet kernels (Qwen3.8-Flash-Next) -- conv + gates + the
 # delta-rule recurrence + gated RMSNorm between the block's projections.  Vs the
@@ -737,20 +722,11 @@ tests/gqa_attn_gate: tests/gqa_attn_gate.cu tests/gqa_ref.h src/cuda/pulsar_cuda
 gqa-attn-gate: tests/gqa_attn_gate
 	./tests/gqa_attn_gate
 
-# The same block on the Inkling-Small mini checkpoint's window and global layers (L294's 3-layer
-# mini, source layers 0 / 2 / 5), graded against transformers' InklingAttention in fp32 and required
-# to be at least as close to it as transformers' bf16 run.  GQA_MINI_FIXTURE is the directory
-# tests/gqa_mini_fixture.py writes (CPU, seconds): python3 tests/gqa_mini_fixture.py
-# /path/to/models/inkling-small-mini /path/to/models/inkling-small-mini-ref/ref_fp32.pt DIR.
 # The block's decode / verify / prefill timings at Inkling's shapes against a measured read-bandwidth and
 # mma.sync roofline (L295 F1).  Not a gate.
 tests/gqa_attn_bench: tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o src/cuda/pulsar_cuda_attn_gqa.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/gqa_attn_bench.cu src/cuda/pulsar_cuda_attn_gqa.o
 
-.PHONY: gqa-attn-mini-grade
-gqa-attn-mini-grade: tests/gqa_attn_gate
-	@test -n "$(GQA_MINI_FIXTURE)" || { echo "gqa-attn-mini-grade: set GQA_MINI_FIXTURE (see tests/gqa_mini_fixture.py)"; exit 1; }
-	./tests/gqa_attn_gate --fixture $(GQA_MINI_FIXTURE)
 
 # L251: the GDN microbenchmark -- decode steps at 1/4/8/16 sequences, DRAM-cold
 # (state slots rotated past L2), prefill throughput, and a streaming-copy
@@ -777,15 +753,6 @@ sconv-gate: tests/sconv_gate
 tests/sconv_bench: tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_sconv.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/sconv_bench.cu src/cuda/pulsar_cuda_sconv.o
 
-# The block on the Inkling-Small mini checkpoint's layer 0 (L294's 3-layer mini): the four
-# streams' real inputs and weights against transformers' InklingShortConvolution in fp32.
-# SCONV_MINI_FIXTURE is the directory tests/sconv_mini_fixture.py writes (CPU, about a
-# minute): python3 tests/sconv_mini_fixture.py /path/to/models/inkling-small-mini
-# /path/to/models/inkling-small-mini-ref/ref_fp32.pt DIR.
-.PHONY: sconv-mini-grade
-sconv-mini-grade: tests/sconv_gate
-	@test -n "$(SCONV_MINI_FIXTURE)" || { echo "sconv-mini-grade: set SCONV_MINI_FIXTURE (see tests/sconv_mini_fixture.py)"; exit 1; }
-	./tests/sconv_gate --fixture $(SCONV_MINI_FIXTURE)
 
 # L296 N2: the family-neutral Mamba-2 (SSD) mixer block (runtime heads / groups / norm group / conv kernel; the
 # conv is E3's block) vs a double reference with its bf16 rounding points; decode == prefill == chunked == verify
@@ -845,13 +812,6 @@ tests/lora_rows_gate: tests/lora_rows_gate.cu src/cuda/pulsar_cuda_f16_rows.o sr
 lora-rows-gate: tests/lora_rows_gate
 	./tests/lora_rows_gate
 
-# The same on the Inkling-Small mini against its transformers fp32 capture: the embedding
-# norm, and the 1/16 logit scale + padding on the head's unscaled f32 output.
-# HEAD_MINI_FIXTURE is the directory tests/head_mini_fixture.py writes.
-.PHONY: head-mini-grade
-head-mini-grade: tests/head_gate
-	@test -n "$(HEAD_MINI_FIXTURE)" || { echo "head-mini-grade: set HEAD_MINI_FIXTURE (see tests/head_mini_fixture.py)"; exit 1; }
-	./tests/head_gate --fixture $(HEAD_MINI_FIXTURE)
 
 # L251: the same TU as a shared object for the real-weight harness in
 # the private notes' research/l251/gdn/ (ctypes from torch, against transformers'
@@ -969,21 +929,6 @@ tests/attn_pack_gate: tests/attn_pack_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $
 cuda-attn-pack-gate: tests/attn_pack_gate
 	./tests/attn_pack_gate
 
-# L242 (Engram, V4.1): rows -> MXFP8 slot -> `wkv` GEMM -> gate -> gated add, on one
-# GPU, against a fixture computed from the checkpoint's own rows and weights
-# (tools/engram/gen_engram_fixture.py).  Tight thresholds by construction: every
-# GEMM product is the reference's product, only the accumulation order and one
-# bf16 rounding differ.  Host reference math -fno-fast-math.  Needs the layer aux
-# files (engram_rows build) under ENGRAM_DIR; not the 189 GiB row files.
-ENGRAM_DIR ?= $(call need_path,ENGRAM_DIR)
-tests/engram_gate.o: tests/engram_gate.cpp src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) -fno-fast-math -Isrc -c -o $@ tests/engram_gate.cpp
-tests/engram_gate: tests/engram_gate.o $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-.PHONY: cuda-engram-gate
-cuda-engram-gate: tests/engram_gate
-	./tests/engram_gate tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
-	./tests/engram_gate tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
 
 .PHONY: attn-pack-fixture-check
 attn-pack-fixture-check: tests/attn_pack_fixture_test
@@ -1036,17 +981,6 @@ tests/spec_depth_gate: tests/spec_depth_gate.cpp src/engine/spec_depth.h Makefil
 spec-depth-gate: tests/spec_depth_gate
 	./tests/spec_depth_gate
 
-# Tessera's fused window kernel (L255): pulsar's launcher vs Tessera's own build, byte for byte, on Qwen
-# layer-12 weights.  The fixtures come from tools/tessera/kernel_fixture.py (needs Tessera + torch), at the
-# vendored revision (VENDOR-TESSERA.md): the 32-expert one (dense qkv/out_proj + routed, 12 cases) and the full
-# 512-expert stack with the capture's own routing (--moe-only --real-routing, 5 cases).  17 of 17 is the bar.
-TESSERA_FIXTURES ?= $(call need_path,TESSERA_FIXTURES)
-.PHONY: tessera-kernel-gate
-tests/tessera_kernel_gate: tests/tessera_kernel_gate.cu src/cuda/mmq/pulsar_tessera.o src/cuda/mmq/pulsar_tessera.h Makefile
-	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda/mmq -o $@ tests/tessera_kernel_gate.cu \
-		src/cuda/mmq/pulsar_tessera.o $(CUDA_LDLIBS)
-tessera-kernel-gate: tests/tessera_kernel_gate
-	@set -e; for f in $(TESSERA_FIXTURES); do ./tests/tessera_kernel_gate $$f; done
 
 .PHONY: qwen-family-gate qwen-family-gate-device qwen-family-containers
 qwen-family-containers:
@@ -1147,14 +1081,11 @@ bank-residency-gate-qwen: tests/bank_residency_gate
 # DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
 # (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
 TP_PAIR_DS_MODEL ?= $(call need_path,TP_PAIR_DS_MODEL)
-# L269 W1: the V4.1 layer-subset fixture (layer 4 = source layer 20, OUR EXL3 K3; the rest CUTLASS MXFP4) -- the
-# plan's EXL3 expert halves beside the MXFP4 ones.
-TP_V41_FIXTURE ?= $(call need_path,TP_V41_FIXTURE)
 # Qwen's plan runs on the U-e4-d5 trunk (the NAS copy, no drafter): the served pack has no TP plan -- the plan refuses
 # a block drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
 # The MTP overlay it used was deleted 2026-10-25; the trunk's plan is the old golden minus its mtp.layers.0 rows.
 TP_QWEN_PLAN_MODEL ?= $(call need_path,TP_QWEN_PLAN_MODEL)
-TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL) $(TP_V41_FIXTURE)
+TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL)
 .PHONY: tp-plan-gate tp-plan-golden
 tp-plan-gate: tests/tp_plan_test
 	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
@@ -1170,18 +1101,6 @@ LOADER_CONTRACT_WORK ?= /var/tmp/pulsar-loader-contract
 .PHONY: loader-contract-gate
 loader-contract-gate: tests/loader_open
 	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(FRONTIER_MODEL) $(QWEN_GATE_MODEL)
-# L295 E1: the Inkling family's load on a built container (tests/inkling_family_gate.{cpp,py}): every tensor bound by
-# its bind record, every byte priced, the plan, the facts, the session refusals -- on the container and its header
-# clone; then each Inkling mutant (a missing tensor, a wrong shape, an unknown or flipped switch, ...) refused by
-# name, and the loader contract's neutral faults on it (its `format` fault is the BF16 build's refusal: no bf16-rows
-# routed arm until F7).  Host-only.  The container: tools/container/build.py emit --hf /path/to/models/inkling-small-mini
-# --exl3 <the mini's K3 pack> --recipe format-maps/inkling-mini-k3.json (L294 / L295 E1).
-INKLING_GATE_MODEL ?= $(call need_path,INKLING_GATE_MODEL)
-.PHONY: inkling-family-gate
-inkling-family-gate: tests/inkling_family_gate tests/loader_open
-	python3 tests/inkling_family_gate.py --probe ./tests/inkling_family_gate --open ./tests/loader_open \
-	    --work $(LOADER_CONTRACT_WORK)/inkling $(INKLING_GATE_MODEL)
-	python3 tests/loader_contract.py --open ./tests/loader_open --work $(LOADER_CONTRACT_WORK) $(INKLING_GATE_MODEL)
 # L338 E2: the Gemma 4 family's load on a built container (tests/gemma4_family_gate.cpp): every tensor bound by its
 # bind record, every byte priced, the plan (PULSAR_FFN_DENSE_MOE), the stored widths, the facts, the session refusals;
 # then the loader contract's neutral faults on it.  Host-only.  The container: tools/container/build.py emit --hf <the
@@ -1322,18 +1241,6 @@ tp-plan-golden: tests/tp_plan_test
 	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 > $$g 2>/dev/null || exit 1; \
 	  echo "recorded $$g ($$(grep -vc '^#' $$g) slices)"; done; done
 
-# L242: the Engram ROW FILE's header contract and the pread gather pool -- HOST ONLY,
-# against the device-path fixture's rows (read from the checkpoint by the generator):
-# a gather of the fixture's ids from the row file must return the fixture's bytes.
-# Reads ENGRAM_DIR/engram-l<L>.rows (over NFS is fine: a few thousand rows).
-tests/engram_table_test: tests/engram_table_test.cpp src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
-                         src/engine/pulsar_engine_internal.h
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/engram_table_test.cpp \
-		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
-.PHONY: engram-table-check
-engram-table-check: tests/engram_table_test
-	./tests/engram_table_test tests/test-vectors/engram-l1.fix $(ENGRAM_DIR)
-	./tests/engram_table_test tests/test-vectors/engram-l14.fix $(ENGRAM_DIR)
 
 # L251 S4: Qwen3.8-Flash-Next's PLE n-gram ids vs transformers' own module, bit-exact,
 # whole-sequence and chunked (decode steps), plus the row gather over the checkpoint's
@@ -1372,20 +1279,6 @@ qwen-chat-gate: tests/qwen_chat_gate
 	./tests/qwen_chat_gate --tok $(QWEN_TOK_DIR) --vectors tests/test-vectors/qwen38 \
 	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
-# L295 F5 / L294 E6: the Inkling-Small frontend -- the shared BPE engine in its tiktoken configuration graded
-# against HF tokenizers on tokenizer.json, the renderer against vLLM's native Inkling renderer, the output-parser
-# kit's Inkling configuration against vLLM's parser engine (goldens from tests/inkling/gen_inkling_goldens.py).
-# Model-free; the inputs are the checkpoint's tokenizer files (hf download, no weights) and the L216 corpus.
-INKLING_TOK_DIR ?= $(call need_path,INKLING_TOK_DIR)
-INKLING_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/inkling_chat.cpp src/lib/out_parse_kit.cpp
-tests/inkling_chat_gate: tests/inkling_chat_gate.cpp tests/bpe_gate_util.h $(INKLING_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                         src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/inkling_chat.h src/lib/out_parse_kit.h src/lib/chat_refuse.h \
-                         src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/inkling_chat_gate.cpp $(INKLING_CHAT_SRCS)
-.PHONY: inkling-chat-gate
-inkling-chat-gate: tests/inkling_chat_gate
-	./tests/inkling_chat_gate --tok $(INKLING_TOK_DIR) --vectors tests/test-vectors/inkling \
-	    --cases $(QWEN_RENDER_CASES) --calib $(QWEN_CALIB)
 
 # L296 N8: the Nemotron-H frontend -- the shared BPE engine in its HF "tekken" configuration (no normaliser,
 # ignore_merges) graded against HF tokenizers, the ChatML + <think> renderer against the checkpoint's
@@ -1877,16 +1770,20 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 # The oracles test_names / test_kv / test_producers read (local.mk): the served DeepSeek container, the Vision-Exp
 # and V4.1 HF snapshots (a glob matching one directory is fine) and a glob of the V4.1 EXL3 shards.
+.PHONY: container-tests container-tests-sources
+container-tests:
+	cd tools/container && for t in test_exl3_rates.py test_deepseek.py test_qwen.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
+	  $(CONTAINER_PY) $$t || exit 1; done
+# Manual: these read the source checkpoints (the DeepSeek Vision-Exp and V4.1 snapshots, V4.1's EXL3 shards), which the
+# box no longer holds.
 CONTAINER_SERVED   ?= $(call need_path,CONTAINER_SERVED)
 CONTAINER_VEXP_HF  ?= $(call need_path,CONTAINER_VEXP_HF)
 CONTAINER_V41_HF   ?= $(call need_path,CONTAINER_V41_HF)
 CONTAINER_V41_EXL3 ?= $(call need_path,CONTAINER_V41_EXL3)
-.PHONY: container-tests
-container-tests:
+container-tests-sources:
 	cd tools/container && export PULSAR_SERVED='$(CONTAINER_SERVED)' PULSAR_HF_SNAPSHOT='$(CONTAINER_VEXP_HF)' \
 	  PULSAR_V41_SNAPSHOT='$(CONTAINER_V41_HF)' PULSAR_V41_EXL3='$(CONTAINER_V41_EXL3)' && \
-	for t in test_exl3_rates.py test_names.py test_kv.py test_producers.py test_deepseek.py test_qwen.py test_inkling.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
-	  $(CONTAINER_PY) $$t || exit 1; done
+	for t in test_names.py test_kv.py test_producers.py; do $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
@@ -2724,18 +2621,6 @@ unit-test-gate: pulsar_test
 agent-test-gate: pulsar_agent_test
 	./pulsar_agent_test
 
-# The renderer gate (L218): pulsar's chat renderer must produce the SAME BYTES
-# as DeepSeek's reference encoder for every conversation it serves.  Oracle =
-# the checkpoint's encoding/ (its shipped goldens plus encoding.py imported
-# for the corpus); no model is loaded.  RENDER_GATE_CASES names JSON case
-# files or directories in the L216 corpus layout (default: the reference's
-# goldens only).
-# L278: the V4.1 checkpoint's own encoding/ in the shared hub (the hub is mounted at /path/to/models; 120 KB, no model)
-V41_REFERENCE_ENCODING ?= $(call need_path,V41_REFERENCE_ENCODING)
-RENDER_GATE_CASES ?=
-.PHONY: render-gate
-render-gate: pulsar_test
-	python3 tests/render_gate.py --reference "$(V41_REFERENCE_ENCODING)" --vectors $(if $(RENDER_GATE_CASES),--cases $(RENDER_GATE_CASES),)
 
 # L325: the prefix-stability replay gate.  A client that changes its request only in cache-preserving ways (a tool
 # loaded by ToolSearch: defer_loading + tool_reference; reminders in the last user turn; mid-conversation system
@@ -2761,7 +2646,7 @@ prefix-stability-gate: pulsar_test
 GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate tessera-kernel-gate \
+	qwen-family-gate-device state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
 	cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
@@ -2770,18 +2655,16 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 # it.  The runner is the only target after them, and every gate binary and
 # CORE_OBJS is built by the targets above, so the background sub-makes only
 # RUN -- they do not race the runner's build (which reads the same objects).
-# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens; inkling-chat-gate:
-# the same against HF and vLLM, L295 F5), the server
+# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens), the server
 # goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
-# the speculation depth rule both drafters share, render-gate (the V4.1 reference encoder's goldens, pinned in the
-# shared hub) and prefix-stability-gate (L325: consecutive client requests render as prefixes of each other, every
+# the speculation depth rule both drafters share and prefix-stability-gate (L325: consecutive client requests render as prefixes of each other, every
 # family) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
 # DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate nemotron-vision-pixel-gate seam-check \
-	exl3-dequant-gate host-checks qwen-chat-gate inkling-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
+	exl3-dequant-gate host-checks qwen-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
 	spec-depth-gate \
-	loader-contract-gate render-gate prefix-stability-gate
+	loader-contract-gate prefix-stability-gate
 # Every gate target is phony, declared HERE where the list is defined (the
 # .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
 # file named like a gate would otherwise satisfy make and print nothing -- the
@@ -2853,7 +2736,7 @@ gates-preflight:
 
 # The binaries of the serial GPU targets are prerequisites too (2026-10-14): they build here, in one parallel make,
 # instead of one target at a time inside the timed loop (pulsar_test alone was ~40 s of unit-test-gate).
-gates: tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/inkling_chat_gate tests/nemotron_chat_gate tests/api_golden \
+gates: tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/nemotron_chat_gate tests/api_golden \
        tests/sse_golden tests/spec_depth_gate \
        tests/loader_open pulsar_test pulsar_agent_test pulsar $(CUDA_REGRESSION_BINS)
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
@@ -2978,7 +2861,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/inkling_*|tests/nemotron_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/nemotron_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        *sconv*|*mamba2*|src/cuda/pulsar_cuda_head*|tests/head_*|*rowops*) cls=blocks; blocks=1 ;; \
@@ -3106,7 +2989,6 @@ gates-dev:
 	  $(MAKE) --no-print-directory qwen-family-gate-device CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory state-kinds-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory loader-contract-gate CUDA_ARCH=sm_120f || rc=1; \
-	  $(MAKE) --no-print-directory inkling-family-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory nemotron-family-gate CUDA_ARCH=sm_120f || rc=1; \
 	  $(MAKE) --no-print-directory nemotron-fwd-gate session-contract-gate-nemotron CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
@@ -3342,7 +3224,7 @@ src/cuda/mmq/%.o: src/cuda/mmq/%.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 
 # Tessera's fused window kernel (L255; vendored in tessera_routed_fused_window.cuh, VENDOR-TESSERA.md) is built
 # WITHOUT --use_fast_math, as upstream builds it (-O3 -lineinfo): its SwiGLU epilogue calls expf and divides,
-# and fast-math would approximate both.  tests/tessera_kernel_gate holds the bytes to Tessera's own build.
+# and fast-math would approximate both.
 src/cuda/mmq/pulsar_tessera.o: src/cuda/mmq/pulsar_tessera.cu $(MMQ_HDRS) $(CUDA_FLAG_STAMP)
 	$(NVCC) $(filter-out --use_fast_math,$(NVCCFLAGS)) -std=c++17 -Isrc -Isrc/cuda/mmq -c -o $@ $<
 
@@ -3521,11 +3403,6 @@ tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS
 tests/loader_open.o: tests/loader_open.cpp
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
 tests/loader_open: tests/loader_open.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/inkling_family_gate.o: tests/inkling_family_gate.cpp src/families/inkling/inkling.h src/engine/role_bind.h \
-                             src/engine/pulsar_engine_internal.h src/pulsar.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
-tests/inkling_family_gate: tests/inkling_family_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L338: the f16 m16n8k16 MMA's sm_75 body (two m16n8k8) graded against the exact product and the k16 instruction --
 # model-free, on an sm_80+ card (it refuses below: the k16 instruction is the comparison).  The split is not the k16
