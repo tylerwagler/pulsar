@@ -2712,9 +2712,15 @@ gates-preflight:
 
 # The binaries of the serial GPU targets are prerequisites too (2026-10-14): they build here, in one parallel make,
 # instead of one target at a time inside the timed loop (pulsar_test alone was ~40 s of unit-test-gate).
-gates: tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/nemotron_chat_gate tests/api_golden \
+TEST_BINS = tests/gates_runner pulsar-server pulsar-eval tests/qwen_chat_gate tests/nemotron_chat_gate tests/api_golden \
        tests/sse_golden tests/spec_depth_gate \
        tests/loader_open pulsar_test pulsar_agent_test pulsar $(CUDA_REGRESSION_BINS)
+.PHONY: test-bins check kernels release
+test-bins: $(TEST_BINS)
+# The tiers (L357, tests/manifest.toml): `make check`, `make kernels`, `make release`.
+check kernels release:
+	python3 tests/run.py $@
+gates: $(TEST_BINS)
 	@$(MAKE) --no-print-directory gates-preflight || exit 1
 	@rc=0; passed=""; failed=""; suite0=$$(date +%s); \
 	hostdir=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-gates-XXXXXX); host_pids=""; \
