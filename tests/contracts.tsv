@@ -24,7 +24,7 @@ runner:session-contract-gate	session,spec	all	battery	every hosted model; B6: mu
 runner:cuda-row-neutrality-gate	session	all	battery	1-row == N-row decode, ~100 / ~2.2k / ~10k tokens, every hosted model
 runner:cuda-chunk-neutrality-gate	session	all	battery	schedules A-P/X at 8600 tokens, chunk 4096; payload (H I M P) / rewind (J K) / standalone restore (L N) schedules skip by name where the family lacks them; origins per sync planner, F G from the prefill grid on both (L284)
 runner:cuda-algo-stability-gate	session	all	battery	width neutrality: bank 0's decode row byte-identical at widths 1/2/4/5/8/16 (KL past the exact range), every hosted model (L284)
-runner:cuda-algo-stability-gate-deep	session	all	battery	the same with bank 0 at 2200 tokens (L284)
+runner:cuda-algo-stability-gate-deep	session	all	dev	the same with bank 0 at 2200 tokens (L284)
 runner:cuda-seam-gate	session	all	battery	a re-tokenized echo keeps the live KV; leg 3 (shorter echo) needs rewind, skipped by name without it (L284)
 runner:cuda-multiseq-gate	session	all	battery	co-scheduling neutrality N=2 vs 3, mixed == multiseq entry, stale-classic guard; ALL_ROWS leg needs prompt runs in a step (L284)
 runner:cuda-multiseq-gate-nodspark	session	all	battery	the same with speculation disabled at open (L284)
@@ -37,7 +37,8 @@ loader-contract-gate	loader	all	battery	header clones + named mutants, both fami
 runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
 spec-depth-gate	spec	all	battery	the depth rule both drafters share
 runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors: DeepSeek B300, Qwen container capture; KL budgets
-runner:cuda-decode-reference-gate-story	reference	deepseek4	battery
+runner:cuda-decode-reference-gate-story	reference	qwen4_exp	manual	L360: out of the battery until Qwen's wide decode rows, which disagree decisively with one-row decode, are understood
+na	runner:cuda-decode-reference-gate-story	deepseek4	DeepSeek is smoke only (Tyler 2026-11-07): its reference gates left the runner
 qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens
 unit-test-gate	server	all	battery	pulsar_test incl. --server (Qwen hooks: 4 tests)
 api-golden-gate	server	all	battery	DeepSeek and Qwen request rows
@@ -57,7 +58,6 @@ gap	tp	qwen4_exp	L278	contract 7: the pair (tools/tp2-l272); tp-plan host-side
 gap	tp	deepseek4	L357	DeepSeek V4 is smoke-only since 2026-11-07: it left the runner, and cuda-tp-head-split-gate (its row slices) with it
 #
 # one-family gates (L284): na = by design, gap = owed
-gap	runner:cuda-decode-reference-gate-story	qwen4_exp	L284	decode rows at served widths vs the reference: Qwen's verify step takes <= 16 rows (24/32 refused) and the gate's exact-width range is DeepSeek's cuBLASLt boundary -- needs the family's served widths
 na	qwen-chat-gate	deepseek4	Qwen's template / tokenizer vs HF goldens; DeepSeek's template is render-gate
 na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
 na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates

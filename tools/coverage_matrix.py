@@ -35,8 +35,13 @@ def main():
     runner_gates = set(re.findall(r'\{"([a-z][a-z0-9-]+)",\s*gate_\w+_main', runner)) | \
         set(re.findall(r'gate_spec \w+ = \{"([a-z][a-z0-9-]+)"', runner))
     m = re.search(r'ref_names\[\d+\] = \{([^}]*)\}', runner)   # the per-model reference gates' names
-    if m:
-        runner_gates |= set(re.findall(r'"([a-z][a-z0-9-]+)"', m.group(1)))
+    ref_names = re.findall(r'"([a-z][a-z0-9-]+)"', m.group(1)) if m else []
+    runner_gates |= set(ref_names)
+    # L357: a runner gate flagged DEV runs only when --only names it -- not in the battery
+    runner_dev = set(re.findall(r'\{"([a-z][a-z0-9-]+)",\s*gate_\w+_main[^\n]*,\s*DEV\}', runner))
+    for idx in re.findall(r'gate_spec \w+ = \{ref_names\[(\d+)\][^;]*,\s*DEV\}', runner):
+        if int(idx) < len(ref_names):
+            runner_dev.add(ref_names[int(idx)])
     rows, gaps, bad = [], [], []
     per_gate = []   # (line, kind, target, family): the na and gate-level gap rows
     # L354: the matrix tracks FAMILIES; every other family in the registry says so, by name and row, or the check fails
@@ -87,7 +92,7 @@ def main():
             bad.append(f'contracts.tsv:{n}: unknown family {family!r}')
         if target.startswith('runner:'):
             name = target[len('runner:'):]
-            exists, in_battery = name in runner_gates, 'cuda-runner-gate' in battery
+            exists, in_battery = name in runner_gates, 'cuda-runner-gate' in battery and name not in runner_dev
         else:
             exists, in_battery = target in targets, target in battery
         if not exists:
