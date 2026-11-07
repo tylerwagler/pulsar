@@ -232,3 +232,7 @@ tests/sse-golden/out.txt
 
 # Machine-local Makefile settings (model and fixture paths); see the top of the Makefile.
 /local.mk
+/tests/bank_isolation_gate
+/tests/kv_accounting_gate
+/tests/graph_eager_gate
+/tests/head_graph_replay_gate

@@ -11,7 +11,7 @@
 release = 3000
 
 [sections]
-"cuda-runner-gate [Qwen4-exp]" = 720
+"cuda-runner-gate [Qwen4-exp]" = 1200
 "cuda-runner-gate [Nemotron-H]" = 300
 "live-legs [qwen]" = 1500
 "live-legs [nemotron]" = 420
