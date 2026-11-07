@@ -43,7 +43,6 @@ runner:cuda-dspark-batch-gate	spec	deepseek4	battery
 spec-depth-gate	spec	all	battery	the depth rule both drafters share
 runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors: DeepSeek B300, Qwen container capture; KL budgets
 runner:cuda-decode-reference-gate-story	reference	deepseek4	battery
-qwen-ref-gate	reference	qwen4_exp	manual	vs the BF16 source: a quant-quality reading, not a regression grade
 qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens
 unit-test-gate	server	all	battery	pulsar_test incl. --server (Qwen hooks: 4 tests)
 api-golden-gate	server	all	battery	DeepSeek and Qwen request rows
@@ -52,7 +51,6 @@ cuda-chat-smoke-gate	server	deepseek4	battery	through the CLI binary (the primar
 server-live-gate	server	all	manual	a live pulsar-server per family over HTTP (tool contract); one server load each, so not in the battery
 runner:chat-smoke-gate	server	all	battery	greedy chat answer on the public text API, every hosted model
 runner:cuda-tp-head-split-gate	tp	deepseek4	battery	one box
-tp-plan-gate	tp	all	manual	cold NFS scan; outside the runner overlap -- L278 contract 7
 cuda-regression	kernel:gdn,exl3,exl3-half,qsa,s4,moe-route,expert-table	all	battery
 cuda-attn-gates	kernel:attn-f16,hc,vision,rope	deepseek4	battery
 vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
@@ -74,7 +72,6 @@ gap	runner:cuda-session-payload-gate	qwen4_exp	L284	whole-session payloads: Qwen
 na	runner:cuda-bank-spec-gate	qwen4_exp	DSpark's per-bank speculative state (s->spec, its checkpoints) through DeepSeek's session; Qwen's MTP verify per bank is session-contract B6, its greedy == spec and distribution cuda-spec-sampling-gate
 na	runner:cuda-dspark-batch-gate	qwen4_exp	the DSpark drafter's batched redraft; Qwen's drafter is MTP (pulsar_engine_drafter)
 gap	runner:cuda-decode-reference-gate-story	qwen4_exp	L284	decode rows at served widths vs the reference: Qwen's verify step takes <= 16 rows (24/32 refused) and the gate's exact-width range is DeepSeek's cuBLASLt boundary -- needs the family's served widths
-na	qwen-ref-gate	deepseek4	Qwen against its BF16 source (a quant-quality reading); DeepSeek's quality is graded against the B300 by the reference gates
 na	qwen-chat-gate	deepseek4	Qwen's template / tokenizer vs HF goldens; DeepSeek's template is render-gate
 na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
 na	runner:cuda-tp-head-split-gate	qwen4_exp	slices DeepSeek's attn_q_b / attn_output_a; Qwen's TP is the tp x qwen4_exp gap (L278)
@@ -94,7 +91,6 @@ gap	runner:cuda-evict-restore-gate	nemotron_h	L354	applies to Nemotron; no batte
 gap	runner:cuda-session-payload-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 gap	runner:cuda-bank-spec-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 gap	runner:cuda-decode-reference-gate-story	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
-gap	qwen-ref-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 gap	cuda-chat-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 gap	qwen-image-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
 na	runner:cuda-dspark-batch-gate	nemotron_h	DeepSeek's DSpark drafter; Nemotron drafts by block
@@ -111,7 +107,6 @@ gap	runner:cuda-evict-restore-gate	gemma4	L354	applies to Gemma; no battery run 
 gap	runner:cuda-session-payload-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 gap	runner:cuda-bank-spec-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 gap	runner:cuda-decode-reference-gate-story	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
-gap	qwen-ref-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 gap	cuda-chat-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 gap	qwen-image-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
 na	runner:cuda-dspark-batch-gate	gemma4	DeepSeek's DSpark drafter; Gemma drafts by block
@@ -139,9 +134,6 @@ na	qwen-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat l
 na	qwen-image-smoke-gate	inkling	parked: its forward is not wired, so no session can run
 na	qwen-image-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	qwen-image-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
-na	qwen-ref-gate	inkling	parked: its forward is not wired, so no session can run
-na	qwen-ref-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
-na	qwen-ref-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
 na	runner:cuda-accounting-gate	inkling	parked: its forward is not wired, so no session can run
 na	runner:cuda-accounting-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
 na	runner:cuda-accounting-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane

@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import loader_contract as LC  # noqa: E402  (the header clone, the open probe)
-import inkling_family_gate as IG  # noqa: E402  (the record / kv editors)
+import container_edit as IG  # noqa: E402  (the record / kv editors)
 
 
 def mutate(shards, what):

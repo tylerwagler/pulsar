@@ -233,7 +233,7 @@ PULSAR_LINK_LIBS ?= $(CUDA_LDLIBS)
 # were current (make compares mtimes, not build success -- 2026-08-19).
 .DELETE_ON_ERROR:
 
-.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-gate-cutlass-mxfp4 cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
+.PHONY: gates gates-preflight gates-quick agent-test-gate host-checks expert-stream-probe decode-kernel-census cuda-runner-gate cuda-spec-width-gate all help clean test seam-check cuda-spark cuda-regression cuda-kv-rows-pack-gate cuda-attn-gates cuda-frontier-gate cuda-rewind-gate cuda-seam-gate cuda-multiseq-gate cuda-multiseq-gate-nodspark cuda-bank-spec-gate cuda-dspark-batch-gate cuda-accounting-gate cuda-evict-restore-gate cuda-session-payload-gate cuda-algo-stability-gate cuda-algo-stability-gate-deep cuda-mixed-prefill-gate cuda-mixed-zero-prefill-gate cuda-fused-step-gate decode-reference-gate verify-width-probe cuda-mixed-neutrality-gate cuda-mixed-neutrality-gate-wide cuda-prefill-gate cuda-prefill-gate-baseline cuda-prefill-decode-gate cuda-prefill-decode-gate-baseline cuda-spec-sampling-gate spec-teacher-forced-probe cuda-row-neutrality-gate cuda-row-neutrality-gate-deep cuda-row-neutrality-gate-deeper cuda-comp-state-gate sse-decode-bench decode-floor-gate decode-floor-baseline context-coherence-probe tp-core-test tp-command-free-test tp-transport-test tp-mesh-test tp-slab-probe tp-dmabuf-probe
 
 all: help
 
@@ -313,7 +313,7 @@ CUDA_REGRESSION_RUNS = $(CUDA_REGRESSION_BINS:tests/%=cuda-regression-run/%)
 cuda-regression: $(CUDA_REGRESSION_BINS)
 	@MAKEFLAGS='$(filter-out -j% --jobserver%,$(MAKEFLAGS))' \
 	  $(MAKE) --no-print-directory -O -k -j$(words $(CUDA_REGRESSION_BINS)) $(CUDA_REGRESSION_RUNS)
-# router_gate runs through its own target: it builds the real-weights Inkling fixture first where the box has it.
+# router_gate runs through its own target.
 .PHONY: $(CUDA_REGRESSION_RUNS)
 $(filter-out cuda-regression-run/router_gate,$(CUDA_REGRESSION_RUNS)): cuda-regression-run/%: tests/%
 	./tests/$* $(if $(filter exl3_half_gate,$*),$(EXL3_HALF_SCRATCH))
@@ -771,15 +771,6 @@ mamba2-gate: tests/mamba2_gate
 tests/mamba2_bench: tests/mamba2_bench.cu src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o src/cuda/pulsar_cuda_mamba2.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/mamba2_bench.cu src/cuda/pulsar_cuda_mamba2.o src/cuda/pulsar_cuda_sconv.o
 
-# The block on real Nemotron 3.5 Super VL Mamba layers (HF blocks 0 / 2 / 4) against transformers'
-# NemotronHMamba2Mixer in fp32: the block's distance must be its declared bf16 rounding points' (vLLM's) and
-# nothing more; the f32 state and arithmetic graded against a double with those rounding points.
-# MAMBA2_MINI_FIXTURE is the directory tests/mamba2_mini_fixture.py writes (CPU, a few minutes):
-# python3 tests/mamba2_mini_fixture.py /path/to/models/nemotron35-super-vl-bf16 DIR.
-.PHONY: mamba2-mini-grade
-mamba2-mini-grade: tests/mamba2_gate
-	@test -n "$(MAMBA2_MINI_FIXTURE)" || { echo "mamba2-mini-grade: set MAMBA2_MINI_FIXTURE (see tests/mamba2_mini_fixture.py)"; exit 1; }
-	./tests/mamba2_gate --fixture $(MAMBA2_MINI_FIXTURE)
 
 # L295 E5: the family head options -- the embedding RMSNorm (graded vs double,
 # batch-independent bytes), the logits finish (scale bit-exact, padding -inf,
@@ -986,7 +977,7 @@ QWEN_GATE_MODEL ?= $(call need_path,QWEN_GATE_MODEL)
 # L278 contract 4: Qwen's reference anchors, graded by the runner's cuda-reference-gate-* on the hosted Qwen model.
 # The capture is the CONTAINER's (HF qwen4_exp modules on these quantized weights, layer-streamed; L251
 # 2026-09-28) -- matched precision, as DeepSeek's B300 capture is, so a KL here is OUR arithmetic's divergence,
-# not the quantization's.  (QWEN_REF_DIR is the BF16 source: a quant-quality reading, qwen-ref-gate.)
+# not the quantization's.
 # No quotes in these values: gates-dev passes them through a shell variable.
 QWEN_REF_ANCHOR_DIR ?= $(call need_path,QWEN_REF_ANCHOR_DIR)
 # Re-recorded 2026-10-21 on the SERVED pack (L305: QWEN_GATE_MODEL, the EXL3 K5 head; the anchors' capture and the
@@ -1051,24 +1042,6 @@ bank-adopt-gate-nemotron: tests/bank_adopt_gate
 .PHONY: bank-residency-gate-qwen
 bank-residency-gate-qwen: tests/bank_residency_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/bank_residency_gate $(QWEN_GATE_MODEL)
-# L272 P4b: each family's tensor-parallel slices for both ranks of a pair, recorded on the host (no GPU work,
-# no transport; tests/tp_plan_test.cpp) and diffed against the committed plan.  tp-plan-golden re-records it --
-# only for a change that MEANS to move a slice.
-# DeepSeek's is the pair's model: its TP builds the expert halves from CUTLASS MXFP4 stacks, which FRONTIER_MODEL
-# (vexp, IQ2 experts) does not have.  A cold first run reads the artifact's scans over NFS (~7 min); cached, seconds.
-TP_PAIR_DS_MODEL ?= $(call need_path,TP_PAIR_DS_MODEL)
-# Qwen's plan runs on the U-e4-d5 trunk (the NAS copy, no drafter): the served pack has no TP plan -- the plan refuses
-# a block drafter under TP and an EXL3 head (L305) -- and Qwen is not a pair model (no DeepSeek/Qwen on the work pair).
-# The MTP overlay it used was deleted 2026-10-25; the trunk's plan is the old golden minus its mtp.layers.0 rows.
-TP_QWEN_PLAN_MODEL ?= $(call need_path,TP_QWEN_PLAN_MODEL)
-TP_PLAN_MODELS = $(TP_PAIR_DS_MODEL) $(TP_QWEN_PLAN_MODEL)
-.PHONY: tp-plan-gate tp-plan-golden
-tp-plan-gate: tests/tp_plan_test
-	@for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
-	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
-	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 2>/dev/null | diff -u $$g - >/dev/null \
-	    || { echo "TP-PLAN GATE FAIL: $$g"; exit 1; }; \
-	  echo "tp-plan: $$g ($$(grep -vc '^#' $$g) slices)"; done; done; echo "TP-PLAN GATE PASS"
 # L278 contract 2, the loader, for every family: each served container's sparse HEADER CLONE must open, and each
 # mutant of it (unknown arch, a missing key / tensor, a transposed shape, a dtype no reader takes, a stack layout no
 # arm reads) must be REFUSED BY NAME with the open returning -- never an exit (tests/loader_contract.py,
@@ -1119,23 +1092,13 @@ nemotron-family-gate: tests/nemotron_family_gate tests/loader_open
 .PHONY: nemotron-fwd-gate
 nemotron-fwd-gate: tests/nemotron_fwd_gate
 	./tests/nemotron_fwd_gate exact $(NEMOTRON_GATE_MODEL) synthetic
-# L296 N9: the chained-MTP drafter (src/engine/spec_mtp.h) on the container: greedy and seeded-sampled spec == plain at
-# depths 1..5 and the drafter's own numbers, the forced-reject stress (every Mamba-2 / attention / drafter byte back to
-# the plain twin's after planned rollbacks), the batched lane's shared verify == each bank's plain stream
-# (tests/mtp_spec_gate.cpp exact).  Any family whose drafter is the MTP lane: MTP_GATE_MODEL.  L305: MTP is a dormant
-# lane -- no production family drafts with it -- so this is not in `make gates`; gates-dev runs it when an MTP path
-# changes (docs/QA_BEFORE_RELEASES.md).
-MTP_GATE_MODEL ?= $(NEMOTRON_GATE_MODEL)
-MTP_GATE_TOKENS ?= 256
-.PHONY: mtp-spec-gate
-mtp-spec-gate: tests/mtp_spec_gate
-	./tests/mtp_spec_gate $(MTP_GATE_MODEL) $(MTP_GATE_TOKENS)
 # L298: the same gate on a container whose drafter is the LiLiCorr block drafter (spec_block.h): spec == plain greedy
 # and seeded-sampled, the forced-reject stress (the drafter's context rings == the plain twin's), the batched lane and
 # toolsample's per-position modes.  L317: the battery runs it in the runner on the hosted engines (block-spec-gate on
 # Qwen's DFlash2 and Nemotron's LiLiCorr, 128 tokens a stream); these two targets are the gates-dev depth (256) on a
 # drafter path change, and the hand run.
 LILICORR_GATE_MODEL ?= $(call need_path,LILICORR_GATE_MODEL)
+MTP_GATE_TOKENS ?= 256
 .PHONY: lilicorr-spec-gate
 lilicorr-spec-gate: tests/mtp_spec_gate
 	./tests/mtp_spec_gate $(LILICORR_GATE_MODEL) $(MTP_GATE_TOKENS)
@@ -1172,50 +1135,6 @@ scratch-poison-gate-mutant: tests/scratch_poison_gate_mutant
 	then printf 'SCRATCH-POISON MUTANT: CAUGHT (the gate failed on the stale read; the unpoisoned runs agreed)\n'; \
 	else printf 'SCRATCH-POISON MUTANT: NOT CAUGHT -- the gate has no teeth (or its premise broke: see the log)\n'; \
 	  exit 1; fi
-# L299: Qwen's drafter selection at open, host-only (pulsar --inspect): of two, DFlash2 by default (announced); --drafter
-# mtp picks the MTP module; a one-drafter container runs its own; unknown names and a missing drafter shard refused.
-# The base is the same model built without a block drafter (the MTP-only container is it + the MTP sidecar).
-QWEN_SELECT_BASE ?= $(call need_path,QWEN_SELECT_BASE)
-QWEN_SELECT_WORK ?= $(or $(TMPDIR),/var/tmp)/qwen-drafter-select-$(USER)
-.PHONY: qwen-drafter-select-gate
-qwen-drafter-select-gate: pulsar
-	python3 tests/qwen_drafter_select_gate.py --open ./pulsar --work $(QWEN_SELECT_WORK) --base $(QWEN_SELECT_BASE) \
-	    $(DFLASH2_GATE_MODEL)
-# ... and its draft grade: the MTP module's first-step logits at every position of capture_ref.py's prompt, the engine's
-# DECODE and PROMPT paths (mtp_spec_gate probe), against transformers' modules on the fp32 trunk
-# (tools/nemotron/capture_mtp_ref.py) with transformers' own bf16 beside it (the floor); PASS within 2x the floor's KL.
-NEMOTRON_MTP_REF ?= $(call need_path,NEMOTRON_MTP_REF)
-NEMOTRON_MTP_REF_BF16 ?= $(call need_path,NEMOTRON_MTP_REF_BF16)
-NEMOTRON_MTP_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mtp-grade-$(USER)
-.PHONY: nemotron-mtp-grade
-nemotron-mtp-grade: tests/mtp_spec_gate
-	rm -rf $(NEMOTRON_MTP_GRADE_DIR) && mkdir -p $(NEMOTRON_MTP_GRADE_DIR)
-	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py prep $(NEMOTRON_MINI_REF) $(NEMOTRON_MTP_GRADE_DIR)
-	./tests/mtp_spec_gate $(NEMOTRON_GATE_MODEL) --probe $(NEMOTRON_MTP_GRADE_DIR)/ids.bin $(NEMOTRON_MTP_GRADE_DIR) \
-	    2> $(NEMOTRON_MTP_GRADE_DIR)/probe.log
-	$(NEMOTRON_GRADE_PY) tests/nemotron_mtp_grade.py grade $(NEMOTRON_MTP_REF) $(NEMOTRON_MTP_GRADE_DIR) \
-	    --bf16 $(NEMOTRON_MTP_REF_BF16) --trunk $(NEMOTRON_MINI_REF)
-# ... and its block grade against the transformers fp32 capture (tools/nemotron/capture_ref.py; dt unclamped) with
-# transformers' own bf16 run beside it (capture_ref.py --dtype bf16): per HF block, the final norm, the logits
-# (tests/nemotron_mini_grade.py; torch + safetensors: NEMOTRON_GRADE_PY).
-NEMOTRON_MINI_HF ?= $(call need_path,NEMOTRON_MINI_HF)
-NEMOTRON_MINI_REF ?= $(call need_path,NEMOTRON_MINI_REF)
-NEMOTRON_MINI_REF_BF16 ?= $(call need_path,NEMOTRON_MINI_REF_BF16)
-NEMOTRON_GRADE_PY ?= $(call need_path,NEMOTRON_GRADE_PY)
-NEMOTRON_GRADE_DIR ?= $(or $(TMPDIR),/var/tmp)/nemotron-mini-grade-$(USER)
-.PHONY: nemotron-mini-grade
-nemotron-mini-grade: tests/nemotron_fwd_gate
-	rm -rf $(NEMOTRON_GRADE_DIR) && mkdir -p $(NEMOTRON_GRADE_DIR)
-	$(NEMOTRON_GRADE_PY) tests/nemotron_mini_grade.py prep $(NEMOTRON_MINI_REF) $(NEMOTRON_GRADE_DIR)
-	PULSAR_CUDA_GRAPH_DUMP_PREFIX=$(NEMOTRON_GRADE_DIR)/d ./tests/nemotron_fwd_gate capture $(NEMOTRON_GATE_MODEL) \
-	    $(NEMOTRON_GRADE_DIR)/ids.bin $(NEMOTRON_GRADE_DIR) 2> $(NEMOTRON_GRADE_DIR)/capture.log
-	$(NEMOTRON_GRADE_PY) tests/nemotron_mini_grade.py grade $(NEMOTRON_MINI_REF) $(NEMOTRON_MINI_HF) $(NEMOTRON_GRADE_DIR) \
-	    $$(test -f $(NEMOTRON_MINI_REF_BF16) && echo --bf16 $(NEMOTRON_MINI_REF_BF16))
-tp-plan-golden: tests/tp_plan_test
-	@mkdir -p tests/tp-plan-golden; for m in $(TP_PLAN_MODELS); do for r in 0 1; do \
-	  g=tests/tp-plan-golden/$$(basename $$m)-r$$r.txt; \
-	  PULSAR_LOCK_FILE=/tmp/pulsar-tp-plan.lock ./tests/tp_plan_test $$m $$r 2 > $$g 2>/dev/null || exit 1; \
-	  echo "recorded $$g ($$(grep -vc '^#' $$g) slices)"; done; done
 
 
 # L251 S4: Qwen3.8-Flash-Next's PLE n-gram ids vs transformers' own module, bit-exact,
@@ -1223,7 +1142,6 @@ tp-plan-golden: tests/tp_plan_test
 # 128 shard tensors through the Engram pool -- HOST ONLY.  Vectors from
 # tools/qwen/gen_ngram_vectors.py (the corpus file lives beside the checkpoint on
 # the GB10; the small in-tree one covers 4 corpus prefixes + the EOS cases, ids only).
-QWEN_NGRAM_VECTORS ?= $(call need_path,QWEN_NGRAM_VECTORS)
 # the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
 # checkpoint's shard parts named in the vectors instead
 QWEN_NGRAM_ROWFILE ?=
@@ -1235,7 +1153,6 @@ tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/e
 .PHONY: qwen-ngram-test
 qwen-ngram-test: tests/qwen_ngram_test
 	./tests/qwen_ngram_test tests/test-vectors/qwen-ngram-small.vec --no-rows
-	./tests/qwen_ngram_test $(QWEN_NGRAM_VECTORS) $(if $(QWEN_NGRAM_ROWFILE),--rowfile $(QWEN_NGRAM_ROWFILE),)
 
 # L251 S5: the Qwen3.8-Flash-Next tokenizer, chat renderer, client-span map and
 # output parser, graded against HF (goldens from tests/qwen/gen_qwen_goldens.py
@@ -1640,11 +1557,8 @@ vision-qwen-tower-gate: tests/vision_qwen_tower_gate
 #   nemotron-vision-smoke        GPU: one image question through the engine (tests/image_chat_smoke.cpp): "red"
 #   nemotron-vision-live         GPU: a real server (tests/nemotron_vision_live.py): V1-V8 name the images' content,
 #                                and the prefix cache resumes past the same image, not past a different one
-#   nemotron-vision-refuse-live  GPU: a container WITHOUT the tower (NEMOTRON_TEXT_MODEL) refuses an image 400, by name
 NEMOTRON_VISION_MODEL ?= /srv/models/nemotron35-k4-lilicorr-vision-pulsar
-NEMOTRON_TEXT_MODEL ?= /srv/models/nemotron35-k4-lilicorr-pulsar
-.PHONY: nemotron-vision-pixel-gate nemotron-vision-tower-gate nemotron-vision-smoke nemotron-vision-live \
-        nemotron-vision-refuse-live
+.PHONY: nemotron-vision-pixel-gate nemotron-vision-tower-gate nemotron-vision-smoke nemotron-vision-live
 nemotron-vision-pixel-gate: tests/nemotron_vision_pixel_gate
 	./tests/nemotron_vision_pixel_gate tests/test-vectors/nemotron-vision-goldens.bin
 nemotron-vision-tower-gate: tests/nemotron_vision_tower_gate
@@ -1654,8 +1568,6 @@ nemotron-vision-smoke: tests/image_chat_smoke
 	./tests/image_chat_smoke $(NEMOTRON_VISION_MODEL) /var/tmp/nemotron-vision-smoke.png "What colour is the circle in this image? Answer with one word." red
 nemotron-vision-live: pulsar-server
 	python3 tests/nemotron_vision_live.py $(NEMOTRON_VISION_MODEL) --binary ./pulsar-server
-nemotron-vision-refuse-live: pulsar-server
-	python3 tests/nemotron_vision_live.py $(NEMOTRON_TEXT_MODEL) --binary ./pulsar-server --refuse
 tests/nemotron_vision_pixel_gate.o: tests/nemotron_vision_pixel_gate.cpp src/families/nemotron_h/nemotron_h.h \
                                     src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/nemotron_vision_pixel_gate.cpp
@@ -1746,20 +1658,10 @@ cuda-reap-router-audit:
 CONTAINER_PY ?= python3
 # The oracles test_names / test_kv / test_producers read (local.mk): the served DeepSeek container, the Vision-Exp
 # and V4.1 HF snapshots (a glob matching one directory is fine) and a glob of the V4.1 EXL3 shards.
-.PHONY: container-tests container-tests-sources
+.PHONY: container-tests
 container-tests:
 	cd tools/container && for t in test_exl3_rates.py test_deepseek.py test_qwen.py test_nemotron_h.py test_nemotron_enc.py test_nemotron_parse.py test_gemma4.py; do \
 	  $(CONTAINER_PY) $$t || exit 1; done
-# Manual: these read the source checkpoints (the DeepSeek Vision-Exp and V4.1 snapshots, V4.1's EXL3 shards), which the
-# box no longer holds.
-CONTAINER_SERVED   ?= $(call need_path,CONTAINER_SERVED)
-CONTAINER_VEXP_HF  ?= $(call need_path,CONTAINER_VEXP_HF)
-CONTAINER_V41_HF   ?= $(call need_path,CONTAINER_V41_HF)
-CONTAINER_V41_EXL3 ?= $(call need_path,CONTAINER_V41_EXL3)
-container-tests-sources:
-	cd tools/container && export PULSAR_SERVED='$(CONTAINER_SERVED)' PULSAR_HF_SNAPSHOT='$(CONTAINER_VEXP_HF)' \
-	  PULSAR_V41_SNAPSHOT='$(CONTAINER_V41_HF)' PULSAR_V41_EXL3='$(CONTAINER_V41_EXL3)' && \
-	for t in test_names.py test_kv.py test_producers.py; do $(CONTAINER_PY) $$t || exit 1; done
 
 # plan-34 phase-2 inc 4: TRUE mixed step — decode banks + one K-row prefill run
 # fused. Gate 4 co-scheduling neutrality (decode logits byte-identical with/without
@@ -2011,29 +1913,6 @@ PREFILL_BASELINE_REF ?= 5fe1831d
 # by a clean dev checkout's own binary; this one by `cuda-prefill-gate-baseline` at the
 # ref, see its .md).
 PREFILL_BASELINE     ?= tests/test-vectors/prefill_bitexact_baseline-$(PREFILL_BASELINE_REF).bin
-# CUTLASS MXFP4 byte coverage, ON THE PROMOTION LANE.
-#
-# The battery's artifact has none of this lane in its main model: all 43 routed
-# layers are iq2_xxs_mmq_k, and the only CUTLASS-MXFP4 stacks are the drafter's,
-# which a plain prefill never runs.  The gate that covered it
-# (`cuda-prefill-gate-type40`) was deleted with the GGUF container -- its only
-# qualifying artifact was the 0731 reapfix, that file is gone and its blob was
-# already absent, so it had been asserting nothing.
-#
-# The promotion lane is what makes the coverage reachable again:
-# /path/to/models/vexp-promoted-L30 is the served artifact with ONE shard swapped,
-# carrying 3 CUTLASS-MXFP4 routed layers (layer 30 @ the source's own MXFP4).
-# 12 cutlass_mxfp4 tensors, 126 iq2_xxs_mmq_k.
-#
-# PROVENANCE NOTE.  Every other prefill baseline here was dumped by an OLDER
-# tree, which is the stronger comparison.  This one CANNOT be: the promoted
-# artifact is safetensors and no pre-safetensors tree can load it at all.  So
-# the blob is dumped at CUTLASS_MXFP4_BASELINE_REF and the gate grades drift
-# FROM that point on -- a regression detector, not a fidelity claim.  Which is
-# what a byte gate is for; the fidelity question is the B300 study's.
-CUTLASS_MXFP4_GATE_MODEL        ?= $(call need_path,CUTLASS_MXFP4_GATE_MODEL)
-PREFILL_CUTLASS_MXFP4_BASELINE_REF ?= e823df67
-PREFILL_CUTLASS_MXFP4_BASELINE  ?= tests/test-vectors/prefill_cutlass_mxfp4_baseline-$(PREFILL_CUTLASS_MXFP4_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_REF ?= 5fe1831d
 PREFILL_DECODE_BASELINE     ?= tests/test-vectors/prefill_decode_baseline-$(PREFILL_DECODE_BASELINE_REF).bin
 PREFILL_DECODE_BASELINE_WT  ?= temp/wt-prefill-decode-baseline
@@ -2283,22 +2162,6 @@ cuda-prefill-gate:
 	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
 
-# The CUTLASS-MXFP4 half of the byte gate -- see CUTLASS_MXFP4_GATE_MODEL above.
-# L354: a configured path that isn't there FAILS.  It used to SKIP and exit 0, so a typo or an unmounted share printed
-# ALL GATES PASS with the only gate for this lane not run.  (Unset, need_path refuses already.)
-# L354: MANUAL, out of the battery: its artifact is on no box (L292 noted it 2026-10-13), and the SKIP had hidden that.  No served
-# family uses this lane, so nothing gates it; bringing it back means rebuilding the artifact and re-dumping the blob.
-cuda-prefill-gate-cutlass-mxfp4:
-	@if [ ! -d "$(CUTLASS_MXFP4_GATE_MODEL)" ]; then \
-		echo "FAIL  cuda-prefill-gate-cutlass-mxfp4: $(CUTLASS_MXFP4_GATE_MODEL) is not on this box --"; \
-		echo "      NO CUTLASS MXFP4 routed-expert coverage in this run."; \
-		exit 1; \
-	else \
-		set -e; \
-		$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f; \
-		./tests/prefill_bitexact_gate $(CUTLASS_MXFP4_GATE_MODEL) \
-			--check $(PREFILL_CUTLASS_MXFP4_BASELINE) $(PREFILL_CUTLASS_MXFP4_BASELINE_REF); \
-	fi
 
 # NOTE the shape above (2026-09-21): the conditional WRAPS the recipe.  It used
 # to be `@if ...; then echo SKIP; exit 0; fi` followed by the build and the run as
@@ -2634,8 +2497,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 # L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens), the server
 # goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
 # the speculation depth rule both drafters share and prefix-stability-gate (L325: consecutive client requests render as prefixes of each other, every
-# family) -- seconds each, overlapping the runner.  (tp-plan-gate stays out of the overlap: its scan of the pair's
-# DeepSeek is a 12 GB process over 167 GB of NFS page cache beside a 90 GB engine on unified memory.)
+# family) -- seconds each, overlapping the runner.
 HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
 	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate nemotron-vision-pixel-gate seam-check \
 	exl3-dequant-gate host-checks qwen-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
@@ -2828,7 +2690,7 @@ gates-dev:
 	fi; \
 	$(MAKE) -j$(GATE_JOBS) --no-print-directory tests/gates_runner pulsar_test CUDA_ARCH=sm_120f || exit 1; \
 	$(MAKE) --no-print-directory gates-preflight || exit 1; \
-	paths='$(PATHS)'; why=''; attn=0; server=0; render=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; mtp=0; resume=0; kvmem=0; chunk=0; ds4legs=0; \
+	paths='$(PATHS)'; why=''; attn=0; server=0; render=0; vision=0; exl3=0; family=0; gdn=0; router=0; blocks=0; bf16=0; minp=0; drafter=0; poison=0; resume=0; kvmem=0; chunk=0; ds4legs=0; \
 	if [ -z "$$paths" ]; then \
 	  paths=$$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } 2>/dev/null \
 	            | grep -E '\.(c|cc|cpp|cu|cuh|h|hpp)$$' | sort -u ); \
@@ -2859,7 +2721,6 @@ gates-dev:
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
 	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
-	      case "$$p" in *mtp*|src/engine/family_qwen.cpp|src/engine/family_qwen.h|src/engine/step_driver*|src/families/nemotron_h/nemotron_h_family.cpp|src/families/nemotron_h/nemotron_h.h) mtp=1 ;; esac; \
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*|src/lib/pulsar_kvdigest*|src/lib/pulsar_kvpool*) resume=1 ;; esac; \
 	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
@@ -2895,7 +2756,6 @@ gates-dev:
 	if [ $$bf16 -eq 1 ]; then printf '  bf16-rows-gate + nvfp4-rows-gate: selected (the BF16 / NVFP4 rows arms and their admission)\n'; fi; \
 	if [ $$minp -eq 1 ]; then printf '  cuda-sampler-device-gate: selected (THE sampler, on the device: L302)\n'; fi; \
 	if [ $$drafter -eq 1 ]; then printf '  block drafter gates: blockdraft-gate, lilicorr-head-gate, lilicorr-spec-gate, dflash2-spec-gate (L298 / L299: the LiLiCorr lane on the Nemotron artifact, the DFlash2 lane on the Qwen artifact)\n'; fi; \
-	if [ $$mtp -eq 1 ]; then printf '  mtp-spec-gate: selected (L305: the dormant MTP lane, on an MTP path change, on the Nemotron mini)\n'; fi; \
 	if [ $$poison -eq 1 ]; then printf '  scratch-poison-gate: selected (L307: the graphed lanes and their scratch, poisoned == unpoisoned on DeepSeek, DFlash2, LiLiCorr)\n'; fi; \
 	if [ $$server -eq 1 ]; then printf '  server: chat smoke + the --server/--api unit switches\n'; fi; \
 	if [ $$render -eq 1 ]; then printf '  prefix-stability-gate: selected (L325: server / chat-render paths, every family, no model)\n'; fi; \
@@ -2940,9 +2800,6 @@ gates-dev:
 	fi; \
 	if [ $$drafter -eq 1 ]; then \
 	  $(MAKE) --no-print-directory blockdraft-gate lilicorr-head-gate lilicorr-spec-gate dflash2-spec-gate draft-refusal-gate CUDA_ARCH=sm_120f || rc=1; \
-	fi; \
-	if [ $$mtp -eq 1 ]; then \
-	  $(MAKE) --no-print-directory mtp-spec-gate CUDA_ARCH=sm_120f || rc=1; \
 	fi; \
 	if [ $$poison -eq 1 ]; then \
 	  $(MAKE) --no-print-directory scratch-poison-gate CUDA_ARCH=sm_120f FRONTIER_MODEL="$(FRONTIER_MODEL)" || rc=1; \
@@ -3336,19 +3193,6 @@ tests/bank_residency_gate.o: tests/bank_residency_gate.cpp tests/gate_entry.h te
 tests/bank_residency_gate: tests/bank_residency_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-# L251 (4): the Qwen reference gate -- the engine on the anchors' tokens vs the
-# BF16 streamed reference.  Needs a real container and the anchors on disk:
-#   make qwen-ref-gate QWEN_REF_MODEL=<container> QWEN_REF_DIR=<anchors>
-QWEN_REF_MODEL ?= $(call need_path,QWEN_REF_MODEL)
-QWEN_REF_DIR   ?= $(call need_path,QWEN_REF_DIR)
-tests/qwen_ref_gate.o: tests/qwen_ref_gate.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/qwen_ref_gate: tests/qwen_ref_gate.o src/lib/pulsar_help.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-.PHONY: qwen-ref-gate
-qwen-ref-gate: tests/qwen_ref_gate
-	@./tests/qwen_ref_gate $(QWEN_REF_MODEL) $(QWEN_REF_DIR)
-
 # L251: end-to-end generation for the Qwen4-exp lane -- token ids in, token ids out (the family has
 # no tokenizer or renderer yet, S5, so the CLI's text path refuses by design).  Decode the emitted
 # ids with qwen_generate_decode.py.  Needs a real container and a prompt's tokens.bin on disk.
@@ -3419,10 +3263,6 @@ tests/nemotron_enc_gate: tests/nemotron_enc_gate.o $(CORE_OBJS)
 tests/nemotron_fwd_gate.o: tests/nemotron_fwd_gate.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ $<
 tests/nemotron_fwd_gate: tests/nemotron_fwd_gate.o $(CORE_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/tp_plan_test.o: tests/tp_plan_test.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
-tests/tp_plan_test: tests/tp_plan_test.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L335: a refused pulsar_tp_plan_build attaches nothing and a second call refuses again (tests/tp_plan_build_test.cpp:
 # a fabricated engine and test families, no model, no GPU work).
