@@ -1397,7 +1397,7 @@ cuda-attn-gates: tests/gqa_attn_gate tests/attn_f16_kernel_test tests/attn_f16_b
 # (L279) is the artifact builder's suite: no GPU, the synthetic builds' golden
 # SHA-256s, and the oracle suites that read the mounted checkpoints' headers.
 host-checks: attn-layout-check engram-hash-check compressor-pool-check \
-             indexer-score-check attn-pack-fixture-check tp-core-test tp-command-free-test container-tests
+             indexer-score-check attn-pack-fixture-check tp-core-test tp-command-free-test container-tests pulsar-eval
 	./pulsar-eval --self-test-extractors
 	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
 
