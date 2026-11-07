@@ -11,7 +11,7 @@ RMS -- the self-calibrating floor vision-tower-gate already grades DeepSeek's to
 Stages: the blocks' input (patch embed + interpolated learned positions), block 0's output, the last block's output,
 the merger's output (the rows the language model receives).  The first case dumps all four; the rest only the merger.
 
-    ~/venvs/q38/bin/python tests/vision_qwen_tower_goldens.py <hf-snapshot> > tests/test-vectors/vision-qwen-tower-goldens.bin
+    ~/tools/venvs/q38/bin/python tests/vision_qwen_tower_goldens.py <hf-snapshot> > tests/test-vectors/vision-qwen-tower-goldens.bin
 """
 import io
 import json

@@ -12,7 +12,7 @@ rounding, the min_pixels upscale, a wide aspect.  Recorded per case: the encoded
 resized size, the patch grid, an FNV-1a of every pixel_values float32 (row-major), and a spread of sample rows in
 full -- so the C++ gate grades the whole array exactly without the array living in the repo.
 
-    ~/venvs/q38/bin/python tests/vision_qwen_pixel_goldens.py <hf-snapshot> > tests/test-vectors/vision-qwen-pixel-goldens.bin
+    ~/tools/venvs/q38/bin/python tests/vision_qwen_pixel_goldens.py <hf-snapshot> > tests/test-vectors/vision-qwen-pixel-goldens.bin
 """
 import io
 import json
