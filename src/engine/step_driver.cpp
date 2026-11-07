@@ -12,6 +12,60 @@
 #include "spec_block.h"
 #include "tp/pulsar_tp.h"
 
+/* ---- L359 diagnostic: PULSAR_STEP_TIMING (1 = step spans, 2 = also per-layer starvation checks) ---------------
+ * Untraced per-step clocks of an EAGER step: host enqueue, the family's host waits inside it (the PLE gather), the
+ * GPU span between timing events at the step's first and last launch, the host's wait for the drain, the host gap
+ * since the previous step's drain, and (2) how many layer boundaries found the GPU already caught up with the host
+ * (the queue empty: a launch-bound or host-bound stall a graph or a stage op could remove).  Means every 64 steps of
+ * a (kind, rows) key on stderr.  Never on a served path unless set. */
+double pulsar_diag_wait_sec = 0.0;
+static int driver_timing_level(void) {
+    static int lvl = -1;
+    if (lvl < 0) {
+        const char *v = getenv("PULSAR_STEP_TIMING");
+        lvl = v && *v ? atoi(v) : 0;
+    }
+    return lvl;
+}
+namespace {
+struct step_timing_acc {
+    int mode;
+    bool verify;
+    uint32_t rows, n;
+    double enq, wait_in, gpu, drain, gap, starved, layers, wall;
+};
+}
+static void driver_timing_note(int mode, bool verify, uint32_t rows, double enq, double wait_in, double gpu,
+                               double drain, double gap, uint32_t starved, uint32_t layers, double wall) {
+    static step_timing_acc acc[32];
+    static uint32_t n_acc = 0;
+    step_timing_acc *a = NULL;
+    for (uint32_t i = 0; i < n_acc; i++)
+        if (acc[i].mode == mode && acc[i].verify == verify && acc[i].rows == rows) a = &acc[i];
+    if (!a) {
+        if (n_acc == 32) return;
+        a = &acc[n_acc++];
+        memset(a, 0, sizeof(*a));
+        a->mode = mode;
+        a->verify = verify;
+        a->rows = rows;
+    }
+    a->n++;
+    a->enq += enq; a->wait_in += wait_in; a->gpu += gpu; a->drain += drain; a->gap += gap;
+    a->starved += starved; a->layers += layers; a->wall += wall;
+    if (a->n == 64) {
+        const double k = 1e3 / a->n;
+        fprintf(stderr,
+                "pulsar: L359 step-timing %s%s rows=%u n=%u: wall %.3f ms = enqueue %.3f (of it host waits %.3f) + "
+                "drain wait %.3f; gpu span %.3f ms; host gap before step %.3f ms; starved boundaries %.2f of %.1f\n",
+                mode == PULSAR_STEP_PREFILL ? "prefill" : "decode", verify ? "/verify" : "", rows, a->n, a->wall * k,
+                a->enq * k, a->wait_in * k, a->drain * k, a->gpu > 0 ? a->gpu / a->n : -1.0, a->gap * k,
+                a->starved / a->n, a->layers / a->n);
+        a->n = 0;
+        a->enq = a->wait_in = a->gpu = a->drain = a->gap = a->starved = a->layers = a->wall = 0;
+    }
+}
+
 /** The engine's family driver ops.  @param e the engine  @return pulsar_family::driver */
 static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family->driver; }
 /** The engine's family arch name, for messages.  @param e the engine  @return pulsar_family::arch */
@@ -343,6 +397,13 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     /* L339: the DELTA fold's table (state_kinds.h THE FOLD) -- a verify step's capture generation, the pending rows
      * every recurrent op of the step applies first -- before the uploads; L289: enqueued, not waited for -- the
      * step's uploads never drain the stream */
+    const int tlevel = driver_timing_level();
+    static double t_prev_end = 0.0;
+    const double t_step0 = tlevel ? now_sec() : 0.0;
+    const double wait0 = pulsar_diag_wait_sec;
+    bool timing_on = false;   /* set once the step is known to run eager (no event query inside a capture) */
+    uint32_t starved = 0, t_layers = 0;
+    double t_enq_done = 0.0;
     bool ok = pulsar_state_step_begin(ss, st.verify) &&
               pulsar_gpu_tensor_write_async(d->row_pos, 0, pos, (uint64_t)n_rows * sizeof(int32_t)) != 0 &&
               pulsar_gpu_tensor_write_async(d->row_bank, 0, bank, (uint64_t)n_rows * sizeof(int32_t)) != 0;
@@ -359,6 +420,7 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     if (ok && st.verify) ok = pulsar_state_verify_capture(ss);
     /* the step's launches: embed, the image rows of a prompt chunk, the plan's blocks, the head list */
     auto launches = [&]() -> bool {
+        if (timing_on) (void)pulsar_gpu_timer_record(0);
         bool lok = ops->embed(&st);
         /* L268: a sync's prefill chunk takes the image rows of the blocks it owns over their pads' embeddings (HF
          * masked_scatter), through the family's writer */
@@ -374,7 +436,13 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
             }
         }
         for (uint32_t il = 0; lok && il < e->plan.n_layer; il++) {
+            if (timing_on && tlevel >= 2 && il > 0 && il < 120) {
+                /* the GPU finished everything queued through layer il-1 before the host queued layer il */
+                if (pulsar_gpu_timer_done(il)) starved++;
+                t_layers++;
+            }
             lok = ops->block[e->plan.kind[il]](&st, il);
+            if (timing_on && tlevel >= 2 && il + 1u < 120) (void)pulsar_gpu_timer_record(il + 1u);
             /* the diagnostic tap after layer il (PULSAR_CUDA_GRAPH_DUMP_PREFIX armed; the family's dump re-checks
              * its own arming, so an unarmed run does no work) */
             if (lok && ops->dump && gpu_graph_debug_dump_enabled()) ops->dump(&st, il);
@@ -385,6 +453,10 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
             for (j = i + 1; j < heads.n && heads.row[i] < st.n_dec && heads.row[j] == heads.row[j - 1] + 1u &&
                             heads.row[j] < st.n_dec; j++) {}
             lok = ops->head(&st, heads.row[i], j - i, i);
+        }
+        if (timing_on) {
+            (void)pulsar_gpu_timer_record(127);
+            t_enq_done = now_sec();
         }
         return lok;
     };
@@ -398,6 +470,7 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     const uint64_t gkey = ok && graphable && family_key && !st.tap && !d->tp && !gpu_graph_debug_dump_enabled()
                               ? driver_graph_key(d, st.verify, n_rows, heads, family_key)
                               : 0;
+    timing_on = tlevel > 0 && ok && !gkey && (mode == PULSAR_STEP_DECODE || st.verify);
     if (ok && gkey) {
         const int seg = pulsar_gpu_seg_enter(gkey);
         if (seg < 0) {
@@ -417,6 +490,13 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     }
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
+    if (timing_on && ok) {
+        const double t_end = now_sec();
+        driver_timing_note((int)mode, st.verify, n_rows, t_enq_done - t_step0, pulsar_diag_wait_sec - wait0,
+                           (double)pulsar_gpu_timer_ms(0, 127), t_end - t_enq_done,
+                           t_prev_end > 0.0 ? t_step0 - t_prev_end : 0.0, starved, t_layers, t_end - t_step0);
+    }
+    if (tlevel) t_prev_end = now_sec();
     /* the family's step end: settles what a failed step left in flight and, on a completed step, its own checks
      * (rule 9) */
     ok = ops->step_end(&st, ok);

@@ -2753,6 +2753,44 @@ int pulsar_gpu_marker_done(int marker) {
     return 1;
 }
 
+/* L359 diagnostic (PULSAR_STEP_TIMING): timing events on the per-thread stream, by slot.  Not on any served path
+ * unless the variable is set; worker-thread only, like the markers above. */
+/// Timing event slots.
+#define PULSAR_GPU_TIMERS 128u
+/// The timing events (created on first use, timing enabled).
+static cudaEvent_t g_timer[PULSAR_GPU_TIMERS];
+
+int pulsar_gpu_timer_record(uint32_t slot) {
+    if (slot >= PULSAR_GPU_TIMERS) return 0;
+    if (!g_timer[slot] && cudaEventCreate(&g_timer[slot]) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaEventRecord(g_timer[slot], cudaStreamPerThread) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+int pulsar_gpu_timer_done(uint32_t slot) {
+    if (slot >= PULSAR_GPU_TIMERS || !g_timer[slot]) return 1;
+    const cudaError_t err = cudaEventQuery(g_timer[slot]);
+    if (err == cudaErrorNotReady) return 0;
+    if (err != cudaSuccess) (void)cudaGetLastError();
+    return 1;
+}
+
+float pulsar_gpu_timer_ms(uint32_t a, uint32_t b) {
+    float ms = -1.0f;
+    if (a >= PULSAR_GPU_TIMERS || b >= PULSAR_GPU_TIMERS || !g_timer[a] || !g_timer[b]) return -1.0f;
+    if (cudaEventElapsedTime(&ms, g_timer[a], g_timer[b]) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return -1.0f;
+    }
+    return ms;
+}
+
 
 
 /// Makes model_map the model mapping: releases every cached range (resetting progress for a new mapping).

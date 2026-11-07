@@ -3914,6 +3914,8 @@ char *pulsar_strdup(const char *s);
 void *xrealloc(void *ptr, size_t size);
 /// @return CLOCK_MONOTONIC time, in seconds.
 double now_sec(void);
+/** L359 diagnostic (PULSAR_STEP_TIMING): seconds the families' host waits inside a step took, summed (step_driver.cpp) */
+extern double pulsar_diag_wait_sec;
 
 /// Fold one step into a lane's exponentially weighted cost fit and refit.
 /// @param f     the fit (NULL is a no-op)

@@ -926,7 +926,9 @@ bool pulsar_qwen_s4_ple(const pulsar_qwen_step *st, uint32_t il) {
     int got;
     {
         PULSAR_NVTX("qwen: PLE gather wait");
+        const double tw = now_sec();   /* L359 diagnostic: a clock read, nothing else */
         got = pulsar_engram_gather_wait(io->pending);
+        pulsar_diag_wait_sec += now_sec() - tw;
     }
     io->pending = NULL;
     if (!got) return fail("the PLE row gather failed (message above)");

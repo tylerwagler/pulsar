@@ -466,6 +466,14 @@ int pulsar_gpu_marker_record(void);
 /** @param marker a handle from pulsar_gpu_marker_record
  *  @return 1 when complete (or invalid), 0 while pending */
 int pulsar_gpu_marker_done(int marker);
+/** L359 diagnostic (PULSAR_STEP_TIMING): record timing event `slot` (< 128) on the per-thread stream.
+ *  @param slot the slot @return 1 recorded, 0 not */
+int pulsar_gpu_timer_record(uint32_t slot);
+/** @param slot the slot @return 1 when the work before its last record has completed (or no such slot), 0 not yet */
+int pulsar_gpu_timer_done(uint32_t slot);
+/** @param a the earlier slot @param b the later slot @return the GPU ms between their last records (both
+ *  completed), or -1 */
+float pulsar_gpu_timer_ms(uint32_t a, uint32_t b);
 
 /** L119 / L306 segment graphs: the CUDA-graph cache of a step's round-invariant stretch, keyed by everything host-side
  *  its launches depend on (the contract, the two kinds of key and the invalidation: pulsar_cuda_runtime.cu).
