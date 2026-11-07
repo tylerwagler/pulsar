@@ -86,7 +86,7 @@ FAMILIES = {
 }
 MUTATIONS = ('arch', 'kv', 'tensor', 'dtype', 'shape', 'native-dtype', 'format', 'dup-name', 'shard-count', 'deep-array',
              'dim-overflow', 'no-kv-arch')
-REFUSAL_WORDS = ('refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
+REFUSAL_WORDS = ('neither', 'refus', 'missing', 'declares', 'expected', 'unsupported', 'disagrees', 'not ', 'unknown', 'no arm', 'want ',
                  'does not')
 SMALL_SIDE_FILE = 64 << 20      # side files up to this size are copied; larger ones are cloned sparse
 SPARSE_PREFIX = 1 << 20         # the bytes a sparse side-file clone keeps (its header)
