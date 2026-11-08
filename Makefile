@@ -342,7 +342,9 @@ nvfp4-rows-bench: tests/nvfp4_rows_gate
 # tools/lilicorr/reference.py `fixture` writes from tools/lilicorr/vllm_dump.py's goldens).  Needs a GPU, the drafter
 # checkpoint and the fixtures: LILICORR_DRAFTER (default /path/to/models/nemotron35-super-lilicorr), LILICORR_FIXTURES.
 LILICORR_DRAFTER ?= $(call need_path,LILICORR_DRAFTER)
-LILICORR_FIXTURES ?= $(call need_path,LILICORR_FIXTURES)
+# L357: the fixtures live in the reference dataset under the drafter's own repo and revision (LILICORR_DRAFTER is its
+# HF cache snapshot): another drafter revision has no fixtures until they are remade
+LILICORR_FIXTURES ?= $(REF_CAPTURES)/lilicorr-head-fixture/$(subst models--,,$(notdir $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(LILICORR_DRAFTER)))))))/$(notdir $(LILICORR_DRAFTER))
 tests/lilicorr_head_gate: tests/lilicorr_head_gate.cu src/cuda/pulsar_cuda_lilicorr.h src/cuda/pulsar_cuda_nvfp4.h \
                           src/cuda/pulsar_cuda_qwen.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lilicorr_head_gate.cu \
@@ -975,7 +977,14 @@ QWEN_GATE_MODEL ?= $(call need_path,QWEN_GATE_MODEL)
 # 2026-09-28) -- matched precision, as DeepSeek's B300 capture is, so a KL here is OUR arithmetic's divergence,
 # not the quantization's.
 # No quotes in these values: gates-dev passes them through a shell variable.
-QWEN_REF_ANCHOR_DIR ?= $(call need_path,QWEN_REF_ANCHOR_DIR)
+# L357 (2026-11-08): every family's reference capture is tools/reference/capture.py's, on the published container's
+# own weights in fp32 with its served head, kept in the private HF dataset ElytronSystems/pulsar-reference-captures
+# (REF_CAPTURES: its snapshot in the HF cache, local.mk).  A capture sits at <container name>/<container revision>/:
+# ref_dir_for derives that from a model's snapshot path, so a republished container has no capture until one is made
+# (the gate fails loudly), and the runner checks capture.json's revision as well.
+REF_CAPTURES ?= $(call need_path,REF_CAPTURES)
+ref_dir_for = $(REF_CAPTURES)/$(subst models--ElytronSystems--,,$(notdir $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(1)))))))/$(notdir $(1))
+QWEN_REF_ANCHOR_DIR ?= $(call ref_dir_for,$(QWEN_GATE_MODEL))
 # Re-recorded 2026-10-21 on the SERVED pack (L305: QWEN_GATE_MODEL, the EXL3 K5 head; the anchors' capture and the
 # 2026-10-07 budgets, e21a0868, were the MTP pack's BF16 head -- code 512 0.076 then), report-only `--dump-kl`, the same
 # numbers at dev ec5bd400 and on the Flare series (gpuq #420):
@@ -992,12 +1001,22 @@ QWEN_REF_ANCHOR_DIR ?= $(call need_path,QWEN_REF_ANCHOR_DIR)
 #          4102 0.42 | 6144 3.13 FLIP (ours 883, gap 2.69) | 16388 1.4e-6 | 31183 8.2e-8   top-1 5/7
 #   confident depths net 1.25e-5 -> 1.47e-6 (-88 %); 2048 -84 %, 4102 -69 %; 512 +47 %, 4096 +24 %, 6144 +463 %.
 #   The flips sit at the known-high (model-sensitive) depths; the code budget is unchanged (it passed).
+# 2026-11-08 (L357): recaptured with tools/reference/capture.py on the published container (f48fa829) in fp32 with its K5
+# head (Tyler: fp32, the served head).  The reference is now exact, so the KL is all our bf16/fp16 arithmetic: higher
+# than against the old matched-precision BF16-source capture wherever the model is sensitive.  Recorded (gpuq #665, engine
+# 12adfe7b = rc2's paths), report-only:
+#   story  512 1.4e-4 | 2048 1.20 FLIP (ref <|im_end|> by 0.67: the near-tie moved) | 4096 4.48 FLIP | 4102 0.55
+#          6144 3.01 FLIP | 16388 1.9e-7 | 31183 2.3e-7        top-1 4/7 (the flips: L251's model-sensitive depths)
+#   code   512 0.018 | 2048 5.0e-3 | 3957 0.107                 top-1 3/3
+# Against the old capture the confident depths moved CLOSER (16388 1.4e-6 -> 1.9e-7, code 512 0.086 -> 0.018); 31183
+# and code 2048 / 3957 farther.  Every row above the tolerance is known-high: top-1 enforced, KL graded for direction by
+# the budgets.
 QWEN_REF_TOL ?= 1e-3
 QWEN_KL_BUDGET_STORY ?= tests/test-vectors/kl-budget-qwen-story.txt
 QWEN_KL_BUDGET_CODE  ?= tests/test-vectors/kl-budget-qwen-code.txt
 QWEN_REF_ANCHORS = --ref-dir $(QWEN_REF_ANCHOR_DIR) --ref-tol $(QWEN_REF_TOL) \
 	--kl-story $(QWEN_KL_BUDGET_STORY) --kl-code $(QWEN_KL_BUDGET_CODE) \
-	--story-known-high 2048,4096,4102,6144 --story-known-flip 4096,6144 --code-known-high 512,3957
+	--story-known-high 2048,4096,4102,6144 --story-known-flip 2048,4096,6144 --code-known-high 512,2048,3957
 .PHONY: session-contract-gate-qwen session-contract-gate-ds session-contract-gate-nemotron
 session-contract-gate-qwen: tests/session_contract_gate
 	PULSAR_MSEQ_BANKS=4 ./tests/session_contract_gate $(QWEN_GATE_MODEL)
@@ -2350,8 +2369,16 @@ GATE_RUNNER_FLAGS ?=
 # L317: Nemotron's LiLiCorr pack is hosted for the legs that loaded it themselves (block-spec, scratch-poison,
 # bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
 # L357: and graph-eager-gate, whose graphed driver steps Qwen does not take (its driver stages none: SKIPped there).
+# L357 (2026-11-08): Gemma 4 is hosted for its two reference gates only (smoke otherwise): its first reference
+# (tools/reference/capture.py, 1492bd71, fp32, the K6 head) matched top-1 10 of 10 (gpuq #665); every story depth past
+# 512 and code 4094 sit above the tolerance -- known-high, graded by the budgets.  Nemotron's reference gates wait on
+# L363 (decisive mispredictions at 3 of 10 depths).
+GEMMA4_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(GEMMA4_GATE_MODEL)) --ref-tol 1e-3 \
+	--kl-story tests/test-vectors/kl-budget-gemma-story.txt --kl-code tests/test-vectors/kl-budget-gemma-code.txt \
+	--story-known-high 2048,4096,4102,6144,16388,30339 --code-known-high 4094
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
-	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate
+	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate \
+	--model $(GEMMA4_GATE_MODEL) --gates=cuda-reference-gate-story,cuda-reference-gate-code $(GEMMA4_REF_ANCHORS)
 # Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
 # itself and is unaffected.
 RUNNER_PRIMARY_ARGS ?=

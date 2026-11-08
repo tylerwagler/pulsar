@@ -1,0 +1,4 @@
+# depth kl   (recorded /home/claude/work/L357/out/refcap/gemma-1492bd71/code.ref.bin)
+512 3.5413343138981538e-07
+2048 9.0424675082884962e-07
+4094 0.023256737693540617
