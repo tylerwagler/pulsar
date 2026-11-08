@@ -110,16 +110,6 @@ name = "live-legs"
 tier = "release"
 
 [[test]]
-name = "preempt-wedge-live"
-tier = "release"
-budget = 300
-
-[[test]]
-name = "resume-fixes-live"
-tier = "release"
-budget = 420
-
-[[test]]
 name = "server-kv-headroom-live"
 tier = "release"
 budget = 240

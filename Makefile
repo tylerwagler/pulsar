@@ -1965,8 +1965,9 @@ SMOKE_GEMMA_MODEL ?= $(call need_path,SMOKE_GEMMA_MODEL)
 SMOKE_EMBED_MODEL ?= $(call need_path,SMOKE_EMBED_MODEL)
 SMOKE_RERANK_MODEL ?= $(call need_path,SMOKE_RERANK_MODEL)
 SMOKE_PARSE_MODEL ?= $(call need_path,SMOKE_PARSE_MODEL)
-SMOKE_MODELS ?= $(QWEN_GATE_MODEL) $(FRONTIER_MODEL) $(LILICORR_GATE_MODEL) $(SMOKE_GEMMA_MODEL) \
-	$(SMOKE_EMBED_MODEL) $(SMOKE_RERANK_MODEL) $(SMOKE_PARSE_MODEL)
+# Qwen and Nemotron (QWEN_GATE_MODEL, LILICORR_GATE_MODEL) take the same check as a live leg on live-legs' warm instance
+# (L357: no server of their own for it); name them here to smoke them alone.
+SMOKE_MODELS ?= $(FRONTIER_MODEL) $(SMOKE_GEMMA_MODEL) $(SMOKE_EMBED_MODEL) $(SMOKE_RERANK_MODEL) $(SMOKE_PARSE_MODEL)
 MODEL_SMOKE_WORK ?= $(CURDIR)/.build/model-smoke
 model-smoke: pulsar-server
 	python3 tests/model_smoke_live.py $(SMOKE_MODELS) --binary ./pulsar-server --work $(MODEL_SMOKE_WORK)
@@ -2016,14 +2017,16 @@ doxygen-gate:
 	  echo "DOXYGEN GATE: FAIL ($$(wc -l < docs/api/doxygen-warnings.log) lines)"; exit 1; fi; \
 	echo "DOXYGEN GATE: PASS (an empty warnings log)"
 
-# L355: what a request resumes from after a disconnect, a spill and a restart.  On its own servers: a budget override and a restart
-# don't fit live-legs' instances.  ~6 min.
+# L355: what a request resumes from after a disconnect, a spill and a restart.  In the release tier it is a live leg
+# (L357: live-legs' hooks instance is the warm one's restart and takes budgets through the test route); this runs it alone,
+# on instances of its own.
 .PHONY: resume-fixes-live
 resume-fixes-live: pulsar-server
 	python3 tests/resume_fixes_live.py $(QWEN_GATE_MODEL) --binary ./pulsar-server
 
-# L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  On
-# its own server: its budget override can't share live-legs' hooks instance with preempt-exact's.  ~4 min.
+# L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back.  In
+# the release tier it is a live leg (L357: its budget through the test route on live-legs' hooks instance); this runs it
+# alone.
 .PHONY: preempt-wedge-live
 preempt-wedge-live: pulsar-server
 	python3 tests/preempt_live.py $(QWEN_GATE_MODEL) wedge --binary ./pulsar-server
@@ -2412,7 +2415,7 @@ GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
 	state-kinds-gate vision-qwen-tower-gate \
 	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	model-smoke cuda-runner-gate live-legs preempt-wedge-live resume-fixes-live server-kv-headroom-live
+	model-smoke cuda-runner-gate live-legs server-kv-headroom-live
 # L220: gates that need no GPU and no model.  They are launched in the
 # background immediately before cuda-runner-gate and collected after it, so
 # they overlap the long GPU tail instead of adding their seconds in front of

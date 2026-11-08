@@ -40,11 +40,13 @@ A_TEXT, B_TEXT, W_TEXT = STORY[:24000], STORY[30000:66000], STORY[70000:78000]
 GEN_A = 1500
 
 
-def chat(srv, text, max_tokens, logprobs=True):
-    """(status, reasoning + text, usage) of one greedy request continuing `text`"""
+def chat(srv, text, max_tokens, logprobs=True, opener=""):
+    """(status, reasoning + text, usage) of one greedy request continuing `text`.  `opener`: the leg's own first line
+    (L357: legs share one server, and each leg's conversations open with text no other leg sends)"""
     st, d = srv.post_json("/v1/chat/completions", {
         "model": "m", "max_tokens": max_tokens, "temperature": 0, "logprobs": logprobs,
-        "messages": [{"role": "user", "content": text + "\n\nContinue this story in your own words."}]}, timeout=3600)
+        "messages": [{"role": "user", "content": opener + text + "\n\nContinue this story in your own words."}]},
+        timeout=3600)
     if st != 200:
         return st, str(d), {}
     m = d["choices"][0]["message"]
@@ -80,6 +82,7 @@ class PreemptLeg(Leg):
     def __init__(self, g, work, margin=1.5, tag=None):   # tag: the old command line's, kept for its callers
         Leg.__init__(self, g, work)
         self.margin, self.budget, self.res = margin, None, {}
+        self.op = "[%s]\n" % self.NAME
         self.per_tok = 0.0
         self.LB = self.LA0 = self.LW = 0
 
@@ -94,7 +97,7 @@ class PreemptLeg(Leg):
         # an earlier leg's) are spilled and A is preempted (L328 (2): bank 0 is a victim like any idle bank).
         lens = {}
         for k, t in (("B", B_TEXT), ("A", A_TEXT), ("W", W_TEXT)):
-            st, _, u = chat(srv, t, 1)
+            st, _, u = chat(srv, t, 1, opener=self.op)
             lens[k] = u.get("prompt_tokens", 0) if st == 200 else 0
         LA, LB, LW = lens["A"] + GEN_A, lens["B"], lens["W"]
         if not self.g.check(0 < LA < LB and LW > 0, "the counted prompts (A + generation %d, B %d, W %d) frame a "
@@ -113,27 +116,28 @@ class PreemptLeg(Leg):
         self.g.note("eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok,
                                                                                     self.budget / 2**30))
 
-    def hook_env(self):
-        return {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(self.budget)} if self.budget else None
-
     def hooked(self, srv):
-        over = srv.grep("KV budget OVERRIDDEN")
-        self.g.check(over, "the hooks instance runs the overridden budget: %s" % (over[0][-80:] if over else "no line"))
-        # the override sizes the ledger's share (kv budget - eager); the ceiling is the smaller of it and the measured
-        # headroom (L319), so the frame holds only when the ledger's share binds: touched budget == override - eager
-        gl = guard(srv)
-        share = self.budget - gl[1] if gl else 0
-        self.g.check(gl is not None and abs(gl[0] - share) < 2**20,
-                     "the overridden ledger share binds the touched budget: %s" %
-                     ("%.2f GiB (ledger share %.2f - eager %.2f = %.2f)" %
-                      (gl[0] / 2**30, self.budget / 2**30, gl[1] / 2**30, share / 2**30) if gl else "guard off"))
+        if not self.g.check(self.budget, "the warm phase framed a budget"):
+            return
         mark = srv.mark()
+        srv.set_guard_budget(self.budget)   # L357: the test route, the run-time PULSAR_SERVER_KV_BUDGET_OVERRIDE
+        over = "KV budget OVERRIDDEN" in srv.since(mark)
+        self.g.check(over, "the hooks instance runs the overridden budget (test route)")
         spills0 = srv.metrics().get("pulsar:bank_spills_total", 0.0)
-        chat(srv, W_TEXT, 1)
-        t_w = srv.metrics().get("pulsar:kv_touched_bytes", 0.0)   # W (and bank 0's warmup, any earlier leg's bank)
+        chat(srv, W_TEXT, 1, opener=self.op)
+        # the override sizes the ledger's share (kv budget - eager); the live budget is the smaller of it and the
+        # measured headroom (L319), so the frame holds only when the ledger's share binds: live budget == override -
+        # eager (read after W: the scheduler refreshes the gauge at its next decision)
+        m = srv.metrics()
+        live, eager = m.get("pulsar:kv_touched_budget_bytes", 0.0), m.get("pulsar:kv_eager_floor_bytes", 0.0)
+        share = self.budget - eager
+        self.g.check(live > 0 and abs(live - share) < 2**20,
+                     "the overridden ledger share binds the live touched budget: %.2f GiB (ledger share %.2f - eager "
+                     "%.2f = %.2f)" % (live / 2**30, self.budget / 2**30, eager / 2**30, share / 2**30))
+        t_w = m.get("pulsar:kv_touched_bytes", 0.0)   # W (and bank 0's warmup, any earlier leg's bank)
         self.g.check(t_w >= self.per_tok * self.LW - 2**20,
                      "touched after W %.3f GiB holds W's %.3f" % (t_w / 2**30, self.per_tok * self.LW / 2**30))
-        th = threading.Thread(target=lambda: self.res.__setitem__("A", chat(srv, A_TEXT, GEN_A)))
+        th = threading.Thread(target=lambda: self.res.__setitem__("A", chat(srv, A_TEXT, GEN_A, opener=self.op)))
         th.start()
         t0 = time.time()   # A decoding: a slot's phase reads decode on /metrics
         while time.time() - t0 < 600 and not slot_decoding(srv):
@@ -146,7 +150,7 @@ class PreemptLeg(Leg):
         self.g.check(self.LA0 - 64 <= a_tok <= self.LA0 + GEN_A + 64,
                      "touched at B's arrival %.3f GiB = %.3f before A + A at ~%.0f tokens (prompt %d, decoding)" %
                      (touched / 2**30, t_w / 2**30, a_tok, self.LA0))
-        self.res["B"] = chat(srv, B_TEXT, 1)
+        self.res["B"] = chat(srv, B_TEXT, 1, opener=self.op)
         th.join()
         log = srv.since(mark)
         mt = srv.metrics()
@@ -172,7 +176,7 @@ class PreemptLeg(Leg):
         if "A" not in self.res:
             self.g.check(False, "no preempted A to compare (the hooks phase did not run)")
             return
-        st, alone, u = chat(srv, A_TEXT, GEN_A)
+        st, alone, u = chat(srv, A_TEXT, GEN_A, opener=self.op)
         check_fresh(self.g, "A uninterrupted", u)
         got = self.res["A"]
         self.g.check(got[0] == 200 and st == 200 and got[1] == alone,
@@ -194,6 +198,7 @@ class PreemptWedgeLeg(Leg):
     def __init__(self, g, work, margin=1.5, tag=None):
         Leg.__init__(self, g, work)
         self.margin, self.budget, self.res = margin, None, {}
+        self.op = "[%s]\n" % self.NAME
         self.h_text = ""
 
     def warm(self, srv):
@@ -203,14 +208,14 @@ class PreemptWedgeLeg(Leg):
         eager, per_tok = pr
         lens = {}
         for k, t in (("A", A_TEXT), ("B", B_TEXT), ("K", W_TEXT)):
-            st, _, u = chat(srv, t, 1)
+            st, _, u = chat(srv, t, 1, opener=self.op)
             lens[k] = u.get("prompt_tokens", 0) if st == 200 else 0
         LA, LB, LK = lens["A"], lens["B"], lens["K"]
         total = LB * self.margin
         # H's growth is past what K leaves of the budget and within the budget: sized from a counted stretch of the story
         rate = len(B_TEXT) / float(LB)
         self.h_text = W_TEXT + STORY[78000:78000 + int((total - 0.3 * LK) * rate)]
-        st, _, u = chat(srv, self.h_text, 1)
+        st, _, u = chat(srv, self.h_text, 1, opener=self.op)
         LH = u.get("prompt_tokens", 0) if st == 200 else 0
         need = LH - LK
         if not self.g.check(LA + LB > total and LB + LK + self.GEN_B < total and LK + need > total and need <= total,
@@ -221,17 +226,17 @@ class PreemptWedgeLeg(Leg):
         self.g.note("eager %.2f GiB, %.0f B a token: budget override %.2f GiB" % (eager / 2**30, per_tok,
                                                                                     self.budget / 2**30))
 
-    def hook_env(self):
-        return {"PULSAR_SERVER_KV_BUDGET_OVERRIDE": str(self.budget)} if self.budget else None
-
     def _bg(self, name, *args):
-        th = threading.Thread(target=lambda: self.res.__setitem__(name, chat(self.srv, *args)), daemon=True)
+        th = threading.Thread(target=lambda: self.res.__setitem__(name, chat(self.srv, *args, opener=self.op)), daemon=True)
         th.start()
         return th
 
     def hooked(self, srv):
+        if not self.g.check(self.budget, "the warm phase framed a budget"):
+            return
         self.srv = srv
         mark = srv.mark()
+        srv.set_guard_budget(self.budget)   # L357: the test route, the run-time PULSAR_SERVER_KV_BUDGET_OVERRIDE
         ta = self._bg("A", A_TEXT, GEN_A)
         t0 = time.time()
         while time.time() - t0 < 600 and not slot_decoding(srv):
@@ -246,7 +251,7 @@ class PreemptWedgeLeg(Leg):
         t0 = time.time()
         while time.time() - t0 < 600 and not slot_decoding(srv):
             time.sleep(0.25)
-        st, _, _ = chat(srv, W_TEXT, 1)
+        st, _, _ = chat(srv, W_TEXT, 1, opener=self.op)
         self.g.check(st == 200, "K answered beside B: %d" % st)
         self.g.check(tb.is_alive(), "B is still decoding when H arrives (else A is back and nothing is parked)")
         th = self._bg("H", self.h_text, 1)
@@ -264,7 +269,7 @@ class PreemptWedgeLeg(Leg):
         ta.join(1200)
         self.g.check(not ta.is_alive() and self.res.get("A", (0,))[0] == 200, "A readmitted and answered")
         self.g.check("READMITTED" in srv.since(mark), "A's readmission in the log")
-        st, _, _ = chat(srv, W_TEXT[:2000], 1) if not th.is_alive() else (0, "", {})
+        st, _, _ = chat(srv, W_TEXT[:2000], 1, opener=self.op) if not th.is_alive() else (0, "", {})
         self.g.check(st == 200, "the queue moves after it: %d" % st)
 
 

@@ -1276,6 +1276,15 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.started = time(NULL);          /* uptime origin reported by /health */
+    /* L357: the /test/ routes (http_server.cpp) answer only when the test harness asks for them; said, so a
+     * production log shows it if they were ever on */
+    {
+        const char *tr = getenv("PULSAR_SERVER_TEST_ROUTES");
+        s.test_routes = tr && !strcmp(tr, "1");
+        if (s.test_routes)
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: test routes ON (PULSAR_SERVER_TEST_ROUTES=1): "
+                       "POST /test/guard-budget answers -- never set this in production");
+    }
     /* Slot 0 is provisioned here at the configured --ctx-size over the ONE
      * session (s.sess). Tier-2: if the created session is bank-pooled
      * (PULSAR_MSEQ_BANKS>1), every other slot maps to one of its banks; the

@@ -10,8 +10,11 @@ loads for nine legs.  Here every model gets, in order, one instance per configur
 once (two engines do not fit on GB10):
 
   warm    the shared server: every leg's main part, one leg after another (LEGS order)
-  hooks   only if a leg needs a server-wide test hook (the grammar's injected failure, the KV-budget override): one
-          instance carrying every such hook of the model's legs -- each hook touches only what its leg drives
+  hooks   only if a leg has a hooked part: one instance carrying every env hook of the model's legs (the grammar's
+          injected failure) -- each touches only what its leg drives -- and the test routes (PULSAR_SERVER_TEST_ROUTES=1),
+          through which each budget leg sets the guard's KV budget for its own phase (Server.set_guard_budget; set back
+          to the startup budget after every phase).  L357: it starts on the warm instance's disk tier, so it is also
+          the warm instance's RESTART: a leg may check what a shutdown persisted (resume-fixes' boundary case)
   fresh   only if a leg grades reuse against a fresh server: one instance, an empty disk tier, for every leg's
           reference request.  Each leg's conversations open with text no other leg sends, and each reference
           request must report 0 cached prompt tokens (live_server.check_fresh), or the comparison says nothing
@@ -23,7 +26,7 @@ leg names the instance each phase ran on.
 
 PULSAR_GATES_SECTIONS=FILE: one line `SECONDS<TAB>live-legs [MODEL]` per model is appended (make gates' wall-time
 budget, docs/QA_BEFORE_RELEASES.md).  Exit 0 only when every leg passed."""
-import argparse, importlib, os, sys, time, traceback
+import argparse, importlib, os, shutil, sys, time, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from live_server import Grader, Server, StartError  # noqa: E402
@@ -63,6 +66,15 @@ LEGS = [
     # prefix prefills it once, every reply == the request alone
     ("fanout-prefix", "fanout_prefix_live", "FanoutPrefixLeg", {}, ("qwen",)),
     ("opencode-turns", "opencode_turns_live", "OpencodeLeg", {}, ("nemotron",)),
+    # L357: the published-model smoke of the models with legs (make model-smoke runs the rest, each on its own server)
+    ("model-smoke", "model_smoke_live", "SmokeLeg", {}, ("qwen", "nemotron")),
+    # L353 no. 5 (make preempt-wedge-live runs it alone): a parked decoder holds no KV, so nothing may wait on its end.
+    # Its budget is set through the test route on the hooks instance (L357: it had two instances of its own)
+    ("preempt-wedge", "preempt_live", "PreemptWedgeLeg", {"margin": 1.5}, ("qwen",)),
+    # L355 (make resume-fixes-live runs it alone): disconnect, spill, boundary.  Last: its boundary bank is the newest
+    # when the warm instance's shutdown persists, and the hooks instance (the restart) reads it first (L357: it had six
+    # instances of its own)
+    ("resume-fixes", "resume_fixes_live", "ResumeFixesLeg", {}, ("qwen",)),
 ]
 
 
@@ -88,13 +100,13 @@ def run_model(key, model, legs, binary, work, port, cfg):
         secs[name] += time.time() - p0
         print("--- live leg %s [%s] %s phase: %.0f s" % (name, key, inst, time.time() - p0), flush=True)
 
-    def instance(inst, env, fn_of):
+    def instance(inst, env, fn_of, kv_dir=None, after=None):
         todo = [(n, l) for n, l in legs if fn_of(l) and n not in dead]
         if not todo:
             return
         try:
             srv = Server(binary, model, work, "%s-%s" % (key, inst), port, cfg["ctx"], cfg["banks"], env,
-                         extra=cfg.get("extra", ()))
+                         extra=cfg.get("extra", ()), kv_dir=kv_dir)
         except StartError as e:
             print(str(e), flush=True)
             for n, l in todo:
@@ -104,22 +116,36 @@ def run_model(key, model, legs, binary, work, port, cfg):
         try:
             for n, l in todo:
                 phase(srv, inst, n, l, fn_of(l))
+                if after and srv.alive():
+                    after(srv, n)
         finally:
             srv.stop()
             print("# server %s stopped" % srv.name, flush=True)
 
-    instance("warm", None, lambda l: l.warm)
-    env = {}
-    for n, l in legs:
-        if n in dead:
-            continue
-        for k, v in (l.hook_env() or {}).items():
-            if env.get(k, v) != v:
-                raise SystemExit("live-legs: two legs of %s need %s=%s and %s -- they cannot share the hooks instance"
-                                 % (key, k, env[k], v))
-            env[k] = v
-    if env:
-        instance("hooks", env, lambda l: l.hooked if l.hook_env() else None)
+    # L357: the warm instance's disk tier outlives it -- the hooks instance starts on it (a restart) -- and goes after
+    store = os.path.join(work, "%s-kvstore" % key)
+    shutil.rmtree(store, ignore_errors=True)
+    try:
+        instance("warm", None, lambda l: l.warm, kv_dir=store)
+        env = {"PULSAR_SERVER_TEST_ROUTES": "1"}
+        for n, l in legs:
+            if n in dead:
+                continue
+            for k, v in (l.hook_env() or {}).items():
+                if env.get(k, v) != v:
+                    raise SystemExit("live-legs: two legs of %s need %s=%s and %s -- they cannot share the hooks "
+                                     "instance" % (key, k, env[k], v))
+                env[k] = v
+
+        def budget_back(srv, n):
+            # a budget leg's budget is its phase's alone: the next leg starts on the startup budget
+            try:
+                srv.set_guard_budget(0)
+            except Exception as e:
+                print("# [%s] the guard budget could not be set back: %s" % (n, e), flush=True)
+        instance("hooks", env, lambda l: l.hooked, kv_dir=store, after=budget_back)
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
     instance("fresh", None, lambda l: l.cold if l.fresh else None)
     out = {n: (l.g.ok and l.g.n > 0, secs[n]) for n, l in legs}
     sections = os.environ.get("PULSAR_GATES_SECTIONS")

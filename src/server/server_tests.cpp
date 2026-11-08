@@ -14006,6 +14006,14 @@ static void test_guard_budget_reads_live_memavailable(void) {
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     s.guard_avail = KvBytes{};                  /* unreadable: fail closed */
     TEST_ASSERT(s.guard_budget() == KvBytes{});
+    /* L357: the test route's ledger budget stands in for the startup one: 33 − eager 31 = 2 GiB binds ... */
+    s.guard_avail = kvb(F + 20 * GiB);
+    s.guard_test_budget = 33 * GiB;
+    TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));
+    s.guard_test_budget = 100 * GiB;            /* ... never above the startup ceiling ... */
+    TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
+    s.guard_test_budget = 0;                    /* ... and 0 restores the startup budget */
+    TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
 }
 
 /* L338: a discrete card's guard reads the device and keeps PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES of it free; the

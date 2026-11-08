@@ -1537,6 +1537,38 @@ void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
+    /* L357: the test routes, only under PULSAR_SERVER_TEST_ROUTES=1 (said at startup); without it they fall through
+     * to the unknown-path answer like any other path.  POST /test/guard-budget, body a decimal byte count: the guard's
+     * ledger budget from now on, as PULSAR_SERVER_KV_BUDGET_OVERRIDE would have set it at startup (0 restores the
+     * startup budget).  The startup ceiling still caps it, so it can only lower what the guard keeps. */
+    if (s->test_routes && !strcmp(hr.method, "POST") && !strcmp(hr.path, "/test/guard-budget")) {
+        char num[32] = {0};
+        const size_t n = hr.body_len < sizeof(num) - 1 ? hr.body_len : sizeof(num) - 1;
+        if (hr.body) memcpy(num, hr.body, n);
+        char *end = NULL;
+        const unsigned long long b = strtoull(num, &end, 10);
+        while (end && (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t')) end++;
+        if (!s->guard_enabled) {
+            http_error(fd, 409, "the guard is off on this server: no budget to set");
+        } else if (n == 0 || end == num || (end && *end)) {
+            http_error(fd, 400, "/test/guard-budget: the body is a decimal byte count (0 restores the startup budget)");
+        } else {
+            __atomic_store_n(&s->guard_test_budget, (uint64_t)b, __ATOMIC_RELAXED);
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            if (b)
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test route)",
+                           (double)b / gib);
+            else
+                server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget back to the startup %.2f GiB (test "
+                           "route)", (double)s->guard_kv_budget.raw() / gib);
+            char out[96];
+            snprintf(out, sizeof(out), "{\"guard_budget_bytes\":%llu}",
+                     b ? b : (unsigned long long)s->guard_kv_budget.raw());
+            http_response(fd, 200, "application/json", out);
+        }
+        http_request_free(&hr);
+        goto done;
+    }
     const char *model_path_prefix;
     model_path_prefix = "/v1/models/";
     size_t model_path_prefix_len;

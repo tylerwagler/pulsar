@@ -163,9 +163,11 @@ KvBytes server::guard_budget() {
         guard_avail = KvBytes{server_guard_avail_bytes(guard_discrete)};
         guard_avail_at = now;
     }
+    /* L357: the test route's ledger budget, when one is set, stands in for the startup one (the ceiling still caps) */
+    const uint64_t test_budget = __atomic_load_n(&guard_test_budget, __ATOMIC_RELAXED);
     const KvBytes live =
-        server_guard_touched_budget(guard_kv_budget, guard_eager_bytes, pulsar_session_touched_kv_bytes(sess),
-                                    guard_avail, guard_floor);
+        server_guard_touched_budget(test_budget ? KvBytes{test_budget} : guard_kv_budget, guard_eager_bytes,
+                                    pulsar_session_touched_kv_bytes(sess), guard_avail, guard_floor);
     const KvBytes b = live < guard_touched_ceiling ? live : guard_touched_ceiling;
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
     const KvBytes step{512ull << 20};

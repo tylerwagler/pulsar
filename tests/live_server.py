@@ -26,8 +26,11 @@ class StartError(RuntimeError):
 
 class Server:
     def __init__(self, binary, model, work, name, port, ctx, banks=None, env=None, extra=(), start_timeout=900.0,
-                 kv_disk=True):
+                 kv_disk=True, kv_dir=None):
+        """kv_dir: a disk tier the caller owns (L357: live-legs' hooks instance starts on the warm instance's store, a
+        restart); stop() leaves it.  Without it the instance's own <dir>/kv, removed at stop()."""
         self.model, self.name, self.port, self.ctx, self.banks = model, name, port, ctx, banks
+        self.kv_dir = kv_dir
         self.env_extra = dict(env or {})
         self.url = "http://127.0.0.1:%d" % port
         self.dir = os.path.join(work, name)
@@ -41,7 +44,7 @@ class Server:
             env["PULSAR_MSEQ_BANKS"] = str(banks)
         env.update(self.env_extra)
         cmd = [binary, "-m", model, "--ctx", str(ctx), "--host", "127.0.0.1", "--port", str(port)]
-        cmd += ["--kv-disk-dir", os.path.join(self.dir, "kv")] if kv_disk else ["--no-kv-disk"]
+        cmd += ["--kv-disk-dir", kv_dir or os.path.join(self.dir, "kv")] if kv_disk else ["--no-kv-disk"]
         cmd += list(extra)
         drop_caches()
         t0 = time.time()
@@ -126,6 +129,18 @@ class Server:
         if not self.log.closed:
             self.log.close()
         shutil.rmtree(os.path.join(self.dir, "kv"), ignore_errors=True)   # the disk tier is scratch; the log stays
+
+    def set_guard_budget(self, nbytes):
+        """L357: the guard's ledger budget from now on (POST /test/guard-budget; the server must run with
+        PULSAR_SERVER_TEST_ROUTES=1), as PULSAR_SERVER_KV_BUDGET_OVERRIDE would set it at startup; 0 restores the
+        startup budget.  Raises unless the server took it."""
+        req = urllib.request.Request(self.url + "/test/guard-budget", data=str(int(nbytes)).encode(), method="POST",
+                                     headers={"Content-Type": "text/plain"})
+        try:
+            body = urllib.request.urlopen(req, timeout=30).read().decode()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError("set_guard_budget(%d): HTTP %d %s" % (nbytes, e.code, e.read()[:200]))
+        return json.loads(body)["guard_budget_bytes"]
 
 
 class Grader:

@@ -2346,6 +2346,12 @@ struct server {
     bool         guard_discrete;         ///< L338: the KV is a discrete card's: the readings are the device's
     double       guard_avail_at;         ///< when it was read (server_now_sec); re-read at most every 0.25 s
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
+    /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
+     *  stands).  The run-time twin of PULSAR_SERVER_KV_BUDGET_OVERRIDE, so the live legs that lower the budget share
+     *  one server instead of starting one each.  Written by a client thread, read by guard_budget() (__atomic). */
+    uint64_t     guard_test_budget;
+    /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
+    bool         test_routes;
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)

@@ -13,11 +13,14 @@ models with "encoder" / "parser"; anything else is a chat model):
            ranks first;
   parse    /v1/parse, a small generated PNG with no text (a grey square on white) -- 200 and a non-empty JSON body.
 A model whose server does not start is a FAIL naming it; there is no SKIP.  One PASS / FAIL line per model; exit 0
-only when every model passed.  DeepSeek V4 is smoke-only since 2026-11-07: this is its release check."""
+only when every model passed.  DeepSeek V4 is smoke-only since 2026-11-07: this is its release check.
+
+L357: the models live-legs already runs (Qwen, Nemotron) take the same chat check as a leg on its warm instance
+(SmokeLeg), so the release tier starts no server of theirs for it; make model-smoke's SMOKE_MODELS leaves them out."""
 import argparse, base64, json, math, os, re, struct, sys, time, urllib.request, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from live_server import Server, StartError  # noqa: E402
+from live_server import Leg, Server, StartError  # noqa: E402
 
 CHAT_Q = "What is 7+5? Answer with the number only."
 RERANK_Q = "capital of France"
@@ -63,6 +66,18 @@ def smoke_chat(srv):
         return False, "chat: HTTP %d %s" % (st, json.dumps(j)[:300])
     content = ((j.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     return re.search(r"\b12\b", content) is not None, "chat answered %r" % content[:120]
+
+
+class SmokeLeg(Leg):
+    """The chat smoke on live-legs' warm instance (production's flags): the model started, and it answers"""
+    NAME = "model-smoke"
+
+    def warm(self, srv):
+        kind, _ = kind_of(health(srv))
+        if not self.g.check(kind == "chat", "the warm instance serves a chat model: %s" % kind):
+            return
+        ok, what = smoke_chat(srv)
+        self.g.check(ok, "%s: %s" % (srv.model, what))
 
 
 def smoke_embed(srv, dim):
