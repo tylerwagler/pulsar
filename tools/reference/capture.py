@@ -134,7 +134,12 @@ class Decoder:
         """exllamav3's bytes -> the weight they encode, fp32 [out, in], exact to fp32 rounding"""
         np, torch = self.np, self.torch
         from exllamav3.modules.quant.exl3 import LinearEXL3
-        from exllamav3.modules.quant.exl3_lib.quantize import preapply_had_l_, preapply_had_r_, had_k, had_n
+        from exllamav3.modules.quant.exl3_lib import quantize as Q
+        had_k, had_n = Q.had_k, Q.had_n
+        # exllamav3 <= 1.5 returns a new tensor in the input's dtype (preapply_had_l); later ones work in place
+        # (preapply_had_l_) and return it too.  Either computes in fp32 here, the input being fp32.
+        had_l = getattr(Q, "preapply_had_l", None) or Q.preapply_had_l_
+        had_r = getattr(Q, "preapply_had_r", None) or Q.preapply_had_r_
         tb, sb = (k // 16) * (n // 16) * words * 2, (k + n) * 2
         if len(blob) != tb + sb:
             sys.exit("capture: exl3 blob %d != trellis %d + scales %d (k=%d n=%d words=%d)" % (len(blob), tb, sb, k, n, words))
@@ -144,9 +149,10 @@ class Decoder:
         lin = LinearEXL3(None, k, n, suh=suh.to(self.dev), svh=svh.to(self.dev), trellis=tr.to(self.dev),
                          mul1=torch.zeros(1, dtype=torch.int32, device=self.dev))   # mul1: the codebook (a flag)
         w = lin.get_inner_weight_tensor().float()          # [in, out]: the codebook's values, exact in fp16
-        preapply_had_l_(w, had_k)                          # in place; computes in fp32, and w is fp32
+        w = had_l(w, had_k)
+        assert w.dtype == self.torch.float32
         w *= suh.to(self.dev).float().unsqueeze(1)
-        preapply_had_r_(w, had_n)
+        w = had_r(w, had_n)
         w *= svh.to(self.dev).float().unsqueeze(0)
         if words not in self.checked:
             # once per layout: exllamav3's own fp16 decode must agree to fp16 rounding -- an order or scale mistake in
