@@ -124,6 +124,9 @@ class Decoder:
     def producers(self):
         if self._producers is None:
             import importlib.util
+            cdir = os.path.join(ROOT, "tools", "container")
+            if cdir not in sys.path:
+                sys.path.insert(0, cdir)        # producers.py imports its siblings (exl3_rates) by name
             spec = importlib.util.spec_from_file_location("pulsar_producers",
                                                           os.path.join(ROOT, "tools", "container", "producers.py"))
             self._producers = importlib.util.module_from_spec(spec)
@@ -643,9 +646,14 @@ def sidecar(torch, tok, depths, rows):
 def versions(torch):
     import transformers
     v = {"transformers": transformers.__version__, "torch": torch.__version__, "python": sys.version.split()[0]}
-    tdir = os.path.dirname(transformers.__file__)
-    r = subprocess.run(["git", "-C", tdir, "rev-parse", "HEAD"], capture_output=True, text=True)
-    v["transformers_git"] = r.stdout.strip() or None   # a dev build: the version string alone does not name it
+    # a dev build: the version string alone does not name it -- pip's record of where it came from does
+    v["transformers_git"] = None
+    try:
+        from importlib.metadata import distribution
+        du = json.loads(distribution("transformers").read_text("direct_url.json") or "{}")
+        v["transformers_git"] = (du.get("vcs_info") or {}).get("commit_id")
+    except Exception:
+        pass
     try:
         import exllamav3
         v["exllamav3"] = getattr(exllamav3, "__version__", None)
