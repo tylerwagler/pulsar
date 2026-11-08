@@ -2212,6 +2212,19 @@ cuda-reference-gate: tests/gates_runner
 # 2026-11-06 (L354), a second exception, Tyler's: the CUDA 13.5 + CUTLASS v4.8.1 toolchain graded story NET +0.78% (1.958e-5 ->
 # 1.973e-5), all of it depth 4102 (2.162e-6 -> 2.316e-6), every top-1 matching, code unmoved.  "we're not gonna stay pinned
 # on an old toolchain. just regrade it and reset the baseline."  The cause inside the toolchain was not split.
+# L357: the same record for any family against its tools/reference/capture.py capture -- REF_MODEL, REF_DIR (the
+# capture's directory, capture.json included), REF_FAMILY names the files (tests/test-vectors/kl-budget-<family>-*.txt).
+# Report-only like the one below; the budgets it writes are graded for DIRECTION in review before they land.
+.PHONY: ref-kl-record
+ref-kl-record: tests/prefill_bitexact_gate
+	@if [ -z "$(REF_MODEL)" ] || [ -z "$(REF_FAMILY)" ] || [ ! -f "$(REF_DIR)/capture.json" ]; then \
+		echo "REFUSING: set REF_MODEL, REF_FAMILY and REF_DIR (a capture with its capture.json)"; exit 1; fi
+	./tests/prefill_bitexact_gate $(REF_MODEL) --check-reference $(REF_DIR)/story.ref.bin $(REF_DIR)/story.tokens.bin \
+		--dump-kl tests/test-vectors/kl-budget-$(REF_FAMILY)-story.txt
+	./tests/prefill_bitexact_gate $(REF_MODEL) --check-reference $(REF_DIR)/code.ref.bin $(REF_DIR)/code.tokens.bin \
+		--dump-kl tests/test-vectors/kl-budget-$(REF_FAMILY)-code.txt
+	@echo "KL budgets recorded for $(REF_FAMILY) against $(REF_DIR) -- grade them, then commit with the reason"
+
 .PHONY: cuda-reference-gate-budget
 cuda-reference-gate-budget:
 	@if [ -z "$(PULSAR_REF_DIR)" ] || [ ! -f "$(PULSAR_REF_DIR)/story.ref.bin" ]; then \
