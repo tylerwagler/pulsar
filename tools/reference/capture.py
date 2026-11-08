@@ -27,7 +27,7 @@ Protocol (unchanged from the DeepSeek and Qwen anchors, so the gates read it as 
     the cached model's revision differs), this tool's sha256, the pulsar git sha, the versions (transformers is a dev
     build: its git sha too), the decode and the dtype, and per prompt its depths, fnv and sha256s.
 
-Families (an adapter each: embed, the layer, the final norm / mixer, the head): qwen4_exp.  Others refuse by name
+Families (an adapter each: embed, the layer, the final norm / mixer, the head): qwen4_exp, gemma4.  Others refuse by name
 until their adapter is written and checked (--check).
 
 Runs on the GB10 in a GPU window (production stopped): it refuses while any other process holds the GPU.
@@ -304,17 +304,132 @@ class QwenAdapter:
         return self.cfg.indexer_budget
 
     def chunk_sdpa(self, q_chunk):
-        from transformers.integrations import sdpa_attention as SA
-        orig = SA.sdpa_attention_forward
+        chunk_sdpa(self.M, self.torch, q_chunk)
 
-        def fwd(module, query, key, value, attention_mask, **kw):
-            T = query.shape[2]
-            if T <= q_chunk:
-                return orig(module, query, key, value, attention_mask, **kw)
-            outs = [orig(module, query[:, :, c0:c0 + q_chunk], key, value, attention_mask[:, :, c0:c0 + q_chunk], **kw)[0]
-                    for c0 in range(0, T, q_chunk)]
-            return self.torch.cat(outs, dim=1), None
-        self.M.ALL_ATTENTION_FUNCTIONS["sdpa"] = fwd
+
+def chunk_sdpa(M, torch, q_chunk):
+    """HF's own sdpa_attention_forward, called on slices of `q_chunk` query rows (the mask's matching rows): a batching
+    change only -- fp32 scores over a 31k-token key range would not fit whole"""
+    from transformers.integrations import sdpa_attention as SA
+    orig = SA.sdpa_attention_forward
+
+    def fwd(module, query, key, value, attention_mask, **kw):
+        T = query.shape[2]
+        if T <= q_chunk:
+            return orig(module, query, key, value, attention_mask, **kw)
+        outs = [orig(module, query[:, :, c0:c0 + q_chunk], key, value, attention_mask[:, :, c0:c0 + q_chunk], **kw)[0]
+                for c0 in range(0, T, q_chunk)]
+        return torch.cat(outs, dim=1), None
+    M.ALL_ATTENTION_FUNCTIONS["sdpa"] = fwd
+
+
+class GemmaAdapter:
+    """gemma4 (Gemma 4 26B-A4B): Gemma4TextModel.forward's own steps, a layer at a time -- the scaled embedding, one
+    rotary per layer type, full and sliding causal masks (masking_utils' rule: kv > q - window), the dense MLP beside
+    the routed experts, the final norm, the container's K6 head (served; HF ties the source's head to the embedding)
+    and the logit softcap, all in fp32.  The container stores the dense MLP 2176 wide and the experts 768 wide (HF:
+    2112 and 704; tools/container/gemma4.py pads with svh = 0): sliced back here, the padded rows checked to be zero.
+    The JEV adapter and the DFlash drafter in the container are not the model and are not read."""
+    PFX = "model.language_model."
+
+    def __init__(self, c, dec, a):
+        import torch
+        from transformers import AutoConfig
+        from transformers.models.gemma4 import modeling_gemma4 as M
+        self.c, self.dec, self.torch, self.M = c, dec, torch, M
+        cfg = AutoConfig.from_pretrained(c.d).text_config
+        cfg._attn_implementation = "sdpa"
+        self.cfg = cfg
+        if cfg.hidden_size_per_layer_input or cfg.num_kv_shared_layers:
+            sys.exit("capture: this Gemma has per-layer inputs or shared KV layers: the adapter does not stream those")
+        # Gemma4TextScaledWordEmbedding multiplies by sqrt(hidden) cast to the WEIGHT's dtype: the published weight is
+        # bf16, so the model's constant is bf16(sqrt(2816)) = 53 (the engine's too) -- not fp32's 53.066
+        self.embed_scale = float(torch.tensor(cfg.hidden_size ** 0.5).to(torch.bfloat16))
+        self.rotary = None
+
+    def layers(self):
+        return self.cfg.num_hidden_layers
+
+    def embed(self, seqs):
+        emb = self.dec.tensor(self.PFX + "embed_tokens.weight").view(-1, self.cfg.hidden_size)
+        self.rotary = self.M.Gemma4TextRotaryEmbedding(self.cfg).to(self.dec.dev)
+        hs = [(emb[ids.to(self.dec.dev)] * self.embed_scale).unsqueeze(0) for ids in seqs]
+        del emb
+        return hs
+
+    def _sliced(self, w, rows=None, cols=None, what=""):
+        torch = self.torch
+        if rows is not None:
+            pad = w[rows:]
+            if pad.numel() and not bool((pad == 0).all()):
+                sys.exit("capture: %s: the padded rows past %d are not zero -- the padding is not what this reads" %
+                         (what, rows))
+            w = w[:rows]
+        if cols is not None:
+            w = w[:, :cols]
+        return w
+
+    def build(self, i, seqs):
+        torch, M, cfg, dec = self.torch, self.M, self.cfg, self.dec
+        pre = "%slayers.%d." % (self.PFX, i)
+        I, E = cfg.intermediate_size, cfg.moe_intermediate_size
+
+        def special(local, t):
+            if local in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
+                return self._sliced(dec.tensor(pre + local), rows=I, what=pre + local)
+            if local == "mlp.down_proj.weight":
+                return self._sliced(dec.tensor(pre + local), cols=I)
+            if local == "experts.gate_up_proj":
+                g, u = dec.c.experts[pre + "experts.gate_proj"], dec.c.experts[pre + "experts.up_proj"]
+                out = torch.empty(t.shape, dtype=torch.float32, device=dec.dev)
+                for e in range(t.shape[0]):
+                    out[e, :E] = self._sliced(dec.expert(g, e), rows=E, what="%s gate %d" % (pre, e))
+                    out[e, E:] = self._sliced(dec.expert(u, e), rows=E, what="%s up %d" % (pre, e))
+                return out
+            if local == "experts.down_proj":
+                d = dec.c.experts[pre + "experts.down_proj"]
+                out = torch.empty(t.shape, dtype=torch.float32, device=dec.dev)
+                for e in range(t.shape[0]):
+                    out[e] = self._sliced(dec.expert(d, e), cols=E)
+                return out
+            return None
+        with torch.device("meta"):
+            layer = M.Gemma4TextDecoderLayer(cfg, i).float()
+        return fill_module(layer, pre, dec, special=special)
+
+    def run(self, layer, h, ids):
+        torch, dev = self.torch, self.dec.dev
+        T = ids.numel()
+        kind = self.cfg.layer_types[layer.layer_idx]
+        pid = torch.arange(T, device=dev).unsqueeze(0)
+        pos = self.rotary(h, pid, kind)
+        q = torch.arange(T, device=dev).view(-1, 1)
+        k = torch.arange(T, device=dev).view(1, -1)
+        mask = k <= q
+        if kind == "sliding_attention":
+            mask = mask & (k > q - self.cfg.sliding_window)
+        return layer(h, None, shared_kv_states={}, position_embeddings=pos, attention_mask=mask.view(1, 1, T, T),
+                     position_ids=pid, past_key_values=None)
+
+    def logits(self, hs):
+        torch, M = self.torch, self.M
+        with torch.device("meta"):
+            norm = M.Gemma4RMSNorm(self.cfg.hidden_size, eps=self.cfg.rms_norm_eps).float()
+        norm = fill_module(norm, self.PFX + "norm.", self.dec)
+        head = self.dec.tensor("lm_head.weight").view(-1, self.cfg.hidden_size)   # the container's K6 head
+        cap = self.cfg.final_logit_softcapping
+        rows = []
+        for h in hs:
+            z = norm(h[:, -1:, :])[0, -1].float() @ head.t()
+            rows.append((torch.tanh(z / cap) * cap if cap else z).cpu())
+        return rows
+
+    def chunk_sdpa(self, q_chunk):
+        chunk_sdpa(self.M, self.torch, q_chunk)
+
+    def notes(self):
+        return {"embed_scale": self.embed_scale, "softcap": self.cfg.final_logit_softcapping,
+                "padding": "dense MLP 2176 -> 2112, experts 768 -> 704 (padded rows checked zero)"}
 
 
 class DiskRows:
@@ -357,7 +472,7 @@ class DiskRows:
         return _Rows()
 
 
-ADAPTERS = {"qwen4_exp": QwenAdapter}
+ADAPTERS = {"qwen4_exp": QwenAdapter, "gemma4": GemmaAdapter}
 
 
 # ----------------------------------------------------------------------------------------------- prompts and output
@@ -509,6 +624,7 @@ def main():
                                  "mxfp8 via tools/container/producers; native as stored",
                        "dtype": "float32", "tf32": False, "head": "the container's lm_head"},
            "attention": "sdpa, query slices of %d" % a.q_chunk, "dense_check": dense_check,
+           "family_notes": ad.notes() if hasattr(ad, "notes") else None,
            "seconds": round(secs), "host": os.uname().nodename, "date_utc": time.strftime("%FT%TZ", time.gmtime()),
            "prompts": {}}
     j = 0
