@@ -33,7 +33,7 @@
  * family, run after it through the same table.  Every gate declares what it
  * needs of the model (gate_spec::needs); the runner reads each model's
  * capabilities through the public queries and a gate whose need is missing is
- * SKIPPED BY NAME ("SKIP <gate> [<family>]: needs <what>"), never run to fail
+ * reported N/A BY NAME ("N/A  <gate> [<family>]: needs <what>"), never run to fail
  * on a capability and never passed silently.
  *
  * usage: tests/gates_runner MODEL --prefill-baseline BLOB --prefill-ref SHORT
@@ -312,7 +312,7 @@ static int run_gate(const gate_spec *g, const hosted_model *hm, gate_result *out
     const uint32_t missing = g->needs & ~hm->has;
     if (missing) {
         const uint32_t bit = missing & (0u - missing);
-        printf("\n  SKIP  %s [%s]: needs %s\n", g->name, hm->family, need_name(bit));
+        printf("\n  N/A   %s [%s]: needs %s\n", g->name, hm->family, need_name(bit));
         fflush(stdout);
         out->skipped = true;
         return 0;
@@ -824,7 +824,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n_results; i++) n_skipped += results[i].skipped;
     if (n_skipped) {
         /* one line per hosted model: which gates its capabilities skipped (each was said by name above) */
-        printf("  SKIP  %d gate(s) whose needs the model lacks:", n_skipped);
+        printf("  N/A   %d gate(s) whose needs the model lacks:", n_skipped);
         for (int i = 0; i < n_results; i++)
             if (results[i].skipped) printf(" %s;", results[i].name);
         printf("\n");

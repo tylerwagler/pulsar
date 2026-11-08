@@ -61,6 +61,8 @@ tests/run.py --verify
 - **No silent SKIP.**  A test that cannot run its check FAILS by name.  Any
   log line that starts with `SKIP` is listed under "NOT FULLY RUN" in the
   summary, and `--strict` fails its test.
+  An `N/A` line is not a skip: it names a leg the loaded family cannot have
+  (a capability it lacks, such as step graphs on Qwen).
 - **`make gates`** is the old wiring and stays until it is retired.
   `make release` runs the same targets in the same order (`GATE_TARGETS`, with
   `HOST_GATE_TARGETS` beside the runner).  `tests/run.py --verify` checks that
@@ -207,36 +209,10 @@ model; the live legs per model; the host-only gates, which overlap the runner,
 as their longest; and the suite total (the recipe's wall, the prerequisite build
 outside it, ~100 s).
 
-<!-- battery-budget -->
-| section | budget s | holds |
-|---|---:|---|
-| `unit-test-gate` | 240 | `pulsar_test --gating`: three model loads, on the served Qwen pack since L357 (was DeepSeek; it absorbed the 120 s `image-chain-qwen` target, whose test `--gating` runs).  An estimate, re-set from the first battery |
-| `agent-test-gate` | 10 | host |
-| `cuda-regression` | 70 | ten model-free kernel gates, concurrent |
-| `cuda-kv-rows-pack-gate` | 10 | |
-| `cuda-sampler-device-gate` | 30 | |
-| `cuda-chat-smoke-gate` | 35 | the CLI's own load |
-| `cuda-attn-gates` | 45 | |
-| `cuda-attn-pack-gate` | 5 | |
-| `indexer-hadamard-kernel-check` | 5 | |
-| `state-kinds-gate` | 5 | |
-| `vision-qwen-tower-gate` | 10 | |
-| `blockdraft-gate` | 5 | |
-| `nvfp4-rows-gate` | 10 | |
-| `lilicorr-head-gate` | 10 | |
-| `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
-| `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
-| `model-smoke` | 900 | L357: seven published models, each its own server load (Qwen, DeepSeek, Nemotron, Gemma, embed, rerank, parse) and one request; an estimate, re-set from the first battery |
-| `cuda-runner-gate [Qwen4-exp]` | 1200 | the primary since L357: the whole table where its needs allow; block-spec (DFlash2) |
-| `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt, graph-eager; 1 open |
-| `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
-| `live-legs [nemotron]` | 420 | kv-dup, opencode-turns: warm + fresh.  L326: 240 -> 420, measured 365 s (#456: L324's kv-dup leg +~49 s, the warm load cold-cache 214 s vs 136) + 15% |
-| `preempt-wedge-live` | 300 | L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back. |
-| `resume-fixes-live` | 420 | L355: the resume after a disconnect, a spill and a restart at a grid multiple |
-| `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon |
-| `host-only gates (longest)` | 90 | overlap the runner |
-| `suite total` | 3000 | the target: <= ~50 min, the live legs included (last measured 3661 s, L357) |
-<!-- /battery-budget -->
+The budgets are `tests/manifest.toml`'s (L357): each test's `budget`, `[sections]` for a test's per-model
+sections, `[limits] release` for the suite total (3000 s; last measured 3661 s).  `tests/run.py` and `make gates`
+(`tests/battery_budget.py`) both read it, so a budget changes in one place.  The table that used to sit here is in
+git history.
 
 **2026-10-21 (L317, the battery diet; #389 / #422 before it: suite 3,329 / 3,219 s + ~45 min of live
 legs, ~1 h 40 min).**  No leg lost its owner: each runs in the battery, or on a gates-dev path trigger, or

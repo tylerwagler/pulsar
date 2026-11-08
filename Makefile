@@ -1987,7 +1987,7 @@ server-kv-admission-live: pulsar-server
 # Nemotron at --ctx 1M allowed 9.05 GiB of touched KV against 5.16 GiB of headroom; MemAvailable reached zero and the
 # GPU stalled).  A balloon leaves the server --headroom-gib over the floor, then conversations of ~2.4x that land on
 # fresh banks; MemAvailable is sampled throughout and a dip past the floor stops the run as a FAIL.  Needs the box to
-# itself (a quiet gpuq job, production stopped); the Nemotron mini, ~5 min, under a timeout.  gates-dev runs it on an
+# itself (a quiet gpuq job, production stopped); Nemotron Super (the published container), ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
 # L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
@@ -2103,7 +2103,7 @@ cuda-prefill-gate:
 	# + `-include $(PULSAR_DEPS)`, compiler configuration via CUDA_FLAG_STAMP.
 	# -B rebuilt the entire engine twice per suite to cover the flag axis alone.
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
-	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check $(PREFILL_BASELINE) \
+	./tests/prefill_bitexact_gate $(BASELINE_MODEL) --check $(PREFILL_BASELINE) \
 		$(PREFILL_BASELINE_REF_SHORT)
 
 
@@ -2118,7 +2118,7 @@ cuda-prefill-gate:
 # L181: decode-step byte gate (see PREFILL_DECODE_BASELINE above).
 cuda-prefill-decode-gate:
 	$(MAKE) tests/prefill_bitexact_gate CUDA_ARCH=sm_120f
-	./tests/prefill_bitexact_gate $(FRONTIER_MODEL) --check-decode $(PREFILL_DECODE_BASELINE) \
+	./tests/prefill_bitexact_gate $(BASELINE_MODEL) --check-decode $(PREFILL_DECODE_BASELINE) \
 		$(PREFILL_DECODE_BASELINE_REF_SHORT)
 cuda-prefill-decode-gate-baseline:
 	git worktree remove --force $(PREFILL_DECODE_BASELINE_WT) 2>/dev/null || true
@@ -2406,7 +2406,7 @@ prefix-stability-gate: pulsar_test
 # (block-spec-gate on the hosted Nemotron and Qwen); the live legs, one shared server
 # per model, are the last section (live-legs) but one: L319's server-kv-headroom-live after them (it balloons the box's
 # memory, so it runs alone, ~2.5 min).  Each section's wall time is printed
-# against its budget (docs/QA_BEFORE_RELEASES.md, "Battery wall time").
+# against its budget (tests/manifest.toml).
 GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
 	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
 	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
@@ -2549,7 +2549,7 @@ gates: $(TEST_BINS)
 	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
 	printf '%s\n' "$$(( $$(date +%s) - suite0 ))" > $$hostdir/total; \
 	python3 tests/battery_budget.py --sections $$PULSAR_GATES_SECTIONS --host $$hostdir/host.tsv \
-	  --total "$$(cat $$hostdir/total)" --budget docs/QA_BEFORE_RELEASES.md || true; \
+	  --total "$$(cat $$hostdir/total)" --budget tests/manifest.toml || true; \
 	rm -rf "$$hostdir"; \
 	if [ $$rc -eq 0 ]; then printf '\nALL GATES PASS\n'; \
 	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
@@ -2558,7 +2558,7 @@ gates: $(TEST_BINS)
 # ---- gates-dev: the ITERATION tier (L220 phase 4) --------------------------
 #
 # `make gates` is the PRE-MERGE instrument: every release-blocking gate, one engine open per configuration (its wall
-# time: docs/QA_BEFORE_RELEASES.md, "Battery wall time").  `make gates-dev` is the ITERATION
+# time: tests/manifest.toml).  `make gates-dev` is the ITERATION
 # tier: a fast subset chosen from what the working tree actually touches, so the
 # loop between an edit and a numeric answer is one-to-two minutes.
 #

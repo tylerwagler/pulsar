@@ -454,7 +454,7 @@ int GATE_ENTRY(int argc, char **argv) {
             if (!want[k]) continue;   /* not this sample's (announced above) */
             const unsigned missing = sched[k].needs & ~has;
             if (missing) {
-                printf("  SKIP  %s [%s]: needs %s\n", sched[k].label, pulsar_engine_family_name(e),
+                printf("  N/A   %s [%s]: needs %s\n", sched[k].label, pulsar_engine_family_name(e),
                        missing & NEED_SNAPSHOT ? "whole-session payloads (pulsar_engine_has_snapshots)"
                        : missing & NEED_REWIND ? "session rewind (pulsar_engine_can_rewind)"
                                                : "a standalone checkpoint restore (the family restores one only inside a sync)");

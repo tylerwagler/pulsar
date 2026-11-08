@@ -36,7 +36,7 @@ runner:graph-eager-gate	session	all	battery	L357: replayed decode / verify step 
 loader-contract-gate	loader	all	battery	header clones + named mutants, both families
 runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
 spec-depth-gate	spec	all	battery	the depth rule both drafters share
-runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors: DeepSeek B300, Qwen container capture; KL budgets
+runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors (Qwen: the published container's capture); manual (DEV) pending L360; KL budgets
 runner:cuda-decode-reference-gate-story	reference	qwen4_exp	manual	L360: out of the battery until Qwen's wide decode rows, which disagree decisively with one-row decode, are understood
 na	runner:cuda-decode-reference-gate-story	deepseek4	DeepSeek is smoke only (Tyler 2026-11-07): its reference gates left the runner
 qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens

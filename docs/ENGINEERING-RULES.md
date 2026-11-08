@@ -255,11 +255,16 @@ queue when someone is waiting on the number; the release run waits behind it.
 - *No silent SKIP.*  A test that cannot run its check FAILS by name.  A log
   line that starts with `SKIP` is listed by `tests/run.py` under "NOT FULLY
   RUN", and `--strict` fails its test.
+  An `N/A` line is not a skip: it names a leg the loaded family cannot have
+  (a capability it lacks, such as step graphs on Qwen).
 - *No generated model pieces.*  A test builds no zero-weight or mini
   containers of its own; it runs on a published one.
 - *No system-wide memory measurement in a gate.*  Measure per process or per
   device.  The box's free memory counts every other process on it, so a
-  verdict read from it is not the test's.
+  verdict read from it is not the test's.  One written exception:
+  `server-kv-headroom-live` grades the server's memory guard, which on GB10's
+  unified memory is defined on the system's MemAvailable, so it measures that,
+  and runs only alone on the box (a quiet gpuq job, production stopped).
 
 ## Named exceptions to rule 1
 

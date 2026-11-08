@@ -2,34 +2,30 @@
 """battery_budget.py -- L317: `make gates` prints each section's wall time against its budget, and flags (never fails)
 a section over it, so a row that adds battery time says so.
 
-    python3 tests/battery_budget.py --sections FILE --host FILE --total SECONDS --budget docs/QA_BEFORE_RELEASES.md
+    python3 tests/battery_budget.py --sections FILE --host FILE --total SECONDS --budget tests/manifest.toml
 
-The budgets live in ONE place, the table between `<!-- battery-budget -->` and `<!-- /battery-budget -->` in
-docs/QA_BEFORE_RELEASES.md ("Battery wall time"): `| section | budget s | ... |`.  The measured sections come from make
+The budgets live in ONE place, tests/manifest.toml (L357): each test's `budget`, the per-model `[sections]`, the
+`[limits]` release total, and for the host-only section the longest budget of the tests that overlap.  The measured sections come from make
 gates: one `SECONDS<TAB>NAME` line per serial target, the runner's per-model lines (cuda-runner-gate [<family>]) and
 the live legs' (live-legs [<model>]); the host-only gates overlap the runner, so they are one section, their longest
 ("host-only gates (longest)").  A measured section with no budget row is flagged (add its row); a budget row nothing
 measured is listed as not run.  Exit 0 always: the report is a flag, the battery's verdict is the gates'."""
-import argparse, re, sys
+import argparse, sys, tomllib
 
 HOST = "host-only gates (longest)"
 TOTAL = "suite total"
 
 
 def read_budget(path):
-    rows, on = [], False
-    for line in open(path, encoding="utf-8"):
-        if "<!-- battery-budget -->" in line:
-            on = True
-            continue
-        if "<!-- /battery-budget -->" in line:
-            break
-        if not on or not line.startswith("|"):
-            continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 2 or not re.fullmatch(r"\d+", cells[1]):
-            continue   # the header and the separator
-        rows.append((cells[0].strip("`"), int(cells[1])))
+    with open(path, "rb") as f:
+        m = tomllib.load(f)
+    rows = [(t["name"], int(t["budget"])) for t in m.get("test", []) if "budget" in t and not t.get("overlap")]
+    rows += [(k, int(v)) for k, v in m.get("sections", {}).items()]
+    host = [int(t["budget"]) for t in m.get("test", []) if t.get("overlap") and "budget" in t]
+    if host:
+        rows.append((HOST, max(host)))
+    if "release" in m.get("limits", {}):
+        rows.append((TOTAL, int(m["limits"]["release"])))
     return rows
 
 
@@ -60,14 +56,14 @@ def main():
     measured.append((TOTAL, a.total))
     want = dict(budget)
     got = dict(measured)
-    print("\n  battery wall time against its budget (docs/QA_BEFORE_RELEASES.md, \"Battery wall time\"):")
+    print("\n  battery wall time against its budget (tests/manifest.toml):")
     print("    %6s  %6s  %s" % ("secs", "budget", "section"))
     over = []
     for name, secs in sorted(measured, key=lambda r: (r[0] == TOTAL, -r[1])):
         b = want.get(name)
         flag = ""
         if b is None:
-            flag = "  <-- NO BUDGET ROW: add one to the table"
+            flag = "  <-- NO BUDGET: add one to tests/manifest.toml"
             over.append(name)
         elif secs > b:
             flag = "  <-- OVER BUDGET by %d s" % (secs - b)
@@ -83,7 +79,7 @@ def main():
     print("\n  suite total: %d s" % a.total)
     if over:
         print("  BUDGET FLAGGED (not a failure): %s -- a row that adds battery time says so in its ledger row, and "
-              "moves the table" % ", ".join(over))
+              "moves the manifest" % ", ".join(over))
     else:
         print("  every section within its budget")
     return 0

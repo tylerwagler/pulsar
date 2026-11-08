@@ -6,7 +6,8 @@
     tests/run.py --verify        the manifest against the Makefile's gate lists
 
 A test is a make target; a target's exit code is its verdict.  A log line starting SKIP means part of it did not run:
-the summary names each one, and --strict fails it.  Each run leaves its logs and results.json in .build/tests/<tier>-<sha>/,
+the summary names each one, and --strict fails it.  N/A is not a skip: it names a leg the loaded family cannot have
+(a capability it lacks, e.g. step graphs on Qwen), so there is nothing to run.  Each run leaves its logs and results.json in .build/tests/<tier>-<sha>/,
 and exits 0 only when every test passed."""
 import argparse
 import json
