@@ -27,7 +27,7 @@ Protocol (unchanged from the DeepSeek and Qwen anchors, so the gates read it as 
     the cached model's revision differs), this tool's sha256, the pulsar git sha, the versions (transformers is a dev
     build: its git sha too), the decode and the dtype, and per prompt its depths, fnv and sha256s.
 
-Families (an adapter each: embed, the layer, the final norm / mixer, the head): qwen4_exp, gemma4.  Others refuse by name
+Families (an adapter each: embed, the layer, the final norm / mixer, the head): qwen4_exp, gemma4, nemotron_h_omni.  Others refuse by name
 until their adapter is written and checked (--check).
 
 Runs on the GB10 in a GPU window (production stopped): it refuses while any other process holds the GPU.
@@ -84,7 +84,9 @@ class Container:
             for e in json.loads(md.get("pulsar.experts", "[]")):
                 self.experts[e["gguf_name"]] = e
             for e in json.loads(md.get("pulsar.kv", "[]")):
-                self.kv[e["key"]] = e["value"]
+                v = e["value"]
+                # an array is spelled {"__array__": type, "n": N, "v": [...]} (tools/container/kv.py)
+                self.kv[e["key"]] = v["v"] if isinstance(v, dict) and "__array__" in v else v
         self._fds = {}
 
     def raw(self, name):
@@ -111,11 +113,12 @@ class Container:
 
 # ----------------------------------------------------------------------------------------------- decoding, in fp32
 class Decoder:
-    def __init__(self, c, dev):
+    def __init__(self, c, dev, dry=False):
         import numpy as np
         import torch
         self.c, self.dev, self.np, self.torch = c, dev, np, torch
         self._producers = None
+        self.dry = dry          # --plan: shapes only, on the meta device -- no bytes read, no CUDA
 
     def producers(self):
         if self._producers is None:
@@ -171,6 +174,9 @@ class Decoder:
     def tensor(self, name):
         """A container tensor as fp32 on the device: [out, in] for a linear, else its stored shape (flat)"""
         dims, lay = self.c.tensors[name]
+        if self.dry:
+            shape = (dims[1], dims[0]) if lay in EXL3_WORDS or lay == "mxfp8_lt" else (int(self.np.prod(dims)),)
+            return self.torch.empty(shape, device="meta")
         if lay in EXL3_WORDS:
             return self.exl3(self.c.raw(name), dims[0], dims[1], EXL3_WORDS[lay])
         if lay == "mxfp8_lt":
@@ -180,6 +186,10 @@ class Decoder:
     def expert(self, entry, e):
         k, n = entry["dims_per_expert_ne"][0], entry["dims_per_expert_ne"][1]
         lay = entry["layout"]
+        if self.dry:
+            if entry["entry_name"].format(e=e) not in self.c.loc:
+                sys.exit("capture: expert %d of %s is not in the container" % (e, entry["entry_name"]))
+            return self.torch.empty((n, k), device="meta")
         if lay not in EXL3_WORDS:
             sys.exit("capture: expert layout %r is not EXL3" % lay)
         return self.exl3(self.c.raw(entry["entry_name"].format(e=e)), k, n, EXL3_WORDS[lay])
@@ -196,9 +206,16 @@ def fill_module(mod, prefix, dec, special=None):
             full = prefix + local
             if full in dec.c.experts:
                 e = dec.c.experts[full]
-                stack = torch.empty(t.shape, dtype=torch.float32, device=dec.dev)
+                stack = torch.empty(t.shape, dtype=torch.float32, device="meta" if dec.dry else dec.dev)
+                if e["n_experts"] != t.shape[0]:
+                    sys.exit("capture: %s: %d experts stored, the module has %d" % (full, e["n_experts"], t.shape[0]))
                 for ei in range(e["n_experts"]):
-                    stack[ei] = dec.expert(e, ei).reshape(t.shape[1:])
+                    w = dec.expert(e, ei)
+                    if w.numel() != t[0].numel():
+                        sys.exit("capture: %s expert %d: %s, the module wants %s" % (full, ei, tuple(w.shape),
+                                                                                    tuple(t.shape[1:])))
+                    if not dec.dry:
+                        stack[ei] = w.reshape(t.shape[1:])
                 got = stack
             elif dec.c.has(full):
                 got = dec.tensor(full)
@@ -208,6 +225,8 @@ def fill_module(mod, prefix, dec, special=None):
             sys.exit("capture: %s: the container holds %d values, the module wants %s" % (prefix + local, got.numel(),
                                                                                          tuple(t.shape)))
         sd[local] = got.reshape(t.shape).to(t.dtype if not t.is_floating_point() else torch.float32)
+    if dec.dry:
+        return mod
     missing, unexpected = mod.load_state_dict(sd, strict=True, assign=True)
     for n, t in list(mod.named_parameters()) + list(mod.named_buffers()):
         if t.device.type != dec.dev.type:
@@ -247,7 +266,7 @@ class QwenAdapter:
         del emb
         return hs
 
-    def _ple_buffer(self, local):
+    def _ple_buffer(self, local, t=None):
         names = {"ple.ple_embedding.layer_multipliers": "qwen4_exp.ple_layer_multipliers",
                  "ple.ple_embedding.ngram_heads_vocab_sizes": "qwen4_exp.ple_ngram_heads_vocab_sizes",
                  "ple.ple_embedding.ngram_heads_offsets": "qwen4_exp.ple_ngram_heads_offsets"}
@@ -271,6 +290,14 @@ class QwenAdapter:
             ng.load(torch.cat([x.flatten() for x in ng.record]))
             ng.record = None
         return layer
+
+    def build_plan(self, i):
+        with self.torch.device("meta"):
+            layer = self.M.Qwen4ExpTextDecoderLayer(self.cfg, i).float()
+        if layer.ple is not None:
+            layer.ple.ple_embedding.ngram_embedding = self.torch.nn.Identity()   # the side file, checked by its header
+            DiskRows(self.rows_file, "cpu", self.torch)
+        return fill_module(layer, "%slayers.%d." % (self.PFX, i), self.dec, special=self._ple_buffer)
 
     def run(self, layer, h, ids):
         torch, cfg, dev = self.torch, self.cfg, self.dec.dev
@@ -361,7 +388,7 @@ class GemmaAdapter:
         torch = self.torch
         if rows is not None:
             pad = w[rows:]
-            if pad.numel() and not bool((pad == 0).all()):
+            if pad.numel() and not self.dec.dry and not bool((pad == 0).all()):
                 sys.exit("capture: %s: the padded rows past %d are not zero -- the padding is not what this reads" %
                          (what, rows))
             w = w[:rows]
@@ -381,14 +408,14 @@ class GemmaAdapter:
                 return self._sliced(dec.tensor(pre + local), cols=I)
             if local == "experts.gate_up_proj":
                 g, u = dec.c.experts[pre + "experts.gate_proj"], dec.c.experts[pre + "experts.up_proj"]
-                out = torch.empty(t.shape, dtype=torch.float32, device=dec.dev)
+                out = torch.empty(t.shape, dtype=torch.float32, device="meta" if dec.dry else dec.dev)
                 for e in range(t.shape[0]):
                     out[e, :E] = self._sliced(dec.expert(g, e), rows=E, what="%s gate %d" % (pre, e))
                     out[e, E:] = self._sliced(dec.expert(u, e), rows=E, what="%s up %d" % (pre, e))
                 return out
             if local == "experts.down_proj":
                 d = dec.c.experts[pre + "experts.down_proj"]
-                out = torch.empty(t.shape, dtype=torch.float32, device=dec.dev)
+                out = torch.empty(t.shape, dtype=torch.float32, device="meta" if dec.dry else dec.dev)
                 for e in range(t.shape[0]):
                     out[e] = self._sliced(dec.expert(d, e), cols=E)
                 return out
@@ -432,6 +459,77 @@ class GemmaAdapter:
                 "padding": "dense MLP 2176 -> 2112, experts 768 -> 704 (padded rows checked zero)"}
 
 
+def hf_json(o):
+    """HF's JSON spelling of non-finite floats ({"__float__": "Infinity"}) back to floats"""
+    if isinstance(o, dict):
+        if set(o) == {"__float__"}:
+            return float(o["__float__"])
+        return {k: hf_json(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [hf_json(x) for x in o]
+    return o
+
+
+class NemotronAdapter:
+    """nemotron_h_omni (Nemotron 3.5 Super): the language model's NemotronHBlocks a layer at a time -- the norm, then
+    the block's mixer (Mamba-2 without a mask, attention with a causal mask and no rope, the latent MoE) and the
+    residual, as NemotronHModel.forward does; norm_f; the container's K6 head.  Mamba runs HF's TORCH paths: the tool
+    refuses when mamba_ssm, causal_conv1d or kernels is importable (their kernels would be the reference otherwise).
+    The vision tower, the projector and the LiLiCorr drafter are not the language model and are not read."""
+    PFX = "language_model.backbone."
+
+    def __init__(self, c, dec, a):
+        import importlib.util
+        import torch
+        from transformers.models.nemotron_h import modeling_nemotron_h as M
+        from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+        present = [p for p in ("mamba_ssm", "causal_conv1d", "kernels") if importlib.util.find_spec(p) is not None]
+        if present:
+            sys.exit("capture: %s importable: HF would run their kernels, not its torch reference" % ", ".join(present))
+        self.c, self.dec, self.torch, self.M = c, dec, torch, M
+        cfg = NemotronHConfig(**hf_json(c.config["llm_config"]))
+        cfg._attn_implementation = "sdpa"
+        self.cfg = cfg
+
+    def layers(self):
+        return self.cfg.num_hidden_layers
+
+    def embed(self, seqs):
+        emb = self.dec.tensor(self.PFX + "embeddings.weight").view(-1, self.cfg.hidden_size)
+        hs = [emb[ids.to(self.dec.dev)].unsqueeze(0) for ids in seqs]
+        del emb
+        return hs
+
+    def build(self, i, seqs):
+        with self.torch.device("meta"):
+            layer = self.M.NemotronHBlock(self.cfg, i).float()
+        return fill_module(layer, "%slayers.%d." % (self.PFX, i), self.dec)
+
+    def run(self, layer, h, ids):
+        torch, dev = self.torch, self.dec.dev
+        T = ids.numel()
+        if layer.block_type == "full_attention":
+            mask = torch.ones(T, T, dtype=torch.bool, device=dev).tril().view(1, 1, T, T)
+            return layer(h, attention_mask=mask, position_ids=torch.arange(T, device=dev).unsqueeze(0))
+        return layer(h, attention_mask=None)
+
+    def logits(self, hs):
+        torch = self.torch
+        with torch.device("meta"):
+            norm = self.M.NemotronHRMSNorm(self.cfg.hidden_size, eps=self.cfg.layer_norm_epsilon).float()
+        norm = fill_module(norm, self.PFX + "norm_f.", self.dec)
+        head = self.dec.tensor("language_model.lm_head.weight").view(-1, self.cfg.hidden_size)   # the container's K6
+        return [(norm(h[:, -1:, :])[0, -1].float() @ head.t()).cpu() for h in hs]
+
+    def chunk_sdpa(self, q_chunk):
+        chunk_sdpa(self.M, self.torch, q_chunk)
+
+    def notes(self):
+        from collections import Counter
+        return {"blocks": dict(Counter(self.cfg.layers_block_type)), "mamba": "HF torch paths (no mamba_ssm / "
+                "causal_conv1d / kernels installed)", "chunk_size": self.cfg.chunk_size}
+
+
 class DiskRows:
     """Stands in for ple_embedding.ngram_embedding: the rows a run touches, read from the container's PENGRAM1 v2 row
     file (tools/container/ple_rows.py: 64-byte header, then n_rows x row_bytes BF16, global row order)."""
@@ -472,7 +570,7 @@ class DiskRows:
         return _Rows()
 
 
-ADAPTERS = {"qwen4_exp": QwenAdapter, "gemma4": GemmaAdapter}
+ADAPTERS = {"qwen4_exp": QwenAdapter, "gemma4": GemmaAdapter, "nemotron_h_omni": NemotronAdapter}
 
 
 # ----------------------------------------------------------------------------------------------- prompts and output
@@ -549,6 +647,23 @@ def git_sha():
 
 
 # ----------------------------------------------------------------------------------------------- main
+def plan_check(c, fam, a):
+    """--plan: every layer's and the final modules' tensors resolved against the container, on the meta device"""
+    import torch
+    dec = Decoder(c, torch.device("meta"), dry=True)
+    ad = ADAPTERS[fam](c, dec, a)
+    ad.embed([])          # the embedding table, by name and size
+    ad.logits([])         # the final norm / mixer and the head
+    n = ad.layers()
+    for i in range(n):
+        if hasattr(ad, "build_plan"):
+            ad.build_plan(i)
+        else:
+            ad.build(i, [])
+    log("%s %s@%s: %d layers resolve against the container" % (fam, c.repo, c.revision[:8], n))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", required=True, help="the container's HF cache snapshot dir")
@@ -556,11 +671,15 @@ def main():
     ap.add_argument("--prompts", default="story,code")
     ap.add_argument("--q-chunk", type=int, default=1024, help="query rows per sdpa call (fp32 scores: keep it small)")
     ap.add_argument("--check-dense", action="store_true", help="Qwen: QSA == dense at depths <= the indexer budget")
+    ap.add_argument("--plan", action="store_true", help="no GPU: build every module on meta and resolve each tensor "
+                    "against the container by name and size, then stop")
     a = ap.parse_args()
     c = Container(a.model)
     fam = c.config.get("model_type")   # the top-level type: qwen4_exp, gemma4, nemotron_h_omni (the text configs differ)
     if fam not in ADAPTERS:
         sys.exit("capture: no adapter for family %r yet (have: %s)" % (fam, ", ".join(sorted(ADAPTERS))))
+    if a.plan:
+        return plan_check(c, fam, a)
     refuse_if_gpu_tenants()
     import torch
     from transformers import AutoTokenizer
