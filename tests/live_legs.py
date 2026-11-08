@@ -143,8 +143,8 @@ def run_model(key, model, legs, binary, work, port, cfg):
                 srv.set_guard_budget(0)
             except Exception as e:
                 print("# [%s] the guard budget could not be set back: %s" % (n, e), flush=True)
-        instance("hooks", env, lambda l: l.hooked if (l.hook_env() or l.test_routes) else None, kv_dir=store,
-                 after=budget_back)
+        instance("hooks", env, lambda l: l.hooked if (l.hook_env() or getattr(l, "test_routes", False)) else None,
+                 kv_dir=store, after=budget_back)
     finally:
         shutil.rmtree(store, ignore_errors=True)
     instance("fresh", None, lambda l: l.cold if l.fresh else None)
