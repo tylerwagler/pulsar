@@ -596,8 +596,6 @@ static int run_agent(pulsar_engine *engine, agent_config *cfg) {
 
 
 
-#ifndef PULSAR_AGENT_TEST_NO_MAIN
-
 /** @brief pulsar-agent's entry point: parse options, open the engine, run interactively or not.
  *  @param argc argument count
  *  @param argv arguments
@@ -654,7 +652,3 @@ int main(int argc, char **argv) {
     pulsar_engine_close(engine);
     return rc;
 }
-
-
-#endif
-

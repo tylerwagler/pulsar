@@ -1992,8 +1992,9 @@ server-kv-admission-live: pulsar-server
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
 # L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
 # of this tree (tracked and new files, so uncommitted edits count) from nothing, so an object already built can't hide a
-# warning, and greps the log for both formats (gcc's `: warning:`, nvcc's front-end `: warning #NNN-D:`).  CUTLASS is -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both
-# run before the runner: a build's memory beside the accounting gate would fail it.
+# warning, and greps the log for both formats (gcc's `: warning:`, nvcc's front-end `: warning #NNN-D:`).  CUTLASS is
+# -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both run before the runner: a build's memory
+# beside the accounting gate would fail it.
 .PHONY: warnings-gate doxygen-gate
 warnings-gate:
 	@d=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-warnings-XXXXXX) || exit 1; \
@@ -2817,7 +2818,7 @@ src/lib/pulsar_grammar.o: src/lib/pulsar_grammar.cpp src/lib/pulsar_grammar.h
 	$(CXX) $(GRAMMAR_CXXFLAGS) $(XGRAMMAR_INC) -c -o $@ $<
 
 tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) tests/sampler_host_ref.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/pulsar_agent_test.cpp
@@ -3325,7 +3326,7 @@ pulsar_test: tests/pulsar_test.o tests/sampler_host_ref.o src/lib/pulsar_help.o 
 # L267: the API parsers' requests dumped field by field (host-only; see tests/api_golden.cpp).
 # api-golden-gate compares them with the golden recorded before L267 moved the parse/render layers.
 tests/api_golden.o: tests/api_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/api_golden.cpp
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/api_golden.cpp
 
 tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3334,7 +3335,7 @@ tests/api_golden: tests/api_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext
 # whether the template's own bytes, tokenized, stay inside the grammar.  No engine, no GPU: the checkpoint's
 # tokenizer.json.  A measurement tool, not a gate.
 tests/grammar_bench.o: tests/grammar_bench.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS) src/lib/pulsar_grammar.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/grammar_bench.cpp
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/grammar_bench.cpp
 
 tests/grammar_bench: tests/grammar_bench.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -3346,7 +3347,7 @@ api-golden-gate: tests/api_golden
 
 # L267: the DeepSeek stream projections' bytes per protocol (host-only; see tests/sse_golden.cpp).
 tests/sse_golden.o: tests/sse_golden.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pulsar.h $(LIB_HDRS)
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/sse_golden.cpp
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/sse_golden.cpp
 
 tests/sse_golden: tests/sse_golden.o src/lib/pulsar_help.o src/lib/pulsar_kvtext.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_dsml.o $(CORE_OBJS) $(GRAMMAR_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

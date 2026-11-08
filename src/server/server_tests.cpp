@@ -2,9 +2,8 @@
  * `#else` branch of its PULSAR_SERVER_TEST guard). Compiled ONLY inside
  * the tests/pulsar_test.cpp harness TU, which #includes every server .c
  * with PULSAR_SERVER_TEST defined and includes cli_main.cpp BEFORE this
- * file, so cli_main.cpp file-statics the tests poke (parse_options,
- * server_kv_budget_bytes, server_default_kv_disk_dir,
- * server_resolve_kv_disk_dir) remain reachable exactly as before.
+ * file, so the cli_main.cpp file-static the tests poke
+ * (server_default_kv_disk_dir) remains reachable exactly as before.
  * A standalone compile (no PULSAR_SERVER_TEST) yields an empty object
  * for the pulsar-server link. */
 /** @file
@@ -11060,7 +11059,7 @@ static void test_kv_disk_flag_matrix(void) {
     /* Unset: the default directory is resolved (default-on). */
     {
         char *argv[] = {(char *)"pulsar-server"};
-        server_config c = parse_options(1, argv);
+        server_config c = server_parse_options(1, argv);
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir != NULL);
         TEST_ASSERT(c.kv_disk_dir &&
@@ -11073,7 +11072,7 @@ static void test_kv_disk_flag_matrix(void) {
     {
         char *argv[] = {(char *)"pulsar-server",
                         (char *)"--kv-disk-dir", (char *)"/tmp/explicit-kv"};
-        server_config c = parse_options(3, argv);
+        server_config c = server_parse_options(3, argv);
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir && !strcmp(c.kv_disk_dir, "/tmp/explicit-kv"));
     }
@@ -11082,7 +11081,7 @@ static void test_kv_disk_flag_matrix(void) {
     {
         char *argv[] = {(char *)"pulsar-server",
                         (char *)"--kv-disk-dir", (char *)""};
-        server_config c = parse_options(3, argv);
+        server_config c = server_parse_options(3, argv);
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir == NULL);
     }
@@ -11090,7 +11089,7 @@ static void test_kv_disk_flag_matrix(void) {
     /* --no-kv-disk: opt-out. */
     {
         char *argv[] = {(char *)"pulsar-server", (char *)"--no-kv-disk"};
-        server_config c = parse_options(2, argv);
+        server_config c = server_parse_options(2, argv);
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir == NULL);
     }
@@ -11099,7 +11098,7 @@ static void test_kv_disk_flag_matrix(void) {
     {
         char *argv[] = {(char *)"pulsar-server", (char *)"--no-kv-disk",
                         (char *)"--kv-disk-dir", (char *)"/tmp/explicit-kv"};
-        server_config c = parse_options(4, argv);
+        server_config c = server_parse_options(4, argv);
         server_resolve_kv_disk_dir(&c);
         TEST_ASSERT(c.kv_disk_dir && !strcmp(c.kv_disk_dir, "/tmp/explicit-kv"));
     }

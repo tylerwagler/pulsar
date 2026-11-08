@@ -16,6 +16,7 @@
 
 
 
+#ifndef PULSAR_SERVER_TEST   /* main() only: the harnesses that include this file run no server */
 /* =========================================================================
  * Startup warmup generation (F1 unledgered-spike fix, task #32).
  *
@@ -183,6 +184,7 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
     }
     return true;
 }
+#endif /* PULSAR_SERVER_TEST */
 
 
 
@@ -257,6 +259,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 
 
+#ifndef PULSAR_SERVER_TEST   /* main() only: the harnesses that include this file run no server */
 /* Tier-2 overcommit (task #55). PULSAR_OVERCOMMIT switches the pool auto-size from
  * "N-bank pool must fit the budget in FULL" to "only the EAGER floor (raw ring +
  * state lanes + shared) for N banks must fit; the ctx-scaled comp/index are
@@ -274,6 +277,7 @@ static bool server_overcommit_enabled(void) {
     if (!v || !v[0]) return true; /* default ON (v0.3.0) */
     return !(v[0] == '0' || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
+#endif /* PULSAR_SERVER_TEST */
 
 
 
@@ -285,7 +289,7 @@ static bool server_overcommit_enabled(void) {
  * leave the floor free. Returns 0 if the reserves already exceed usable. */
 /// @param weights_resident_bytes the resident weights, bytes
 /// @return the session budget in bytes (0 when the reserves exceed PULSAR_SERVER_USABLE_BYTES)
-static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
+uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
     uint64_t reserved = weights_resident_bytes +
                         PULSAR_SERVER_PROCESS_OVERHEAD_BYTES +
                         PULSAR_SERVER_MEM_FLOOR_BYTES;
@@ -301,11 +305,12 @@ static uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes) {
 /// @param free_bytes        the device's free memory, the weights staged
 /// @param working_set_bytes the working set the margin keeps (PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing)
 /// @return the session budget in bytes (0 when the margin exceeds what is free)
-static uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes) {
+uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes) {
     const uint64_t margin = server_discrete_margin_bytes(working_set_bytes);
     return free_bytes > margin ? free_bytes - margin : 0;
 }
 
+#ifndef PULSAR_SERVER_TEST   /* main() only: the harnesses that include this file run no server */
 /* The budget for the device this process runs on: the discrete formula when the device says its memory is its own,
  * else (GB10, or a device that did not answer) the unified one. */
 /// @param weights_resident_bytes the resident weights, bytes (the unified formula's)
@@ -318,6 +323,7 @@ static uint64_t server_kv_budget_for_device(uint64_t weights_resident_bytes) {
     }
     return server_kv_budget_bytes(weights_resident_bytes);
 }
+#endif /* PULSAR_SERVER_TEST */
 
 /* Admission rule: the already-committed live-session cost plus this request's
  * estimated cost must fit under the budget. Gates the startup session here and
@@ -619,7 +625,7 @@ static char *server_default_kv_disk_dir(const char *model_path, double rope_yarn
  * unresolvable or unusable directory must never be fatal — the server runs
  * with the disk cache disabled (kv_cache_open handles the unusable case). */
 /// @param c the parsed config; kv_disk_dir is filled (NULL = disk cache off)
-static void server_resolve_kv_disk_dir(server_config *c) {
+void server_resolve_kv_disk_dir(server_config *c) {
     if (c->kv_disk_disable) {
         c->kv_disk_dir = NULL;
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: disk KV cache disabled by flag");
@@ -646,7 +652,7 @@ static void server_resolve_kv_disk_dir(server_config *c) {
 /// @param argc argument count
 /// @param argv the arguments
 /// @return the config (its strings point into argv or static storage)
-static server_config parse_options(int argc, char **argv) {
+server_config server_parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
             .model_path = "model",
@@ -818,7 +824,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    server_config cfg = parse_options(argc, argv);
+    server_config cfg = server_parse_options(argc, argv);
     server_resolve_kv_disk_dir(&cfg);
     int stall_limit_s = 0;
     {

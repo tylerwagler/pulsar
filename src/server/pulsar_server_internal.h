@@ -5053,6 +5053,12 @@ bool server_route_in_place(int common, int score, int frontier, int prefilled, i
  * past it, 0 when one begins inside it (*inside = its index, else -1).  Defined in server_jobs.cpp; unit-tested in
  * server_tests.cpp. */
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
+/* The admission budgets (unified memory; a discrete card's own) and the command line with its disk KV directory
+ * resolved: defined in cli_main.cpp for main(), unit-tested in server_tests.cpp. */
+uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes);
+uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes);
+server_config server_parse_options(int argc, char **argv);
+void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
 bool server_kv_admits(uint64_t kv_budget_bytes,
                              uint64_t committed_bytes,
