@@ -273,6 +273,43 @@ static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
 }
 
 /* Append `flag value` to a spec's argv when the value is given. */
+/* L357: a reference capture grades only the container it was made from.  `ref_dir`/capture.json
+ * (tools/reference/capture.py) names the container's revision; the hosted model is an HF cache snapshot,
+ * models--ORG--NAME/snapshots/<rev> (resolved through links).  true when they match; else `why` says what is off --
+ * a capture with no record, a model path that is not a snapshot, or another revision. */
+static bool ref_revision_ok(const char *ref_dir, const char *model_path, char *why, size_t n) {
+    char path[4096], real[4096];
+    snprintf(path, sizeof path, "%s/capture.json", ref_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(why, n, "%.400s has no capture.json: nothing says which container it was made from", ref_dir);
+        return false;
+    }
+    char buf[65536];
+    const size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = 0;
+    const char *k = strstr(buf, "\"revision\"");
+    char cap[41] = "";
+    if (k && (k = strchr(k + 10, '"')) && sscanf(k + 1, "%40[0-9a-f]", cap) != 1) cap[0] = 0;
+    if (strlen(cap) != 40) {
+        snprintf(why, n, "%.400s names no 40-hex container revision", path);
+        return false;
+    }
+    if (!realpath(model_path, real)) snprintf(real, sizeof real, "%s", model_path);
+    const char *sn = strstr(real, "/snapshots/");
+    char rev[41] = "";
+    if (!sn || sscanf(sn + 11, "%40[0-9a-f]", rev) != 1 || strlen(rev) != 40) {
+        snprintf(why, n, "the model %.400s is not an HF cache snapshot: its revision is unknown", real);
+        return false;
+    }
+    if (strcmp(cap, rev) != 0) {
+        snprintf(why, n, "the capture was made from revision %.12s, the cached model is %.12s: recapture it", cap, rev);
+        return false;
+    }
+    return true;
+}
+
 static void spec_append(gate_spec *g, const char *flag, const char *value) {
     if (!value || !value[0]) return;
     int n = 0;
@@ -744,6 +781,13 @@ int main(int argc, char **argv) {
             snprintf(code_tok, sizeof code_tok, "%s/code.tokens.bin", ma->ref_dir);
             have_ref = access(story_ref, R_OK) == 0;
         }
+        /* L357: the capture must be this container's (capture.json's revision == the snapshot's) */
+        bool ref_stale = false;
+        char ref_why[512] = "";
+        if (have_ref && !ref_revision_ok(ma->ref_dir, ma->path, ref_why, sizeof ref_why)) {
+            have_ref = false;
+            ref_stale = true;
+        }
         const char *tol = ma->ref_tol ? ma->ref_tol : "1e-4";
         gate_spec ref_story = {ref_names[0], gate_prefill_bitexact_gate_main, 1, NULL, NULL,
                                {"--check-reference", story_ref, story_tok, tol, NULL}, 0};
@@ -779,6 +823,9 @@ int main(int argc, char **argv) {
         if (have_ref) {
             RUN(ref_story);
             RUN(ref_code);
+        } else if (ref_stale && ref_selected) {
+            printf("\n  FAIL  cuda-reference-gate [%s]: %s\n", hm.family, ref_why);
+            rc_all = 1;
         } else if (ma->ref_dir && ref_selected) {
             /* The caller ASKED for the reference grade (--ref-dir was passed) and the
              * blob is not readable: that is a misconfiguration, not "not
