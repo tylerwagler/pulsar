@@ -2479,8 +2479,14 @@ bool server::spill_bank(session_slot *victim) {
     /* L328 (2): the pool parks on another resident bank while vb's physical goes (bank 0 is a victim like any) */
     const int park = s->park_bank((int)vb);
     if (park < 0) {
-        server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %u is the only resident bank -- nowhere to park the "
-                   "pool, spill refused", vb);
+        /* L362: said once per bank every 10 s -- a caller that retries each pass (the readmission did, 19.5 MB of
+         * this line in 20 minutes) must not flood the log */
+        const double now = server_now_sec();
+        if (vb < PULSAR_SESSION_POOL_CAP && now - s->park_refused_said[vb] >= 10.0) {
+            s->park_refused_said[vb] = now;
+            server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: bank %u is the only resident bank -- nowhere to park "
+                       "the pool, spill refused", vb);
+        }
         return false;
     }
     if (!s->bank_switch((int)vb)) {
@@ -2782,6 +2788,11 @@ bool server::worker_readmit_preempted() {
             }
             return true;
         }
+        /* L362: the parked decoder's own bank is re-backed FIRST, so a spill has a resident bank to park the pool on:
+         * with the victim the only other resident bank, spill_bank refused (nowhere to park), this returned false,
+         * and the next pass did the same -- the decoder never came back (#661).  Re-backing touches nothing (the pools
+         * are demand-paged), and the reload below re-backs it anyway (alloc_physical is idempotent). */
+        if (n_spill > 0 && !pulsar_session_bank_alloc_physical(pool, v->bank)) return false;
         for (int k = 0; k < n_spill; k++) {
             if (!s->spill_bank(&s->slots[order[k]])) return false;
             s->count_metric(&s->m_spills);

@@ -2352,6 +2352,8 @@ struct server {
     uint64_t     guard_test_budget;
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
+    /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
+    double       park_refused_said[PULSAR_SESSION_POOL_CAP];
     /** The stall watchdog (watchdog.cpp).  `stall_s` is written by the watchdog and read by /health (__atomic);
      *  For the dump, `worker_tid` is set by server_worker_main and `worker_thread` by cli_main after pthread_create. */
     int          stall_limit_s;          ///< PULSAR_STALL_WATCHDOG_S (0 = off)
