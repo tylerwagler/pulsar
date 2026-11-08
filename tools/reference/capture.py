@@ -119,6 +119,7 @@ class Decoder:
         self.c, self.dev, self.np, self.torch = c, dev, np, torch
         self._producers = None
         self.dry = dry          # --plan: shapes only, on the meta device -- no bytes read, no CUDA
+        self.checked = {}       # EXL3 tile width -> the first decode's rel difference to exllamav3's fp16 path
 
     def producers(self):
         if self._producers is None:
@@ -147,6 +148,16 @@ class Decoder:
         w *= suh.to(self.dev).float().unsqueeze(1)
         preapply_had_r_(w, had_n)
         w *= svh.to(self.dev).float().unsqueeze(0)
+        if words not in self.checked:
+            # once per layout: exllamav3's own fp16 decode must agree to fp16 rounding -- an order or scale mistake in
+            # the fp32 path above would otherwise skew every reference without a sound
+            ref = lin.get_weight_tensor().float()
+            rel = float((w - ref).norm() / ref.norm())
+            if not rel < 2e-3:
+                sys.exit("capture: the fp32 EXL3 decode disagrees with exllamav3's own (rel %.3g, k=%d n=%d K%d)" %
+                         (rel, k, n, words // 16))
+            self.checked[words] = rel
+            log("EXL3 K%d decode: fp32 vs exllamav3's fp16 rel %.2e (the fp16 rounding)" % (words // 16, rel))
         return w.t().contiguous()                          # [out, in]
 
     def mxfp8(self, blob, k, n):
@@ -744,6 +755,7 @@ def main():
                        "dtype": "float32", "tf32": False, "head": "the container's lm_head"},
            "attention": "sdpa, query slices of %d" % a.q_chunk, "dense_check": dense_check,
            "family_notes": ad.notes() if hasattr(ad, "notes") else None,
+           "exl3_selfcheck": {"K%d" % (w // 16): r for w, r in dec.checked.items()},
            "seconds": round(secs), "host": os.uname().nodename, "date_utc": time.strftime("%FT%TZ", time.gmtime()),
            "prompts": {}}
     j = 0
