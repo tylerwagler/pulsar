@@ -68,6 +68,7 @@ def evicted(log):
 class ResumeFixesLeg(Leg):
     NAME = "resume-fixes"
     fresh = False
+    test_routes = True
 
     def __init__(self, g, work):
         Leg.__init__(self, g, work)

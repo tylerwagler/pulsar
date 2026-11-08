@@ -78,6 +78,7 @@ def slot_decoding(srv):
 class PreemptLeg(Leg):
     NAME = "preempt-exact"
     fresh = True
+    test_routes = True
 
     def __init__(self, g, work, margin=1.5, tag=None):   # tag: the old command line's, kept for its callers
         Leg.__init__(self, g, work)
@@ -193,6 +194,7 @@ class PreemptWedgeLeg(Leg):
     with everything queued behind them."""
     NAME = "preempt-wedge"
     fresh = False
+    test_routes = True
     GEN_B = 1200
 
     def __init__(self, g, work, margin=1.5, tag=None):
