@@ -94,15 +94,10 @@ struct slot {
     std::vector<double> x;
 };
 static uint16_t bf16_bits(double v) {
-    const __nv_bfloat16 b = __float2bfloat16((float)v);
-    uint16_t u = 0;
-    std::memcpy(&u, &b, sizeof(u));
-    return u;
+    return __bfloat16_as_ushort(__float2bfloat16((float)v));
 }
 static double bf16_back(uint16_t u) {
-    __nv_bfloat16 b;
-    std::memcpy(&b, &u, sizeof(u));
-    return (double)__bfloat162float(b);
+    return (double)__bfloat162float(__ushort_as_bfloat16(u));
 }
 static slot make_slot(int rows, int K) {
     slot s; s.rows = rows; s.K = K;

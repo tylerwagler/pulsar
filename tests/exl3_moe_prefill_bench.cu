@@ -13,6 +13,7 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_exl3_dense.cuh"
 #include "cuda/mmq/exl3_moe.cuh"
+#include "cuda/pulsar_cuda_qwen.h"
 #include "engine/exl3_trellis.h"
 
 #include <cuda_bf16.h>
@@ -144,7 +145,7 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaDeviceSynchronize());
     cudaStream_t st = cudaStreamPerThread;
     auto layer = [&](int T) -> int {
-        const exl3_moe_stacks w{nullptr, G.table, U.table, D.table, k2, k2, E, H, MID, H};
+        const exl3_moe_stacks w{nullptr, G.table, U.table, D.table, k2, k2, E, H, MID, H, PULSAR_FFN_ACT_SWIGLU};
         const exl3_moe_bufs b{gz, uz, dz, exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, midq, midsf, kbm}};
         return exl3_moe_routed_launch(w, sel, wts, T, TOPK, 10.0f, exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, xq, xsf, kbx}, b,
                                       out, nf, 1u, true, st);

@@ -13,6 +13,7 @@
  * Not a gate: it prints, it does not grade. */
 #include "cuda/pulsar_cuda_gdn.h"
 #include "cuda/pulsar_cuda_mx.cuh"
+#include <cuda_bf16.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,18 +27,26 @@ static const int QKV = PULSAR_GDN_QKV_DIM, VD = PULSAR_GDN_V_DIM, NV = PULSAR_GD
 __global__ void copy_kernel(const float4 *__restrict__ in, float4 *__restrict__ out, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) out[i] = in[i];
 }
+__device__ float fill_value(size_t i, float scale, uint32_t seed) {
+    uint32_t h = (uint32_t)i * 2654435761u ^ seed; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    return scale * ((float)(h & 0xffffff) / 8388608.f - 1.f);
+}
 __global__ void fill_kernel(float *p, size_t n, float scale, uint32_t seed) {
-    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
-        uint32_t h = (uint32_t)i * 2654435761u ^ seed; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-        p[i] = scale * ((float)(h & 0xffffff) / 8388608.f - 1.f);
-    }
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        p[i] = fill_value(i, scale, seed);
+}
+/* the layer's parameters are bf16 on the device (pulsar_gdn_weights) */
+__global__ void fill_bf16_kernel(uint16_t *p, size_t n, float scale, uint32_t seed) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        p[i] = __bfloat16_as_ushort(__float2bfloat16(fill_value(i, scale, seed)));
 }
 static void fill(float *p, size_t n, float scale, uint32_t seed) { fill_kernel<<<1024, 256>>>(p, n, scale, seed); CK(cudaGetLastError()); }
+static void fill(uint16_t *p, size_t n, float scale, uint32_t seed) { fill_bf16_kernel<<<1024, 256>>>(p, n, scale, seed); CK(cudaGetLastError()); }
 
 int main() {
     const int SLOTS = 64, MAXR = 8192;
-    float *conv_w, *A_log, *dt_bias, *norm_w;
-    CK(cudaMalloc(&conv_w, (size_t)QKV * 4 * 4)); CK(cudaMalloc(&A_log, NV * 4)); CK(cudaMalloc(&dt_bias, NV * 4)); CK(cudaMalloc(&norm_w, 128 * 4));
+    uint16_t *conv_w, *A_log, *dt_bias, *norm_w;
+    CK(cudaMalloc(&conv_w, (size_t)QKV * 4 * 2)); CK(cudaMalloc(&A_log, NV * 2)); CK(cudaMalloc(&dt_bias, NV * 2)); CK(cudaMalloc(&norm_w, 128 * 2));
     fill(conv_w, (size_t)QKV * 4, 0.5f, 1); fill(A_log, NV, 1.f, 2); fill(dt_bias, NV, 2.f, 3); fill(norm_w, 128, 1.f, 4);
     float *qkv, *z, *a, *b, *cs, *rs;
     CK(cudaMalloc(&qkv, (size_t)MAXR * QKV * 4)); CK(cudaMalloc(&z, (size_t)MAXR * VD * 4));

@@ -424,8 +424,8 @@ static void section_shared_relu2(void) {
         CUDA_OK(cudaMalloc((void **)&dh, (size_t)rows * M * 2));
         pulsar_rows_moe_shared q{};
         q.act = PULSAR_FFN_ACT_RELU2;
-        q.up = pulsar_rows_linear{dU, nullptr, 0, H, M, false, true};
-        q.down = pulsar_rows_linear{dD, nullptr, 0, M, H, false, true};
+        q.up = pulsar_rows_linear{dU, nullptr, 0, H, M, false, true, false, false};
+        q.down = pulsar_rows_linear{dD, nullptr, 0, M, H, false, true, false, false};
         q.yu = dyu; q.ys = dys; q.h = dh;   /* no gate, no yg */
         out r;
         r.rc = pulsar_rows_moe_shared_launch(&q, dX, rows, dO, 0);

@@ -1,5 +1,4 @@
 #define PULSAR_AGENT_TEST
-#define PULSAR_AGENT_TEST_NO_MAIN
 #include "../src/agent/config_types.cpp"
 #include "../src/agent/util_cli.cpp"
 #include "../src/agent/prompt_queue.cpp"
@@ -18,7 +17,6 @@
 #include "../src/agent/worker.cpp"
 #include "../src/agent/worker_sync.cpp"
 #include "../src/agent/terminal_ui.cpp"
-#include "../src/agent/runtime.cpp"
 
 int main(void) {
     pulsar_agent_unit_tests_run();

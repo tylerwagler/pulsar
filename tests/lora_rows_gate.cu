@@ -35,8 +35,8 @@ struct dev { void *p = nullptr; explicit dev(size_t n) { cudaMalloc(&p, n ? n : 
 
 static uint16_t to_bf16(float f) { uint32_t u; memcpy(&u, &f, 4); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
 static float from_bf16(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
-static uint16_t to_f16(float f) { const __half h = __float2half_rn(f); uint16_t u; memcpy(&u, &h, 2); return u; }
-static float from_f16(uint16_t u) { __half h; memcpy(&h, &u, 2); return __half2float(h); }
+static uint16_t to_f16(float f) { return __half_as_ushort(__float2half_rn(f)); }
+static float from_f16(uint16_t u) { return __half2float(__ushort_as_half(u)); }
 
 /* y (device, ld_y) <- y0, then the LoRA over rows [t0, t0 + n) of x on the row kind; false on a refusal */
 static bool call(const dev &dx, uint64_t ld_x, uint32_t t0, uint32_t n, const pulsar_rows_lora &l, const dev &dy,

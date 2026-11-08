@@ -97,7 +97,7 @@ static void embed_tests() {
     CK(cudaMalloc(&d_w, H * 2)); CK(cudaMemcpy(d_w, w.data(), H * 2, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_ids, n * 4)); CK(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_out, n * ld * 2)); CK(cudaMalloc(&d_one, ld * 2));
-    pulsar_head_decl h{H, d_w, 1e-6f, 1, 1, 1.0f};
+    pulsar_head_decl h{H, d_w, 1e-6f, 1, 1, 1.0f, 0.0f, 0.0f};
     check(pulsar_head_embed_launch(&h, d_table, V, d_ids, n, d_out, ld, 0) == 0, "a batch of %u ids (repeats, first and last row)", n);
     std::vector<uint16_t> out((size_t)n * ld);
     CK(cudaMemcpy(out.data(), d_out, out.size() * 2, cudaMemcpyDeviceToHost));
@@ -167,7 +167,7 @@ static void logits_tests() {
     float *d;
     CK(cudaMalloc(&d, in.size() * 4));
     CK(cudaMemcpy(d, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
-    pulsar_head_decl h{4096, nullptr, 0.0f, NL, NR, 1.0f / 16.0f};
+    pulsar_head_decl h{4096, nullptr, 0.0f, NL, NR, 1.0f / 16.0f, 0.0f, 0.0f};
     check(pulsar_head_logits_finish_launch(&h, d, rows, ld, 0) == 0, "%u strided rows", rows);
     std::vector<float> out(in.size());
     CK(cudaMemcpy(out.data(), d, out.size() * 4, cudaMemcpyDeviceToHost));
@@ -191,7 +191,7 @@ static void logits_tests() {
     check(top, "with the pads pre-loaded at 1e30 the finite argmax is a real id");
     /* identity: nothing declared, nothing launched */
     CK(cudaMemcpy(d, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
-    pulsar_head_decl id{4096, nullptr, 0.0f, NL, NL, 1.0f};
+    pulsar_head_decl id{4096, nullptr, 0.0f, NL, NL, 1.0f, 0.0f, 0.0f};
     check(pulsar_head_logits_finish_launch(&id, d, rows, ld, 0) == 0, "a head that declares nothing");
     CK(cudaMemcpy(out.data(), d, out.size() * 4, cudaMemcpyDeviceToHost));
     check(memcmp(out.data(), in.data(), in.size() * 4) == 0, "... leaves the logits as the GEMM wrote them");
@@ -215,7 +215,7 @@ static void gemma4_tests() {
     CK(cudaMalloc(&d_ids, sizeof ids));
     CK(cudaMemcpy(d_table, table.data(), table.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_ids, ids, sizeof ids, cudaMemcpyHostToDevice));
-    pulsar_head_decl h{H, nullptr, 0.0f, 262144, 262144, 1.0f};
+    pulsar_head_decl h{H, nullptr, 0.0f, 262144, 262144, 1.0f, 0.0f, 0.0f};
     h.softcap = 30.0f;
     h.embed_scale = s;
     check(s == 53.0f, "the bf16-rounded scale is 53 (got %g)", (double)s);
@@ -235,7 +235,7 @@ static void gemma4_tests() {
     float *d;
     CK(cudaMalloc(&d, in.size() * 4));
     CK(cudaMemcpy(d, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
-    pulsar_head_decl hc{H, nullptr, 0.0f, NL, NL, 1.0f};
+    pulsar_head_decl hc{H, nullptr, 0.0f, NL, NL, 1.0f, 0.0f, 0.0f};
     hc.softcap = 30.0f;
     check(pulsar_head_logits_finish_launch(&hc, d, rows, NL, 0) == 0, "%u soft-capped rows", rows);
     std::vector<float> lo(in.size());
@@ -268,7 +268,7 @@ static void refusals() {
     float *d; uint16_t *t; int32_t *ids;
     CK(cudaMalloc(&d, 1 << 20)); CK(cudaMalloc(&t, 1 << 20)); CK(cudaMalloc(&ids, 64));
     CK(cudaMemset(ids, 0, 64));
-    const pulsar_head_decl base{64, t, 1e-6f, 1000, 900, 0.5f};
+    const pulsar_head_decl base{64, t, 1e-6f, 1000, 900, 0.5f, 0.0f, 0.0f};
     auto lg = [&](const char *what, pulsar_head_decl h, uint32_t n, uint64_t ld) {
         check(pulsar_head_logits_finish_launch(&h, d, n, ld, 0) == -1, "refused: %s", what);
     };
@@ -331,7 +331,7 @@ static int fixture(const char *dir) {
     CK(cudaMalloc(&d_w, nw.size())); CK(cudaMemcpy(d_w, nw.data(), nw.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_ids, ids.size())); CK(cudaMemcpy(d_ids, ids.data(), ids.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_out, (size_t)T * H * 2));
-    const pulsar_head_decl h{H, d_w, (float)eps, NV, NR, (float)(1.0 / mup)};
+    const pulsar_head_decl h{H, d_w, (float)eps, NV, NR, (float)(1.0 / mup), 0.0f, 0.0f};
     bool ok = pulsar_head_embed_launch(&h, d_table, U, d_ids, T, d_out, H, 0) == 0;
     std::vector<uint16_t> y((size_t)T * H);
     CK(cudaMemcpy(y.data(), d_out, y.size() * 2, cudaMemcpyDeviceToHost));

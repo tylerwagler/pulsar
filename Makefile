@@ -552,8 +552,8 @@ tests/moe_route_bounds_gate: tests/moe_route_bounds_gate.cu Makefile \
 # production shape (every expert at half the intermediate width, 6 slots) on
 # one GPU, where ncu can profile it.  Prints us/call, GB/s and an output
 # checksum (a bit-exact kernel change must keep it).  Not a gate.
-tests/expert_gemv_bench: tests/expert_gemv_bench.cu $(CUTLASS_CUDA_OBJS) Makefile
-	$(NVCC) $(NVCCFLAGS) -Isrc -Isrc/cuda -o $@ $< $(CUTLASS_CUDA_OBJS) $(CUDA_LDLIBS)
+tests/expert_gemv_bench: tests/expert_gemv_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -Isrc -Isrc/cuda -o $@ $< $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 tests/expert_table_gate: tests/expert_table_gate.cu Makefile \
                          src/cuda/pulsar_cuda_expert_table.cu src/cuda/pulsar_cuda_internal.h \
@@ -1992,7 +1992,7 @@ server-kv-admission-live: pulsar-server
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
 # L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
 # of this tree (tracked and new files, so uncommitted edits count) from nothing, so an object already built can't hide a
-# warning, and greps the log.  CUTLASS is -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both
+# warning, and greps the log for both formats (gcc's `: warning:`, nvcc's front-end `: warning #NNN-D:`).  CUTLASS is -isystem: its own headers raise about 16,000 under -Wextra and aren't ours.  Both
 # run before the runner: a build's memory beside the accounting gate would fail it.
 .PHONY: warnings-gate doxygen-gate
 warnings-gate:
@@ -2002,7 +2002,7 @@ warnings-gate:
 	[ ! -f local.mk ] || cp local.mk "$$d/"; \
 	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
 	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
-	grep ': warning:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
+	grep -E ': warning( #[0-9]+-D)?:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
 	head -40 "$$d/warnings"; \
 	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
 	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
@@ -2312,7 +2312,9 @@ tests/runner/%.o: tests/%.cpp tests/gate_entry.h tests/gate_fixture.h tests/gate
 		-DPULSAR_GATE_BUILD_REF='"$(GATE_BUILD_REF)"' -c -o $@ $<
 tests/gates_runner.o: tests/gates_runner.cpp tests/gate_entry.h tests/gate_util.h src/pulsar.h src/engine/pulsar_engine_internal.h
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ tests/gates_runner.cpp
-tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o $(CORE_OBJS)
+# The host libraries the runner links beside its gates (its mutants below link the same).
+RUNNER_LIBS = src/lib/pulsar_help.o src/lib/pulsar_segstore.o src/lib/pulsar_kvchain.o src/lib/pulsar_kvtext.o
+tests/gates_runner: tests/gates_runner.o $(RUNNER_OBJS) $(RUNNER_LIBS) $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # The runner receives exactly what the individual targets passed: the prefill
 # baseline blob and its ref, the reference-capture dir (skips loudly when
@@ -2818,7 +2820,7 @@ tests/pulsar_test.o: tests/pulsar_test.cpp $(SERVER_SRCS) $(SERVER_HDRS) src/pul
 	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Itests -Wno-unused-function -c -o $@ tests/pulsar_test.cpp
 
 tests/pulsar_agent_test.o: tests/pulsar_agent_test.cpp $(AGENT_SRCS) src/agent/pulsar_agent_internal.h src/pulsar.h $(LIB_HDRS) src/vendor/linenoise.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Wno-unused-function -c -o $@ tests/pulsar_agent_test.cpp
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -c -o $@ tests/pulsar_agent_test.cpp
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.cpp src/pulsar_gpu.h
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ tests/cuda_long_context_smoke.cpp
@@ -3187,7 +3189,7 @@ tests/mutant/runner_$(1).$(3): $(2).$(3) tests/runner_mutants.py
 	python3 tests/runner_mutants.py $(1) $$< $$@
 tests/mutant/runner_$(1).o: tests/mutant/runner_$(1).$(3) $$(CUDA_FLAG_STAMP)
 	$(if $(filter cu,$(3)),$$(NVCC) $$(NVCCFLAGS) $$(MMQ_CPPFLAGS) -Isrc -Isrc/cuda -c -o $$@ $$<,$$(CXX) $$(CXXFLAGS) $$(PULSAR_INC) -Isrc/engine -c -o $$@ $$<)
-tests/gates_runner_mutant_$(1): tests/gates_runner.o $$(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o \
+tests/gates_runner_mutant_$(1): tests/gates_runner.o $$(RUNNER_OBJS) $$(RUNNER_LIBS) \
                                tests/mutant/runner_$(1).o $$(filter-out $(2).o,$$(CORE_OBJS))
 	$$(NVCC) $$(NVCCFLAGS) -o $$@ $$^ $$(CUDA_LDLIBS)
 endef
@@ -3197,7 +3199,7 @@ $(eval $(call RUNNER_MUTANT_RULES,row-sort-wide,src/cuda/pulsar_cuda_attention,c
 $(eval $(call RUNNER_MUTANT_RULES,adopt-rows,src/engine/checkpoint,cpp))
 $(eval $(call RUNNER_MUTANT_RULES,spec-emit,src/engine/session_spec,cpp))
 # ... and the L307 scratch-poison mutant in the runner: scratch-poison-gate on the hosted Qwen
-tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) src/lib/pulsar_help.o src/lib/pulsar_segstore.o \
+tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) $(RUNNER_LIBS) \
                                           tests/mutant/family_qwen_s4_l307.o $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # mutant -> the sub-gate (the moved leg) whose FAIL is the catch; the runner selection is runner_mutants.py's

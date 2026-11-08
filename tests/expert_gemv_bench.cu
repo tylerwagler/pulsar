@@ -38,14 +38,6 @@
 #include <string.h>
 #include <vector>
 
-/* The two symbols the CUTLASS object needs from the rest of the backend. */
-void pulsar_gpu_seg_note_device_free(const char *) {}
-int cuda_ok(cudaError_t err, const char *what) {
-    if (err == cudaSuccess) return 1;
-    fprintf(stderr, "expert_gemv_bench: %s: %s\n", what, cudaGetErrorString(err));
-    return 0;
-}
-
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
 

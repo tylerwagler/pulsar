@@ -441,7 +441,10 @@ static void multi_stream() {
     int32_t *d_first, *d_slot;
     CK(cudaMalloc(&d_first, 8)); CK(cudaMalloc(&d_slot, 4));
     CK(cudaMemcpy(d_first, hfirst, 8, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_slot, hslot, 4, cudaMemcpyHostToDevice));
-    pulsar_sconv_decl kd{1024, 4, 1, d_w}, vd{1024, 4, 1, d_w + 4096}, ad{4096, 4, 1, d_w + 8192}, md{4096, 4, 1, d_w + 8192 + 16384};
+    pulsar_sconv_decl kd{1024, 4, 1, d_w, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl vd{1024, 4, 1, d_w + 4096, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl ad{4096, 4, 1, d_w + 8192, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl md{4096, 4, 1, d_w + 8192 + 16384, nullptr, PULSAR_SCONV_ACT_NONE};
     const pulsar_sconv_rows rows{1, T, T, d_first, d_slot};
     auto stream_of = [&](const pulsar_sconv_decl *d, const uint16_t *x, uint64_t ldx, uint16_t *y, uint32_t i) {
         pulsar_sconv_stream s{};
@@ -504,7 +507,7 @@ static void refusals() {
     CK(cudaMalloc(&b, 1 << 20)); CK(cudaMalloc(&d, 64));
     const int32_t hf[3] = {0, 4, 0};   /* seq_first {0, 4}, seq_slot {0} */
     CK(cudaMemcpy(d, hf, 12, cudaMemcpyHostToDevice));
-    pulsar_sconv_decl D{64, 4, 1, b};
+    pulsar_sconv_decl D{64, 4, 1, b, nullptr, PULSAR_SCONV_ACT_NONE};
     pulsar_sconv_stream s{};
     s.decl = &D; s.x = b + 4096; s.ld_x = 64; s.y = b + 8192; s.ld_y = 64; s.state = b + 16384; s.state_ld = 64; s.state_stride = 192;
     pulsar_sconv_rows r{1, 4, 4, d, d + 2};
@@ -574,7 +577,7 @@ static int fixture(const char *dir) {
         CK(cudaMalloc(&d_y, xin.size())); CK(cudaMalloc(&d_y1, xin.size()));
         CK(cudaMalloc(&d_pool, (size_t)2 * 3 * C * 2)); CK(cudaMemset(d_pool, 0, (size_t)2 * 3 * C * 2));
         CK(cudaMalloc(&d_first, (T + 1) * 4)); CK(cudaMalloc(&d_slot, T * 4));
-        pulsar_sconv_decl D{C, 4, 1, d_w};
+        pulsar_sconv_decl D{C, 4, 1, d_w, nullptr, PULSAR_SCONV_ACT_NONE};
         pulsar_sconv_stream s{};
         s.decl = &D; s.x = d_x; s.ld_x = C; s.y = d_y; s.ld_y = C; s.state = d_pool; s.state_ld = C; s.state_stride = (uint64_t)3 * C;
         const int32_t one[2] = {0, (int32_t)T}, zero = 0;

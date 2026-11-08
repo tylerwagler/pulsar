@@ -34,7 +34,10 @@ int main() {
     CK(cudaMalloc(&cap, (size_t)4 * 16 * 6 * ss * 2));
     int32_t *first, *slot;
     CK(cudaMalloc(&first, 17 * 4)); CK(cudaMalloc(&slot, 16 * 4));
-    pulsar_sconv_decl kd{1024, K, 1, w}, vd{1024, K, 1, w + 1024 * K}, ad{H, K, 1, w + 2048 * K}, md{H, K, 1, w + (2048 + H) * K};
+    pulsar_sconv_decl kd{1024, K, 1, w, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl vd{1024, K, 1, w + 1024 * K, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl ad{H, K, 1, w + 2048 * K, nullptr, PULSAR_SCONV_ACT_NONE};
+    pulsar_sconv_decl md{H, K, 1, w + (2048 + H) * K, nullptr, PULSAR_SCONV_ACT_NONE};
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     const Lane lanes[] = {{"decode, 1 seq x 1 row", 1, 1, false},

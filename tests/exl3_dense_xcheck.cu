@@ -29,9 +29,7 @@
 
 /* the bf16 value a 16-bit pattern names (what the arm reads) */
 static double bf16_back(uint16_t u) {
-    __nv_bfloat16 b;
-    std::memcpy(&b, &u, sizeof(u));
-    return (double)__bfloat162float(b);
+    return (double)__bfloat162float(__ushort_as_bfloat16(u));
 }
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
