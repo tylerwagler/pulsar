@@ -28,21 +28,22 @@ container's `general.architecture` key picks the family; anything else is refuse
 at load.
 
 **GB10 (DGX Spark, `sm_121`) is the focus.** It is the production machine and
-the only one the release battery runs on. **The only model with good test
-coverage is Qwen3.8-Flash-Next.** It is the production model, and most of the
-battery's serving legs run on it. Treat every other row below as less proven, to
+the only one the release tier runs on. **The only model with good test
+coverage is Qwen3.8-Flash-Next.** It is the production model, the gate
+runner's primary, and most of the release tier's serving legs run on it. Every
+published model also starts and answers one request in `model-smoke`. Treat every other row below as less proven, to
 the degree its coverage column says.
 
 | Model (family) | Served id | Weight formats | Runs on | Features | Test coverage |
 | --- | --- | --- | --- | --- | --- |
-| **Qwen3.8-Flash-Next** (`qwen4_exp`) | `qwen3.8-flash-next` | EXL3 experts and head, MXFP8 / BF16 dense, NVFP4 drafter; PLE n-gram row file beside the container | GB10 | DFlash2 block drafter (default) or MTP; 262k context, 1M with `--rope-yarn 4`; banks + disk KV; images; TP=2 | **Good.** Production; most of the battery's live serving legs (scheduling, preemption, prefix reuse, resume, fan-out, structured output); its session, speculation, chunk-neutrality and KL-vs-BF16 reference gates; chat-template and vision-tower gates. Declared gaps (`tests/contracts.tsv`): TP on a real pair, whole-session payloads, mixed-prefill neutrality |
-| **DeepSeek V4 Flash** Vision-Exp / 0731 (`deepseek4`) | `deepseek-v4-flash` | MXFP8 dense, MXFP4 / IQ2_XXS / EXL3 routed experts, BF16 head | GB10 (needs `sm_12x`) | DSpark drafter merged in the container; 1M context; banks + disk KV; images (Vision-Exp); TP=2 | **Partial.** The Vision-Exp container is the battery runner's primary model (kernels, bit-exact prefill and decode baselines, the reference gates, sessions, speculation) and runs four live legs. Not exercised in production in this release |
+| **Qwen3.8-Flash-Next** (`qwen4_exp`) | `qwen3.8-flash-next` | EXL3 experts and head, MXFP8 / BF16 dense, NVFP4 drafter; PLE n-gram row file beside the container | GB10 | DFlash2 block drafter (default) or MTP; 262k context, 1M with `--rope-yarn 4`; banks + disk KV; images; TP=2 | **Good.** Production; the gate runner's primary (bit-exact prefill and decode baselines, sessions, speculation, chunk neutrality, the KL-vs-BF16 reference gate) and the unit suite; most of the release tier's live serving legs (scheduling, preemption, prefix reuse, resume, fan-out, structured output); chat-template and vision-tower gates. Decode reference is manual pending L360. Declared gaps (`tests/contracts.tsv`): TP on a real pair, whole-session payloads, mixed-prefill neutrality |
+| **DeepSeek V4 Flash** Vision-Exp / 0731 (`deepseek4`) | `deepseek-v4-flash` | MXFP8 dense, MXFP4 / IQ2_XXS / EXL3 routed experts, BF16 head | GB10 (needs `sm_12x`) | DSpark drafter merged in the container; 1M context; banks + disk KV; images (Vision-Exp); TP=2 | **Smoke.** `model-smoke` starts it and checks one answer. Its mechanism gates were retired when it left the gate runner (L357); its live legs (`make live-legs-deepseek`) run by hand. Not exercised in production in this release |
 | **DeepSeek V4.1 Flash** (`deepseek4`) | `deepseek-v4.1-flash` | as above, EXL3 routed experts; Engram table on disk | GB10 | DSpark when the container carries it; 1M context; banks + disk KV; no images (its image path refuses); TP=2 | **None.** Its gates read a checkpoint that was removed |
-| **Nemotron 3.5 Super** (`nemotron_h`) | `nemotron-3.5-super` | EXL3 K4, NVFP4 W4A16 LiLiCorr drafter | GB10 | LiLiCorr or MTP drafter; banks + disk KV; no images; no TP | **Partial.** Its LiLiCorr container runs three runner legs (block speculation, scratch poison, bank adoption) and two live legs; KV-admission legs on a mini fixture; chat-template gate |
+| **Nemotron 3.5 Super** (`nemotron_h`) | `nemotron-3.5-super` | EXL3 K4, NVFP4 W4A16 LiLiCorr drafter | GB10 | LiLiCorr or MTP drafter; banks + disk KV; no images; no TP | **Partial.** Its LiLiCorr container runs four runner legs (block speculation, scratch poison, bank adoption, graph == eager), two live legs and `model-smoke`; chat-template gate |
 | **Inkling** (`inkling`) | `inkling-small` | EXL3 K3 | GB10 | single session; no drafter, banks, images or TP | **None.** Parked; its gates read fixtures that were removed |
-| **Gemma 4 26B-A4B** (`gemma4`) | `gemma-4-26b-a4b` | EXL3 4.0, optional DFlash drafter and JEV adapter | Turing `sm_75` (in service on an RTX 6000); GB10 builds | DFlash drafter; banks + disk KV; `/v1/systemone` judge with the adapter; no images | **Manual.** `tests/gemma4_family_gate` and `tests/gemma4_jev_gate` run by hand; no Gemma model in the battery |
-| **Nemotron 3.5 Embed-8B / Rerank-8B** (`nemotron_enc`) | `nemotron-embed` / `nemotron-rerank` | EXL3 4.0 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/embeddings`, `/v1/rerank`; several in one process | **Manual.** `tests/nemotron_enc_gate` run by hand; not in the battery |
-| **Nemotron 3.5 Parse** (`nemotron_parse`) | `nemotron-parse` | f16 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/parse`, one page image a call | **Manual.** `tests/nemotron_parse_gate` against the HF fp32 reference, run by hand; not in the battery |
+| **Gemma 4 26B-A4B** (`gemma4`) | `gemma-4-26b-a4b` | EXL3 4.0, optional DFlash drafter and JEV adapter | Turing `sm_75` (in service on an RTX 6000); GB10 builds | DFlash drafter; banks + disk KV; `/v1/systemone` judge with the adapter; no images | **Smoke.** `model-smoke` starts it and checks one answer; `tests/gemma4_family_gate` and `tests/gemma4_jev_gate` run by hand |
+| **Nemotron 3.5 Embed-8B / Rerank-8B** (`nemotron_enc`) | `nemotron-embed` / `nemotron-rerank` | EXL3 4.0 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/embeddings`, `/v1/rerank`; several in one process | **Smoke.** `model-smoke` checks one embedding and one ranking; `tests/nemotron_enc_gate` runs by hand |
+| **Nemotron 3.5 Parse** (`nemotron_parse`) | `nemotron-parse` | f16 | Turing `sm_75` (in service on an RTX 5000); GB10 builds | `/v1/parse`, one page image a call | **Smoke.** `model-smoke` checks one parse; `tests/nemotron_parse_gate` against the HF fp32 reference runs by hand |
 
 "Runs on" lists what has been run. Other GPUs are not tested. What they could
 run follows from the code: the runtime floor is `sm_75`, and anything below it is
@@ -109,10 +110,14 @@ Tests and release gates are described in
 [docs/QA_BEFORE_RELEASES.md](docs/QA_BEFORE_RELEASES.md) and
 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md). In short:
 
-- `make test`: the main test runner. It needs a model in `PULSAR_TEST_MODEL`.
-- `make cuda-regression`: modelless kernel smokes.
-- `make gates-dev`: the fast tier.
-- `make gates`: the full release battery.
+- `make check`: no GPU, no model time; runs beside a serving box. Every commit.
+- `make kernels`: a GPU, no model.
+- `make release`: the real models, production down. It runs every tier.
+- `make gates-dev`: the iteration tier, chosen from the paths you touched.
+
+The tiers are listed in `tests/manifest.toml` and run by `tests/run.py`; each
+run leaves its logs and `results.json` in `.build/tests/<tier>-<sha>/`.
+`make test` runs the unit suite alone; it needs a model in `PULSAR_TEST_MODEL`.
 
 ## Models
 

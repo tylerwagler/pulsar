@@ -26,12 +26,94 @@ and any non-default flags for every manual run.
 
 ## 2. Core Regression Tests
 
-- Run the default suite:
-  `make test` (also the first entry of `make gates`, as `unit-test-gate`,
-  since 2026-09-03 -- a battery run covers it, as `pulsar_test --gating` since
-  2026-10-14: every test but the informational `logprob-vectors`).
-- Run the CUDA smoke regression:
-  `make cuda-regression`.
+### The tiers
+
+Every test is a make target, listed once in `tests/manifest.toml` with its
+tier, its order and its budget.  `tests/run.py` runs a tier from that list and
+says exactly what ran (L357).  The tier says what a test needs:
+
+| tier | command | needs | when |
+|---|---|---|---|
+| check | `make check` | no GPU, no model time; runs beside a serving production box | every commit |
+| kernels | `make kernels` | a GPU, no model | kernel changes |
+| release | `make release` | the real models, production down | once per landing series on numeric paths, and before a release |
+
+`make release` runs every tier: the check and kernels tests first, then the
+model tests, with the host-only tests (`overlap = true` in the manifest)
+running in the background beside `cuda-runner-gate`, the long GPU tail.  The
+landing rules that pick a tier are `ENGINEERING-RULES.md` section 10.
+
+```
+tests/run.py check|kernels|release [--only a,b] [--strict] [--dry-run]
+tests/run.py --list [TIER]
+tests/run.py --verify
+```
+
+- **Results.**  Each run writes `.build/tests/<tier>-<sha>/`: one log per
+  test, `results.json` (each test's exit code, seconds, budget and SKIP lines)
+  and `sections.tsv` (the per-model sections the runner and the live legs
+  report).  A dirty tree is named in the first line.  The exit code is 0 only
+  when every test passed.
+- **Budgets** live in the manifest: per test, per section (`[sections]`), and
+  the release total (`[limits]`).  A test over its budget is flagged, not
+  failed.  A row that adds time moves its budget in the manifest, in its own
+  commit, and its ledger row says why.
+- **No silent SKIP.**  A test that cannot run its check FAILS by name.  Any
+  log line that starts with `SKIP` is listed under "NOT FULLY RUN" in the
+  summary, and `--strict` fails its test.
+- **`make gates`** is the old wiring and stays until it is retired.
+  `make release` runs the same targets in the same order (`GATE_TARGETS`, with
+  `HOST_GATE_TARGETS` beside the runner).  `tests/run.py --verify` checks that
+  the manifest and the two Makefile lists agree; every run checks it first and
+  refuses on a difference.
+- **`make gates-dev`** stays the iteration tier: a subset chosen from the
+  paths the working tree touches, one to two minutes.  It is not a release
+  gate.
+
+### Models and fixtures
+
+The tests read their models, fixtures and reference captures from Makefile
+variables (`QWEN_GATE_MODEL`, `LILICORR_GATE_MODEL`, `FRONTIER_MODEL`, the
+`SMOKE_*` models, ...).  They have no defaults in the tree.  Set them in a
+gitignored `local.mk` at the engine root; `local.mk.example` lists them.  A
+test whose variable is unset refuses by name when it runs.
+
+- **The published containers, from the Hugging Face cache.**  `local.mk`
+  resolves each repo's `refs/main` to its snapshot.  On the GB10 host the
+  cache is on local NVMe: streaming the Qwen PLE rows over NFS doubled the
+  release time.  A local copy instead of the cache needs a good reason, and
+  the reason is written down.
+- **No generated model pieces.**  No test builds zero-weight or mini
+  containers of its own.
+- **No system-wide memory measurement in a gate.**  Measure per process or
+  per device.
+- **Qwen 3.8, the production model, is the runner's primary** and runs the
+  whole table.  Nemotron 3.5 Super is hosted after it for its drafter legs
+  (`block-spec-gate`, `scratch-poison-gate`, `bank-adopt-gate`) and
+  `graph-eager-gate` (`RUNNER_HOSTED_ARGS`).  **DeepSeek V4 is smoke-only**
+  since 2026-11-07: its mechanism gates were retired (L357), and the
+  family-neutral runner gates carry their intent.
+- **`model-smoke`** (`tests/model_smoke_live.py`) starts every published
+  container on a server of its own, one at a time, and checks one answer of
+  its kind: a chat model answers "7+5" with 12, an embedder returns a vector
+  of its advertised dimension, the reranker ranks Paris above bananas, the
+  parser answers 200 on a text-free PNG.  A model that does not start FAILS by
+  name.  It is DeepSeek's release check.
+- **The byte baselines are Qwen's**, dumped at `d3e488fe` on the published
+  container (`tests/test-vectors/prefill_bitexact_baseline-qwen-d3e488fe.md`
+  and `prefill_decode_baseline-qwen-d3e488fe.md` give the provenance).  A blob
+  is only meaningful for the container revision it was dumped on: a new
+  revision needs new blobs.
+- **Decode reference is manual.**  `cuda-decode-reference-gate-*` is a DEV
+  entry of the runner: the release tier lists it and does not run it, pending
+  an open investigation of Qwen's wide decode rows (L360).
+
+### Other tests
+
+- `make test` runs the whole unit suite (`pulsar_test`, including the
+  informational `logprob-vectors`).  `make release` runs it as
+  `unit-test-gate`: `pulsar_test --gating` on the served Qwen pack, every test
+  but `logprob-vectors`.
 - Run the vector checks explicitly after any tokenizer, template, KV, kernel,
   quantization, or prompt-rendering change:
   `./pulsar_test --logprob-vectors`
@@ -41,26 +123,17 @@ and any non-default flags for every manual run.
 - Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
   replay changed:
   `./pulsar_test --server`.
-- Build and run the agent unit tests: `make pulsar_agent_test CUDA_ARCH=sm_120f
-  && ./pulsar_agent_test` (they are not part of `make test`).
-- Run `./pulsar-eval --self-test-extractors`.
+- The agent unit tests (`pulsar_agent_test`) are `agent-test-gate`, in
+  `make check`; they are not part of `make test`.
+- `./pulsar-eval --self-test-extractors` runs in `host-checks`.
 
 ### CUDA gates ledger
 
 **Run them with one command:**
 
 ```
-make gates FRONTIER_MODEL=/path/to/<checkpoint-dir>
+make release
 ```
-
-The battery reads its models, fixtures and reference captures from about 40
-Makefile variables (`FRONTIER_MODEL`, `QWEN_GATE_MODEL`, `LILICORR_GATE_MODEL`,
-...). They have no defaults in the tree. Set them in a gitignored `local.mk` at
-the engine root; `local.mk.example` lists them. A gate whose variable is unset
-refuses by name when it runs.
-
-It runs every gate below, continues past failures so one break does not hide
-the rest, prints a PASS/FAIL summary, and exits non-zero if any failed.
 
 > ⚠ **Do not hand-run these individually and tick them off.** That is what this
 > checklist used to say, and on 2026-08-14 a sweep found the prefill gate
@@ -71,26 +144,28 @@ the rest, prints a PASS/FAIL summary, and exits non-zero if any failed.
 > build.**  A gate nobody invokes is a gate that silently stops compiling.
 >
 > Two rules that follow:
-> * After removing or changing any engine API parameter, run `make gates`.
+> * After removing or changing any engine API parameter, run `make release`.
 >   Gates are separate targets; the product build will not tell you.
 > * Re-baseline `PREFILL_BASELINE_REF` whenever a numerics change **ships**, and
 >   only then.  Anchoring it before a deliberate precision change makes the gate
 >   fail forever, and a gate that always fails is one you learn to ignore.
 
-The individual targets, all needing the GB10 and (except the first two) the
-model.  Record pass/fail against the release commit:
+Some of the gates, for iterating on one.  The model gates are sub-gates of
+`cuda-runner-gate` and run there on Qwen.  Their standalone targets read
+`FRONTIER_MODEL`; the baselines are Qwen's, so set it to the Qwen container
+when running one alone.
 
 - `make cuda-regression` — modelless kernel smokes.
 - `make cuda-attn-gates` — fp16 attention kernel oracle (dense, compressed,
   indexed, decode-batch, one-row), banked cross-session KV-leak isolation
   (modelless).
 - `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
-  `PREFILL_BASELINE_REF` blob (default `5fe1831d`, the CUDA 13.5 toolchain; before it `13bcbab1`, the L292 NVFP4
-  exact-divide fix; provenance in `tests/test-vectors/`).  **The baseline
-  build must be able to load the shipped artifact**: a baseline ref that
-  predates the artifact's layouts or payload version cannot run at all, and
-  the gate cannot certify the release.  Rebuild the blob with
-  `make cuda-prefill-gate-baseline` after bumping the ref.
+  `PREFILL_BASELINE_REF` blob (`d3e488fe`, Qwen's, on the published container;
+  before it the DeepSeek Vision-Exp blob at `5fe1831d`; provenance in
+  `tests/test-vectors/`).  **The baseline build must be able to load the
+  shipped artifact**: a baseline ref that predates the artifact's layouts or
+  payload version cannot run at all, and the gate cannot certify the release.
+  Rebuild the blob with `make cuda-prefill-gate-baseline` after bumping the ref.
 - `make cuda-seam-gate` — token-boundary seams keep the live KV (L115).
   Discovers a seam pair from the model's own vocabulary, then pins the byte
   walk, the sync rescue, the shorter-echo shape, and a fork across seams.
@@ -100,26 +175,37 @@ model.  Record pass/fail against the release commit:
 - `make cuda-algo-stability-gate` — cuBLASLt M-independence.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
-**The battery runs the production drafters (L305, 2026-10-21).**  Qwen's hosted model and every Qwen gate default
-(`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the served pack, `qwen38fn-dflash2` (DFlash2, the EXL3 K5
-head, no MTP module); Nemotron's drafter gate is LiLiCorr's, DeepSeek's is DSpark's.  **MTP is a dormant lane, and no gate grades it.**
+**The release tier runs the production drafters (L305, 2026-10-21).**  Qwen's model and every Qwen gate default
+(`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the published Qwen container (DFlash2, the EXL3 K5
+head, no MTP module); Nemotron's drafter gate is LiLiCorr's.  **MTP is a dormant lane, and no gate grades it.**
 `sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.
 
-### Battery wall time
+### Battery wall time (the release tier)
 
-The one home for what `make gates` costs and why (Phase 5 #39: back under ~35 min).  The battery prints
-its own table at the end -- `seconds per gate` in the runner summary, and each section against its budget
-below in the GATE SUMMARY -- so every battery log is a fresh measurement; this section records the levers.
+The one home for what the release tier costs and why.  Every run prints its own
+table at the end -- each test's seconds against its budget, each section's, and
+the total -- and keeps it in `.build/tests/release-<sha>/results.json`, so every
+run is a fresh measurement; this section records the levers.  The history below
+is from the `make gates` era ("the battery"); the targets are the same.
 
-**The budget (L317, 2026-10-21).**  `make gates` ends with each section's seconds against this table
-(`tests/battery_budget.py` reads it from here -- the one place the budgets are written) and flags, never
-fails, a section over its budget or a section with no row.  A row that adds battery time says so: it moves
-its section's budget here, in its own commit, and its ledger row says why.  Sections: each serial target;
-the runner per hosted model (`cuda-runner-gate [<family>]`, its engine opens included); the live legs per
-model (`live-legs [<model>]`, its server loads included); the host-only gates, which overlap the runner, as
-their longest; and the suite total (the recipe's wall, the prerequisite build outside it, ~100 s).
-*Provisional:* the section rows are estimates from #422; the first battery at the L317 sha re-sets them from its
-own table.  The total is the target (L317: about 50 min with the live legs), not the sum of the rows.
+**Now (L357, 2026-11-07).**  The budgets live in `tests/manifest.toml`: per test,
+per section (`[sections]`: the runner per hosted model, `cuda-runner-gate
+[<family>]`, its engine opens included; the live legs per model, `live-legs
+[<model>]`, its server loads included) and the release total (`[limits]`,
+3000 s).  The last full release on the new structure took **3661 s**; that run
+still paid DeepSeek's unit-test model loads, before the unit suite moved to the
+Qwen pack.  The same release with the Hugging Face cache on NFS took **7797 s**:
+streaming the Qwen PLE rows over NFS is why the GB10 host keeps its cache on
+local NVMe.
+
+**The `make gates` copy.**  `make gates` still prints each section against the
+table below (`tests/battery_budget.py` reads it from here), and flags, never
+fails, a section over its budget or a section with no row.  The manifest is the
+authority; this table is kept equal to it until `make gates` is retired, and a
+budget change edits both.  Sections: each serial target; the runner per hosted
+model; the live legs per model; the host-only gates, which overlap the runner,
+as their longest; and the suite total (the recipe's wall, the prerequisite build
+outside it, ~100 s).
 
 <!-- battery-budget -->
 | section | budget s | holds |
@@ -141,15 +227,15 @@ own table.  The total is the target (L317: about 50 min with the live legs), not
 | `warnings-gate` | 180 | L354: a build from nothing has zero warnings (CUTLASS is `-isystem`) |
 | `doxygen-gate` | 120 | L354: `docs/api/doxygen-warnings.log` is empty |
 | `model-smoke` | 900 | L357: seven published models, each its own server load (Qwen, DeepSeek, Nemotron, Gemma, embed, rerank, parse) and one request; an estimate, re-set from the first battery |
-| `cuda-runner-gate [Qwen4-exp]` | 720 | the whole table where its needs allow, 2 opens; block-spec (DFlash2) |
-| `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt; 1 open |
+| `cuda-runner-gate [Qwen4-exp]` | 1200 | the primary since L357: the whole table where its needs allow; block-spec (DFlash2) |
+| `cuda-runner-gate [Nemotron-H]` | 300 | block-spec (LiLiCorr), scratch-poison, bank-adopt, graph-eager; 1 open |
 | `live-legs [qwen]` | 1500 | the stall check, abandon, constrained, server-live, prefix-turns x2, preempt: warm + hooks + fresh |
 | `live-legs [nemotron]` | 420 | kv-dup, opencode-turns: warm + fresh.  L326: 240 -> 420, measured 365 s (#456: L324's kv-dup leg +~49 s, the warm load cold-cache 214 s vs 136) + 15% |
 | `preempt-wedge-live` | 300 | L353 no. 5: a parked decoder holds no KV, so a prompt that can never fit gets its 503 and the decoder comes back. |
 | `resume-fixes-live` | 420 | L355: the resume after a disconnect, a spill and a restart at a grid multiple |
-| `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon, the Nemotron mini |
+| `server-kv-headroom-live` | 240 | L319: the touched-KV ceiling is the measured headroom; a balloon |
 | `host-only gates (longest)` | 90 | overlap the runner |
-| `suite total` | 3000 | the target: <= ~50 min, the live legs included |
+| `suite total` | 3000 | the target: <= ~50 min, the live legs included (last measured 3661 s, L357) |
 <!-- /battery-budget -->
 
 **2026-10-21 (L317, the battery diet; #389 / #422 before it: suite 3,329 / 3,219 s + ~45 min of live
@@ -169,14 +255,15 @@ on an engine it now shares.
 | cuda-chunk-neutrality-gate (382 + 212 s) | 16 schedules + X, both families | battery: A + one schedule per class (grid, endpoint, finishing, disk), seeded by the sha; the past-ring class (K, M, P: the 4,600-step decode) and the rest: `cuda-chunk-neutrality-gate-full`, gates-dev on prefill / chunk / kv_state / checkpoint / session / segment-store paths |
 | row-neutrality -deep / -deeper, algo-stability -deep | battery, both families | gates-dev entries of the runner (attention and kernel-dispatch paths); the battery keeps the short probe and the short sweep |
 
-- *The runner hosts three models, one at a time* (each closed before the next opens): DeepSeek, Qwen
-  (`qwen38fn-dflash2`, the production pack), Nemotron (`nemotron35-k4-lilicorr-pulsar`).  `--gates=a,b`
+- *The runner hosts two models, one at a time* (each closed before the next opens; L357): Qwen, the
+  primary, on the whole table, then Nemotron's LiLiCorr container for its own legs.  DeepSeek, the primary
+  until L357, left the runner.  `--gates=a,b`
   after a `--model` restricts a hosted model to its own legs; a runner entry marked DEV runs only when
   `--only` names it (gates-dev), and every run lists them by name.  A hosted model none of whose entries the
   selection takes is not opened.
 - *The live legs* run at each model's production flags (`tests/live_legs.py` MODELS, from the production serve env files:
-  all PULSAR_MSEQ_BANKS=16; DeepSeek 1M ctx; Qwen 262k ctx, 64 GB disk tier; Nemotron 1M ctx, LiLiCorr, 64 GB disk
-  tier).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
+  all PULSAR_MSEQ_BANKS=16; Qwen 262k ctx, 64 GB disk tier; Nemotron 1M ctx, LiLiCorr, 64 GB disk
+  tier; DeepSeek's legs, 1M ctx, are `live-legs-deepseek`, run by hand or by gates-dev on a DeepSeek path).  `tests/live_legs.py`, `make live-legs`, `LIVE_LEGS=a,b` for a subset: per model the
   shared server, then one instance with every server-wide test hook its legs need (only if one does), then
   one fresh instance for every reuse == cold reference (only if one does) -- never two engines at once.
   Each leg keeps its checks and its PASS/FAIL; each phase names the instance it ran on; each leg's
@@ -267,7 +354,7 @@ and a bare `flock -o ~/gpu.lock`, which is not FIFO (seven waiters ran in random
 no job classes and no memory, and shows little.
 
     gpuq submit --class short --timeout 20m --wait -- make gates-dev PATHS=src/engine/session.cpp
-    gpuq submit --class quiet --timeout 75m --wait -- ./battery.sh <sha>             # a battery
+    gpuq submit --class quiet --timeout 90m --wait -- make release                   # the release tier
     gpuq submit --class long --timeout 20h --mem 40G --min-hold 1h --yield-grace 90m \
          --label my-long-job -- bash ./long_job.sh                                     # prints the job id
     gpuq status [--json]    gpuq log [-f] ID    gpuq cancel ID
@@ -489,9 +576,11 @@ notes, since a number with no run record is not a baseline.
 
 Do not sign off until:
 
-- `make test` and `make cuda-regression` passed on the GB10 host.
-- The CUDA gates ledger (section 2) passed against the release commit and the
-  shipped artifact, with a prefill-gate baseline (`PREFILL_BASELINE_REF`) whose build loads the shipped artifact.
+- `make release` passed on the GB10 host against the release commit and the
+  shipped artifacts, on a clean tree, with nothing under "NOT FULLY RUN"
+  that is not written down; keep its `results.json` with the release notes.
+- The byte baselines (`PREFILL_BASELINE_REF`) were dumped on the shipped
+  container revision, by a build that loads it.
 - The Flash inference path (CLI, thinking modes, long-context recall) was
   exercised.
 - Disk KV cache was exercised.

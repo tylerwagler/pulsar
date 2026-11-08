@@ -28,7 +28,7 @@ suffix re-quantised f32 through a fallback on every step.  Each one passed
 every gate because the gates only ever ran the path the fallback masked.
 
 *How enforced:* the refusal names the shape and the producer that did not
-emit (see `act_a8_missing_fail`); the battery surfaces it as a failed gate.
+emit (see `act_a8_missing_fail`); the release tier surfaces it as a failed gate.
 There are no announce-on-miss lines: if the miss cannot happen, there is
 nothing to announce.  A review question for every branch: *if this branch is
 taken, is a different numeric answer produced?*  If yes, it is a fallback.
@@ -144,9 +144,10 @@ takes the faster arms instead of being refused.  Choosing such an arm is a
 numerics change and is graded, not byte-gated: the spec oracle
 (`make cuda-spec-sampling-gate`: the sampled distribution still the target's)
 for any verify-path change, KL of the row against a one-token decode, and the
-reference gate where the prefill moves.  The width/row/mixed neutrality gates
-still run; past the M-independent width they report the drift (KL) instead of
-failing on bytes.  What stays bit-exact: a refactor, the same rows at the same
+reference gate where the prefill moves.  The width and row neutrality gates
+and the session contract's batched and verify legs (B2, B6, F1, F4) still run;
+past the M-independent width they report the drift (KL) instead of failing on
+bytes.  What stays bit-exact: a refactor, the same rows at the same
 width, and a resume against the cold prefill of the same chunking.  Rule 8
 picks the arm: measured at the production lane's widths, the fastest wins.
 
@@ -171,15 +172,16 @@ An engine that hits an impossible state stops the call and says exactly
 what was missing, once per shape.  It never returns a well-formed number
 from a different computation.  Warnings that fire per token are noise; a
 missing announce is a fact nobody can see; a refusal is a gate failure the
-battery reports.
+release tier reports.
 
 ## 10. Landing discipline.
 
-Every landing: the gate tier its paths call for (below) on the GB10 at an
-asserted sha and clean tree, zero build warnings, doxygen zero warnings, the
-unit suite (in the battery since L158), and the ledger row updated in the same
-session.  Byte-exact or graded (rule 7).  Production A/B when the change
-touches a served kernel.  Squash to one commit whose message says what was
+Every landing: the test tier its paths call for (below) at an asserted sha
+and clean tree, zero build warnings and zero doxygen warnings (`warnings-gate`
+and `doxygen-gate`, both in `make check`), the unit suite (`unit-test-gate`, in
+`make release`), and the ledger row updated in the same session.
+Byte-exact or graded (rule 7).  Production A/B when the change touches a
+served kernel.  Squash to one commit whose message says what was
 deleted as clearly as what was added.  Delete the topic branch when it lands;
 park a branch only with a row that says why and for how long.
 
@@ -206,22 +208,58 @@ through comments.  For contributors:
   read as an undocumented parameter list, depending on which file it parses
   first.
 
+**The tiers (L357).**  Every test is a make target, listed once in
+`tests/manifest.toml` with its tier and its budget; `tests/run.py` runs a tier
+from it.  The tier says what a test needs:
+
+- `make check`: no GPU, no model time.  It runs beside a serving production
+  box.  Every commit.
+- `make kernels`: a GPU, no model.
+- `make release`: the real models, production down.  It runs every tier:
+  check and kernels first, the host tests overlapping the runner.
+
+`make gates` is the old wiring and stays until it is retired.  `make release`
+runs the same targets in the same order (`GATE_TARGETS`, then
+`HOST_GATE_TARGETS` beside `cuda-runner-gate`); `tests/run.py --verify`
+checks that the manifest and the Makefile's lists agree, and every run checks
+it first.  `make gates-dev` stays the iteration tier: a subset chosen from the
+paths the working tree touches.  It is not a release gate.
+
+A run leaves its logs, `results.json` and `sections.tsv` in
+`.build/tests/<tier>-<sha>/`.  A test over its budget is flagged, not failed.
+
 **The tier follows the paths (2026-09-23, Tyler: "we spend way too much time
-on batteries").**  ONE full battery per landing SERIES, on the last sha whose
-numeric paths changed -- not one per increment, and not again for a delta
-that cannot move a number:
+on batteries").**  `make check` on every commit.  ONE `make release` per
+landing SERIES, on the last sha whose numeric paths changed -- not one per
+increment, and not again for a delta that cannot move a number:
 
 - `src/engine`, `src/families`, `src/cuda`, `src/server`, `src/tp` changed on a path a token
-  takes: the full `make gates` at that sha.
-- After that battery, a delta of refusal paths, announces, tests, tools,
-  docs or Makefile recipes: the gate that covers it plus `make gates-dev`
-  for the touched paths, at the sha that lands.  The battery already proved
-  the numerics; re-running it proves nothing the dev tier does not.
-- `tools/`, `docs/`, test helpers, Makefile recipes only: a build plus
+  takes: `make release` at that sha.
+- After that release run, a delta of refusal paths, announces, tests, tools,
+  docs or Makefile recipes: the test that covers it plus `make gates-dev`
+  for the touched paths, at the sha that lands.  The release run already
+  proved the numerics; re-running it proves nothing the dev tier does not.
+- `tools/`, `docs/`, test helpers, Makefile recipes only: `make check` plus
   `make gates-dev`.
 
-A measurement (the perf A/B, a census) goes AHEAD of a battery in the GPU
-queue when someone is waiting on the number; the battery runs behind it.
+A measurement (the perf A/B, a census) goes AHEAD of a release run in the GPU
+queue when someone is waiting on the number; the release run waits behind it.
+
+**What a test may do (L357).**
+
+- *Read the published containers.*  Tests read each model from the Hugging
+  Face cache; `local.mk` resolves each repo's `refs/main` to its snapshot.  On
+  the GB10 host the cache sits on local NVMe: streaming the Qwen PLE rows over
+  NFS doubled the release time.  A local copy instead of the cache needs a
+  good reason, and the reason is written down.
+- *No silent SKIP.*  A test that cannot run its check FAILS by name.  A log
+  line that starts with `SKIP` is listed by `tests/run.py` under "NOT FULLY
+  RUN", and `--strict` fails its test.
+- *No generated model pieces.*  A test builds no zero-weight or mini
+  containers of its own; it runs on a published one.
+- *No system-wide memory measurement in a gate.*  Measure per process or per
+  device.  The box's free memory counts every other process on it, so a
+  verdict read from it is not the test's.
 
 ## Named exceptions to rule 1
 
@@ -261,9 +299,10 @@ byte-identical to cold).
    `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend
    on how many drafts ride with it (within the M-independent width; past it
    the faster arms are allowed and the drift is graded -- rule 7, 2026-10-08).
-   *Instruments:* `cuda-mixed-neutrality-gate` GATE 5/5R (a
-   run's rows batched == the same run alone, byte-identical, 1..16 rows) for
-   the per-row claim; the spec oracle (`make cuda-spec-sampling-gate`) grades
+   *Instruments:* `session-contract-gate` B6 / F1 (a verify
+   step over several banks' runs gives each run's rows byte-identical to the
+   same rows verified alone) for the per-row claim (it replaced
+   `cuda-mixed-neutrality-gate`, retired with DeepSeek's mechanism gates, L357); the spec oracle (`make cuda-spec-sampling-gate`) grades
    alpha at the default tau.
 
 ## What "clean" means here
