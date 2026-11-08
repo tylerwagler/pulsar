@@ -3,7 +3,7 @@
 
 Reads tests/contracts.tsv (every gate's contract, family and tier) and the Makefile, then:
   - checks every listed gate exists (a make target, or a runner sub-gate name in tests/gates_runner.cpp) and is in
-    the tier it claims (battery = in GATE_TARGETS / HOST_GATE_TARGETS / the runner; dev = selected by gates-dev);
+    the tier it claims (battery = in tests/manifest.toml (any tier) or the runner; dev = selected by gates-dev);
   - prints the contract x family matrix (battery gates per cell);
   - FAILS on a contract x family cell that has no battery gate and is not a declared `gap` row naming the ledger
     row that closes it -- and on a `gap` row whose cell is in fact covered (a closed gap must be deleted);
@@ -20,17 +20,17 @@ CONTRACTS = ('session', 'loader', 'spec', 'spec-dist', 'reference', 'chat', 'ser
 FAMILIES = ('deepseek4', 'qwen4_exp', 'nemotron_h', 'gemma4', 'nemotron_enc', 'nemotron_parse', 'inkling')
 
 
-def make_list(text, var):
-    m = re.search(r'^' + var + r'\s*[:?]?=\s*((?:.*\\\n)*.*)$', text, re.M)
-    if not m:
-        sys.exit(f'coverage_matrix: {var} not found in the Makefile')
-    return set(m.group(1).replace('\\\n', ' ').split())
+def manifest_names():
+    """every test of every tier: tests/manifest.toml is the tiers' one list (L357)"""
+    import tomllib
+    with open('tests/manifest.toml', 'rb') as f:
+        return {t['name'] for t in tomllib.load(f)['test']}
 
 
 def main():
     mk = open('Makefile').read()
     runner = open('tests/gates_runner.cpp').read()
-    battery = make_list(mk, 'GATE_TARGETS') | make_list(mk, 'HOST_GATE_TARGETS')
+    battery = manifest_names()
     targets = set(re.findall(r'^([A-Za-z0-9_.-]+):', mk, re.M))
     runner_gates = set(re.findall(r'\{"([a-z][a-z0-9-]+)",\s*gate_\w+_main', runner)) | \
         set(re.findall(r'gate_spec \w+ = \{"([a-z][a-z0-9-]+)"', runner))

@@ -218,11 +218,10 @@ from it.  The tier says what a test needs:
 - `make release`: the real models, production down.  It runs every tier:
   check and kernels first, the host tests overlapping the runner.
 
-`make gates` is the old wiring and stays until it is retired.  `make release`
-runs the same targets in the same order (`GATE_TARGETS`, then
-`HOST_GATE_TARGETS` beside `cuda-runner-gate`); `tests/run.py --verify`
-checks that the manifest and the Makefile's lists agree, and every run checks
-it first.  `make gates-dev` stays the iteration tier: a subset chosen from the
+`make gates` is `make release` under its old name: the Makefile keeps no list
+of its own (L357, 2026-11-08).  `tests/run.py --verify` checks that every
+manifest test is named once and is a make target, and every run checks it
+first.  `make gates-dev` stays the iteration tier: a subset chosen from the
 paths the working tree touches.  It is not a release gate.
 
 A run leaves its logs, `results.json` and `sections.tsv` in

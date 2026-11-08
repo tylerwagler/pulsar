@@ -266,13 +266,11 @@ help:
 	@echo "  make cuda-spec-sampling-gate"
 	@echo "                           Speculative-sampling chi-square exactness"
 	@echo "                           oracle + acceptance alpha (needs the model)"
-	@echo "  make gates               Run EVERY release-blocking gate and print a"
-	@echo "                           pass/fail summary (needs the GB10 + model:"
-	@echo "                           model paths in local.mk, or FRONTIER_MODEL=DIR ...)"
-	@echo "                           = $(GATE_TARGETS)"
-	@echo "                           + host-only, run alongside cuda-runner-gate:"
-	@echo "                             $(HOST_GATE_TARGETS)"
-	@echo "                           (cuda-runner-gate runs the model gates in one process)"
+	@echo "  make gates               = make release: EVERY release-blocking test, from"
+	@echo "                           tests/manifest.toml (tests/run.py --list release),"
+	@echo "                           with a pass/fail and budget summary (needs the GB10"
+	@echo "                           + the cached models: local.mk)"
+	@echo "  make check | kernels     The no-GPU tier; the GPU-no-model tier"
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
@@ -1431,7 +1429,7 @@ vision-span-gate: tests/vision_span_gate
 
 # L216: the ViT + aligner forward vs the checkpoint's own vision.py.  This one
 # needs a VISION-EXP artifact (the battery's FRONTIER_MODEL is 0731, which has no
-# tower), so it is NOT in GATE_TARGETS and refuses to silently pass when
+# tower), so it is NOT in tests/manifest.toml and refuses to silently pass when
 # VISION_MODEL is unset.
 VISION_MODEL ?=
 # L216: the WHOLE per-image lane, bytes in -> HC carrier out, vs the reference.
@@ -1883,7 +1881,7 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 # pin appear not to work.  So: dependency tracking removed the .cuh-staleness
 # reason for -B; the arch-mismatch reason remains, and it is sufficient on its
 # own for an acceptance gate.
-# DIAGNOSTIC, deliberately NOT in GATE_TARGETS.  Spec-vs-greedy byte equality is
+# DIAGNOSTIC, deliberately NOT in tests/manifest.toml.  Spec-vs-greedy byte equality is
 # NOT an invariant of this engine: measured 2026-08-14 on clean dev, the set of
 # diverging draft depths is stable across generation LENGTH but changes with the
 # PROMPT -- one prompt gives {4,5}, another gives all of {1..8}.  Not even depth 1
@@ -2370,7 +2368,7 @@ cuda-runner-gate: tests/gates_runner
 # been failing since May because nobody ran it.  Same model as the frontier
 # gates so one FRONTIER_MODEL= names the artifact for everything.
 # seam-check used to be a prerequisite here (host-only, ~instant).  L220 moved
-# it to HOST_GATE_TARGETS: it still runs in the battery, just alongside the GPU
+# it to the manifest's overlap tests: it still runs in the battery, just alongside the GPU
 # tail instead of in front of pulsar_test.  A seam-check failure still fails the
 # battery (it lands in the same pass/fail fold).
 # 2026-10-14: --gating, every test but the informational ones (logprob-vectors: a drift dashboard whose mismatches
@@ -2402,46 +2400,24 @@ agent-test-gate: pulsar_agent_test
 prefix-stability-gate: pulsar_test
 	python3 tests/prefix_stability_gate.py --pulsar-test ./pulsar_test
 
-# The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
-# tests/gates_runner.cpp) -- one 92 GB model load per engine configuration
-# instead of one per gate.  Their individual targets below remain for
-# iterating on one gate; the battery is the runner.  L317: so did lilicorr-spec-gate and dflash2-spec-gate
-# (block-spec-gate on the hosted Nemotron and Qwen); the live legs, one shared server
-# per model, are the last section (live-legs) but one: L319's server-kv-headroom-live after them (it balloons the box's
-# memory, so it runs alone, ~2.5 min).  Each section's wall time is printed
-# against its budget (tests/manifest.toml).
-GATE_TARGETS =warnings-gate doxygen-gate unit-test-gate agent-test-gate \
-	cuda-regression cuda-kv-rows-pack-gate cuda-sampler-device-gate cuda-chat-smoke-gate \
-	cuda-attn-gates cuda-attn-pack-gate indexer-hadamard-kernel-check \
-	state-kinds-gate vision-qwen-tower-gate \
-	blockdraft-gate nvfp4-rows-gate lilicorr-head-gate \
-	model-smoke cuda-runner-gate live-legs server-kv-headroom-live
-# L220: gates that need no GPU and no model.  They are launched in the
-# background immediately before cuda-runner-gate and collected after it, so
-# they overlap the long GPU tail instead of adding their seconds in front of
-# it.  The runner is the only target after them, and every gate binary and
-# CORE_OBJS is built by the targets above, so the background sub-makes only
-# RUN -- they do not race the runner's build (which reads the same objects).
-# L278: plus the chat / tokenizer contract (qwen-chat-gate: tokenize, render, parser vs HF goldens), the server
-# goldens for both families (api-golden: parsed requests, DeepSeek and Qwen rows; sse-golden: stream bytes) and
-# the speculation depth rule both drafters share and prefix-stability-gate (L325: consecutive client requests render as prefixes of each other, every
-# family) -- seconds each, overlapping the runner.
-HOST_GATE_TARGETS = cuda-reap-router-audit vision-layout-gate vision-pixel-gate \
-	vision-codec-gate vision-span-gate vision-visible-gate vision-placeholder-gate vision-qwen-pixel-gate nemotron-vision-pixel-gate seam-check \
-	exl3-dequant-gate host-checks qwen-chat-gate nemotron-chat-gate api-golden-gate sse-golden-gate \
-	spec-depth-gate \
-	loader-contract-gate prefix-stability-gate segstore-tsan
-# Every gate target is phony, declared HERE where the list is defined (the
-# .PHONY line at the top of the file expands before GATE_TARGETS exists).  A
-# file named like a gate would otherwise satisfy make and print nothing -- the
-# silent-PASS shape the tracked-binary incident documented (L178).
-.PHONY: $(GATE_TARGETS) $(HOST_GATE_TARGETS) cuda-vision-chunk-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
+# The test tiers' one list is tests/manifest.toml (L357): what runs, in which tier and order, which tests overlap the
+# runner (overlap = true: no GPU, no model), and every budget.  `make gates` and `make release` run it through
+# tests/run.py; there is no second list here.  The model-dependent gates run inside ONE process, cuda-runner-gate (L163:
+# tests/gates_runner.cpp) -- one model load per engine configuration instead of one per gate; their individual targets
+# remain for iterating on one gate.  The live legs share one server per model (live-legs; L357: the hooks instance is
+# the warm one's restart), and server-kv-headroom-live runs last, alone (it balloons the box's memory).
+#
+# Every test target is phony, declared from the manifest (the .PHONY line at the top of the file expands before this):
+# a file named like a gate would otherwise satisfy make and print nothing -- the silent-PASS shape the tracked-binary
+# incident documented (L178).
+MANIFEST_TESTS := $(shell python3 tests/run.py --names 2>/dev/null)
+.PHONY: $(MANIFEST_TESTS) cuda-vision-chunk-gate vision-tower-gate vision-span-gate vision-merge-gate vision-image-gate vision-image-sync-gate
 
 # The numerics-critical subset, for the ITERATION loop.  `make gates` is a
-# pre-merge instrument -- every target in GATE_TARGETS, each loading the model,
+# pre-merge instrument -- every release test in tests/manifest.toml, each loading the model,
 # with spec_sampling alone running 2x2500 trajectories; it is the wrong tool to
 # sit and watch after every edit.  (This said "17 gates" as a second copy of a
-# fact that lives in GATE_TARGETS and had drifted to 10; the list is the count.)
+# fact that lives in the manifest and had drifted to 10; the list is the count.)
 # These five are the ones that actually catch a numerics or dispatch regression:
 #   cuda-prefill-gate        full-vocab logits byte-identical at 5 depths
 #   cuda-chunk-neutrality-gate  the same tokens under four chunkings give byte-identical logits (L183)
@@ -2510,53 +2486,9 @@ test-bins: $(TEST_BINS)
 # The tiers (L357, tests/manifest.toml): `make check`, `make kernels`, `make release`.
 check kernels release:
 	python3 tests/run.py $@
+# `make gates`: the name every note and rule uses for the release battery -- the release tier, nothing else (L357)
 gates: $(TEST_BINS)
-	@$(MAKE) --no-print-directory gates-preflight || exit 1
-	@rc=0; passed=""; failed=""; suite0=$$(date +%s); \
-	hostdir=$$(mktemp -d $${TMPDIR:-/var/tmp}/pulsar-gates-XXXXXX); host_pids=""; \
-	export PULSAR_GATES_SECTIONS=$$hostdir/sections.tsv; : > $$PULSAR_GATES_SECTIONS; \
-	for g in $(GATE_TARGETS); do \
-	  if [ "$$g" = "cuda-runner-gate" ]; then \
-	    for h in $(HOST_GATE_TARGETS); do \
-	      ( h0=$$(date +%s); \
-	        $(MAKE) -j$(GATE_JOBS) --no-print-directory "$$h" CUDA_ARCH=sm_120f \
-	              FRONTIER_MODEL="$(FRONTIER_MODEL)" SPEC_GATE_MODEL="$(SPEC_GATE_MODEL)" \
-	              CUTLASS_DIR="$(CUTLASS_DIR)" > "$$hostdir/$$h.log" 2>&1; \
-	        echo "$$? $$(( $$(date +%s) - h0 ))" > "$$hostdir/$$h.result" ) & \
-	      host_pids="$$host_pids $$!"; \
-	    done; \
-	  fi; \
-	  printf '\n\033[1m=== %s ===\033[0m\n' "$$g"; \
-	  t0=$$(date +%s); \
-	  if $(MAKE) -j$(GATE_JOBS) --no-print-directory "$$g" CUDA_ARCH=sm_120f \
-	        FRONTIER_MODEL="$(FRONTIER_MODEL)" SPEC_GATE_MODEL="$(SPEC_GATE_MODEL)" \
-	        CUTLASS_DIR="$(CUTLASS_DIR)"; then \
-	    passed="$$passed $$g"; \
-	  else \
-	    failed="$$failed $$g"; rc=1; \
-	  fi; \
-	  case "$$g" in cuda-runner-gate|live-legs) ;; \
-	    *) printf '%s\t%s\n' "$$(( $$(date +%s) - t0 ))" "$$g" >> $$PULSAR_GATES_SECTIONS ;; esac; \
-	done; \
-	for p in $$host_pids; do wait $$p; done; \
-	for h in $(HOST_GATE_TARGETS); do \
-	  printf '\n\033[1m=== %s (host-only, ran alongside the GPU tail) ===\033[0m\n' "$$h"; \
-	  cat "$$hostdir/$$h.log"; \
-	  read hrc hsecs < "$$hostdir/$$h.result"; \
-	  printf '%s\t%s\n' "$$hsecs" "$$h" >> $$hostdir/host.tsv; \
-	  if [ "$$hrc" = "0" ]; then passed="$$passed $$h"; \
-	  else failed="$$failed $$h"; rc=1; fi; \
-	done; \
-	printf '\n===================== GATE SUMMARY =====================\n'; \
-	for g in $$passed; do printf '  PASS  %s\n' "$$g"; done; \
-	for g in $$failed; do printf '  FAIL  %s\n' "$$g"; done; \
-	printf '%s\n' "$$(( $$(date +%s) - suite0 ))" > $$hostdir/total; \
-	python3 tests/battery_budget.py --sections $$PULSAR_GATES_SECTIONS --host $$hostdir/host.tsv \
-	  --total "$$(cat $$hostdir/total)" --budget tests/manifest.toml || true; \
-	rm -rf "$$hostdir"; \
-	if [ $$rc -eq 0 ]; then printf '\nALL GATES PASS\n'; \
-	else printf '\nGATES FAILED:%s\n' "$$failed"; fi; \
-	exit $$rc
+	python3 tests/run.py release
 
 # ---- gates-dev: the ITERATION tier (L220 phase 4) --------------------------
 #

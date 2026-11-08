@@ -21,7 +21,7 @@ So this gate sweeps the depths the others skip.  Greedy (temp 0) decoding is
 deterministic, and speculative decoding is an exact-output optimisation: it may
 change SPEED but never TEXT.
 
-*** THIS IS A DIAGNOSTIC, NOT A GATE.  Do not add it to GATE_TARGETS. ***
+*** THIS IS A DIAGNOSTIC, NOT A GATE.  Do not add it to tests/manifest.toml. ***
 
 Byte-equality against greedy is NOT an invariant of this engine, and the first
 two versions of this script assumed it was.  Measured on clean dev (cf33e3e),

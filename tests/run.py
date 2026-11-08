@@ -3,7 +3,8 @@
 
     tests/run.py check|kernels|release [--only a,b] [--strict] [--dry-run]
     tests/run.py --list [TIER]
-    tests/run.py --verify        the manifest against the Makefile's gate lists
+    tests/run.py --verify        every manifest test is named once and is a make target
+    tests/run.py --names         every test's name (the Makefile declares them phony from it)
 
 A test is a make target; a target's exit code is its verdict.  A log line starting SKIP means part of it did not run:
 the summary names each one, and --strict fails it.  N/A is not a skip: it names a leg the loaded family cannot have
@@ -33,28 +34,18 @@ def manifest():
     return m
 
 
-def makefile_list(text, var):
-    m = re.search(r"^%s\s*=\s*((?:.*\\\n)*.*)$" % var, text, re.M)
-    if not m:
-        sys.exit("run.py: the Makefile has no %s" % var)
-    return m.group(1).replace("\\\n", " ").split()
-
-
 def verify(m):
-    """The old lists stay until the side-by-side run; until then the two may not disagree."""
+    """The manifest is the one list (L357): every test is named once and is a make target (a name with no rule would
+    fail only when its tier runs)."""
     text = open(os.path.join(ROOT, "Makefile"), encoding="utf-8", errors="replace").read()
-    serial, host = makefile_list(text, "GATE_TARGETS"), makefile_list(text, "HOST_GATE_TARGETS")
-    mine_serial = [t["name"] for t in m["test"] if not t.get("overlap")]
-    mine_host = [t["name"] for t in m["test"] if t.get("overlap")]
-    bad = []
-    if mine_serial != serial:
-        bad.append("serial differs: only Makefile %s, only manifest %s, or the order" % (sorted(set(serial) - set(mine_serial)), sorted(set(mine_serial) - set(serial))))
-    if mine_host != host:
-        bad.append("overlap differs: only Makefile %s, only manifest %s, or the order" % (sorted(set(host) - set(mine_host)), sorted(set(mine_host) - set(host))))
+    rules = set(re.findall(r"^([A-Za-z0-9_.-]+)\s*:(?!=)", text, re.M))
+    names = [t["name"] for t in m["test"]]
+    bad = ["%s is listed %d times" % (n, names.count(n)) for n in sorted(set(names)) if names.count(n) > 1]
+    bad += ["%s has no make rule" % n for n in names if n not in rules]
     for b in bad:
         print("MANIFEST FAIL: " + b)
     if not bad:
-        print("manifest: %d serial + %d overlap tests match the Makefile" % (len(serial), len(host)))
+        print("manifest: %d tests, each a make target" % len(names))
     return not bad
 
 
@@ -147,8 +138,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--names", action="store_true", help="every test's name, one line (the Makefile's .PHONY)")
     a = ap.parse_args()
     m = manifest()
+    if a.names:
+        print("\n".join(t["name"] for t in m["test"]))
+        return 0
     if a.verify:
         return 0 if verify(m) else 1
     tests = m["test"]

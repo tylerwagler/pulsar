@@ -63,11 +63,10 @@ tests/run.py --verify
   summary, and `--strict` fails its test.
   An `N/A` line is not a skip: it names a leg the loaded family cannot have
   (a capability it lacks, such as step graphs on Qwen).
-- **`make gates`** is the old wiring and stays until it is retired.
-  `make release` runs the same targets in the same order (`GATE_TARGETS`, with
-  `HOST_GATE_TARGETS` beside the runner).  `tests/run.py --verify` checks that
-  the manifest and the two Makefile lists agree; every run checks it first and
-  refuses on a difference.
+- **`make gates`** is `make release` under its old name (L357, 2026-11-08):
+  the Makefile keeps no list of its own.  `tests/run.py --verify` checks that
+  every manifest test is named once and is a make target; every run checks it
+  first and refuses on a failure.
 - **`make gates-dev`** stays the iteration tier: a subset chosen from the
   paths the working tree touches, one to two minutes.  It is not a release
   gate.
@@ -200,18 +199,9 @@ Qwen pack.  The same release with the Hugging Face cache on NFS took **7797 s**:
 streaming the Qwen PLE rows over NFS is why the GB10 host keeps its cache on
 local NVMe.
 
-**The `make gates` copy.**  `make gates` still prints each section against the
-table below (`tests/battery_budget.py` reads it from here), and flags, never
-fails, a section over its budget or a section with no row.  The manifest is the
-authority; this table is kept equal to it until `make gates` is retired, and a
-budget change edits both.  Sections: each serial target; the runner per hosted
-model; the live legs per model; the host-only gates, which overlap the runner,
-as their longest; and the suite total (the recipe's wall, the prerequisite build
-outside it, ~100 s).
-
 The budgets are `tests/manifest.toml`'s (L357): each test's `budget`, `[sections]` for a test's per-model
-sections, `[limits] release` for the suite total (3000 s; last measured 3661 s).  `tests/run.py` and `make gates`
-(`tests/battery_budget.py`) both read it, so a budget changes in one place.  The table that used to sit here is in
+sections, `[limits] release` for the suite total (3000 s; last measured 3661 s).  `tests/run.py` reads it (`make gates` is
+`make release`), so a budget changes in one place.  The table that used to sit here is in
 git history.
 
 **2026-10-21 (L317, the battery diet; #389 / #422 before it: suite 3,329 / 3,219 s + ~45 min of live
