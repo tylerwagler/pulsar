@@ -1989,6 +1989,8 @@ server-kv-admission-live: pulsar-server
 # itself (a quiet gpuq job, production stopped); Nemotron Super (the published container), ~5 min, under a timeout.  gates-dev runs it on an
 # admission / guard / bank path.
 KV_HEADROOM_MODEL ?= $(call need_path,KV_HEADROOM_MODEL)
+# L357: every test program too (each tests/<name> rule, read from `make -qp`, and the battery mutants): the test sources
+# had gathered 68 warnings while the gate covered only the engine.  One build, so the engine's objects are compiled once.
 # L354 (F23): the landing rule's zero warnings and zero doxygen warnings, as gates that can fail.  warnings-gate builds a copy
 # of this tree (tracked and new files, so uncommitted edits count) from nothing, so an object already built can't hide a
 # warning, and greps the log for both formats (gcc's `: warning:`, nvcc's front-end `: warning #NNN-D:`).  CUTLASS is
@@ -2000,13 +2002,16 @@ warnings-gate:
 	trap 'rm -rf "$$d"' EXIT; \
 	git ls-files -co --exclude-standard -z | tar --null -T - -cf - | tar -xf - -C "$$d" || exit 1; \
 	[ ! -f local.mk ] || cp local.mk "$$d/"; \
+	progs=$$($(MAKE) -C "$$d" -qp CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) 2>/dev/null | grep -oE '^tests/[A-Za-z0-9_]+:' \
+	  | tr -d : | sort -u); \
 	$(MAKE) -C "$$d" -j$(GATE_JOBS) --no-print-directory pulsar-server pulsar pulsar_test pulsar_agent_test \
+	  $$progs $(BATTERY_MUTANT_NAMES:%=tests/gates_runner_mutant_%) \
 	  CUDA_ARCH=$(or $(CUDA_ARCH),sm_120f) CUTLASS_DIR=$(abspath $(CUTLASS_DIR)) > "$$d/build.log" 2>&1; rc=$$?; \
 	grep -E ': warning( #[0-9]+-D)?:' "$$d/build.log" | grep -v '^make' | sort -u > "$$d/warnings"; n=$$(wc -l < "$$d/warnings"); \
 	head -40 "$$d/warnings"; \
 	[ $$rc -eq 0 ] || { tail -30 "$$d/build.log"; echo "WARNINGS GATE: FAIL (the build failed, rc $$rc)"; exit 1; }; \
 	[ "$$n" -eq 0 ] || { echo "WARNINGS GATE: FAIL ($$n warnings)"; exit 1; }; \
-	echo "WARNINGS GATE: PASS (a build from nothing, 0 warnings)"
+	echo "WARNINGS GATE: PASS (a build from nothing, the engine and $$(echo $$progs | wc -w) test programs + the mutants, 0 warnings)"
 doxygen-gate:
 	@rm -f docs/api/doxygen-warnings.log; \
 	(cat docs/Doxyfile; echo "HAVE_DOT = NO") | doxygen - > /dev/null 2>&1 || { echo "DOXYGEN GATE: FAIL (doxygen did not run)"; exit 1; }; \

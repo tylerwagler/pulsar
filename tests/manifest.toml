@@ -19,7 +19,7 @@ release = 3000
 [[test]]
 name = "warnings-gate"
 tier = "check"
-budget = 180
+budget = 300   # L357 2026-11-08: the engine + every test program (VM -j48: 165 s); Sparky's figure from the next release run
 
 [[test]]
 name = "doxygen-gate"
