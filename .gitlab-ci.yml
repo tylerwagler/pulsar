@@ -1,0 +1,35 @@
+# CI (L366): the check tier -- no GPU, no model time (tests/manifest.toml) -- on every push to dev, main and work/*
+# branches, and on merge requests.  It runs on CT 132 `ci` (pve2): a shell runner tagged `pulsar-check`, Ubuntu 26.04
+# with Sparky's compiler, Python and CUDA 13.5 (x86, no GPU), CUTLASS at the pin in /opt/cutlass, and the NAS HF cache
+# read-only at /mnt/models (its local.mk is /opt/ci/local.mk).  The kernels and release tiers need the GB10 and still
+# run by hand through gpuq.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # a branch with an open merge request runs once, as the merge request's pipeline
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^work\//
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+stages: [check]
+
+check:
+  stage: check
+  tags: [pulsar-check]
+  interruptible: true
+  timeout: 40m
+  variables:
+    GIT_STRATEGY: fetch
+    GIT_DEPTH: "50"
+    CUTLASS_DIR: /opt/cutlass
+    GATE_JOBS: "32"
+  script:
+    - cp /opt/ci/local.mk local.mk
+    - python3 tests/run.py check
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    paths:
+      - .build/tests/
