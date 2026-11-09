@@ -1346,6 +1346,7 @@ host-checks: attn-layout-check engram-hash-check compressor-pool-check \
              indexer-score-check attn-pack-fixture-check tp-core-test tp-command-free-test container-tests pulsar-eval
 	./pulsar-eval --self-test-extractors
 	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
+	python3 tests/decode_floor_gate.py --self-test   # L367: per-workload grading + the shipped per-model baselines
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
 # ORDER cost bandwidth?  Model-free and standalone -- it allocates one real IQ2
@@ -1635,16 +1636,17 @@ sse-decode-bench:
 	python3 tests/sse_decode_bench.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
 	  --kv-disk-state disabled
 
-# Five workloads, 512 tokens, C1; scores the WORST one against a recorded floor.
-# Capture the floor once on a known-good build:
-#   make decode-floor-baseline
+# Five workloads, 512 tokens, C1, greedy, median of 3 (L367): each workload against its own baseline for the
+# SERVED model (tests/test-vectors/decode_floor_baseline.json, one entry per model id).  Record a model's baseline on
+# the release build:  make decode-floor-baseline RELEASE=v0.5.1 ENGINE=52bc947e SERVER_ARGS="--ctx 1048576 ..."
 decode-floor-gate:
 	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
 	  --kv-disk-state disabled
 
 decode-floor-baseline:
+	@[ -n "$(RELEASE)" ] || { echo "RELEASE=vX.Y.Z is required: a baseline belongs to a release"; exit 2; }
 	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
-	  --kv-disk-state disabled --write-baseline
+	  --kv-disk-state disabled --write-baseline --release $(RELEASE) --engine "$(ENGINE)" --server-args "$(SERVER_ARGS)"
 
 # Facts planted at begin/middle/end of a long context, asked back in free prose
 # (no grammar mask) plus a checksum that needs all three at once.

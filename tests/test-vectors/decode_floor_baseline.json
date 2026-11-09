@@ -1,15 +1,52 @@
 {
-  "schema": "pulsar.decode_floor_baseline.v1",
-  "min_sse_decode_tps": 22.557,
-  "min_workload": "typescript",
+  "schema": "pulsar.decode_floor_baseline.v2",
   "max_tokens": 512,
-  "model": "deepseek-v4-flash",
-  "kv_disk_state": "disabled",
-  "per_workload": {
-    "python": 23.584,
-    "rust": 23.653,
-    "typescript": 22.557,
-    "cuda": 23.13,
-    "go": 24.231
+  "repeats": 3,
+  "temperature": 0.0,
+  "models": {
+    "qwen3.8-flash-next": {
+      "release": "v0.5.1",
+      "engine": "52bc947e",
+      "server_args": "--ctx 1048576 --rope-yarn 4",
+      "recorded": "2026-11-09",
+      "per_workload": {
+        "python": 80.583,
+        "rust": 64.212,
+        "typescript": 61.068,
+        "cuda": 66.479,
+        "go": 56.297
+      },
+      "spread": {
+        "python": 0.0566,
+        "rust": 0.0252,
+        "typescript": 0.0416,
+        "cuda": 0.0246,
+        "go": 0.0604
+      },
+      "tolerance": 0.05,
+      "tolerance_why": "L367 #682: a repeat run on the same build within 0.3% per workload, v0.5.0 within 2.3%"
+    },
+    "deepseek-v4-flash": {
+      "release": "v0.5.1",
+      "engine": "52bc947e",
+      "server_args": "--ctx 262144",
+      "recorded": "2026-11-09",
+      "per_workload": {
+        "python": 32.147,
+        "rust": 28.861,
+        "typescript": 35.842,
+        "cuda": 29.787,
+        "go": 30.922
+      },
+      "spread": {
+        "python": 0.0537,
+        "rust": 0.0229,
+        "typescript": 0.1535,
+        "cuda": 0.0318,
+        "go": 0.0504
+      },
+      "tolerance": 0.2,
+      "tolerance_why": "L367 #682: the fixture's typescript workload is bimodal at greedy -- runs at ~36 or ~30 tok/s (a repeat run on the same build: 83.4%); the other four within 2%.  Until that is explained (L368), 20%"
+    }
   }
 }
