@@ -1,12 +1,45 @@
 # Pulsar 0.5.0 release notes
 
 0.5.0 covers everything on `dev` since `v0.4.2` (2026-08-03).  0.5.0-rc1 was about 1,450
-commits; what changed after it is under [Since rc1](#since-rc1). Ledger rows (Lnnn) are named where a commit message gives one. The full
+commits; what changed after it is under [Since rc1](#since-rc1), and after rc2 under [Since rc2](#since-rc2). Ledger rows (Lnnn) are named where a commit message gives one. The full
 list is `git log v0.4.2..`.
 
 0.4.2 served one model, DeepSeek V4 Flash, from GGUF. 0.5.0 is a
 multi-family server that reads pulsar safetensors containers. Its production
 model is Qwen3.8-Flash-Next.
+
+## Since rc2
+
+**Upgrade notes.**
+
+- **Nemotron 3.5 Super's outputs change** (L363).  Its Mamba-2 timestep is now floored at the checkpoint's
+  `time_step_min` (0.001), as transformers' NemotronH clamps it; before, pulsar followed vLLM's `time_step_limit`
+  [0, inf] and left heads whose timestep ran below it nearly frozen.  Against an fp32 reference on the container's own
+  weights, story top-1 went from 5 of 7 depths to 7 of 7 and the KL fell 10-1000x at most depths; at story 4102 the
+  old build predicted `' output'` where the text continues `' made'`, ranked #142.  Outputs now differ from vLLM's.
+- `make gates` is `make release`: one test list, `tests/manifest.toml`, three tiers -- `make check` (no GPU),
+  `make kernels` (no model), `make release` (real models, production down) -- each test with a budget.
+- The reference gates read the private HF dataset `ElytronSystems/pulsar-reference-captures` from the HF cache
+  (`REF_CAPTURES` in `local.mk`); a capture is keyed by its container's revision, and a revision it was not made from
+  fails the gate.
+
+**Fixed.**
+
+- A preempted decoder is readmitted when the only other resident bank is idle (L362).  Before, the spill it needed
+  was refused ("nowhere to park the pool"), the readmission retried every pass, the client waited for ever and the
+  log filled; that line is now said once a bank every 10 s.
+- Nemotron's Mamba-2 dt floor (L363, above).
+
+**New.**
+
+- The server names each top-level request key it ignores, once per process and endpoint (L249).
+- `POST /test/guard-budget` sets the eviction guard's KV budget at run time, for tests only: it answers only under
+  `PULSAR_SERVER_TEST_ROUTES=1`, which the server logs at startup.
+
+**Tests** (L357).  The release tier starts 11 servers where it started 21 (the live legs share a warm instance and its
+restart), runs Qwen as its primary, and passes 40 of 40 in about 58 minutes.  The reference gates of Qwen, Gemma 4 and
+Nemotron grade against fp32 captures on each published container's own weights (`tools/reference/capture.py`).
+`warnings-gate` also builds every test program.
 
 ## Since rc1
 
@@ -117,6 +150,9 @@ rounds. A duplicate-prefix census is exported (L324).
 
 ## Behaviour changes
 
+- **Nemotron's Mamba-2 timestep has a floor** (L363): `dt = max(softplus(dt_raw + dt_bias), time_step_min)`, as
+  transformers computes it.  Its outputs differ from vLLM's, which does not clamp; see [Since rc2](#since-rc2).
+
 - **`cached_tokens` is correct at token seams** (L334). When a client re-spells
   text the model generated, the reported cached count is now the request's own
   tokens that the reused state serves. Before, it was a position on the live side.
@@ -171,8 +207,9 @@ rounds. A duplicate-prefix census is exported (L324).
   - `PULSAR_SPEC_DEPTH` and `PULSAR_SPEC_TAU`.
   - `PULSAR_TP_TIMEOUT_SEC` and `PULSAR_TP_RDMA_DEV`, `PULSAR_TP_RDMA_DEV2`,
     `PULSAR_TP_RDMA_GID_INDEX`.
-  - Test hooks: `PULSAR_SERVER_SCHED`, `PULSAR_SERVER_KV_RESTORE_SLICE_MS` and
-    `PULSAR_GRAMMAR_FAIL_AFTER`.
+  - Test hooks: `PULSAR_SERVER_SCHED`, `PULSAR_SERVER_KV_RESTORE_SLICE_MS`,
+    `PULSAR_GRAMMAR_FAIL_AFTER` and `PULSAR_SERVER_TEST_ROUTES` (L357: enables `POST /test/guard-budget`; never in
+    production).
 
   See [SERVER.md](SERVER.md#environment-variables).
 
@@ -230,7 +267,8 @@ rounds. A duplicate-prefix census is exported (L324).
   (the gate runner's primary, production and most live legs). DeepSeek Vision-Exp
   is smoke-only since 2026-11-07: it left the gate runner, and the gates that graded
   its own mechanisms (rewind, compressor state, DSpark batching, the TP head split,
-  mixed prefill) were retired with it. Nemotron is thinner, and V4.1 and Inkling have no gate of their own.
+  mixed prefill) were retired with it. Nemotron is thinner (its runner legs, its reference gates and two live legs),
+  and V4.1 and Inkling have no gate of their own.
   The encoder and Parse families are gated by hand, beside `make model-smoke` (every
   published model starts and answers one request of its kind). See the README's model table.
 - **Nemotron 3.5 Super image input is not in this release.** Its vision front is
@@ -244,5 +282,11 @@ rounds. A duplicate-prefix census is exported (L324).
   near tie can flip with what else is co-scheduled. Under sampling the
   distribution is preserved.
 - `--kv-disk-space-mb 0` leaves the disk KV cache with no size limit.
+- **A disk store smaller than every resident bank can lose the newest conversation at shutdown.**  The shutdown
+  persist runs in slot order; when the store cannot hold them all, the earlier banks evict the newest one and its own
+  persist fails ("no room").  The default budget (131072 MiB) holds every bank of the shipped configurations.
+- **Qwen's decode-reference gate is manual** (L360): its wide teacher-forced decode rows disagree with one-row decode
+  at some depths; whether the gate asks for a step Qwen does not support, or its wide verify rows are off, is open.
+  Served text is unaffected (speculative decoding keeps only tokens equal to plain decoding).
 - The default context (1M) is refused by a container whose trained context is
   smaller. Pass `--ctx` or `--rope-yarn`.
