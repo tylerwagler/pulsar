@@ -2520,8 +2520,9 @@ typedef struct pulsar_spec_carry_state {
      * +/-1 per round by the controller in spec_round_end from the realized
      * accept count and the verified tail confidence. 0 = uninitialized (first
      * draft reads pulsar_spec_depth_start, which is thereby the STARTING
-     * depth, not a fixed width). Persists across requests in a session on
-     * purpose: a client's workload regime usually does too. */
+     * depth, not a fixed width). Restarts at every request boundary
+     * (spec_lookahead_reset, L368: carrying it bought nothing measurable;
+     * PULSAR_SPEC_CARRY=1 carries it, to compare). */
     int spec_adaptive_depth;  ///< bounds: the drafter's adaptive policy (pulsar_drafter_ops::adapt)
     bool spec_depth_down_forgiven;  ///< L107 v2: one down-signal was vetoed on a still-confident tail; a second consecutive one backs off regardless
     uint8_t spec_depth_rounds_since_up;  ///< L107 v5: rounds since the last UP, saturating at 255; a down within 2 of an up is a FAILED EXCURSION and triggers the cooldown; a down after a sustained ride carries no penalty (v4's blanket cooldown cost ~0.9 t/s on BOTH server workloads by suppressing profitable climbs).

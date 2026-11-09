@@ -14,8 +14,8 @@ PER MODEL, PER WORKLOAD.  The baseline file holds one entry per served model id 
 on a release build with --write-baseline --release vX.Y.Z.  A run is graded workload by workload: each median against
 that workload's baseline; the gate fails when any falls below (1 - tolerance) of it, and names the worst.  A regression
 in one workload can no longer hide behind the slowest one.  A model with no baseline is not graded (exit 2), never
-compared against another model's numbers.  Each entry carries its own tolerance, set from that model's measured
-run-to-run spread (`tolerance_why` says how); --tolerance overrides it.
+compared against another model's numbers.  Each entry carries its own tolerance -- one number, or one per workload --
+set from that model's measured run-to-run spread (`tolerance_why` says how); --tolerance overrides it.
 
     # on the release build, once per model (the server serving that model, --no-kv-disk):
     ./tests/decode_floor_gate.py --port 8080 --write-baseline --release v0.5.1 --engine 52bc947e
@@ -105,10 +105,16 @@ def run_workloads(args, model):
     return results
 
 
+def tol_of(tolerance, name):
+    """A workload's tolerance: one number for every workload, or a {workload: number} map (DEFAULT_TOLERANCE where
+    a workload has none)."""
+    return tolerance.get(name, DEFAULT_TOLERANCE) if isinstance(tolerance, dict) else tolerance
+
+
 def grade(per_workload, base_per_workload, tolerance):
-    """Each workload's rate against its own baseline.  Returns (verdict, rows, worst) where rows are
-    (workload, rate, baseline, ratio) and worst is the row with the lowest ratio; verdict is 'pass', 'fail' or
-    'incomplete' (a baseline workload missing from the run, or without a rate)."""
+    """Each workload's rate against its own baseline, at its own tolerance (tol_of).  Returns (verdict, rows, worst)
+    where rows are (workload, rate, baseline, ratio) and worst is the row furthest below its floor (else the lowest
+    ratio); verdict is 'pass', 'fail' or 'incomplete' (a baseline workload missing from the run, or without a rate)."""
     rows = []
     for name, floor in base_per_workload.items():
         rate = per_workload.get(name)
@@ -117,8 +123,8 @@ def grade(per_workload, base_per_workload, tolerance):
         rows.append((name, rate, floor, round(rate / floor, 4)))
     if not rows:
         return "incomplete", rows, None
-    worst = min(rows, key=lambda r: r[3])
-    return ("fail" if worst[3] < 1.0 - tolerance else "pass"), rows, worst
+    worst = min(rows, key=lambda r: r[3] - (1.0 - tol_of(tolerance, r[0])))
+    return ("fail" if worst[3] < 1.0 - tol_of(tolerance, worst[0]) else "pass"), rows, worst
 
 
 def load_baselines(path):
@@ -158,6 +164,11 @@ def self_test():
     assert v == "fail" and worst[0] == "python" and worst[3] == 0.8, (v, worst)
     v, _, worst = grade({"python": 75.0, "rust": 54.0}, base, 0.05)
     assert v == "incomplete" and worst[0] == "go", (v, worst)
+    # per-workload tolerances: python's 15% drop passes at its own 20%, rust's 6% drop fails at the default 5%
+    v, _, worst = grade({"python": 64.0, "rust": 50.7, "go": 56.0}, base, {"python": 0.20})
+    assert v == "fail" and worst[0] == "rust", (v, worst)
+    v, _, worst = grade({"python": 64.0, "rust": 54.0, "go": 56.0}, base, {"python": 0.20})
+    assert v == "pass", (v, worst)
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "b.json")
         write_baseline(p, "qwen", {"per_workload": {"python": 75.0}}, 512, 3)
@@ -174,7 +185,8 @@ def self_test():
     b = load_baselines(DEFAULT_BASELINE)
     for m, e in b["models"].items():
         assert e.get("release") and set(e["per_workload"]) == {w for w, _ in WORKLOADS}, m
-        assert 0 < e.get("tolerance", 0) < 0.5 and e.get("tolerance_why"), m
+        t = e.get("tolerance", 0)
+        assert e.get("tolerance_why") and all(0 < x < 0.5 for x in (t.values() if isinstance(t, dict) else [t])), m
     print("decode_floor_gate self-test: PASS (%d models in the shipped baselines)" % len(b["models"]))
     return 0
 
@@ -296,16 +308,16 @@ def main():
     emit(record, args.json_out)
     for name, rate, floor, ratio in rows:
         print("  %-11s %8.3f t/s  baseline %8.3f  %6.1f%%%s" % (name, rate, floor, 100 * ratio,
-              "  <-- below" if ratio < 1.0 - tol else ""), file=sys.stderr)
+              "  <-- below" if ratio < 1.0 - tol_of(tol, name) else ""), file=sys.stderr)
     if verdict == "incomplete":
         print("FAIL: workload %r has no rate or no baseline" % (worst[0] if worst else None), file=sys.stderr)
         return 2
     if verdict == "fail":
         print("FAIL: %s's '%s' at %.1f%% of its %s baseline (tolerance %.0f%%)"
-              % (model, worst[0], 100 * worst[3], entry.get("release"), 100 * tol), file=sys.stderr)
+              % (model, worst[0], 100 * worst[3], entry.get("release"), 100 * tol_of(tol, worst[0])), file=sys.stderr)
         return 1
-    print("PASS: %s, every workload within %.0f%% of its %s baseline (worst '%s' %.1f%%)"
-          % (model, 100 * tol, entry.get("release"), worst[0], 100 * worst[3]), file=sys.stderr)
+    print("PASS: %s, every workload within its tolerance of its %s baseline (closest: '%s' %.1f%%, tolerance %.0f%%)"
+          % (model, entry.get("release"), worst[0], 100 * worst[3], 100 * tol_of(tol, worst[0])), file=sys.stderr)
     return 0
 
 

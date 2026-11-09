@@ -45,8 +45,14 @@
         "cuda": 0.0318,
         "go": 0.0504
       },
-      "tolerance": 0.2,
-      "tolerance_why": "L367 #682: the fixture's typescript workload is bimodal at greedy -- runs at ~36 or ~30 tok/s (a repeat run on the same build: 83.4%); the other four within 2%.  Until that is explained (L368), 20%"
+      "tolerance": {
+        "python": 0.05,
+        "rust": 0.05,
+        "typescript": 0.2,
+        "cuda": 0.05,
+        "go": 0.05
+      },
+      "tolerance_why": "L368: on DeepSeek the verify width each round is set by timing-measured policies (the verify pick; the draft depth's controller), so a greedy prompt can take a different text and run at that text's speed. typescript swings between paths ~30/34/36 tok/s (gpuq #682-#685); the other four repeat within ~4%. typescript 20%, the rest 5%."
     }
   }
 }

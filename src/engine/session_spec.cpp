@@ -403,17 +403,19 @@ void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quenched = false;
 }
 
-/* A request boundary: the lookahead goes, the quench re-arms.  L368 measurement switch: PULSAR_SPEC_NO_CARRY=1 also
- * restarts the draft-depth controller (spec_depth.h) at every boundary -- the start depth, fresh counters -- instead
- * of carrying the bank's last depth into its next request (L112). */
+/* A request boundary: the lookahead goes, the quench re-arms, and (L368) the draft-depth controller (spec_depth.h)
+ * restarts -- the start depth, fresh counters.  Carrying the bank's last depth into its next request bought nothing
+ * measurable (gpuq #685: 4 of 5 floor workloads equal; #686: 5 conversations x 5 turns, 67.2 tok/s carried vs 68.1
+ * restarted, inside the run-to-run spread) and tied a request's greedy text and speed to whatever the bank served
+ * before.  PULSAR_SPEC_CARRY=1 (announced) carries it as before, to compare. */
 void spec_lookahead_reset(pulsar_session *s) {
-    static int no_carry = -1;
-    if (no_carry < 0) {
-        const char *e = getenv("PULSAR_SPEC_NO_CARRY");
-        no_carry = e && e[0] == '1';
-        if (no_carry) fprintf(stderr, "pulsar: draft depth restarts every request (PULSAR_SPEC_NO_CARRY, a measurement switch)\n");
+    static int carry = -1;
+    if (carry < 0) {
+        const char *e = getenv("PULSAR_SPEC_CARRY");
+        carry = e && e[0] == '1';
+        if (carry) fprintf(stderr, "pulsar: draft depth carries across requests (PULSAR_SPEC_CARRY, a measurement switch)\n");
     }
-    if (no_carry) {
+    if (!carry) {
         s->spec.spec_adaptive_depth = 0;
         s->spec.spec_depth_down_forgiven = false;
         s->spec.spec_depth_rounds_since_up = 0;
