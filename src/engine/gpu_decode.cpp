@@ -1,52 +1,30 @@
+/** @file gpu_decode.cpp
+ *  @brief DeepSeek graph decode: HC / Q readers, the DSpark drafter's forward and seeding, and the output head. */
 #include "pulsar_engine_internal.h"
+#include "pulsar_nvtx.h"
+#include "tp/pulsar_tp.h"
 
 
 /* Read an HC residual CARRIER (BF16 storage under task #62) into an f32 host
  * buffer, expanding each stored sample (BF16->f32 is an exact bit-extension:
  * the stored 16 bits are the high half of the f32). Used ONLY by the dev-only
- * layer-0 parity self-test (gpu_graph_decode_test) and the env-gated DSpark
- * dumps — never the production decode path. In the PULSAR_HC_F32 fallback build the
- * carrier is already f32, so it is a plain read. n is a sample count. */
-/* Host-side f32 -> HC carrier store (task #62). Round-to-nearest-even so a host
- * staged write matches the GPU's __float2bfloat16 store path. NaN is
- * CANONICALIZED to 0x7FFF, which is what cvt.rn.bf16.f32 emits on sm_80+ (and
- * what CUDA's software path returns) — passing the payload through in the high
- * half would NOT match. Inf needs no special case: it rounds exactly through
- * the RNE path below. `dst` is raw carrier bytes, n a sample count. */
-void pulsar_store_hc_carrier_f32(void *dst, const float *src, uint64_t n) {
-#ifdef PULSAR_HC_F32
-    memcpy(dst, src, (size_t)n * sizeof(float));
-#else
-    uint16_t *d = (uint16_t *)dst;
-    for (uint64_t i = 0; i < n; i++) {
-        uint32_t x;
-        memcpy(&x, &src[i], sizeof(x));
-        if ((x & 0x7FFFFFFFu) > 0x7F800000u) {       /* NaN -> canonical */
-            d[i] = 0x7FFFu;
-        } else {
-            const uint32_t bias = 0x7FFFu + ((x >> 16) & 1u);   /* RNE; Inf exact */
-            d[i] = (uint16_t)((x + bias) >> 16);
-        }
-    }
-#endif
-}
-
-
+ * layer-0 parity self-test (since removed) and the env-gated DSpark
+ * dumps — never the production decode path. n is a sample count. */
+/// @param t the carrier tensor
+/// @param off_elems the first sample, in samples
+/// @param out [n] receives f32 samples (untouched on failure)
+/// @param n samples
+/// @return nonzero on success, 0 on a failed read
 int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
                             float *out, uint64_t n) {
-#ifdef PULSAR_HC_F32
-    return pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * sizeof(float),
-                               out, n * sizeof(float));
-#else
     uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
     int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_HC_ELT_SIZE,
                                  tmp, n * PULSAR_HC_ELT_SIZE);
     if (rc == 0) {
         /* Read failed and left tmp uninitialized — do NOT convert it. Callers
-         * (the DSpark dumps at session.c) memset `out` to zero beforehand and
+         * (the DSpark dumps at session.cpp) memset `out` to zero beforehand and
          * ignore the return, relying on "zeros on failure"; converting garbage
-         * here would silently write heap noise into the dump, and the f32
-         * fallback build leaves `out` untouched in the same case. */
+         * here would silently write heap noise into the dump. */
         free(tmp);
         return 0;
     }
@@ -56,527 +34,42 @@ int pulsar_read_hc_carrier_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
     }
     free(tmp);
     return rc;
-#endif
 }
 
-
-
-
-bool gpu_graph_use_reference_hc_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_FUSION", &cache);
-}
-
-
-
-static bool gpu_graph_use_reference_kv_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_KV_FUSION", &cache);
-}
-
-
-
-bool gpu_graph_use_reference_qkv_norm(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_QKV_NORM_FUSION", &cache);
-}
-
-
-
-static bool gpu_graph_use_reference_compressor_pair_proj(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
-}
-
-
-
-static bool gpu_graph_use_reference_hc_norm_decode(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_HC_NORM_FUSION", &cache);
-}
-
-
-
-bool gpu_graph_enable_batch_hc_norm_fusion(void) {
-    return !gpu_graph_use_reference_hc_norm_decode();
-}
-
-
-
-static bool gpu_graph_use_reference_shared_down_hc(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
-}
-
-
-
-static bool gpu_graph_use_reference_attn_out_hc(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_ATTN_OUT_HC_FUSION", &cache);
-}
-
-/* Evaluated every layer on the decode path; cache the flag reads (like the
- * fusion toggles above) instead of scanning environ per layer. */
-static bool gpu_graph_disable_shared_gate_up_swiglu(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION", &cache);
-}
-
-
-
-
-static bool gpu_graph_decode_hc_pre(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_model        *model,
-        uint64_t                scale_offset,
-        uint64_t                base_offset) {
-    if (gpu_graph_use_reference_hc_decode()) {
-        return pulsar_gpu_hc_split_sinkhorn_tensor(split,
-                                                  mix,
-                                                  model->map,
-                                                  model->size,
-                                                  scale_offset,
-                                                  base_offset,
-                                                  PULSAR_N_HC,
-                                                  PULSAR_N_HC_SINKHORN_ITER,
-                                                  PULSAR_HC_EPS) != 0 &&
-               pulsar_gpu_hc_weighted_sum_tensor(out,
-                                                 residual_hc,
-                                                 split,
-                                                 PULSAR_N_EMBD,
-                                                 PULSAR_N_HC) != 0;
+/* The same, for the stored Q buffer (f16 since L045).  A plain f32 read
+ * would take n*sizeof(float) bytes from a buffer holding
+ * n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read.  (The tensor's esz field
+ * records the width now, but tensor_read is deliberately byte-oriented, so
+ * this wrapper is still the only f32-decoding host read of a Q buffer.) */
+static_assert(PULSAR_Q_ELT_SIZE == 2u,
+              "pulsar_read_q_f32 decodes f16; update it if the Q element type moves");
+int pulsar_read_q_f32(const pulsar_gpu_tensor *t, uint64_t off_elems,
+                      float *out, uint64_t n) {
+    uint16_t *tmp = (uint16_t *)xmalloc((size_t)n * sizeof(uint16_t));
+    int rc = pulsar_gpu_tensor_read((pulsar_gpu_tensor *)t, off_elems * PULSAR_Q_ELT_SIZE,
+                                 tmp, n * PULSAR_Q_ELT_SIZE);
+    if (rc == 0) {
+        /* Same contract as the HC reader: a failed read leaves tmp
+         * uninitialised, so do NOT convert it into the caller's buffer. */
+        free(tmp);
+        return 0;
     }
-
-    return pulsar_gpu_hc_split_weighted_sum_tensor(out,
-                                                  split,
-                                                  mix,
-                                                  residual_hc,
-                                                  model->map,
-                                                  model->size,
-                                                  scale_offset,
-                                                  base_offset,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC,
-                                                  PULSAR_N_HC_SINKHORN_ITER,
-                                                  PULSAR_HC_EPS) != 0;
+    for (uint64_t i = 0; i < n; i++) out[i] = f16_to_f32(tmp[i]);
+    free(tmp);
+    return rc;
 }
 
 
 
-static bool gpu_graph_hc_norm_fusion_check_enabled(void) {
-    static int cache = -1;
-    return gpu_graph_env_flag("PULSAR_CUDA_HC_NORM_FUSION_CHECK", &cache);
-}
-
-
-
-static float gpu_graph_hc_norm_fusion_check_tolerance(void) {
-    static int initialized;
-    static float tolerance;
-    if (initialized) return tolerance;
-    tolerance = 2.0e-4f;
-    const char *env = getenv("PULSAR_CUDA_HC_NORM_FUSION_CHECK_TOL");
-    if (env && env[0]) {
-        char *end = NULL;
-        const float v = strtof(env, &end);
-        if (end != env && isfinite(v) && v > 0.0f) tolerance = v;
-    }
-    initialized = 1;
-    return tolerance;
-}
-
-
-
-static bool gpu_graph_check_hc_norm_fusion(
-        const char            *label,
-        pulsar_gpu_tensor        *fused_out,
-        pulsar_gpu_tensor        *fused_norm,
-        const pulsar_gpu_tensor  *mix,
-        const pulsar_gpu_tensor  *residual_hc,
-        const pulsar_model       *model,
-        uint64_t               scale_offset,
-        uint64_t               base_offset,
-        uint64_t               norm_weight_offset,
-        uint32_t               il,
-        uint32_t               pos) {
-    if (!gpu_graph_hc_norm_fusion_check_enabled()) return true;
-    if (!fused_out || !fused_norm || !mix || !residual_hc || !model) return false;
-
-    const uint64_t n_embd = PULSAR_N_EMBD;
-    const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    pulsar_gpu_tensor *ref_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
-    pulsar_gpu_tensor *ref_out = pulsar_gpu_tensor_alloc(n_embd * sizeof(float));
-    pulsar_gpu_tensor *ref_norm = pulsar_gpu_tensor_alloc(n_embd * sizeof(float));
-    bool ok = ref_split && ref_out && ref_norm;
-
-    if (ok) {
-        ok = pulsar_gpu_hc_split_sinkhorn_tensor(ref_split,
-                                              mix,
-                                              model->map,
-                                              model->size,
-                                              scale_offset,
-                                              base_offset,
-                                              PULSAR_N_HC,
-                                              PULSAR_N_HC_SINKHORN_ITER,
-                                              PULSAR_HC_EPS) != 0 &&
-             pulsar_gpu_hc_weighted_sum_tensor(ref_out,
-                                            residual_hc,
-                                            ref_split,
-                                            PULSAR_N_EMBD,
-                                            PULSAR_N_HC) != 0 &&
-             pulsar_gpu_rms_norm_weight_tensor(ref_norm,
-                                            ref_out,
-                                            model->map,
-                                            model->size,
-                                            norm_weight_offset,
-                                            PULSAR_N_EMBD,
-                                            PULSAR_RMS_EPS) != 0;
-    }
-
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-
-    float *fused_out_cpu = NULL;
-    float *ref_out_cpu = NULL;
-    float *fused_norm_cpu = NULL;
-    float *ref_norm_cpu = NULL;
-    if (ok) {
-        fused_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ref_out_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        fused_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ref_norm_cpu = (float *)xmalloc((size_t)n_embd * sizeof(float));
-        ok = pulsar_gpu_tensor_read(fused_out, 0, fused_out_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(ref_out, 0, ref_out_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(fused_norm, 0, fused_norm_cpu, n_embd * sizeof(float)) != 0 &&
-             pulsar_gpu_tensor_read(ref_norm, 0, ref_norm_cpu, n_embd * sizeof(float)) != 0;
-    }
-
-    if (ok) {
-        const float out_max = max_abs_diff(fused_out_cpu, ref_out_cpu, n_embd);
-        const float out_rms = rms_abs_diff(fused_out_cpu, ref_out_cpu, n_embd);
-        const float norm_max = max_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
-        const float norm_rms = rms_abs_diff(fused_norm_cpu, ref_norm_cpu, n_embd);
-        const float tol = gpu_graph_hc_norm_fusion_check_tolerance();
-        fprintf(stderr,
-                "pulsar: GPU HC norm fusion check %s layer=%u pos=%u "
-                "out_max=%g out_rms=%g norm_max=%g norm_rms=%g tol=%g\n",
-                label ? label : "hc",
-                il,
-                pos,
-                out_max,
-                out_rms,
-                norm_max,
-                norm_rms,
-                tol);
-        if (out_max > tol || norm_max > tol) {
-            fprintf(stderr,
-                    "pulsar: GPU HC norm fusion check failed for %s layer=%u pos=%u\n",
-                    label ? label : "hc",
-                    il,
-                    pos);
-            ok = false;
-        }
-    }
-
-    free(fused_out_cpu);
-    free(ref_out_cpu);
-    free(fused_norm_cpu);
-    free(ref_norm_cpu);
-    pulsar_gpu_tensor_free(ref_norm);
-    pulsar_gpu_tensor_free(ref_out);
-    pulsar_gpu_tensor_free(ref_split);
-
-    const bool restart_ok = pulsar_gpu_begin_commands() != 0;
-    return ok && restart_ok;
-}
-
-
-
-static bool gpu_graph_decode_kv_store(
-        pulsar_gpu_tensor *kv,
-        pulsar_gpu_tensor *raw_cache,
-        uint32_t          raw_cap,
-        uint32_t          raw_row,
-        uint32_t          raw_f16) {
-    if (gpu_graph_use_reference_kv_decode()) {
-        return pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0 &&
-               pulsar_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, PULSAR_N_HEAD_DIM, raw_f16) != 0;
-    }
-
-    return pulsar_gpu_kv_fp8_store_raw_tensor(kv,
-                                             raw_cache,
-                                             raw_cap,
-                                             raw_row,
-                                             PULSAR_N_HEAD_DIM,
-                                             PULSAR_N_ROT,
-                                             raw_f16) != 0;
-}
-
-
-
-/* The validated packed storage formats and the prefill work-buffer slice
- * default ON (2026-07-09: each proven bit-exact by golden byte-compare; see
- * commits 0647621, 34f6a95, 87f8374, 39c6526).  Their env vars are
- * OFF-switches: unset or "1"/"on" enables, "0"/"off"/"false" restores the
- * classic f32 containers — the escape hatch for regression bisects. */
-static int gpu_graph_env_default_flag(const char *name, int def) {
-    const char *v = getenv(name);
-    if (!v || !v[0]) return def;
-    if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
-        strcasecmp(v, "false") == 0) return 0;
-    return 1;
-}
-
-int gpu_graph_attn_pack_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_ATTN_PACK", 1);
-    return cached;
-}
-
-int gpu_graph_idx_fp4_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_IDX_FP4", 1);
-    return cached;
-}
-
-int gpu_graph_raw_f16_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) cached = gpu_graph_env_default_flag("PULSAR_RAW_F16", 1);
-    return cached;
-}
-
-/* PULSAR_DECODE_DESCR: Tier-2 A/B diagnostic level (env read once per process
- * and cached — never a per-token getenv).  Not a production mode.
- *
- * Level 1: single-token decode attention AND indexer scan route through the
- * descriptor (banked) entry points as an n_banks=1 pool over the installed
- * cache views (positions=[pos], seq_id=[0]).  At n_tokens==1 the banked
- * dispatch selects the SAME kernels as classic, so this level is byte-exact
- * vs classic under the default configuration — the descriptor-vs-classic
- * gate.
- *
- * Level 2: additionally arms the banked MULTISEQ machinery for the
- * spec-verify batch (imatrix.c: one-bank batch over the current bank —
- * per-bank frontier bookkeeping, banked emit loop, banked raw scatter,
- * banked multi-token attention/indexer with packed-native comp reads).
- * Banked multi-token rows force the generic kernel tiers (WMMA / indexed
- * heads8 stay single-bank), so level 2 is byte-exact vs classic ONLY when
- * both runs pin those tiers off.  PULSAR_CUDA_NO_INDEXED_HEADS8=1 still does
- * that half; the WMMA opt-out was retired in L027 (nothing invoked it), so a
- * byte-exact Tier-2 comparison now needs the indexer WMMA condition edited
- * directly rather than an env flag. */
-int gpu_graph_decode_descr_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("PULSAR_DECODE_DESCR");
-        if (v && strcmp(v, "2") == 0) cached = 2;
-        else cached = gpu_graph_env_default_flag("PULSAR_DECODE_DESCR", 0);
-    }
-    return cached;
-}
-
-/* Lazily allocate the 1-row descriptor arrays and refresh positions[0] = pos
- * (seq_id[0] stays 0: the single session lives in bank 0). */
-static bool gpu_graph_decode_descr_prepare(pulsar_gpu_graph *g, uint32_t pos) {
-    if (!g->descr_diag_pos) {
-        g->descr_diag_pos = pulsar_gpu_tensor_alloc(sizeof(int32_t));
-        g->descr_diag_seq = pulsar_gpu_tensor_alloc(sizeof(int32_t));
-        const int32_t bank0 = 0;
-        if (!g->descr_diag_pos || !g->descr_diag_seq ||
-            !pulsar_gpu_tensor_write(g->descr_diag_seq, 0, &bank0, sizeof(bank0))) {
-            fprintf(stderr, "pulsar: PULSAR_DECODE_DESCR descriptor alloc failed\n");
-            /* Release and reset BOTH so a later call retries the whole block
-             * instead of keying off a half-allocated descr_diag_pos and
-             * failing forever (descr_diag_seq NULL / unwritten). */
-            pulsar_gpu_tensor_free(g->descr_diag_pos);
-            pulsar_gpu_tensor_free(g->descr_diag_seq);
-            g->descr_diag_pos = NULL;
-            g->descr_diag_seq = NULL;
-            return false;
-        }
-    }
-    const int32_t p = (int32_t)pos;
-    return pulsar_gpu_tensor_write(g->descr_diag_pos, 0, &p, sizeof(p)) != 0;
-}
-
-/* PULSAR_PREFILL_SLICE=<N>: process the prefill [indexer score -> top-k ->
- * indexed attention] sequence in <=N-token slices so the two ctx-scaling f32
- * work buffers (indexer_scores, comp_mask) are allocated with only N token
- * rows instead of prefill_cap.  Defaults to 512 (validated bit-exact);
- * 0 restores the historical full-chunk buffers. */
+/* Prefill score slice, in rows: the prefill [indexer score -> top-k -> indexed
+ * attention] sequence runs in <= slice-token spans so indexer_scores (the one
+ * ctx-scaling f32 work buffer with a token dimension) is allocated with slice
+ * rows instead of prefill_cap.  512, one number one place (validated bit-exact;
+ * the PULSAR_PREFILL_SLICE env override went with L159 inc 4). */
 uint32_t gpu_graph_prefill_slice(void) {
-    static long cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("PULSAR_PREFILL_SLICE");
-        long v = (e && e[0]) ? strtol(e, NULL, 10) : 512;
-        cached = v > 0 ? v : 0;
-    }
-    return (uint32_t)cached;
-}
-
-uint64_t gpu_graph_attn_comp_cache_row_bytes(void) {
-    if (gpu_graph_attn_pack_enabled()) return PULSAR_ENGINE_ATTN_PACK_ROWBYTES;
-    return (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float);
-}
-
-/* Comp cache to hand the f32 prefill attention consumers. Normally the
- * persistent cache itself; under PULSAR_ATTN_PACK storage, dequantize the first
- * n_rows packed rows into the f32 shadow and return that.  The dequant is
- * bit-exact: packed rows decode to exactly the values the f32 cache would
- * hold. */
-pulsar_gpu_tensor *gpu_graph_attn_comp_read_cache(pulsar_gpu_graph *g, uint32_t il, uint32_t n_rows) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    if (!gpu_graph_attn_pack_enabled()) return g->layer_attn_comp_cache[il];
-    if (!g->attn_comp_dequant) return NULL;
-    if (n_rows == 0) return g->attn_comp_dequant;
-    if (n_rows > g->layer_comp_cap[il]) return NULL;
-    if (pulsar_gpu_attn_pack_dequant_tensor(g->layer_attn_comp_cache[il], g->attn_comp_dequant,
-                                         n_rows, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
-        return NULL;
-    }
-    return g->attn_comp_dequant;
-}
-
-/* Format flag for consumers reading the PERSISTENT comp cache natively (the
- * single-token decode attention).  The prefill/batch consumers read the f32
- * shadow instead (gpu_graph_attn_comp_read_cache) and pass 0. */
-uint32_t gpu_graph_attn_comp_cache_is_pack(void) {
-    return gpu_graph_attn_pack_enabled() ? 1u : 0u;
-}
-static bool gpu_graph_weight_is_plain_or_mxfp8(const pulsar_tensor *w) {
-    return w->type == PULSAR_TENSOR_F16 || w->type == PULSAR_TENSOR_FP8_E4M3;
-}
-
-
-
-
-pulsar_gpu_tensor *gpu_graph_attn_comp_update_target(
-        pulsar_gpu_graph *g,
-        uint32_t       il) {
-    return gpu_graph_attn_pack_enabled()
-        ? g->attn_comp_stage
-        : g->layer_attn_comp_cache[il];
-}
-
-
-
-uint32_t gpu_graph_attn_comp_update_row(uint32_t row) {
-    return gpu_graph_attn_pack_enabled() ? 0u : row;
-}
-
-
-
-bool gpu_graph_commit_attn_comp_stage(
-        pulsar_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       first_row,
-        uint32_t       rows) {
-    if (gpu_graph_attn_pack_enabled()) {
-        /* Quantize+pack the `rows` f32 rows staged in attn_comp_stage into the
-         * packed comp cache at first_row.  The kernel also fp8-roundtrips the
-         * stage rows in place (identical to the plain quantize the f32 path
-         * runs), so the stage keeps the exact f32-pipeline values.  This MUST
-         * be the only fp8 quantize of the row: re-quantizing an already-
-         * roundtripped block is NOT bit-idempotent when the block amax sits on
-         * a scale boundary (the recomputed scale can shift one step and
-         * re-round small values, e.g. subnormal ties) — that is why the
-         * prefill/replay producers pass quantize_fp8=false under pack. */
-        if (rows == 0) return true;
-        if (!g || il >= PULSAR_N_LAYER || !g->layer_attn_comp_cache[il] || !g->attn_comp_stage) {
-            return false;
-        }
-        if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
-            return false;
-        }
-        if (pulsar_gpu_attn_pack_quantize_store_tensor(g->attn_comp_stage,
-                                                    g->layer_attn_comp_cache[il],
-                                                    first_row, rows,
-                                                    PULSAR_N_HEAD_DIM, PULSAR_N_ROT) == 0) {
-            return false;
-        }
-        /* plan-33 inc C: byte-replace the ratio-4 boundary row after any commit
-         * below the fork keep threshold (no-op when ms_emit_keep is 0). */
-        return gpu_graph_emit_keep_restore(g, il,
-                g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
-    }
-    /* Classic f32 storage: the compressor wrote the persistent cache directly
-     * (gpu_graph_attn_comp_update_target returned it), nothing to commit — but
-     * the fork boundary restore still applies to the rows it just wrote. */
-    return gpu_graph_emit_keep_restore(g, il,
-            g->banks.n_banks ? g->banks.cur_bank : 0u, first_row, rows, false);
-}
-
-
-
-bool gpu_graph_commit_attn_comp_stage_bank(
-        pulsar_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       bank,
-        uint32_t       first_row,
-        uint32_t       rows) {
-    if (!gpu_graph_attn_pack_enabled()) {
-        /* f32 storage: the multiseq emit loop pointed the compressor at the
-         * bank's comp view directly; nothing to commit (mirrors the classic
-         * helper). */
-        return true;
-    }
-    if (rows == 0) return true;
-    if (!g || il >= PULSAR_N_LAYER || !g->attn_comp_stage) return false;
-    if (first_row > g->layer_comp_cap[il] || rows > g->layer_comp_cap[il] - first_row) {
-        return false;
-    }
-    pulsar_gpu_tensor *cache = gpu_graph_bank_attn_comp_view(g, il, bank);
-    if (!cache) return false;
-    const bool ok = pulsar_gpu_attn_pack_quantize_store_tensor(
-            g->attn_comp_stage, cache, first_row, rows,
-            PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
-    pulsar_gpu_tensor_free(cache);
-    /* plan-33 inc C: boundary-row restore for the explicit-bank commit path. */
-    return ok && gpu_graph_emit_keep_restore(g, il, bank, first_row, rows, false);
-}
-
-
-
-pulsar_gpu_tensor *gpu_graph_attn_comp_row_view(
-        pulsar_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       row) {
-    if (gpu_graph_attn_pack_enabled()) {
-        return pulsar_gpu_tensor_view(g->attn_comp_stage,
-                                   0,
-                                   (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-    }
-    return pulsar_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)row * PULSAR_N_HEAD_DIM * sizeof(float),
-                               (uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-}
-
-
-
-pulsar_gpu_tensor *gpu_graph_attn_comp_prefill_target(
-        pulsar_gpu_graph *g,
-        uint32_t       il,
-        uint32_t       first_row,
-        uint32_t       rows) {
-    if (gpu_graph_attn_pack_enabled()) {
-        return g->attn_comp_stage;
-    }
-    const uint32_t view_rows = rows ? rows : 1u;
-    return pulsar_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                               (uint64_t)first_row * PULSAR_N_HEAD_DIM * sizeof(float),
-                               (uint64_t)view_rows * PULSAR_N_HEAD_DIM * sizeof(float));
-}
-
-
-
-void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t) {
-    /* Only the pure-f32 path returns a fresh view; the staged pack path
-     * returns the persistent attn_comp_stage, which must not be freed. */
-    if (!gpu_graph_attn_pack_enabled()) {
-        pulsar_gpu_tensor_free(t);
-    }
+    /* The prefill score slice, in rows.  The env override had no caller
+     * (L159 inc 4); one number, one place. */
+    return 512u;
 }
 
 
@@ -584,1064 +77,14 @@ void gpu_graph_attn_comp_prefill_target_free(pulsar_gpu_tensor *t) {
 /* Encode one DS4 decode layer on GPU.  This is the release single-token
  * layer path; diagnostics reuse it so they compare exactly what generation
  * runs. */
-bool gpu_graph_indexer_stage_profile_boundary(
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        uint32_t    n_comp,
-        double     *stage_t0);
-
-
-bool gpu_graph_layer_stage_profile_boundary(
-        const char *part,
-        const char *stage,
-        uint32_t    il,
-        uint32_t    pos0,
-        uint32_t    n_tokens,
-        double     *stage_t0);
-
-
-bool gpu_graph_decode_stage_profile_enabled(uint32_t il);
-
-
-bool gpu_graph_matmul_plain_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok);
 
 
 
-/* Decode-only fused RMSNorm + HC-mix GEMV.  Byte-identical to the
- * rms_norm_plain -> matmul_f16 pair it replaces (see pulsar_cuda_hc_router.cu);
- * it exists because that pair ran a 1-block kernel and then a 24-block kernel
- * with a 64 KB f32 scratch round trip between them, for ~5.4% of decode.
- * src_hc is an HC residual carrier (BF16 under task #62); the fused kernel
- * reads it via pulsar_hc_load, exactly as rms_norm_plain_tensor does.
- * Non-F16 mix weights keep the original two-kernel path. */
-static bool gpu_graph_norm_mix_plain(
-        pulsar_gpu_graph        *g,
-        const pulsar_model      *model,
-        const pulsar_tensor     *w,
-        uint64_t              hc_dim,
-        uint64_t              out_dim,
-        const pulsar_gpu_tensor *src_hc,
-        pulsar_gpu_tensor       *out) {
-    if (w->type == PULSAR_TENSOR_F16) {
-        return pulsar_gpu_hc_norm_mix_f16_tensor(out, model->map, model->size,
-                                              w->abs_offset, hc_dim, out_dim,
-                                              src_hc, PULSAR_RMS_EPS) != 0;
-    }
-    if (!pulsar_gpu_rms_norm_plain_tensor(g->flat_hc, src_hc, (uint32_t)hc_dim, PULSAR_RMS_EPS)) return false;
-    return gpu_graph_matmul_plain_tensor(out, model, w, hc_dim, out_dim, g->flat_hc, 1);
-}
-
-
-bool gpu_graph_encode_decode_layer(
-        pulsar_gpu_graph  *g,
-        const pulsar_model        *model,
-        const pulsar_layer_weights *layer,
-        uint32_t                il,
-        uint32_t                pos,
-        pulsar_gpu_tensor       *raw_cache,
-        uint32_t                raw_cap,
-        uint32_t                raw_row,
-        uint32_t                n_raw,
-        int                     token) {
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
-    const uint32_t raw_f16 = (uint32_t)gpu_graph_raw_f16_enabled();
-    const uint64_t q_rank = layer->attn_q_a->dim[1];
-    const uint64_t q_dim = (uint64_t)PULSAR_N_HEAD * PULSAR_N_HEAD_DIM;
-    const uint32_t n_groups = PULSAR_N_OUT_GROUP;
-    const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
-    const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
-    const uint32_t rank = PULSAR_N_LORA_O;
-    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const bool compressed = g->comp_ratio_override >= 0
-        ? g->comp_ratio_override != 0
-        : pulsar_layer_compress_ratio(il) != 0;
-    const float freq_base = layer_rope_freq_base(il);
-    const float freq_scale = layer_rope_freq_scale(il);
-    const float ext_factor = compressed && PULSAR_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
-    float attn_factor = 1.0f;
-    if (ext_factor != 0.0f && freq_scale > 0.0f) {
-        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    const bool qkv_rms_fused = !gpu_graph_use_reference_qkv_norm();
-
-    bool ok = true;
-    const bool decode_stage_profile = gpu_graph_decode_stage_profile_enabled(il);
-    double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
-#define PULSAR_CUDA_PROFILE_DECODE_STAGE(name) do { \
-        if (ok && decode_stage_profile) { \
-            ok = gpu_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
-        } \
-    } while (0)
-    if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_attn_fn,
-                                          hc_dim, mix_hc, g->cur_hc, g->hc_mix);
-    const bool fuse_hc_norm =
-        PULSAR_N_HC == 4 &&
-        !gpu_graph_use_reference_hc_decode() &&
-        !gpu_graph_use_reference_hc_norm_decode();
-    if (ok && fuse_hc_norm) {
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
-                                                         g->attn_norm,
-                                                         g->hc_split,
-                                                         g->hc_mix,
-                                                         g->cur_hc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->hc_attn_scale->abs_offset,
-                                                         layer->hc_attn_base->abs_offset,
-                                                         layer->attn_norm->abs_offset,
-                                                         PULSAR_N_EMBD,
-                                                         PULSAR_N_HC,
-                                                         PULSAR_N_HC_SINKHORN_ITER,
-                                                         PULSAR_HC_EPS,
-                                                         PULSAR_RMS_EPS) != 0;
-        if (ok) {
-            ok = gpu_graph_check_hc_norm_fusion("attn",
-                                                  g->attn_cur,
-                                                  g->attn_norm,
-                                                  g->hc_mix,
-                                                  g->cur_hc,
-                                                  model,
-                                                  layer->hc_attn_scale->abs_offset,
-                                                  layer->hc_attn_base->abs_offset,
-                                                  layer->attn_norm->abs_offset,
-                                                  il,
-                                                  pos);
-        }
-    } else if (ok) {
-        ok = gpu_graph_decode_hc_pre(g->attn_cur,
-                                       g->hc_split,
-                                       g->hc_mix,
-                                       g->cur_hc,
-                                       model,
-                                       layer->hc_attn_scale->abs_offset,
-                                       layer->hc_attn_base->abs_offset);
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_hc_pre");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("hc_attn_pre_mixes", g->hc_mix, mix_hc, il, pos);
-        gpu_graph_debug_dump_tensor("hc_attn_pre_weights", g->hc_pre, PULSAR_N_HC, il, pos);
-        gpu_graph_debug_dump_tensor("hc_attn_pre_post_weights", g->hc_post, PULSAR_N_HC, il, pos);
-        gpu_graph_debug_dump_tensor("hc_attn_pre_comb", g->hc_comb, (uint64_t)PULSAR_N_HC * PULSAR_N_HC, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && !fuse_hc_norm) ok = pulsar_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
-                                                                   model->map, model->size,
-                                                                   layer->attn_norm->abs_offset,
-                                                                   PULSAR_N_EMBD, PULSAR_RMS_EPS) != 0;
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_norm");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("attn_norm", g->attn_norm, PULSAR_N_EMBD, il, pos);
-    }
-    bool qkv_pair_projected = false;
-    if (ok && qkv_rms_fused) {
-        qkv_pair_projected = pulsar_gpu_matmul_mxfp8_pair_tensor(g->qr,
-                                                             g->kv_raw,
-                                                             model->map,
-                                                             model->size,
-                                                             layer->attn_q_a->abs_offset,
-                                                             layer->attn_kv->abs_offset,
-                                                             PULSAR_N_EMBD,
-                                                             q_rank,
-                                                             PULSAR_N_HEAD_DIM,
-                                                             g->attn_norm,
-                                                             1) != 0;
-    }
-    if (ok && !qkv_pair_projected) ok = pulsar_gpu_matmul_mxfp8_tensor(g->qr,
-                                                                    model->map,
-                                                                    model->size,
-                                                                    layer->attn_q_a->abs_offset,
-                                                                    PULSAR_N_EMBD,
-                                                                    q_rank,
-                                                                    g->attn_norm,
-                                                                    1) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
-    }
-    if (qkv_rms_fused) {
-        if (ok && !qkv_pair_projected) ok = pulsar_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("KVraw", g->kv_raw, PULSAR_N_HEAD_DIM, il, pos);
-        }
-        if (ok) ok = pulsar_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
-                                                             g->qr,
-                                                             model->map,
-                                                             model->size,
-                                                             layer->attn_q_a_norm->abs_offset,
-                                                             (uint32_t)q_rank,
-                                                             g->kv,
-                                                             g->kv_raw,
-                                                             layer->attn_kv_a_norm->abs_offset,
-                                                             PULSAR_N_HEAD_DIM,
-                                                             1,
-                                                             PULSAR_RMS_EPS) != 0;
-    } else {
-        if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
-                                                      model->map, model->size,
-                                                      layer->attn_q_a_norm->abs_offset,
-                                                      (uint32_t)q_rank, PULSAR_RMS_EPS) != 0;
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("q_lora_norm", g->qr_norm, q_rank, il, pos);
-    }
-    if (qkv_rms_fused && ok) {
-        gpu_graph_debug_dump_tensor("KVnorm", g->kv, PULSAR_N_HEAD_DIM, il, pos);
-    }
-    if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->q, model->map, model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank, q_dim,
-                                              g->qr_norm, 1) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
-    }
-    const bool decode_q_norm_debug = gpu_graph_debug_wants("Qnorm", il, pos);
-    bool decode_q_norm_rope_fused = false;
-    if (ok && !decode_q_norm_debug) {
-        decode_q_norm_rope_fused =
-            pulsar_gpu_head_rms_norm_rope_tail_tensor(g->q,
-                                                   1,
-                                                   PULSAR_N_HEAD,
-                                                   PULSAR_N_HEAD_DIM,
-                                                   PULSAR_N_ROT,
-                                                   pos,
-                                                   compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                   false,
-                                                   freq_base,
-                                                   freq_scale,
-                                                   ext_factor,
-                                                   attn_factor,
-                                                   PULSAR_ROPE_YARN_BETA_FAST,
-                                                   PULSAR_ROPE_YARN_BETA_SLOW,
-                                                   PULSAR_RMS_EPS,
-                                                   NULL) != 0;
-    }
-    if (!decode_q_norm_rope_fused) {
-        if (ok) ok = pulsar_gpu_head_rms_norm_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
-        }
-        if (ok) ok = pulsar_gpu_rope_tail_tensor(g->q, 1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                                PULSAR_N_ROT, pos,
-                                                compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                false, freq_base, freq_scale, ext_factor, attn_factor,
-                                                PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
-                                                NULL) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("q_path");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
-    }
-    if (!qkv_rms_fused) {
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("KVraw", g->kv_raw, PULSAR_N_HEAD_DIM, il, pos);
-        }
-        if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->kv, g->kv_raw,
-                                                      model->map, model->size,
-                                                      layer->attn_kv_a_norm->abs_offset,
-                                                      PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS) != 0;
-        if (ok) {
-            gpu_graph_debug_dump_tensor("KVnorm", g->kv, PULSAR_N_HEAD_DIM, il, pos);
-        }
-    }
-    if (ok) ok = pulsar_gpu_rope_tail_tensor(g->kv, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM,
-                                            PULSAR_N_ROT, pos,
-                                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
-                                            NULL) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("KVrope", g->kv, PULSAR_N_HEAD_DIM, il, pos);
-    }
-    /* RoPE stays as the exact standalone kernel above.  The decode fusion
-     * starts after that, where FP8 KV quantization and raw-cache storage can
-     * share one pass without changing the trigonometric path. */
-    if (ok) ok = gpu_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row, raw_f16);
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("kv_path");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("KVcur", g->kv, PULSAR_N_HEAD_DIM, il, pos);
-    }
-
-    uint32_t n_comp = 0;
-    pulsar_gpu_tensor *comp_cache = NULL;
-    pulsar_gpu_tensor *comp_selected = NULL;
-    uint32_t n_selected = 0;
-    double decode_index_stage_t0 = 0.0;
-    static int decode_index_stage_env = -1;
-    const bool decode_index_stage_profile = gpu_graph_env_flag("PULSAR_CUDA_INDEXER_STAGE_PROFILE", &decode_index_stage_env);
-    /* PULSAR_DECODE_DESCR diagnostic: refresh the 1-row descriptor arrays once
-     * per layer (both the banked indexer scan and the banked attention below
-     * read them). */
-    const int descr_diag = gpu_graph_decode_descr_enabled();
-    if (ok && descr_diag) ok = gpu_graph_decode_descr_prepare(g, pos);
-    if (ok && compressed) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint32_t comp_width = coff * PULSAR_N_HEAD_DIM;
-        const bool emit = ((pos + 1u) % ratio) == 0u;
-        if (!layer->attn_compressor_kv || !layer->attn_compressor_gate ||
-            !layer->attn_compressor_ape || !layer->attn_compressor_norm ||
-            !gpu_graph_weight_is_plain_or_mxfp8(layer->attn_compressor_kv) ||
-            !gpu_graph_weight_is_plain_or_mxfp8(layer->attn_compressor_gate) ||
-            layer->attn_compressor_kv->dim[0] != PULSAR_N_EMBD ||
-            layer->attn_compressor_gate->dim[0] != PULSAR_N_EMBD ||
-            layer->attn_compressor_kv->dim[1] != comp_width ||
-            layer->attn_compressor_gate->dim[1] != comp_width) {
-            fprintf(stderr, "pulsar: GPU graph compressor expects paired F16 compressor projections\n");
-            ok = false;
-        }
-        if (ok && emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
-            fprintf(stderr, "pulsar: GPU graph compressed KV cache capacity exceeded at layer %u\n", il);
-            ok = false;
-        }
-        if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
-            if (layer->attn_compressor_kv->type == PULSAR_TENSOR_F16) {
-                ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                      g->comp_sc_cur,
-                                                      model->map,
-                                                      model->size,
-                                                      layer->attn_compressor_kv->abs_offset,
-                                                      layer->attn_compressor_gate->abs_offset,
-                                                      PULSAR_N_EMBD,
-                                                      comp_width,
-                                                      g->attn_norm,
-                                                      1) != 0;
-            } else {
-                ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                    layer->attn_compressor_kv,
-                                                    PULSAR_N_EMBD, comp_width,
-                                                    g->attn_norm, 1) &&
-                     gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                    layer->attn_compressor_gate,
-                                                    PULSAR_N_EMBD, comp_width,
-                                                    g->attn_norm, 1);
-            }
-        } else {
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                         layer->attn_compressor_kv,
-                                                         PULSAR_N_EMBD, comp_width,
-                                                         g->attn_norm, 1);
-            if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                         layer->attn_compressor_gate,
-                                                         PULSAR_N_EMBD, comp_width,
-                                                         g->attn_norm, 1);
-        }
-        const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                        g->comp_sc_cur,
-                                                        g->layer_attn_state_kv[il],
-                                                        g->layer_attn_state_score[il],
-                                                        gpu_graph_attn_comp_update_target(g, il),
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_compressor_ape->abs_offset,
-                                                        layer->attn_compressor_ape->type,
-                                                        layer->attn_compressor_norm->abs_offset,
-                                                        layer->attn_compressor_norm->type,
-                                                        PULSAR_N_HEAD_DIM,
-                                                        ratio,
-                                                        pos,
-                                                        gpu_graph_attn_comp_update_row(comp_row),
-                                                        PULSAR_N_ROT,
-                                                        compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                        freq_base,
-                                                        freq_scale,
-                                                        ext_factor,
-                                                        attn_factor,
-                                                        PULSAR_ROPE_YARN_BETA_FAST,
-                                                        PULSAR_ROPE_YARN_BETA_SLOW,
-                                                        PULSAR_RMS_EPS) != 0;
-        if (ok && emit) {
-            pulsar_gpu_tensor *comp_row_view = gpu_graph_attn_comp_row_view(g, il, comp_row);
-            if (!comp_row_view) {
-                ok = false;
-            } else if (gpu_graph_attn_pack_enabled()) {
-                /* comp_row_view aliases the f32 stage; commit below quantizes,
-                 * packs, and roundtrips the stage in place — dump afterwards so
-                 * KVcompress shows the same post-roundtrip values as f32 mode. */
-            } else {
-                ok = pulsar_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
-                if (ok) {
-                    gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, PULSAR_N_HEAD_DIM, il, pos);
-                }
-            }
-            if (ok) ok = gpu_graph_commit_attn_comp_stage(g, il, comp_row, 1);
-            if (ok && comp_row_view && gpu_graph_attn_pack_enabled()) {
-                gpu_graph_debug_dump_tensor("KVcompress", comp_row_view, PULSAR_N_HEAD_DIM, il, pos);
-            }
-            pulsar_gpu_tensor_free(comp_row_view);
-        }
-        if (ok && emit) g->layer_n_comp[il]++;
-
-        if (ok && ratio == 4) {
-            const uint32_t index_width = coff * PULSAR_N_INDEXER_HEAD_DIM;
-            if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
-                !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
-                !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_compressor_kv) ||
-                !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_compressor_gate) ||
-                layer->indexer_compressor_kv->dim[0] != PULSAR_N_EMBD ||
-                layer->indexer_compressor_gate->dim[0] != PULSAR_N_EMBD ||
-                layer->indexer_compressor_kv->dim[1] != index_width ||
-                layer->indexer_compressor_gate->dim[1] != index_width) {
-                fprintf(stderr, "pulsar: GPU graph indexer compressor expects paired F16 projections\n");
-                ok = false;
-            }
-            if (ok && emit && g->layer_n_index_comp[il] >= g->layer_comp_cap[il]) {
-                fprintf(stderr, "pulsar: GPU graph indexer compressed KV cache capacity exceeded at layer %u\n", il);
-                ok = false;
-            }
-            if (ok && !gpu_graph_use_reference_compressor_pair_proj()) {
-                if (layer->indexer_compressor_kv->type == PULSAR_TENSOR_F16) {
-                    ok = pulsar_gpu_matmul_f16_pair_tensor(g->comp_kv_cur,
-                                                          g->comp_sc_cur,
-                                                          model->map,
-                                                          model->size,
-                                                          layer->indexer_compressor_kv->abs_offset,
-                                                          layer->indexer_compressor_gate->abs_offset,
-                                                          PULSAR_N_EMBD,
-                                                          index_width,
-                                                          g->attn_norm,
-                                                          1) != 0;
-                } else {
-                    ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                        layer->indexer_compressor_kv,
-                                                        PULSAR_N_EMBD, index_width,
-                                                        g->attn_norm, 1) &&
-                         gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                        layer->indexer_compressor_gate,
-                                                        PULSAR_N_EMBD, index_width,
-                                                        g->attn_norm, 1);
-                }
-            } else {
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_kv_cur, model,
-                                                             layer->indexer_compressor_kv,
-                                                             PULSAR_N_EMBD, index_width,
-                                                             g->attn_norm, 1);
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->comp_sc_cur, model,
-                                                             layer->indexer_compressor_gate,
-                                                             PULSAR_N_EMBD, index_width,
-                                                              g->attn_norm, 1);
-            }
-            const uint32_t index_row = g->layer_n_index_comp[il];
-            const int idx_fp4 = gpu_graph_idx_fp4_enabled();
-            if (ok) ok = pulsar_gpu_compressor_update_tensor(g->comp_kv_cur,
-                                                            g->comp_sc_cur,
-                                                            g->layer_index_state_kv[il],
-                                                            g->layer_index_state_score[il],
-                                                            idx_fp4 ? g->idx_comp_stage
-                                                                    : g->layer_index_comp_cache[il],
-                                                            model->map,
-                                                            model->size,
-                                                            layer->indexer_compressor_ape->abs_offset,
-                                                            layer->indexer_compressor_ape->type,
-                                                            layer->indexer_compressor_norm->abs_offset,
-                                                            layer->indexer_compressor_norm->type,
-                                                            PULSAR_N_INDEXER_HEAD_DIM,
-                                                            ratio,
-                                                            pos,
-                                                            index_row,
-                                                            PULSAR_N_ROT,
-                                                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                            freq_base,
-                                                            freq_scale,
-                                                            ext_factor,
-                                                            attn_factor,
-                                                            PULSAR_ROPE_YARN_BETA_FAST,
-                                                            PULSAR_ROPE_YARN_BETA_SLOW,
-                                                            PULSAR_RMS_EPS) != 0;
-            if (ok && emit) {
-                pulsar_gpu_tensor *index_row_view = pulsar_gpu_tensor_view(
-                        idx_fp4 ? g->idx_comp_stage : g->layer_index_comp_cache[il],
-                        (uint64_t)index_row * PULSAR_N_INDEXER_HEAD_DIM * sizeof(float),
-                        (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-                if (!index_row_view) {
-                    ok = false;
-                } else if (idx_fp4) {
-                    ok = pulsar_gpu_dsv4_indexer_qat_pack_tensor(index_row_view,
-                                                               g->layer_index_comp_cache[il],
-                                                               index_row,
-                                                               1,
-                                                               PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                    pulsar_gpu_tensor_free(index_row_view);
-                } else {
-                    ok = pulsar_gpu_dsv4_indexer_qat_tensor(index_row_view,
-                                                          1,
-                                                          PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                    pulsar_gpu_tensor_free(index_row_view);
-                }
-                /* plan-33 inc C: boundary-row restore (decode-fallback site). */
-                if (ok) ok = gpu_graph_emit_keep_restore(g, il,
-                        g->banks.n_banks ? g->banks.cur_bank : 0u, index_row, 1, true);
-            }
-            if (ok && emit) g->layer_n_index_comp[il]++;
-            const uint32_t decode_sparse_threshold =
-                gpu_graph_decode_indexer_sparse_threshold(g);
-            if (ok &&
-                g->layer_n_comp[il] > decode_sparse_threshold &&
-                g->layer_n_index_comp[il] > PULSAR_N_INDEXER_TOP_K) {
-                const uint64_t indexer_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
-                if (!layer->indexer_attn_q_b ||
-                    !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_attn_q_b) ||
-                    layer->indexer_attn_q_b->dim[0] != q_rank ||
-                    layer->indexer_attn_q_b->dim[1] != indexer_q_dim) {
-                    fprintf(stderr, "pulsar: GPU graph indexer q projection expects F16 weights\n");
-                    ok = false;
-                }
-                if (ok && (!layer->indexer_proj ||
-                           !gpu_graph_weight_is_plain_or_mxfp8(layer->indexer_proj) ||
-                           layer->indexer_proj->dim[0] != PULSAR_N_EMBD ||
-                           layer->indexer_proj->dim[1] != PULSAR_N_INDEXER_HEAD)) {
-                    fprintf(stderr, "pulsar: GPU graph indexer weight projection expects F16 weights\n");
-                    ok = false;
-                }
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->indexer_q,
-                                                              model,
-                                                              layer->indexer_attn_q_b,
-                                                              q_rank,
-                                                              indexer_q_dim,
-                                                              g->qr_norm,
-                                                              1);
-                if (ok) ok = pulsar_gpu_rope_tail_tensor(g->indexer_q, 1,
-                                                        PULSAR_N_INDEXER_HEAD,
-                                                        PULSAR_N_INDEXER_HEAD_DIM,
-                                                        PULSAR_N_ROT,
-                                                        pos,
-                                                        compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                                        false,
-                                                        freq_base,
-                                                        freq_scale,
-                                                        ext_factor,
-                                                        attn_factor,
-                                                        PULSAR_ROPE_YARN_BETA_FAST,
-                                                        PULSAR_ROPE_YARN_BETA_SLOW,
-                                                        NULL) != 0;
-                if (ok) ok = pulsar_gpu_dsv4_indexer_qat_tensor(g->indexer_q,
-                                                              PULSAR_N_INDEXER_HEAD,
-                                                              PULSAR_N_INDEXER_HEAD_DIM) != 0;
-                if (ok) ok = gpu_graph_matmul_plain_tensor(g->indexer_weights, model,
-                                                             layer->indexer_proj,
-                                                             PULSAR_N_EMBD, PULSAR_N_INDEXER_HEAD,
-                                                             g->attn_norm, 1);
-                const float index_scale = 1.0f / sqrtf((float)(PULSAR_N_INDEXER_HEAD_DIM * PULSAR_N_INDEXER_HEAD));
-                if (ok && decode_index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary(NULL,
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
-                if (ok && descr_diag) {
-                    /* PULSAR_DECODE_DESCR: route the single-token indexer scan
-                     * through the banked entry (n_banks=1, bank 0 over the
-                     * installed views).  Dispatches the SAME direct-one fast
-                     * tier as score_one; the banked causal clamp (pos+1)/ratio
-                     * equals layer_n_index_comp here (emit-before-read), so
-                     * no row goes -INF and the scan is byte-exact vs classic
-                     * — gated in the Tier-2 harness. */
-                    ok = pulsar_gpu_indexer_scores_decode_batch_tensor(g->indexer_scores,
-                                                                g->indexer_q,
-                                                                g->indexer_weights,
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                1,
-                                                                pos,
-                                                                PULSAR_N_INDEXER_HEAD,
-                                                                PULSAR_N_INDEXER_HEAD_DIM,
-                                                                pulsar_layer_compress_ratio(il),
-                                                                index_scale,
-                                                                g->descr_diag_pos,
-                                                                g->descr_diag_seq,
-                                                                NULL, /* n_banks==1 diag: installed bank view */
-                                                                g->layer_comp_cap[il],
-                                                                1) != 0;
-                } else if (ok) {
-                    ok = pulsar_gpu_indexer_score_one_tensor(g->indexer_scores,
-                                                                g->indexer_q,
-                                                                g->indexer_weights,
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                PULSAR_N_INDEXER_HEAD,
-                                                                PULSAR_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
-                }
-                if (ok && decode_index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("decode_score",
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
-                if (ok) ok = pulsar_gpu_indexer_topk_tensor(g->comp_selected,
-                                                           g->indexer_scores,
-                                                           g->layer_n_index_comp[il],
-                                                           1,
-                                                           PULSAR_N_INDEXER_TOP_K) != 0;
-                if (ok && decode_index_stage_profile) {
-                    ok = gpu_graph_indexer_stage_profile_boundary("decode_topk",
-                                                                    il,
-                                                                    pos,
-                                                                    1,
-                                                                    g->layer_n_index_comp[il],
-                                                                    &decode_index_stage_t0);
-                }
-                /* Decode used to materialize a dense compressed-row mask and
-                 * call the generic gathered FlashAttention wrapper below.
-                 * That wrapper scans every compressed row and rejects long
-                 * contexts once raw+compressed rows exceed 8192.  Ratio-4 DS4
-                 * attention is sparse after indexer top-k, so use the private
-                 * indexed attention kernel instead: it scans only SWA raw rows
-                 * plus the selected compressed rows, matching prefill and
-                 * avoiding the long-context decode failure. */
-                if (ok) {
-                    comp_selected = g->comp_selected;
-                    /*
-                     * Contract: the indexer top-k is fixed by the model config
-                     * and must remain the full 512 rows.  Do not reduce this for
-                     * throughput benchmarks.
-                     *
-                     * Why: the indexer is not just an implementation detail.  It
-                     * decides which compressed memory rows are visible to the
-                     * attention kernel.  If we keep only 128/256 rows, the later
-                     * indexed-attention math may be perfectly computed, but it is
-                     * computed over the wrong candidate set: rows ranked 257-512
-                     * are removed before softmax/PV can use them.  Those rows may
-                     * carry weak-but-necessary evidence for retrieval, name/number
-                     * recall, or long-context disambiguation.  The error is
-                     * therefore semantic/algorithmic, not the acceptable kind of
-                     * local numerical drift caused by a different reduction order
-                     * or Tensor/NAX precision.
-                     *
-                     * Short prompt tests, first-token agreement, or even a small
-                     * official-vector set can miss this because many prompts do
-                     * not need the tail of the 512 selected compressed rows.  The
-                     * failure appears only when the model needs information that
-                     * fell below the reduced cutoff.  Optimizations belong inside
-                     * the score/top-k/attention implementation while preserving
-                     * PULSAR_N_INDEXER_TOP_K.
-                     */
-                    n_selected = PULSAR_N_INDEXER_TOP_K < g->layer_n_index_comp[il]
-                        ? PULSAR_N_INDEXER_TOP_K
-                        : g->layer_n_index_comp[il];
-                }
-            }
-        }
-
-        n_comp = g->layer_n_comp[il];
-        comp_cache = g->layer_attn_comp_cache[il];
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("compressor_indexer");
-
-    if (ok) {
-        const uint32_t raw_start = gpu_graph_raw_start_for_span(g, pos, n_raw);
-        /* PULSAR_DECODE_DESCR diagnostic (see gpu_graph_decode_descr_enabled):
-         * route this step through the banked entries as a 1-bank pool.  The
-         * per-row raw derivation (min(pos+1, raw_window) rows ending at pos)
-         * matches gpu_graph_raw_span_for_batch/raw_start_for_span exactly,
-         * and the per-row (pos+1)/ratio compressed visibility equals the
-         * n_comp this step just produced (emit-before-attention).  The
-         * descriptor arrays were refreshed once at the top of this layer. */
-        if (!ok) {
-            /* fall through with ok == false */
-        } else if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
-            ok = pulsar_gpu_attention_indexed_mixed_batch_heads_tensor(
-                    g->heads,
-                    model->map,
-                    model->size,
-                    layer->attn_sinks->abs_offset,
-                    g->q,
-                    raw_cache,
-                    g->layer_attn_comp_cache[il],
-                    gpu_graph_attn_comp_cache_is_pack(),
-                    comp_selected,
-                    1,
-                    pos,
-                    n_raw,
-                    raw_cap,
-                    raw_start,
-                    n_comp,
-                    n_selected,
-                    g->raw_window,
-                    pulsar_layer_compress_ratio(il),
-                    PULSAR_N_HEAD,
-                    PULSAR_N_HEAD_DIM,
-                    raw_f16,
-                    descr_diag ? g->descr_diag_pos : NULL,
-                    descr_diag ? g->descr_diag_seq : NULL,
-                    NULL, /* n_banks==1 diag: installed bank view is the operand */
-                    descr_diag ? g->layer_comp_cap[il] : 0,
-                    1) != 0;
-            if (ok && decode_index_stage_profile) {
-                ok = gpu_graph_indexer_stage_profile_boundary("decode_attention",
-                                                                il,
-                                                                pos,
-                                                                1,
-                                                                n_comp,
-                                                                &decode_index_stage_t0);
-            }
-        } else if (descr_diag) {
-            /* Non-indexed single-token attention through the banked batch
-             * entry (scalar n_raw/raw_start are ignored in banked mode). */
-            ok = pulsar_gpu_attention_decode_mixed_batch_heads_tensor(g->heads,
-                    model->map, model->size,
-                    layer->attn_sinks->abs_offset,
-                    g->q, raw_cache,
-                    n_comp ? comp_cache : NULL,
-                    gpu_graph_attn_comp_cache_is_pack(),
-                    NULL, 0,
-                    1, pos,
-                    0, raw_cap, 0, /* n_raw/raw_start unused (banked) */
-                    n_comp,
-                    g->raw_window,
-                    pulsar_layer_compress_ratio(il),
-                    PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                    0, raw_f16,
-                    g->descr_diag_pos, g->descr_diag_seq,
-                    NULL, /* n_banks==1 diag: installed bank view is the operand */
-                    g->layer_comp_cap[il], 1) != 0;
-        } else {
-            ok = pulsar_gpu_attention_decode_heads_tensor(g->heads,
-                                                         model->map, model->size,
-                                                         layer->attn_sinks->abs_offset,
-                                                         g->q, raw_cache, n_raw,
-                                                         raw_cap,
-                                                         raw_start,
-                                                         n_comp ? comp_cache : NULL,
-                                                         gpu_graph_attn_comp_cache_is_pack(),
-                                                         n_comp,
-                                                         NULL,
-                                                         0,
-                                                         PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                                         raw_f16) != 0;
-        }
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("attention");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
-    }
-    if (ok) ok = pulsar_gpu_rope_tail_tensor(g->heads,
-                                            1, PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-                                            PULSAR_N_ROT, pos,
-                                            compressed ? (uint32_t)PULSAR_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            PULSAR_ROPE_YARN_BETA_FAST,
-                                            PULSAR_ROPE_YARN_BETA_SLOW,
-                                            NULL) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
-    }
-    const bool fuse_attn_out_hc =
-        !gpu_graph_directional_steering_attn_enabled(g) &&
-        !gpu_graph_use_reference_attn_out_hc();
-    if (ok && fuse_attn_out_hc) {
-        ok = pulsar_gpu_attention_output_low_tensor(g->attn_low,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->attn_output_a->abs_offset,
-                                                   group_dim,
-                                                   rank,
-                                                   n_groups,
-                                                   g->heads) != 0;
-        if (ok) {
-            ok = pulsar_gpu_matmul_fp8_hc_expand_tensor(g->after_attn_hc,
-                                                        g->attn_out,
-                                                        model->map,
-                                                        model->size,
-                                                        layer->attn_output_b->abs_offset,
-                                                        (uint64_t)n_groups * rank,
-                                                        PULSAR_N_EMBD,
-                                                        g->attn_low,
-                                                        g->cur_hc,
-                                                        g->hc_split,
-                                                        PULSAR_N_EMBD,
-                                                        PULSAR_N_HC) != 0;
-        }
-    } else if (ok) {
-        ok = pulsar_gpu_attention_output_batch_tensor(g->attn_out,
-                                                     g->attn_low,
-                                                     model->map,
-                                                     model->size,
-                                                     layer->attn_output_a->abs_offset,
-                                                     layer->attn_output_b->abs_offset,
-                                                     group_dim, rank,
-                                                     n_groups, PULSAR_N_EMBD,
-                                                     g->heads, 1) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_output");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("attn_low", g->attn_low, (uint64_t)n_groups * rank, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("attn_out", g->attn_out, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && gpu_graph_directional_steering_attn_enabled(g)) {
-        ok = gpu_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
-    }
-    if (ok && !fuse_attn_out_hc) {
-        ok = pulsar_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
-                                        g->hc_post, g->hc_comb, PULSAR_N_EMBD, PULSAR_N_HC) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("attn_hc_post");
-    if (ok) {
-        gpu_graph_debug_dump_hc_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
-    }
-    if (ok) ok = gpu_graph_norm_mix_plain(g, model, layer->hc_ffn_fn,
-                                          hc_dim, mix_hc, g->after_attn_hc, g->hc_mix);
-    if (ok && fuse_hc_norm) {
-        ok = pulsar_gpu_hc_split_weighted_sum_norm_tensor(g->ffn_cur,
-                                                         g->ffn_norm,
-                                                         g->hc_split,
-                                                         g->hc_mix,
-                                                         g->after_attn_hc,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->hc_ffn_scale->abs_offset,
-                                                         layer->hc_ffn_base->abs_offset,
-                                                         layer->ffn_norm->abs_offset,
-                                                         PULSAR_N_EMBD,
-                                                         PULSAR_N_HC,
-                                                         PULSAR_N_HC_SINKHORN_ITER,
-                                                         PULSAR_HC_EPS,
-                                                         PULSAR_RMS_EPS) != 0;
-        if (ok) {
-            ok = gpu_graph_check_hc_norm_fusion("ffn",
-                                                  g->ffn_cur,
-                                                  g->ffn_norm,
-                                                  g->hc_mix,
-                                                  g->after_attn_hc,
-                                                  model,
-                                                  layer->hc_ffn_scale->abs_offset,
-                                                  layer->hc_ffn_base->abs_offset,
-                                                  layer->ffn_norm->abs_offset,
-                                                  il,
-                                                  pos);
-        }
-    } else if (ok) {
-        ok = gpu_graph_decode_hc_pre(g->ffn_cur,
-                                       g->hc_split,
-                                       g->hc_mix,
-                                       g->after_attn_hc,
-                                       model,
-                                       layer->hc_ffn_scale->abs_offset,
-                                       layer->hc_ffn_base->abs_offset);
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_hc_pre");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("hc_ffn_pre_mixes", g->hc_mix, mix_hc, il, pos);
-        gpu_graph_debug_dump_tensor("hc_ffn_pre_weights", g->hc_pre, PULSAR_N_HC, il, pos);
-        gpu_graph_debug_dump_tensor("hc_ffn_pre_post_weights", g->hc_post, PULSAR_N_HC, il, pos);
-        gpu_graph_debug_dump_tensor("hc_ffn_pre_comb", g->hc_comb, (uint64_t)PULSAR_N_HC * PULSAR_N_HC, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("hc_ffn_pre", g->ffn_cur, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && !fuse_hc_norm) ok = pulsar_gpu_rms_norm_weight_tensor(g->ffn_norm, g->ffn_cur,
-                                                                   model->map, model->size,
-                                                                   layer->ffn_norm->abs_offset,
-                                                                   PULSAR_N_EMBD, PULSAR_RMS_EPS) != 0;
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_norm");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, PULSAR_N_EMBD, il, pos);
-    }
-    uint64_t gate_expert_bytes = 0, gate_row_bytes = 0;
-    uint64_t down_expert_bytes = 0, down_row_bytes = 0;
-    if (ok) {
-        ok = routed_expert_gate_down_layout(layer->ffn_gate_exps, layer->ffn_down_exps,
-                                            &gate_expert_bytes, &gate_row_bytes,
-                                            &down_expert_bytes, &down_row_bytes);
-    }
-    if (ok) ok = gpu_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
-                                                 PULSAR_N_EMBD, PULSAR_N_EXPERT, g->ffn_norm, 1);
-    if (ok) ok = pulsar_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
-                                                model->map, model->size,
-                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
-                                                layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
-                                                (uint32_t)token,
-                                                PULSAR_N_EXPERT,
-                                                PULSAR_N_EXPERT_USED,
-                                                PULSAR_EXPERT_WEIGHT_SCALE,
-                                                0,
-                                                0,
-                                                layer->ffn_exp_probs_b != NULL,
-                                                layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("router");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, PULSAR_N_EXPERT, il, pos);
-        gpu_graph_debug_dump_tensor("ffn_moe_probs", g->router_probs, PULSAR_N_EXPERT, il, pos);
-        gpu_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, PULSAR_N_EXPERT_USED, il, pos);
-        gpu_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, PULSAR_N_EXPERT_USED, il, pos);
-    }
-    const bool keep_ffn_out = gpu_graph_needs_ffn_out(g, il, pos);
-    const bool fuse_shared_gate_up =
-        !g->quality &&
-        !gpu_graph_disable_shared_gate_up_swiglu();
-    const bool fuse_shared_down_hc =
-        !keep_ffn_out && !gpu_graph_use_reference_shared_down_hc();
-    if (ok) ok = pulsar_gpu_routed_moe_one_tensor(g->routed_out,
-                                                 g->routed_gate,
-                                                 g->routed_up,
-                                                 g->routed_mid,
-                                                 g->routed_down,
-                                                 tensor_map_base(model, layer->ffn_gate_exps),
-                                                 tensor_map_size(model, layer->ffn_gate_exps),
-                                                 layer->ffn_gate_exps->abs_offset,
-                                                 layer->ffn_up_exps->abs_offset,
-                                                 layer->ffn_down_exps->abs_offset,
-                                                 layer->ffn_gate_exps->type,
-                                                 layer->ffn_down_exps->type,
-                                                 gate_expert_bytes, gate_row_bytes,
-                                                 down_expert_bytes, down_row_bytes,
-                                                 (uint32_t)expert_in_dim,
-                                                 (uint32_t)down_in_dim,
-                                                 (uint32_t)routed_out_dim,
-                                                 g->router_selected, g->router_weights,
-                                                 pulsar_layer_n_expert(il),
-                                                 PULSAR_N_EXPERT_USED, PULSAR_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                 il) != 0;
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("routed_moe");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
-                                      (uint64_t)PULSAR_N_EXPERT_USED * down_in_dim, il, pos);
-        gpu_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
-                                      (uint64_t)PULSAR_N_EXPERT_USED * down_in_dim, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->routed_mid,
-                                      (uint64_t)PULSAR_N_EXPERT_USED * down_in_dim, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_down", g->routed_down,
-                                      (uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD, il, pos);
-    }
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && fuse_shared_gate_up) {
-        ok = pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(g->shared_gate,
-                                                         g->shared_up,
-                                                         g->shared_mid,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->ffn_gate_shexp->abs_offset,
-                                                         layer->ffn_up_shexp->abs_offset,
-                                                         PULSAR_N_EMBD,
-                                                         shared_dim,
-                                                         g->ffn_norm,
-                                                         PULSAR_SWIGLU_CLAMP_EXP) != 0;
-    } else {
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_gate, model->map, model->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
-                                                  PULSAR_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_up, model->map, model->size,
-                                                  layer->ffn_up_shexp->abs_offset,
-                                                  PULSAR_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = pulsar_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                                           shared_dim, PULSAR_SWIGLU_CLAMP_EXP, 1.0f) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("shared_gate_up");
-    if (ok && fuse_shared_down_hc) {
-        ok = pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(g->after_ffn_hc,
-                                                         g->shared_out,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->ffn_down_shexp->abs_offset,
-                                                         shared_dim,
-                                                         PULSAR_N_EMBD,
-                                                         g->shared_mid,
-                                                         g->routed_out,
-                                                         g->after_attn_hc,
-                                                         g->hc_split,
-                                                         PULSAR_N_EMBD,
-                                                         PULSAR_N_HC) != 0;
-    } else if (ok) {
-        ok = pulsar_gpu_matmul_mxfp8_tensor(g->shared_out, model->map, model->size,
-                                          layer->ffn_down_shexp->abs_offset,
-                                          shared_dim, PULSAR_N_EMBD,
-                                          g->shared_mid, 1) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("shared_down");
-    if (ok) {
-        gpu_graph_debug_dump_tensor("ffn_shexp", g->shared_out, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && keep_ffn_out) {
-        ok = gpu_graph_ensure_ffn_out(g) &&
-             pulsar_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, PULSAR_N_EMBD) != 0;
-    }
-    if (ok && keep_ffn_out) {
-        gpu_graph_debug_dump_tensor("ffn_out", g->ffn_out, PULSAR_N_EMBD, il, pos);
-    }
-    if (ok && gpu_graph_directional_steering_ffn_enabled(g)) {
-        ok = gpu_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
-    }
-    if (ok && gpu_graph_directional_steering_ffn_enabled(g)) {
-        ok = pulsar_gpu_hc_expand_tensor(g->after_ffn_hc,
-                                        g->ffn_out,
-                                        g->after_attn_hc,
-                                        g->hc_post,
-                                        g->hc_comb,
-                                        PULSAR_N_EMBD,
-                                        PULSAR_N_HC) != 0;
-    } else if (ok && !fuse_shared_down_hc) {
-        ok = pulsar_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
-                                                  g->routed_out,
-                                                  g->shared_out,
-                                                  g->after_attn_hc,
-                                                  g->hc_split,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
-    }
-    PULSAR_CUDA_PROFILE_DECODE_STAGE("ffn_hc_post");
-#undef PULSAR_CUDA_PROFILE_DECODE_STAGE
-    if (ok) {
-        gpu_graph_debug_dump_hc_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
-    }
-    if (ok) gpu_graph_capture_dspark_target_hc(g, il);
-    return ok;
-}
-
-void gpu_graph_capture_dspark_target_hc(pulsar_gpu_graph *g, uint32_t il) {
-    int slot = -1;
-    for (int i = 0; i < 3; i++) {
-        if (il == g->dspark_target_layer_ids[i]) { slot = i; break; }
-    }
-    if (slot < 0 || !g->dspark_target_h[slot]) return;
-
-    pulsar_gpu_dspark_hc_mean_reduce(g->dspark_target_h[slot],
-                                   g->after_ffn_hc,
-                                   PULSAR_N_EMBD, PULSAR_N_HC);
-}
-
-
-
+/// The drafter's conditioning: its projection of the three captured target hiddens (dspark_target_h) into main_x.
+/// @param g the graph
+/// @param dspark_model the drafter's model
+/// @param w its weights
+/// @return false = an input is missing or a launch failed
 bool gpu_graph_dspark_project_main_x(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
@@ -1658,37 +101,70 @@ bool gpu_graph_dspark_project_main_x(
     pulsar_gpu_tensor *target_concat = g->dspark_concat;
     pulsar_gpu_tensor *proj_out = g->dspark_proj_out;
     if (!target_concat || !proj_out) return false;
+    /* The projection is one DECODE row (the drafter's conditioning); the GEMV
+     * under it takes the M-independent arm.  Restored on exit, so a caller
+     * mid-step (the fused loop seeds up to 5 rows per step) keeps its count. */
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
 
+    /* L158 (2026-09-03): this was the ONE dense GEMV in the served lane still
+     * multiplying f32 activations.  Three tensor copies built an f32 concat,
+     * nothing armed a slot, and the GEMV fell to the f32 kernel -- W8A32 on
+     * the drafter's projection while every other projection ran W8A8 (found
+     * the day the f32 fallback was deleted: four spec gates refused here).
+     * A8 is producer-side: the concat is now emitted as E4M3 straight into
+     * the slot, the f32 concat is never written, and the GEMV reads the
+     * encoding.  No slot means no GEMV -- one format or an error. */
     bool ok = true;
-    for (int i = 0; i < 3; i++) {
-        ok = pulsar_gpu_tensor_copy(target_concat, (uint64_t)i * E * sizeof(float),
-                                 g->dspark_target_h[i], 0, E * sizeof(float)) != 0;
-        if (!ok) break;
+    void *cq = NULL, *csf = NULL;
+    int ckbp = 0;
+    pulsar_gpu_mxfp8_act_cache_arm(target_concat, 1, concat_dim);
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(target_concat, 1, concat_dim, &cq, &csf, &ckbp)) {
+        static int said = 0;
+        if (!said) { said = 1; fprintf(stderr, "pulsar: dspark main-x concat: no E4M3 slot -- refusing\n"); }
+        ok = false;
     }
-
+    if (ok) ok = pulsar_gpu_dspark_concat3_e4m3(cq, csf, ckbp,
+                                                g->dspark_target_h[0], g->dspark_target_h[1],
+                                                g->dspark_target_h[2], (uint32_t)E) != 0;
     if (ok) {
-        ok = pulsar_gpu_matmul_mxfp8_tensor(proj_out,
-                                          dspark_model->map,
-                                          dspark_model->size,
-                                          w->main_proj->abs_offset,
-                                          concat_dim, E,
-                                          target_concat, 1) != 0;
+        pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        pulsar_gpu_mxfp8_act_cache_note_f32_skipped(1u);
+        ok = pulsar_linear_slot(proj_out, dspark_model, w->main_proj, concat_dim, 0, E, target_concat, 1);
     }
+    pulsar_gpu_mxfp8_act_cache_disarm();
 
+    /* main_x feeds the seed-KV GEMVs (gpu_graph_dspark_seed_draft_kv, called
+     * right after this): the norm emits E4M3 into main_x's slot and leaves it
+     * ARMED for the seed, which disarms when done.  The f32 row is written
+     * only when the spec dump (session_spec.cpp) will read it. */
+    void *mx_q = NULL, *mx_sf = NULL; int mx_kbp = 0;
+    if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_main_x, 1, E, &mx_q, &mx_sf, &mx_kbp)) {
+        static int said = 0;
+        if (!said) { said = 1; fprintf(stderr, "pulsar: dspark main-x norm: no E4M3 slot -- refusing\n"); }
+        ok = false;
+    }
     if (ok) {
-        ok = pulsar_gpu_rms_norm_weight_tensor(g->dspark_main_x,
-                                            proj_out,
-                                            dspark_model->map,
-                                            dspark_model->size,
-                                            w->main_norm->abs_offset,
-                                            (uint32_t)E,
-                                            PULSAR_RMS_EPS) != 0;
+        ok = pulsar_gpu_rms_norm_weight_mx_tensor(gpu_graph_spec_dump_active() ? g->dspark_main_x : NULL,
+                                               proj_out,
+                                               tensor_map_base(dspark_model, w->main_norm),
+                                               tensor_map_size(dspark_model, w->main_norm),
+                                               w->main_norm->abs_offset,
+                                               (uint32_t)E,
+                                               PULSAR_RMS_EPS,
+                                               mx_q, mx_sf, mx_kbp,
+        NULL,
+        w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
+    }
+    if (ok) {
+        pulsar_gpu_mxfp8_act_cache_arm(g->dspark_main_x, 1, E);
+        pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     }
 
     return ok;
 }
 
-void gpu_graph_dspark_seed_draft_kv(
+bool gpu_graph_dspark_seed_draft_kv(
         pulsar_gpu_graph          *g,
         const pulsar_model         *dspark_model,
         const pulsar_dspark_weights *w,
@@ -1700,22 +176,45 @@ void gpu_graph_dspark_seed_draft_kv(
     pulsar_gpu_tensor *kv_out = g->dspark_seed_kv;
     pulsar_gpu_tensor *kv_norm = g->dspark_seed_norm;
     pulsar_gpu_tensor *kv_rot = g->dspark_seed_rot;
-    if (!kv_out || !kv_norm || !kv_rot) return;
-    for (int li = 0; li < 3; li++) {
-        if (!pulsar_gpu_matmul_mxfp8_tensor(kv_out,
-                                          dspark_model->map,
-                                          dspark_model->size,
-                                          w->layer[li].attn_kv->abs_offset,
-                                          PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-                                          g->dspark_main_x, 1)) {
-            continue;
+    if (!kv_out || !kv_norm || !kv_rot) {
+        fprintf(stderr, "pulsar: drafter KV seed: seed scratch not allocated -- refusing\n");
+        return false;
+    }
+    /* One DECODE row per layer GEMV (kv projection of main_x). */
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
+
+    /* ⚠ THE THREE LAYERS MUST ADVANCE IN LOCKSTEP, so a partial failure rolls the
+     * whole seed back and the call REFUSES.  This loop used to `continue` past a
+     * failed layer without advancing dspark_n_raw[li], leaving that layer's ring
+     * counter behind its siblings' PERMANENTLY: every later draft then RoPEs at
+     * a different sequence position per layer.  The verifier still rejects the
+     * bad drafts, so output stays exact -- which is precisely why it was
+     * invisible.  What degrades is ACCEPTANCE, silently, for the rest of the
+     * session.  Until L167 the rollback was followed by a once-only WARNING and
+     * the step drafted unseeded -- the same silent acceptance dip, one step
+     * wide; now the caller's spec round refuses instead.
+     *
+     * Rolling the counters back is enough to stay consistent: rows already
+     * written sit at ring slots the counters no longer reach, so nothing reads
+     * them and the next successful seed overwrites the same slots. */
+    const uint32_t n_raw_entry[3] = {
+        g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2]
+    };
+    bool seeded = true;
+    for (int li = 0; li < 3 && seeded; li++) {
+        if (!pulsar_linear_slot(kv_out, dspark_model, w->layer[li].attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->dspark_main_x, 1)) {
+            seeded = false;
+            break;
         }
         if (!pulsar_gpu_rms_norm_weight_tensor(kv_norm, kv_out,
-                                             dspark_model->map,
-                                             dspark_model->size,
+                                             tensor_map_base(dspark_model, w->layer[li].attn_kv_a_norm),
+                                             tensor_map_size(dspark_model, w->layer[li].attn_kv_a_norm),
                                              w->layer[li].attn_kv_a_norm->abs_offset,
-                                             PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS)) {
-            continue;
+                                             PULSAR_N_HEAD_DIM, PULSAR_RMS_EPS,
+        w->layer[li].attn_kv_a_norm->type == PULSAR_TENSOR_BF16)) {
+            seeded = false;
+            break;
         }
         /* Seed one KV row per committed position.  Each row is RoPE'd at its OWN
          * sequence position (dspark_n_raw[li]) and fp8-rounded, matching the
@@ -1726,20 +225,187 @@ void gpu_graph_dspark_seed_draft_kv(
         for (uint32_t i = 0; i < n_rows; i++) {
             const uint32_t pos = g->dspark_n_raw[li];
             const uint32_t row = pos % PULSAR_DSPARK_DRAFT_WINDOW;
-            pulsar_gpu_tensor_copy(kv_rot, 0, kv_norm, 0, kv_bytes);
-            pulsar_gpu_rope_tail_tensor(kv_rot, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+            /* Both copies were unchecked: a failed stage used to leave the row
+             * unwritten while the counter still advanced past it, i.e. the ring
+             * would be read as if it held a seeded position.  Async: kv_rot is
+             * consumed only by the rope/pack kernels that follow on this same
+             * (per-thread) stream, so the host wait bought nothing. */
+            if (!pulsar_gpu_tensor_copy_async(kv_rot, 0, kv_norm, 0, kv_bytes)) {
+                seeded = false;
+                break;
+            }
+            if (!pulsar_gpu_rope_tail_tensor(kv_rot, 1, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
                                      pos, 0, false,
                                      (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL);
-            pulsar_gpu_dsv4_fp8_kv_quantize_tensor(kv_rot, 1, PULSAR_N_HEAD_DIM, PULSAR_N_ROT);
-            pulsar_gpu_tensor_copy(g->dspark_raw_cache[li],
-                                (uint64_t)row * kv_bytes,
-                                kv_rot, 0, kv_bytes);
+                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL)) {
+                seeded = false;
+                break;
+            }
+            /* No fake-quantise before the store.  The TARGET path this seed has
+             * to agree with (the draft batch's pulsar_gpu_store_raw_kv_batch_tensor
+             * -> winkv_pack_kernel) quantises the true f32 exactly ONCE into the
+             * ring.  Round-tripping here first made the seed quantise twice,
+             * which is the ~5%-misround pattern norm_kv warns about and would
+             * let a seeded row differ from the target's row for the same token
+             * -- the one thing this seed exists to make identical. */
+            /* Store through the ring's own writer, not a byte copy.  This was
+             * pulsar_gpu_tensor_copy at row*kv_bytes -- an f32 row at a 2048 B
+             * stride -- which stopped being the ring's layout when it became
+             * a packed row (584 B) in 157cd1d.  It then failed its bounds
+             * check, the seed aborted, and acceptance collapsed far enough that
+             * the yield-quench dropped the request to plain decode.  A writer
+             * that bypasses the store API is a writer the next format change
+             * will miss, which is exactly what happened. */
+            if (!pulsar_gpu_store_raw_kv_tensor(g->dspark_raw_cache[li], kv_rot,
+                                                PULSAR_DSPARK_DRAFT_WINDOW, row,
+                                                PULSAR_N_HEAD_DIM)) {
+                seeded = false;
+                break;
+            }
             g->dspark_n_raw[li]++;
         }
     }
+    /* L158: last consumer of main_x's E4M3 encoding (armed by the projection). */
+    pulsar_gpu_mxfp8_act_cache_disarm();
+    if (!seeded) {
+        g->dspark_n_raw[0] = n_raw_entry[0];
+        g->dspark_n_raw[1] = n_raw_entry[1];
+        g->dspark_n_raw[2] = n_raw_entry[2];
+        fprintf(stderr,
+                "pulsar: drafter KV seed failed (%u row(s)); the three layers are rolled "
+                "back to %u/%u/%u -- refusing the spec round rather than drafting unseeded\n",
+                n_rows, n_raw_entry[0], n_raw_entry[1], n_raw_entry[2]);
+        return false;
+    }
+    return true;
 }
 
+/* L260: the batched lane's drafter seed.  The per-bank round end used to seed
+ * each committed row with its own one-row GEMVs (main_proj, ~50 MB, and three
+ * attn_kv) -- 16 to 32 reads of the same weights per step at c16.  Here every
+ * bank's rows share each weight read.  Chunks stay inside the exact decode
+ * range, where the MXFP8 GEMV gives every row the one-row kernel's bytes; the
+ * norms (one block per row), the rope (per-row positions) and the ring packer
+ * are the one-row path's kernels, so the rings hold exactly what the per-row
+ * seed wrote. */
+bool gpu_graph_dspark_seed_rows_banked(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        const uint32_t            *src_rows,
+        const uint32_t            *row_bank,
+        uint32_t                 n_rows) {
+    PULSAR_NVTX("drafter seed (banked)");
+    if (n_rows == 0) return true;
+    const int64_t E = PULSAR_N_EMBD;
+    const uint64_t concat_dim = 3u * (uint64_t)E;
+    if (!src_rows || !row_bank || g->banks.n_banks == 0 || !g->dspark_row_meta ||
+        !g->dspark_concat || !g->dspark_proj_out || !g->dspark_main_x || !g->dspark_seed_kv ||
+        !g->dspark_seed_norm || !g->banks.dspark_raw[0] || !g->banks.dspark_raw[1] ||
+        !g->banks.dspark_raw[2]) {
+        fprintf(stderr, "pulsar: batched drafter seed: no banked rings or seed scratch -- refusing\n");
+        return false;
+    }
+    for (int i = 0; i < 3; i++) if (!g->dspark_target_h_batch[i]) return false;
+    const int exact = pulsar_gpu_matmul_decode_exact_rows();
+    const uint32_t chunk_max = exact < (int)PULSAR_DSPARK_SEED_ROWS ? (uint32_t)exact : PULSAR_DSPARK_SEED_ROWS;
+    if (chunk_max == 0) return false;
+    uint32_t added[PULSAR_MSEQ_MAX] = {0};   /* rows seeded per bank so far: its next ring position */
+    bool ok = true;
+    for (uint32_t c0 = 0; ok && c0 < n_rows; ) {
+        const uint32_t m = (n_rows - c0) < chunk_max ? (n_rows - c0) : chunk_max;
+        pulsar_decode_rows_scope rows(m);
+        if (!rows.ok()) return false;
+        /* positions: row t of bank b lands at ms_dspark_n_raw[b][li] + (rows of b before it) */
+        int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX] = {0};
+        uint32_t chunk_added[PULSAR_MSEQ_MAX] = {0};
+        for (uint32_t t = 0; t < m; t++) {
+            const uint32_t b = row_bank[c0 + t];
+            if (b >= g->banks.n_banks) return false;
+            const uint32_t k = added[b] + chunk_added[b]++;
+            for (uint32_t li = 0; li < 3; li++)
+                meta[(li * 2 + 0) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)(g->ms_dspark_n_raw[b][li] + k);
+            meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
+        }
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
+        pulsar_gpu_tensor *meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb, (uint64_t)m * sizeof(int32_t));
+        /* main_x rows: concat -> main_proj -> main_norm (E4M3 into main_x's slot) */
+        void *cq = NULL, *csf = NULL; int ckbp = 0;
+        pulsar_gpu_mxfp8_act_cache_arm(g->dspark_concat, m, concat_dim);
+        ok = meta_seq && pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_concat, m, concat_dim, &cq, &csf, &ckbp);
+        if (ok) ok = pulsar_gpu_dspark_concat3_e4m3_rows(cq, csf, ckbp, g->dspark_target_h_batch[0],
+                                                         g->dspark_target_h_batch[1], g->dspark_target_h_batch[2],
+                                                         src_rows + c0, m, (uint32_t)E) != 0;
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+            pulsar_gpu_mxfp8_act_cache_note_f32_skipped(m);
+            ok = pulsar_linear_slot(g->dspark_proj_out, dspark_model, w->main_proj, concat_dim, 0, E, g->dspark_concat, m);
+        }
+        pulsar_gpu_mxfp8_act_cache_disarm();
+        void *mx_q = NULL, *mx_sf = NULL; int mx_kbp = 0;
+        if (ok) ok = pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->dspark_main_x, m, E, &mx_q, &mx_sf, &mx_kbp);
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_mx_tensor(NULL, g->dspark_proj_out,
+                                                             tensor_map_base(dspark_model, w->main_norm),
+                                                             tensor_map_size(dspark_model, w->main_norm),
+                                                             w->main_norm->abs_offset, (uint32_t)E, m,
+                                                             PULSAR_RMS_EPS, mx_q, mx_sf, mx_kbp, NULL,
+                                                             w->main_norm->type == PULSAR_TENSOR_BF16) != 0;
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_arm(g->dspark_main_x, m, E);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        }
+        /* each layer: kv projection, its norm, rope at each row's position, banked ring store */
+        for (int li = 0; ok && li < 3; li++) {
+            pulsar_gpu_tensor *rope_pos = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2) * rb,
+                                                                 (uint64_t)m * sizeof(int32_t));
+            ok = rope_pos && pulsar_linear_slot(g->dspark_seed_kv, dspark_model, w->layer[li].attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->dspark_main_x, m);
+            if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(g->dspark_seed_norm, g->dspark_seed_kv,
+                                             tensor_map_base(dspark_model, w->layer[li].attn_kv_a_norm),
+                                             tensor_map_size(dspark_model, w->layer[li].attn_kv_a_norm),
+                                             w->layer[li].attn_kv_a_norm->abs_offset,
+                                             PULSAR_N_HEAD_DIM, m, PULSAR_RMS_EPS, NULL,
+                                             w->layer[li].attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+            if (ok) ok = pulsar_gpu_rope_tail_tensor(g->dspark_seed_norm, m, PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM,
+                                                     PULSAR_N_ROT, 0, 0, false,
+                                                     (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                                                     PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                                                     rope_pos) != 0;
+            if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(g->banks.dspark_raw[li], g->dspark_seed_norm,
+                                                              PULSAR_DSPARK_DRAFT_WINDOW, 0u, m, PULSAR_N_HEAD_DIM,
+                                                              rope_pos, meta_seq, g->banks.n_banks) != 0;
+            pulsar_gpu_tensor_free(rope_pos);
+        }
+        pulsar_gpu_mxfp8_act_cache_disarm();
+        pulsar_gpu_tensor_free(meta_seq);
+        for (uint32_t b = 0; b < g->banks.n_banks && b < PULSAR_MSEQ_MAX; b++) added[b] += chunk_added[b];
+        c0 += m;
+    }
+    if (!ok) {
+        fprintf(stderr, "pulsar: batched drafter seed failed (%u rows); no ring counter advanced -- "
+                        "refusing those banks' spec rounds rather than drafting unseeded\n", n_rows);
+        return false;
+    }
+    /* every chunk landed: advance each bank's counters (and the installed bank's live copy) */
+    for (uint32_t b = 0; b < g->banks.n_banks && b < PULSAR_MSEQ_MAX; b++) {
+        if (!added[b]) continue;
+        for (int li = 0; li < 3; li++) g->ms_dspark_n_raw[b][li] += added[b];
+        if (b == g->banks.cur_bank)
+            for (int li = 0; li < 3; li++) g->dspark_n_raw[li] = g->ms_dspark_n_raw[b][li];
+    }
+    return true;
+}
+
+/// The single-bank drafter forward (gpu_graph_dspark_draft_forward_banks at one bank).
+/// @param g the graph
+/// @param base_model the target model
+/// @param base_weights its weights
+/// @param dspark_model the drafter's model
+/// @param w its weights
+/// @param base_logits_out receives the base logits rows
+/// @param draft_ids the block's input ids
+/// @param n_draft rows
+/// @return false = failed
 bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_graph          *g,
         const pulsar_model         *base_model,
@@ -1749,32 +415,144 @@ bool gpu_graph_dspark_draft_forward(
         pulsar_gpu_tensor         *base_logits_out,
         const int32_t            draft_ids[],
         uint32_t                n_draft) {
+    /* L150: the single-bank forward is the banked one at n_banks == 1 -- the
+     * scalar-position code path, byte-identical to before. */
+    return gpu_graph_dspark_draft_forward_banks(g, base_model, base_weights, dspark_model, w,
+                                                base_logits_out, draft_ids, n_draft,
+                                                1u, NULL, NULL, NULL);
+}
+
+/* L150: the drafter forward over the rows of several banks at once. Row t
+ * belongs to bank row_bank[t] (ids in [0, g->banks.n_banks)); rows of one bank
+ * are contiguous and in draft order; bank b has bank_n_draft[b] rows and its
+ * three drafter rings hold bank_n_raw[b][li] positions. n_banks == 1 with the
+ * three arrays NULL is the classic single-bank forward on the CURRENT bank's
+ * repointed ring views (scalar positions, unchanged). With n_banks > 1 the
+ * per-row position arrays go up in ONE write and the attention/store calls
+ * take the banked arm over the bank-major slabs: rope and KV-store positions
+ * are each row's true position (n_raw_b + k); the attention VISIBILITY
+ * position is the bank's last draft position (n_raw_b + n_draft_b - 1) for
+ * every row of that bank, which reproduces today's non-causal window
+ * [0, n_raw_b + n_draft_b) and ring start exactly (rows/L150.md). */
+bool gpu_graph_dspark_draft_forward_banks(
+        pulsar_gpu_graph          *g,
+        const pulsar_model         *base_model,
+        const pulsar_weights       *base_weights,
+        const pulsar_model         *dspark_model,
+        const pulsar_dspark_weights *w,
+        pulsar_gpu_tensor         *base_logits_out,
+        const int32_t            draft_ids[],
+        uint32_t                n_draft,
+        uint32_t                n_banks,
+        const uint32_t          *row_bank,
+        const uint32_t         (*bank_n_raw)[3],
+        const uint32_t          *bank_n_draft) {
+    PULSAR_NVTX("drafter forward");
+    const bool banked = row_bank != NULL;
+    if (banked && (n_banks == 0 || !bank_n_raw || !bank_n_draft || !g->dspark_row_meta ||
+                   g->banks.n_banks == 0 || n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX ||
+                   !g->banks.dspark_raw[0] || !g->banks.dspark_raw[1] || !g->banks.dspark_raw[2]))
+        return false;
+    /* per-row device arrays: rope/store position per layer, visibility per
+     * layer, bank id -- one upload for the whole forward */
+    pulsar_gpu_tensor *meta_rope[3] = {NULL, NULL, NULL};
+    pulsar_gpu_tensor *meta_vis[3] = {NULL, NULL, NULL};
+    pulsar_gpu_tensor *meta_seq = NULL;
+    if (banked) {
+        int32_t meta[7 * PULSAR_DSPARK_DRAFT_ROWS_MAX];
+        uint32_t k = 0, prev_bank = UINT32_MAX;
+        for (uint32_t t = 0; t < n_draft; t++) {
+            const uint32_t b = row_bank[t];
+            if (b >= g->banks.n_banks) return false;
+            k = (b == prev_bank) ? k + 1u : 0u;
+            prev_bank = b;
+            for (uint32_t li = 0; li < 3; li++) {
+                meta[(li * 2 + 0) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)(bank_n_raw[b][li] + k);
+                meta[(li * 2 + 1) * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] =
+                    (int32_t)(bank_n_raw[b][li] + bank_n_draft[b] - 1u);
+            }
+            meta[6 * PULSAR_DSPARK_DRAFT_ROWS_MAX + t] = (int32_t)b;
+        }
+        if (!pulsar_gpu_tensor_write(g->dspark_row_meta, 0, meta, sizeof(meta))) return false;
+        const uint64_t rb = (uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t);
+        bool vok = true;
+        for (uint32_t li = 0; li < 3; li++) {
+            meta_rope[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 0) * rb,
+                                                   (uint64_t)n_draft * sizeof(int32_t));
+            meta_vis[li] = pulsar_gpu_tensor_view(g->dspark_row_meta, (uint64_t)(li * 2 + 1) * rb,
+                                                  (uint64_t)n_draft * sizeof(int32_t));
+            vok = vok && meta_rope[li] && meta_vis[li];
+        }
+        meta_seq = pulsar_gpu_tensor_view(g->dspark_row_meta, 6u * rb,
+                                          (uint64_t)n_draft * sizeof(int32_t));
+        if (!vok || !meta_seq) {
+            for (uint32_t li = 0; li < 3; li++) {
+                pulsar_gpu_tensor_free(meta_rope[li]);
+                pulsar_gpu_tensor_free(meta_vis[li]);
+            }
+            pulsar_gpu_tensor_free(meta_seq);
+            return false;
+        }
+    }
+    struct MetaGuard {
+        pulsar_gpu_tensor **r, **v, *s;
+        ~MetaGuard() {
+            for (int i = 0; i < 3; i++) { pulsar_gpu_tensor_free(r[i]); pulsar_gpu_tensor_free(v[i]); }
+            pulsar_gpu_tensor_free(s);
+        }
+    } meta_guard = { meta_rope, meta_vis, meta_seq };
+    /* Every row of a drafter forward -- banked or the single-bank one -- is a
+     * DECODE row: declare the count so every dense GEMM, the attn-out GEMV,
+     * the heads and the MoE under it take the M-independent arms whatever the
+     * batch width (until L167 the single-bank forward declared nothing and
+     * its 5..16-row GEMMs took cuBLASLt by row count).  The setter refuses a
+     * forward wider than the cap; the caller groups banks to fit it. */
+    pulsar_decode_rows_scope rows(n_draft, PULSAR_DSPARK_DRAFT_ROWS_MAX);
+    if (!rows.ok()) return false;
+    /* L106 K2a: the drafter hand-rolls its attention half and never passes
+     * through the batch encode whose first act is the gact disarm -- so a
+     * gact entry armed and noted by a prior prefill chunk or spec verify of
+     * EQUAL WIDTH would satisfy the cache probe when a deeper draft
+     * (n_draft >= 5) takes the tensor-core "a" arm, handing the drafter the
+     * MAIN model's activation encoding: corrupted draft logits, acceptance
+     * collapse (output stays correct -- spec verify is protected).  Unreachable
+     * at today's n_draft <= 4; a PREREQUISITE for L092 deeper drafts.  Disarm
+     * here, unconditionally, exactly as the batch encode does per layer. */
+    pulsar_gpu_mxfp8_gact_disarm();
     if (!g || !base_model || !base_weights || !dspark_model || !w ||
-        !base_logits_out || n_draft == 0 || n_draft > 16 ||
+        !base_logits_out || n_draft == 0 || n_draft > PULSAR_DSPARK_DRAFT_ROWS_MAX ||
         n_draft > g->prefill_cap)
         return false;
 
     if (!base_weights->token_embd || !base_weights->output)
         return false;
 
-    /* Embed N draft tokens via main model's F16 token_embd → HC-expand */
-    pulsar_gpu_tensor *tokens_t = pulsar_gpu_tensor_alloc((uint64_t)n_draft * sizeof(int32_t));
+    /* Embed N draft tokens via main model's F16 token_embd → HC-expand.
+     * L104 fix B: persistent graph-owned upload tensor (n_draft <= 16) -- this
+     * was a cudaMalloc + blocking write + cudaFree per drafter forward. */
+    pulsar_gpu_tensor *tokens_t = g->dspark_embed_tokens;
     if (!tokens_t) return false;
-    if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t))) {
-        pulsar_gpu_tensor_free(tokens_t);
-        return false;
+    /* L335: the embed kernel does not clamp (an id past the vocabulary is an image slot's sentinel there): a draft id
+     * outside the vocabulary refuses here, by name. */
+    for (uint32_t i = 0; i < n_draft; i++) {
+        if (draft_ids[i] < 0 || draft_ids[i] >= (int32_t)PULSAR_N_VOCAB) {
+            fprintf(stderr, "pulsar: dspark draft token %d at row %u is not a vocab id -- refusing\n", draft_ids[i], i);
+            return false;
+        }
     }
+    if (!pulsar_gpu_tensor_write(tokens_t, 0, draft_ids, (uint64_t)n_draft * sizeof(int32_t)))
+        return false;
     bool ok = pulsar_gpu_embed_tokens_hc_tensor(g->batch_cur_hc,
                                               tokens_t,
-                                              base_model->map,
-                                              base_model->size,
+                                              tensor_map_base(base_model, base_weights->token_embd),
+                                              tensor_map_size(base_model, base_weights->token_embd),
                                               base_weights->token_embd->abs_offset,
                                               PULSAR_N_VOCAB,
                                               n_draft,
                                               PULSAR_N_EMBD,
                                               PULSAR_N_HC) != 0;
-    pulsar_gpu_tensor_free(tokens_t);
-    if (!ok) return false;
+    /* forward_spec: the drafter's stream starts from the identity pre-mix too */
+    if (ok) ok = pulsar_gpu_hc_pre_identity_tensor(g->batch_hc_pre, n_draft, PULSAR_N_HC) != 0;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
     const uint64_t mix_hc = 2ull * PULSAR_N_HC + (uint64_t)PULSAR_N_HC * PULSAR_N_HC;
@@ -1782,9 +560,21 @@ bool gpu_graph_dspark_draft_forward(
     const uint32_t group_heads = PULSAR_N_HEAD / n_groups;
     const uint32_t group_dim = PULSAR_N_HEAD_DIM * group_heads;
     const uint32_t rank = PULSAR_N_LORA_O;
-
-    const int prev_comp = g->comp_ratio_override;
-    g->comp_ratio_override = 0;
+    /* 4g-1b: the drafter's attention runs on the OWNED output groups, exactly
+     * like a target layer's (gpu_graph_encode_layer_attention_batch): q_b rows,
+     * per-head norm/rope, attention and the inverse rope over the owned heads,
+     * stage 'a' over the owned groups, stage 'b' row-parallel on its K-half with
+     * the partials summed across the pair.  One box owns every group, and every
+     * call below reduces to the whole-tensor call it replaced. */
+    const uint32_t g_lo = g->tp_group_lo, g_hi = g->tp_group_hi;
+    if (g_hi <= g_lo || g_hi > n_groups) {
+        fprintf(stderr, "pulsar: drafter: this graph owns output groups [%u,%u) of %u -- refusing\n",
+                g_lo, g_hi, n_groups);
+        return false;
+    }
+    const uint32_t own_groups = g_hi - g_lo;
+    const uint32_t own_heads = own_groups * group_heads;
+    const uint32_t h_lo = g_lo * group_heads;
 
     for (uint32_t li = 0; li < 3 && ok; li++) {
         const pulsar_layer_weights *layer = &w->layer[li];
@@ -1802,88 +592,155 @@ bool gpu_graph_dspark_draft_forward(
             g->batch_hc_mix, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
         pulsar_gpu_tensor *hc_split_view = pulsar_gpu_tensor_view(
             g->batch_hc_split, 0, (uint64_t)n_draft * mix_hc * sizeof(float));
-        pulsar_gpu_tensor *attn_cur_view = pulsar_gpu_tensor_view(
+        pulsar_gpu_tensor *ffn_cur_view = pulsar_gpu_tensor_view(
             g->batch_ffn_cur, 0, (uint64_t)n_draft * PULSAR_N_EMBD * sizeof(float));
-        ok = hc_mix_view && hc_split_view && attn_cur_view;
-        /* RMS norm: flat HC from batch_cur_hc */
+        ok = hc_mix_view && hc_split_view && ffn_cur_view;
+        /* RMS norm: flat HC from batch_cur_hc.
+         *
+         * The consumer below (hc_attn_fn, a BF16-weight GEMM through the shared
+         * bf16 core) takes the producer-emitted BF16 copy when the slot for
+         * (batch_flat_hc, n_draft, hc_dim) is noted valid -- the same slot the
+         * drafter's output head notes at the SAME key one pass earlier. So this
+         * producer must acquire the slot (which resets that note) and emit its
+         * own copy, exactly as the batch layer encoder does; a producer that
+         * skips the slot would leave the head's stale note standing and the
+         * GEMM would read last pass's rows. (As cherry-picked, de459a8 also
+         * passed NULL as the OUTPUT here and the flat buffer as the bf16 slot:
+         * the wrapper refused, every drafter forward failed, and the drafter
+         * was silently dead on dev from a5208ca until this fix -- no gate in
+         * that landing batch looked at drafts. rows/L150.md.) */
+        void *flat_b = NULL;
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_draft, hc_dim, &flat_b)) {
+            fprintf(stderr, "pulsar: drafter flat_hc: no bf16 slot -- refusing (L159)\n");
+            ok = false;
+        }
         if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(
-            g->batch_flat_hc, g->batch_cur_hc,
-            (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS) != 0;
+            g->batch_flat_hc, flat_b, g->batch_cur_hc,
+            (uint32_t)hc_dim, n_draft, PULSAR_RMS_EPS, 0) != 0;
+        if (ok && flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_draft, hc_dim);
         /* HC → mix projection */
-        if (ok) ok = gpu_graph_matmul_plain_tensor(
-            hc_mix_view, dspark_model,
-            layer->hc_attn_fn,
-            hc_dim, mix_hc, g->batch_flat_hc, n_draft);
-        /* HC split + weighted sum → attn_cur (E-dim) */
-        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_tensor(
-            attn_cur_view, hc_split_view, hc_mix_view,
-            g->batch_cur_hc,
-            dspark_model->map, dspark_model->size,
+        if (ok) ok = pulsar_linear_slot(hc_mix_view, dspark_model, layer->hc_attn_fn, hc_dim, 0, mix_hc, g->batch_flat_hc, n_draft);
+        /* HC split + weighted sum + input RMS norm -> batch_attn_norm, with the
+         * E4M3 encoding emitted at the producer (L158, 2026-09-03).  Until today
+         * this was a split-sum kernel plus a plain f32 norm, and the two GEMVs
+         * below read f32 -- the drafter's attention ran W8A32 while the target's
+         * ran W8A8 (the f32 GEMV arms were deleted in L158 and refused here).
+         * Same fused producer the target's batch layer uses (gpu_prefill.cpp);
+         * the pre-norm carrier still lands in ffn_cur_view. */
+        void *dn_q = NULL, *dn_sf = NULL; int dn_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_attn_norm, n_draft, PULSAR_N_EMBD,
+                                                        &dn_q, &dn_sf, &dn_kbp)) {
+            fprintf(stderr, "pulsar: drafter attn_norm: no E4M3 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
+            ffn_cur_view, g->batch_attn_norm, dn_q, dn_sf, dn_kbp,
+            NULL /* no bf16 consumer in the drafter */,
+            gpu_graph_f32_store_observed_any() ? 0u : n_draft /* f32 rows only for a dump */,
+            hc_split_view, g->batch_hc_pre, hc_mix_view, g->batch_cur_hc,
+            tensor_map_base(dspark_model, layer->hc_attn_scale), tensor_map_size(dspark_model, layer->hc_attn_scale),
             layer->hc_attn_scale->abs_offset,
             layer->hc_attn_base->abs_offset,
-            PULSAR_N_EMBD, PULSAR_N_HC,
-            PULSAR_N_HC_SINKHORN_ITER, PULSAR_HC_EPS) != 0;
-        /* Input RMS norm → batch_attn_norm */
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
-            g->batch_attn_norm, attn_cur_view,
-            dspark_model->map, dspark_model->size,
             layer->attn_norm->abs_offset,
-            PULSAR_N_EMBD, n_draft, PULSAR_RMS_EPS) != 0;
+            n_draft, PULSAR_N_EMBD, PULSAR_N_HC,
+            PULSAR_N_HC_SINKHORN_ITER, PULSAR_HC_EPS, PULSAR_RMS_EPS,
+            layer->attn_norm->type == PULSAR_TENSOR_BF16) != 0;
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_norm", g->batch_attn_norm,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
+        /* batch_attn_norm feeds TWO MXFP8 GEMMs (attn_q_a, attn_kv).  The fused
+         * norm emitted its E4M3 into the armed slot once; both GEMMs read it. */
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_attn_norm, n_draft,
+                                               PULSAR_N_EMBD);
+        if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();   /* L158: the fused norm emitted it */
         /* --- Q projection --- */
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
-            g->batch_qr, dspark_model->map, dspark_model->size,
-            layer->attn_q_a->abs_offset,
-            PULSAR_N_EMBD, q_rank, g->batch_attn_norm, n_draft) != 0;
-        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
-            g->batch_qr_norm, g->batch_qr,
-            dspark_model->map, dspark_model->size,
+        if (ok) ok = pulsar_linear_slot(g->batch_qr, dspark_model, layer->attn_q_a, PULSAR_N_EMBD, 0, q_rank, g->batch_attn_norm, n_draft);
+        /* L158: q_a_norm emits E4M3 for the q_b GEMV (was f32 -> W8A32). */
+        void *dq_q = NULL, *dq_sf = NULL; int dq_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->batch_qr_norm, n_draft, q_rank,
+                                                        &dq_q, &dq_sf, &dq_kbp)) {
+            fprintf(stderr, "pulsar: drafter q_a_norm: no E4M3 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_weight_rows_mx_tensor(
+            NULL /* no f32 reader: attn_q_b reads the E4M3 slot keyed on batch_qr_norm */, g->batch_qr,
+            tensor_map_base(dspark_model, layer->attn_q_a_norm), tensor_map_size(dspark_model, layer->attn_q_a_norm),
             layer->attn_q_a_norm->abs_offset,
-            q_rank, n_draft, PULSAR_RMS_EPS) != 0;
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
-            g->batch_q, dspark_model->map, dspark_model->size,
-            layer->attn_q_b->abs_offset,
-            q_rank, PULSAR_N_HEAD * PULSAR_N_HEAD_DIM,
-            g->batch_qr_norm, n_draft) != 0;
-        /* Q head-norm + RoPE */
-        if (ok) ok = pulsar_gpu_head_rms_norm_rope_tail_tensor(
-            g->batch_q, n_draft,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
-            pos0, 0, false,
-            (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, PULSAR_RMS_EPS,
-            NULL) != 0;
+            q_rank, n_draft, PULSAR_RMS_EPS,
+            dq_q, dq_sf, dq_kbp,
+            NULL,
+            layer->attn_q_a_norm->type == PULSAR_TENSOR_BF16) != 0;
+        if (ok) pulsar_gpu_mxfp8_act_cache_arm(g->batch_qr_norm, n_draft, q_rank);
+        if (ok) pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        if (ok) ok = pulsar_linear_slot(g->batch_q, dspark_model, layer->attn_q_b, q_rank, (uint64_t)h_lo * PULSAR_N_HEAD_DIM, (uint64_t)(h_lo + own_heads) * PULSAR_N_HEAD_DIM, g->batch_qr_norm, n_draft);
+        /* Q norm + tail RoPE: the PROFILE picks the kernel, exactly as the
+         * target's prefill does (gpu_prefill.cpp's `PULSAR_Q_HEAD_NORM ?`).
+         * 0731 normalises Q per head here; V4.1 has no per-head pass (its
+         * q_norm sits on the latent above).  Running V4.1's arithmetic on a 0731
+         * drafter left `dsp_attn_norm` byte-exact while `dsp_heads` was not --
+         * the drafter's first bad step (L218 s117). */
+        if (ok) {
+            const pulsar_gpu_tensor *q_pos = banked ? meta_rope[li] : NULL;
+            ok = (PULSAR_Q_HEAD_NORM
+                ? pulsar_gpu_head_rms_norm_rope_tail_tensor(
+                    g->batch_q, n_draft,
+                    own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    pos0, 0, false,
+                    (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                    PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                    PULSAR_RMS_EPS, q_pos)
+                : pulsar_gpu_rope_tail_tensor(
+                    g->batch_q, n_draft,
+                    own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+                    pos0, 0, false,
+                    (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
+                    PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+                    q_pos)) != 0;
+        }
 
         /* --- KV projection --- */
-        if (ok) ok = pulsar_gpu_matmul_mxfp8_tensor(
-            g->batch_kv_raw, dspark_model->map, dspark_model->size,
-            layer->attn_kv->abs_offset,
-            PULSAR_N_EMBD, PULSAR_N_HEAD_DIM,
-            g->batch_attn_norm, n_draft) != 0;
+        if (ok) ok = pulsar_linear_slot(g->batch_kv_raw, dspark_model, layer->attn_kv, PULSAR_N_EMBD, 0, PULSAR_N_HEAD_DIM, g->batch_attn_norm, n_draft);
+        /* K2b: last consumer of the armed attn_norm ran; disarm so a later
+         * width-matched buffer reuse cannot hit this entry (same rule as the
+         * head entries' redundant second lock). */
+        pulsar_gpu_mxfp8_act_cache_disarm();
         if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(
             g->batch_kv, g->batch_kv_raw,
-            dspark_model->map, dspark_model->size,
+            tensor_map_base(dspark_model, layer->attn_kv_a_norm), tensor_map_size(dspark_model, layer->attn_kv_a_norm),
             layer->attn_kv_a_norm->abs_offset,
-            PULSAR_N_HEAD_DIM, n_draft, PULSAR_RMS_EPS) != 0;
+            PULSAR_N_HEAD_DIM, n_draft, PULSAR_RMS_EPS,
+        NULL,
+        layer->attn_kv_a_norm->type == PULSAR_TENSOR_BF16) != 0;
         if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_kv, n_draft,
             PULSAR_N_HEAD_KV, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, false,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL) != 0;
-        if (ok) ok = pulsar_gpu_dsv4_fp8_kv_quantize_tensor(
-            g->batch_kv, n_draft, PULSAR_N_HEAD_DIM, PULSAR_N_ROT) != 0;
+            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+            banked ? meta_rope[li] : NULL) != 0;
+        /* No fake-quantise pass here.  batch_kv has no reader after the store
+         * below, and that store packs the rows itself -- so round-tripping first
+         * only fed already-quantized values to a fresh quantizer, which is the
+         * ~5%-misround pattern norm_kv warns about.  Packing the true f32 once
+         * is both cheaper and closer to what the target path does for the same
+         * token, which is what verification compares against. */
 
         /* --- Store draft KV transiently in ring buffer for attention --- */
         const uint32_t saved_n_raw = g->dspark_n_raw[li];
         const uint32_t kv_store_pos = saved_n_raw % raw_cap;
-        if (ok) ok = pulsar_gpu_store_raw_kv_batch_tensor(
-            g->dspark_raw_cache[li], g->batch_kv,
-            raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
-            0 /* drafter ring is always f32 */,
-            NULL, NULL, 1) != 0;
+        if (ok) {
+            if (banked)
+                /* row t -> bank row_bank[t]'s ring at slot rope_pos[t] % raw_cap */
+                ok = pulsar_gpu_store_raw_kv_batch_tensor(
+                    g->banks.dspark_raw[li], g->batch_kv,
+                    raw_cap, 0u, n_draft, PULSAR_N_HEAD_DIM,
+                    meta_rope[li], meta_seq, g->banks.n_banks) != 0;
+            else
+                ok = pulsar_gpu_store_raw_kv_batch_tensor(
+                    g->dspark_raw_cache[li], g->batch_kv,
+                    raw_cap, kv_store_pos, n_draft, PULSAR_N_HEAD_DIM,
+                    NULL, NULL, 1) != 0;
+        }
         const uint32_t vis_raw = saved_n_raw + n_draft;
         const uint32_t cap_raw = vis_raw < raw_cap ? vis_raw : raw_cap;
         const uint32_t raw_start = vis_raw > raw_cap
@@ -1891,22 +748,42 @@ bool gpu_graph_dspark_draft_forward(
 
         /* --- Non-causal raw batch attention ---
          * Queries are at positions [saved_n_raw, saved_n_raw+n_draft).
-         * Visible raw entries span [0, vis_raw) — all cached + current draft rows. */
-        if (ok) ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
-            g->batch_heads,
-            dspark_model->map, dspark_model->size,
-            layer->attn_sinks->abs_offset,
-            g->batch_q, g->dspark_raw_cache[li],
-            n_draft, saved_n_raw,
-            cap_raw, raw_cap, raw_start,
-            0,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM,
-            1,
-            0 /* drafter ring is always f32 */,
-            NULL, NULL, 0, 1) != 0;
+         * Visible raw entries span [0, vis_raw) — all cached + current draft rows.
+         * Banked: per row, the kernel derives the window from the VISIBILITY
+         * position (the bank's last draft position) with window = raw_cap, which
+         * yields exactly cap_raw / raw_start / first_raw_pos of the scalar path
+         * for that bank; scalar n_raw/raw_start are ignored there. */
+        if (ok) {
+            if (banked)
+                ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+                    g->batch_heads,
+                    tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
+                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
+                    g->batch_q, g->banks.dspark_raw[li],
+                    n_draft, 0u,
+                    0u, raw_cap, 0u,
+                    raw_cap,
+                    own_heads, PULSAR_N_HEAD_DIM,
+                    1,
+                    meta_vis[li], meta_seq, 0, g->banks.n_banks,
+                    NULL /* q pre-normed */, NULL, NULL /* a draft carries no image span */) != 0;
+            else
+                ok = pulsar_gpu_attention_decode_raw_batch_heads_tensor(
+                    g->batch_heads,
+                    tensor_map_base(dspark_model, layer->attn_sinks), tensor_map_size(dspark_model, layer->attn_sinks),
+                    layer->attn_sinks->abs_offset + (uint64_t)h_lo * sizeof(float),
+                    g->batch_q, g->dspark_raw_cache[li],
+                    n_draft, saved_n_raw,
+                    cap_raw, raw_cap, raw_start,
+                    0,
+                    own_heads, PULSAR_N_HEAD_DIM,
+                    1,
+                    NULL, NULL, 0, 1,
+                    NULL /* q pre-normed */, NULL, NULL /* a draft carries no image span */) != 0;
+        }
 
         if (ok) gpu_graph_debug_dump_tensor("dsp_heads", g->batch_heads,
-                                             (uint64_t)n_draft * PULSAR_N_HEAD * PULSAR_N_HEAD_DIM, li, pos0);
+                                             (uint64_t)n_draft * own_heads * PULSAR_N_HEAD_DIM, li, pos0);
         /* Inverse-rotate the attention output's rope dims before the o
          * projection (reference: apply_rotary_emb(o, freqs_cis, inverse=True);
          * the verify/prefill path does the same via its "kqv_back" rope).
@@ -1918,18 +795,46 @@ bool gpu_graph_dspark_draft_forward(
          * downstream of this line computed on corrupted features. */
         if (ok) ok = pulsar_gpu_rope_tail_tensor(
             g->batch_heads, n_draft,
-            PULSAR_N_HEAD, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
+            own_heads, PULSAR_N_HEAD_DIM, PULSAR_N_ROT,
             pos0, 0, true,
             (float)PULSAR_ROPE_FREQ_BASE, 1.0f, 0.0f, 1.0f,
-            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW, NULL) != 0;
+            PULSAR_ROPE_YARN_BETA_FAST, PULSAR_ROPE_YARN_BETA_SLOW,
+            banked ? meta_rope[li] : NULL) != 0;
+        /* L158 inc 4: the drafter's raw attention has no E4M3 epilogue, so the
+         * attention stage emits the grouped encoding here, after the inverse
+         * rope, and the attn-out 'a' projection reads it -- the consumer's
+         * quantise-from-heads fallback is gone. */
+        if (ok) ok = pulsar_gpu_mxfp8_gact_emit_heads(g->batch_heads, n_draft, own_groups, group_dim) != 0;
         /* --- Attention output projection (LoRA grouped) --- */
-        if (ok) ok = pulsar_gpu_attention_output_batch_tensor(
-            g->batch_attn_out, g->batch_attn_low,
-            dspark_model->map, dspark_model->size,
-            layer->attn_output_a->abs_offset,
-            layer->attn_output_b->abs_offset,
-            group_dim, rank, n_groups, PULSAR_N_EMBD,
+        /* Stage 'a' over the owned groups (the registered row slice on a TP
+         * rank), then 'b': whole on one box; on the pair row-parallel -- this
+         * rank's `low` is its owned groups' columns of 'b''s input, so it
+         * multiplies the matching registered K-half into a partial and the pair
+         * sums the partials (4g-1b, the target layers' 4g-2 shape). */
+        if (ok) ok = pulsar_gpu_attention_output_a_tensor(
+            g->batch_attn_low,
+            tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
+            layer->attn_output_a->abs_offset + (uint64_t)g_lo * rank * group_dim,
+            group_dim, rank, own_groups,
             g->batch_heads, n_draft) != 0;
+        if (ok && own_groups != n_groups) {
+            ok = g->tp && g->tp_kslice_key &&
+                 pulsar_gpu_attention_output_b_tensor(g->batch_attn_out, g->tp_kslice_key, UINT64_MAX / 2u,
+                                                      pulsar_tp_kslice_key_offset(layer->attn_output_b),
+                                                      (uint64_t)own_groups * rank, PULSAR_N_EMBD,
+                                                      g->batch_attn_low, n_draft) != 0;
+            if (!ok) fprintf(stderr, "pulsar: drafter block %u: row-parallel stage 'b' refused (owned groups "
+                                     "[%u,%u) of %u)\n", li, g_lo, g_hi, n_groups);
+            if (ok) ok = gpu_graph_tp_allreduce_rows(g, li, n_draft, g->batch_attn_out, NULL, "drafter attention");
+        } else if (ok) {
+            ok = pulsar_gpu_attention_output_b_tensor(
+                g->batch_attn_out,
+                tensor_map_base(dspark_model, layer->attn_output_a), tensor_map_size(dspark_model, layer->attn_output_a),
+                layer->attn_output_b->abs_offset,
+                (uint64_t)n_groups * rank, PULSAR_N_EMBD,
+                g->batch_attn_low, n_draft) != 0;
+        }
+        pulsar_gpu_mxfp8_gact_disarm();
         if (ok) gpu_graph_debug_dump_tensor("dsp_attn_out", g->batch_attn_out,
                                              (uint64_t)n_draft * PULSAR_N_EMBD, li, pos0);
 
@@ -1971,10 +876,8 @@ bool gpu_graph_dspark_draft_forward(
          * free them each layer or they leak on every speculative block. */
         pulsar_gpu_tensor_free(hc_mix_view);
         pulsar_gpu_tensor_free(hc_split_view);
-        pulsar_gpu_tensor_free(attn_cur_view);
+        pulsar_gpu_tensor_free(ffn_cur_view);
     }
-
-    g->comp_ratio_override = prev_comp;
 
     /* Batch output head → N-token logits in g->spec_logits.  Use the DSpark
      * drafter's OWN hc_head + norm (dspark.2.*) with the shared vocab head, NOT
@@ -1997,54 +900,156 @@ bool gpu_graph_dspark_draft_forward(
     return ok;
 }
 
-/* Encode the final HC collapse, output norm, and vocab projection on GPU. */
+/* The fused RMSNorm + HC-mix GEMV, for the head that computes its own
+ * coefficients (0731).  Byte-identical to the rms_norm_plain -> matmul pair it
+ * replaces; it exists because that pair ran a 1-block kernel then a 24-block
+ * kernel with a 64 KB f32 scratch round trip between them.  Anything that is
+ * not a storage the fused kernel reads REFUSES rather than being read at the
+ * wrong width.  plans/96-two-profiles-one-engine.md s17. */
+/// @param model the model
+/// @param w the HC mix weight (BF16 or F32)
+/// @param hc_dim the HC row width
+/// @param out_dim the mix's output width
+/// @param src_hc the HC row
+/// @param out receives the mix
+/// @return false = refused (said) or failed
+static bool gpu_graph_norm_mix_plain(
+        const pulsar_model      *model,
+        const pulsar_tensor     *w,
+        uint64_t              hc_dim,
+        uint64_t              out_dim,
+        const pulsar_gpu_tensor *src_hc,
+        pulsar_gpu_tensor       *out) {
+    if (w->type != PULSAR_TENSOR_BF16 && w->type != PULSAR_TENSOR_F32) {
+        fprintf(stderr, "pulsar: hc mix weight type %d has no fused norm+mix kernel -- refusing\n",
+                (int)w->type);
+        return false;
+    }
+    return pulsar_gpu_hc_norm_mix_tensor(out, tensor_map_base(model, w), tensor_map_size(model, w),
+                                          w->abs_offset, hc_dim, out_dim,
+                                          src_hc, PULSAR_RMS_EPS,
+                                          w->type) != 0;
+}
+
+/* Encode the final HC collapse, output norm, and vocab projection on GPU for
+ * ONE row of the sweep-final stream: the last row of a whole/chunked prefill.
+ * The collapse weights are the pre the last FFN handed on (batch_hc_pre, the
+ * reference's `layer.hc_pre(h, pre_mix)` after the layer loop) for V4.1, and
+ * the head's own mix (output_hc_*) for 0731.  Its logits are the first decode
+ * output -- the same distribution the classic decode step produces with the
+ * one-row GEMV -- so the row is declared a DECODE row and the vocab GEMM takes
+ * the M-independent arm (as it did before L167, by row count).  The callers are
+ * the prefill lane, which declares nothing itself. */
 bool gpu_graph_encode_output_head(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
-        uint64_t               vocab_dim) {
+        uint32_t               row,
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    bool ok = gpu_graph_norm_mix_plain(g, (const pulsar_model *)model, weights->output_hc_fn,
-                                       hc_dim, PULSAR_N_HC, g->cur_hc, g->output_pre);
-    if (ok) {
-        gpu_graph_debug_dump_tensor("result_hc_pre", g->output_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+    pulsar_decode_rows_scope rows(1u);
+    if (!rows.ok()) return false;
+    pulsar_gpu_tensor *row_hc = gpu_graph_hc_row_view(g->batch_cur_hc, row, hc_dim);
+    pulsar_gpu_tensor *row_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
+                                                        (uint64_t)row * PULSAR_N_HC * sizeof(float),
+                                                        (uint64_t)PULSAR_N_HC * sizeof(float));
+    bool ok = row_hc && row_pre && out;
+    /* The collapse is SHARED; only the coefficient source differs.  0731 binds
+     * output_hc_* and computes its own; V4.1 binds none and collapses with the
+     * pre its last FFN handed on.  The bind is the fact -- a 0731 artifact
+     * missing the group is refused at load (weights_bind_output). */
+    if (weights->output_hc_fn) {
+        if (!weights->output_hc_scale || !weights->output_hc_base) {
+            fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = gpu_graph_norm_mix_plain(model, weights->output_hc_fn, hc_dim, PULSAR_N_HC,
+                                              row_hc, g->output_pre);
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(g->output_weights, g->output_pre,
+                                                        tensor_map_base(model, weights->output_hc_scale), tensor_map_size(model, weights->output_hc_scale),
+                                                        weights->output_hc_scale->abs_offset,
+                                                        weights->output_hc_base->abs_offset,
+                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+        if (ok) {
+            gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+        }
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd, row_hc, g->output_weights,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+    } else {
+        if (ok) {
+            gpu_graph_debug_dump_tensor("result_hc_weights", row_pre, PULSAR_N_HC, PULSAR_N_LAYER, 0);
+        }
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd,
+                                                      row_hc,
+                                                      row_pre,
+                                                      PULSAR_N_EMBD,
+                                                      PULSAR_N_HC) != 0;
     }
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(g->output_weights,
-                                                    g->output_pre,
-                                                    model->map,
-                                                    model->size,
-                                                    weights->output_hc_scale->abs_offset,
-                                                    weights->output_hc_base->abs_offset,
-                                                    PULSAR_N_HC,
-                                                    PULSAR_HC_EPS) != 0;
-    if (ok) {
-        gpu_graph_debug_dump_tensor("result_hc_weights", g->output_weights, PULSAR_N_HC, PULSAR_N_LAYER, 0);
-    }
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(g->output_embd,
-                                                  g->cur_hc,
-                                                  g->output_weights,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
+    pulsar_gpu_tensor_free(row_pre);
+    pulsar_gpu_tensor_free(row_hc);
     if (ok) {
         gpu_graph_debug_dump_tensor("result_hc", g->output_embd, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
-    if (ok) ok = pulsar_gpu_rms_norm_weight_tensor(g->output_norm,
-                                                  g->output_embd,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->output_norm->abs_offset,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_RMS_EPS) != 0;
+    /* L158: an MXFP8 head (the drafter's) reads its activation from the E4M3
+     * slot, so the output norm emits it; a bf16 head (the target's) takes the
+     * bf16 core, which converts elementwise -- same bytes whichever side does
+     * it, so no slot is needed there. */
+    const bool head_mx = weights->output->type != PULSAR_TENSOR_BF16;
+    void *hn_q = NULL, *hn_sf = NULL; int hn_kbp = 0;
+    if (ok && head_mx && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(g->output_norm, 1, PULSAR_N_EMBD,
+                                                              &hn_q, &hn_sf, &hn_kbp)) {
+        fprintf(stderr, "pulsar: output norm: no E4M3 slot for the MXFP8 head -- refusing\n");
+        ok = false;
+    }
+    /* L159: a bf16 head reads the producer's bf16 plane; the GEMM core no
+     * longer converts f32 on a miss.  Same slot as the E4M3 half: one key, two
+     * planes, the head fills the one its weight format needs. */
+    void *hn_b = NULL;
+    if (ok && !head_mx && !pulsar_gpu_bf16_act_slot(g->output_norm, 1, PULSAR_N_EMBD, &hn_b)) {
+        fprintf(stderr, "pulsar: output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
+    if (ok) ok = pulsar_gpu_rms_norm_weight_mx_tensor(g->output_norm,
+                                                     g->output_embd,
+                                                     tensor_map_base(model, weights->output_norm),
+                                                     tensor_map_size(model, weights->output_norm),
+                                                     weights->output_norm->abs_offset,
+                                                     PULSAR_N_EMBD,
+                                                     PULSAR_RMS_EPS,
+                                                     hn_q, hn_sf, hn_kbp,
+        hn_b,
+        weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
     if (ok) {
         gpu_graph_debug_dump_tensor("result_norm", g->output_norm, PULSAR_N_EMBD, PULSAR_N_LAYER, 0);
     }
-    if (ok) {
-        ok = pulsar_gpu_matmul_mxfp8_tensor(g->logits, model->map, model->size,
-                                        weights->output->abs_offset, PULSAR_N_EMBD,
-                                        vocab_dim, g->output_norm, 1) != 0;
+    if (ok && hn_b) pulsar_gpu_bf16_act_note(g->output_norm, 1, PULSAR_N_EMBD);
+    /* Slice 4d: a vocab RANGE [vocab_lo, vocab_lo+vocab_dim) of the head.  The
+     * weight is stored [vocab, in_dim] row-major (the container's dims_ne is
+     * [4096, 129280], HF [129280, 4096]), so a vocab range IS a contiguous ROW
+     * range: the offset advances by whole rows and the block stays packed --
+     * exactly what pulsar_gpu_matmul_bf16_tensor's out_dim*in_dim byte check
+     * expects.  Only the bf16 head slices this way: the MXFP8_LT layout keeps
+     * its swizzled E8M0 scale plane beside the payload, so a row slice would
+     * mis-address the scales.  That arm refuses until its own slice lands. */
+    if (ok && head_mx && (vocab_lo != 0 || vocab_dim != (uint64_t)PULSAR_N_VOCAB)) {
+        fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
+                        "(range [%u, %u)) -- refusing\n", vocab_lo,
+                (unsigned)(vocab_lo + vocab_dim));
+        ok = false;
     }
     if (ok) {
-        gpu_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, PULSAR_N_LAYER, 0);
+        if (head_mx) {
+            pulsar_gpu_mxfp8_act_cache_arm(g->output_norm, 1, PULSAR_N_EMBD);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        }
+        ok = pulsar_linear_slot(out, model, weights->output, PULSAR_N_EMBD, vocab_lo, vocab_lo + vocab_dim,
+                                g->output_norm, 1);
+        if (head_mx) pulsar_gpu_mxfp8_act_cache_disarm();
+    }
+    if (ok) {
+        gpu_graph_debug_dump_tensor("result_output", out, vocab_dim, PULSAR_N_LAYER, 0);
     }
     return ok;
 }
@@ -2059,92 +1064,326 @@ bool gpu_graph_encode_output_head(
  * tiny speculative suffixes we instead process all rows together and let the GPU reduce
  * each row to a top id; the CPU reads back just those ids plus the last row's
  * logits needed to continue the exact target stream. */
+static bool gpu_graph_encode_output_head_batch_impl(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out);
+
+/* L119 segment bracket: the output head reads no position, no frontier and no
+ * readback, so at decode widths it is captured once per KEY and replayed.  The
+ * key is everything host-side the body's launches depend on
+ * (gpu_graph_output_head_seg_key): the carrier parity, n_tokens, and -- since
+ * L292 -- the row kinds.  The 2026-08-27 audit said "norm/mix/weights/vocab GEMM
+ * take only n_tokens and vocab_dim"; L167 made row KIND choose every dense arm
+ * (pulsar_gpu_matmul_decode_prefix), so a fused step's head (decode rows, then
+ * headed prompt rows on the tensor-core arm) and a pure decode step of the same
+ * width recorded different launches under one key, and whichever was captured
+ * replayed for both (vllm 877f6df88 is the same class: a host decision baked
+ * into a graph).
+ *
+ * Slice 4d: the bracket is taken only for the FULL-vocab range.  A gate recv is
+ * a host-side wait (design rule 1) and cannot live inside a captured graph, and
+ * the recorded body also writes to whichever destination the capture ran with,
+ * so a sliced/TP head must run eager.  `vocab_lo == 0 && vocab_dim == N_VOCAB`
+ * is exactly the single-box range, so the capture key needs no new dimension. */
+uint64_t gpu_graph_output_head_seg_key(bool hc_parity, uint32_t n_tokens, uint32_t decode_prefix) {
+    return ((hc_parity ? 1ull : 0ull) << 40) | ((uint64_t)(decode_prefix & 0xFFu) << 24) |
+           (0xFFull << 16) | (2ull << 8) | (uint64_t)(n_tokens & 0xFFu);
+}
+
+/// The output head over batch rows [row0, row0 + n_tokens) of the sweep-final stream into `out` rows
+/// [0, n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim) (a full-range head at row 0 runs as a captured
+/// segment; the single-box caller passes 0, N_VOCAB and g->spec_logits).
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param vocab_lo the first column
+/// @param vocab_dim columns
+/// @param out receives the logits rows
+/// @return false = failed
 bool gpu_graph_encode_output_head_batch(
         pulsar_gpu_graph *g,
         const pulsar_model       *model,
         const pulsar_weights     *weights,
+        uint32_t               row0,
         uint32_t               n_tokens,
-        uint64_t               vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
+    const bool full_range = vocab_lo == 0u && vocab_dim == (uint64_t)PULSAR_N_VOCAB;
+    if (full_range && row0 == 0u && n_tokens >= 1 && n_tokens <= 16 && g->banks.n_banks) {
+        /* L119: parity-keyed -- the head reads the sweep-final hidden buffer,
+         * whose identity alternates per sweep (odd layer count x per-layer
+         * pointer swap). */
+        const bool hc_parity =
+            (uintptr_t)(const void *)g->batch_cur_hc > (uintptr_t)(const void *)g->batch_next_hc;
+        const uint64_t key = gpu_graph_output_head_seg_key(hc_parity, n_tokens,
+                                                           pulsar_gpu_matmul_decode_prefix(n_tokens));
+        const int st = pulsar_gpu_seg_enter(key);
+        if (st < 0) return false;   /* L306: this shape's graph failed (the runtime's line names it) */
+        if (st == 2) return true;
+        if (st == 1) {
+            const bool ok = gpu_graph_encode_output_head_batch_impl(
+                    g, model, weights, 0u, n_tokens, vocab_lo, vocab_dim, out);
+            /* L306: a failed capture ran nothing and refuses -- no eager re-run */
+            return pulsar_gpu_seg_exit(key, ok ? 1 : 0) != 0;
+        }
+    }
+    return gpu_graph_encode_output_head_batch_impl(g, model, weights, row0, n_tokens,
+                                                   vocab_lo, vocab_dim, out);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Slice 4d: the ONE place the output head knows about TP.
+ *
+ * With the group off the entry points below are exactly the calls they
+ * replace (whole range, same destination, same captures) -- the single-box path
+ * is byte-identical by construction.  With the group armed this rank projects
+ * only ITS vocab range (`head(lo, width, dst)` writes the packed slice: row r
+ * at r * width), every rank's range is gathered, and the assembled full logits
+ * land in `out` in rank order.  Every rank therefore ends with the same full
+ * vector and samples independently: no leader-only decision, no token
+ * broadcast.  Copies only -- the assembled rows are the bytes the heads wrote.
+ *
+ * Two lanes, chosen by the transport (like gpu_graph_tp_allreduce_rows):
+ *
+ *  - a row-lane pair (4g-2) gathers ON THE STREAM: the slice is written to
+ *    g->tp_vocab_own, scattered into its columns of `out`, and cut into
+ *    row-lane messages (<= PULSAR_TP_BATCH_MAX_ROWS per exchange); each
+ *    exchange's combine scatters the peer's chunk into the peer's columns.
+ *    The engine thread never waits; a failed exchange latches the lane's
+ *    error word, which the next stream drain refuses (pulsar_gpu_end_commands).
+ *    Both ranks cut the same number of messages: the count is taken at the
+ *    padded stride, not at either rank's own width.
+ *  - otherwise the slice is staged to host, all-gathered by the transport, and
+ *    written back (one D2H + one H2D per eval).  The padded tail of each
+ *    rank's slice is ZEROED after the read: the head only writes [0, hi-lo) of
+ *    a stride-wide row, and the stride is rounded up so the group exchange can
+ *    carry one byte count per round.
+ * ------------------------------------------------------------------------- */
+/// @tparam Head callable bool(uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst): the head over vocab [lo, lo + width)
+/// @param g the graph (its TP group)
+/// @param n_rows rows
+/// @param head writes the rank's vocab slice
+/// @param out receives the full rows
+/// @return false = failed
+template <class Head>
+static bool tp_vocab_split(pulsar_gpu_graph *g, uint32_t n_rows, Head head,
+                           pulsar_gpu_tensor *out) {
+    /* L266: the gather is the engine's (tp_rows.cpp); the graph lends its transport, slab, ticket, scratch and seq */
+    const pulsar_tp_vocab x = {g->tp, g->tp_slab_dev, g->tp_stage_ticket, g->tp_vocab_own, &g->tp_vocab_seq,
+                               (uint32_t)PULSAR_N_VOCAB, (uint32_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS};
+    return pulsar_tp_vocab_gather(&x, n_rows, head, out);
+}
+
+bool gpu_graph_encode_output_head_row_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row,
+        pulsar_gpu_tensor      *out) {
+    if (!g->tp)
+        return gpu_graph_encode_output_head(g, model, weights, row, 0u,
+                                            (uint64_t)PULSAR_N_VOCAB, out);
+    return tp_vocab_split(g, 1u, [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
+        return gpu_graph_encode_output_head(g, model, weights, row, lo, width, dst);
+    }, out);
+}
+
+/// gpu_graph_encode_output_head_batch over the full vocab; on a TP group each rank's slice, gathered.
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param out receives the full logits rows
+/// @return false = failed
+bool gpu_graph_encode_output_head_batch_tp(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
+        pulsar_gpu_tensor      *out) {
+    if (!g->tp)
+        return gpu_graph_encode_output_head_batch(g, model, weights, row0, n_tokens,
+                                                  0u, (uint64_t)PULSAR_N_VOCAB, out);
+    return tp_vocab_split(g, n_tokens, [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) {
+        return gpu_graph_encode_output_head_batch(g, model, weights, row0, n_tokens, lo, width, dst);
+    }, out);
+}
+
+/// The output head over batch rows [row0, row0 + n_tokens), vocab columns [vocab_lo, vocab_lo + vocab_dim).
+/// @param g the graph
+/// @param model the model
+/// @param weights its device weights
+/// @param row0 the first batch row
+/// @param n_tokens rows
+/// @param vocab_lo the first vocab column
+/// @param vocab_dim columns
+/// @param out receives the logits rows
+/// @return false = refused or failed
+static bool gpu_graph_encode_output_head_batch_impl(
+        pulsar_gpu_graph *g,
+        const pulsar_model       *model,
+        const pulsar_weights     *weights,
+        uint32_t               row0,
+        uint32_t               n_tokens,
+        uint32_t               vocab_lo,
+        uint64_t               vocab_dim,
+        pulsar_gpu_tensor      *out) {
+    if (!out || n_tokens == 0 || row0 > g->prefill_cap || n_tokens > g->prefill_cap - row0 ||
+        n_tokens > PULSAR_SPEC_LOGITS_ALLOC_ROWS || !g->spec_logits) return false;
 
     const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    pulsar_gpu_tensor *output_pre = NULL;
-    pulsar_gpu_tensor *output_weights = NULL;
+    pulsar_gpu_tensor *rows_hc = NULL;
+    pulsar_gpu_tensor *rows_pre = NULL;
     pulsar_gpu_tensor *output_embd = NULL;
     pulsar_gpu_tensor *output_norm = NULL;
     pulsar_gpu_tensor *logits = NULL;
 
     bool ok = true;
-    output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix,
-                                       0,
-                                       (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-    output_weights = pulsar_gpu_tensor_view(g->batch_hc_split,
-                                           0,
-                                           (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+    /* the sweep-final rows and the pre the last FFN handed each of them */
+    rows_hc = pulsar_gpu_tensor_view(g->batch_cur_hc,
+                                     (uint64_t)row0 * hc_dim * PULSAR_HC_ELT_SIZE,
+                                     (uint64_t)n_tokens * hc_dim * PULSAR_HC_ELT_SIZE);
+    rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre,
+                                      (uint64_t)row0 * PULSAR_N_HC * sizeof(float),
+                                      (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur,
                                         0,
                                         (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm,
                                         0,
                                         (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
-    logits = pulsar_gpu_tensor_view(g->spec_logits,
+    /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
+     * and in_dim the layer encodes armed it with, so an activation cache that
+     * outlived a layer would hit here and quantize the vocab GEMM from stale
+     * activations.  The FFN encode disarms at its exit; this is the second lock
+     * on the same door, and it is free. */
+    pulsar_gpu_mxfp8_act_cache_disarm();
+    logits = pulsar_gpu_tensor_view(out,
                                    0,
                                    (uint64_t)n_tokens * vocab_dim * sizeof(float));
-    ok = output_pre && output_weights && output_embd && output_norm && logits;
+    ok = rows_hc && rows_pre && output_embd && output_norm && logits;
 
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
-                                                      g->batch_cur_hc,
-                                                      (uint32_t)hc_dim,
-                                                      n_tokens,
-                                                      PULSAR_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre,
-                                                 (const pulsar_model *)model,
-                                                 weights->output_hc_fn,
-                                             hc_dim,
-                                             PULSAR_N_HC,
-                                             g->batch_flat_hc,
-                                             n_tokens) != 0;
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights,
-                                                    output_pre,
-                                                    model->map,
-                                                    model->size,
-                                                    weights->output_hc_scale->abs_offset,
-                                                    weights->output_hc_base->abs_offset,
-                                                    PULSAR_N_HC,
-                                                    PULSAR_HC_EPS) != 0;
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
-                                                  g->batch_cur_hc,
-                                                  output_weights,
-                                                  PULSAR_N_EMBD,
-                                                  PULSAR_N_HC) != 0;
+    /* The collapse is SHARED; only the coefficient source differs.  A profile that
+     * binds output_hc_* (0731) computes the head's own mix here -- exactly as the
+     * single-row head does and exactly as dev's batch head does; one that binds
+     * none (V4.1) collapses with the pre its last FFN handed on,
+     * layer.hc_pre(h, pre_mix), with no head-side mix GEMM.  The bind is the fact:
+     * a 0731 artifact missing the group dies at load.  NOTE the batch path needs
+     * BATCH-SIZED scratch: dev views g->batch_hc_mix / g->batch_hc_split, not the
+     * single-row g->output_pre / g->output_weights (using those was s100's bug). */
+    if (weights->output_hc_fn) {
+        if (!weights->output_hc_scale || !weights->output_hc_base) {
+            fprintf(stderr, "pulsar: output_hc_fn is bound without scale/base -- refusing\n");
+            ok = false;
+        }
+        pulsar_gpu_tensor *hc_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *hc_w = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        if (!hc_pre || !hc_w) ok = false;
+        void *out_flat_b = NULL;
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens,
+                                            (uint64_t)hc_dim, &out_flat_b)) {
+            fprintf(stderr, "pulsar: verify head flat_hc: no bf16 slot -- refusing (L159)\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, out_flat_b,
+                                                          rows_hc, (uint32_t)hc_dim,
+                                                          n_tokens, PULSAR_RMS_EPS, 0) != 0;
+        if (ok && out_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens,
+                                                       (uint64_t)hc_dim);
+        if (ok) ok = pulsar_linear_slot(hc_pre, (const pulsar_model *)model, weights->output_hc_fn, hc_dim, 0, PULSAR_N_HC, g->batch_flat_hc, n_tokens);
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(hc_w,
+                                                        hc_pre,
+                                                        tensor_map_base(model, weights->output_hc_scale),
+                                                        tensor_map_size(model, weights->output_hc_scale),
+                                                        weights->output_hc_scale->abs_offset,
+                                                        weights->output_hc_base->abs_offset,
+                                                        PULSAR_N_HC,
+                                                        PULSAR_HC_EPS) != 0;
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, rows_hc, hc_w,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+        pulsar_gpu_tensor_free(hc_w);
+        pulsar_gpu_tensor_free(hc_pre);
+    } else if (ok) {
+        ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd,
+                                              rows_hc,
+                                              rows_pre,
+                                              PULSAR_N_EMBD,
+                                              PULSAR_N_HC) != 0;
+    }
+    void *on_b = NULL;
+    if (ok && weights->output->type == PULSAR_TENSOR_BF16 &&
+        !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &on_b)) {
+        fprintf(stderr, "pulsar: verify output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
     if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm,
                                                        output_embd,
-                                                       model->map,
-                                                       model->size,
+                                                       tensor_map_base(model, weights->output_norm),
+                                                       tensor_map_size(model, weights->output_norm),
                                                        weights->output_norm->abs_offset,
                                                        PULSAR_N_EMBD,
                                                        n_tokens,
-                                                       PULSAR_RMS_EPS) != 0;
-    if (ok) {
-        ok = pulsar_gpu_matmul_mxfp8_tensor(logits, model->map, model->size,
-                                        weights->output->abs_offset, PULSAR_N_EMBD,
-                                        vocab_dim, output_norm, n_tokens) != 0;
+                                                       PULSAR_RMS_EPS,
+        on_b,
+        weights->output_norm->type == PULSAR_TENSOR_BF16) != 0;
+    if (ok && on_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
+    /* Slice 4d: same vocab-range rule as the single-row head -- the head weight
+     * is [vocab, in_dim] row-major, so a vocab range is a contiguous row range
+     * and the packed-block check still holds.  The MXFP8_LT arm refuses a slice
+     * (its scale plane is not row-addressable). */
+    const bool bh_mx = weights->output->type != PULSAR_TENSOR_BF16;
+    if (ok && bh_mx && (vocab_lo != 0 || vocab_dim != (uint64_t)PULSAR_N_VOCAB)) {
+        fprintf(stderr, "pulsar: MXFP8 output head cannot be vocab-sliced yet "
+                        "(range [%u, %u)) -- refusing\n", vocab_lo,
+                (unsigned)(vocab_lo + vocab_dim));
+        ok = false;
     }
+    if (ok)
+        ok = pulsar_linear_slot(logits, model, weights->output, PULSAR_N_EMBD, vocab_lo, vocab_lo + vocab_dim,
+                                output_norm, n_tokens);
 
+    pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
+    /* L292: and the head's flat_hc plane dies with the head.  It is keyed (batch_flat_hc, head rows, hc_dim) and
+     * noted valid; left behind, the NEXT step's layer-0 hc_attn_fn GEMM of a fused step -- whose decode-prefix
+     * call takes the TIGHTEST window over batch_flat_hc (act_slot_find_window) -- read this head's rows instead of
+     * its own (every fused step after an eagerly-encoded head).  A replayed head acquires no slot, so the leak
+     * also made the bytes depend on whether the previous head replayed. */
+    pulsar_gpu_act_slot_drop(g->batch_flat_hc);
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
-    pulsar_gpu_tensor_free(output_weights);
-    pulsar_gpu_tensor_free(output_pre);
+    pulsar_gpu_tensor_free(rows_pre);
+    pulsar_gpu_tensor_free(rows_hc);
     return ok;
 }
 
-/* DSpark drafter output head.  Collapses the drafter's final HC with the DSpark
- * block's OWN head (dspark.2.hc_head_fn/scale/base) and norm (dspark.2.norm),
- * then projects to vocab with the SHARED main output head (self.head in the
- * reference).  The plain gpu_graph_encode_output_head_batch used the MAIN model's
- * output_hc and output_norm weights for the drafter -- wrong weights that
- * corrupted the draft base logits (base0_hit was ~29%). */
+/* DSpark drafter output head (forward_head in the reference): collapses the
+ * drafter's final HC with the pre its last FFN handed on (batch_hc_pre), norms
+ * with the DSpark block's OWN norm (dspark.2.norm), then projects to vocab
+ * with the SHARED main output head (self.head).  The main model's
+ * output_norm is the wrong norm for the drafter -- using it corrupted the
+ * draft base logits (base0_hit was ~29%). */
+/// @param g the graph
+/// @param dspark_model the drafter's model
+/// @param dw its weights (its own norm)
+/// @param base_model the target model
+/// @param bw its weights (the shared output head)
+/// @param n_tokens rows (<= PULSAR_DSPARK_DRAFT_ROWS_MAX)
+/// @param vocab_dim logits columns (the full vocab on a TP group)
+/// @return false = refused or failed
 bool gpu_graph_encode_dspark_output_head_batch(
         pulsar_gpu_graph            *g,
         const pulsar_model          *dspark_model,
@@ -2153,92 +1392,104 @@ bool gpu_graph_encode_dspark_output_head_batch(
         const pulsar_weights        *bw,
         uint32_t                  n_tokens,
         uint64_t                  vocab_dim) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
-    const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
-    pulsar_gpu_tensor *output_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+    if (n_tokens == 0 || n_tokens > g->prefill_cap ||
+        n_tokens > PULSAR_DSPARK_DRAFT_ROWS_MAX || !g->spec_logits) return false;
+    pulsar_gpu_tensor *rows_pre = pulsar_gpu_tensor_view(g->batch_hc_pre, 0, (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
     pulsar_gpu_tensor *output_embd = pulsar_gpu_tensor_view(g->batch_ffn_cur, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
     pulsar_gpu_tensor *output_norm = pulsar_gpu_tensor_view(g->batch_ffn_norm, 0, (uint64_t)n_tokens * PULSAR_N_EMBD * sizeof(float));
+    /* These heads REUSE batch_ffn_norm as output_norm scratch at the same n_tok
+     * and in_dim the layer encodes armed it with, so an activation cache that
+     * outlived a layer would hit here and quantize the vocab GEMM from stale
+     * activations.  The FFN encode disarms at its exit; this is the second lock
+     * on the same door, and it is free. */
+    pulsar_gpu_mxfp8_act_cache_disarm();
     pulsar_gpu_tensor *logits = pulsar_gpu_tensor_view(g->spec_logits, 0, (uint64_t)n_tokens * vocab_dim * sizeof(float));
-    bool ok = output_pre && output_weights && output_embd && output_norm && logits;
-    if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, g->batch_cur_hc,
-                                                     (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS) != 0;
-    if (ok) ok = gpu_graph_matmul_plain_tensor(output_pre, dspark_model, dw->hc_head_fn,
-                                               hc_dim, PULSAR_N_HC, g->batch_flat_hc, n_tokens) != 0;
-    if (ok) ok = pulsar_gpu_output_hc_weights_tensor(output_weights, output_pre,
-                                                  dspark_model->map, dspark_model->size,
-                                                  dw->hc_head_scale->abs_offset,
-                                                  dw->hc_head_base->abs_offset,
-                                                  PULSAR_N_HC, PULSAR_HC_EPS) != 0;
-    if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, output_weights,
-                                                PULSAR_N_EMBD, PULSAR_N_HC) != 0;
-    if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
-                                                     dspark_model->map, dspark_model->size,
-                                                     dw->final_norm->abs_offset,
-                                                     PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS) != 0;
-    if (ok) {
-        ok = pulsar_gpu_matmul_mxfp8_tensor(logits, base_model->map, base_model->size,
-                                         bw->output->abs_offset, PULSAR_N_EMBD, vocab_dim,
-                                         output_norm, n_tokens) != 0;
+    bool ok = rows_pre && output_embd && output_norm && logits;
+    /* The DRAFTER's own head mix (dspark.2.hc_head_*).  Unlike the TARGET head,
+     * which uses the fused norm+mix kernel, this one uses the UNFUSED
+     * rms_norm_plain -> plain-matmul pair over batch_flat_hc -- dev's code,
+     * kept as it is rather than folded into the fused path.  The collapse at the
+     * end is the same shared one either way; only the coefficient source
+     * differs.  plans/96-two-profiles-one-engine.md s17. */
+    if (ok && dw->hc_head_fn) {
+        const uint64_t hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
+        pulsar_gpu_tensor *output_pre = pulsar_gpu_tensor_view(g->batch_hc_mix, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        pulsar_gpu_tensor *mix_weights = pulsar_gpu_tensor_view(g->batch_hc_split, 0,
+                                        (uint64_t)n_tokens * PULSAR_N_HC * sizeof(float));
+        void *dsp_flat_b = NULL;
+        if (!dw->hc_head_scale || !dw->hc_head_base || !output_pre || !mix_weights) {
+            fprintf(stderr, "pulsar: drafter head mix: weights or scratch missing -- refusing\n");
+            ok = false;
+        }
+        if (ok && !pulsar_gpu_bf16_act_slot(g->batch_flat_hc, n_tokens, hc_dim, &dsp_flat_b)) {
+            fprintf(stderr, "pulsar: dspark head flat_hc: no bf16 slot -- refusing\n");
+            ok = false;
+        }
+        if (ok) ok = pulsar_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc, dsp_flat_b, g->batch_cur_hc,
+                                                          (uint32_t)hc_dim, n_tokens, PULSAR_RMS_EPS, 0) != 0;
+        if (ok && dsp_flat_b) pulsar_gpu_bf16_act_note(g->batch_flat_hc, n_tokens, hc_dim);
+        if (ok) ok = pulsar_linear_slot(output_pre, dspark_model, dw->hc_head_fn, hc_dim, 0, PULSAR_N_HC, g->batch_flat_hc, n_tokens);
+        if (ok) ok = pulsar_gpu_output_hc_weights_tensor(mix_weights, output_pre,
+                                                        tensor_map_base(dspark_model, dw->hc_head_scale), tensor_map_size(dspark_model, dw->hc_head_scale),
+                                                        dw->hc_head_scale->abs_offset,
+                                                        dw->hc_head_base->abs_offset,
+                                                        PULSAR_N_HC, PULSAR_HC_EPS) != 0;
+        if (ok) ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, mix_weights,
+                                                      PULSAR_N_EMBD, PULSAR_N_HC) != 0;
+        pulsar_gpu_tensor_free(output_pre);
+        pulsar_gpu_tensor_free(mix_weights);
+    } else if (ok) {
+        ok = pulsar_gpu_hc_weighted_sum_tensor(output_embd, g->batch_cur_hc, rows_pre,
+                                              PULSAR_N_EMBD, PULSAR_N_HC) != 0;
     }
+    void *dn_b = NULL;
+    if (ok && bw->output->type == PULSAR_TENSOR_BF16 &&
+        !pulsar_gpu_bf16_act_slot(output_norm, n_tokens, PULSAR_N_EMBD, &dn_b)) {
+        fprintf(stderr, "pulsar: dspark output norm: no bf16 slot for the bf16 head -- refusing\n");
+        ok = false;
+    }
+    if (ok) ok = pulsar_gpu_rms_norm_weight_rows_tensor(output_norm, output_embd,
+                                                     tensor_map_base(dspark_model, dw->final_norm), tensor_map_size(dspark_model, dw->final_norm),
+                                                     dw->final_norm->abs_offset,
+                                                     PULSAR_N_EMBD, n_tokens, PULSAR_RMS_EPS,
+        dn_b,
+        dw->final_norm->type == PULSAR_TENSOR_BF16) != 0;
+    if (ok && dn_b) pulsar_gpu_bf16_act_note(output_norm, n_tokens, PULSAR_N_EMBD);
+    /* The projection over a vocab range: [vocab, in_dim] row-major, so a range
+     * is a contiguous row range of the bf16 head (the MXFP8_LT scale plane is
+     * not row-addressable -- that arm takes the whole vocab only, like the
+     * target heads).  Under TP (4g-2) each rank projects its own range and
+     * tp_vocab_split gathers the full rows into spec_logits: the drafter's
+     * head was the one whole-vocab GEMM both ranks still ran in full. */
+    const bool dh_mx = bw->output->type != PULSAR_TENSOR_BF16;
+    auto project = [&](uint32_t lo, uint32_t width, pulsar_gpu_tensor *dst) -> bool {
+        if (dh_mx && (lo != 0u || width != vocab_dim)) {
+            fprintf(stderr, "pulsar: MXFP8 drafter head cannot be vocab-sliced (range [%u, %u)) -- refusing\n",
+                    lo, lo + width);
+            return false;
+        }
+        return pulsar_linear_slot(dst, base_model, bw->output, PULSAR_N_EMBD, lo, (uint64_t)lo + width, output_norm,
+                                  n_tokens);
+    };
+    if (ok && g->tp && vocab_dim != (uint64_t)PULSAR_N_VOCAB) {
+        fprintf(stderr, "pulsar: tp drafter head over %llu logits, not the full vocab -- refusing\n",
+                (unsigned long long)vocab_dim);
+        ok = false;
+    }
+    if (ok) ok = g->tp ? tp_vocab_split(g, n_tokens, project, g->spec_logits)
+                       : project(0u, (uint32_t)vocab_dim, logits);
+    pulsar_gpu_act_slot_drop(output_norm);   /* L159: planes die with the buffer */
+    /* L292: and the head's flat_hc plane dies with the head.  It is keyed (batch_flat_hc, head rows, hc_dim) and
+     * noted valid; left behind, the NEXT step's layer-0 hc_attn_fn GEMM of a fused step -- whose decode-prefix
+     * call takes the TIGHTEST window over batch_flat_hc (act_slot_find_window) -- read this head's rows instead of
+     * its own (every fused step after an eagerly-encoded head).  A replayed head acquires no slot, so the leak
+     * also made the bytes depend on whether the previous head replayed. */
+    pulsar_gpu_act_slot_drop(g->batch_flat_hc);
     pulsar_gpu_tensor_free(logits);
     pulsar_gpu_tensor_free(output_norm);
     pulsar_gpu_tensor_free(output_embd);
-    pulsar_gpu_tensor_free(output_weights);
-    pulsar_gpu_tensor_free(output_pre);
-    return ok;
-}
-
-
-
-bool gpu_graph_matmul_plain_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok) {
-    if (w->type == PULSAR_TENSOR_F16) {
-        return pulsar_gpu_matmul_f16_tensor(out, model->map, model->size,
-                                           w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
-    }
-    if (w->type == PULSAR_TENSOR_F32) {
-        return pulsar_gpu_matmul_f32_tensor(out, model->map, model->size,
-                                           w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
-    }
-    if (w->type == PULSAR_TENSOR_FP8_E4M3) {
-        return pulsar_gpu_matmul_mxfp8_tensor(out, model->map, model->size,
-                                            w->abs_offset, in_dim, out_dim, x, n_tok) != 0;
-    }
-    fprintf(stderr, "pulsar: plain matmul does not support %s\n", tensor_type_name(w->type));
-    return false;
-}
-
-
-
-bool gpu_graph_matmul_mxfp8_named_tensor(
-        const char             *module,
-        uint32_t                il,
-        uint32_t                pos0,
-        pulsar_gpu_tensor       *out,
-        const pulsar_model        *model,
-        const pulsar_tensor       *w,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        uint64_t                n_tok) {
-    (void)module;
-    (void)il;
-    (void)pos0;
-    const bool ok = pulsar_gpu_matmul_mxfp8_tensor(out,
-                                                 model->map,
-                                                 model->size,
-                                                 w->abs_offset,
-                                                 in_dim,
-                                                 out_dim,
-                                                 x,
-                                                 n_tok) != 0;
+    pulsar_gpu_tensor_free(rows_pre);
     return ok;
 }
 
@@ -2255,13 +1506,6 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
 
 
 
-
-
-
-
-
-
-
 /* =========================================================================
  * GPU Release Decode and Prefill.
  * =========================================================================
@@ -2271,14 +1515,4 @@ bool gpu_graph_matmul_mxfp8_named_tensor(
  * flow and their CPU reads stay outside these generation entry points.
  */
 
-uint32_t gpu_graph_token_split_after_layers(void) {
-    uint32_t split_after_layers = 4;
-    const char *split_env = getenv("PULSAR_CUDA_GRAPH_TOKEN_SPLIT_LAYERS");
-    if (split_env && split_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(split_env, &end, 10);
-        if (end != split_env && v <= PULSAR_N_LAYER) split_after_layers = (uint32_t)v;
-    }
-    return split_after_layers;
-}
 

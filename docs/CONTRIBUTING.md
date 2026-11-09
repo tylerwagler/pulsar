@@ -1,18 +1,50 @@
 # Contributing
 
+Read `ENGINEERING-RULES.md` in this directory first: one path or an error (no
+fallbacks), no dead code kept, producers emit and consumers never convert,
+zero build warnings, and a landing is one squashed commit gated by the tier
+its paths call for (`ENGINEERING-RULES.md` §10, `QA_BEFORE_RELEASES.md`
+section 2). Those rules apply to every change on `dev`.
+
+The tests run in three tiers, listed in `tests/manifest.toml` and run by
+`tests/run.py`:
+
+- `make check`: no GPU, no model time. It runs beside a serving production
+  box. Run it on every commit.
+- `make kernels`: a GPU, no model.
+- `make release`: the real models, production down. It runs every tier.
+  Run it once per landing series on numeric paths.
+
+`make gates-dev` is the iteration tier: a fast subset chosen from the paths
+you touched. It is not a release gate. `make gates`, the old full battery,
+runs the same targets as `make release` until it is retired.
+
+Each run leaves its logs and `results.json` in `.build/tests/<tier>-<sha>/`.
+A test that cannot run its check fails by name; a `SKIP` line is listed
+under "NOT FULLY RUN". Tests read the published containers from the Hugging
+Face cache (set the paths in `local.mk`; `local.mk.example` lists them), and
+build no model pieces of their own.
+
 Pulsar changes should be tested against the failure mode they can realistically
 affect. The project has two regression tracks: correctness and speed. Please
-include the commands you ran, the machine/backend, the model quant, and any
+include the commands you ran, the machine, the model family and quant, and any
 notable failures in the PR or commit notes.
 
-Do not send PRs affecting one or more inference backends without checking if the
-resulting code is still correct and fast. The only acceptable regression speed
+Do not send PRs affecting a CUDA inference path without checking that the
+resulting code is still correct and fast on every family that runs it. The only acceptable regression speed
 is when an important correctness bug is fixed and it requires some speed penalty.
 
 ## Correctness Regression Tests
 
-Build the CUDA binaries first (`make cuda-spark` for DGX Spark / GB10,
-`make cuda-generic` for other local CUDA GPUs):
+Build the CUDA binaries first. `make cuda-spark` is the GB10 shortcut and
+rebuilds `pulsar-server` at `CUDA_ARCH=sm_120f`; on any other CUDA GPU name the
+target and the arch yourself, because `CUDA_ARCH` defaults to empty:
+
+    make pulsar-server CUDA_ARCH=native
+
+There is no `cuda-generic` target. To build the other binaries, name them
+(`pulsar`, `pulsar-agent`, `pulsar-bench`, `pulsar-eval`) with the same
+`CUDA_ARCH`:
 
 ```sh
 make clean
@@ -20,7 +52,8 @@ make cuda-spark
 ```
 
 The C test runner is `pulsar_test`. Running it without arguments is equivalent to
-`--all`:
+`--all`. `make release` runs it as `unit-test-gate` (`--gating`, on the
+Qwen container in `QWEN_GATE_MODEL`):
 
 ```sh
 make test
@@ -47,49 +80,50 @@ What they cover:
   `tests/long_context_story_prompt.txt`. The model must retrieve spelled-out
   person-number assignments from a long prose prompt and return `Name=number`
   lines that the test parses.
-- `--tool-call-quality`: exercises actual model behavior for DSML tool-call
-  emission in both fast and exact paths.
+- `--tool-call-quality`: exercises actual model behavior for tool-call emission,
+  read by the loaded family's own output parser (L357: no longer DSML-only).
 
-The runner defaults to `ds4flash.gguf`. Override paths when needed:
+Point the runner at a checkpoint directory:
 
 ```sh
-PULSAR_TEST_MODEL=/path/to/model.gguf ./pulsar_test --logprob-vectors
+PULSAR_TEST_MODEL=/path/to/<checkpoint-dir> ./pulsar_test --logprob-vectors
 PULSAR_TEST_VECTOR_FILE=/path/to/official.vec ./pulsar_test --logprob-vectors
 PULSAR_TEST_LONG_PROMPT=/path/to/prompt.txt ./pulsar_test --long-context
 ```
 
-For kernel or GPU-path changes, also run the CUDA smoke regression:
+For kernel or GPU-path changes, also run the kernel tier (it includes the
+CUDA smoke regression, `make cuda-regression`):
 
 ```sh
-make cuda-regression
+make kernels
 ```
 
 ## Quality Checks For Quantization Changes
 
-For GGUF or quantization work, use the official-continuation scorer in
-`gguf-tools/quality-testing`. The test compares how much probability a local
-GGUF assigns to official DeepSeek V4 Flash continuations, token by token.
+For quantization work, use the official-continuation scorer in
+`tools/quality-testing`. The test compares how much probability a local
+checkpoint assigns to official DeepSeek V4 Flash continuations, token by token.
 
 Build the scorer:
 
 ```sh
-make -C gguf-tools quality-score
+make -C tools/quality-testing
 ```
 
-Then score old and new GGUFs against the same manifest and compare:
+Then score old and new checkpoints against the same manifest and compare:
 
 ```sh
-gguf-tools/quality-testing/score_official OLD.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
+tools/quality-testing/score_official /path/to/OLD-checkpoint \
+  tools/quality-testing/data/manifest.tsv /tmp/old.tsv 4096
 
-gguf-tools/quality-testing/score_official NEW.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
+tools/quality-testing/score_official /path/to/NEW-checkpoint \
+  tools/quality-testing/data/manifest.tsv /tmp/new.tsv 4096
 
-python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
+python3 tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
 
 Lower `avg_nll` is better. See
-`gguf-tools/quality-testing/README.md` for collecting or refreshing official
+`tools/quality-testing/README.md` for collecting or refreshing official
 continuations.
 
 ## Speed Regression Tests
@@ -103,7 +137,7 @@ Default linear sweep:
 
 ```sh
 ./pulsar-bench \
-  -m ds4flash.gguf \
+  -m /path/to/<checkpoint-dir> \
   --prompt-file speed-bench/promessi_sposi.txt \
   --ctx-start 2048 \
   --ctx-max 65536 \

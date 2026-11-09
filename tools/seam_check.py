@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOTS = ["src/engine", "src/server", "src/cli", "src/agent", "src/lib"]
+ROOTS = ["src/engine", "src/families", "src/server", "src/cli", "src/agent", "src/lib"]
 FILES = ["src/pulsar.h", "src/pulsar_gpu.h"]
 
 INCLUDE = re.compile(r'#\s*include\s*[<"](cuda|cublas|cooperative_groups|curand|cutlass)')

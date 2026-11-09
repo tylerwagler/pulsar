@@ -1,0 +1,4 @@
+# depth kl   (recorded /home/claude/work/L357/out/refcap/nemotron-6faf460d/code.ref.bin)
+512 1.7556092082925356
+2048 3.401776476260941e-05
+3956 0.0051566268116572103

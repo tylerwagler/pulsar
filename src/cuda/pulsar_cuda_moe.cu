@@ -1,18 +1,38 @@
+/** @file
+ *  DeepSeek routed-expert MoE: the expert FFN lanes (MMQ, mixed, CUTLASS MXFP4) and their dispatch. */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_slot */
 #ifdef PULSAR_HAVE_MMQ
 #include "mmq/ds4_mmq.h"     /* vendored llama.cpp MMQ adapter -- see mmq/VENDOR.md */
-#include "mmq/ds4_repack.h"  /* raw IQ2 block stream -> aligned artifact */
+#include "mmq/exl3_moe.cuh"   /* task #44: the one EXL3 routed front door */
+#include "engine/exl3_trellis.h" /* L245: exl3_type_k2 */
+
 #endif
 
+/* The three sorted-pair builders (count, prefix sum, scatter) live in
+ * pulsar_cuda_moe_pairs.cu -- they hold the one place a router id becomes an
+ * array index, and they are declared in pulsar_cuda_internal.h together with
+ * the `moe_route_oob_code` arm tag each call site below passes. */
 
+/* The per-expert address tables live in pulsar_cuda_expert_table.cu -- they hold the
+ * one place an expert's ADDRESS is computed, and they are what phase 2 re-fills
+ * with slot addresses instead.  Declared in pulsar_cuda_internal.h. */
 
 
+/* The three sorted-pair builders (count, prefix sum, scatter) live in
+ * pulsar_cuda_moe_pairs.cu -- they hold the one place a router id becomes an
+ * array index, and they are declared in pulsar_cuda_internal.h. */
 
 
 
+/* Exclusive prefix sum over the per-expert counts -- see pulsar_cuda_moe_pairs.cu
+ * for the bit-exactness argument that makes the block scan safe here. */
 
 
 
+/* The scattered pair -> expert-major schedule is built by
+ * pulsar_cuda_moe_pairs.cu's moe_scatter_sorted_pairs_kernel. */
 
 
 
@@ -60,147 +80,82 @@
 
 
 
+/* L188: the non-finite flag for the routed experts.
+ *
+ * Until 2026-09-05 the MMQ down GEMM ran a whole-buffer pass that rewrote every
+ * NaN/Inf to 0.0f (ds4_mmq_sanitize_f32) -- a plausible number from a different
+ * computation, emitted as a token, with no message and no counter.  There is no
+ * sanitizer anywhere now.  Instead the per-token reduction, which is the one
+ * kernel every routed arm already runs over every output element, checks the
+ * sum it is about to store: a non-finite sum means at least one expert's down
+ * row was non-finite (NaN and Inf both propagate through the add), and the
+ * flag records the FIRST (layer, arm) that tripped -- atomicCAS from 0, so a
+ * NaN that propagates through every later layer does not overwrite the origin.
+ * The kernel pays one isfinite per output element and no atomic on the good
+ * path; the host reads the 4 bytes at the step's stream drain
+ * (pulsar_gpu_end_commands -> pulsar_gpu_routed_moe_nonfinite_take), which is
+ * already a synchronisation point, so the decode lane pays no extra sync.
+ *
+ * Code layout: bits 0..7 = layer_index + 1 (0 means "clear"), bits 8..15 = arm. */
+/// Device non-finite flag: 0 = clear, else the first (layer, arm) code whose MoE sum was not finite.
+__device__ static uint32_t g_moe_nonfinite = 0u;
 
+/// The MoE down arm a non-finite flag names (bits 8..15 of the code).
+enum moe_nonfinite_arm {
+    MOE_NF_ARM_MMQ_DOWN     = 1,   ///< IQ2_XXS MMQ down (routed_moe_launch)
+    MOE_NF_ARM_GROUPED_DOWN = 2,   ///< grouped CUTLASS MXFP4 down (routed_moe_launch_cutlass_grouped)
+    MOE_NF_ARM_GEMV_DOWN    = 3,   ///< small-batch MXFP4 GEMV down (pulsar_cutlass_expert_ffn_gemv_small)
+    MOE_NF_ARM_MIXED_DOWN   = 4,   ///< mixed type-40/type-43 down (routed_moe_launch_mixed40)
+    MOE_NF_ARM_EXL3_DOWN    = 5,   ///< EXL3 trellis down + rotated sum (routed_moe_launch_exl3, L245)
+};
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-__global__ static void moe_count_sorted_pairs_kernel(
-        uint32_t *counts,
-        const int32_t *selected,
-        uint32_t pair_count) {
-    uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (pair >= pair_count) return;
-    int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
-    atomicAdd(counts + (uint32_t)expert_i, 1u);
+/** The flag value moe_sum stores for a non-finite sum at (layer_index, arm). */
+/** @param layer_index the layer
+ *  @param arm         a moe_nonfinite_arm value
+ *  @return the flag code (arm << 8 | (layer_index + 1) & 0xff) */
+static __host__ __device__ __forceinline__ uint32_t moe_nonfinite_code(uint32_t layer_index, uint32_t arm) {
+    return (arm << 8) | ((layer_index + 1u) & 0xffu);
 }
 
+/** Record `nf_code` in the flag if `acc` is not finite (first writer wins). */
+/** @param acc     a summed output element
+ *  @param nf_code the code to record when it is not finite */
+__device__ static __forceinline__ void moe_flag_nonfinite(float acc, uint32_t nf_code) {
+    if (!isfinite(acc)) atomicCAS(&g_moe_nonfinite, 0u, nf_code);
+}
 
-
-__global__ static void moe_prefix_sorted_pairs_kernel(
-        uint32_t *offsets,
-        uint32_t *cursors,
-        const uint32_t *counts,
-        uint32_t expert_count) {
-    if (threadIdx.x == 0) {
-        uint32_t sum = 0;
-        for (uint32_t e = 0; e < expert_count; e++) {
-            offsets[e] = sum;
-            cursors[e] = sum;
-            sum += counts[e];
+int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm) {
+    uint32_t code = 0u;
+    if (!cuda_ok(cudaMemcpyFromSymbol(&code, g_moe_nonfinite, sizeof code, 0, cudaMemcpyDeviceToHost),
+                 "routed MoE non-finite flag read")) return -1;
+    if (code == 0u) return 0;
+    const uint32_t zero = 0u;
+    if (!cuda_ok(cudaMemcpyToSymbol(g_moe_nonfinite, &zero, sizeof zero, 0, cudaMemcpyHostToDevice),
+                 "routed MoE non-finite flag clear")) return -1;
+    if (layer_index) *layer_index = (code & 0xffu) - 1u;
+    if (arm) {
+        switch (code >> 8) {
+        case MOE_NF_ARM_MMQ_DOWN:     *arm = "MMQ down"; break;
+        case MOE_NF_ARM_GROUPED_DOWN: *arm = "grouped CUTLASS MXFP4 down"; break;
+        case MOE_NF_ARM_GEMV_DOWN:    *arm = "small-batch MXFP4 GEMV down"; break;
+        case MOE_NF_ARM_MIXED_DOWN:   *arm = "mixed type-40/type-43 down"; break;
+        case MOE_NF_ARM_EXL3_DOWN:    *arm = "EXL3 trellis down"; break;
+        default:                      *arm = "unknown arm"; break;
         }
-        offsets[expert_count] = sum;
     }
+    return 1;
 }
 
-
-
-__global__ static void moe_scatter_sorted_pairs_kernel(
-        uint32_t *sorted_pairs,
-        uint32_t *cursors,
-        const int32_t *selected,
-        uint32_t pair_count) {
-    uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (pair >= pair_count) return;
-    int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
-    uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
-    sorted_pairs[pos] = pair;
-}
-
-
-
-__global__ static void moe_build_expert_tile_offsets_kernel(
-        uint32_t *tile_offsets,
-        uint32_t *tile_total,
-        const uint32_t *counts,
-        uint32_t expert_count,
-        uint32_t block_m) {
-    if (threadIdx.x == 0) {
-        uint32_t sum = 0;
-        for (uint32_t e = 0; e < expert_count; e++) {
-            tile_offsets[e] = sum;
-            sum += (counts[e] + block_m - 1u) / block_m;
-        }
-        tile_offsets[expert_count] = sum;
-        *tile_total = sum;
-    }
-}
-
-
-
-__global__ static void moe_build_expert_tiles_kernel(
-        uint32_t *tile_experts,
-        uint32_t *tile_starts,
-        const uint32_t *tile_offsets,
-        const uint32_t *counts,
-        uint32_t expert_count,
-        uint32_t block_m) {
-    uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
-    if (e >= expert_count) return;
-    uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
-    uint32_t off = tile_offsets[e];
-    for (uint32_t t = 0; t < ntiles; t++) {
-        tile_experts[off + t] = e;
-        tile_starts[off + t] = t * block_m;
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+/** Per-token MoE sum: out[t][r] = sum over slots e (ascending) of down[t * n_expert + e][r]; flags a non-finite
+ *  result.  Grid ceil(n_tokens * out_dim / 256); block 256.
+ *  @param out      device f32 [n_tokens][out_dim]
+ *  @param down     device f32 [n_tokens * n_expert][out_dim] pre-weighted slot outputs
+ *  @param out_dim  output width
+ *  @param n_expert slots per token
+ *  @param n_tokens token rows
+ *  @param nf_code  non-finite flag code for this layer and arm */
+__global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens,
+                                      uint32_t nf_code) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
     if (gid >= n) return;
@@ -208,6 +163,7 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
     for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    moe_flag_nonfinite(acc, nf_code);
     out[gid] = acc;
 }
 
@@ -220,10 +176,11 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
 
 
 /* ---- CUTLASS MXFP4 (type 40) grouped-expert dispatch. --------------------------------------
- * Unlike the qwarp32/dp4a paths above, which process each (token,expert) pair independently on
+ * Unlike the per-expert paths above, which process each (token,expert) pair independently on
  * device, CUTLASS's dense GemmUniversal interface needs one contiguous [T_e,in_dim] activation
  * matrix per expert with T_e known host-side at launch time. So this path: (1) sorts tokens by
- * expert exactly like use_sorted_pairs above, (2) reads the resulting per-expert offsets back to
+ * expert (it builds its own sorted pairs; the routed path's build was deleted), (2) reads the
+ * resulting per-expert offsets back to
  * host (the one sync point this path has that the others don't -- n_total_expert is small, so
  * this is a bounded single readback per CUTLASS layer per forward pass, not per expert), then
  * (3) for each active expert: gather its rows into a contiguous scratch buffer, run the CUTLASS
@@ -231,207 +188,17 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
  * reusing `down` as that flat buffer and moe_sum_kernel for the final per-token reduction is
  * exactly the existing convention other paths use, just fed from CUTLASS instead of dp4a. */
 
-__global__ static void moe_cutlass_gather_kernel(
-        float *x_gathered,
-        float *w_gathered,
-        const float *x,
-        const float *weights,
-        const uint32_t *sorted_pairs,
-        uint32_t pair_offset,
-        uint32_t count,
-        uint32_t n_expert,
-        uint32_t in_dim) {
-    uint32_t i = blockIdx.x;
-    if (i >= count) return;
-    uint32_t pair = sorted_pairs[pair_offset + i];
-    uint32_t tok = pair / n_expert;
-    const float *src = x + (uint64_t)tok * in_dim;
-    float *dst = x_gathered + (uint64_t)i * in_dim;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
-    if (threadIdx.x == 0) w_gathered[i] = weights[pair];
-}
 
 
 
-__global__ static void moe_cutlass_scatter_kernel(
-        float *down_flat,
-        const float *ffn_out,
-        const uint32_t *sorted_pairs,
-        uint32_t pair_offset,
-        uint32_t count,
-        uint32_t out_dim) {
-    uint32_t i = blockIdx.x;
-    if (i >= count) return;
-    uint32_t pair = sorted_pairs[pair_offset + i];
-    const float *src = ffn_out + (uint64_t)i * out_dim;
-    float *dst = down_flat + (uint64_t)pair * out_dim;
-    for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
-}
 
 
 
+/// @param n bytes
+/// @param a alignment (> 0)
+/// @return n rounded up to a multiple of a
 static uint64_t cutlass_moe_align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
-/* gate_stride/gate_data_bytes and down_stride/down_data_bytes come from
- * routed_expert_gate_down_layout()'s CUTLASS_MXFP4 branch: *_stride is the full per-expert
- * [data+SF] block size, *_data_bytes is where the SF blob starts within that block (the
- * "row_bytes" parameter slot, repurposed -- see that function's comment in weights.c). */
-static int routed_moe_launch_cutlass(
-        pulsar_gpu_tensor *out,
-        pulsar_gpu_tensor *down,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_stride,
-        uint64_t gate_data_bytes,
-        uint64_t down_stride,
-        uint64_t down_data_bytes,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        const pulsar_gpu_tensor *selected,
-        const pulsar_gpu_tensor *weights,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        float clamp,
-        const pulsar_gpu_tensor *x,
-        uint32_t n_tokens) {
-    if (!out || !down || !model_map || !selected || !weights || !x ||
-        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
-        gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
-        selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
-        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
-        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
-        return 0;
-    }
-
-    const uint64_t gate_total_bytes = (uint64_t)n_total_expert * gate_stride;
-    const uint64_t down_total_bytes = (uint64_t)n_total_expert * down_stride;
-    if (gate_total_bytes > model_size - gate_offset ||
-        gate_total_bytes > model_size - up_offset ||
-        down_total_bytes > model_size - down_offset) {
-        return 0;
-    }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total_bytes, "moe_cutlass_gate");
-    const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total_bytes, "moe_cutlass_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total_bytes, "moe_cutlass_down");
-    if (!gate_w || !up_w || !down_w) return 0;
-
-    const uint32_t pair_count = n_tokens * n_expert;
-    const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
-    const uint64_t offsets_bytes = ((uint64_t)n_total_expert + 1) * sizeof(uint32_t);
-    const uint64_t cursors_bytes = counts_bytes;
-    const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-
-    /* Safe upper bound for the per-expert FFN scratch: one expert could receive every token
-     * in this batch. Sizing at n_tokens (rather than the true, smaller max observed count)
-     * means everything fits in ONE cuda_tmp_alloc call -- cuda_tmp_alloc is a single global
-     * buffer that may cudaFree-and-regrow on a size increase, so a second call after reading
-     * back real per-expert counts could invalidate the sorted_pairs region we still need. */
-    const uint32_t T_max = n_tokens;
-    const uint64_t gather_x_bytes = (uint64_t)T_max * expert_in_dim * sizeof(float);
-    const uint64_t gather_w_bytes = (uint64_t)T_max * sizeof(float);
-    const uint64_t ffn_out_bytes = (uint64_t)T_max * out_dim * sizeof(float);
-    const uint64_t ffn_scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(
-            (int)T_max, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
-
-    const uint64_t align = 256;
-    uint64_t off = 0;
-    const uint64_t counts_off = off;  off = cutlass_moe_align_up(off + counts_bytes, align);
-    const uint64_t offsets_off = off; off = cutlass_moe_align_up(off + offsets_bytes, align);
-    const uint64_t cursors_off = off; off = cutlass_moe_align_up(off + cursors_bytes, align);
-    const uint64_t sorted_off = off;  off = cutlass_moe_align_up(off + sorted_bytes, align);
-    const uint64_t gx_off = off;      off = cutlass_moe_align_up(off + gather_x_bytes, align);
-    const uint64_t gw_off = off;      off = cutlass_moe_align_up(off + gather_w_bytes, align);
-    const uint64_t fo_off = off;      off = cutlass_moe_align_up(off + ffn_out_bytes, align);
-    const uint64_t fs_off = off;      off = cutlass_moe_align_up(off + ffn_scratch_bytes, align);
-    const uint64_t total_scratch = off;
-
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(total_scratch, "routed_moe cutlass");
-    if (!scratch) return 0;
-
-    uint32_t *counts = (uint32_t *)(scratch + counts_off);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_off);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
-    float *x_gathered = (float *)(scratch + gx_off);
-    float *w_gathered = (float *)(scratch + gw_off);
-    float *ffn_out = (float *)(scratch + fo_off);
-    uint8_t *ffn_scratch = scratch + fs_off;
-
-    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe_cutlass counts clear");
-    if (ok) {
-        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass count launch");
-    }
-    if (ok) {
-        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass prefix launch");
-    }
-    if (ok) {
-        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch");
-    }
-    if (!ok) return 0;
-
-    std::vector<uint32_t> h_offsets((size_t)n_total_expert + 1);
-    if (!cuda_ok(cudaMemcpy(h_offsets.data(), offsets, offsets_bytes, cudaMemcpyDeviceToHost),
-                "routed_moe_cutlass offsets readback")) {
-        return 0;
-    }
-
-    for (uint32_t e = 0; e < n_total_expert; e++) {
-        const uint32_t e_offset = h_offsets[e];
-        const uint32_t e_count = h_offsets[e + 1] - e_offset;
-        if (e_count == 0) continue;
-
-        const uint8_t *Wg_d = (const uint8_t *)gate_w + (uint64_t)e * gate_stride;
-        const uint8_t *Wg_sf = Wg_d + gate_data_bytes;
-        const uint8_t *Wu_d = (const uint8_t *)up_w + (uint64_t)e * gate_stride;
-        const uint8_t *Wu_sf = Wu_d + gate_data_bytes;
-        const uint8_t *Wd_d = (const uint8_t *)down_w + (uint64_t)e * down_stride;
-        const uint8_t *Wd_sf = Wd_d + down_data_bytes;
-
-        /* One expert can receive MORE than n_tokens pairs when routing carries
-         * duplicates (e.g. tid2eid -1 "dropped" entries all clamp to expert 0),
-         * but the gather/ffn scratch is sized for T_max = n_tokens rows -- so
-         * run the expert in <=T_max-row slices. Every row is computed
-         * independently (per-row GEMM dot products, per-row swiglu), so slicing
-         * is bit-identical to a single full-count pass; with well-formed
-         * routing (count <= n_tokens) this loop body runs exactly once with
-         * the same arguments as before. */
-        for (uint32_t done = 0; done < e_count; done += T_max) {
-            const uint32_t pair_offset = e_offset + done;
-            const uint32_t count = (e_count - done < T_max) ? (e_count - done) : T_max;
-
-            moe_cutlass_gather_kernel<<<count, 256>>>(x_gathered, w_gathered,
-                    (const float *)x->ptr, (const float *)weights->ptr,
-                    sorted_pairs, pair_offset, count, n_expert, expert_in_dim);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass gather launch")) return 0;
-
-            const int rc = pulsar_cutlass_expert_ffn_scratch(ffn_out, x_gathered,
-                    Wg_d, Wg_sf, Wu_d, Wu_sf, Wd_d, Wd_sf,
-                    w_gathered, clamp,
-                    (int)count, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                    ffn_scratch, ffn_scratch_bytes);
-            if (rc != 0) return 0;
-
-            moe_cutlass_scatter_kernel<<<count, 256>>>((float *)down->ptr, ffn_out,
-                    sorted_pairs, pair_offset, count, out_dim);
-            if (!cuda_ok(cudaGetLastError(), "routed_moe_cutlass scatter launch")) return 0;
-        }
-    }
-
-    const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
-    moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-            (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-    return cuda_ok(cudaGetLastError(), "routed_moe_cutlass sum launch");
-}
 
 
 
@@ -441,6 +208,10 @@ static int routed_moe_launch_cutlass(
  * group's block-scaled SF starts on a 128-row atom boundary (see pulsar_cutlass_grouped_moe). ---- */
 
 /* padded_offsets[e] = sum_{e'<e} ceil(counts[e']/128)*128 (per-group 128-row-padded row base). */
+/** Serial 128-row-padded group bases.  Grid 1; block 1 (only thread 0 works).
+ *  @param padded_off device [n_total] padded row base of each expert's group
+ *  @param counts     device [n_total] rows routed to each expert
+ *  @param n_total    experts */
 __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uint32_t *counts, uint32_t n_total) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     uint32_t run = 0;
@@ -452,9 +223,32 @@ __global__ static void moe_padded_offsets_kernel(uint32_t *padded_off, const uin
 
 /* One block per sorted-pair slot s: locate its expert e (offsets[e] <= s < offsets[e+1]), place
  * the token's activation row at padded row padded_off[e] + (s - offsets[e]), record the routing
- * weight and the originating pair index (padded_pair[R]) for the later scatter. */
+ * weight and the originating pair index (padded_pair[R]). The grouped path also records the
+ * INVERSE map (pair_slot[pair] = R) so its reduction reads the padded GEMM output directly;
+ * the mixed path passes pair_slot = NULL and still scatters through padded_pair. */
+/* row_src_tok[R] records which token row R came from, so a consumer that already
+ * has that token encoded (the CUTLASS path reads the activation cache's E4M3)
+ * can gather the codes itself.  When it does, x_gathered is NULL and the f32 row
+ * copy below -- the expensive half of this kernel -- is skipped entirely. */
+/** Places each sorted pair at its expert's padded row (see above).  Grid pair_count (one block per sorted slot);
+ *  block 256 (the row copy); no smem.
+ *  @param x_gathered  device f32 [padded][in_dim] gathered rows, or NULL: skip the f32 copy
+ *  @param w_gathered  device f32 [padded] routing weight per padded row
+ *  @param padded_pair device int32 [padded] originating pair per padded row (padding stays -1)
+ *  @param row_src_tok device int32 [padded] source token per padded row, or NULL
+ *  @param pair_slot   device int32 [pair_count] inverse map pair -> padded row, or NULL
+ *  @param x           device f32 [tokens][in_dim] input rows (read only with x_gathered)
+ *  @param weights     device f32 [pair_count] routing weights
+ *  @param sorted_pairs device [pair_count] pair indices, expert-major
+ *  @param offsets     device [n_total + 1] exclusive pair offsets per expert
+ *  @param padded_off  device [n_total] padded row bases per expert
+ *  @param pair_count  pairs (tokens x slots)
+ *  @param n_total     experts
+ *  @param n_expert    slots per token (pair = token * n_expert + slot)
+ *  @param in_dim      row width */
 __global__ static void moe_padded_gather_kernel(
-        float *x_gathered, float *w_gathered, int32_t *padded_pair,
+        float *x_gathered, float *w_gathered, int32_t *padded_pair, int32_t *row_src_tok,
+        int32_t *pair_slot,
         const float *x, const float *weights,
         const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *padded_off,
         uint32_t pair_count, uint32_t n_total, uint32_t n_expert, uint32_t in_dim) {
@@ -471,26 +265,144 @@ __global__ static void moe_padded_gather_kernel(
     uint32_t R = padded_off[e] + i;
     uint32_t pair = sorted_pairs[s];
     uint32_t tok = pair / n_expert;
-    const float *src = x + (uint64_t)tok * in_dim;
-    float *dst = x_gathered + (uint64_t)R * in_dim;
-    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
-    if (threadIdx.x == 0) { w_gathered[R] = weights[pair]; padded_pair[R] = (int32_t)pair; }
+    if (x_gathered) {
+        const float *src = x + (uint64_t)tok * in_dim;
+        float *dst = x_gathered + (uint64_t)R * in_dim;
+        for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) dst[k] = src[k];
+    }
+    if (threadIdx.x == 0) {
+        w_gathered[R] = weights[pair];
+        padded_pair[R] = (int32_t)pair;
+        if (pair_slot) pair_slot[pair] = (int32_t)R;
+        if (row_src_tok) row_src_tok[R] = (int32_t)tok;
+    }
+}
+
+/* Per-token reduction reading the grouped GEMM's 128-row-padded output
+ * DIRECTLY through the pair->padded-row map, in the same ascending-expert
+ * order as moe_sum_kernel: identical values, identical addition order,
+ * bit-exact. This is what lets the grouped path skip the scatter's full
+ * round trip of the flat down buffer (a write + re-read of
+ * n_tokens*n_expert*out_dim f32 per layer). Rows a pair never claimed carry
+ * -1, matching the padded_pair<0 convention, and contribute nothing. */
+/** Per-token MoE sum straight from the padded grouped output (see above).  Grid ceil(n_tokens * out_dim / 256);
+ *  block 256.
+ *  @param out       device f32 [n_tokens][out_dim]
+ *  @param ffn_out   device f32 [padded][out_dim] pre-weighted grouped GEMM output
+ *  @param pair_slot device int32 [n_tokens * n_expert] pair -> padded row (-1: none)
+ *  @param out_dim   output width
+ *  @param n_expert  slots per token
+ *  @param n_tokens  token rows
+ *  @param nf_code   non-finite flag code */
+__global__ static void moe_sum_padded_kernel(
+        float *out, const float *ffn_out, const int32_t *pair_slot,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t nf_code) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const int32_t R = pair_slot[(uint64_t)tok * n_expert + e];
+        if (R >= 0) acc += ffn_out[(uint64_t)R * out_dim + row];
+    }
+    moe_flag_nonfinite(acc, nf_code);
+    out[gid] = acc;
 }
 
 /* One block per padded row R: scatter the pre-weighted FFN result back to the flat down buffer at
  * its originating pair (padding rows carry padded_pair<0 and are skipped). */
+/* EMIT=false: plain padded-row -> pair-row copy (the down scatter and the
+ * historical mid path).  EMIT=true (L219): the mid leaf is emitted as E4M3
+ * here, from the same f32 values the deleted encode pass would have read.
+ * One block owns one padded row and warp w covers columns [k0 + 32w, ...),
+ * an aligned 32-block per step, so the block amax is a full-warp shuffle; the
+ * destination row is the PAIR row, which is the activation slot's row. */
+/** Padded row -> pair row scatter (see above).  Grid padded_total (one block per padded row); block a multiple
+ *  of 32 (256 at the call sites); EMIT needs whole warps over aligned 32-column blocks.
+ *  @tparam EMIT true: write E4M3 + E8M0 into the pair-row slot instead of the f32 row
+ *  @param down_flat    device f32 [pairs][out_dim] destination (EMIT false)
+ *  @param ffn_out      device f32 [padded_total][out_dim] source rows
+ *  @param padded_pair  device int32 [padded_total] pair per padded row (< 0: padding, skipped)
+ *  @param padded_total padded rows
+ *  @param out_dim      row width
+ *  @param eq           E4M3 destination rows [pairs][out_dim] (EMIT true)
+ *  @param esf          E8M0 scale slab, pulsar_mx_sfoff layout (EMIT true)
+ *  @param ekbp         the slab's padded blocks per row */
+template <bool EMIT>
 __global__ static void moe_padded_scatter_kernel(
         float *down_flat, const float *ffn_out, const int32_t *padded_pair,
-        uint32_t padded_total, uint32_t out_dim) {
+        uint32_t padded_total, uint32_t out_dim,
+        __nv_fp8_e4m3 *eq, unsigned char *esf, int ekbp) {
     uint32_t R = blockIdx.x;
     if (R >= padded_total) return;
     int32_t pair = padded_pair[R];
     if (pair < 0) return;
     const float *src = ffn_out + (uint64_t)R * out_dim;
-    float *dst = down_flat + (uint64_t)pair * out_dim;
-    for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
+    if constexpr (!EMIT) {
+        float *dst = down_flat + (uint64_t)pair * out_dim;
+        for (uint32_t k = threadIdx.x; k < out_dim; k += blockDim.x) dst[k] = src[k];
+    } else {
+        for (uint32_t k0 = 0; k0 < out_dim; k0 += blockDim.x) {
+            const uint32_t k = k0 + threadIdx.x;
+            const bool live = k < out_dim;
+            const float v = live ? src[k] : 0.0f;
+            float a = live ? fabsf(v) : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            const int se = pulsar_mx_shared_exp(a);
+            if (live) {
+                eq[(size_t)pair * out_dim + k] = pulsar_mx_encode(v, se);
+                if ((threadIdx.x & 31u) == 0u)
+                    esf[pulsar_mx_sfoff((int)pair, (int)(k >> 5), ekbp)] = pulsar_mx_scale_byte(se);
+            }
+        }
+    }
 }
 
+/* The device pointer for a whole routed-expert stack: `n_total` experts of
+ * `expert_bytes` each, back to back from `stack_offset`.  Every rank holds
+ * every expert (under TP, its half of each -- L241 4g-2), so the whole stack
+ * is the one request. */
+/** @param model_map    host base of the mapping
+ *  @param stack_offset byte offset of the stack
+ *  @param expert_bytes bytes per expert
+ *  @param n_total      experts in the stack
+ *  @param what         label for the range request
+ *  @return the device pointer to the whole stack, or NULL (empty stack or an unresolvable range) */
+static const char *routed_expert_stack_ptr(const void *model_map, uint64_t stack_offset,
+                                           uint64_t expert_bytes, uint32_t n_total,
+                                           const char *what) {
+    if (expert_bytes == 0 || n_total == 0) return NULL;
+    return cuda_model_range_ptr(model_map, stack_offset, (uint64_t)n_total * expert_bytes, what);
+}
+
+/** Uniform CUTLASS MXFP4 (type 40) routed MoE: sorted pairs, 128-row-padded gather, one grouped GEMM per
+ *  projection, the padded sum into out.  Needs the producer E4M3 of x (refuses without).  No host sync.
+ *  @param out             device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param down            device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map       host base of the model mapping the expert stacks live in
+ *  @param model_size      bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset     byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset       byte offset of the up stack
+ *  @param down_offset     byte offset of the down stack
+ *  @param gate_stride     bytes per gate / up expert (the stack stride)
+ *  @param gate_data_bytes gate / up data-plane bytes per expert (the scale plane follows)
+ *  @param down_stride     bytes per down expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param expert_in_dim   expert input width (the hidden size)
+ *  @param expert_mid_dim  expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim         expert output width
+ *  @param selected        device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights         device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert  experts present in the stacks
+ *  @param n_expert        routed slots per token (top-k)
+ *  @param clamp           SwiGLU clamp (<= 1e-6: none)
+ *  @param x               device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index     layer, for the non-finite / route-bounds flags
+ *  @param n_tokens        token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch_cutlass_grouped(
         pulsar_gpu_tensor *out,
         pulsar_gpu_tensor *down,
@@ -512,6 +424,7 @@ static int routed_moe_launch_cutlass_grouped(
         uint32_t n_expert,
         float clamp,
         const pulsar_gpu_tensor *x,
+        uint32_t layer_index,
         uint32_t n_tokens) {
     if (!out || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
@@ -531,71 +444,117 @@ static int routed_moe_launch_cutlass_grouped(
         down_total_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total_bytes, "moe_grouped_gate");
-    const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total_bytes, "moe_grouped_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total_bytes, "moe_grouped_down");
+    const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_stride, n_total_expert,
+                                                 "moe_grouped_gate");
+    const char *up_w   = routed_expert_stack_ptr(model_map, up_offset, gate_stride, n_total_expert,
+                                                 "moe_grouped_up");
+    const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_stride, n_total_expert,
+                                                 "moe_grouped_down");
     if (!gate_w || !up_w || !down_w) return 0;
+    /* PLAN 94 phase 1: the expert ADDRESSES become data (mxfp4_expert_table).
+     * Built from the same arithmetic the grouped setup used to perform, so this
+     * is bit-identical; phase 2 changes only what fills the tables. */
+    const uint8_t *const *gate_tab = mxfp4_expert_table(gate_w, gate_stride, n_total_expert);
+    const uint8_t *const *up_tab   = mxfp4_expert_table(up_w,   gate_stride, n_total_expert);
+    const uint8_t *const *down_tab = mxfp4_expert_table(down_w, down_stride, n_total_expert);
+    if (!gate_tab || !up_tab || !down_tab) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
     /* Host upper bound on padded rows: every active expert adds <=127 padding; round to 128. */
     const uint64_t padded_upper = (((uint64_t)pair_count + 128ull * n_total_expert + 127ull) / 128ull) * 128ull;
+
+    /* The norm that produced x already emitted its E4M3 + ue8m0 encoding. When
+     * it is still cached we hand it to the grouped GEMM and gather the 1-byte
+     * codes, which drops both the f32 row copy here and the re-encode there --
+     * the same values, encoded once instead of twice. A miss is not an error;
+     * it just means we take the f32 path we always took. */
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    const bool cached_act = pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim,
+                                                                &act_q, &act_sf, &act_kbp) != 0;
 
     const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
     const uint64_t offsets_bytes = ((uint64_t)n_total_expert + 1) * sizeof(uint32_t);
     const uint64_t cursors_bytes = counts_bytes;
     const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
     const uint64_t padoff_bytes = counts_bytes;
-    const uint64_t xg_bytes = padded_upper * expert_in_dim * sizeof(float);
+    /* No f32 gather buffer at all on the cached path -- nothing reads it. */
+    /* L158 inc 5: x arrives as the producer's E4M3 or the MoE refuses; the f32
+     * gather buffer that stood in for a missing encoding is gone. */
+    if (!cached_act) {
+        fprintf(stderr, "pulsar: routed MoE grouped: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                expert_in_dim, n_tokens);
+        return 0;
+    }
     const uint64_t wg_bytes = padded_upper * sizeof(float);
     const uint64_t ppair_bytes = padded_upper * sizeof(int32_t);
+    const uint64_t pslot_bytes = (uint64_t)pair_count * sizeof(int32_t);
+    const uint64_t rsrc_bytes = cached_act ? padded_upper * sizeof(int32_t) : 0;
     const uint64_t ffn_bytes = padded_upper * out_dim * sizeof(float);
     const uint64_t grp_bytes = pulsar_cutlass_grouped_moe_scratch_bytes(
             (int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim);
 
     const uint64_t align = 256;
-    uint64_t off = 0;
-    const uint64_t counts_off = off;  off = cutlass_moe_align_up(off + counts_bytes, align);
-    const uint64_t offsets_off = off; off = cutlass_moe_align_up(off + offsets_bytes, align);
-    const uint64_t cursors_off = off; off = cutlass_moe_align_up(off + cursors_bytes, align);
-    const uint64_t sorted_off = off;  off = cutlass_moe_align_up(off + sorted_bytes, align);
-    const uint64_t padoff_off = off;  off = cutlass_moe_align_up(off + padoff_bytes, align);
-    const uint64_t xg_off = off;      off = cutlass_moe_align_up(off + xg_bytes, align);
-    const uint64_t wg_off = off;      off = cutlass_moe_align_up(off + wg_bytes, align);
-    const uint64_t ppair_off = off;   off = cutlass_moe_align_up(off + ppair_bytes, align);
-    const uint64_t ffn_off = off;     off = cutlass_moe_align_up(off + ffn_bytes, align);
-    const uint64_t grp_off = off;     off = cutlass_moe_align_up(off + grp_bytes, align);
-    const uint64_t total_scratch = off;
+    /* Eleven buffers from one reservation.  Two are used only on one side of
+     * `cached_act`, but BOTH are still taken so the layout is independent of
+     * that flag -- the old code reserved space for both unconditionally and only
+     * the POINTERS were conditional, and keeping that property means this
+     * conversion cannot change what any kernel sees. */
+    const uint64_t total_scratch =
+        cutlass_moe_align_up(counts_bytes, align) +
+        cutlass_moe_align_up(offsets_bytes, align) +
+        cutlass_moe_align_up(cursors_bytes, align) +
+        cutlass_moe_align_up(sorted_bytes, align) +
+        cutlass_moe_align_up(padoff_bytes, align) +
+        cutlass_moe_align_up(wg_bytes, align) +
+        cutlass_moe_align_up(ppair_bytes, align) +
+        cutlass_moe_align_up(pslot_bytes, align) +
+        cutlass_moe_align_up(rsrc_bytes, align) +
+        cutlass_moe_align_up(ffn_bytes, align) +
+        cutlass_moe_align_up(grp_bytes, align);
 
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(total_scratch, "routed_moe grouped");
-    if (!scratch) return 0;
-
-    uint32_t *counts = (uint32_t *)(scratch + counts_off);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_off);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_off);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_off);
-    uint32_t *padded_off = (uint32_t *)(scratch + padoff_off);
-    float *x_gathered = (float *)(scratch + xg_off);
-    float *w_gathered = (float *)(scratch + wg_off);
-    int32_t *padded_pair = (int32_t *)(scratch + ppair_off);
-    float *ffn_out = (float *)(scratch + ffn_off);
-    uint8_t *grp_scratch = scratch + grp_off;
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, total_scratch, "routed_moe grouped")) return 0;
+    uint32_t *counts       = (uint32_t *)cuda_arena_take(&ar, counts_bytes, align);
+    uint32_t *offsets      = (uint32_t *)cuda_arena_take(&ar, offsets_bytes, align);
+    uint32_t *cursors      = (uint32_t *)cuda_arena_take(&ar, cursors_bytes, align);
+    uint32_t *sorted_pairs = (uint32_t *)cuda_arena_take(&ar, sorted_bytes, align);
+    uint32_t *padded_off   = (uint32_t *)cuda_arena_take(&ar, padoff_bytes, align);
+    float    *w_gathered   = (float *)cuda_arena_take(&ar, wg_bytes, align);
+    int32_t  *padded_pair  = (int32_t *)cuda_arena_take(&ar, ppair_bytes, align);
+    int32_t  *pair_slot    = (int32_t *)cuda_arena_take(&ar, pslot_bytes, align);
+    int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_bytes, align);
+    float    *ffn_out      = (float *)cuda_arena_take(&ar, ffn_bytes, align);
+    uint8_t  *grp_scratch  = (uint8_t *)cuda_arena_take(&ar, grp_bytes, align);
+    if (!grp_scratch) return 0;   /* take() latches: one check covers all eleven */
 
     const int32_t *selected_ptr = (const int32_t *)selected->ptr;
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "moe_grouped counts clear");
+    /* L119: Async — the sync form is a stream-capture violation and this path
+     * is reached by captured decode segments at rows > 8 (same stream, same
+     * ordering; behavior unchanged). */
+    int ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes), "moe_grouped counts clear");
     /* padding rows must be zeroed (pack sees clean data) and unmapped (padded_pair = -1). */
-    if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_bytes), "moe_grouped xg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_bytes), "moe_grouped wg clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_bytes), "moe_grouped ppair clear");
+    /* -1: a pair the gather never claims must read as "no row" in the padded
+     * sum, not as padded row 0. Every real pair is written by the gather. */
+    if (ok) ok = cuda_ok(cudaMemsetAsync(pair_slot, 0xFF, pslot_bytes), "moe_grouped pslot clear");
+    /* -1 everywhere: rows the gather never visits ARE the padding rows, and the
+     * E4M3 gather zero-fills exactly those (what the pre-zeroed f32 rows gave). */
+    if (ok && row_src_tok) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_bytes),
+                                        "moe_grouped rsrc clear");
     if (ok) {
-        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+        moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_COUNT));
         ok = cuda_ok(cudaGetLastError(), "moe_grouped count launch");
     }
     if (ok) {
-        moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+        moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped prefix launch");
     }
     if (ok) {
-        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+        moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
+                n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_GROUPED_SCATTER));
         ok = cuda_ok(cudaGetLastError(), "moe_grouped scatter launch");
     }
     if (ok) {
@@ -603,34 +562,59 @@ static int routed_moe_launch_cutlass_grouped(
         ok = cuda_ok(cudaGetLastError(), "moe_grouped padded offsets launch");
     }
     if (ok) {
-        moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair,
+        moe_padded_gather_kernel<<<pair_count, 256>>>(NULL /* no f32 rows */, w_gathered, padded_pair, row_src_tok,
+                pair_slot,
                 (const float *)x->ptr, (const float *)weights->ptr,
                 sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
         ok = cuda_ok(cudaGetLastError(), "moe_grouped gather launch");
     }
     if (ok) {
-        int rc = pulsar_cutlass_grouped_moe(ffn_out, x_gathered, w_gathered,
-                (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
-                gate_stride, gate_data_bytes, down_stride, down_data_bytes,
+        int rc = pulsar_cutlass_grouped_moe(ffn_out, NULL /* x arrives as E4M3 */, w_gathered,
+                gate_tab, up_tab, down_tab,
+                gate_data_bytes, down_data_bytes,
                 clamp, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
-                counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes);
+                counts, padded_off, (int)padded_upper, grp_scratch, grp_bytes,
+                act_q, act_sf, act_kbp, row_src_tok);
         if (rc != 0) return 0;
-    }
-    if (ok) {
-        moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>((float *)down->ptr, ffn_out,
-                padded_pair, (uint32_t)padded_upper, out_dim);
-        ok = cuda_ok(cudaGetLastError(), "moe_grouped padded scatter launch");
     }
     if (!ok) return 0;
 
+    /* Reduce straight from the padded GEMM output through pair_slot -- the
+     * flat `down` buffer is NOT touched on this path (its scatter + re-read
+     * used to move 2*n_tokens*n_expert*out_dim f32 per layer for nothing).
+     * The MMQ down arm still writes `down`. */
     const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
-    moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-            (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-    return cuda_ok(cudaGetLastError(), "moe_grouped sum launch");
+    moe_sum_padded_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+            (float *)out->ptr, ffn_out, pair_slot, out_dim, n_expert, n_tokens,
+            moe_nonfinite_code(layer_index, MOE_NF_ARM_GROUPED_DOWN));
+    return cuda_ok(cudaGetLastError(), "moe_grouped padded sum launch");
 }
 
-/* A/B dispatcher: PULSAR_MOE_FP4_GROUPED=0 forces the legacy per-expert loop (routed_moe_launch_cutlass);
- * default (unset or !=0) uses the grouped single-launch path. Same result, bit-exact. */
+/* Grouped single-launch path; a failed grouped call is a failed MoE step. */
+/** Calls routed_moe_launch_cutlass_grouped and names a failure once on stderr (no fallback).
+ *  @param out             device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param down            device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map       host base of the model mapping the expert stacks live in
+ *  @param model_size      bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset     byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset       byte offset of the up stack
+ *  @param down_offset     byte offset of the down stack
+ *  @param gate_stride     bytes per gate / up expert (the stack stride)
+ *  @param gate_data_bytes gate / up data-plane bytes per expert (the scale plane follows)
+ *  @param down_stride     bytes per down expert
+ *  @param down_data_bytes down data-plane bytes per expert
+ *  @param expert_in_dim   expert input width (the hidden size)
+ *  @param expert_mid_dim  expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim         expert output width
+ *  @param selected        device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights         device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert  experts present in the stacks
+ *  @param n_expert        routed slots per token (top-k)
+ *  @param clamp           SwiGLU clamp (<= 1e-6: none)
+ *  @param x               device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index     layer, for the non-finite / route-bounds flags
+ *  @param n_tokens        token rows
+ *  @return 1 on success, 0 on failure */
 static int routed_moe_launch_cutlass_dispatch(
         pulsar_gpu_tensor *out, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -638,48 +622,25 @@ static int routed_moe_launch_cutlass_dispatch(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    static int grouped = -1;
-    if (grouped < 0) {
-        const char *e = getenv("PULSAR_MOE_FP4_GROUPED");
-        grouped = !(e && e[0] == '0');
-    }
-    if (grouped) {
-        int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
-                gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
-                down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
-                selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
-        {
-            static int glog = -1;
-            if (glog < 0) glog = getenv("PULSAR_MOE_GROUPED_LOG") != NULL ? 1 : 0;
-            static int logged = 0;
-            if (glog && !logged) { logged = 1;
-                fprintf(stderr, "pulsar: moe grouped path rc=%d n_tok=%u n_total=%u n_exp=%u -> %s\n",
-                        rc, n_tokens, n_total_expert, n_expert, rc ? "USED grouped" : "FELL BACK to per-expert"); }
-        }
-        if (rc) return rc;   /* any failure falls through to the legacy loop (safety net) */
-    }
-    /* Reached only when the grouped path was disabled or failed -> the ~4x
-     * slower per-expert loop.  Announce once, unconditionally (was gated behind
-     * the unset PULSAR_MOE_GROUPED_LOG), so this slow tier is never silent. */
-    {
-        static int fb_logged = 0;
-        if (!fb_logged) { fb_logged = 1;
-            fprintf(stderr,
-                    "pulsar: WARNING MoE grouped GEMM %s -> per-expert loop (~4x slower prefill)\n",
-                    grouped ? "failed" : "disabled");
-        }
-    }
-    return routed_moe_launch_cutlass(out, down, model_map, model_size,
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+    /* The grouped GEMM is the only path for this shape.  A failure here is a
+     * failure. */
+    const int rc = routed_moe_launch_cutlass_grouped(out, down, model_map, model_size,
             gate_offset, up_offset, down_offset, gate_stride, gate_data_bytes,
             down_stride, down_data_bytes, expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+            selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+    if (!rc) {
+        static pulsar_shape_once seen = {};
+        if (pulsar_shape_once_first(&seen, pulsar_shape_key(n_tokens, n_expert), "MoE grouped GEMM")) { fprintf(stderr, "pulsar: MoE grouped GEMM failed (n_tok=%u n_total=%u n_exp=%u) -- no fallback; refusing\n",
+                                       n_tokens, n_total_expert, n_expert); }
+    }
+    return rc;
 }
 
 
 
 /* ---- MIXED type-40 (CUTLASS W4A8) + type-43 (MMQ) layer dispatch. --------------------------------
- * Some layers have ONE projection as CUTLASS MXFP4 (type 40) and the other as IQ2_XXS_MMQ (type 43);
+ * Some layers have ONE projection as CUTLASS MXFP4 (type 40) and the other as IQ2_XXS_MMQ_K (type 44);
  * the artifact has 7 such layers (4x gate=40/down=43, 3x gate=43/down=40). The grouped path needs
  * all-three-same-type and CUTLASS cannot read the MMQ layout (or vice versa), so we run each
  * projection in its native precision and compose in f32. The CUTLASS side runs as a GROUPED
@@ -687,67 +648,81 @@ static int routed_moe_launch_cutlass_dispatch(
  * device-built ptr-array, NO host readback, NO per-expert sync -- the same machinery the uniform
  * grouped path uses. The MMQ side stays in the per-(token,expert) pair layout; padded gather/scatter
  * bridge the two:
- *   Case A (gate/up type-40, down type-43): padded-gather x -> grouped W4A8 gate & up GEMMs -> swiglu
- *     (+routing weight) on the gathered rows -> padded-scatter mid into pair layout -> MMQ down per
- *     pair (takes mid as f32, does its own q8_1) -> moe_sum.
+ *   Case A (gate/up type-40, down type-43): gather the producer's E4M3 x -> grouped W4A8 gate & up
+ *     GEMMs -> swiglu (+routing weight) on the gathered rows -> padded-scatter mid into pair layout
+ *     -> the MoE stage emits mid's E4M3 once -> MMQ down per pair reads that encoding -> moe_sum.
  *   Case B (gate/up type-43, down type-40): MMQ gate/up per pair (fused swiglu) -> padded-gather mid
  *     -> grouped W4A8 down GEMM -> padded-scatter into pair layout -> moe_sum.
  * The grouped CUTLASS projection is bit-identical to the per-expert single-proj path it replaces
  * (same pack + same g_build_arrays gather order + same GEMM, just batched). No cross-contamination:
  * each projection reads only its own weight/SF and its own activation quant.
  *
- * Both MMQ arms fail closed if MMQ declines: the dp4a kernels that used to back them up are gone
- * with types 16/42/39/10, and no other reader understands the aligned layout. */
+ * Both MMQ arms fail closed if MMQ declines; no other reader understands the aligned layout. */
+/** mid_g = swiglu(gate_g, up_g) * w over gathered rows.  Grid ceil(n_rows * mid_dim / 256); block 256;
+ *  one element a thread.
+ *  @param mid_g   device f32 [n_rows][mid_dim] output
+ *  @param gate_g  device f32 [n_rows][mid_dim] gate
+ *  @param up_g    device f32 [n_rows][mid_dim] up
+ *  @param w_g     device f32 [n_rows] routing weight per row
+ *  @param clamp   SwiGLU clamp
+ *  @param mid_dim row width
+ *  @param n_rows  rows */
 __global__ static void moe_swiglu_gathered_kernel(
         float *mid_g, const float *gate_g, const float *up_g, const float *w_g,
         float clamp, uint32_t mid_dim, uint32_t n_rows) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_rows * mid_dim;
     if (i >= n) return;
-    float g = gate_g[i], u = up_g[i];
-    if (clamp > 1.0e-6f) { if (g > clamp) g = clamp; if (u > clamp) u = clamp; if (u < -clamp) u = -clamp; }
-    mid_g[i] = (g / (1.0f + expf(-g))) * u * w_g[i / mid_dim];   /* same order as qwarp32 line 487 */
+    mid_g[i] = pulsar_swiglu_elem(gate_g[i], up_g[i], w_g[i / mid_dim], clamp);
 }
 
-/* 128-padded gather of a PAIR-LAYOUT f32 buffer (src[pair*dim]) into the grouped-GEMM activation
- * layout -- the mid-side companion to moe_padded_gather_kernel (which gathers per-TOKEN x). One block
- * per sorted-pair slot s: locate its expert e, place the row at padded_off[e]+(s-offsets[e]), record
- * the originating pair for the later padded scatter. Used to feed the CUTLASS down GEMM in case B. */
-__global__ static void moe_padded_gather_pairflat_kernel(
-        float *dst, int32_t *padded_pair, const float *src_pairflat,
-        const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *padded_off,
-        uint32_t pair_count, uint32_t n_total, uint32_t dim) {
-    uint32_t s = blockIdx.x;
-    if (s >= pair_count) return;
-    uint32_t lo = 0, hi = n_total;
-    while (lo < hi) { uint32_t m = (lo + hi) >> 1; if (offsets[m] <= s) lo = m + 1; else hi = m; }
-    uint32_t e = lo - 1u;
-    uint32_t R = padded_off[e] + (s - offsets[e]);
-    uint32_t pair = sorted_pairs[s];
-    const float *src = src_pairflat + (uint64_t)pair * dim;
-    float *d = dst + (uint64_t)R * dim;
-    for (uint32_t k = threadIdx.x; k < dim; k += blockDim.x) d[k] = src[k];
-    if (threadIdx.x == 0) padded_pair[R] = (int32_t)pair;
-}
 
 #ifdef PULSAR_HAVE_MMQ
 /* both defined below, next to each other */
-static int routed_moe_try_mmq_gate_up(float *mid_out, float *gate_scratch,
+static int routed_moe_try_mmq_gate_up(pulsar_gpu_tensor *mid, float *gate_scratch,
                                       const char *gate_w, const char *up_w,
                                       const float *x_f32, const int32_t *selected_ptr,
                                       const float *weights_ptr, uint32_t gate_type,
                                       uint32_t expert_in_dim, uint32_t expert_mid_dim,
                                       uint32_t n_total_expert, uint32_t n_expert,
                                       uint32_t n_tokens, float clamp);
-static int routed_moe_try_mmq_down(float *down_out, const float *mid_f32,
+static int routed_moe_try_mmq_down(float *down_out,
                                    const char *down_w, const int32_t *selected_ptr,
                                    uint32_t down_type, uint32_t expert_mid_dim,
                                    uint32_t out_dim, uint32_t n_total_expert,
-                                   uint64_t pairs);
+                                   uint64_t pairs, const void *mid_q, const void *mid_sf, int mid_kbp);
 #endif
 
+/** Mixed layer: one side CUTLASS MXFP4 (type 40), the other IQ2_XXS MMQ (cases A / B above); fail-closed.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
 static int routed_moe_launch_mixed40(
-        pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *out, pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -757,9 +732,9 @@ static int routed_moe_launch_mixed40(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const pulsar_gpu_tensor *x, uint32_t n_tokens) {
-    const int caseA = (gate_type == 40u);       /* gate/up type-40, down MMQ-43 */
-    const int caseB = (down_type == 40u);       /* gate/up MMQ-43, down type-40 */
+        const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+    const int caseA = (gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4);   /* gate/up MXFP4, down MMQ */
+    const int caseB = (down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4);   /* gate/up MMQ, down MXFP4 */
     if (caseA == caseB) return 0;               /* exactly one side must be cutlass */
     /* ...and the OTHER side must be type 43, the only non-cutlass expert format
      * left.  This is where the artifact's 7 mixed layers land (4x gate=40/
@@ -771,14 +746,13 @@ static int routed_moe_launch_mixed40(
      * dispatch below is a chain keyed on a type tag, and every silent misread
      * this file has produced came from such a chain ACCEPTING an unknown tag and
      * reading its bytes as the last arm's format.  An allowlist cannot do that. */
-    if ((caseA ? down_type : gate_type) != 43u) return 0;
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+    if ((caseA ? down_type : gate_type) != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0) return 0;
     if (mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float) ||
-        gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)) return 0;
 
     const uint32_t pair_count = n_tokens * n_expert;
@@ -790,20 +764,16 @@ static int routed_moe_launch_mixed40(
     const uint64_t nact = (n_total_expert < pair_count) ? (uint64_t)n_total_expert : (uint64_t)pair_count;
     const uint64_t padded_upper = (((uint64_t)pair_count + 128ull * nact + 127ull) / 128ull) * 128ull;
     /* the CUTLASS side's inner (K) dim: in_dim for gate/up (A), mid_dim for down (B) */
-    const uint32_t cut_k = caseA ? expert_in_dim : expert_mid_dim;
-    /* Small batches (decode n=1, spec-verify n<=4) use the PER-EXPERT single-proj CUTLASS path: the
-     * 128-padded grouped buffer would be almost all padding (few tokens spread over many experts),
-     * so its memset/pack/grouped-launch overhead dominates. Big batches (prefill) use the grouped,
-     * no-host-sync path. `rows` sizes the gather/proj buffers for whichever path is active. */
-    /* plan-34 inc 2: a batched multiseq/mixed step forces the M-INDEPENDENT
-     * per-token (non-grouped) path across the whole row range (<=PULSAR_MSEQ_MAX=8):
-     * the grouped path's per-expert group sizes depend on the batch composition,
-     * so a co-scheduled decode bank's expert output would shift with the batch
-     * width. The non-grouped CUTLASS proj uses fixed compile-time tiles (per-row
-     * output independent of M); buffers are sized by n_tokens, so 5..8 are safe.
-     * Classic prefill (never armed) keeps the grouped, no-host-sync path at >4. */
-    const int use_grouped = pulsar_gpu_matmul_batch_mneutral()
-            ? (n_tokens > 8u) : (n_tokens > 4u);
+    /* Row KIND chooses (pulsar_gpu_matmul_batch_decode_rows, pulsar_gpu.h;
+     * the two-pass split in routed_moe_batch_impl leaves the count at 0 or
+     * >= n_tokens here).  Decode rows take the pair-layout W4A8 GEMV (L219,
+     * the else-arms below; no CUTLASS): each row's output independent of the
+     * batch.  Prefill rows take the grouped, no-host-sync path at any
+     * n_tokens, whose per-expert group sizes -- and therefore its numerics --
+     * depend on the batch composition.  (Row count chose this until L167: > 4
+     * unarmed, > 16 armed.)  `rows` sizes the gather/proj buffers for
+     * whichever path is active. */
+    const int use_grouped = pulsar_gpu_matmul_batch_decode_rows() == 0;
     const uint64_t rows = use_grouped ? padded_upper : (uint64_t)n_tokens;
 
     /* model weight bases */
@@ -823,106 +793,78 @@ static int routed_moe_launch_mixed40(
     const uint64_t cursors_b = counts_b;
     const uint64_t sorted_b  = (uint64_t)pair_count * sizeof(uint32_t);
     const uint64_t padoff_b  = counts_b;
-    const uint64_t xg_b   = rows * cut_k * sizeof(float);              /* gathered x(A)/mid(B) */
     const uint64_t wg_b   = rows * sizeof(float);                      /* routing weights (A) */
     const uint64_t ppair_b= rows * sizeof(int32_t);
     const uint64_t gg_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* gate_g (A) */
     const uint64_t ug_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* up_g   (A) */
     const uint64_t mg_b   = caseA ? rows * expert_mid_dim * sizeof(float) : 0;  /* mid_g  (A) */
     const uint64_t og_b   = caseB ? rows * out_dim * sizeof(float) : 0;         /* out_g  (B) */
+    /* row_src_tok: only the caseA GROUPED arm gathers x, so only it can take the
+     * producer handover.  caseB's grouped_proj consumes mid_g, which the GPU
+     * just computed and no norm ever encoded. */
+    const uint64_t rsrc_b = (use_grouped && caseA) ? rows * sizeof(int32_t) : 0;
     const uint64_t proj_b = use_grouped
         ? (caseA ? pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim)
                  : pulsar_cutlass_grouped_proj_scratch_bytes((int)padded_upper, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim))
         : (caseA ? pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_in_dim, (int)expert_mid_dim)
                  : pulsar_cutlass_proj_scratch_bytes((int)n_tokens, (int)expert_mid_dim, (int)out_dim));
 
-    uint64_t off = 0;
-    const uint64_t counts_o  = off; off = cutlass_moe_align_up(off + counts_b, A);
-    const uint64_t offsets_o = off; off = cutlass_moe_align_up(off + offsets_b, A);
-    const uint64_t cursors_o = off; off = cutlass_moe_align_up(off + cursors_b, A);
-    const uint64_t sorted_o  = off; off = cutlass_moe_align_up(off + sorted_b, A);
-    const uint64_t padoff_o  = off; off = cutlass_moe_align_up(off + padoff_b, A);
-    const uint64_t xg_o   = off; off = cutlass_moe_align_up(off + xg_b, A);
-    const uint64_t wg_o   = off; off = cutlass_moe_align_up(off + wg_b, A);
-    const uint64_t ppair_o= off; off = cutlass_moe_align_up(off + ppair_b, A);
-    const uint64_t gg_o   = off; off = cutlass_moe_align_up(off + gg_b, A);
-    const uint64_t ug_o   = off; off = cutlass_moe_align_up(off + ug_b, A);
-    const uint64_t mg_o   = off; off = cutlass_moe_align_up(off + mg_b, A);
-    const uint64_t og_o   = off; off = cutlass_moe_align_up(off + og_b, A);
-    const uint64_t proj_o = off; off = cutlass_moe_align_up(off + proj_b, A);
-    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(off, "routed_moe mixed40");
-    if (!scratch) return 0;
+    /* Fourteen buffers from one reservation.  The last four (gate/up/mid/out
+     * gathers) are consumed further down; they are TAKEN here with the rest so
+     * every slice comes from one bump sequence rather than being reconstructed
+     * from a saved offset at the point of use -- which is the pattern that lets
+     * a stale offset survive a layout change.
+     *
+     * The bump itself belongs to cuda_arena_take.  A `uint64_t off = 0` stood
+     * here from the hand-rolled version it replaced; nvcc had been reporting it
+     * unreferenced, and the count in this comment said twelve while the note
+     * below said thirteen and the code took fourteen. */
+    const uint64_t total_scratch =
+        cutlass_moe_align_up(counts_b, A)  + cutlass_moe_align_up(offsets_b, A) +
+        cutlass_moe_align_up(cursors_b, A) + cutlass_moe_align_up(sorted_b, A) +
+        cutlass_moe_align_up(padoff_b, A)  +
+        cutlass_moe_align_up(wg_b, A)      + cutlass_moe_align_up(ppair_b, A) +
+        cutlass_moe_align_up(gg_b, A)      + cutlass_moe_align_up(ug_b, A) +
+        cutlass_moe_align_up(mg_b, A)      + cutlass_moe_align_up(og_b, A) +
+        cutlass_moe_align_up(rsrc_b, A)    + cutlass_moe_align_up(proj_b, A);
 
-    uint32_t *counts  = (uint32_t *)(scratch + counts_o);
-    uint32_t *offsets = (uint32_t *)(scratch + offsets_o);
-    uint32_t *cursors = (uint32_t *)(scratch + cursors_o);
-    uint32_t *sorted_pairs = (uint32_t *)(scratch + sorted_o);
-    uint32_t *padded_off = (uint32_t *)(scratch + padoff_o);
-    float   *x_gathered = (float *)(scratch + xg_o);
-    float   *w_gathered = (float *)(scratch + wg_o);
-    int32_t *padded_pair = (int32_t *)(scratch + ppair_o);
-    float *mid_flat = (float *)mid->ptr;        /* pair-layout mid accumulator */
+    cuda_arena ar;
+    if (!cuda_arena_begin(&ar, total_scratch, "routed_moe mixed40")) return 0;
+    uint32_t *counts       = (uint32_t *)cuda_arena_take(&ar, counts_b, A);
+    uint32_t *offsets      = (uint32_t *)cuda_arena_take(&ar, offsets_b, A);
+    uint32_t *cursors      = (uint32_t *)cuda_arena_take(&ar, cursors_b, A);
+    uint32_t *sorted_pairs = (uint32_t *)cuda_arena_take(&ar, sorted_b, A);
+    uint32_t *padded_off   = (uint32_t *)cuda_arena_take(&ar, padoff_b, A);
+    float    *w_gathered   = (float *)cuda_arena_take(&ar, wg_b, A);
+    int32_t  *padded_pair  = (int32_t *)cuda_arena_take(&ar, ppair_b, A);
+    float    *gate_g_buf   = (float *)cuda_arena_take(&ar, gg_b, A);
+    float    *up_g_buf     = (float *)cuda_arena_take(&ar, ug_b, A);
+    float    *mid_g_buf    = (float *)cuda_arena_take(&ar, mg_b, A);
+    float    *out_g_buf    = (float *)cuda_arena_take(&ar, og_b, A);
+    int32_t  *row_src_tok  = (int32_t *)cuda_arena_take(&ar, rsrc_b, A);
+    uint8_t  *proj_scratch = (uint8_t *)cuda_arena_take(&ar, proj_b, A);
+    if (!proj_scratch) return 0;  /* take() latches: one check covers all fourteen */
+    float *mid_flat = (float *)mid->ptr;        /* f32 mid scratch: MMQ raw up on the MMQ arms;
+                                                 * every arm's folded leaf is E4M3 in mid's slot (L219) */
     float *down_flat = (float *)down->ptr;      /* pair-layout down accumulator */
-    uint8_t *proj_scratch = scratch + proj_o;
 
-    /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1). */
-    int ok = cuda_ok(cudaMemset(counts, 0, counts_b), "mixed40 counts clear");
-    if (ok) ok = cuda_ok(cudaMemsetAsync(x_gathered, 0, xg_b), "mixed40 xg clear");
+    /* padding rows: zeroed (pack sees clean data) + unmapped (padded_pair=-1).
+     * L119: Async like its four siblings — the synchronous form is a CUDA
+     * stream-capture violation and this clear runs on every decode round's
+     * mixed-type layers (same stream, same ordering; behavior unchanged). */
+    int ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_b), "mixed40 counts clear");
     if (ok) ok = cuda_ok(cudaMemsetAsync(padded_pair, 0xFF, ppair_b), "mixed40 ppair clear");
+    /* -1 everywhere: rows the gather never visits ARE the padding rows, and the
+     * E4M3 gather zero-fills exactly those (what pre-zeroed f32 rows gave). */
+    if (ok && rsrc_b) ok = cuda_ok(cudaMemsetAsync(row_src_tok, 0xFF, rsrc_b), "mixed40 rsrc clear");
     if (ok && caseA) ok = cuda_ok(cudaMemsetAsync(w_gathered, 0, wg_b), "mixed40 wg clear");
-    if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count);
+    if (ok) { moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(counts, selected_ptr, pair_count,
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_COUNT));
               ok = cuda_ok(cudaGetLastError(), "mixed40 count"); }
-    /* PULSAR_MOE_OVERLAP: expert-set overlap probe (read-only diagnostic).
-     *
-     * Three spec levers died on "wider spec batches don't amortize on our
-     * bandwidth-bound decode" (BlockV #1, DTree #33, HybridLC #74). The ledger
-     * blames verify running the prefill batch path, but that path is the
-     * bandwidth-FAVOURABLE one -- it reads each dense weight once for all rows.
-     * The likelier wall is MoE expert-set growth: M rows route to up to M*top_k
-     * DISTINCT experts, and routed experts dominate model bytes.
-     *
-     * This measures it directly. `counts[e]` already holds rows-per-expert, so
-     * SUM = pair_count = rows * top_k, and UNION = #{e : counts[e] > 0}. If
-     * union is far below sum, drafts already share experts and the ceiling for
-     * "expert-coherent drafting" is low; if union tracks sum, each extra verify
-     * row really does drag in its own expert weights and there is headroom.
-     *
-     * Costs a sync + copy, so it is OFF unless asked for and never on a
-     * measured path. Changes no computation. */
-    static int overlap_env = -1;
-    if (overlap_env < 0) overlap_env = getenv("PULSAR_MOE_OVERLAP") != NULL;
-    if (ok && overlap_env && n_tokens > 0) {
-        uint32_t *h_counts = (uint32_t *)malloc((size_t)n_total_expert * sizeof(uint32_t));
-        if (h_counts) {
-            if (cudaMemcpy(h_counts, counts,
-                           (size_t)n_total_expert * sizeof(uint32_t),
-                           cudaMemcpyDeviceToHost) == cudaSuccess) {
-                uint32_t distinct = 0, maxc = 0;
-                uint64_t total = 0;
-                for (uint32_t e = 0; e < n_total_expert; e++) {
-                    if (h_counts[e]) { distinct++; total += h_counts[e]; }
-                    if (h_counts[e] > maxc) maxc = h_counts[e];
-                }
-                /* saturation = distinct / min(sum, n_total_expert): 1.0 means
-                 * every routed slot pulled a different expert (no sharing). */
-                const uint32_t ceil_distinct =
-                        (uint64_t)pair_count < (uint64_t)n_total_expert
-                        ? pair_count : n_total_expert;
-                fprintf(stderr,
-                        "pulsar: MOE-OVERLAP rows=%u top_k=%u sum=%u "
-                        "distinct=%u of %u experts (saturation %.3f of the "
-                        "%u reachable) max_rows_per_expert=%u\n",
-                        n_tokens, n_expert, pair_count, distinct,
-                        n_total_expert,
-                        ceil_distinct ? (double)distinct / (double)ceil_distinct : 0.0,
-                        ceil_distinct, maxc);
-            }
-            free(h_counts);
-        }
-    }
-    if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, n_total_expert);
+    if (ok) { moe_prefix_sorted_pairs_kernel<<<1, 256>>>(offsets, cursors, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 prefix"); }
-    if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count);
+    if (ok) { moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(sorted_pairs, cursors, selected_ptr, pair_count,
+              n_total_expert, moe_route_oob_code(layer_index, MOE_OOB_ARM_MIXED_SCATTER));
               ok = cuda_ok(cudaGetLastError(), "mixed40 scatter"); }
     if (ok) { moe_padded_offsets_kernel<<<1, 1>>>(padded_off, counts, n_total_expert);
               ok = cuda_ok(cudaGetLastError(), "mixed40 padded offsets"); }
@@ -930,21 +872,59 @@ static int routed_moe_launch_mixed40(
 
     if (caseA) {
         /* Phase 1: gate & up W4A8 -> swiglu -> mid (pair layout). */
-        float *gate_g = (float *)(scratch + gg_o);
-        float *up_g   = (float *)(scratch + ug_o);
-        float *mid_g  = (float *)(scratch + mg_o);
+        float *gate_g = gate_g_buf;
+        float *up_g   = up_g_buf;
+        float *mid_g  = mid_g_buf;
+        /* L219: both case-A arms emit the folded leaf as E4M3 in their own
+         * epilogue (the scatter for the grouped arm, the GEMV for decode), so
+         * the slot is reserved before either runs -- the same producer contract
+         * routed_moe_try_mmq_gate_up uses. */
+        void *ca_q = NULL, *ca_sf = NULL;
+        int ca_kbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pair_count, expert_mid_dim,
+                                                        &ca_q, &ca_sf, &ca_kbp)) {
+            fprintf(stderr, "pulsar: routed MoE mixed40A: no E4M3 slot for the folded mid "
+                            "(mid_dim=%u pairs=%u) -- refusing\n",
+                    expert_mid_dim, pair_count);
+            ok = 0;
+        }
         if (use_grouped) {
-            /* grouped: padded-gather x -> grouped GEMMs -> swiglu(padded) -> padded-scatter. */
-            moe_padded_gather_kernel<<<pair_count, 256>>>(x_gathered, w_gathered, padded_pair,
+            /* grouped: gather the producer's E4M3 x straight into the CUTLASS
+             * layout (riding the row permutation that happens anyway) ->
+             * grouped GEMMs -> swiglu(padded) -> padded-scatter.  No producer
+             * encoding: refuse. */
+            const void *mq = NULL, *msf = NULL; int mkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &mq, &msf, &mkbp)) {
+                mq = NULL; msf = NULL; mkbp = 0;
+            }
+            const int mixed_handover = (mq && msf && row_src_tok);
+            if (!mixed_handover) {
+                fprintf(stderr, "pulsar: routed MoE mixed40 gate/up: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                        expert_in_dim, n_tokens);
+                ok = 0;
+            }
+            if (ok) moe_padded_gather_kernel<<<pair_count, 256>>>(
+                    NULL /* no f32 rows: the grouped GEMM gathers the E4M3 */, w_gathered, padded_pair,
+                    row_src_tok,
+                    NULL /* pair_slot: this path scatters, no inverse map */,
                     (const float *)x->ptr, (const float *)weights->ptr,
                     sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
             ok = cuda_ok(cudaGetLastError(), "mixed40A gather");
-            if (ok && pulsar_cutlass_grouped_proj(gate_g, x_gathered, (const uint8_t *)gate_w,
-                    gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
-            if (ok && pulsar_cutlass_grouped_proj(up_g, x_gathered, (const uint8_t *)up_w,
-                    gate_expert_bytes, gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
+            if (ok && pulsar_cutlass_grouped_proj(gate_g, NULL,
+                    mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                    gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
+                    mq, msf,
+                    mkbp, row_src_tok) != 0) ok = 0;
+            /* reuse_packed_a: same x_gathered, same scratch, same layout -- the
+             * up leg consumes the gate leg's E4M3 encoding instead of packing
+             * the identical values a second time. */
+            if (ok && pulsar_cutlass_grouped_proj(up_g, NULL,
+                    mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                    gate_row_bytes, (int)n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 1,
+                    mq, msf,
+                    mkbp, row_src_tok) != 0) ok = 0;
             if (ok) {
                 uint64_t n = padded_upper * expert_mid_dim;
                 moe_swiglu_gathered_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>(
@@ -952,50 +932,75 @@ static int routed_moe_launch_mixed40(
                 ok = cuda_ok(cudaGetLastError(), "mixed40A swiglu");
             }
             if (ok) {
-                moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(mid_flat, mid_g, padded_pair,
-                        (uint32_t)padded_upper, expert_mid_dim);
-                ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter");
+                moe_padded_scatter_kernel<true><<<(uint32_t)padded_upper, 256>>>(NULL, mid_g, padded_pair,
+                        (uint32_t)padded_upper, expert_mid_dim,
+                        (__nv_fp8_e4m3 *)ca_q, (unsigned char *)ca_sf, ca_kbp);
+                ok = cuda_ok(cudaGetLastError(), "mixed40A mid scatter (E4M3)");
             }
         } else {
-            /* decode/verify (n<=4): lean W4A8 GEMV -> mid_flat (fused swiglu+routing weight), pair
-             * layout, ONE launch over all slots -- no gather/scatter, no host sync, no TC underfill. */
+            /* decode/verify rows (any width to the row cap): lean W4A8 GEMV -> mid's E4M3 slot (fused swiglu+routing
+             * weight), pair layout, ONE launch over all slots -- no gather/scatter, no host
+             * sync, no TC underfill, and no separate encode (L219). */
             (void)gate_g; (void)up_g; (void)mid_g;
-            if (pulsar_cutlass_gemv_gateup(mid_flat, (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
-                    (const uint8_t *)gate_w, (const uint8_t *)up_w, gate_expert_bytes, gate_row_bytes,
-                    clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim) != 0) ok = 0;
+            /* Hand over the producing norm's E4M3, exactly as the grouped path
+             * above does.  A miss refuses (L158): there is no re-encode here. */
+            const void *gq = NULL, *gsf = NULL;
+            int gkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &gq, &gsf, &gkbp)) {
+                gq = NULL; gsf = NULL; gkbp = 0;
+            }
+            /* The FIFTH f32 reader the census missed (found by the depth-4102
+             * chunk-boundary failure): the GEMV fallback round-trips from raw
+             * f32 when the handover misses.  Same rule as the other four. */
+            if (!gq) {
+                fprintf(stderr, "pulsar: routed MoE gate/up GEMV: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                        expert_in_dim, n_tokens);
+                ok = 0;
+            }
+            if (ok && pulsar_cutlass_gemv_gateup(mid_flat, selected_ptr, (const float *)weights->ptr,
+                    mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                    mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                    gate_expert_bytes, gate_row_bytes,
+                    clamp, (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_in_dim, (int)expert_mid_dim,
+                    gq, gsf, gkbp, ca_q, ca_sf, ca_kbp) != 0) ok = 0;
         }
         /* Phase 2: type-43 down against a type-40 gate/up (4 of the artifact's
-         * layers).  MMQ takes mid_flat as f32 directly and does its own q8_1,
-         * which is why no midq quantize remains here. */
+         * layers).  The leaf was emitted as E4M3 by phase 1's own epilogue
+         * (L219); make the slot current and hand the down arm the encoding. */
+        if (ok) {
+            pulsar_gpu_mxfp8_act_cache_arm(mid, pair_count, expert_mid_dim);
+            pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+        }
+        const void *mq = NULL, *msf = NULL; int mkbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, pair_count, expert_mid_dim, &mq, &msf, &mkbp)) {
+            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after the case-A emit -- refusing\n");
+            ok = 0;
+        }
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
-            mmq_down_done = routed_moe_try_mmq_down(down_flat, mid_flat, down_w, selected_ptr,
+            mmq_down_done = routed_moe_try_mmq_down(down_flat, down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
-                                                    n_total_expert, (uint64_t)pair_count);
+                                                    n_total_expert, (uint64_t)pair_count, mq, msf, mkbp);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "mixed40A mmq down");
         }
 #endif
-        /* Fail closed: the dp4a chain that used to follow is gone with Q2_K and
-         * type 16, so a declined MMQ has nothing left to fall through to. */
+        /* Fail closed: a declined MMQ has no other arm. */
         if (ok && !mmq_down_done) {
             fprintf(stderr, "pulsar: mixed40 type-43 down but MMQ declined and no fallback exists\n");
             ok = 0;
         }
     } else {
-        /* Case B. Phase 1: MMQ gate/up (fused swiglu) -> mid_flat.  The Q8_K
-         * quantize of x that used to run here fed the dp4a kernels; MMQ takes x
-         * as f32 and does its own q8_1, so it was pure waste once they went. */
-        float *mid_g = (float *)(scratch + xg_o);   /* reuse the gather buffer (K=mid_dim=cut_k) */
-        float *out_g = (float *)(scratch + og_o);
+        /* Case B. Phase 1: MMQ gate/up whose fold epilogue emits mid's E4M3
+         * directly (L219), reading the producer's E4M3 x. */
+        float *out_g = out_g_buf;
         /* Type-43 gate/up against a type-40 down (3 of the artifact's layers).
-         * `up` is pair-sized and was only read by the deleted qwarp32 branch, so
-         * it serves as MMQ's raw gate buffer -- no arena change needed. */
+         * `up` is pair-sized and serves as MMQ's raw gate buffer. */
         int mmq_gu_done = 0;
 #ifdef PULSAR_HAVE_MMQ
         if (ok) {
             mmq_gu_done = routed_moe_try_mmq_gate_up(
-                mid_flat, (float *)up->ptr, gate_w, up_w,
+                mid, (float *)up->ptr, gate_w, up_w,
                 (const float *)x->ptr, selected_ptr, (const float *)weights->ptr,
                 gate_type, expert_in_dim, expert_mid_dim,
                 n_total_expert, n_expert, n_tokens, clamp);
@@ -1008,33 +1013,50 @@ static int routed_moe_launch_mixed40(
             fprintf(stderr, "pulsar: mixed40 type-43 gate/up but MMQ declined and no fallback exists\n");
             ok = 0;
         }
+        /* L219: the gate/up fold emitted mid's E4M3 in its own epilogue (the
+         * standalone encode pass is deleted); the reader only has to check it
+         * landed. */
+        const void *mq = NULL, *msf = NULL; int mkbp = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, pair_count, expert_mid_dim, &mq, &msf, &mkbp)) {
+            fprintf(stderr, "pulsar: routed MoE: mid E4M3 not readable after the fold emit -- refusing\n");
+            ok = 0;
+        }
         /* Phase 2: mid -> W4A8 down -> down_flat[pair]. */
         if (ok && use_grouped) {
-            /* grouped: padded-gather mid -> grouped down GEMM -> padded-scatter. */
-            moe_padded_gather_pairflat_kernel<<<pair_count, 256>>>(mid_g, padded_pair, mid_flat,
-                    sorted_pairs, offsets, padded_off, pair_count, n_total_expert, expert_mid_dim);
-            ok = cuda_ok(cudaGetLastError(), "mixed40B mid gather");
-            if (ok && pulsar_cutlass_grouped_proj(out_g, mid_g, (const uint8_t *)down_w,
-                    down_expert_bytes, down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
-                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b) != 0) ok = 0;
+            /* grouped: the down GEMM gathers the mid E4M3 through padded_pair
+             * (padded row -> pair row).  The f32 padded gather that used to
+             * build that map is gone, so build the map here (x_gathered = NULL:
+             * no rows are copied, only padded_pair and the weights). */
+            moe_padded_gather_kernel<<<pair_count, 256>>>(NULL, w_gathered, padded_pair, NULL, NULL,
+                    (const float *)x->ptr, (const float *)weights->ptr,
+                    sorted_pairs, offsets, padded_off, pair_count, n_total_expert, n_expert, expert_in_dim);
+            ok = cuda_ok(cudaGetLastError(), "mixed40B pair map");
+            if (ok && pulsar_cutlass_grouped_proj(out_g, NULL,
+                    mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
+                    down_row_bytes, (int)n_total_expert, (int)expert_mid_dim, (int)out_dim,
+                    counts, padded_off, (int)padded_upper, proj_scratch, proj_b, 0,
+                    mq, msf, mkbp, padded_pair) != 0) ok = 0;
             if (ok) {
-                moe_padded_scatter_kernel<<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
-                        (uint32_t)padded_upper, out_dim);
+                moe_padded_scatter_kernel<false><<<(uint32_t)padded_upper, 256>>>(down_flat, out_g, padded_pair,
+                        (uint32_t)padded_upper, out_dim, NULL, NULL, 0);
                 ok = cuda_ok(cudaGetLastError(), "mixed40B down scatter");
             }
         } else if (ok) {
-            /* decode/verify (n<=4): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
-             * slots (routing weight already applied by the dp4a gate/up swiglu into mid_flat). */
-            (void)mid_g; (void)out_g;
-            if (pulsar_cutlass_gemv_down(down_flat, mid_flat, selected_ptr,
-                    (const uint8_t *)down_w, down_expert_bytes, down_row_bytes,
-                    (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim) != 0) ok = 0;
+            /* decode/verify rows (any width to the row cap): lean W4A8 GEMV -> down_flat, pair layout, ONE launch over all
+             * slots (the routing weight is already in the mid E4M3 the gate/up epilogue emitted). */
+            (void)out_g;
+            if (pulsar_cutlass_gemv_down(down_flat, selected_ptr,
+                    mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
+                    down_expert_bytes, down_row_bytes,
+                    (int)n_tokens, (int)n_expert, n_total_expert, (int)expert_mid_dim, (int)out_dim,
+                    mq, msf, mkbp) != 0) ok = 0;
         }
     }
     if (!ok) return 0;
 
     uint64_t n = (uint64_t)n_tokens * out_dim;
-    moe_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr, down_flat, out_dim, n_expert, n_tokens);
+    moe_sum_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr, down_flat, out_dim, n_expert, n_tokens,
+                                                          moe_nonfinite_code(layer_index, MOE_NF_ARM_MIXED_DOWN));
     return cuda_ok(cudaGetLastError(), "mixed40 sum");
 }
 
@@ -1043,7 +1065,7 @@ static int routed_moe_launch_mixed40(
 #ifdef PULSAR_HAVE_MMQ
 /* ---- MMQ (llama.cpp INT8 tensor-core) routed gate/up -----------------------
  * Plan 41b.  Measured on GB10, same box/model/prompt/metric: the shipped dp4a
- * moe_gate_up_mid_expert_tile8_rowspan_kernel costs 73.20 ms/layer at a
+ * the since-removed per-expert tile8 rowspan kernel cost 73.20 ms/layer at a
  * 4096-token prefill; Palaferri's stock mul_mat_q<IQ2_XXS> costs 29.99 ms/layer
  * (2.44x) and Entrpi's bespoke fused D2R 18.01 ms (4.07x).  This routes our
  * gate/up through the vendored stock MMQ.
@@ -1057,71 +1079,38 @@ static int routed_moe_launch_mixed40(
  *   off  = pair * mid_dim + row,  pair = tok * n_expert + slot
  *   so weights[tok * n_expert + slot] == weights[pair].
  */
-/* Aligned IQ2 artifact cache.  Keyed by the raw weight pointer, which is stable
- * for the life of the model map, so one repack per tensor for the whole run.
- * Budget-capped: when it is exhausted a tensor is marked raw-forever (entry with
- * a NULL buffer) and never retried, so there is no per-launch allocation churn.
- * Populated lazily on first use -- the alternative, repacking at model load,
- * needs loader surgery; this gets the same steady state after the first chunk.
- */
-#define PULSAR_MMQ_ALIGN_MAX_TENSORS 256
-struct pulsar_mmq_aligned_entry { const void *raw; void *aligned; };
-static pulsar_mmq_aligned_entry g_mmq_aligned[PULSAR_MMQ_ALIGN_MAX_TENSORS];
-static int g_mmq_aligned_n = 0;
-static uint64_t g_mmq_aligned_budget = 0;
-static int g_mmq_aligned_init = 0;
+/* The runtime aligned-IQ2 repack cache is GONE (2026-08-15).  It existed to
+ * lazily repack raw IQ2_XXS (type 16) into the MMQ aligned layout under a
+ * memory budget.  The loader now accepts only IQ2_XXS_MMQ_K (44) and
+ * CUTLASS_MXFP4 (40) for routed experts (weights.cpp tensor_is_routed_expert
+ * _type), and 43 is ALREADY aligned in the gguf -- so every tensor took the
+ * prealigned branch and the cache never repacked anything.  With it go the
+ * 256-entry table, the budget probe, and the raw-forever pinning. */
 
-static const void *mmq_aligned_for(const void *raw, uint32_t in_dim, uint32_t mid_dim,
-                                   uint32_t n_experts) {
-    for (int i = 0; i < g_mmq_aligned_n; i++) {
-        if (g_mmq_aligned[i].raw == raw) return g_mmq_aligned[i].aligned;
-    }
-    if (g_mmq_aligned_n >= PULSAR_MMQ_ALIGN_MAX_TENSORS) return NULL;
+/* The ds4_cuda_q8_fold_take_q81 stub stood here.  The vendored adapter called it
+ * from its q8-fold vec path to ask for pre-quantized canonical q8_1 codes;
+ * pulsar never had such a registry, so the stub always answered "no fold" and
+ * existed purely to satisfy the link.  That path went with the mmvq half in
+ * ledger L066 step 2, so the stub has no caller and no reason to exist. */
 
-    if (!g_mmq_aligned_init) {
-        g_mmq_aligned_init = 1;
-        size_t freeb = 0, totalb = 0;
-        if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess) {
-            /* leave headroom for KV growth and activations */
-            const uint64_t reserve = 6ull << 30;
-            g_mmq_aligned_budget = (freeb > reserve) ? (uint64_t)(freeb - reserve) : 0ull;
-        }
-        fprintf(stderr, "pulsar: MMQ aligned-IQ2 cache budget %.1f GiB\n",
-                g_mmq_aligned_budget / 1073741824.0);
-    }
 
-    const uint64_t need = ds4_mmq_iq2_xxs_aligned_bytes((int)mid_dim, (int)in_dim, (int)n_experts);
-    void *buf = NULL;
-    if (need && need <= g_mmq_aligned_budget && cudaMalloc(&buf, need) == cudaSuccess) {
-        if (ds4_repack_iq2_aligned_device(buf, raw, in_dim, mid_dim, n_experts,
-                                          cudaStreamPerThread)) {
-            g_mmq_aligned_budget -= need;
-        } else {
-            (void)cudaFree(buf);
-            buf = NULL;
-        }
-    } else if (buf) {
-        (void)cudaFree(buf);
-        buf = NULL;
-    }
-    /* record either way: a NULL entry pins this tensor to the raw path */
-    g_mmq_aligned[g_mmq_aligned_n].raw = raw;
-    g_mmq_aligned[g_mmq_aligned_n].aligned = buf;
-    g_mmq_aligned_n++;
-    return buf;
-}
+/* EMIT=false writes the folded leaf as f32 (the historical contract).
+ * EMIT=true is the L219 producer epilogue: the same per-element SwiGLU lands
+ * as the activation's E4M3 + E8M0 plane, so the separate
+ * pulsar_gpu_mxfp8_act_cache_encode_f32 pass is deleted for this path.  The
+ * encoding is byte-identical to that pass by construction: the block amax is
+ * an fmaxf reduction over the same 32 elements (exact, order-independent) and
+ * pulsar_mx_shared_exp/_encode/_scale_byte are the same helpers the standalone
+ * quantiser calls.
+ *
+ * The EMIT arm must run in FULL WARPS: the max reduction is a shuffle over the
+ * elements a lane group owns.  For the scalar kernel one warp owns one 32-wide
+ * block (lane 0 owns col%32==0); for v4 the warp's 32 lanes cover 128 columns,
+ * i.e. four blocks, so the reduction is over 8-lane groups.  Dead lanes are
+ * predicated, never early-returned -- a lane that exits would corrupt the
+ * shuffle.  Both shapes are guarded by mid_dim % 32 == 0 at this file's door. */
 
-/* The vendored adapter references this ds4-engine hook from its q8-fold vec
- * (decode) path: given an activation pointer it may hand back pre-quantized
- * canonical q8_1 codes so the caller can skip its quantize prelude.  pulsar has
- * no such registry, and the path is single-token only (n_tokens != 1 bails
- * before this), so prefill never reaches it.  "No fold available" satisfies the
- * link -- the same stub Palaferri's own cuda/mmq/test TUs use. */
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim, const void **q81) {
-    (void)src; (void)in_dim; (void)q81;
-    return 0;
-}
-
+template <bool EMIT>
 __global__ static void moe_mmq_swiglu_fold_kernel(
         float *mid_out,
         const float *gate_raw,
@@ -1129,77 +1118,110 @@ __global__ static void moe_mmq_swiglu_fold_kernel(
         const float *weights,
         uint64_t total,
         uint32_t expert_mid_dim,
-        float clamp) {
+        float clamp,
+        __nv_fp8_e4m3 *mid_q,
+        unsigned char *mid_sf,
+        int mid_kbp) {
     const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    float g = gate_raw[idx];
-    float u = up_raw[idx];
-    /* identical clamp semantics to moe_gate_up_mid_expert_tile8_rowspan_kernel */
-    if (clamp > 1.0e-6f) {
-        if (g > clamp) g = clamp;
-        if (u > clamp) u = clamp;
-        if (u < -clamp) u = -clamp;
+    if constexpr (!EMIT) {
+        if (idx >= total) return;
     }
-    const uint64_t pair = idx / (uint64_t)expert_mid_dim;
-    mid_out[idx] = (g / (1.0f + expf(-g))) * u * weights[pair];
+    const bool live = idx < total;
+    const uint64_t ii = live ? idx : (total ? total - 1u : 0u);
+    const float v = pulsar_swiglu_elem(gate_raw[ii], up_raw[ii],
+                                 weights[ii / (uint64_t)expert_mid_dim], clamp);
+    if constexpr (EMIT) {
+        float a = live ? fabsf(v) : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+        const int se = pulsar_mx_shared_exp(a);
+        if (live) {
+            const uint64_t row = ii / (uint64_t)expert_mid_dim;
+            const uint32_t col = (uint32_t)(ii - row * (uint64_t)expert_mid_dim);
+            mid_q[(size_t)row * expert_mid_dim + col] = pulsar_mx_encode(v, se);
+            if ((threadIdx.x & 31u) == 0u)
+                mid_sf[pulsar_mx_sfoff((int)row, (int)(col >> 5), mid_kbp)] =
+                        pulsar_mx_scale_byte(se);
+        }
+    } else {
+        mid_out[idx] = v;
+    }
 }
 
-/* DECODE arm for pre-aligned (type-43) tensors.
- * The big-batch arm below needs n_tokens >= 128; at decode n_tokens is 1, so
- * without this the dp4a qwarp32/LUT kernels would have to read the aligned
- * layout -- which they cannot -- and the fail-closed guard aborts the run
- * ("cuda decode failed").  ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec folds
- * clamp + SwiGLU + router weight and writes mid[slot*M + row], which is exactly
- * our mid layout (pair == slot when n_tokens == 1), so no fold kernel is needed
- * here.  Returns 1 when it produced `mid`. */
-static int routed_moe_try_mmq_gate_up_vec(
-        float *mid_out,
-        const char *gate_w,
-        const char *up_w,
-        const float *x_f32,
-        const int32_t *selected_ptr,
-        const float *weights_ptr,
-        uint32_t gate_type,
-        uint32_t expert_in_dim,
-        uint32_t expert_mid_dim,
-        uint32_t n_total_expert,
-        uint32_t n_expert,
-        uint32_t n_tokens,
-        float clamp) {
-    if (gate_type != 43u) return 0;          /* aligned artifacts only */
-    if (n_tokens != 1u) return 0;            /* _vec entries are n_tokens==1 */
-    return ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
-               gate_w, up_w, x_f32, selected_ptr, weights_ptr, mid_out,
-               (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
-               (int)n_total_expert, (int)n_expert, clamp,
-               cudaStreamPerThread) == 0;
+/* Vector-4 twin (L128).  ncu on the decode path measured this kernel at 9.7%
+ * SM throughput with 93% occupancy and a long-scoreboard stall ratio of
+ * 111.9 -- fully resident and doing almost nothing but waiting on memory.
+ * It is a pure streaming op (two loads, one store per output), so one
+ * element per thread wastes three quarters of every transaction and pays a
+ * 64-bit divide per element.  BIT-EXACT: identical per-element math, no
+ * reduction, only the access granularity and thread mapping change.
+ *
+ * EMIT=true (L219): the warp's 32 lanes each hold four consecutive columns, so
+ * one 32-element MX block is exactly an EIGHT-lane group; its amax is the
+ * fmaxf over those lanes' per-quad maxima.  `mid_dim` is the row pitch of the
+ * E4M3 plane (expert_mid_dim_q is the row pitch in quads). */
+template <bool EMIT>
+__global__ static void moe_mmq_swiglu_fold_v4_kernel(
+        float4 *mid_out,
+        const float4 *gate_raw,
+        const float4 *up_raw,
+        const float *weights,
+        uint64_t quads,
+        uint32_t expert_mid_dim_q,
+        float clamp,
+        __nv_fp8_e4m3 *mid_q,
+        unsigned char *mid_sf,
+        int mid_kbp,
+        uint32_t mid_dim) {
+    const uint64_t q = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if constexpr (!EMIT) {
+        if (q >= quads) return;
+    }
+    const bool live = q < quads;
+    const uint64_t qq = live ? q : (quads ? quads - 1u : 0u);
+    const float4 g = gate_raw[qq], u = up_raw[qq];
+    const float wv = weights[qq / (uint64_t)expert_mid_dim_q];
+    float4 o;
+    o.x = pulsar_swiglu_elem(g.x, u.x, wv, clamp);
+    o.y = pulsar_swiglu_elem(g.y, u.y, wv, clamp);
+    o.z = pulsar_swiglu_elem(g.z, u.z, wv, clamp);
+    o.w = pulsar_swiglu_elem(g.w, u.w, wv, clamp);
+    if constexpr (EMIT) {
+        float a = live ? fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)))
+                       : 0.0f;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const int se = pulsar_mx_shared_exp(a);
+        if (live) {
+            const uint64_t row = qq / (uint64_t)expert_mid_dim_q;
+            const uint32_t col = (uint32_t)(qq - row * (uint64_t)expert_mid_dim_q) * 4u;
+            __nv_fp8_e4m3 *dst = mid_q + (size_t)row * mid_dim + col;
+            dst[0] = pulsar_mx_encode(o.x, se);
+            dst[1] = pulsar_mx_encode(o.y, se);
+            dst[2] = pulsar_mx_encode(o.z, se);
+            dst[3] = pulsar_mx_encode(o.w, se);
+            if ((threadIdx.x & 7u) == 0u)
+                mid_sf[pulsar_mx_sfoff((int)row, (int)(col >> 5), mid_kbp)] =
+                        pulsar_mx_scale_byte(se);
+        }
+    } else {
+        mid_out[q] = o;
+    }
 }
 
-/* DECODE arm for the routed down.  Same pairs reshape as the prefill arm: one
- * row per (token,slot), each using exactly one expert.  Output stays per-pair
- * so the existing fixed-order moe_sum_kernel still does the reduction. */
-static int routed_moe_try_mmq_down_vec(
-        float *down_out,
-        const float *mid_f32,
-        const char *down_w,
-        const int32_t *selected_ptr,
-        uint32_t down_type,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        uint32_t n_total_expert,
-        uint64_t pairs) {
-    if (down_type != 43u) return 0;
-    if (pairs == 0 || pairs > (uint64_t)INT32_MAX) return 0;
-    return ds4_mmq_iq2_xxs_aligned_moe_vec(
-               down_w, mid_f32, selected_ptr, down_out,
-               (int)out_dim, (int)expert_mid_dim,
-               (int)pairs, (int)n_total_expert, 1,
-               cudaStreamPerThread) == 0;
-}
-
-/* Returns 1 when MMQ produced `mid`, 0 to fall through to the dp4a path. */
+/* Returns 1 when MMQ produced the fold (the IQ2 tier), 0 when this layer's
+ * gate/up is not that tier and the caller's MXFP4 arms run instead.
+ *
+ * L219: the SwiGLU leaf is emitted into `mid`'s E4M3 activation slot by the
+ * fold epilogue itself.  Before, the fold wrote pairs x mid_dim f32 to `mid`
+ * and a separate whole-tensor pass (pulsar_gpu_mxfp8_act_cache_encode_f32)
+ * read it back to encode; on the MMQ tiers that round trip was ~98 KB/token/
+ * layer of avoidable traffic.  The emitted bytes are identical by construction
+ * (same 32-element amax set, same pulsar_mx_shared_exp/_encode/_scale_byte), so
+ * the down arms and their gates see the same operand. */
 static int routed_moe_try_mmq_gate_up(
-        float *mid_out,
+        pulsar_gpu_tensor *mid,
         float *gate_scratch,
         const char *gate_w,
         const char *up_w,
@@ -1214,15 +1236,14 @@ static int routed_moe_try_mmq_gate_up(
         uint32_t n_tokens,
         float clamp) {
     /* 16 = raw IQ2_XXS block stream (aligned lazily via the cache below).
-     * 43 = IQ2_XXS_MMQ, already stored aligned IN THE GGUF -- no cache, no
+     * 44 = IQ2_XXS_MMQ_K, already stored k-major IN THE GGUF -- no cache, no
      *      repack, no budget, and every tensor gets the fast path instead of
      *      whichever ~58 won a 22.9 GiB cache.
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
-    const int gate_prealigned = (gate_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
-    if (gate_type != 16u && !gate_prealigned) return 0;
-    /* One-shot: the adapter allocates its persistent q8_1 scratch here.  Without
-     * it every call falls back to per-call async allocation, which cost 6x
-     * (78 vs 477 t/s) the first time this was wired.  One-shot, not per-token. */
+    if (gate_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
+    if (!mid || !mid->ptr || (expert_mid_dim % 32u) != 0u) return 0;
+    /* One-shot: ds4_mmq_init selects the device and populates the ggml
+     * device-info singleton the MMQ launchers read. */
     static int mmq_ready = -1;
     if (mmq_ready < 0) {
         int dev = 0;
@@ -1231,53 +1252,96 @@ static int routed_moe_try_mmq_gate_up(
         fprintf(stderr, "pulsar: MMQ routed gate/up %s\n", mmq_ready ? "ready" : "unavailable");
     }
     if (!mmq_ready) return 0;
-    /* should_use takes a GGML type; both 16 and our 43 are IQ2_XXS data, and 43
-     * is not a ggml type at all -- passing it through returned false and
-     * silently declined every pre-aligned layer. */
-    if (!ds4_mmq_should_use(16, (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
+    /* should_use takes the ENGINE's layout id.  It used to take a ggml type
+     * code, so this call passed a bare `16` and a comment explaining that the
+     * engine's own id for the same data was not a ggml type at all -- a
+     * vocabulary mismatch that silently declined every pre-aligned layer once
+     * (L207).  One vocabulary, named. */
+    if (!ds4_mmq_should_use((uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K,
+                            (int64_t)n_tokens, (int64_t)n_total_expert)) return 0;
 
-    /* Aligned-artifact cache.  block_iq2_xxs is 66 B with qs[] at offset 2, so a
-     * raw stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
-     * weight-read-bound, so that costs a LOT more than it does on our dp4a
-     * kernel: microbenched at the production shape (tests/mmq_align_bench.cu),
-     * raw 44.70 vs aligned 18.65 ms/pair-call = 2.40x, against a one-time
-     * repack of 4.81 ms/tensor.
-     * We cannot hold an aligned copy of every IQ2 tensor (30 layers x 3 x
-     * 0.39 GiB ~ 35 GB on top of an 86 GB model in 121 GB), so cache what fits
-     * under a budget and leave the rest on the raw path. */
-    const void *gate_a, *up_a;
-    if (gate_prealigned) {
-        gate_a = gate_w;   /* the gguf already holds the aligned layout */
-        up_a = up_w;
-    } else {
-        gate_a = mmq_aligned_for(gate_w, expert_in_dim, expert_mid_dim, n_total_expert);
-        up_a = gate_a ? mmq_aligned_for(up_w, expert_in_dim, expert_mid_dim, n_total_expert) : NULL;
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    /* Reserve the producer slot BEFORE the gate/up GEMM: if the encoding has
+     * nowhere to land the arm is terminal, and failing first cannot leave a
+     * launched GEMM writing into a slot that was refused. */
+    void *mid_q = NULL, *mid_sf = NULL;
+    int mid_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pairs, expert_mid_dim,
+                                              &mid_q, &mid_sf, &mid_kbp)) {
+        fprintf(stderr, "pulsar: routed MoE MMQ gate/up: no E4M3 slot for the folded mid "
+                        "(mid_dim=%u pairs=%llu) -- refusing\n",
+                expert_mid_dim, (unsigned long long)pairs);
+        return 0;
     }
 
-    float *gate_raw = gate_scratch;   /* both are n_tokens*n_expert*mid f32 */
-    float *up_raw = mid_out;          /* folded in place below */
-    const int rc = (gate_a && up_a)
-        ? ds4_mmq_iq2_xxs_moe_pair_soa(gate_a, up_a, x_f32, selected_ptr,
-                                       gate_raw, up_raw,
-                                       (int)expert_mid_dim, (int)expert_in_dim,
-                                       (int)n_tokens, (int)n_total_expert,
-                                       (int)n_expert, cudaStreamPerThread)
-        : ds4_mmq_iq2_xxs_moe_pair(gate_w, up_w, x_f32, selected_ptr,
-                                   gate_raw, up_raw,
-                                   (int)expert_mid_dim, (int)expert_in_dim,
-                                   (int)n_tokens, (int)n_total_expert,
-                                   (int)n_expert, cudaStreamPerThread);
+    /* Why the artifact stores IQ2 pre-aligned, recorded because the code that
+     * proved it is gone: block_iq2_xxs is 66 B with qs[] at offset 2, so a raw
+     * stream is 2-byte aligned and nvcc emits LDG.E.U16.  MMQ is heavily
+     * weight-read-bound, so at the production shape raw measured 44.70 vs
+     * aligned 18.65 ms/pair-call = 2.40x, against a one-time repack of
+     * 4.81 ms/tensor.  That settled it: the gguf now ships type 43 aligned, the
+     * runtime repack cache is deleted, and tests/mmq_align_bench.cu with it --
+     * a closed question does not need a live A/B keeping the losing arm
+     * compiled. */
+    /* Type 43 is stored aligned IN THE GGUF, so the weight pointer IS the SoA
+     * entry.  There is no raw arm and no repack. */
+    float *gate_raw = gate_scratch;   /* pairs*mid f32 */
+    float *up_raw = (float *)mid->ptr; /* MMQ writes raw up here; the fold reads it */
+    /* x_f32 is ffn_norm, whose fused norm emitted its E4M3 + ue8m0 into the
+     * activation cache; the input staging gathers those codes.  No encoding:
+     * refuse (below). */
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr(x_f32, n_tokens, expert_in_dim,
+                                                 &act_q, &act_sf, &act_kbp)) {
+        act_q = NULL; act_sf = NULL; act_kbp = 0;
+    }
+    if (!act_q) {
+        fprintf(stderr, "pulsar: routed MoE MMQ gate/up: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                expert_in_dim, n_tokens);
+        return 0;
+    }
+    const int rc = ds4_mmq_iq2_xxs_moe_pair_soa(
+        iq2_expert_table(gate_w, n_total_expert, expert_in_dim >> 8, expert_mid_dim),
+        iq2_expert_table(up_w, n_total_expert, expert_in_dim >> 8, expert_mid_dim),
+        selected_ptr, gate_raw, up_raw,
+        (int)expert_mid_dim, (int)expert_in_dim,
+        (int)n_tokens, (int)n_total_expert,
+        (int)n_expert, cudaStreamPerThread,
+        act_q, act_sf, act_kbp);
     if (rc != 0) return 0;
-    const uint64_t total = (uint64_t)n_tokens * n_expert * expert_mid_dim;
+    const uint64_t total = pairs * expert_mid_dim;
     const uint32_t threads = 256u;
-    const uint64_t blocks = (total + threads - 1u) / threads;
-    moe_mmq_swiglu_fold_kernel<<<(unsigned)blocks, threads>>>(
-        mid_out, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp);
+    /* L128: four elements per thread when the shape and alignment allow --
+     * see the v4 kernel's note.  gate_scratch and up_raw are whole
+     * allocations here (256 B aligned), but the check is cheap and keeps the
+     * fast path honest if a caller ever hands in an offset view. */
+    const bool v4 = (expert_mid_dim % 4u) == 0u && (total % 4u) == 0u &&
+                    ((uintptr_t)gate_raw % 16u) == 0u &&
+                    ((uintptr_t)up_raw % 16u) == 0u;
+    if (v4) {
+        const uint64_t quads = total / 4u;
+        const uint64_t blocks = (quads + threads - 1u) / threads;
+        moe_mmq_swiglu_fold_v4_kernel<true><<<(unsigned)blocks, threads>>>(
+            NULL, (const float4 *)gate_raw, (const float4 *)up_raw,
+            weights_ptr, quads, expert_mid_dim / 4u, clamp,
+            (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp, expert_mid_dim);
+    } else {
+        const uint64_t blocks = (total + threads - 1u) / threads;
+        moe_mmq_swiglu_fold_kernel<true><<<(unsigned)blocks, threads>>>(
+            NULL, gate_raw, up_raw, weights_ptr, total, expert_mid_dim, clamp,
+            (__nv_fp8_e4m3 *)mid_q, (unsigned char *)mid_sf, mid_kbp);
+    }
+    if (!cuda_ok(cudaGetLastError(), "routed_moe mmq swiglu fold (E4M3)")) return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
     return 1;
 }
-/* Routed DOWN through MMQ.  The adapter has no IQ2 prefill down entry (only
- * _vec decode ones); Palaferri's down rides inside ds4_mmq_iq2_xxs_q2_K_moe_fused,
- * which is Q2_K-specific and so useless for v5mx (our down is IQ2).
+/* Routed DOWN through MMQ.  Upstream's down rode inside a Q2_K-specific fused
+ * kernel, useless for v5mx whose down is IQ2 -- and that whole Q2_K expert
+ * family has since been deleted, because the loader accepts only types 43 and
+ * 40 for routed experts (weights.cpp: tensor_is_routed_expert_type), so no
+ * Q2_K expert tensor can reach the engine at all.
  *
  * But down does not need a fused kernel here: `mid` is ALREADY materialized f32
  * per (token,slot), and `selected` is ALREADY the flat per-pair expert id
@@ -1286,51 +1350,79 @@ static int routed_moe_try_mmq_gate_up(
  *     n_tokens'      = n_tokens * n_expert     (one row per pair)
  *     n_expert_used' = 1
  * Output is per-pair, which is what the existing fixed-order moe_sum_kernel
- * already consumes -- so the bit-exact reduction is untouched.  This also skips
- * the mid -> midq q8_K quantize entirely (MMQ does its own q8_1).
+ * already consumes -- so the bit-exact reduction is untouched.  The down MMQ
+ * reads mid as the MoE stage's E4M3 encoding (mid_q/mid_sf/mid_kbp).
  */
 static int routed_moe_try_mmq_down(
         float *down_out,
-        const float *mid_f32,
         const char *down_w,
         const int32_t *selected_ptr,
         uint32_t down_type,
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint32_t n_total_expert,
-        uint64_t pairs) {
-    const int down_prealigned = (down_type == 43u);  /* PULSAR_TENSOR_IQ2_XXS_MMQ */
-    if (down_type != 16u && !down_prealigned) return 0;
+        uint64_t pairs,
+        const void *mid_q, const void *mid_sf, int mid_kbp) {
+    if (down_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
     if (pairs > (uint64_t)INT32_MAX) return 0;
-    if (!ds4_mmq_should_use(16, (int64_t)pairs, (int64_t)n_total_expert)) return 0;
+    if (!ds4_mmq_should_use((uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K,
+                            (int64_t)pairs, (int64_t)n_total_expert)) return 0;
     /* Pre-aligned in the gguf: take the SoA entry directly.  This is the case the
      * runtime cache could never afford -- letting down compete for a 22.9 GiB
      * budget just starved late layers of gate/up (measured 566.46 vs 590.77).
      * With the layout on disk there is no budget to compete for. */
-    if (down_prealigned) {
-        return ds4_mmq_iq2_xxs_moe_soa(down_w, mid_f32, selected_ptr, down_out,
-                                       (int)out_dim, (int)expert_mid_dim,
-                                       (int)pairs, (int)n_total_expert, 1,
-                                       cudaStreamPerThread) == 0;
-    }
-    /* DOWN DELIBERATELY STAYS ON RAW while the aligned cache is capacity-bound.
-     * ds4_mmq_iq2_xxs_moe_soa (added to the vendored adapter, upstream has only
-     * q2_K single-soa and iq2 pair-soa) works and gives down the same 2.40x --
-     * but the cache holds ~58 tensors against 90 (30 layers x gate/up/down), so
-     * letting down compete just starves late layers of gate/up alignment.
-     * MEASURED: down-aligned 566.46 vs gate/up-only 588.77 @4k, a net LOSS.
-     * Re-enable the moment the gguf stores IQ2 aligned (byte-identical size, so
-     * the cache disappears and all 90 tensors are aligned for free). */
-    return ds4_mmq_iq2_xxs_moe(down_w, mid_f32, selected_ptr, down_out,
-                               (int)out_dim, (int)expert_mid_dim,
-                               (int)pairs, (int)n_total_expert, 1,
-                               cudaStreamPerThread) == 0;
+    return ds4_mmq_iq2_xxs_moe_soa(iq2_expert_table(down_w, n_total_expert, expert_mid_dim >> 8, out_dim),
+                                  selected_ptr, down_out,
+                                   (int)out_dim, (int)expert_mid_dim,
+                                   (int)pairs, (int)n_total_expert, 1,
+                                   cudaStreamPerThread, mid_q, mid_sf, mid_kbp) == 0;
 }
 #endif /* PULSAR_HAVE_MMQ */
 
-static int routed_moe_launch(
+
+/* L245: the EXL3 routed arm.  Both sides carry an EXL3 rate (the binder
+ * refuses a mix with 40/44); gate/up and down may differ in rate.  Task #44:
+ * the dataflow is the one EXL3 routed front door every family takes
+ * (mmq/exl3_moe.cuh) over this family's E4M3 slots.  L287: PREFILL rows (the row kind, L167:
+ * pulsar_gpu_matmul_batch_decode_rows() == 0) are a prompt chunk and take the
+ * tensor-core prefill GEMM over the producer's E4M3 slot at every width -- the
+ * arm Qwen's prompt chunks take, by the same rule (the row kind) --
+ * so a prompt row's bits never depend on its chunk; decode rows take the
+ * tensor-core decode GEMM at every width (task #46).  The fold, the down's E4M3 mid slot and
+ * the sum are one dataflow for both.  Under TP (L269 W1) the stacks are the
+ * rank's halves (pulsar_gpu_register_exl3_expert_half) and expert_mid_dim is
+ * the half width: nothing here is tied to the full width, and the mid granule
+ * is the 128 Hadamard block (V4.1's 2304 halves to 1152 = 9 x 128). */
+/** EXL3 routed arm (see above): the EXL3 front door over the E4M3 slots, prompt / decode GEMM by the row kind.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
+static int routed_moe_launch_exl3(
         pulsar_gpu_tensor *out,
-        pulsar_gpu_tensor *gate,
         pulsar_gpu_tensor *up,
         pulsar_gpu_tensor *mid,
         pulsar_gpu_tensor *down,
@@ -1356,21 +1448,174 @@ static int routed_moe_launch(
         const pulsar_gpu_tensor *x,
         uint32_t layer_index,
         uint32_t n_tokens) {
-    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+    const int k2g = exl3_type_k2(gate_type), k2d = exl3_type_k2(down_type);
+    if (!k2g || !k2d) {
+        static int said_mix = 0;
+        if (!said_mix) { said_mix = 1;
+            fprintf(stderr, "pulsar: routed MoE: an exl3 side paired with a non-exl3 side "
+                    "(gate type %u, down type %u) -- no kernel reads that mix; refusing\n",
+                    gate_type, down_type); }
+        return 0;
+    }
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
-        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        expert_in_dim % 256u != 0 || expert_mid_dim % EXL3_HAD_BLOCK != 0 || out_dim % 128u != 0 ||
         gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
         x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
-        gate->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    /* This function is now IQ2_XXS_MMQ (43) on BOTH sides, and nothing else.
+#ifndef PULSAR_HAVE_MMQ
+    return 0;   /* the pair/single drivers live in the MMQ TU */
+#else
+    const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_expert_bytes, n_total_expert,
+                                                 "moe_exl3_gate");
+    const char *up_w = routed_expert_stack_ptr(model_map, up_offset, gate_expert_bytes, n_total_expert,
+                                               "moe_exl3_up");
+    const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_expert_bytes, n_total_expert,
+                                                 "moe_exl3_down");
+    if (!gate_w || !up_w || !down_w) return 0;
+
+    /* the row kind is the step's (L167): prefill rows are a prompt chunk */
+    const bool prompt = pulsar_gpu_matmul_batch_decode_rows() == 0;
+    static int announced[2] = {0, 0};
+    if (!announced[prompt]) {
+        announced[prompt] = 1;
+        fprintf(stderr, "pulsar: routed EXL3 arm, %s rows = %s (gate/up K=%g, down K=%g)\n",
+                prompt ? "prefill" : "decode",
+                prompt ? "fp16 tensor-core prefill GEMM (exl3_moe_prefill)"
+                       : "fp16 tensor-core split-K decode GEMM (exl3_moe_decode)",
+                k2g / 2.0, k2d / 2.0);
+    }
+    /* the [trellis, scales] tables: row_bytes is the split point (routed_expert_side_layout) */
+    const void *const *gt = exl3_expert_table(gate_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
+    const void *const *ut = exl3_expert_table(up_w, n_total_expert, gate_expert_bytes, gate_row_bytes);
+    const void *const *dt = exl3_expert_table(down_w, n_total_expert, down_expert_bytes, down_row_bytes);
+    if (!gt || !ut || !dt) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no expert table -- refusing\n");
+        return 0;
+    }
+    const int32_t *selected_ptr = (const int32_t *)selected->ptr;
+    const uint64_t pairs = (uint64_t)n_tokens * n_expert;
+    if (pairs > (uint64_t)INT32_MAX) return 0;
+    void *mid_q = NULL, *mid_sf = NULL;
+    int mid_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_e4m3_slot(mid, pairs, expert_mid_dim, &mid_q, &mid_sf, &mid_kbp)) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no E4M3 slot for the folded mid (mid_dim=%u pairs=%llu) -- refusing\n",
+                expert_mid_dim, (unsigned long long)pairs);
+        return 0;
+    }
+    const void *act_q = NULL, *act_sf = NULL;
+    int act_kbp = 0;
+    if (!pulsar_gpu_mxfp8_act_cache_get_e4m3_ptr((const float *)x->ptr, n_tokens, expert_in_dim,
+                                                 &act_q, &act_sf, &act_kbp) || !act_q) {
+        fprintf(stderr, "pulsar: EXL3 routed MoE: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                expert_in_dim, n_tokens);
+        return 0;
+    }
+    /* per device (L335): a __device__ symbol has one copy per device, so its address cached on the first device
+     * pointed the second device's kernels at memory that is not theirs */
+    static uint32_t *nf_flag_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    const int dslot = pulsar_cuda_device_slot();
+    if (dslot < 0) return 0;
+    uint32_t *&nf_flag = nf_flag_of[dslot];
+    if (!nf_flag && !cuda_ok(cudaGetSymbolAddress((void **)&nf_flag, g_moe_nonfinite),
+                             "routed MoE non-finite flag address")) return 0;
+    /* the one EXL3 routed front door (mmq/exl3_moe.cuh): x from the producer's E4M3 slot, the fold's mid
+     * emitted into the mid tensor's E4M3 slot (the producer rule for the down); gate z in the up buffer and up z
+     * in the mid buffer, pairs x mid f32 each */
+    const exl3_moe_stacks st{NULL, gt, ut, dt, k2g, k2d, (int)n_total_expert, (int)expert_in_dim,
+                             (int)expert_mid_dim, (int)out_dim, {}};
+    const exl3_moe_bufs bufs{(float *)up->ptr, (float *)mid->ptr, (float *)down->ptr,
+                             exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, mid_q, mid_sf, mid_kbp}};
+    if (exl3_moe_routed_launch(st, selected_ptr, (const float *)weights->ptr, (int)n_tokens, (int)n_expert, clamp,
+                               exl3_moe_act{EXL3_MOE_ACT_E4M3_SLOT, act_q, act_sf, act_kbp}, bufs, (float *)out->ptr,
+                               nf_flag, moe_nonfinite_code(layer_index, MOE_NF_ARM_EXL3_DOWN), prompt,
+                               cudaStreamPerThread) != 0)
+        return 0;
+    pulsar_gpu_mxfp8_act_cache_arm(mid, pairs, expert_mid_dim);
+    pulsar_gpu_mxfp8_act_cache_note_mxfp8();
+    return cuda_ok(cudaGetLastError(), "routed_moe exl3");
+#endif
+}
+
+/** IQ2_XXS MMQ on both sides (the only remaining non-CUTLASS, non-EXL3 arm): MMQ gate/up + fold, MMQ down,
+ *  moe_sum.  Refuses any other type and in a build without MMQ.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
+static int routed_moe_launch(
+        pulsar_gpu_tensor *out,
+        pulsar_gpu_tensor *up,
+        pulsar_gpu_tensor *mid,
+        pulsar_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const pulsar_gpu_tensor *selected,
+        const pulsar_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const pulsar_gpu_tensor *x,
+        uint32_t layer_index,
+        uint32_t n_tokens) {
+    (void)gate_row_bytes;   /* an EXL3 stack is stored per its own layout, not by these */
+    (void)down_row_bytes;
+    if (!out || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
+        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        up->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
+        down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+    /* This function is now IQ2_XXS_MMQ_K (44) on BOTH sides, and nothing else.
      *
      * The three dispatchers above it split the space first: 40/40 goes to
      * routed_moe_launch_cutlass, exactly-one-40 to routed_moe_launch_mixed40,
@@ -1384,7 +1629,7 @@ static int routed_moe_launch(
      * Anything else is refused rather than reinterpreted: a dispatch chain that
      * accepts an unknown tag does not fail, it reads the bytes as some other
      * format and returns plausible garbage. */
-    if (gate_type != 43u || down_type != 43u) return 0;
+    if (gate_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K || down_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;
 #ifndef PULSAR_HAVE_MMQ
     return 0;   /* no MMQ build -> type 43 is unreadable */
 #endif
@@ -1409,23 +1654,6 @@ static int routed_moe_launch(
      * exists.  `down` is still the per-pair output buffer, sized by the caller
      * checks above. */
     {
-        /* Read once (no-hot-path-flags): this runs on every MoE launch, i.e.
-         * every layer of every decode token, for a switch fixed at start.
-         * Same cached-static idiom the rest of this file already uses. */
-        static int profile_moe_env = -1;
-        if (profile_moe_env < 0) profile_moe_env = getenv("PULSAR_CUDA_MOE_PROFILE") != NULL;
-        const uint32_t profile_moe = (uint32_t)profile_moe_env;
-        cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-        if (profile_moe) {
-            for (uint32_t i = 0; i < 7u; i++) {
-                if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
-                    for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
-                    memset(prof_ev, 0, sizeof(prof_ev));
-                    break;
-                }
-            }
-            if (prof_ev[0]) (void)cudaEventRecord(prof_ev[0], 0);
-        }
         /* One release configuration (the tuned production values from the old
          * PULSAR_CUDA_MOE_* env matrix): expert-major sorted pair tiles, 16-row
          * down tiles + row-span kernels for big prefill batches, LUT gate for
@@ -1434,114 +1662,43 @@ static int routed_moe_launch(
          * on any down path -- every output element is written by exactly one
          * thread, per-pair stores plus a fixed-order moe_sum_kernel, which is
          * precisely why these stages are bit-exact and re-tileable.) */
-        const uint32_t pair_count = n_tokens * n_expert;
-        /* The sorted-pair structures are not read by MMQ itself; they survive as
-         * the shape signal the batch arms are gated on (and the tile lists the
-         * deleted dp4a kernels used to consume).  n_tokens > 1 is the whole
-         * condition now that the both-mxfp4 special case is gone. */
-        const uint32_t use_sorted_pairs = n_tokens > 1u;
-        /* 128 used to be a throughput heuristic for type 16, which could always
-         * fall back to the dp4a chain below it.  Type 43 cannot, and the gate/up
-         * _vec arm only serves n_tokens==1, so 2..127 had no reader at all: any
-         * short CLI prompt is one small chunk and died with "MMQ declined".  The
-         * batch arm is the only correct reader at n_tokens>1, so it takes every
-         * such n.  With type 16 gone the threshold has no remaining meaning and
-         * use_big_batch is simply use_sorted_pairs; n_tokens==1 still routes to
-         * the _vec arms, which is what use_sorted_pairs excludes. */
-        const uint32_t use_big_batch = use_sorted_pairs;
-        const uint32_t use_direct_down_sum6 = n_tokens == 1u && n_expert == 6u;
-        uint32_t *sorted_pairs = NULL;
-        uint32_t *tile_total = NULL;
-        uint32_t *tile_experts = NULL;
-        uint32_t *tile_starts = NULL;
-        uint32_t *tile16_total = NULL;
-        uint32_t *tile16_experts = NULL;
-        uint32_t *tile16_starts = NULL;
-        uint32_t tile_capacity = 0;
-        uint32_t tile16_capacity = 0;
-        if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
-        if (ok && use_sorted_pairs) {
-            const uint32_t sort_expert_count = n_total_expert;
-            if (sort_expert_count == 0) ok = 0;
-            const uint64_t counts_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
-            const uint64_t offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
-            const uint64_t cursors_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
-            const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-            tile_capacity = (pair_count + 7u) / 8u + sort_expert_count;
-            tile16_capacity = use_big_batch ? ((pair_count + 15u) / 16u + sort_expert_count) : 0u;
-            const uint64_t tile_offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
-            const uint64_t tile_total_bytes = sizeof(uint32_t);
-            const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_big_batch ? ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t) : 0u;
-            const uint64_t tile16_total_bytes = use_big_batch ? sizeof(uint32_t) : 0u;
-            const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
-            const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
-            const uint64_t tile_offsets_off = counts_bytes + offsets_bytes + cursors_bytes + sorted_bytes;
-            const uint64_t tile_total_off = tile_offsets_off + tile_offsets_bytes;
-            const uint64_t tile_experts_off = tile_total_off + tile_total_bytes;
-            const uint64_t tile_starts_off = tile_experts_off + tile_experts_bytes;
-            const uint64_t tile16_offsets_off = tile_starts_off + tile_starts_bytes;
-            const uint64_t tile16_total_off = tile16_offsets_off + tile16_offsets_bytes;
-            const uint64_t tile16_experts_off = tile16_total_off + tile16_total_bytes;
-            const uint64_t tile16_starts_off = tile16_experts_off + tile16_experts_bytes;
-            const uint64_t scratch_bytes = tile16_starts_off + tile16_starts_bytes;
-            uint8_t *scratch = (uint8_t *)cuda_tmp_alloc(scratch_bytes,
-                                                         "routed_moe sorted pairs");
-            if (!scratch) {
-                ok = 0;
-            } else {
-                uint32_t *counts = (uint32_t *)scratch;
-                uint32_t *offsets = (uint32_t *)(scratch + counts_bytes);
-                uint32_t *cursors = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
-                sorted_pairs = (uint32_t *)(scratch + counts_bytes + offsets_bytes + cursors_bytes);
-                uint32_t *tile_offsets = (uint32_t *)(scratch + tile_offsets_off);
-                tile_total = (uint32_t *)(scratch + tile_total_off);
-                tile_experts = (uint32_t *)(scratch + tile_experts_off);
-                tile_starts = (uint32_t *)(scratch + tile_starts_off);
-                uint32_t *tile16_offsets = use_big_batch ? (uint32_t *)(scratch + tile16_offsets_off) : NULL;
-                tile16_total = use_big_batch ? (uint32_t *)(scratch + tile16_total_off) : NULL;
-                tile16_experts = use_big_batch ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
-                tile16_starts = use_big_batch ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
-                if (ok) {
-                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-                        counts,
-                        selected_ptr,
-                        pair_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
-                }
-                if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, sort_expert_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
-                }
-                if (ok) {
-                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
-                        sorted_pairs,
-                        cursors,
-                        selected_ptr,
-                        pair_count);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
-                }
-                if (ok) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, sort_expert_count, 8u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
-                }
-                if (ok) {
-                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile_experts, tile_starts, tile_offsets, counts, sort_expert_count, 8u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
-                }
-                if (ok && use_big_batch) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, sort_expert_count, 16u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
-                }
-                if (ok && use_big_batch) {
-                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, sort_expert_count, 16u);
-                    ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
-                }
-            }
-        }
-        if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
+        /* EVERY batch size takes the batch arm, n_tokens==1 included.  This was
+         * `n_tokens > 1u`, and that comparison was the last size-thresholded
+         * activation-format split in the engine: n>=2 reached the D2R arm with
+         * E4M3 operands, while n==1 went to the _vec arm, which stages
+         * `block_q8_1` and runs integer dp4a against the IQ2 codebook.  q8_1 is
+         * not a preference there -- dp4a is an integer instruction and E4M3
+         * cannot feed it -- so the split was a KERNEL difference wearing a
+         * format's clothes, and the exposure was plain decode and the drafter's
+         * own forwards (speculative verify batches are n>1 and already ran
+         * E4M3).
+         *
+         * mmq/ds4_mmq.cu already refuses exactly this on the prefill down path
+         * by name -- "one activation format, every batch size" -- having been
+         * written after a size-thresholded split hid a missing conversion for
+         * two days.  This was the surviving instance of the thing that comment
+         * forbids, and Tyler's call (2026-08-17) is that the format wins:
+         * "We want one activation format everywhere."
+         *
+         * ⚠ IT COSTS 9.4% OF DECODE, MEASURED, AND THAT IS ACCEPTED, NOT
+         * UNKNOWN: 17.47 -> 15.82 t/s, routed_moe 0.473 -> 0.584 ms/layer.
+         * Cause is tile occupancy, not arithmetic -- the batch path's kNTile is
+         * 64 token-expert pairs wide and decode presents 6, so the N dimension
+         * runs at 9.4% occupancy.  Recovering it is a separate perf row (L056
+         * option B), NOT a precondition for this line; the fidelity decision
+         * ships first and the speed follows it.  Prefill is a clean control at
+         * 957.08 -> 957.00 t/s: only the n==1 path moved. */
+        /* The sorted-pair and expert-tile structures USED to be built here: a
+         * scratch allocation plus six kernel launches (count, prefix, scatter,
+         * two tile builders, and an 8/16-row pair) on every layer of every
+         * prefill chunk.  Nothing read them.  MMQ takes selected_ptr directly,
+         * and the only surviving use of the result was `sorted_pairs != NULL`
+         * as a stand-in for `n_tokens > 1`, a distinction this path no longer
+         * makes at all.
+         * The file said so itself: "not read by MMQ itself; they survive as
+         * the shape signal the batch arms are gated on".  A shape signal does
+         * not need six kernels to compute.
+         * (The CUTLASS dispatchers above build their own and DO read them.) */
         /* MMQ is now the ONLY reader here: this function is type-43-on-both-
          * sides, and the dp4a chains that used to follow each arm are gone with
          * the types that fed them.  So "MMQ declined" is terminal -- there is
@@ -1550,24 +1707,20 @@ static int routed_moe_launch(
          * gate and up share a type: the fused gate+up kernels read ONE layout. */
         int mmq_done = 0;
 #ifdef PULSAR_HAVE_MMQ
-        /* Shape-time decision, evaluated once per launch -- not per token. */
-        if (ok && sorted_pairs && use_big_batch) {
+        if (ok) {
             mmq_done = routed_moe_try_mmq_gate_up(
-                (float *)mid->ptr, (float *)up->ptr,
+                mid, (float *)up->ptr,
                 gate_w, up_w, (const float *)x->ptr, selected_ptr,
                 (const float *)weights->ptr, gate_type,
                 expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
             if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up");
         }
-        /* decode: n_tokens < 128 never reaches the big-batch arm above */
-        if (ok && !mmq_done) {
-            mmq_done = routed_moe_try_mmq_gate_up_vec(
-                (float *)mid->ptr, gate_w, up_w, (const float *)x->ptr, selected_ptr,
-                (const float *)weights->ptr, gate_type,
-                expert_in_dim, expert_mid_dim, n_total_expert, n_expert, n_tokens, clamp);
-            if (mmq_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq gate/up vec");
-        }
-        /* fail closed: nothing else can read the aligned layout */
+        /* Fail closed, and note WHICH failure this now is.  A _vec fallback used
+         * to sit here for n_tokens==1.  It cannot come back: it stages q8_1, so
+         * reinstating it as a decline-handler would mean a declined batch launch
+         * silently changes the activation format instead of failing -- the split
+         * removed above, restored by the back door and visible only as a quality
+         * regression.  One format, or an error. */
         if (ok && !mmq_done) {
             fprintf(stderr, "pulsar: type-43 gate/up but MMQ declined and no fallback exists\n");
             ok = 0;
@@ -1576,65 +1729,41 @@ static int routed_moe_launch(
         (void)mmq_done;
         return 0;   /* no MMQ build -> type 43 is unreadable; rejected at the door */
 #endif
-        if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
+        /* L219: the fold epilogue emitted mid's E4M3 itself; the reader only
+         * checks it landed.  (An earlier contract encoded mid from f32 here in
+         * a separate whole-tensor pass.) */
+        const void *mq2 = NULL, *msf2 = NULL; int mkbp2 = 0;
+        if (ok && !pulsar_gpu_mxfp8_act_cache_get_e4m3(mid, (uint64_t)n_tokens * n_expert, expert_mid_dim, &mq2, &msf2, &mkbp2)) {
+            fprintf(stderr, "pulsar: routed MoE (type-43): mid E4M3 not readable after the fold emit -- refusing\n");
+            ok = 0;
+        }
         int mmq_down_done = 0;
 #ifdef PULSAR_HAVE_MMQ
-        /* Shape-time, once per launch.  MMQ consumes mid as f32 and does its own
-         * q8_1, which is why there is no mid -> midq q8_K quantize left here. */
-        if (ok && sorted_pairs && use_big_batch && !use_direct_down_sum6) {
+        if (ok) {
             mmq_down_done = routed_moe_try_mmq_down((float *)down->ptr,
-                                                    (const float *)mid->ptr,
                                                     down_w, selected_ptr,
                                                     down_type, expert_mid_dim, out_dim,
                                                     n_total_expert,
-                                                    (uint64_t)n_tokens * n_expert);
+                                                    (uint64_t)n_tokens * n_expert, mq2, msf2, mkbp2);
             if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down");
         }
-        /* decode: below the big-batch threshold, and possibly on the
-         * direct-sum6 path.  The _vec entry writes PER-PAIR, so whenever it
-         * runs the fixed-order moe_sum_kernel must run too -- see the sum gate
-         * below, which is widened by mmq_down_done for exactly this case. */
-        if (ok && !mmq_down_done) {
-            mmq_down_done = routed_moe_try_mmq_down_vec((float *)down->ptr,
-                                                        (const float *)mid->ptr,
-                                                        down_w, selected_ptr,
-                                                        down_type, expert_mid_dim, out_dim,
-                                                        n_total_expert,
-                                                        (uint64_t)n_tokens * n_expert);
-            if (mmq_down_done) ok = cuda_ok(cudaGetLastError(), "routed_moe mmq down vec");
-        }
+        /* Same fail-closed rule as gate/up: the down _vec arm is gone with the
+         * threshold that was its only reader.  The reduction below is unaffected
+         * -- it was already owed unconditionally, because every surviving arm
+         * writes per-pair. */
         if (ok && !mmq_down_done) {
             fprintf(stderr, "pulsar: type-43 down but MMQ declined and no fallback exists\n");
             ok = 0;
         }
 #endif
-        if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
-        if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        /* mmq_down_done means the MMQ arm wrote PER-PAIR results, so the
-         * reduction is still owed even on the direct-sum6 decode path (whose
-         * dp4a kernel would have summed in-kernel).  Without this the decode
-         * output would be a single slot instead of the 6-expert sum. */
-        if (ok && (!use_direct_down_sum6 || mmq_down_done)) {
+        /* The MMQ arms write PER-PAIR results, so the fixed-order reduction is
+         * always owed; the arms above are fail-closed, so reaching here with ok
+         * set means one of them ran. */
+        if (ok) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens,
+                                                     moe_nonfinite_code(layer_index, MOE_NF_ARM_MMQ_DOWN));
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
-        }
-        if (prof_ev[6]) {
-            (void)cudaEventRecord(prof_ev[6], 0);
-            if (cudaEventSynchronize(prof_ev[6]) == cudaSuccess) {
-                float ms_xq = 0.0f, ms_sort = 0.0f, ms_gate = 0.0f, ms_midq = 0.0f, ms_down = 0.0f, ms_sum = 0.0f, ms_total = 0.0f;
-                (void)cudaEventElapsedTime(&ms_xq, prof_ev[0], prof_ev[1]);
-                (void)cudaEventElapsedTime(&ms_sort, prof_ev[1], prof_ev[2]);
-                (void)cudaEventElapsedTime(&ms_gate, prof_ev[2], prof_ev[3]);
-                (void)cudaEventElapsedTime(&ms_midq, prof_ev[3], prof_ev[4]);
-                (void)cudaEventElapsedTime(&ms_down, prof_ev[4], prof_ev[5]);
-                (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
-                (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
-                fprintf(stderr,
-                        "pulsar: CUDA MoE profile tokens=%u pairs=%u xq=%.3f sort=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
-                        n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
-            }
-            for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
         }
         return ok;
     }
@@ -1644,89 +1773,13 @@ static int routed_moe_launch(
 
 
 
-int pulsar_gpu_routed_moe_one_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index) {
-    if (gate_type == 40u && down_type == 40u) {
-        /* Decode (n=1) takes the same direct fp4 GEMV as small verify batches:
-         * 4 launches with no host round-trip, vs the grouped path's BLOCKING
-         * per-layer offsets readback -- required for CUDA graph capture of the
-         * decode tape, and computes the exact same function (see the batch
-         * path's comment; bit-exact oracle in temp/fp4gemv_test.cu covers
-         * n_tokens>=1). PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
-        static int fp4_gemv = -1;
-        if (fp4_gemv < 0) {
-            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
-            fp4_gemv = !(e && e[0] == '0');
-        }
-        if (fp4_gemv &&
-            mid && mid->ptr && down && down->ptr && out && out->ptr &&
-            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
-            mid->bytes >= (uint64_t)n_expert * expert_mid_dim * sizeof(float) &&
-            down->bytes >= (uint64_t)n_expert * out_dim * sizeof(float) &&
-            out->bytes >= (uint64_t)out_dim * sizeof(float) &&
-            selected->bytes >= (uint64_t)n_expert * sizeof(int32_t) &&
-            weights->bytes >= (uint64_t)n_expert * sizeof(float) &&
-            x->bytes >= (uint64_t)expert_in_dim * sizeof(float)) {
-            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
-            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
-            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
-            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
-            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
-            if (gate_w && up_w && down_w &&
-                pulsar_cutlass_expert_ffn_gemv_small(
-                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
-                        (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
-                        gate_expert_bytes, gate_row_bytes,
-                        down_expert_bytes, down_row_bytes,
-                        clamp, 1, (int)n_expert, n_total_expert,
-                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
-                moe_sum_kernel<<<(uint32_t)((out_dim + 255u) / 256u), 256>>>(
-                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, 1u);
-                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 1;
-            }
-            /* any failure: fall through to the grouped CUTLASS path */
-        }
-        /* type-40 decode bypassed the fp4 GEMV fast path -> the per-expert
-         * CUTLASS loop.  Announce once, unconditionally, so the slow decode
-         * tier is not silent. */
-        {
-            static int gemv_dec_logged = 0;
-            if (!gemv_dec_logged) { gemv_dec_logged = 1;
-                fprintf(stderr,
-                        "pulsar: WARNING MoE fp4 GEMV decode path not taken -> per-expert loop (slower decode)\n");
-            }
-        }
-        return routed_moe_launch_cutlass(out, down, model_map, model_size,
-                                         gate_offset, up_offset, down_offset,
-                                         gate_expert_bytes, gate_row_bytes,
-                                         down_expert_bytes, down_row_bytes,
-                                         expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, 1);
-    }
-    if ((gate_type == 40u) != (down_type == 40u)) {
-        /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed --
-         * routed_moe_launch is 43/43 only and cannot read the type-40 swizzle,
-         * so a mixed layer must never fall through to it. */
-        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
-                                         gate_offset, up_offset, down_offset, gate_type, down_type,
-                                         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-                                         expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, 1);
-    }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
-}
-
 
 /* plan-34 inc 4: row-offset sub-view of a per-token MoE tensor for the two-pass
  * split (byte offset into a row-major [n_tokens x stride] buffer). Reads ptr/bytes
  * only; owner=0 (never freed). NULL/empty tensors pass through as empty. */
+/** @param t         the tensor (may be NULL)
+ *  @param off_bytes byte offset of the sub-view
+ *  @return a non-owning view from off_bytes to the end (empty for a NULL / empty tensor) */
 static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t off_bytes) {
     pulsar_gpu_tensor s; s.ptr = NULL; s.bytes = 0; s.owner = 0;
     if (t && t->ptr) {
@@ -1736,145 +1789,186 @@ static inline pulsar_gpu_tensor moe_subrow(const pulsar_gpu_tensor *t, uint64_t 
     return s;
 }
 
-static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    if (mid_is_f16) *mid_is_f16 = false;
+/** Routed MoE dispatch: splits a mixed decode + prefill step in two passes (see the comment inside), then
+ *  routes by the stacks' types to the EXL3, small-batch GEMV, grouped CUTLASS, mixed or MMQ arm.
+ *  @param out               device f32 [n_tokens][out_dim] block output (the per-token sum over its n_expert slots)
+ *  @param up                device f32 scratch [n_tokens * n_expert][expert_mid_dim] (gate / up partials, by arm)
+ *  @param mid               device f32 [n_tokens * n_expert][expert_mid_dim] mid tensor (its E4M3 activation slot carries the encoded mid)
+ *  @param down              device f32 [n_tokens * n_expert][out_dim] per-slot pre-weighted FFN outputs (the flat down buffer)
+ *  @param model_map         host base of the model mapping the expert stacks live in
+ *  @param model_size        bytes of that mapping (offsets are bounds-checked against it)
+ *  @param gate_offset       byte offset of the gate stack (n_total_expert experts back to back)
+ *  @param up_offset         byte offset of the up stack
+ *  @param down_offset       byte offset of the down stack
+ *  @param gate_type         pulsar_tensor_type of the gate / up stacks
+ *  @param down_type         pulsar_tensor_type of the down stack
+ *  @param gate_expert_bytes bytes per gate / up expert (the stack stride)
+ *  @param gate_row_bytes    gate / up per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param down_expert_bytes bytes per down expert (the stack stride)
+ *  @param down_row_bytes    down per-expert row bytes; for CUTLASS MXFP4 the data-plane bytes before the scale plane
+ *  @param expert_in_dim     expert input width (the hidden size)
+ *  @param expert_mid_dim    expert intermediate width (under expert TP, this rank's half)
+ *  @param out_dim           expert output width
+ *  @param selected          device int32 [n_tokens][n_expert] routed expert ids
+ *  @param weights           device f32 [n_tokens][n_expert] routing weights
+ *  @param n_total_expert    experts present in the stacks
+ *  @param n_expert          routed slots per token (top-k)
+ *  @param clamp             SwiGLU clamp (<= 1e-6: none)
+ *  @param x                 device f32 [n_tokens][expert_in_dim] input; its producer E4M3 slot is what the GEMMs read
+ *  @param layer_index       layer, for the non-finite / route-bounds flags
+ *  @param n_tokens          token rows
+ *  @return 1 on success, 0 refused / failed */
+static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
     /* plan-34 inc 4 — MoE TWO-PASS split of a fused mixed step. Row layout is
      * [decode rows 0..n_dec) then one K-row prefill run [n_dec..n_tokens). The MoE
      * is strictly per-row (selected/weights/x/out addressed by token), so a decode
      * row's expert output is invariant to co-scheduled rows ONLY if it takes the
      * M-independent per-token path — but the grouped GEMM's per-expert group sizes
-     * depend on the whole batch. So: run the PER-TOKEN path over the decode prefix
-     * (n_tokens=n_dec<=8 keeps the GEMV/non-grouped dispatch) and the GROUPED path
-     * over the prefill suffix (K>8), offsetting every per-token buffer by n_dec rows.
-     *   - Pass 1 keeps the flag = n_dec (nonzero) so the cap-8 dispatch picks the
-     *     per-token path for n_dec<=8; n_tokens==n_dec => it does NOT re-split.
-     *   - Pass 2 clears the flag so it (a) does not re-split and (b) is BYTE-
-     *     IDENTICAL to an inc-3 pure-prefill MoE of the same K rows (grouped path,
-     *     which reads no flag). The flag is restored before returning so the rest of
-     *     the layer/step still splits its dense GEMMs. */
+     * depend on the whole batch. So: run the decode prefix as its own call
+     * (n_dec <= PULSAR_GPU_MNEUTRAL_ROWS_MAX, so the capped dispatch below takes
+     * the per-token path) and the prefill suffix as its own call, offsetting
+     * every per-token buffer by n_dec rows.
+     *   - Pass 1 runs with the decode-row count = n_dec == n_tokens, so it does
+     *     not re-split.
+     *   - Pass 2 runs with the count cleared so it (a) does not re-split and (b)
+     *     is BYTE-IDENTICAL to a pure-prefill MoE of the same K rows.  The count
+     *     is restored before returning so the rest of the layer/step still splits
+     *     its dense GEMMs. */
     {
-        const uint32_t n_dec = (uint32_t)pulsar_gpu_matmul_batch_mneutral();
+        const uint32_t n_dec = (uint32_t)pulsar_gpu_matmul_batch_decode_rows();
         if (n_dec > 0 && n_dec < n_tokens && x && selected && weights && out) {
             const uint64_t f = sizeof(float), i4 = sizeof(int32_t);
             pulsar_gpu_tensor x_s    = moe_subrow(x,        (uint64_t)n_dec * expert_in_dim * f);
             pulsar_gpu_tensor sel_s  = moe_subrow(selected, (uint64_t)n_dec * n_expert * i4);
             pulsar_gpu_tensor w_s    = moe_subrow(weights,  (uint64_t)n_dec * n_expert * f);
             pulsar_gpu_tensor out_s  = moe_subrow(out,      (uint64_t)n_dec * out_dim * f);
-            pulsar_gpu_tensor gate_s = moe_subrow(gate,     (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor up_s   = moe_subrow(up,       (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor mid_s  = moe_subrow(mid,      (uint64_t)n_dec * n_expert * expert_mid_dim * f);
             pulsar_gpu_tensor down_s = moe_subrow(down,     (uint64_t)n_dec * n_expert * out_dim * f);
-            const int r1 = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+            const int r1 = routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                     gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-                    n_total_expert, n_expert, clamp, x, layer_index, n_dec, mid_is_f16);
-            pulsar_gpu_matmul_set_batch_mneutral(0);
-            const int r2 = routed_moe_batch_impl(&out_s, &gate_s, &up_s, &mid_s, &down_s,
+                    n_total_expert, n_expert, clamp, x, layer_index, n_dec);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
+            /* L158 inc 5: the suffix view keys no slot; give it one from the
+             * producer's full-width encoding (byte copy + scale re-base).  No
+             * encoding on x means no MoE -- refuse rather than quantise. */
+            if (!pulsar_gpu_mxfp8_act_cache_window(x, n_dec, n_tokens - n_dec, expert_in_dim, &x_s)) {
+                fprintf(stderr, "pulsar: routed MoE mixed split: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                        expert_in_dim, n_tokens);
+                (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
+                return 0;
+            }
+            const int r2 = routed_moe_batch_impl(&out_s, &up_s, &mid_s, &down_s,
                     model_map, model_size, gate_offset, up_offset, down_offset, gate_type, down_type,
                     gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim, &sel_s, &w_s,
-                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec, mid_is_f16);
-            pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
+                    n_total_expert, n_expert, clamp, &x_s, layer_index, n_tokens - n_dec);
+            (void)pulsar_gpu_matmul_set_batch_decode_rows((int)n_dec);   /* restoring an accepted value */
             return (r1 && r2) ? 1 : 0;
         }
     }
-    {
-        static int entry_log = -1;
-        if (entry_log < 0) entry_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 200 : 0;
-        if (entry_log > 0) { entry_log--;
-            fprintf(stderr, "pulsar: moe_batch ENTRY layer=%u gate_type=%u down_type=%u n_tok=%u\n",
-                    layer_index, gate_type, down_type, n_tokens); }
+    if (exl3_type_k2(gate_type) || exl3_type_k2(down_type)) {
+        /* L245: the EXL3 arm; a mix with 40/44 is refused inside, by name. */
+        return routed_moe_launch_exl3(out, up, mid, down, model_map, model_size,
+                                      gate_offset, up_offset, down_offset, gate_type, down_type,
+                                      gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                      expert_in_dim, expert_mid_dim, out_dim,
+                                      selected, weights, n_total_expert, n_expert, clamp, x,
+                                      layer_index, n_tokens);
     }
-    if (gate_type == 40u && down_type == 40u) {
-        /* Small batches (spec-decode verify, n_tokens 2..4): direct fp4 GEMV over the
-         * packed expert weights -- 4 launches per layer (act-roundtrip + gate/up+swiglu
-         * + act-roundtrip + down) vs the grouped path's BLOCKING per-layer offsets
-         * readback + ~5 launches per active expert. Computes the exact same function
-         * as the grouped GEMMs (weights read in the verified row-major CUTLASS B
-         * layout; activations round-tripped through the same fp4 quantizer) -- proven
-         * bit-exact vs a quant-exact CPU oracle (temp/fp4gemv_test.cu) and clean-text
-         * on-model. Measured verify(3) step 118.2 -> 116.5 ms; the bigger win is
-         * removing the per-rich-layer host sync from the verify path (CUDA-graph
-         * prerequisite). n_tokens==1 (decode) keeps the grouped path unchanged.
-         * PULSAR_MOE_FP4_GEMV=0 restores the grouped dispatch. */
-        static int fp4_gemv = -1;
-        if (fp4_gemv < 0) {
-            const char *e = getenv("PULSAR_MOE_FP4_GEMV");
-            fp4_gemv = !(e && e[0] == '0');
-        }
-        static int path_log = -1;
-        if (path_log < 0) path_log = getenv("PULSAR_MOE_PATH_LOG") != NULL ? 400 : 0;
-        if (path_log > 0) {
-            path_log--;
-            fprintf(stderr,
-                    "pulsar: moe40 layer=%u n_tok=%u n_total=%u stride=%llu split=%llu mid=%d down=%d midb=%llu need=%llu\n",
-                    layer_index, n_tokens, n_total_expert,
-                    (unsigned long long)gate_expert_bytes, (unsigned long long)gate_row_bytes,
-                    mid && mid->ptr ? 1 : 0, down && down->ptr ? 1 : 0,
-                    (unsigned long long)(mid ? mid->bytes : 0),
-                    (unsigned long long)((uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float)));
-        }
-        /* inc 2: raise the M-independent GEMV cap to PULSAR_MSEQ_MAX (8) for a batched
-         * step so 5..8 keep the per-token path instead of the grouped GEMM. */
-        /* 2026-07-21: the un-armed default was 4, so spec-verify at --dspark-draft 5
-         * (w=6) fell off the per-token GEMV onto the grouped expert GEMM with its
-         * blocking per-layer offsets readback. Both arms are 8 now; the 5..8 path
-         * is the same kernel already used under mneutral.
-         * VERIFIED bit-exact in isolation vs the cap-4 build at verify widths 6
-         * and 8 (byte-identical logits + token stream, 3 fresh loads per arm), and
-         * width 4 is untouched. Median verify: w=6 258.0 -> 180.7 ms (-30.0%),
-         * w=8 290.4 -> 213.9 ms (-26.4%); layers_encode 213 -> 130 ms. The three
-         * sibling caps in pulsar_cuda_matmul.cu were tried alongside this and are NOT
-         * bit-exact -- they stay at 4; do not re-couple them to this one. */
-        const uint32_t moe_gemv_cap = 8u;
-        if (fp4_gemv && n_tokens >= 2u && n_tokens <= moe_gemv_cap &&
-            mid && mid->ptr && down && down->ptr && out && out->ptr &&
-            selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
-            mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
-            down->bytes >= (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) &&
-            out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float) &&
-            selected->bytes >= (uint64_t)n_tokens * n_expert * sizeof(int32_t) &&
-            weights->bytes >= (uint64_t)n_tokens * n_expert * sizeof(float) &&
-            x->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(float)) {
-            const uint64_t gate_total = (uint64_t)n_total_expert * gate_expert_bytes;
-            const uint64_t down_total = (uint64_t)n_total_expert * down_expert_bytes;
-            const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_total, "moe_fp4_gemv_gate");
-            const char *up_w   = cuda_model_range_ptr(model_map, up_offset, gate_total, "moe_fp4_gemv_up");
-            const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_total, "moe_fp4_gemv_down");
-            if (gate_w && up_w && down_w &&
-                pulsar_cutlass_expert_ffn_gemv_small(
-                        (float *)down->ptr, (float *)mid->ptr, (const float *)x->ptr,
+    if (gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 && down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) {
+        /* Which expert-FFN arithmetic a row gets is a numerics boundary: the
+         * direct fp4 GEMV over the packed expert weights (4 launches per
+         * layer, gate/up+swiglu, down, their E4M3 emits, no host sync, each
+         * row from its own activation) and routed_moe_launch_cutlass_dispatch's
+         * grouped fixed-tile projection do NOT agree to the last bit on every
+         * row (a final-rounding difference in ~1 element per 50k; L150 and
+         * L152 bisected the row-selective drift of a 9..16-row drafter step
+         * to exactly this boundary when a cap of 8 chose here inside the
+         * M-neutral range).  The rule, in two halves (L167):
+         *   DECODE rows (pulsar_gpu_matmul_batch_decode_rows > 0; the two-pass
+         *   split above leaves the count at 0 or >= n_tokens, the setter bounds
+         *   it at PULSAR_GPU_MNEUTRAL_ROWS_MAX) take the GEMV at ANY width, so
+         *   the whole neutral range is one arithmetic and no cap sits inside it.
+         *   PREFILL rows take the GEMV up to MOE_PREFILL_GEMV_ROWS and the
+         *   grouped projection above it.  The cap is REFERENCE-GRADED, not a
+         *   speed choice: the 6-row remainder chunk of the story blob's
+         *   depth-4102 prefill graded 8.4% further from the B300 reference on
+         *   the grouped kernel (KL 6.456e-07 -> 6.997e-07; every other depth
+         *   unchanged; cuda-reference-gate FAIL), and back to bit-identical
+         *   with the GEMV.  A prefill remainder is a fixed function of the
+         *   chunk schedule, never a per-step width, so this cap creates no
+         *   step-to-step neutrality boundary.
+         * A decode call whose buffers do not fit refuses -- it used to fall to
+         * the grouped path. */
+        enum { MOE_PREFILL_GEMV_ROWS = 32 };   /* EXPERIMENT 2026-09-30: decode-width steps past 16 rows keep the expert GEMV */
+        if (pulsar_gpu_matmul_batch_decode_rows() > 0 || n_tokens <= (uint32_t)MOE_PREFILL_GEMV_ROWS) {
+            if (!(mid && mid->ptr && down && down->ptr && out && out->ptr &&
+                  selected && selected->ptr && weights && weights->ptr && x && x->ptr &&
+                  mid->bytes >= (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) &&
+                  down->bytes >= (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) &&
+                  out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float) &&
+                  selected->bytes >= (uint64_t)n_tokens * n_expert * sizeof(int32_t) &&
+                  weights->bytes >= (uint64_t)n_tokens * n_expert * sizeof(float) &&
+                  x->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(float))) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN (n_tok=%u): a scratch "
+                                "buffer is missing or too small -- refusing\n", n_tokens);
+                return 0;
+            }
+            const char *gate_w = routed_expert_stack_ptr(model_map, gate_offset, gate_expert_bytes, n_total_expert,
+                                                         "moe_fp4_gemv_gate");
+            const char *up_w   = routed_expert_stack_ptr(model_map, up_offset, gate_expert_bytes, n_total_expert,
+                                                         "moe_fp4_gemv_up");
+            const char *down_w = routed_expert_stack_ptr(model_map, down_offset, down_expert_bytes, n_total_expert,
+                                                         "moe_fp4_gemv_down");
+            /* Handover first (L089): when the producing norm already emitted
+             * this x as E4M3, gemv_small reads THOSE bytes and never
+             * dereferences the f32 -- which REMOVES the sixth reader instead of
+             * guarding it, and is what makes lifting the n<=8 ffn store-skip
+             * possible.  A miss refuses (L158); same shape as the gemv_gateup
+             * handover above. */
+            const void *hq = NULL, *hsf = NULL;
+            int hkbp = 0;
+            if (!pulsar_gpu_mxfp8_act_cache_get_e4m3(x, n_tokens, expert_in_dim, &hq, &hsf, &hkbp)) {
+                hq = NULL; hsf = NULL; hkbp = 0;
+            }
+            if (!hq) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN: no producer E4M3 for x (in_dim=%u n_tok=%u) -- refusing\n",
+                        expert_in_dim, n_tokens);
+                return 0;
+            }
+            if (!(gate_w && up_w && down_w)) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN: expert weight range unmapped -- refusing\n");
+                return 0;
+            }
+            /* L159 inc 2: this arm either runs or refuses.  It used to fall
+             * through to the grouped dispatch on any failure -- for an armed
+             * step a neutrality break (the rows took the other kernel), for an
+             * unarmed one a silent slow path -- with a WARNING line as the only
+             * witness.  A failure here is a failure. */
+            if (pulsar_cutlass_expert_ffn_gemv_small(
+                        (float *)down->ptr,
                         (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                        (const uint8_t *)gate_w, (const uint8_t *)up_w, (const uint8_t *)down_w,
+                        mxfp4_expert_table(gate_w, gate_expert_bytes, n_total_expert),
+                        mxfp4_expert_table(up_w, gate_expert_bytes, n_total_expert),
+                        mxfp4_expert_table(down_w, down_expert_bytes, n_total_expert),
                         gate_expert_bytes, gate_row_bytes,
                         down_expert_bytes, down_row_bytes,
                         clamp, (int)n_tokens, (int)n_expert, n_total_expert,
-                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim) == 0) {
-                const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
-                moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
-                        (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
-                if (cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) {
-                    if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> gemv\n", layer_index);
-                    return 1;
-                }
-            }
-            /* any failure: fall through to the grouped CUTLASS path */
-        }
-        if (path_log > 0) fprintf(stderr, "pulsar: moe40 layer=%u -> grouped\n", layer_index);
-        /* A small verify batch (n_tokens 2..4) that was ELIGIBLE for the fp4
-         * GEMV fast path but fell through is a genuine (if minor) silent
-         * fallback -- announce once, unconditionally.  n_tokens>4 (prefill)
-         * routing to the grouped dispatch is the intended fast path, not a
-         * fallback, so it is deliberately NOT flagged here. */
-        {
-            static int gemv_batch_logged = 0;
-            if (fp4_gemv && n_tokens >= 2u && n_tokens <= 4u && !gemv_batch_logged) {
-                gemv_batch_logged = 1;
-                fprintf(stderr,
-                        "pulsar: WARNING MoE fp4 GEMV verify(%u) path not taken -> grouped dispatch\n",
+                        (int)expert_in_dim, (int)expert_mid_dim, (int)out_dim,
+                        hq, hsf, hkbp) != 0) {
+                fprintf(stderr, "pulsar: routed MoE small-batch FFN (n_tok=%u) failed -- no fallback; refusing\n",
                         n_tokens);
+                return 0;
             }
+            const uint64_t sum_n = (uint64_t)n_tokens * out_dim;
+            moe_sum_kernel<<<(uint32_t)((sum_n + 255u) / 256u), 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens,
+                    moe_nonfinite_code(layer_index, MOE_NF_ARM_GEMV_DOWN));
+            if (!cuda_ok(cudaGetLastError(), "moe fp4 gemv sum")) return 0;
+            return 1;
         }
         return routed_moe_launch_cutlass_dispatch(out, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset,
@@ -1882,17 +1976,17 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
                                          down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
                                          selected, weights, n_total_expert, n_expert, clamp, x,
-                                         n_tokens);
+                                         layer_index, n_tokens);
     }
-    if ((gate_type == 40u) != (down_type == 40u)) {
+    if ((gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4) != (down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4)) {
         /* MIXED type-40 + type-43: per-projection dispatch. Fail-closed. */
-        return routed_moe_launch_mixed40(out, gate, up, mid, down, model_map, model_size,
+        return routed_moe_launch_mixed40(out, up, mid, down, model_map, model_size,
                                          gate_offset, up_offset, down_offset, gate_type, down_type,
                                          gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                                          expert_in_dim, expert_mid_dim, out_dim,
-                                         selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                                         selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
     }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+    return routed_moe_launch(out, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
@@ -1902,61 +1996,46 @@ static int routed_moe_batch_impl(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate
                              layer_index, n_tokens);
 }
 
-/* ---- Per-format MoE prefill timing (PULSAR_MOE_TIME=1). Buckets each batch MoE call's GPU time
- * by (gate_type,down_type) via a CUDA-event pair around the impl, and dumps a table at exit.
- * The event sync perturbs host wall-time but the measured per-call GPU interval is accurate;
- * this is a diagnostic-only path (one getenv read, no per-token flag branching in production). */
-struct moe_time_bucket { uint32_t gate_type, down_type; double ms; uint64_t calls; };
-static moe_time_bucket g_moe_time[64];
-static int g_moe_time_n = 0;
-static void moe_time_dump(void){
-    if (g_moe_time_n == 0) return;
-    double tot = 0; for (int i = 0; i < g_moe_time_n; i++) tot += g_moe_time[i].ms;
-    fprintf(stderr, "\n=== PULSAR_MOE_TIME per-format MoE batch GPU time (total %.2f ms over all calls) ===\n", tot);
-    for (int i = 0; i < g_moe_time_n; i++) {
-        moe_time_bucket *b = &g_moe_time[i];
-        fprintf(stderr, "  gate_type=%2u down_type=%2u : %9.2f ms  (%5.1f%%)  calls=%llu  avg=%.3f ms\n",
-                b->gate_type, b->down_type, b->ms, tot > 0 ? 100.0 * b->ms / tot : 0.0,
-                (unsigned long long)b->calls, b->calls ? b->ms / (double)b->calls : 0.0);
+int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, uint32_t expert_split) {
+    /* Nothing below this line consults esz: every scratch/output cast in the
+     * MoE lane is (float *) over a tensor the graph allocates f32.  That was
+     * TRUE-BY-ACCIDENT rather than checked (types sweep 2026-08-22): if any
+     * MoE tensor is ever narrowed, ten casts become defect nine at once,
+     * silently.  So the whole lane's f32 assumption is enforced ONCE, here at
+     * its two entry points. */
+    if (pulsar_tensor_esz(out) != sizeof(float) || pulsar_tensor_esz(up) != sizeof(float) ||
+        pulsar_tensor_esz(mid) != sizeof(float) || pulsar_tensor_esz(down) != sizeof(float) ||
+        pulsar_tensor_esz(weights) != sizeof(float) || pulsar_tensor_esz(x) != sizeof(float)) {
+        fprintf(stderr, "pulsar: routed MoE lane is f32-only; a narrowed tensor reached it\n");
+        return 0;
     }
-    fprintf(stderr, "=== end PULSAR_MOE_TIME ===\n");
-}
-static void moe_time_accum(uint32_t gt, uint32_t dt, double ms){
-    for (int i = 0; i < g_moe_time_n; i++)
-        if (g_moe_time[i].gate_type == gt && g_moe_time[i].down_type == dt) {
-            g_moe_time[i].ms += ms; g_moe_time[i].calls++; return;
+    /* L241 4g-2 / L269 W1 expert tensor-parallel: the stacks behind (model_map,
+     * offsets) are this rank's HALF of every expert at expert_mid_dim = the half
+     * width -- the pure cutlass_mxfp4 halves (pulsar_gpu_register_mxfp4_expert_half)
+     * or the pure EXL3 halves (pulsar_gpu_register_exl3_expert_half), each its
+     * format's own layout of the half shape.  Every other arm (MMQ, mixed) would
+     * read whole-expert bytes that are not there -- refuse by name (rule 1). */
+    if (expert_split) {
+        const int mx = gate_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4 &&
+                       down_type == (uint32_t)PULSAR_TENSOR_CUTLASS_MXFP4;
+        const int ex = exl3_type_k2(gate_type) != 0 && exl3_type_k2(down_type) != 0;
+        if (!mx && !ex) {
+            fprintf(stderr, "pulsar: routed MoE: expert tensor-parallel serves cutlass_mxfp4 (type 40) or EXL3 "
+                            "stacks on both sides; layer %u is gate %u / down %u -- refusing\n",
+                    layer_index, gate_type, down_type);
+            return 0;
         }
-    if (g_moe_time_n < 64) {
-        static int registered = 0;
-        if (!registered) { registered = 1; atexit(moe_time_dump); }
-        g_moe_time[g_moe_time_n].gate_type = gt; g_moe_time[g_moe_time_n].down_type = dt;
-        g_moe_time[g_moe_time_n].ms = ms; g_moe_time[g_moe_time_n].calls = 1; g_moe_time_n++;
+        static int split_said[2] = {0, 0};
+        if (!split_said[ex]) {
+            split_said[ex] = 1;
+            fprintf(stderr, "pulsar: routed MoE expert tensor-parallel lane on (%s halves: every expert, "
+                            "intermediate half of width %u)\n", ex ? "EXL3" : "cutlass_mxfp4", expert_mid_dim);
+        }
     }
-}
-
-int pulsar_gpu_routed_moe_batch_tensor(pulsar_gpu_tensor *out, pulsar_gpu_tensor *gate, pulsar_gpu_tensor *up, pulsar_gpu_tensor *mid, pulsar_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const pulsar_gpu_tensor *selected, const pulsar_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const pulsar_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    static int time_moe = -1;
-    if (time_moe < 0) time_moe = getenv("PULSAR_MOE_TIME") != NULL ? 1 : 0;
-    if (!time_moe) {
-        return routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
+    return routed_moe_batch_impl(out, up, mid, down, model_map, model_size,
                 gate_offset, up_offset, down_offset, gate_type, down_type,
                 gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
                 expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-                n_total_expert, n_expert, clamp, x, layer_index, n_tokens, mid_is_f16);
-    }
-    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s, 0);
-    int r = routed_moe_batch_impl(out, gate, up, mid, down, model_map, model_size,
-            gate_offset, up_offset, down_offset, gate_type, down_type,
-            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-            n_total_expert, n_expert, clamp, x, layer_index, n_tokens, mid_is_f16);
-    cudaEventRecord(e, 0);
-    if (cudaEventSynchronize(e) == cudaSuccess) {
-        float ms = 0; cudaEventElapsedTime(&ms, s, e);
-        moe_time_accum(gate_type, down_type, (double)ms);
-    }
-    cudaEventDestroy(s); cudaEventDestroy(e);
-    return r;
+                n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
 }
 

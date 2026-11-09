@@ -1,5 +1,9 @@
+/** @file
+ *  pulsar-bench: prefill and decode throughput at fixed context frontiers. */
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
+#include "pulsar_argparse.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -21,85 +25,57 @@
 #include <string.h>
 #include <time.h>
 
+/** A context-depth sweep: prefill and decode at a series of context sizes,
+ * reporting throughput at each.
+ *
+ * The sweep steps EITHER additively (step_incr) or multiplicatively
+ * (step_mul); step_mul == 1.0 selects the additive form, and one of the two
+ * must be set or the sweep would not advance.
+ */
 typedef struct {
-    const char *model_path;
-    const char *prompt_path;
-    const char *chat_prompt_path;
-    const char *system;
-    const char *csv_path;
-    pulsar_backend backend;
-    int threads;
-    int ctx_start;
-    int ctx_max;
+    const char *model_path;        ///< model to benchmark
+    const char *prompt_path;       ///< raw prompt text file
+    const char *chat_prompt_path;  ///< prompt to render through the chat template instead
+    const char *system;            ///< system prompt for the chat form
+    const char *csv_path;          ///< write per-step results here; NULL = stdout only
+    pulsar_backend backend;        ///< CPU or CUDA
+    int ctx_start;                 ///< first context depth in the sweep
+    int ctx_max;                   ///< last context depth in the sweep
+    /** Context the session is ALLOCATED with, as opposed to the depths swept.
+     * Held fixed across the sweep so every step measures the same allocation
+     * and depth is the only variable; defaults to ctx_max + gen_tokens + 1. */
     int ctx_alloc;
-    int step_incr;
-    int gen_tokens;
-    uint32_t prefill_chunk;
-    double step_mul;
-    const char *dump_frontier_logits_dir;
-    bool warm_weights;
-    bool quality;
+    int step_incr;                 ///< additive step between depths
+    int gen_tokens;                ///< tokens to decode at each depth
+    uint32_t prefill_chunk;        ///< prefill chunk size in rows
+    double step_mul;               ///< multiplicative step; 1.0 selects the additive form
+    const char *dump_frontier_logits_dir;  ///< write each step's frontier logits here, for divergence checks
 } bench_config;
 
+/** @brief Monotonic wall clock.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+/** @brief Print pulsar-bench's help text.
+ *  @param fp    the stream to print to
+ *  @param topic help topic, or NULL for the overview */
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_BENCH, topic);
 }
 
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static int parse_nonnegative_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static double parse_double_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    double v = strtod(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v)) {
-        fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-bench: %s requires an argument\n", opt);
-        exit(2);
-    }
-    return argv[++*i];
-}
-
-static pulsar_backend parse_backend(const char *s, const char *opt) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "pulsar-bench: valid backends are: cuda\n");
-    exit(2);
-}
-
+/** @brief The backend selected when none is given.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
 
+/** @brief Read a whole file into a NUL-terminated buffer; any failure exits 1 (said on stderr).
+ *  @param path the file
+ *  @return a malloc'd buffer; caller frees */
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -139,9 +115,14 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/** @brief Parse the command line into a sweep configuration; --help prints usage and exits 0, a bad argument
+ *  or an inconsistent sweep exits 2.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the resolved configuration */
 static bench_config parse_options(int argc, char **argv) {
     bench_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "model",
         .system = "You are a helpful assistant.",
         .backend = default_backend(),
         .ctx_start = 2048,
@@ -183,18 +164,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             c.prefill_chunk = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.warm_weights = true;
         } else {
             fprintf(stderr, "pulsar-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -230,6 +201,9 @@ static bench_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/** @brief Write a NUL-terminated string as a JSON string literal (control bytes escaped).
+ *  @param fp the stream
+ *  @param s  the string; NULL writes "" */
 static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
@@ -252,6 +226,14 @@ static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
+/** @brief With --dump-frontier-logits: write the session's frontier logits row (non-finite as null) and its
+ *  argmax as JSON to `<dir>/frontier_<frontier>.logits.json`; a no-op without the option.
+ *  @param cfg      the sweep configuration
+ *  @param engine   the loaded engine
+ *  @param session  the session at the frontier
+ *  @param frontier the frontier, tokens
+ *  @param previous the previous frontier, tokens (prefill_tokens = frontier - previous)
+ *  @return 0, or 1 on failure (said on stderr; a row with no finite logit has no argmax and refuses) */
 static int write_frontier_logits_json(
         const bench_config *cfg,
         pulsar_engine         *engine,
@@ -260,7 +242,7 @@ static int write_frontier_logits_json(
         int                 previous) {
     if (!cfg->dump_frontier_logits_dir) return 0;
 
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
     float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         fprintf(stderr, "pulsar-bench: out of memory copying frontier logits\n");
@@ -284,6 +266,12 @@ static int write_frontier_logits_json(
         return 1;
     }
 
+    const int argmax = pulsar_session_argmax(session);
+    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+        fprintf(stderr, "pulsar-bench: no finite logit at frontier %d; refusing its logits dump\n", frontier);
+        free(logits);
+        return 1;
+    }
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "pulsar-bench: failed to open %s: %s\n", path, strerror(errno));
@@ -291,17 +279,15 @@ static int write_frontier_logits_json(
         return 1;
     }
 
-    const int argmax = pulsar_session_argmax(session);
     fprintf(fp, "{\n  \"source\":\"pulsar-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            ",\n  \"backend\":\"%s\",\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             pulsar_backend_name(cfg->backend),
-            cfg->quality ? "true" : "false",
             pulsar_engine_routed_quant_bits(engine),
             frontier,
             frontier,
@@ -326,6 +312,11 @@ static int write_frontier_logits_json(
     return 0;
 }
 
+/** @brief The sweep's next depth after cur: + step_incr (step_mul == 1) or ceil(cur * step_mul) (at least
+ *  cur + 1), clamped to ctx_max.
+ *  @param c   the sweep configuration
+ *  @param cur the current depth, tokens
+ *  @return the next depth; ctx_max once cur reaches it */
 static int next_frontier(const bench_config *c, int cur) {
     if (cur >= c->ctx_max) return c->ctx_max;
     int next;
@@ -341,23 +332,10 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
+/** @brief pulsar-bench's entry point: open the engine and run the depth sweep.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit status (0 = success) */
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -367,14 +345,21 @@ int main(int argc, char **argv) {
          * drafter (spec-decode throughput has its own timed-server protocol) */
         .dspark_disable = true,
         .backend = cfg.backend,
-        .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) return 1;
-    log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
+    /* the bench tokenizes its prompt: a family whose tokenizer this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-bench: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
+    char ctxmem_line[256];
+    fprintf(stderr, "%s\n",
+            pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-bench",
+                                       cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk));
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     pulsar_tokens prompt = {0};
@@ -454,7 +439,7 @@ int main(int argc, char **argv) {
 
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; i++) {
-            if (pulsar_session_pos(session) + 1 >= pulsar_session_ctx(session)) {
+            if (pulsar_session_pos(session) + TokCount{1} >= TokPos::after(pulsar_session_ctx(session))) {
                 fprintf(stderr, "pulsar-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
                 break;

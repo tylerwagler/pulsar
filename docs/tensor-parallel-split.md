@@ -1,0 +1,282 @@
+# TP engine split — design decisions (slices 4+, Phase 2/4)
+
+> **Status (2026-10-30):** a design and decision record from the TP bring-up (2026-08 to 2026-10). Source
+> comments cite it, so it stays here; the slice plans and open items in it are historical. How to run TP today:
+> [SERVER.md#tensor-parallelism](SERVER.md#tensor-parallelism).
+
+Decision record for how the two Spark ranks split the model, grounded in the
+vLLM DSv4 TP/EP study (private: the ledger's vllm-ds4-tp-ep-study-2026-08-26
+— evidence and sources; this file is the public record the code implements).
+Port decisions: ledger L102, plan 102, docs/tensor-parallel-port.md.
+
+Merged with the `tensor_parallel` branch into `dev` 2026-09-04 (the branch is
+history; this file lives on dev). Slice-4 status below is current as of that
+merge — the remaining 4b-CUDA/4c/4d/4e chunks are GPU/pair-gated.
+
+## The split model (two ranks = one EP group)
+
+1. **Routed experts: whole-expert-per-rank.** vLLM is EP-first for MoE — routed
+   experts are never split inside an expert; 256 experts land 128 per rank and
+   tokens are dispatched between ranks every MoE layer. This is exactly
+   upstream ds4's default ("one contiguous half of the routed experts").
+   **Payoff:** halves per-node routed-expert weight bytes AND halves per-token
+   active-expert GEMM FLOPs at batch 1 (each node computes each token only for
+   its ~3 of the 6 active experts). Per-token dispatch bytes are unchanged
+   (a function of routing, not the split).
+
+2. **Attention + KV cache: replicated per rank, never sharded.** vLLM keeps the
+   latent MLA projections (`W_DKV`, `kv_a`, `W_KR`, `W_DQ`) and the whole
+   compressed KV cache local to every TP rank; each rank attends over the full
+   sequence on its local head slice with its own local cache copy. **No
+   cross-node KV traffic during attention.** Our attn-pack KV layout stays
+   replicated on both boxes.
+
+3. **Attention head split (Phase 4) is a re-scope.** The real mechanism is
+   NOT "split the attention weights": it is heading the *per-head*
+   up-projections (`W_UK/W_UV` → kv_b, `W_UQ` → q_b) as sharded-by-head
+   ColumnParallel GEMMs, with `W_O` a RowParallel all-reduce per layer, while
+   Q/KV/rope latents stay replicated. That per-head + output GEMM surface is
+   where the ~2.82 GB/token attention byte cut lives. Do not spend Phase-4
+   effort on sharding the replicated latent side.
+
+4. **Vocab/output head: split.** Worker ships its logits half on the control
+   socket (frames already ported in slice 3a).
+
+5. **Shared expert, norms, router, embeddings: replicated** (upstream default).
+
+## Transport consequence — RDMA is mandatory for decode TP
+
+At batch-1 on V4-Flash, per token ≈ 1 dispatch (≈8 KiB bf16/rank-pair) + 1
+combine (≤ topk×hidden, 24-48 KiB when remote experts) + 1 all-reduce per MoE
+layer ≈ **2-4 small messages/layer × 43 layers**. At 10-30 µs RoCE RTT that is
+≲ 4 ms/token inside the ~11 ms/token budget at 90 t/s — viable. At TCP
+fallback RTT (100-1000 µs) the same pattern is 14-140 ms/token — **dead**.
+So: TCP stays a bring-up/unit-test path only (why the loopback tests exist);
+the pair's direct 200G RoCE DAC is load-bearing. Our f32 gate payload is
+exactly 2× the bf16 dispatch (f32 partials, never quantized on the wire).
+
+## Not transferable (keep our fine-grained per-gate design)
+
+Bulk collectives/NCCL-all-reduce-rings (8+ rank shaped), DP/mega-batch
+pipelines, CUDA-graph capture + handle-caching amortization, EPLB/weight-
+shuffle orchestration, MTP/spec-decode machinery, and vLLM's DSpark
+c4a/c128a compressor + lightning-indexer are overhead at 2 ranks × batch 1,
+not structure. DeepEP's low-latency decode mode is the same per-layer
+dispatch+combine shape as ours (RDMA internode) — the closest external
+calibration, minus its handle caching.
+
+## Constants cross-check (verify at binder time)
+
+43 layers, hidden 4096, 64 heads × 512 (+64 rope), q/o_lora_rank 1024,
+256 routed + 1 shared expert, top-6, moe_intermediate 2048, vocab 129280,
+1M context, 284B total / ~13B activated, first 3 layers hash-routed, fp4
+expert dtype. Should match our shape profile; any mismatch is a bind-time
+bug, not a design change.
+
+## Slice-4 sequencing (what is desk-testable vs GPU-gated)
+
+- 4a. **DONE 2026-08-26** — DS-default identity builder
+      `pulsar_tp_identity_init_defaults` (src/tp) + host tests. Engine open
+      still fails loudly (see the guard) until 4b, per the fail-loud rule.
+      **Binder cross-check PASSED:** `shape_profiles.cpp` Flash {43L, 4096h,
+      129280v, 512 head-dim, 64 rot, 256+1 exp, 6 used} matches the study's
+      V4-Flash constants exactly.
+- 4b. **DONE → dev (host half only, by design; merged 2026-09-04)** — gate
+      scheduler `pulsar_tp_sched.{h,cpp}`: drives the transport per-exchange
+      over the DS per-layer ATTN→FFN order and the prefill big-gate-per-layer
+      path, with the two CUDA-touching steps (.cu write/read partial) funneled
+      through hook pointers → every scheduling/lockstep rule is host-tested
+      (tp_sched_test: 2 decode tokens x 86 gates + prefill chunk, symmetric
+      on both ranks over the TCP loopback).  Also landed in the merge: the
+      host-pinned slab allocator (`pulsar_tp_gpu_slab_alloc_hostpin/free_hostpin`,
+      src/tp/pulsar_tp_gpu.cpp — `cudaHostRegister` verdict).  The `.cu`
+      wrapper implementations deliberately ship with their engine callers
+      (no dead code) — see the hook-targets inventory note in port.md.
+- 4b. **Prefill big-gate arm (engine-wired, compile-verified 2026-09-21).**
+      `pulsar_engine::open` now stands up the pair when `--tp-role` + `--tp-arm
+      prefill`: builds the identity from the resolved shape, `pulsar_tp_create`
+      (leader listens / worker dials), allocates the host-pinned GPU-visible
+      slab and `pulsar_tp_attach_slab`; teardown on `destroy()`.  The prefill
+      path (gpu_prefill.cpp `tp_prefill_big_gate`, called from
+      `gpu_graph_encode_layer_ffn_batch` before the HC expansion) exchanges one
+      big gate per layer per chunk on the layer's routed contribution and folds
+      the peer's partial in.  Compile-only so far (no runtime) — the `.cu`
+      gate kernels for the DECODE per-layer arm are still unwired and
+      `tp_role != 0` with no `--tp-arm` still fails loudly (rule 4).  The
+      per-rank partial is ownership-aware only once 4c lands.
+      (2026-09-23, L239: `--tp-arm` is RETIRED.  Since 4c every lane -- owned
+      experts, vocab split, the session mirror -- is wired whenever a group is
+      configured, so the selector selected nothing; the flag, the field and its
+      guard are deleted.  A configured group is the only switch.)
+- **N-way transport (2026-09-22).** The transport is no longer two-rank-only:
+      `pulsar_tp_create_mesh` brings up **n** ranks in a full mesh
+      (`--tp-rank`/`--tp-nranks`/`--tp-peers`; every rank connects to every
+      other, rank-ordered dial/accept) and `pulsar_tp_allreduce_sum` combines
+      the routed partial across all n ranks (all-gather + local sum in
+      canonical ascending-rank order so every rank bits the same full value).
+      The n=2 legacy `--tp-role`/`--tp-peer` pair path and its RDMA are
+      unchanged.  Perimeter of this increment: decode/batch gates and the
+      command plane fail loudly for n>2 (rule 9) until their n-way slices;
+      per-peer RDMA is pair-gated.
+- **4c. Ownership-aware routed-MoE kernels (2026-09-22, engine + kernel wiring;
+      runtime GPU/pair-gated).** Each rank now computes ONLY its owned expert
+      slice — the single authority `pulsar_tp_owned_range(rank, n_ranks,
+      n_total, &lo, &hi)` (floor partition `[r·n/nr, (r+1)·n/nr)`), threaded as
+      an expert range into `pulsar_gpu_routed_moe_batch_tensor`.  The
+      CUTLASS MXFP4 grouped arm skips peer-owned pairs in the count/scatter
+      (making those groups M=0 in the grouped GEMM — no bytes, no FLOPs) with a
+      sentinel `sorted_pairs` + gather guard; the small-batch GEMV arm extends
+      its `valid` predicate; the MMQ/mixed arms fail loudly (rule 9).  The
+      engine passes the owned range under the same `g->tp` condition that gates
+      `tp_prefill_big_gate`, so the all-reduce sums n owned partials into the
+      correct full routed sum — numerically correct **on the CUTLASS MXFP4
+      arms**.  The MMQ (IQ2 type 44) and mixed arms REFUSE ownership, so the
+      served all-IQ2 artifact cannot run TP until the same predicate is ported
+      to them (open item, port.md).  The range is the LAYER's own present
+      expert count (2026-09-23 fix: it read the target table by index, which
+      the drafter's own layer index and any REAP'd/V4.1 layout disagree with).
+      Non-TP (lo=0,hi=n_total) is byte-identical.  Kernel runtime behavior is
+      GPU/pair-gated (the prefill byte gate and the pair all-reduce check).
+- 4d. **Vocab head split on the logits path.  n-GENERAL, not two-rank**
+      (Tyler 2026-09-22: the target is n parallel Sparks).  Split = one vocab
+      RANGE per rank, `[r*V/n, (r+1)*V/n)` — the same floor partition as the
+      routed experts, and the same single authority pattern
+      (`pulsar_tp_owned_range`, the SAME authority the experts use).
+      Each rank computes only its range, then the group ALL-GATHERS (concatenate,
+      NOT the sum `pulsar_tp_allreduce_sum` performs) so every rank holds the
+      full logits and can sample independently — no leader broadcast needed.
+      - **4d inc 1 LANDED 2026-09-22** (`tp-vision-exp` 6267908b): the range is
+        expressible.  The deciding fact is the head's STORED orientation —
+        `head.weight` is HF `[129280, 4096]` / `dims_ne [4096, 129280]`, i.e.
+        `[vocab, in_dim]` row-major (why the cuBLASLt arm sets `TRANSA=OP_T`), so
+        a vocab range IS a contiguous ROW range and the existing packed-block
+        GEMM needs no kernel change.  `gpu_graph_encode_output_head[_batch]`
+        take `(vocab_lo, vocab_dim, out)`; single-box passes
+        `(0, N_VOCAB, g->logits|spec_logits)` → byte-identical.  The MXFP8_LT arm
+        REFUSES a slice (its scale plane is not row-addressable); the target head
+        is bf16, so the drafter's MXFP8 head stays full-range.  The L119 segment
+        bracket is now taken only for the full-vocab range: a gate recv is a host
+        wait and cannot live in a captured graph, and the recorded body binds its
+        destination.
+      - **4d inc 2 LANDED 2026-09-22** (`pulsar_tp_allgather_vocab` + the eval
+        path wiring): one authority for the range (`pulsar_tp_owned_range`),
+        an n-way all-gather that CONCATENATES in rank order, slices padded to
+        `ceil(V/n)` so every exchange round carries one byte count (129280 does
+        not divide by 3 or 5).  **Fixed 2026-09-23:** the head writes its slice
+        PACKED (pitch = range width) and the engine copied it at the padded
+        pitch, mis-placing every row after the first on an uneven split with
+        more than one head row; the rows are now re-pitched after the read.
+        The pair (n=2, even split) never showed it, and the mesh test builds
+        its slice at stride pitch, which is why neither caught it.
+- 4e. Phase-3 lockstep over our session surface — **IN PROGRESS**, tracked in
+      docs/tensor-parallel-port.md.  Driver model DECIDED 2026-09-23 (L238): a
+      worker rank runs the receive loop `pulsar_tp_worker_run` over a session
+      registry keyed by the create ordinal; the leader's wrappers ship frames.
+      Mirrored: create, destroy, sync, eval, batched decode, the mixed step
+      (head policy on the wire), rewind, invalidate, the speculation rng, and
+      the bank surface (save; restore / repoint / fork / partial fork as
+      agreed verdicts), rewrite_from_common, note_committed_tokens, set_logits
+      and the speculative round family (rng on every drawing frame; the CLI's
+      generate_speculative as one frame); set_cancel is not polled inside a
+      mirrored operation; the spill path (free/alloc physical, kv save/load,
+      each rank to its own disk) and images on the sync frame.  First live
+      pair run 2026-09-23 (runbook step 6).  The ack of every logits-producing
+      frame (eval, batch decode, mixed batch, the CLI's one-frame
+      generate_speculative verdict) carries the worker's digest of
+      its assembled logits and the leader refuses a mismatch by name -- the
+      cross-rank identity check, protocol v11 (L243); the tally prints at
+      close and is the grading tool's LEG A.
+- **4g-1. Attention head split, v1 -- the bit-exact split (L241, 2026-09-23).**
+      The partition unit is the attention OUTPUT GROUP (`PULSAR_N_OUT_GROUP`,
+      8 heads and one LoRA-down block each), from the same range authority as
+      the experts and the vocab (`pulsar_tp_owned_range`), so n <= 8 and every
+      rank's heads are whole groups.  Per layer a rank runs `attn_q_b` over its
+      heads' rows, the attention core / inverse rope / grouped E4M3 emit on
+      those heads (compact `[tokens][owned heads][head_dim]` q and heads, sinks
+      from the first owned head), `attn_output_a` over its groups' rows, then
+      the group ALL-GATHERS `low` (`pulsar_tp_allgather_rows`, unit = the LoRA
+      rank, one exchange per layer on the big-gate seq) and every rank runs
+      `attn_output_b` whole on the identical block.  Every value a rank
+      computes is a head- or group-independent piece of the single-box
+      computation, so **v1 is bit-exact against one box and across ranks**.
+      Mechanism: the pre-stored MXFP8_LT layout is row-major per output row
+      with a 128-row-tiled scale plane, so an owned row range is two contiguous
+      spans; the engine registers each layer's two slices at open
+      (`pulsar_gpu_register_fp8_lt_row_slice`, keyed by the slice's own data
+      offset) and every GEMM arm resolves them by offset unchanged.  The latent
+      side (`wq_a`, `wkv`, norms), the KV cache, the indexer and the shared
+      expert stay replicated; the drafter blocks are not split yet (4g-1b).
+      Gate: `cuda-tp-head-split-gate` (runner) -- every rank's slice of n = 2,
+      3, 4 equals the whole projection's columns byte for byte on both GEMM
+      arms, plus the two refusals.  v2 (row-parallel `attn_output_b` on the
+      decode arm, an all-reduce instead of the gather, not bit-exact) and the
+      owned-span residency wait for the pair's measured collective latency
+      (rows/L241.md).
+- **4f. Owned-expert RESIDENCY (L237, 2026-09-23).**  4c split expert COMPUTE by
+      ownership but every rank still staged every expert: on GB10 host
+      registration is unsupported, so the supported load path stages each
+      tensor from its fd into device memory under a 96 GiB cap
+      (`accelerator_prepare_model_tensor_spans` -> `cuda_model_range_ptr_from_fd`),
+      and staging IS residency.  The full-fidelity artifact
+      (`ElytronAI/DeepSeek-v4-Flash`, 157.4 GB of MXFP4 experts) therefore could
+      not open on a 121 GB Spark, pair or no pair.  Now: the model carries the
+      rank it is loaded for (`pulsar_model.tp_rank/tp_n_ranks`, set from the
+      options BEFORE staging), a routed-expert stack is staged only over the
+      rank's owned byte span (a byte-span helper over the range authority
+      in bytes), the MoE dispatch requests that span and REBASES the pointer so
+      `base + e*stride` is unchanged (`routed_expert_stack_ptr`), the expert
+      table clamps peer-owned entries to the owned base
+      (an "owned" expert-table builder), the admission budget subtracts the
+      peer-owned bytes, and the transport's rank is asserted equal to the
+      staged rank.  `--expert-overlay` is refused under TP.  Per rank on the
+      full artifact: ~10.5 GB replicated + 157.4/n GB of experts -> ~89 GB at
+      n=2 (derived from the build record, to be measured).
+- **4g-2. Routed experts go tensor-parallel (L241, 2026-09-24) -- supersedes
+      the 4c/4f ownership machinery.**  Every rank holds HALF of EVERY expert
+      (`pulsar_gpu_register_mxfp4_expert_half`: gate/up by rows, down by input
+      columns, the `pulsar_tp_owned_range` split of the intermediate width) and
+      runs every selected expert over that half; the routed output is a
+      partial the FFN exchange sums.  Under TP no stored routed stack is staged
+      (`pulsar_model_unstaged_expert_bytes` is what the budget subtracts), and
+      the routed entry refuses every non-type-40 arm (`expert_split`).  The
+      expert range therefore became the whole range on every call, and the
+      cleanup commit deleted it: the expert-range parameters on every MoE
+      launcher and kernel, the count/scatter ownership predicate and the
+      `sorted_pairs` sentinel + gather guard, the GEMV `valid` range, the
+      EXL3 zero-fill, the owned (clamping) expert tables for MXFP4 and EXL3,
+      the owned byte-span helper and the 4f owned span.  The 4c/4f entries
+      above are history.
+- **4g-2 EXL3 (L269 W1, 2026-10-10): the same split for EXL3 routed stacks**,
+      which is what lets V4.1 (all-EXL3 experts) fit the pair.  The plan's op
+      `exl3_half` (tp_slice.cpp) cuts every expert with `exl3_expert_cut`
+      (exl3_trellis.h: gate/up per k-tile row the n-tiles of the owned
+      columns + svh of them, suh whole; down the owned k-tile rows + suh of
+      them, svh whole -- 128-aligned, so the Hadamard blocks stay whole), and
+      `pulsar_gpu_register_exl3_expert_half` builds it through the same staged
+      reader as the MXFP4 half (`cuda_register_expert_half`).  The half is
+      `exl3_expert_layout` of the half shape, so the EXL3 arms (trellis GEMV,
+      fold, the L287 prefill GEMM, sum) run on it unchanged at
+      expert_mid_dim = the half width; their mid granule is the 128 block
+      (V4.1: 2304 -> 1152 = 9 x 128).  The routed entry's `expert_split`
+      admits pure MXFP4 or pure EXL3 stacks.  `make exl3-half-gate` proves the
+      halves byte-exact and the routed entry on both halves == the whole (z and
+      the folded mid bit for bit; out_0 + out_1 within f32 reassociation).
+      V4.1's shared-expert half (1152) also needed the MXFP4 small-batch FFN
+      and the SwiGLU MX emit to take a 128 / warp granule instead of 256.
+
+## Open items for bring-up
+- **Slab (resolved on-pair 2026-09-02, allocator merged → dev):**
+  `cudaMallocManaged` does NOT register with `ibv_reg_mr` on GB10 (EFAULT).
+  Host-pinned (`malloc` + `cudaHostRegister`) registers and the probe passes
+  over RDMA — `pulsar_tp_gpu_slab_alloc_hostpin` (src/tp/pulsar_tp_gpu.cpp,
+  on dev) is the allocator slice 4b-CUDA uses; kernels still write it directly
+  over unified memory, no D2H/H2D bounce. **GPUDirect RDMA is unavailable on this platform**
+  (tests/tp_dmabuf_probe: attrs 110/116 = 0, CUDA-13 GPURDMA flag rejected,
+  dma-buf import EINVAL) — so host-pinned is final, not a stopgap. Recheck the
+  probe if the nvidia driver ever advertises `GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED`.
+- Two-cable RDMA: pick device explicitly (`PULSAR_TP_RDMA_DEV`); bench 1-link
+  vs 2-link.
+- Caveat recorded, not re-litigated: community reports the shipped
+  "NVFP4"-dtype DS-V4-Flash artifact is actually FP8 under the covers; and
+  V4-Flash official docs are thin (mechanics drawn from V3 + V4 tech report +
+  vLLM source).

@@ -172,6 +172,8 @@ def run(args):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if args.reasoning_effort is not None:
+        payload["reasoning_effort"] = args.reasoning_effort
     if args.temperature is not None:
         payload["temperature"] = args.temperature
 
@@ -225,6 +227,9 @@ def main():
     p.add_argument("--prompt", default="Write a short technical paragraph about cache coherence.")
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--reasoning-effort", default=None,
+                   help="pin the request's reasoning effort (e.g. low); the server's DEFAULT "
+                        "changed across the v41 merge (L239), so an A/B across it must pin this")
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--label", default="", help="free-form tag recorded in the output")

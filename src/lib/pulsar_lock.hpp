@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar::ScopedLock, an RAII scoped lock for a pthread_mutex_t. */
 #pragma once
 
 #include <pthread.h>
@@ -23,16 +25,20 @@
 
 namespace pulsar {
 
+/** RAII mutex hold -- see the note above for the scope contract. */
 class ScopedLock {
 public:
+    /** Lock `m`, which must outlive this object. */
+    /// @param m the mutex to hold until scope exit
     explicit ScopedLock(pthread_mutex_t *m) : m_(m) { pthread_mutex_lock(m_); }
+    /** Unlock at scope exit. */
     ~ScopedLock() { pthread_mutex_unlock(m_); }
 
     ScopedLock(const ScopedLock &) = delete;
     ScopedLock &operator=(const ScopedLock &) = delete;
 
 private:
-    pthread_mutex_t *m_;
+    pthread_mutex_t *m_;  ///< the held mutex; borrowed, never owned
 };
 
 } // namespace pulsar

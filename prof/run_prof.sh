@@ -2,9 +2,10 @@
 # Prefill composition profiling on the post-widening dev build (77d579d).
 # nsys kernel trace + PULSAR_MOE_TIME per-format split, at prefill-chunk 2048 and 8192.
 set -u
-WT=/home/tyler/Projects/AI/temp/wt-prof
-OUT=/home/tyler/Projects/AI/temp
-MODEL=/home/tyler/Projects/AI/ds4-gb10/gguf/model.gguf
+# Settings (env, required): WT the built engine tree, OUT the output directory, MODEL the model container.
+WT=${WT:?set WT to the built engine tree}
+OUT=${OUT:?set OUT to the output directory}
+MODEL=${MODEL:?set MODEL to the model container}
 PROMPT=$WT/speed-bench/promessi_sposi.txt
 cd "$WT" || exit 1
 
@@ -15,7 +16,7 @@ run_depth () {
   free -g | head -2
   PULSAR_MOE_TIME=1 nsys profile --trace=cuda --sample=none \
       -o "$OUT/prof_p${D}" --force-overwrite true \
-      ./pulsar-bench -m "$MODEL" --prompt-file "$PROMPT" --cuda \
+      ./pulsar-bench -m "$MODEL" --prompt-file "$PROMPT" \
       --ctx-start $D --ctx-max $D --gen-tokens 0 --prefill-chunk $D \
       --csv "$OUT/p${D}.csv" > "$OUT/moetime_p${D}.log" 2>&1
   echo "exit=$? depth $D done $(date +%T)"

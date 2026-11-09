@@ -1,3 +1,5 @@
+/** @file
+ *  The help text and its TTY-aware printers for every pulsar binary. */
 #include "pulsar_help.h"
 
 #include <stdbool.h>
@@ -5,17 +7,25 @@
 #include <string.h>
 #include <unistd.h>
 
+/** SGR escape sequences for help output.
+ *
+ * Every field is an empty string when the sink is not a TTY, so the printers
+ * interpolate them unconditionally and colour disappears from a pipe without a
+ * single conditional at the call sites. */
 typedef struct {
-    const char *off;
-    const char *cyan;
-    const char *title;
-    const char *yellow;
-    const char *grey;
-    const char *red;
-    const char *white;
-    const char *bright;
+    const char *off;     ///< reset
+    const char *cyan;    ///< flags and option names
+    const char *title;   ///< section headings
+    const char *yellow;  ///< argument placeholders
+    const char *grey;    ///< de-emphasised detail
+    const char *red;     ///< warnings
+    const char *white;   ///< body text
+    const char *bright;  ///< emphasis
 } help_colors;
 
+/// The colour set for `fp`: real SGR sequences on a TTY, all-NULL fields otherwise (printers treat NULL as "").
+/// @param fp the sink help is printed to
+/// @return the colour set
 static help_colors help_make_colors(FILE *fp) {
     bool color = isatty(fileno(fp));
     help_colors c = {0};
@@ -31,14 +41,25 @@ static help_colors help_make_colors(FILE *fp) {
     return c;
 }
 
+/// Print a section heading.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the heading text
 static void title(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n", c->title ? c->title : "", s, c->off ? c->off : "");
 }
 
+/// Print a heading in the warning colour.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the heading text
 static void title_red(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n", c->red ? c->red : "", s, c->off ? c->off : "");
 }
 
+/// Does some word of an option's name start with '-' or '/' (a switch, not a bare command)?
+/// @param name the option's display name
+/// @return true when a word starts with '-' or '/'
 static bool option_name_has_switch(const char *name) {
     bool word_start = true;
     while (*name) {
@@ -49,6 +70,10 @@ static bool option_name_has_switch(const char *name) {
     return false;
 }
 
+/// Print an option's name word by word: switches (and the first word) in the option colour, placeholders bright.
+/// @param fp   the sink
+/// @param c    the colour set (cyan non-NULL)
+/// @param name the option's display name
 static void print_colored_option_name(FILE *fp, const help_colors *c, const char *name) {
     bool has_switch = option_name_has_switch(name);
     bool word_start = true;
@@ -68,6 +93,11 @@ static void print_colored_option_name(FILE *fp, const help_colors *c, const char
     }
 }
 
+/// Print one option row: name and description (a "|" separator with colour, a 30-column table without).
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param name the option's display name ("" for a continuation row)
+/// @param desc its description
 static void opt(FILE *fp, const help_colors *c, const char *name, const char *desc) {
     if (c->cyan) {
         fputs("  ", fp);
@@ -87,19 +117,31 @@ static void opt(FILE *fp, const help_colors *c, const char *name, const char *de
     }
 }
 
+/// Print a paragraph line in the placeholder colour.
+/// @param fp the sink
+/// @param c  the colour set
+/// @param s  the line
 static void para(FILE *fp, const help_colors *c, const char *s) {
     fprintf(fp, "%s%s%s\n",
             c->yellow ? c->yellow : "", s, c->yellow ? c->off : "");
 }
 
+/// @param a a string, or NULL
+/// @param b a string, or NULL
+/// @return true when both are non-NULL and equal
 static bool streq(const char *a, const char *b) {
     return a && b && strcmp(a, b) == 0;
 }
 
+/// @param topic the requested topic, or NULL
+/// @param name  a topic name
+/// @return true when `topic` is non-NULL and equals `name`
 static bool topic_is(const char *topic, const char *name) {
     return topic && strcmp(topic, name) == 0;
 }
 
+/// @param tool the binary
+/// @return its program name ("pulsar", "pulsar-server", ...)
 static const char *tool_name(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4: return "pulsar";
@@ -111,6 +153,8 @@ static const char *tool_name(pulsar_help_tool tool) {
     return "pulsar";
 }
 
+/// @param tool the binary
+/// @return its one-line usage synopsis
 static const char *tool_usage(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4:
@@ -127,6 +171,8 @@ static const char *tool_usage(pulsar_help_tool tool) {
     return "Usage: pulsar [options]";
 }
 
+/// @param tool the binary
+/// @return its one-sentence summary
 static const char *tool_summary(pulsar_help_tool tool) {
     switch (tool) {
     case PULSAR_HELP_DS4:
@@ -143,31 +189,49 @@ static const char *tool_summary(pulsar_help_tool tool) {
     return "";
 }
 
+/// Print the "Model And Runtime" section (the options shared by every binary, per binary).
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
+/// @param full also print the speculative-decoding tuning options
 static void print_model_runtime(FILE *fp, const help_colors *c,
                                 pulsar_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
-    opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-    opt(fp, c, "--served-model-id ID", "Model id in /v1/models(id,root),/version,/metrics (default deepseek-v4-flash). Set to an HF repo path so HF tools (llama-benchy tokenizer) resolve it.");
-    opt(fp, c, "--served-model-name NAME", "Human display name in /v1/models(name)/version (default: model shape name). Free-form; never used as a tokenizer id.");
+    opt(fp, c, "-m, --model PATH", "Checkpoint to serve: a shard directory or a single");
+    opt(fp, c, "", "file. Default: ./model, else $PULSAR_MODEL_DIR/model");
+    if (tool == PULSAR_HELP_SERVER) {
+        opt(fp, c, "", "Repeat -m to serve several ENCODER models (embed, rerank) from one");
+        opt(fp, c, "", "process on one GPU, each on its own endpoint.");
+    }
     if (tool != PULSAR_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }
-    if (tool == PULSAR_HELP_SERVER) {
-        opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+    if (tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_DS4) {
+        opt(fp, c, "--rope-yarn F", "YaRN rope scaling at factor F over the trained context, for a container whose rope is native (Qwen: 4 = 1M positions, static at every length). A container that declares YaRN takes only its own factor; a family without a rope refuses; refused under tensor parallelism. The server's default disk KV directory gets a -rope-yarnF suffix (the store identity carries the rope too).");
     }
-    opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
-    opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
+    if (tool != PULSAR_HELP_SERVER) {
+        opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
+    }
     if (full) {
-        if (tool != PULSAR_HELP_BENCH) {
-            opt(fp, c, "--no-dspark", "Disable the DSpark speculative drafter bundled in the model GGUF.");
-            opt(fp, c, "--expert-overlay FILE:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor GGUF FILE (quant-format measurement).");
+        /* the drafter flags are parsed by the server and the CLI only (cli_main.cpp, pulsar_cli.cpp) */
+        if (tool == PULSAR_HELP_SERVER || tool == PULSAR_HELP_DS4) {
+            opt(fp, c, "--no-dspark", "Run without the container's speculative drafter (DSpark, MTP or a block drafter).");
+            opt(fp, c, "--reasoning on|off", "Thinking for a request that sends no thinking control (reasoning_effort, thinking, enable_thinking): llama-server's --reasoning. Default: the family's (on). A request's own control always wins.");
+            opt(fp, c, "--judge-banks N", "Banks reserved for /v1/systemone, the container's runtime-adapter judge (Gemma 4's JEV System 1): 1 (default when the container carries an adapter; the pool's last bank, outside the chat pool, needs a pool of 3) or 0 (no endpoint).");
+            opt(fp, c, "--drafter NAME", "Which drafter the container holds runs, and so is loaded at all: mtp, or its block drafter -- lilicorr (Nemotron-H), dflash2 (Qwen3.8-Flash-Next). Default: the one the container holds; of two, the block drafter on Qwen (dflash2), a choice on Nemotron-H; a name it does not hold refuses.");
+            opt(fp, c, "--spec-depth N", "Draft depth a session starts at (default: the drafter's -- DSpark 3, then its adaptive controller walks 2..5; MTP 4, its controller walks 4..7 and a chain stops sooner when one more draft would not pay its step and verify row). Env PULSAR_SPEC_DEPTH.");
+            opt(fp, c, "--spec-tau F|off", "Draft stop threshold: a chain ends at its first draft whose confidence is under F, that draft its last verified (default: the drafter's -- DSpark 0.55, MTP 0.7). Env PULSAR_SPEC_TAU.");
         }
-        opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
-        opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
+        if (tool == PULSAR_HELP_DS4)
+            opt(fp, c, "--expert-overlay PATH:PFX", "Swap routed-expert tensors matching PFX for the same tensors in donor checkpoint PATH (quant-format measurement).");
     }
     fputc('\n', fp);
 }
 
+/// Print the "Prompt And Sampling" section.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param full also print the system-prompt and prompt-input options
 static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
@@ -175,9 +239,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    opt(fp, c, "--think", "Use thinking mode at the default (low) reasoning effort.");
-    opt(fp, c, "--think-high", "Use high reasoning effort when context is large enough.");
-    opt(fp, c, "--think-max", "Use max reasoning effort when context is large enough.");
+    opt(fp, c, "--think", "Use thinking mode at the default reasoning effort (high, 75).");
+    opt(fp, c, "--think-effort N", "Use thinking mode at effort N in [1, 100] (V4.1 numeric budget).");
+    opt(fp, c, "--think-low, --think-high, --think-max", "The named presets: effort 50, 75, 100.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
@@ -187,6 +251,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     fputc('\n', fp);
 }
 
+/// Print the "Directional Steering" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_steering(FILE *fp, const help_colors *c) {
     title(fp, c, "Directional Steering");
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
@@ -197,6 +264,10 @@ static void print_steering(FILE *fp, const help_colors *c) {
 
 static void print_cli_diagnostics(FILE *fp, const help_colors *c);
 
+/// Print the CLI's "CLI Modes" section.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param full also print the diagnostics section
 static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "CLI Modes");
     opt(fp, c, "pulsar", "Start the interactive prompt.");
@@ -208,6 +279,9 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     }
 }
 
+/// Print the CLI's "Diagnostics And Data Collection" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
@@ -223,10 +297,13 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the CLI's interactive commands.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-high, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think [N], /think-low, /think-high, /think-max, /nothink", "Switch thinking mode / effort.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
@@ -234,16 +311,24 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the agent's "Agent Options" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
+    opt(fp, c, "--allow-outside-workspace", "File tools may leave the directory the agent started in. Default: they refuse.");
+    opt(fp, c, "--allow-bash", "With --non-interactive: allow the bash tool. Default: refused. Interactive bash has no boundary.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     fputc('\n', fp);
 }
 
+/// Print the agent's "Agent Runtime Commands" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_agent_sessions(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Runtime Commands");
     opt(fp, c, "/save", "Save the current session in ~/.ds4/kvcache.");
@@ -258,45 +343,49 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the server's "HTTP API" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
-    opt(fp, c, "--host HOST", "Bind address. Default: 0.0.0.0 (all interfaces; use 127.0.0.1 for loopback-only)");
+    opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1 (loopback; 0.0.0.0 exposes it, with no auth)");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
-    opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "The model endpoint id reflects the loaded GGUF shape: deepseek-v4-flash or deepseek-v4-pro (one at a time).");
+    para(fp, c, "Also /v1/messages/count_tokens, /v1/models, /health, /version, /metrics and /metrics/stream.");
+    para(fp, c, "The model id is the loaded model's (e.g. qwen3.8-flash-next, deepseek-v4-flash); the request's model selects nothing.");
     fputc('\n', fp);
 }
 
+/// Print the server's "Server Thinking Defaults" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to thinking at low reasoning effort.");
-    para(fp, c, "reasoning_effort (or output_config.effort) selects low, high, or max (0731 levels).");
-    para(fp, c, "high and max require --ctx >= 393216; smaller contexts use low.");
-    para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
-    para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "Chat requests think by default, at the loaded family's default effort.");
+    para(fp, c, "reasoning_effort (or reasoning.effort, output_config.effort) takes none, minimal, low, medium, high, xhigh,");
+    para(fp, c, "max or 1..100; the family maps it to its template's levels (docs/SERVER.md, Thinking and effort).");
+    para(fp, c, "thinking={type:disabled}, think=false, enable_thinking=false, effort none, or (DeepSeek) model=deepseek-chat");
+    para(fp, c, "selects non-thinking mode.  Sampling knobs a request sends are used as sent; absent ones take the defaults.");
     fputc('\n', fp);
 }
 
+/// Print the server's "Disk KV Cache" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
-    opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/ds4/kv-<model>, else ~/.cache/ds4/kv-<model>. \"\" disables.");
+    opt(fp, c, "--kv-disk-dir DIR", "Disk KV checkpoint dir. Default (on): $XDG_CACHE_HOME/pulsar/kv-<model>, else ~/.cache/pulsar/kv-<model>. \"\" disables.");
     opt(fp, c, "--no-kv-disk", "Disable the disk KV cache.");
-    opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default: 4096");
-    opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
-    opt(fp, c, "--kv-cache-cold-max-tokens N", "Save cold first prompts up to N tokens. 0 disables. Default: 30000");
-    opt(fp, c, "--kv-cache-continued-interval-tokens N", "Save aligned continued frontiers. 0 disables. Default: 10000");
-    opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
-    opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
-    opt(fp, c, "--kv-cache-sys-prefix-margin-tokens N", "Cut the shared-preamble checkpoint this far below the chat anchor, clearing client-injected preamble jitter. Default: 2048");
-    opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
-    opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
-    opt(fp, c, "--web-search-url URL", "SearXNG endpoint for the Anthropic web_search server tool (env: PULSAR_WEB_SEARCH_URL). Unset drops web_search tool entries.");
-    opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
+    opt(fp, c, "--kv-disk-space-mb N", "Disk budget in MiB. Default: 131072; 0 is unbounded (a full disk still evicts).");
+    opt(fp, c, "--kv-ram-mb N", "Disk KV host pool in MiB (pinned at startup): the RAM tier restores read before disk, and the copy-out buffers. Default: 25% of RAM, at most 16384, on a discrete GPU; 1024 (copy-out only, no RAM tier) on unified memory.");
+    opt(fp, c, "--kv-pinned-max-mb N", "Budget in MiB for pinned anchors (X-Pulsar-KV: pin-anchor): never evicted while under it; past it the least recently used loses its pin. Default: 2048.");
     fputc('\n', fp);
 }
 
+/// Print the bench's "Benchmark Input" and "Benchmark Sweep" sections.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_bench_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Benchmark Input");
     opt(fp, c, "--prompt-file FILE", "Raw benchmark text; token sequence is sliced at each frontier.");
@@ -315,6 +404,9 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// Print the eval's "Evaluation" section.
+/// @param fp the sink
+/// @param c  the colour set
 static void print_eval_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Evaluation");
     opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
@@ -322,6 +414,7 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");
     opt(fp, c, "--regrade-trace FILE", "Regrade a prior trace without loading the model.");
+    opt(fp, c, "--retry-incomplete", "Re-run a case whose reply had no final Answer line (INCOMPLETE) once with 2x --tokens.");
     opt(fp, c, "--soft-limit-reply-budget N", "Soft close thinking near the end of reply budget. Default: 1024");
     opt(fp, c, "--hard-limit-reply-budget N", "Force </think> with N tokens left. Default: 512");
     opt(fp, c, "--soft-limit-think-close-rank N", "Soft-close when </think> is in top N tokens. Default: 3");
@@ -331,6 +424,9 @@ static void print_eval_specific(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
 }
 
+/// @param tool  the binary
+/// @param topic the requested topic, or NULL
+/// @return true when `tool`'s help has `topic` (NULL, "all" and "runtime" always do)
 static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
     if (!topic) return true;
     if (streq(topic, "all")) return true;
@@ -354,58 +450,71 @@ static bool tool_has_topic(pulsar_help_tool tool, const char *topic) {
     return false;
 }
 
-static void more_line(FILE *fp, const help_colors *c, const char *label, const char *topic) {
+/// Print one "More Info" row, cycling through the accent colours on a TTY.
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param row   in: the row's index in its section (0 = the first), which picks the colour; out: the next row's
+/// @param label the row's label
+/// @param topic the topic its `--help TOPIC` names
+static void more_line(FILE *fp, const help_colors *c, size_t *row, const char *label, const char *topic) {
     static const char *colors[] = {
         "\x1b[38;5;81m", "\x1b[38;5;114m", "\x1b[38;5;179m",
         "\x1b[38;5;141m", "\x1b[38;5;147m"
     };
-    static size_t idx;
-    const char *on = c->cyan ? colors[idx++ % (sizeof(colors) / sizeof(colors[0]))] : "";
+    const char *on = c->cyan ? colors[(*row)++ % (sizeof(colors) / sizeof(colors[0]))] : "";
     if (streq(label, "Interactive commands:") && c->red) on = c->red;
     const char *off = c->off ? c->off : "";
     fprintf(fp, "    %s%-26s%s --help %s\n", on, label, off, topic);
 }
 
+/// Print the "More Info" section: the topics `tool`'s help offers.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
 static void print_more_info(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     title(fp, c, "More Info");
-    more_line(fp, c, "Runtime full info:", "runtime");
+    size_t row = 0;
+    more_line(fp, c, &row, "Runtime full info:", "runtime");
     if (tool_has_topic(tool, "sampling"))
-        more_line(fp, c, "Sampling full info:", "sampling");
+        more_line(fp, c, &row, "Sampling full info:", "sampling");
     if (tool_has_topic(tool, "steering"))
-        more_line(fp, c, "Steering full info:", "steering");
+        more_line(fp, c, &row, "Steering full info:", "steering");
     if (tool == PULSAR_HELP_DS4) {
-        more_line(fp, c, "Interactive commands:", "commands");
-        more_line(fp, c, "Diagnostics:", "diagnostics");
+        more_line(fp, c, &row, "Interactive commands:", "commands");
+        more_line(fp, c, &row, "Diagnostics:", "diagnostics");
     } else if (tool == PULSAR_HELP_SERVER) {
-        more_line(fp, c, "HTTP API:", "api");
-        more_line(fp, c, "Disk KV cache:", "kv-cache");
-        more_line(fp, c, "Thinking behavior:", "thinking");
+        more_line(fp, c, &row, "HTTP API:", "api");
+        more_line(fp, c, &row, "Disk KV cache:", "kv-cache");
+        more_line(fp, c, &row, "Thinking behavior:", "thinking");
     } else if (tool == PULSAR_HELP_AGENT) {
-        more_line(fp, c, "Agent sessions:", "sessions");
-        more_line(fp, c, "Agent commands:", "commands");
-        more_line(fp, c, "Agent tool system:", "tools");
+        more_line(fp, c, &row, "Agent sessions & commands:", "commands");
+        more_line(fp, c, &row, "Agent tool system:", "tools");
     } else if (tool == PULSAR_HELP_BENCH) {
-        more_line(fp, c, "Benchmark sweep:", "benchmark");
+        more_line(fp, c, &row, "Benchmark sweep:", "benchmark");
     } else if (tool == PULSAR_HELP_EVAL) {
-        more_line(fp, c, "Evaluation options:", "evaluation");
+        more_line(fp, c, &row, "Evaluation options:", "evaluation");
     }
     fputc('\n', fp);
 }
 
+/// Print the "Examples" section for `tool` and `topic`.
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param tool  the binary
+/// @param topic the requested topic, or NULL
 static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     title(fp, c, "Examples");
     if (topic_is(topic, "runtime")) {
         if (tool == PULSAR_HELP_SERVER) {
-            opt(fp, c, "CUDA API", "./pulsar-server -m ds4flash.gguf --cuda --ctx 100000");
+            opt(fp, c, "CUDA API", "./pulsar-server -m model --ctx 100000");
         } else if (tool == PULSAR_HELP_AGENT) {
-            opt(fp, c, "agent", "./pulsar-agent -m ds4flash.gguf --ctx 100000");
+            opt(fp, c, "agent", "./pulsar-agent -m model --ctx 100000");
         } else if (tool == PULSAR_HELP_BENCH) {
             opt(fp, c, "bench", "./pulsar-bench --prompt-file long.txt --ctx-max 32768");
         } else if (tool == PULSAR_HELP_EVAL) {
             opt(fp, c, "eval", "./pulsar-eval --questions 10 --ctx 100000");
-            opt(fp, c, "CPU debug", "./pulsar-eval --cpu --questions 1 --tokens 32");
         } else {
-            opt(fp, c, "CUDA", "./pulsar -m ds4flash.gguf --cuda -c 100000");
+            opt(fp, c, "CUDA", "./pulsar -m model -c 100000");
         }
     } else if (topic_is(topic, "steering")) {
         opt(fp, c, "steer FFN", "./pulsar -p \"Write tersely\" --dir-steering-file dir.bin --dir-steering-ffn 0.8");
@@ -414,7 +523,7 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
         opt(fp, c, "curl", "curl http://127.0.0.1:8000/v1/models");
     } else if (tool == PULSAR_HELP_AGENT || topic_is(topic, "sessions") || topic_is(topic, "tools")) {
         opt(fp, c, "interactive", "./pulsar-agent");
-        opt(fp, c, "one shot", "./pulsar-agent --non-interactive -p \"Create /tmp/hello.c\"");
+        opt(fp, c, "one shot", "./pulsar-agent --non-interactive --allow-outside-workspace -p \"Create /tmp/hello.c\"");
     } else if (tool == PULSAR_HELP_BENCH || topic_is(topic, "benchmark")) {
         opt(fp, c, "csv", "./pulsar-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
         opt(fp, c, "prefill only", "./pulsar-bench --prompt-file long.txt --gen-tokens 0");
@@ -424,11 +533,16 @@ static void print_examples(FILE *fp, const help_colors *c, pulsar_help_tool tool
     } else {
         opt(fp, c, "chat", "./pulsar");
         opt(fp, c, "one shot", "./pulsar -p \"Explain mmap in C\"");
-        opt(fp, c, "long prompt", "./pulsar --think-max --prompt-file prompt.txt --ctx 393216");
+        opt(fp, c, "long prompt", "./pulsar --think-max --prompt-file prompt.txt --ctx 262144");
     }
     fputc('\n', fp);
 }
 
+/// Print the sections of one topic ("all" prints every section `tool` has).
+/// @param fp    the sink
+/// @param c     the colour set
+/// @param tool  the binary
+/// @param topic a topic tool_has_topic accepted
 static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, const char *topic) {
     if (streq(topic, "all")) {
         print_model_runtime(fp, c, tool, true);
@@ -460,8 +574,9 @@ static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, c
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "api")) print_server_api(fp, c);
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "kv-cache")) print_kv_cache(fp, c);
     else if (tool == PULSAR_HELP_SERVER && streq(topic, "thinking")) print_server_thinking(fp, c);
-    else if (tool == PULSAR_HELP_AGENT && streq(topic, "sessions")) print_agent_sessions(fp, c);
-    else if (tool == PULSAR_HELP_AGENT && streq(topic, "commands")) print_agent_sessions(fp, c);
+    /* the agent's session commands ARE its runtime commands: one section, `sessions` its alias */
+    else if (tool == PULSAR_HELP_AGENT && (streq(topic, "commands") || streq(topic, "sessions")))
+        print_agent_sessions(fp, c);
     else if (tool == PULSAR_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit files, and run bash commands.");
@@ -472,6 +587,10 @@ static void print_topic(FILE *fp, const help_colors *c, pulsar_help_tool tool, c
     else if (tool == PULSAR_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);
 }
 
+/// Print the default help (no topic): the runtime options and `tool`'s main sections.
+/// @param fp   the sink
+/// @param c    the colour set
+/// @param tool the binary
 static void print_default(FILE *fp, const help_colors *c, pulsar_help_tool tool) {
     print_model_runtime(fp, c, tool, false);
 

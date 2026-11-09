@@ -1,3 +1,7 @@
+/** @file
+ *  pulsar-agent: tool argument parsing and the file tools' helpers. */
+#include <limits.h>
+#include <string>
 #include "pulsar_agent_internal.h"
 
 
@@ -51,6 +55,9 @@ void agent_line_spans_free(agent_line_spans *spans) {
 
 
 
+/** @brief Append one span to `spans`, growing by doubling (128 first).
+ *  @param spans the list
+ *  @param span  the span to append */
 static void agent_line_spans_push(agent_line_spans *spans, agent_line_span span) {
     if (spans->len == spans->cap) {
         spans->cap = spans->cap ? spans->cap * 2 : 128;
@@ -133,6 +140,10 @@ int agent_read_file_bytes(const char *path, char **data, size_t *len,
 
 
 
+/** @brief The 1-based line holding byte `offset`.
+ *  @param spans the file's line spans
+ *  @param offset byte offset into the file
+ *  @return the line number; 1 for an empty file, the last line for an offset past the end */
 static int agent_line_for_offset(const agent_line_spans *spans, size_t offset) {
     if (!spans || spans->len <= 0) return 1;
     for (int i = 0; i < spans->len; i++) {
@@ -168,14 +179,6 @@ bool agent_old_new_line_effect(const char *old_data, size_t old_len,
 
 
 
-void agent_edit_result_append_context(agent_buf *b,
-                                             const char *path,
-                                             const char *data, size_t len,
-                                             int anchor_start,
-                                             int anchor_end);
-
-
-
 char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
                                        const char *new_data, size_t new_len,
@@ -207,6 +210,11 @@ char *agent_edit_result(const char *path,
 
 
 
+/** @brief Record (or clear) where the `more` tool continues reading.
+ *  @param w         the worker
+ *  @param path      the file; NULL or empty clears the continuation
+ *  @param next_line the 1-based line `more` starts at; <= 0 clears
+ *  @param bare      the continuation reads raw (no line numbers) */
 static void agent_worker_set_more(agent_worker *w, const char *path,
                                   int next_line, bool bare) {
     snprintf(w->more_path, sizeof(w->more_path), "%s", path ? path : "");
@@ -222,7 +230,8 @@ bool agent_tool_result_fits_context(agent_worker *w, const char *result,
                                            int *tokens_out) {
     pulsar_tokens tmp = {0};
     pulsar_tokens_copy(&tmp, &w->transcript);
-    pulsar_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
+    const pulsar_chat_message tool = {"tool", result ? result : "", false};
+    agent_turn_render(w, &tmp, &tool, 1, w->cfg->gen.think_mode);
     int tokens = tmp.len;
     pulsar_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;
@@ -234,6 +243,15 @@ bool agent_tool_result_fits_context(agent_worker *w, const char *result,
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
  * mode is reserved for cases where line decoration would corrupt the payload
  * being inspected. */
+/// @brief Read lines of a file as the read / more tools' result (see above).
+/// @param w          the worker (for the `more` continuation)
+/// @param path       the file
+/// @param start_line first line, 1-based (< 1 = 1)
+/// @param max_lines  lines to read; <= 0 = AGENT_READ_DEFAULT_LINES (ignored with whole_file)
+/// @param whole_file read to the end of the file
+/// @param bare       raw text without line numbers
+/// @param set_more   record the continuation for `more` (cleared when the read reached the end)
+/// @return the tool result (or a "Tool error: ..." text), malloc'd; caller frees
 static char *agent_read_range(agent_worker *w, const char *path, int start_line,
                               int max_lines, bool whole_file, bool bare,
                               bool set_more) {
@@ -310,8 +328,59 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
 
 
 
+/// The resolved workspace; empty: no boundary.
+static char g_workspace[PATH_MAX];
+
+void agent_workspace_init(bool allow_outside) {
+    g_workspace[0] = '\0';
+    if (allow_outside) return;
+    if (!realpath(".", g_workspace)) {
+        fprintf(stderr, "pulsar-agent: cannot resolve the working directory: %s\n", strerror(errno));
+        exit(1);
+    }
+}
+
+char *agent_workspace_refusal(const char *path) {
+    if (!g_workspace[0]) return NULL;
+    /* the deepest part of the path that exists, resolved (symlinks and ..); the rest must not climb back out */
+    std::string probe(path);
+    std::string rest;
+    char real[PATH_MAX];
+    bool inside = false;
+    for (;;) {
+        if (realpath(probe.empty() ? "." : probe.c_str(), real)) {
+            const size_t n = strlen(g_workspace);
+            inside = rest.find("..") == std::string::npos && !strncmp(real, g_workspace, n) &&
+                     (real[n] == '\0' || real[n] == '/' || (n == 1 && g_workspace[0] == '/'));
+            break;
+        }
+        const size_t slash = probe.find_last_of('/');
+        if (slash == std::string::npos) {
+            rest = probe + "/" + rest;
+            probe.clear();
+        } else if (slash == 0) {
+            rest = probe.substr(1) + "/" + rest;
+            probe = "/";
+        } else {
+            rest = probe.substr(slash + 1) + "/" + rest;
+            probe.resize(slash);
+        }
+    }
+    if (inside) return NULL;
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Tool error: ");
+    agent_buf_puts(&b, path);
+    agent_buf_puts(&b, " is outside the workspace ");
+    agent_buf_puts(&b, g_workspace);
+    agent_buf_puts(&b, " (--allow-outside-workspace permits it)\n");
+    return agent_buf_take(&b);
+}
+
 char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
+    if (path && path[0]) {
+        if (char *refused = agent_workspace_refusal(path)) return refused;
+    }
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
     int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
                                         1, 1, INT_MAX);
@@ -338,6 +407,7 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     if (!content) return xstrdup("Tool error: write requires content\n");
     FILE *fp = fopen(path, "wb");
     if (!fp) {
@@ -367,6 +437,7 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
 char *agent_tool_list(const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     DIR *dir = opendir(path);
     if (!dir) {
         agent_buf b = {0};

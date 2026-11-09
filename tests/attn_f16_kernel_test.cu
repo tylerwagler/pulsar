@@ -7,7 +7,8 @@
  * two transposed phases, the k-split reduction and the online-softmax
  * bookkeeping are right.  A layout bug does not show up as a small error here;
  * it shows up as garbage, which is the point -- what fp16 COSTS was settled
- * separately in tests/attn_precision_fidelity.cc, so this test only asks
+ * separately -- see pulsar_cuda_attn_f16.cu's header table (the old
+ * attn_precision_fidelity.cc went in a71e346) -- so this test only asks
  * whether the kernel computes the function it claims to.
  *
  * WHERE THE RESIDUAL COMES FROM.  It settles at ~4e-4 worst-case, not the ~1e-6
@@ -31,6 +32,25 @@
  * oracle would take longer than the measurement is worth.
  */
 #include "../src/cuda/pulsar_cuda_attn_f16.cu"
+/* The launcher reads the engine's row-kind global (pulsar_gpu_matmul_batch_decode_rows,
+ * defined in pulsar_cuda_matmul.cu, not linked here): the leading rows under that count
+ * take the L210 split-K path, the rest the classic walk.  This test owns the value and
+ * drives every indexed case through BOTH paths against the same oracle. */
+static int g_decode_rows = 0;
+int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
+/* The split-K partials regrow drops the captured segment graphs (pulsar_gpu_seg_note_device_free,
+ * defined in pulsar_cuda_runtime.cu, not linked here); this test captures none. */
+void pulsar_gpu_seg_note_device_free(const char *) {}
+/* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
+ * pulsar_cuda_norm_kv.cu, not linked here).  This test owns the value and drives
+ * BOTH families, because a gate built from one family's fixture cannot fail for
+ * the other: this file built only V4.1's WINDOW/MAIN pair, and the fp16 kernel
+ * meanwhile had no arm at all for V4's single 384-byte row -- so every V4
+ * attention staged 384-byte rows at a 528-byte stride and produced NaN, at
+ * every shape this gate declares PASS (L218 s45/s46). */
+static pulsar_kv_row_style g_row_style = PULSAR_KV_ROWS_CSA2;
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_row_style; }
+static const char *g_family = "csa2";
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -41,11 +61,40 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <random>
+#include <algorithm>
 
 /* host mirror of the fp16 round trip the kernel applies to its operands */
 static double h16(double v) { return (double)__half2float(__float2half((float)v)); }
+
+
+/* The UNIFIED row's host replica (V4), included UNDER A RENAME.
+ *
+ * attn_pack_fixture.h and kv_row_fixture.h both define host_e4m3_mag,
+ * host_e4m3_encode_pos, host_e2m1_value, host_e2m1_encode, fixture_q_set and
+ * fixture_upload_q -- and they are NOT the same functions (the two row families
+ * have their own encoders; unifying them silently broke the MAIN leg of
+ * tests/kv_rows_pack_gate when this was first tried).  So the colliding names
+ * are macro-renamed for the duration of this include instead of being merged:
+ * this gate needs exactly one thing from the unified replica, host_nv_pack_row,
+ * and must not reach into the CSA2 gate's arithmetic to get it. */
+#define host_e4m3_mag         attnfix_host_e4m3_mag
+#define host_e4m3_encode_pos  attnfix_host_e4m3_encode_pos
+#define host_e2m1_value       attnfix_host_e2m1_value
+#define host_e2m1_encode      attnfix_host_e2m1_encode
+#define fixture_q_set         attnfix_fixture_q_set
+#define fixture_upload_q      attnfix_fixture_upload_q
+#include "attn_pack_fixture.h"
+#undef host_e4m3_mag
+#undef host_e4m3_encode_pos
+#undef host_e2m1_value
+#undef host_e2m1_encode
+#undef fixture_q_set
+#undef fixture_upload_q
+#include "kv_row_fixture.h"   /* host replicas of the two CSA2 row packers (V4.1): see the note
+ * there on why the fixture ENCODES a draw instead of drawing random bytes */
 
 int main(int argc, char **argv) {
     const uint32_t n_tokens = (argc > 1) ? (uint32_t)atoi(argv[1]) : 40u;
@@ -55,6 +104,10 @@ int main(int argc, char **argv) {
      * uses and the raw-window one does not.  Wiring the kernel in against only
      * the n_comp=0 path would have shipped that half untested. */
     const uint32_t n_comp   = (argc > 5) ? (uint32_t)atoi(argv[5]) : 0u;
+    if (argc > 9 && strcmp(argv[9], "unified") == 0) {
+        g_row_style = PULSAR_KV_ROWS_UNIFIED;
+        g_family = "unified";
+    }
     const uint32_t ratio    = (argc > 6) ? (uint32_t)atoi(argv[6]) : 4u;
     /* top_k > 0 switches to INDEXED mode: compressed rows become a top-k
      * selection and raw rows come from a ring buffer.  Exercised against the
@@ -62,20 +115,69 @@ int main(int argc, char **argv) {
      * subtly wrong and it is invisible in the output magnitude. */
     const uint32_t top_k    = (argc > 7) ? (uint32_t)atoi(argv[7]) : 0u;
     const uint32_t raw_cap  = (argc > 8) ? (uint32_t)atoi(argv[8]) : 0u;
+    /* argv[9] == "vis": arm the L216 image-span VISIBILITY.  A synthetic span
+     * [n/4, 3n/4] gives every in-span query a FORWARD reach past the causal
+     * window, so an oracle/plan that ignored vis_right, or one that kept the
+     * window-sized raw span and only clamped its ends, is caught here -- this is
+     * the lane the prefill attention now takes for an image request. */
+    const int vis_mode = (argc > 9 && argv[9][0] == 'v');
     const uint32_t D = AF16_DIM;
 
     printf("attn f16 kernel test: n_tokens=%u window=%u n_head=%u head_dim=%u"
-           " n_comp=%u ratio=%u\n\n", n_tokens, window, n_head, D, n_comp, ratio);
+           " n_comp=%u ratio=%u vis=%d rows=%s\n\n", n_tokens, window, n_head, D, n_comp, ratio,
+           vis_mode, g_family);
 
     std::mt19937_64 rng(20260808);
     std::normal_distribution<double> nd(0.0, 1.0);
+
+    /* The synthetic image span: left = distance back to the span's first slot,
+     * right = distance forward to its last -- the reference's get_image_visible
+     * counts, which are 0 outside a span. */
+    std::vector<int32_t> vleft((size_t)n_tokens, 0), vright((size_t)n_tokens, 0);
+    if (vis_mode) {
+        const uint32_t a = n_tokens / 4u, b = (3u * n_tokens) / 4u;
+        for (uint32_t i = a; i <= b; i++) {
+            vleft[i] = (int32_t)(i - a);
+            vright[i] = (int32_t)(b - i);
+        }
+    }
 
     std::vector<float> q((size_t)n_tokens * n_head * D), kv((size_t)n_tokens * D),
                        ckv((size_t)(n_comp ? n_comp : 1u) * D),
                        sinks(n_head), out((size_t)n_tokens * n_head * D, -12345.f);
     for (auto &v : q) v = (float)(nd(rng) * 0.5);
-    for (auto &v : kv) v = (float)(nd(rng) * 0.5);
-    for (auto &v : ckv) v = (float)(nd(rng) * 0.5);
+    /* Raw KV rows first, then DECODE them into kv[] so the f64 oracle below and
+     * the kernel are looking at the same numbers.  Draws with a per-16-block
+     * magnitude band (2^-1..2^1) so scale addressing is exercised without
+     * degenerating the softmax.
+     *
+     * WHICH family's packer builds these rows is the gate's own switch, and it
+     * must match what the kernel will read: V4.1's WINDOW/MAIN pair, or V4's
+     * single UNIFIED row for both. */
+    const int unified = g_row_style == PULSAR_KV_ROWS_UNIFIED;
+    const size_t win_row_h = unified ? (size_t)PULSAR_ATTN_PACK_ROWBYTES(D)
+                                     : (size_t)PULSAR_WINKV_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_tokens * win_row_h);
+    for (uint32_t r = 0; r < n_tokens; r++) {
+        std::vector<float> vals(D);
+        for (uint32_t d = 0; d < D; d++)
+            vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
+        if (unified) host_nv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
+        else         host_winkv_pack_row(vals.data(), &rawp[(size_t)r * win_row_h], &kv[(size_t)r * D], D);
+    }
+    /* Comp rows: MAIN for V4.1, the same UNIFIED row for V4; same
+     * encode-a-draw discipline. */
+    const size_t main_row_h = unified ? (size_t)PULSAR_ATTN_PACK_ROWBYTES(D)
+                                      : (size_t)PULSAR_MAINKV_ROWBYTES(D);
+    const size_t n_ckv = (size_t)(n_comp ? n_comp : 1u);
+    std::vector<uint8_t> ckvp(n_ckv * main_row_h);
+    for (size_t r = 0; r < n_ckv; r++) {
+        std::vector<float> vals(D);
+        for (uint32_t d = 0; d < D; d++)
+            vals[d] = (float)(nd(rng) * 0.5) * std::ldexp(1.0f, (int)((r + d / 16u) % 3) - 1);
+        if (unified) host_nv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
+        else         host_mainkv_pack_row(vals.data(), &ckvp[r * main_row_h], &ckv[r * D], D);
+    }
     for (auto &v : sinks) v = (float)(nd(rng) * 0.25);
 
     const int bench_only = (argc > 4 && argv[4][0] == 'b');
@@ -107,22 +209,57 @@ int main(int argc, char **argv) {
             if (n_raw != 0u) {
                 const uint32_t last = first_raw_pos + n_raw - 1u;
                 if (qpos >= first_raw_pos) {
-                    uint32_t lo = first_raw_pos;
-                    if (window != 0u && qpos + 1u > window) {
-                        const uint32_t wlo = qpos + 1u - window;
-                        if (wlo > lo) lo = wlo;
+                    if (vis_mode) {
+                        /* Kernel's scalar-ring visibility plan: widen around the
+                         * query, clamp to the ring the launcher stored, and fold
+                         * exactly [lo, hi] (rfirst is 0 by construction). */
+                        uint32_t lo = (window != 0u && qpos + 1u > window) ? qpos + 1u - window : 0u;
+                        if (vleft[t] > 0) {
+                            const uint32_t v = (uint32_t)vleft[t];
+                            const uint32_t vlo = v <= qpos ? qpos - v : 0u;
+                            if (vlo < lo) lo = vlo;
+                        }
+                        uint32_t hi = qpos + (vright[t] > 0 ? (uint32_t)vright[t] : 0u);
+                        if (lo < first_raw_pos) lo = first_raw_pos;
+                        if (hi > last) hi = last;
+                        /* The kernel keeps first_raw_pos = lo for the visibility
+                         * plan, so its row base is lo's ring slot and rfirst is
+                         * 0.  The ring is position-indexed (slot = pos % cap). */
+                        rfirst = lo % rcap;
+                        rc = hi >= lo ? hi - lo + 1u : 0u;
+                    } else {
+                        uint32_t lo = first_raw_pos;
+                        if (window != 0u && qpos + 1u > window) {
+                            const uint32_t wlo = qpos + 1u - window;
+                            if (wlo > lo) lo = wlo;
+                        }
+                        const uint32_t hi = qpos < last ? qpos : last;
+                        if (hi >= lo) { rfirst = lo - first_raw_pos; rc = hi - lo + 1u; }
                     }
-                    const uint32_t hi = qpos < last ? qpos : last;
-                    if (hi >= lo) { rfirst = lo - first_raw_pos; rc = hi - lo + 1u; }
-                    if (rc > 256u) rc = 256u;
+                    if (rc > AF16_RAWROWS) rc = AF16_RAWROWS;
                 }
             }
             cnt = rc;
             if (ratio) { vis = (qpos + 1u) / ratio; if (vis > n_comp) vis = n_comp; }
             ccnt = use_topk ? (top_k < vis ? top_k : vis) : vis;
         } else {
-            cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
-            start = t + 1u - cnt;
+            if (vis_mode) {
+                /* Kernel's dense visibility plan: the chunk's own rows, so the
+                 * helper's absolute bounds ARE row indices. */
+                uint32_t lo = (window != 0u && t + 1u > window) ? t + 1u - window : 0u;
+                if (vleft[t] > 0) {
+                    const uint32_t v = (uint32_t)vleft[t];
+                    const uint32_t vlo = v <= t ? t - v : 0u;
+                    if (vlo < lo) lo = vlo;
+                }
+                uint32_t hi = t + (vright[t] > 0 ? (uint32_t)vright[t] : 0u);
+                if (hi >= n_tokens) hi = n_tokens - 1u;
+                cnt = hi >= lo ? hi - lo + 1u : 0u;
+                start = lo;
+            } else {
+                cnt = (window != 0u && t + 1u > window) ? window : t + 1u;
+                start = t + 1u - cnt;
+            }
             if (n_comp && ratio) { ccnt = (t + 1u) / ratio; if (ccnt > n_comp) ccnt = n_comp; }
         }
         const uint32_t tot = cnt + ccnt;
@@ -133,11 +270,25 @@ int main(int argc, char **argv) {
             }
             uint32_t ci = r - cnt;
             if (indexed && use_topk) {
-                /* clamp against VISIBLE comp, matching the f32 kernel */
                 const int32_t c = tk[(size_t)t * top_k + ci];
                 ci = (c >= 0 && (uint32_t)c < vis) ? (uint32_t)c : 0u;
             }
             return &ckv[(size_t)ci * D];
+        };
+        /* An out-of-range top-k selection is NO row, not row 0.  The f16 kernel
+         * loads row 0 to keep the access in range and the branch uniform, then
+         * masks the score to -INF so the row contributes zero; substituting row
+         * 0 for real would inject an unselected position AND double-count row 0
+         * whenever row 0 was also legitimately selected.  This oracle used to
+         * mirror the f32 kernel of the time (deleted in L166), which did substitute -- so it encoded the
+         * behaviour the f16 kernel was written to fix, and every top_k>0 shape
+         * disagreed with it by ~8e-1.  The divergence is confined to
+         * out-of-VISIBLE selections, which is why ratio=0 (everything visible)
+         * agreed and ratio=4 did not. */
+        auto kvbad = [&](uint32_t r) -> bool {
+            if (r < cnt || !(indexed && use_topk)) return false;
+            const int32_t c = tk[(size_t)t * top_k + (r - cnt)];
+            return !(c >= 0 && (uint32_t)c < vis);
         };
         const double scale = 1.0 / std::sqrt((double)D);
         for (uint32_t h = 0; h < n_head; h++) {
@@ -148,7 +299,7 @@ int main(int argc, char **argv) {
                 const float *kr = kvrow(r);
                 for (uint32_t d = 0; d < D; d++)
                     acc += h16(q[((size_t)t * n_head + h) * D + d]) * h16(kr[d]);
-                s[r] = acc * scale;
+                s[r] = kvbad(r) ? -INFINITY : acc * scale;
                 mx = std::max(mx, s[r]);
             }
             const double sink = sinks[h];
@@ -159,54 +310,97 @@ int main(int argc, char **argv) {
             for (uint32_t d = 0; d < D; d++) {
                 double o = 0.0;
                 for (uint32_t r = 0; r < tot; r++) o += h16(p[r]) * h16(kvrow(r)[d]);
-                ref[((size_t)t * n_head + h) * D + d] = o / sum;
+                /* Round through the STORED heads width (L033): the kernel's
+                 * last act is a pulsar_heads_t store, so the oracle must take
+                 * the same rounding or the compare measures storage width
+                 * instead of fragment layout and summation -- bf16 rounding is
+                 * ~4e-3 relative, an order over this test's 4.9e-4 budget. */
+                ref[((size_t)t * n_head + h) * D + d] = (float)(pulsar_heads_t)(o / sum);
             }
         }
     }
 
     /* ---- kernel ----------------------------------------------------------- */
-    float *dq, *dkv, *dckv, *ds, *dout;
-    cudaMalloc(&dq, q.size() * 4); cudaMalloc(&dkv, kv.size() * 4);
-    cudaMalloc(&dckv, ckv.size() * 4);
-    cudaMemcpy(dckv, ckv.data(), ckv.size() * 4, cudaMemcpyHostToDevice);
-    cudaMalloc(&ds, sinks.size() * 4); cudaMalloc(&dout, out.size() * 4);
-    cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dkv, kv.data(), kv.size() * 4, cudaMemcpyHostToDevice);
+    pulsar_q_t *dq;
+    float *dkv, *dckv, *ds;
+    /* dout carries the STORED heads type (L033): this test raw-byte-read the
+     * kernel's output as f32 and became one of the day's five reinterpreting
+     * readers the moment the width flipped.  Written in pulsar_heads_t it is
+     * width-agnostic instead. */
+    pulsar_heads_t *dout;
+    std::vector<pulsar_heads_t> out_h(out.size());
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+    dq = fixture_upload_q(q); cudaMalloc(&dkv, rawp.size());
+    cudaMalloc(&dckv, ckvp.size());
+    cudaMemcpy(dckv, ckvp.data(), ckvp.size(), cudaMemcpyHostToDevice);
+    cudaMalloc(&ds, sinks.size() * 4);
+    cudaMalloc(&dout, out.size() * sizeof(pulsar_heads_t));
+    cudaMemcpy(dkv, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dout, out.data(), out.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
 
     int32_t *dtk = NULL;
     if (use_topk) {
         cudaMalloc(&dtk, tk.size() * 4);
         cudaMemcpy(dtk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice);
     }
+    int32_t *dvl = NULL, *dvr = NULL;
+    if (vis_mode) {
+        cudaMalloc(&dvl, (size_t)n_tokens * sizeof(int32_t));
+        cudaMalloc(&dvr, (size_t)n_tokens * sizeof(int32_t));
+        cudaMemcpy(dvl, vleft.data(), (size_t)n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(dvr, vright.data(), (size_t)n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice);
+    }
+    /* L210: an indexed case runs twice -- the classic whole-window walk (no
+     * decode rows) and the split-K path (every row a decode row: 4 logical
+     * splits, partials, combine) -- against the same oracle and bar.  The two
+     * reach the bf16 rounding boundary from different f32 fold orders, so they
+     * are not byte-identical to each other; both must be within the bar.  The
+     * visibility plan is a PREFILL plan and the split-K walk has no visibility
+     * arithmetic, so a vis case runs the classic walk only (the launcher refuses
+     * the combination, which the launch check below would surface). */
+    int overall = 1;
+    const int n_modes = (indexed && !vis_mode) ? 2 : 1;
+    for (int split_mode = 0; split_mode < n_modes; split_mode++) {
+    g_decode_rows = split_mode ? (int)n_tokens : 0;
+    const char *mode_label = split_mode ? "split-K (decode rows)" : "classic walk";
+    std::fill(out.begin(), out.end(), -12345.f);
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+    cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
     const int rc = indexed
-        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, dkv, dckv, use_topk ? dtk : NULL,
+        ? pulsar_gpu_attention_f16_indexed(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                           (const pulsar_mainkv_row_t *)dckv, use_topk ? dtk : NULL,
                                            n_tokens, pos0, n_raw, rcap, 0u,
-                                           n_comp, top_k, window, ratio, n_head, D, 0,
-                                           NULL, NULL, NULL, 0u, 1u, 0)
-        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv,
-                                           n_comp ? dckv : NULL,
+                                           n_comp, top_k, window, ratio, n_head, D,
+                                           NULL, NULL, NULL, 0u, 1u, 0u /* causal */, NULL,
+                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL,
+                                           NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u)
+        : pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                           n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
                                            n_tokens, n_comp, window, ratio,
-                                           n_head, D, 0);
+                                           n_head, D, NULL,
+                                           vis_mode ? dvl : NULL, vis_mode ? dvr : NULL);
     if (!rc) { printf("LAUNCH REFUSED (shape gate)\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
     }
-    cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_h.data(), dout, out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < out.size(); i++) out[i] = (float)out_h[i];
 
     /* ---- timing, at the shape nsys measured the shipping kernel at --------- */
-    {
+    if (split_mode == 0) {
         cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
         const int iters = 20;
         for (int i = 0; i < 3; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, 0);
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                             n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
+                                             n_tokens, n_comp, window, ratio, n_head, D, NULL, NULL, NULL);
         cudaDeviceSynchronize();
         cudaEventRecord(e0);
         for (int i = 0; i < iters; i++)
-            pulsar_gpu_attention_f16_prefill(dout, ds, dq, dkv, n_comp ? dckv : NULL,
-                                             n_tokens, n_comp, window, ratio, n_head, D, 0);
+            pulsar_gpu_attention_f16_prefill(dout, ds, dq, (const pulsar_winkv_row_t *)dkv,
+                                             n_comp ? (const pulsar_mainkv_row_t *)dckv : NULL,
+                                             n_tokens, n_comp, window, ratio, n_head, D, NULL, NULL, NULL);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
         float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
         printf("timing: %.4f ms/launch  (n_tokens=%u window=%u n_head=%u)\n",
@@ -216,7 +410,8 @@ int main(int argc, char **argv) {
 
     /* ---- compare ---------------------------------------------------------- */
     /* Per (token, head) relative L2, the same scale-aware measure
-     * tests/attn_precision_fidelity.cc reports, so the two are comparable.  A
+     * pulsar_cuda_attn_f16.cu's header table reports, so the two are
+     * comparable.  A
      * plain elementwise max-relative is useless here: an output element that
      * happens to sit near zero divides a normal rounding difference by almost
      * nothing and reports ~1.0 while the vector is perfectly good. */
@@ -243,13 +438,23 @@ int main(int argc, char **argv) {
     printf("max |delta|                 = %.3e\n", max_abs);
     printf("NaN = %zu, never-written = %zu\n", nan, untouched);
 
-    const int pass = (nan == 0 && untouched == 0 && worst_l2 < 1e-3 &&
-                      (sum_ref > 0 && sum_abs / sum_ref < 1e-3));
-    printf("\nATTN F16 KERNEL TEST: %s\n", pass ? "PASS" : "FAIL");
+    /* Width-aware bar (L033): the oracle narrows through pulsar_heads_t, but
+     * kernel and oracle reach the rounding boundary from DIFFERENT f32 values
+     * (fold order), so near-boundary elements legitimately land one bf16 ulp
+     * apart (~4e-3 element-wise; measured worst rel L2 1.6e-3).  5e-3 keeps a
+     * ~100x margin to the layout-bug class this test exists to catch (the
+     * phase-3 B row bug measured ~0.5). */
+    const double bar = sizeof(pulsar_heads_t) == 2 ? 5e-3 : 1e-3;
+    const int pass = (nan == 0 && untouched == 0 && worst_l2 < bar &&
+                      (sum_ref > 0 && sum_abs / sum_ref < bar));
+    printf("  %s: %s\n", mode_label, pass ? "PASS" : "FAIL");
     if (!pass) {
         printf("  first few (ref vs got):\n");
         for (size_t i = 0; i < 8 && i < out.size(); i++)
             printf("    [%zu] %12.6f  %12.6f\n", i, ref[i], (double)out[i]);
+        overall = 0;
     }
-    return pass ? 0 : 1;
+    }   /* split_mode */
+    printf("\nATTN F16 KERNEL TEST: %s\n", overall ? "PASS" : "FAIL");
+    return overall ? 0 : 1;
 }

@@ -1,4 +1,8 @@
+/** @file
+ *  pulsar-agent: streaming terminal markdown rendering of the assistant's output (bold, italic,
+ *  inline code, fenced code blocks with syntax colour). */
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -78,6 +82,8 @@ void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
 
 
 
+/** @brief Switch to the thinking text's grey (256-colour 245); nothing without colour.
+ *  @param r the renderer */
 static void renderer_set_grey(agent_token_renderer *r) {
     if (r->use_color) renderer_write(r, "\x1b[38;5;245m", 11);
 }
@@ -91,26 +97,22 @@ void renderer_reset_color(agent_token_renderer *r) {
 
 
 
-static size_t renderer_utf8_need(unsigned char c) {
-    if (c < 0x80) return 1;
-    if (c >= 0xc2 && c <= 0xdf) return 2;
-    if (c >= 0xe0 && c <= 0xef) return 3;
-    if (c >= 0xf0 && c <= 0xf4) return 4;
-    return 1;
-}
-
-
-
+/** @brief Whether any text attribute is active (thinking, bold, italic, inline code, code block).
+ *  @param r the renderer
+ *  @return true when the next text byte needs an SGR sequence */
 static bool renderer_has_text_attrs(agent_token_renderer *r) {
-    return r->in_think || r->md_bold || r->md_italic ||
+    return r->think.in_think || r->md_bold || r->md_italic ||
            r->md_inline_code || r->md_code_block;
 }
 
 
 
+/** @brief Emit the SGR sequence for the active attributes (grey thinking; code block blue; inline code cyan, plus
+ *  bold / italic); nothing without colour.
+ *  @param r the renderer */
 static void renderer_set_text_attrs(agent_token_renderer *r) {
     if (!r->use_color) return;
-    if (r->in_think) {
+    if (r->think.in_think) {
         renderer_set_grey(r);
         return;
     }
@@ -133,7 +135,19 @@ void renderer_restore_text_attrs(agent_token_renderer *r) {
 
 
 
+/** @brief Write one complete character (a whole UTF-8 sequence), opening or closing the attribute colour as the
+ *  current state requires, and track visible output and line starts.
+ *  @param r the renderer
+ *  @param s the character's bytes
+ *  @param n byte count */
 static void renderer_write_complete_char_raw(agent_token_renderer *r, const char *s, size_t n) {
+    /* L354: a model's character the terminal would obey goes out as '?' */
+    char safe[4];
+    if (n <= sizeof safe) {
+        memcpy(safe, s, n);
+        agent_terminal_sanitize(safe, n);
+        s = safe;
+    }
     bool styled = r->use_color && renderer_has_text_attrs(r);
     if (styled && !r->color_open) {
         renderer_set_text_attrs(r);
@@ -148,6 +162,8 @@ static void renderer_write_complete_char_raw(agent_token_renderer *r, const char
 
 
 
+/** @brief Write a held partial UTF-8 sequence as it stands and clear it; nothing when none is held.
+ *  @param r the renderer */
 static void renderer_flush_utf8(agent_token_renderer *r) {
     if (!r->utf8_pending_len) return;
     renderer_write_complete_char_raw(r, r->utf8_pending, r->utf8_pending_len);
@@ -157,6 +173,10 @@ static void renderer_flush_utf8(agent_token_renderer *r) {
 
 
 
+/** @brief Write one byte, holding a multi-byte UTF-8 sequence until it is complete (an interrupted sequence is
+ *  flushed as it stands), so attributes never split a character.
+ *  @param r the renderer
+ *  @param c the byte */
 static void renderer_write_char_raw(agent_token_renderer *r, char c) {
     unsigned char uc = (unsigned char)c;
 
@@ -169,18 +189,23 @@ static void renderer_write_char_raw(agent_token_renderer *r, char c) {
         renderer_flush_utf8(r);
     }
 
-    size_t need = renderer_utf8_need(uc);
-    if (need == 1) {
+    /* A byte that cannot lead a sequence (utf8_seq_len 0) is its own unit. */
+    const int need = utf8_seq_len(uc);
+    if (need <= 1) {
         renderer_write_complete_char_raw(r, &c, 1);
         return;
     }
     r->utf8_pending[0] = c;
     r->utf8_pending_len = 1;
-    r->utf8_pending_need = need;
+    r->utf8_pending_need = (size_t)need;
 }
 
 
 
+/** @brief Write one byte with the markdown attributes suppressed for it (code-block bytes stream plain and are
+ *  repainted with syntax colour per line).
+ *  @param r the renderer
+ *  @param c the byte */
 static void renderer_write_plain_byte(agent_token_renderer *r, char c) {
     bool old_bold = r->md_bold;
     bool old_italic = r->md_italic;
@@ -204,6 +229,8 @@ static void renderer_write_plain_byte(agent_token_renderer *r, char c) {
 
 
 
+/** Keywords for unknown or unlabelled fences; a trailing '|' marks a secondary keyword (types and literals,
+ *  AGENT_HL_KEYWORD2).  NULL-terminated, as are the lists below. */
 static const char *agent_kw_generic[] = {
     "if","else","for","while","do","switch","case","default","break",
     "continue","return","try","catch","finally","throw","throws","class",
@@ -219,6 +246,7 @@ static const char *agent_kw_generic[] = {
 
 
 
+/** C and C++ keywords (trailing '|': secondary). */
 static const char *agent_kw_c[] = {
     "auto","break","case","continue","default","do","else","enum",
     "extern","for","goto","if","register","return","sizeof","static",
@@ -237,6 +265,7 @@ static const char *agent_kw_c[] = {
 
 
 
+/** Python keywords (trailing '|': secondary). */
 static const char *agent_kw_python[] = {
     "and","as","assert","async","await","break","case","class","continue",
     "def","del","elif","else","except","finally","for","from","global",
@@ -248,6 +277,7 @@ static const char *agent_kw_python[] = {
 
 
 
+/** JavaScript and TypeScript keywords (trailing '|': secondary). */
 static const char *agent_kw_js[] = {
     "async","await","break","case","catch","class","const","continue",
     "debugger","default","delete","do","else","export","extends",
@@ -262,6 +292,7 @@ static const char *agent_kw_js[] = {
 
 
 
+/** Java keywords (trailing '|': secondary). */
 static const char *agent_kw_java[] = {
     "abstract","assert","break","case","catch","class","const","continue",
     "default","do","else","enum","extends","final","finally","for","goto",
@@ -275,6 +306,7 @@ static const char *agent_kw_java[] = {
 
 
 
+/** C# keywords (trailing '|': secondary). */
 static const char *agent_kw_csharp[] = {
     "abstract","as","base","break","case","catch","checked","class","const",
     "continue","default","delegate","do","else","enum","event","explicit",
@@ -291,6 +323,7 @@ static const char *agent_kw_csharp[] = {
 
 
 
+/** Go keywords (trailing '|': secondary). */
 static const char *agent_kw_go[] = {
     "break","case","chan","const","continue","default","defer","else",
     "fallthrough","for","func","go","goto","if","import","interface",
@@ -303,6 +336,7 @@ static const char *agent_kw_go[] = {
 
 
 
+/** Rust keywords (trailing '|': secondary). */
 static const char *agent_kw_rust[] = {
     "as","async","await","break","const","continue","crate","dyn","else",
     "enum","extern","fn","for","if","impl","in","let","loop","match",
@@ -315,6 +349,7 @@ static const char *agent_kw_rust[] = {
 
 
 
+/** Shell keywords and common builtins (trailing '|': secondary). */
 static const char *agent_kw_shell[] = {
     "case","do","done","elif","else","esac","fi","for","function","if",
     "in","select","then","time","until","while","break","continue",
@@ -324,6 +359,7 @@ static const char *agent_kw_shell[] = {
 
 
 
+/** SQL keywords (trailing '|': secondary); matched case-insensitively. */
 static const char *agent_kw_sql[] = {
     "add","alter","and","as","asc","between","by","case","check","column",
     "constraint","create","delete","desc","distinct","drop","else","end",
@@ -337,6 +373,7 @@ static const char *agent_kw_sql[] = {
 
 
 
+/** Ruby keywords (trailing '|': secondary). */
 static const char *agent_kw_ruby[] = {
     "BEGIN","END","alias","and","begin","break","case","class","def",
     "defined?","do","else","elsif","end","ensure","for","if","in",
@@ -347,6 +384,7 @@ static const char *agent_kw_ruby[] = {
 
 
 
+/** PHP keywords (trailing '|': secondary). */
 static const char *agent_kw_php[] = {
     "abstract","and","array","as","break","callable","case","catch","class",
     "clone","const","continue","declare","default","die","do","echo","else",
@@ -362,6 +400,7 @@ static const char *agent_kw_php[] = {
 
 
 
+/** Swift keywords (trailing '|': secondary). */
 static const char *agent_kw_swift[] = {
     "actor","as","associatedtype","async","await","break","case","catch",
     "class","continue","default","defer","do","else","enum","extension",
@@ -375,6 +414,7 @@ static const char *agent_kw_swift[] = {
 
 
 
+/** Kotlin keywords (trailing '|': secondary). */
 static const char *agent_kw_kotlin[] = {
     "as","break","class","continue","do","else","false","for","fun","if",
     "in","interface","is","null","object","package","return","super",
@@ -390,6 +430,7 @@ static const char *agent_kw_kotlin[] = {
 
 
 
+/** Zig keywords (trailing '|': secondary). */
 static const char *agent_kw_zig[] = {
     "addrspace","align","allowzero","and","anyframe","anytype","asm",
     "async","await","break","callconv","catch","comptime","const",
@@ -404,6 +445,7 @@ static const char *agent_kw_zig[] = {
 
 
 
+/** Lua keywords. */
 static const char *agent_kw_lua[] = {
     "and","break","do","else","elseif","end","false","for","function",
     "goto","if","in","local","nil","not","or","repeat","return","then",
@@ -412,6 +454,7 @@ static const char *agent_kw_lua[] = {
 
 
 
+/** HTML element names and common attributes (trailing '|': secondary). */
 static const char *agent_kw_html[] = {
     "a","body","button","div","doctype","form","h1","h2","h3","head",
     "html","input","label","li","link","main","meta","ol","option","p",
@@ -422,6 +465,7 @@ static const char *agent_kw_html[] = {
 
 
 
+/** CSS properties and common values (trailing '|': secondary). */
 static const char *agent_kw_css[] = {
     "align-items","background","border","bottom","color","display","flex",
     "font","font-size","gap","grid","height","justify-content","left",
@@ -432,6 +476,7 @@ static const char *agent_kw_css[] = {
 
 
 
+/** The highlighter's language table, terminated by a NULL name; entry 0 ("generic") is the fallback. */
 static const agent_syntax agent_syntaxes[] = {
     {"generic", " text txt", agent_kw_generic, {"//","#",NULL}, "/*", "*/",
         AGENT_SYNTAX_NUMBERS | AGENT_SYNTAX_STRINGS | AGENT_SYNTAX_BACKTICK_STRINGS},
@@ -480,6 +525,10 @@ static const agent_syntax agent_syntaxes[] = {
 
 
 
+/** @brief Whether `lang` is one of the space-separated `aliases` (case-insensitive).
+ *  @param aliases the syntax's alias list
+ *  @param lang    the fence's language tag
+ *  @return true on a match; false for an empty or NULL tag */
 static bool agent_syntax_alias_match(const char *aliases, const char *lang) {
     if (!aliases || !lang || !lang[0]) return false;
     size_t llen = strlen(lang);
@@ -496,6 +545,9 @@ static bool agent_syntax_alias_match(const char *aliases, const char *lang) {
 
 
 
+/** @brief The syntax for a fence language tag, by name or alias.
+ *  @param lang the tag; NULL or empty = generic
+ *  @return the syntax (static); the generic one when nothing matches */
 static const agent_syntax *agent_syntax_for_lang(const char *lang) {
     if (lang && lang[0]) {
         for (const agent_syntax *s = agent_syntaxes; s->name; s++) {
@@ -523,6 +575,9 @@ const agent_syntax *agent_syntax_for_path(const char *path) {
 
 
 
+/** @brief Whether `c` separates tokens for the highlighter (NUL, whitespace, punctuation and operators).
+ *  @param c the byte
+ *  @return true for a separator */
 static bool agent_syntax_separator(char c) {
     unsigned char uc = (unsigned char)c;
     return c == '\0' || isspace(uc) || strchr(",.()+-/*=~%[]{}<>:;!&|^?", c) != NULL;
@@ -543,6 +598,9 @@ const char *agent_syntax::line_comment(const char *p) const {
 
 
 
+/** @brief The 256-colour index for a highlight class.
+ *  @param hl an AGENT_HL_* class
+ *  @return the colour index (252 for normal text) */
 static int agent_syntax_color(int hl) {
     switch (hl) {
     case AGENT_HL_COMMENT: return 244;
@@ -556,6 +614,12 @@ static int agent_syntax_color(int hl) {
 
 
 
+/** @brief Write a run of code in a highlight class (coloured, then reset); records that the line had a highlight.
+ *  Writes nothing while md_syntax_silent (a scan-only pass).
+ *  @param r  the renderer
+ *  @param hl the run's AGENT_HL_* class
+ *  @param s  bytes
+ *  @param n  byte count */
 static void renderer_syntax_write(agent_token_renderer *r, int hl,
                                   const char *s, size_t n) {
     if (!n) return;
@@ -574,6 +638,8 @@ static void renderer_syntax_write(agent_token_renderer *r, int hl,
 
 
 
+/** @brief Write an edit's "[upto]" marker highlighted (plain without colour); nothing while md_syntax_silent.
+ *  @param r the renderer */
 static void renderer_syntax_write_upto_marker(agent_token_renderer *r) {
     static const char marker[] = "[upto]";
     r->md_syntax_has_highlight = true;
@@ -593,6 +659,10 @@ static void renderer_syntax_write_upto_marker(agent_token_renderer *r) {
 
 
 
+/** @brief A keyword entry's length without its secondary marker.
+ *  @param kw        the entry
+ *  @param secondary receives true when it ends in '|'
+ *  @return its length, bytes */
 static size_t agent_syntax_keyword_len(const char *kw, bool *secondary) {
     size_t len = strlen(kw);
     *secondary = len && kw[len - 1] == '|';
@@ -625,6 +695,13 @@ bool agent_syntax::match_keyword(const char *p,
 
 
 
+/** @brief Whether a number starts (or continues) at `p`: a digit after a separator or inside a number, or a '.'
+ *  inside a number.
+ *  @param p       the position
+ *  @param line    the line's start
+ *  @param prev_sep the previous byte was a separator
+ *  @param prev_hl  the previous byte's highlight class
+ *  @return true when `p` is part of a number */
 static bool agent_syntax_number_start(const char *p, const char *line,
                                       bool prev_sep, int prev_hl) {
     unsigned char c = (unsigned char)*p;
@@ -635,6 +712,10 @@ static bool agent_syntax_number_start(const char *p, const char *line,
 
 
 
+/** @brief The length of a number token at `p` (alphanumerics, '_', '.', '+', '-').
+ *  @param p        the number's start
+ *  @param line_end the line's end (exclusive)
+ *  @return bytes */
 static size_t agent_syntax_number_len(const char *p, const char *line_end) {
     const char *q = p;
     while (q < line_end) {
@@ -647,6 +728,11 @@ static size_t agent_syntax_number_len(const char *p, const char *line_end) {
 
 
 
+/** @brief Highlight and write one code line with the block's syntax (comments, strings, numbers, keywords, and
+ *  an edit's [upto] marker when enabled), carrying the multi-line comment state across lines.
+ *  @param r    the renderer
+ *  @param line the line's bytes (no newline)
+ *  @param len  byte count */
 static void renderer_syntax_emit_line(agent_token_renderer *r,
                                       const char *line, size_t len) {
     const agent_syntax *syn = r->md_syntax ? r->md_syntax : agent_syntax_for_lang(NULL);
@@ -784,6 +870,10 @@ static void renderer_syntax_emit_line(agent_token_renderer *r,
 
 
 
+/** @brief Append bytes to the buffered code line (kept NUL-terminated, grown by doubling from 256).
+ *  @param r the renderer
+ *  @param s bytes
+ *  @param n byte count */
 static void renderer_code_line_append(agent_token_renderer *r,
                                       const char *s, size_t n) {
     if (!n) return;
@@ -809,6 +899,10 @@ int renderer_terminal_cols(void) {
 
 
 
+/** @brief Whether the buffered code line can be repainted in place: colour on, output not captured, and the line
+ *  plain ASCII without tabs or escapes that fits one terminal row with its prefix.
+ *  @param r the renderer
+ *  @return true when a repaint is safe */
 static bool renderer_code_line_can_repaint(agent_token_renderer *r) {
     if (!r->use_color || r->capture || r->md_code_line_len == 0) return false;
     int cols = renderer_terminal_cols();
@@ -826,6 +920,8 @@ static bool renderer_code_line_can_repaint(agent_token_renderer *r) {
 
 
 
+/** @brief Write the code stream's line prefix (in its colour, when set); nothing without a prefix.
+ *  @param r the renderer */
 static void renderer_code_write_line_prefix(agent_token_renderer *r) {
     if (!r->md_code_line_prefix) return;
     if (r->use_color && r->md_code_line_prefix_color)
@@ -843,6 +939,10 @@ static void renderer_code_write_line_prefix(agent_token_renderer *r) {
 /* Run the syntax highlighter in silent mode to learn whether the already
  * streamed line would change if repainted, while preserving the multiline
  * comment state until the caller decides whether repaint is safe. */
+/// @brief Dry-run the highlighter over the buffered line (see above).
+/// @param r                the renderer (its multi-line comment state is left unchanged)
+/// @param final_ml_comment receives the multi-line comment state the line would leave
+/// @return true when the line has any highlight, i.e. a repaint would change it
 static bool renderer_code_scan_line(agent_token_renderer *r,
                                     bool *final_ml_comment) {
     bool old_silent = r->md_syntax_silent;
@@ -867,6 +967,9 @@ static bool renderer_code_scan_line(agent_token_renderer *r,
  * replace only that terminal row with syntax-highlighted text, but only for
  * simple one-row ASCII lines; long, tabbed, escaped, or UTF-8 lines are left
  * as streamed and only advance the highlighter state. */
+/// @brief Finish the buffered code line (see above): repaint it highlighted when it changed and can be repainted.
+/// @param r            the renderer
+/// @param with_newline also write the line's newline
 static void renderer_code_emit_buffered_line(agent_token_renderer *r,
                                              bool with_newline) {
     bool final_ml_comment = r->md_code_in_ml_comment;
@@ -903,6 +1006,9 @@ void renderer_code_byte(agent_token_renderer *r, char c) {
 
 
 
+/** @brief Write `count` literal backticks into the code block.
+ *  @param r     the renderer
+ *  @param count backticks */
 static void renderer_code_emit_backtick_literals(agent_token_renderer *r,
                                                  size_t count) {
     for (size_t i = 0; i < count; i++) renderer_code_byte(r, '`');
@@ -910,6 +1016,9 @@ static void renderer_code_emit_backtick_literals(agent_token_renderer *r,
 
 
 
+/** @brief Enter a fenced code block: reset colour and code state, expect the fence's info string, generic syntax
+ *  until the language is known.
+ *  @param r the renderer */
 static void renderer_code_begin(agent_token_renderer *r) {
     renderer_reset_color(r);
     r->md_code_block = true;
@@ -996,6 +1105,8 @@ void renderer_code_end(agent_token_renderer *r) {
  * The state machine holds only possible delimiter bytes; once a byte is known
  * to be ordinary text it is sent to the raw UTF-8 writer above.  Tool
  * visualization and redirected output bypass this layer. */
+/// @brief Drop the held delimiter bytes.
+/// @param r the renderer
 static void renderer_markdown_clear_pending(agent_token_renderer *r) {
     r->md_pending = AGENT_MD_PENDING_NONE;
     r->md_pending_len = 0;
@@ -1003,6 +1114,8 @@ static void renderer_markdown_clear_pending(agent_token_renderer *r) {
 
 
 
+/** @brief Write held star or backtick bytes as literal text (into the code block when inside one) and clear them.
+ *  @param r the renderer */
 static void renderer_markdown_emit_pending_literals(agent_token_renderer *r) {
     char c;
     if (r->md_pending == AGENT_MD_PENDING_STAR) {
@@ -1024,6 +1137,9 @@ static void renderer_markdown_emit_pending_literals(agent_token_renderer *r) {
 
 
 
+/** @brief Act on a held backtick run: three or more open or close a fence; inside a code block they are literal;
+ *  otherwise they toggle inline code.
+ *  @param r the renderer */
 static void renderer_markdown_commit_backticks(agent_token_renderer *r) {
     size_t count = r->md_pending_len;
     renderer_markdown_clear_pending(r);
@@ -1044,6 +1160,9 @@ static void renderer_markdown_commit_backticks(agent_token_renderer *r) {
 
 
 
+/** @brief Whether `c` is a space, tab, CR or LF.
+ *  @param c the byte
+ *  @return true for whitespace */
 static bool renderer_space_byte(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
@@ -1053,6 +1172,9 @@ static bool renderer_space_byte(char c) {
 /* Consume one byte of markdown-aware assistant output.  Backticks and stars
  * are held in r->pending until the parser knows whether they form a marker;
  * all ordinary text is emitted with the current terminal attributes. */
+/// @brief Feed one byte of assistant output through the markdown state machine (see above).
+/// @param r the renderer
+/// @param c the byte
 static void renderer_markdown_feed(agent_token_renderer *r, char c) {
     if (r->md_fence_info) {
         if (c == '\n') {
@@ -1121,6 +1243,9 @@ static void renderer_markdown_feed(agent_token_renderer *r, char c) {
 
 
 
+/** @brief End of the reply: commit a final closing fence or emit held delimiters, flush the code line, and clear
+ *  every markdown attribute.
+ *  @param r the renderer */
 static void renderer_markdown_finish(agent_token_renderer *r) {
     /* A closing code fence can be the final bytes of the assistant reply.  In
      * that case no following character arrives to force the pending backticks
@@ -1154,7 +1279,7 @@ static void renderer_markdown_finish(agent_token_renderer *r) {
 
 
 void renderer_write_char(agent_token_renderer *r, char c) {
-    if (!r->format_markdown || r->in_think) {
+    if (!r->format_markdown || r->think.in_think) {
         renderer_markdown_emit_pending_literals(r);
         renderer_write_char_raw(r, c);
         return;
@@ -1164,58 +1289,7 @@ void renderer_write_char(agent_token_renderer *r, char c) {
 
 
 
-/* Render assistant text while hiding <think> tags and dimming thinking text.
- * The function is also responsible for not prematurely emitting a partial
- * control tag split across model tokens. */
-static void renderer_process(agent_token_renderer *r, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = r->pending_len + len;
-    char *buf = (char *)agent_xmalloc(total ? total : 1);
-    if (r->pending_len) memcpy(buf, r->pending, r->pending_len);
-    if (len) memcpy(buf + r->pending_len, text, len);
-    r->pending_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = buf + i;
-        size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
-            r->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, think_close)) {
-            r->in_think = false;
-            renderer_reset_color(r);
-            if (!r->last_output_newline) renderer_write(r, "\n", 1);
-            renderer_write(r, "\n", 1);
-            r->last_output_newline = true;
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(r->pending)) {
-                memcpy(r->pending, cur, rem);
-                r->pending_len = rem;
-            }
-            break;
-        }
-        renderer_write_char(r, cur[0]);
-        i++;
-    }
-    free(buf);
-}
-
-
-
 void renderer_finish(agent_token_renderer *r) {
-    if (r->format_thinking) {
-        renderer_process(r, NULL, 0, true);
-    }
     renderer_markdown_finish(r);
     renderer_flush_utf8(r);
     renderer_reset_color(r);

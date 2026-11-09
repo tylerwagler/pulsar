@@ -1,0 +1,106 @@
+# Doxygen configuration for pulsar.
+#
+# Build:  doxygen docs/Doxyfile      (output: docs/api/html/index.html)
+# Needs:  doxygen, and graphviz `dot` for the call/collaboration graphs.
+#
+# Scope note: this documents the ENGINE, not the vendored code. src/vendor is
+# excluded deliberately -- it is third-party and its comments are not ours to
+# curate.
+
+PROJECT_NAME           = "pulsar"
+PROJECT_BRIEF          = "Multi-family CUDA inference server (GB10)"
+OUTPUT_DIRECTORY       = docs/api
+CREATE_SUBDIRS         = NO
+OPTIMIZE_OUTPUT_FOR_C  = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+INPUT                  = src docs/DESIGN.md
+FILE_PATTERNS          = *.h *.hpp *.c *.cpp *.cu *.cuh *.md
+RECURSIVE              = YES
+# VENDORED CODE IS OUT OF SCOPE, and this is a correctness rule rather than a
+# taste one. src/cuda/mmq/VENDOR.md records that mma.cuh, mmid.*, ggml-common.h
+# and the ggml redirect headers are byte-identical to llama.cpp pin 5c0e946 and
+# are therefore "free to replace outright" on a re-sync. Adding our own doc
+# comments to them would destroy exactly that property and turn a clean
+# re-vendor into a merge. ds4_cuda_env.cuh is a derived extract of upstream's
+# common.cuh and carries the same argument.
+#
+# Our own adapters in that directory (ds4_mmq*, ds4_mmid*, ds4_ggml_stubs*,
+# ds4_act_block.cuh, ds4_quantize_e4m3.cu) stay IN scope -- they are ours to
+# document.  src/cuda/fmha is CUTLASS examples/41 at the pin (its VENDOR.md),
+# out of scope for the same reason; its wrapper pulsar_cuda_fmha.* is ours.
+EXCLUDE                = src/vendor \
+                         src/cuda/fmha \
+                         src/cuda/mmq/mma.cuh \
+                         src/cuda/mmq/mmid.cu \
+                         src/cuda/mmq/mmid.cuh \
+                         src/cuda/mmq/ggml-common.h \
+                         src/cuda/mmq/ggml.h \
+                         src/cuda/mmq/ggml-impl.h \
+                         src/cuda/mmq/ggml-cuda.h \
+                         src/cuda/mmq/ds4_cuda_env.cuh \
+                         src/cuda/mmq/tessera_routed_fused_window.cuh
+EXCLUDE_PATTERNS       = */build/* */cutlass/* */vendors/*
+USE_MDFILE_AS_MAINPAGE = docs/DESIGN.md
+
+# EXTRACT_ALL = NO: an entity without a doc block is a warning, so an empty
+# warnings log means every file (@file), function, type and member is
+# documented.  The engine's real content is in static functions and struct
+# internals, so those are extracted too.
+EXTRACT_ALL            = NO
+EXTRACT_STATIC         = YES
+# L298: anonymous-namespace members are extracted like statics.  Left at NO, doxygen numbers anonymous namespaces
+# across the whole input and, as files are added, mis-pairs a file's members with another's (`@31::...` "was not
+# declared or defined" on ds4_mmq.cu, a file L298 never touched).
+EXTRACT_ANON_NSPACES   = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_LOCAL_CLASSES  = YES
+INTERNAL_DOCS          = YES
+
+# Surface what is NOT yet documented -- the point of an exhaustive pass is
+# knowing what is left, so warnings are the progress meter.
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = docs/api/doxygen-warnings.log
+
+# CUDA: doxygen does not know these, and without the mapping every __global__
+# kernel is parsed as a syntax error rather than a function.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = __global__= \
+                         __device__= \
+                         __host__= \
+                         __shared__= \
+                         __restrict__= \
+                         __launch_bounds__(...)= \
+                         __attribute__(x)= \
+                         GDN_CLUSTER_DIMS= \
+                         PULSAR_DOXYGEN=1
+EXTENSION_MAPPING      = cu=C++ cuh=C++
+
+HAVE_DOT               = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = NO
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+# Four call/caller graphs were skipped at 80 (buf_puts had 94 callers,
+# gpu_graph_encode_layer_attention_batch 90 callees). 100 captures them; much
+# beyond that a graph stops being readable and the textual caller list is the
+# better tool anyway.
+DOT_GRAPH_MAX_NODES    = 100
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+# The ledger rows and design docs live in the private notes. Do NOT add
+# that tree here -- it must not end up in generated output that could be
+# published from the public repo.

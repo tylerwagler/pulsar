@@ -7,7 +7,7 @@
 #   out_dir gets: dump.bin, server.log, driver.log, manifest.jsonl, DONE
 #
 # Successor of temp/conf_collect2.sh (the argmax-era collector). Differences:
-# runs the merged v5mx artifact (drafter auto-detected, no --dspark), samples
+# runs the merged v5mx artifact (drafter auto-detected from the merged artifact), samples
 # at request temperature (labels = real p/q accept outcomes), and spans the
 # temp x workload x depth mixture instead of greedy-only ~1k ctx.
 #
@@ -42,12 +42,12 @@ if [ "${avail_gb:-0}" -lt 100 ]; then
 fi
 
 export PULSAR_DSPARK_STATS=1
-export PULSAR_DSPARK_CONF_SCHED=off       # unbiased labels: verify all n_draft
+export PULSAR_SPEC_TAU=off             # unbiased labels: verify all n_draft
 export PULSAR_DSPARK_DUMP="$OUT/dump.bin"
 export PULSAR_DSPARK_DUMP_LEAN=1
 export PULSAR_DSPARK_DUMP_STEPS=200000
 
-./pulsar-server -m "$MODEL" --dspark-draft 5 -c "$CTX" --port "$PORT" \
+./pulsar-server -m "$MODEL" --spec-depth 5 -c "$CTX" --port "$PORT" \
     > "$OUT/server.log" 2>&1 &
 SRV=$!
 echo "server pid $SRV"

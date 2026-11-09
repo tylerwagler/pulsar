@@ -1,45 +1,221 @@
+/** @file
+ *  DeepSeek's prompt renderer (the DSML template, verbatim per variant) and the Responses / Anthropic
+ *  tool-output validation that precedes rendering.
+ */
 #include "pulsar_server_internal.h"
 
 
 
-static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
+/* The tools prompt, VERBATIM per template family.  V4.1's is byte-identical to
+ * the reference encoder's TOOLS_TEMPLATE (encoding.py render_tools); V4's is
+ * dev's, which the 0731 checkpoints were trained on -- the reference-quality
+ * rewording this branch gave V4.1 (and, by accident, 0731) is a DIFFERENT
+ * prompt, and a 0731 artifact primed with it answered a tool request with a
+ * DSML invoke and no block opener at all (L218 s123).  The DSML literals come
+ * from the family's spelling row; nothing here is compiled per profile. */
+/* L223: record the byte range a client-data write occupies, so the tokeniser
+ * can treat those bytes as PLAIN TEXT (see buf's span fields).  begin/end nest
+ * (a depth counter and the outermost start) and a range that emitted nothing is
+ * dropped, so the list is disjoint and ascending -- which is what the tokeniser's
+ * single forward pass relies on. */
+void buf_text_begin(buf *b) {
+    if (!b) return;
+    if (!b->span_open) b->span_lo = (uint32_t)b->len;
+    b->span_open++;
+}
+
+void buf_text_end(buf *b) {
+    if (!b || !b->span_open) return;
+    if (--b->span_open) return;             /* an inner range closed; keep the outer open */
+    const uint32_t lo = b->span_lo;
+    const uint32_t hi = (uint32_t)b->len;
+    if (hi <= lo) return;
+    if (b->n_spans == b->cap_spans) {
+        const uint32_t cap = b->cap_spans ? b->cap_spans * 2u : 16u;
+        chat_text_span *grown = (chat_text_span *)server_xrealloc(b->spans, (size_t)cap * sizeof *grown);
+        b->spans = grown;
+        b->cap_spans = cap;
+    }
+    b->spans[b->n_spans].lo = lo;
+    b->spans[b->n_spans].hi = hi;
+    b->n_spans++;
+}
+
+void buf_spans_carry(buf *dst, buf *src, size_t offset) {
+    if (!dst || !src || !src->n_spans) { if (src) { free(src->spans); src->spans = NULL; src->n_spans = src->cap_spans = 0; } return; }
+    for (uint32_t i = 0; i < src->n_spans; i++) {
+        if (dst->n_spans == dst->cap_spans) {
+            const uint32_t cap = dst->cap_spans ? dst->cap_spans * 2u : 16u;
+            chat_text_span *grown = (chat_text_span *)server_xrealloc(dst->spans, (size_t)cap * sizeof *grown);
+            dst->spans = grown;
+            dst->cap_spans = cap;
+        }
+        dst->spans[dst->n_spans].lo = (uint32_t)offset + src->spans[i].lo;
+        dst->spans[dst->n_spans].hi = (uint32_t)offset + src->spans[i].hi;
+        dst->n_spans++;
+    }
+    free(src->spans);
+    src->spans = NULL;
+    src->n_spans = src->cap_spans = 0;
+}
+
+void buf_puts_spanned(buf *dst, const char *text, const pulsar_text_span *spans,
+                      uint32_t n_spans) {
+    if (!dst || !text) return;
+    const size_t at = dst->len;
+    buf_puts(dst, text);
+    const size_t appended = dst->len - at;
+    for (uint32_t i = 0; i < n_spans; i++) {
+        if (spans[i].lo >= appended) continue;      /* past the appended bytes */
+        const uint32_t hi = spans[i].hi > appended ? (uint32_t)appended : spans[i].hi;
+        if (hi <= spans[i].lo) continue;
+        if (dst->n_spans == dst->cap_spans) {
+            const uint32_t cap = dst->cap_spans ? dst->cap_spans * 2u : 16u;
+            chat_text_span *grown = (chat_text_span *)server_xrealloc(dst->spans, (size_t)cap * sizeof *grown);
+            dst->spans = grown;
+            dst->cap_spans = cap;
+        }
+        dst->spans[dst->n_spans].lo = (uint32_t)at + spans[i].lo;
+        dst->spans[dst->n_spans].hi = (uint32_t)at + hi;
+        dst->n_spans++;
+    }
+}
+
+/** Write client-supplied bytes as plain text: the range is recorded so the
+ * tokeniser will not match a special-token spelling inside it. */
+/// Write client bytes as one plain-text range.
+/// @param b  the prompt buffer
+/// @param s  the client bytes (NULL: nothing)
+/// @param n  bytes at `s` (0: nothing)
+static void buf_puts_content_n(buf *b, const char *s, size_t n) {
+    if (!s || !n) return;
+    buf_text_begin(b);
+    buf_append(b, s, n);
+    buf_text_end(b);
+}
+
+/// buf_puts_content_n over a NUL-terminated string.
+/// @param b  the prompt buffer
+/// @param s  the client text (NULL or empty: nothing)
+static void buf_puts_content(buf *b, const char *s) {
+    if (!s || !s[0]) return;
+    buf_puts_content_n(b, s, strlen(s));
+}
+
+/* Message content that may carry inline images.  The client's text keeps its
+ * client-text span (the L223 invariant: a spelling inside client text must not
+ * become a control token), but each placeholder the PARSER inserted -- the
+ * offsets in `m->image_ph_off`, one per image -- is emitted OUTSIDE the span so
+ * the tokeniser resolves exactly it to the image token.  This is the one place
+ * that distinction is made, and it is made from WHERE the placeholder came
+ * from, never from what the text looks like: a client who types the placeholder
+ * spelling has it inside its span and it stays ordinary text.
+ *
+ * The offsets were checked before the render (chat_msg_image_offsets_check, from
+ * deepseek_render: the request refuses by name); an offset list that fails the
+ * check here is a caller that skipped it, and dies loudly (L335: the old
+ * whole-content fallback never advanced its order check, so an out-of-order list
+ * passed and the copy's `off - pos` underflowed). */
+/// Write message content as client text with each parser-inserted image placeholder outside the range.
+/// @param b  the prompt buffer
+/// @param m  the message (its content, images_len and image_ph_off; chat_msg_image_offsets_check holds)
+static void buf_puts_content_images(buf *b, const chat_msg *m) {
+    const char *s = m->content;
+    const size_t len = s ? strlen(s) : 0;
+    const size_t ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
+    if (m->images_len <= 0) {
+        buf_puts_content(b, s);
+        return;
+    }
+    char err[160];
+    if (!chat_msg_image_offsets_check(m, err, sizeof(err))) {
+        fprintf(stderr, "pulsar-server: render: %s (the offsets were not checked before the render)\n", err);
+        pulsar_die("buf_puts_content_images: an unchecked image offset list");
+    }
+    size_t pos = 0;
+    for (int i = 0; i < m->images_len; i++) {
+        const size_t off = m->image_ph_off[i];
+        buf_puts_content_n(b, s + pos, off - pos);
+        buf_puts(b, PULSAR_IMAGE_PLACEHOLDER);
+        pos = off + ph;
+    }
+    buf_puts_content_n(b, s + pos, len - pos);
+}
+
+/// Append DeepSeek's tools prompt for the template variant, the schemas inside it as client text.
+/// @param b             the prompt buffer
+/// @param tool_schemas  the tool schema lines (NULL or empty: nothing appended)
+/// @param v41           V4.1's prompt (else V4's)
+static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
     if (!tool_schemas || !tool_schemas[0]) return;
+    const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
+    if (!v41) {
+        buf_puts(b,
+            "## Tools\n\n"
+            "You have access to a set of tools to help answer the user question. "
+            "You can invoke tools by writing a \"");
+        buf_puts(b, d->tool_calls_start);
+        buf_puts(b, "\" block like the following:\n\n");
+        buf_puts(b, d->tool_calls_start);
+        buf_puts(b, "\n");
+        buf_puts(b, d->invoke_start);
+        buf_puts(b, " name=\"$TOOL_NAME\">\n");
+        buf_puts(b, d->param_start);
+        buf_puts(b, " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE");
+        buf_puts(b, d->param_end);
+        buf_puts(b, "\n...\n");
+        buf_puts(b, d->invoke_end);
+        buf_puts(b, "\n");
+        buf_puts(b, d->invoke_start);
+        buf_puts(b, " name=\"$TOOL_NAME2\">\n...\n");
+        buf_puts(b, d->invoke_end);
+        buf_puts(b, "\n");
+        buf_puts(b, d->tool_calls_end);
+        buf_puts(b,
+            "\n\n"
+            "String parameters should be specified as raw text and set `string=\"true\"`. "
+            "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
+            "Only if a string value itself contains the exact closing parameter tag `");
+        buf_puts(b, d->param_end);
+        buf_puts(b, "`, write that tag as `&lt;/" PULSAR_DSML "parameter>` inside the value. "
+            "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+            "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+            "### Available Tool Schemas\n\n");
+        buf_puts_content(b, tool_schemas);
+        buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
+                    "Use the exact parameter names from the schemas.");
+        return;
+    }
     buf_puts(b,
         "## Tools\n\n"
-        "You have access to a set of tools to help answer the user question. "
-        "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
-        "<｜DSML｜tool_calls>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "You have access to a set of tools to help answer the user's question. "
+        "You can invoke tools by writing a \"" PULSAR_TOOL_CALLS_START "\" block like the following:\n\n"
+        PULSAR_TOOL_CALLS_START "\n"
+        PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
+        PULSAR_PARAM_START " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" PULSAR_PARAM_END "\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        PULSAR_INVOKE_END "\n"
+        PULSAR_INVOKE_START " name=\"$TOOL_NAME2\">\n"
         "...\n"
-        "</｜DSML｜invoke>\n"
-        "</｜DSML｜tool_calls>\n\n"
-        "String parameters should be specified as raw text and set `string=\"true\"`. "
-        "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
-        "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
+        PULSAR_INVOKE_END "\n"
+        PULSAR_TOOL_CALLS_END "\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. "
         "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
-        /* Do not ask the model to OPEN a <think> block the prompt already
-         * opened — that wording provoked a second reasoning pass after the
-         * first </think> (upstream ds4 fe2d3b0). NOTE: changes the rendered
-         * tools-prompt bytes — one-time full re-prefill of cached prefixes on
-         * first request after upgrade. */
-        "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
         "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
-    buf_puts(b, tool_schemas);
-    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
-                "Use the exact parameter names from the schemas.");
+    buf_puts_content(b, tool_schemas);
+    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
 }
 
 
 
-void json_escape(buf *b, const char *s);
 
 
 
+/// Free every key and value and the array; zeroes `args`.
+/// @param args  the parsed arguments
 static void json_args_free(json_args *args) {
     for (int i = 0; i < args->len; i++) {
         free(args->v[i].key);
@@ -51,6 +227,9 @@ static void json_args_free(json_args *args) {
 
 
 
+/// Append one argument (takes ownership of its key and value).
+/// @param args  the list
+/// @param arg   the argument
 static void json_args_push(json_args *args, json_arg arg) {
     if (args->len == args->cap) {
         args->cap = args->cap ? args->cap * 2 : 8;
@@ -61,6 +240,9 @@ static void json_args_push(json_args *args, json_arg arg) {
 
 
 
+/// @param args  the list
+/// @param key   the key to find (NULL: none)
+/// @return the index of the first not-yet-used argument named `key`, or -1
 static int json_args_find_unused(json_args *args, const char *key) {
     if (!key) return -1;
     for (int i = 0; i < args->len; i++) {
@@ -71,7 +253,13 @@ static int json_args_find_unused(json_args *args, const char *key) {
 
 
 
-static bool json_args_parse(const char *json, json_args *args) {
+/// Parse a JSON object's top-level members in order: strings decoded, other values re-serialized in the variant's
+/// spelling (V4.1: Python json.dumps; V4: minified).
+/// @param json  the object text (NULL: "")
+/// @param args  receives the members (freed and zeroed on failure)
+/// @param v41   V4.1's value spelling
+/// @return false when `json` is not one well-formed object
+static bool json_args_parse(const char *json, json_args *args, bool v41) {
     const char *p = json ? json : "";
     json_ws(&p);
     if (*p != '{') return false;
@@ -90,9 +278,13 @@ static bool json_args_parse(const char *json, json_args *args) {
             is_string = true;
             if (!json_string(&p, &value)) goto bad;
         } else {
+            /* V4.1's reference writes non-string values with Python's
+             * json.dumps (", " and ": " separators, repr() floats, non-ASCII
+             * raw); V4 uses the minified form its own tree rendered.  The bytes
+             * are what each model was trained on. */
             char *raw = NULL;
             if (!json_raw_value(&p, &raw)) goto bad;
-            value = json_minify_raw_value(raw);
+            value = v41 ? json_python_dumps_raw_value(raw) : json_minify_raw_value(raw);
             free(raw);
         }
 
@@ -119,20 +311,24 @@ bad:
 
 
 
+/* Attribute values (tool and parameter names) carry the ONE entity encoding
+ * the parser reverses (pulsar_dsml_unescape via pulsar_dsml_attr). */
+/// Append an attribute value with the DSML entity encoding.
+/// @param b  the prompt buffer
+/// @param s  the attribute value
 static void append_dsml_attr_escaped(buf *b, const char *s) {
-    for (s = s ? s : ""; *s; s++) {
-        if (*s == '&') buf_puts(b, "&amp;");
-        else if (*s == '<') buf_puts(b, "&lt;");
-        else if (*s == '>') buf_puts(b, "&gt;");
-        else if (*s == '"') buf_puts(b, "&quot;");
-        else buf_putc(b, *s);
-    }
+    char *escaped = pulsar_dsml_escape_attr(s);
+    buf_puts(b, escaped);
+    free(escaped);
 }
 
 
 
+/// Append a string parameter's text, its "<" escaped as "&lt;" wherever the parameter close tag would start.
+/// @param b  the prompt buffer
+/// @param s  the text (NULL: "")
 static void append_dsml_parameter_text(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+    const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -146,28 +342,31 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
 
 
 
+/// pulsar_tool_result_escape's sink: append to the buf in `ud`.
+/// @param ud     the buf
+/// @param bytes  the escaped bytes
+/// @param n      bytes at `bytes`
+static void tool_result_buf_emit(void *ud, const char *bytes, size_t n) {
+    buf_append((buf *)ud, bytes, n);
+}
+
+/// Append a tool result's text with the engine's escape rule (pulsar_tool_result_escape).
+/// @param b  the prompt buffer
+/// @param s  the result text
 void append_tool_result_text(buf *b, const char *s) {
-    /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
-     * <tool_result>...</tool_result>, so preserving literal '<', '>' and '&' is
-     * important for read-file tools and shell output.  The only delimiter we must
-     * protect is the wrapper's own closing tag; otherwise a file containing that
-     * exact sentinel would terminate the result early. */
-    const char *end = "</tool_result>";
-    const size_t endlen = strlen(end);
-    for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
-            s++;
-        } else {
-            buf_putc(b, *s++);
-        }
-    }
+    /* The escape RULE is the engine's (pulsar_tool_result_escape, L185) so the
+     * server's renderer and the engine's token-level twin cannot drift; this
+     * only decides where the bytes go. */
+    pulsar_tool_result_escape(s, tool_result_buf_emit, b);
 }
 
 
 
+/// Append a non-string parameter's JSON, its "<" written as \\u003c wherever the parameter close tag would start.
+/// @param b  the prompt buffer
+/// @param s  the JSON text (NULL: "")
 static void append_dsml_json_literal(buf *b, const char *s) {
-    const char *end = "</｜DSML｜parameter>";
+    const char *end = PULSAR_PARAM_END;
     const size_t endlen = strlen(end);
     for (s = s ? s : ""; *s;) {
         if (!strncmp(s, end, endlen)) {
@@ -181,22 +380,54 @@ static void append_dsml_json_literal(buf *b, const char *s) {
 
 
 
+/// Append one DSML parameter element; its name and value are client text.
+/// @param b    the prompt buffer
+/// @param arg  the argument
 static void append_dsml_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<｜DSML｜parameter name=\"");
+    buf_puts(b, PULSAR_PARAM_START " name=\"");
+    buf_text_begin(b);
     append_dsml_attr_escaped(b, arg->key);
+    buf_text_end(b);
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
+    buf_text_begin(b);
     if (arg->is_string) append_dsml_parameter_text(b, arg->value);
     else append_dsml_json_literal(b, arg->value);
-    buf_puts(b, "</｜DSML｜parameter>\n");
+    buf_text_end(b);
+    buf_puts(b, PULSAR_PARAM_END "\n");
 }
 
 
 
-bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
+/// Append a call's arguments as DSML parameters: the schema's property order first, then the rest as sent.
+/// @param b      the prompt buffer
+/// @param json   the arguments object (V4.1 also accepts it double-encoded)
+/// @param order  the tool's schema order (NULL: as sent)
+/// @param v41    the template variant
+/// @return false when the arguments do not parse (nothing appended)
+bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order, bool v41) {
     json_args args = {0};
-    if (!json_args_parse(json, &args)) return false;
+    if (!json_args_parse(json, &args, v41)) {
+        /* V4.1: encoding.py encode_arguments_to_dsml tolerates a DOUBLE-encoded
+         * arguments field (a JSON string whose content is the object) by
+         * decoding twice; clients that stringify twice are common enough that
+         * the reference renders them as parameters.  V4's renderer had no such
+         * arm (and V4's minified encoding is what its clients matched), so a
+         * request that only parses double-encoded falls back to one text
+         * parameter there, exactly as dev did. */
+        if (!v41) return false;
+        const char *p = json ? json : "";
+        json_ws(&p);
+        char *inner = NULL;
+        bool ok = false;
+        if (*p == '"' && json_string(&p, &inner)) {
+            json_ws(&p);
+            ok = *p == '\0' && json_args_parse(inner, &args, v41);
+        }
+        free(inner);
+        if (!ok) return false;
+    }
     if (order) {
         for (int i = 0; i < order->len; i++) {
             int idx = json_args_find_unused(&args, order->prop[i]);
@@ -215,18 +446,28 @@ bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema
 
 
 
+/// Append one "key":value member as client text.
+/// @param b    the buffer
+/// @param arg  the argument
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
+    buf_text_begin(b);
     json_escape(b, arg->key);
+    buf_text_end(b);
     buf_puts(b, ":");
+    buf_text_begin(b);
     if (arg->is_string) json_escape(b, arg->value);
     else buf_puts(b, arg->value);
+    buf_text_end(b);
 }
 
 
 
+/// Append the arguments as a JSON object re-serialized from its parsed members, or {} when they do not parse.
+/// @param b     the buffer
+/// @param json  the arguments text
 void append_json_object_or_empty(buf *b, const char *json) {
     json_args args = {0};
-    if (!json_args_parse(json, &args)) {
+    if (!json_args_parse(json, &args, true)) {
         buf_puts(b, "{}");
         return;
     }
@@ -243,42 +484,66 @@ void append_json_object_or_empty(buf *b, const char *json) {
 
 
 
-void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
+/// Append an assistant turn's tool calls as a DSML block: the sampled bytes when the calls carry them, else
+/// rendered from the calls in the variant's canonical spelling.
+/// @param b      the prompt buffer
+/// @param calls  the calls (NULL or empty: nothing)
+/// @param v41    the template variant
+void append_dsml_tool_calls_text(buf *b, const tool_calls *calls, bool v41) {
+    const pulsar_dsml_syntax *d = pulsar_dsml_canonical(v41);
     if (!calls || calls->len == 0) return;
-    if (calls->raw_dsml && calls->raw_dsml[0]) {
-        buf_puts(b, calls->raw_dsml);
+    if (calls->raw_calls && calls->raw_calls[0]) {
+        buf_puts(b, calls->raw_calls);
         return;
     }
-    buf_puts(b, "\n\n<｜DSML｜tool_calls>\n");
+    /* The renderer writes the LOADED FAMILY's spelling (pulsar_dsml_canonical). */
+    buf_puts(b, "\n\n");
+    buf_puts(b, d->tool_calls_start);
+    buf_puts(b, "\n");
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        buf_puts(b, "<｜DSML｜invoke name=\"");
+        buf_puts(b, d->invoke_start);
+        buf_puts(b, " name=\"");
         append_dsml_attr_escaped(b, tc->name);
         buf_puts(b, "\">\n");
-        if (!append_dsml_arguments_from_json(b, tc->arguments, NULL)) {
-            buf_puts(b, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+        const size_t before_args = b->len;
+        if (!append_dsml_arguments_from_json(b, tc->arguments, NULL, v41)) {
+            buf_puts(b, d->param_start);
+            buf_puts(b, " name=\"arguments\" string=\"true\">");
             append_dsml_parameter_text(b, tc->arguments);
-            buf_puts(b, "</｜DSML｜parameter>\n");
+            buf_puts(b, d->param_end);
+            buf_puts(b, "\n");
         }
-        buf_puts(b, "</｜DSML｜invoke>\n");
+        /* V4.1's reference: name line, "\n".join(parameters), "\n", close -- so
+         * an invoke with no parameters carries one blank line. */
+        if (v41 && b->len == before_args) buf_puts(b, "\n");
+        buf_puts(b, d->invoke_end);
+        buf_puts(b, "\n");
     }
-    buf_puts(b, "</｜DSML｜tool_calls>");
+    buf_puts(b, d->tool_calls_end);
 }
 
 
 
+/// @param role  a message role
+/// @return true for "system" and "developer"
 static bool role_is_system(const char *role) {
     return !strcmp(role, "system") || !strcmp(role, "developer");
 }
 
 
 
+/// @param role  a message role
+/// @return true for "user", "tool" and "function"
 static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
 
 
+/// @param msgs          the conversation (may be NULL)
+/// @param tool_schemas  the tool schema lines (non-empty: true)
+/// @return true when tools are declared or the history holds an assistant call or a tool result
 bool chat_history_uses_tool_context(const chat_msgs *msgs,
                                            const char *tool_schemas) {
     if (tool_schemas && tool_schemas[0]) return true;
@@ -294,118 +559,265 @@ bool chat_history_uses_tool_context(const chat_msgs *msgs,
 }
 
 
-/* Does this client REPLAY prior reasoning on the next turn?  This governs the
- * thinking checkpoint (should_remember_thinking_checkpoint): a reasoning-
- * preserving client (opencode et al.) echoes reasoning_content so its replay
- * byte-matches the live KV directly and no stripped checkpoint is wanted; a
- * reasoning-stripping client (openwebui) drops it, so the durable key must be
- * the reasoning-STRIPPED transcript.
- *
- * The old code keyed this off chat_history_uses_tool_context — i.e. "tools are
- * advertised" — on the assumption that tool-advertising clients are agentic and
- * preserve reasoning.  openwebui breaks that: it advertises a tool list AND
- * strips reasoning, so every thinking turn was stored token-text-with-reasoning
- * and its stripped replay cold-re-prefilled the whole conversation.
- *
- * The ground truth is observable: if any prior assistant turn carries non-empty
- * reasoning the client preserves; if we have seen assistant turns and NONE do,
- * it strips.  Only with no assistant history yet can we not tell — there we fall
- * back to the tool-context heuristic (unchanged first-turn behavior; the signal
- * self-corrects from the second turn on, where the deep re-prefills hurt). */
-bool chat_history_preserves_reasoning(const chat_msgs *msgs,
-                                             const char *tool_schemas) {
-    bool saw_assistant = false;
+/// Set up a render's state: the variant's DSML spelling, thinking, tool context and the last user-side turn
+/// (which governs reasoning replay).
+/// @param r                 the render state, zeroed
+/// @param msgs              the conversation
+/// @param tools_advertised  the request declares tools
+/// @param think_mode        the resolved think mode
+/// @param v41               the template variant
+void chat_render_init(chat_render *r, const chat_msgs *msgs, bool tools_advertised,
+                      pulsar_think_mode think_mode, bool v41) {
+    memset(r, 0, sizeof *r);
+    r->v41 = v41;
+    r->dsml = pulsar_dsml_canonical(v41);
+    r->think = pulsar_think_mode_enabled(think_mode);
+    r->tool_context = tools_advertised || chat_history_uses_tool_context(msgs, NULL);
+    r->last_user_idx = -1;
+    /* V4.1: a mid-conversation system message counts as a user turn for the
+     * "last user" that governs reasoning replay (encoding.py
+     * find_last_user_index: role system at index > 0).  The LEADING run of
+     * system messages is the system region, not a turn.  V4's renderer counted
+     * user-side roles only. */
+    int leading_end = 0;
+    while (msgs && leading_end < msgs->len &&
+           role_is_system(msgs->v[leading_end].role) &&
+           !msgs->v[leading_end].system_field)
+        leading_end++;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (strcmp(m->role, "assistant")) continue;
-        saw_assistant = true;
-        if (m->reasoning && m->reasoning[0]) return true;
+        if (role_is_user_like(m->role)) r->last_user_idx = i;
+        else if (v41 && role_is_system(m->role) && !m->system_field && i >= leading_end)
+            r->last_user_idx = i;
     }
-    if (saw_assistant) return false;
-    return chat_history_uses_tool_context(msgs, tool_schemas);
 }
 
 
 
-char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     pulsar_think_mode think_mode) {
-    (void)tool_orders;
-    const bool think = pulsar_think_mode_enabled(think_mode);
-    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
-    int last_user_idx = -1;
-    buf system = {0};
-    /* Render tool schemas before the client system content so
-     * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
-     * message instead of the much larger tool-schema region. */
-    if (tool_schemas && tool_schemas[0]) {
-        append_tools_prompt_text(&system, tool_schemas);
+void append_assistant_open(buf *out, bool think) {
+    buf_puts(out, PULSAR_RENDER_ASSISTANT);
+    buf_puts(out, think ? "<think>" : "</think>");
+}
+
+
+
+/// Append an assistant turn's body: reasoning, the think close, content (client text) and the calls.
+/// @param out          the prompt buffer
+/// @param close_think  write the reasoning close after the reasoning
+/// @param reasoning    the replayed reasoning (NULL: none)
+/// @param content      the content
+/// @param calls        the turn's calls (may be NULL)
+/// @param v41          the template variant
+static void append_assistant_turn_body(buf *out, bool close_think, const char *reasoning,
+                                       const char *content, const tool_calls *calls, bool v41) {
+    if (reasoning) buf_puts_content(out, reasoning);
+    if (close_think) buf_puts(out, "</think>");
+    buf_puts_content(out, content);
+    append_dsml_tool_calls_text(out, calls, v41);
+}
+
+void append_assistant_turn_close(buf *out, bool close_think, const char *reasoning,
+                                 const char *content, const tool_calls *calls, bool v41) {
+    append_assistant_turn_body(out, close_think, reasoning, content, calls, v41);
+    buf_puts(out, PULSAR_RENDER_EOS);
+}
+
+void append_assistant_turn_sampled(buf *out, bool close_think, const char *reasoning,
+                                   const char *content, const tool_calls *calls, bool v41) {
+    append_assistant_turn_body(out, close_think, reasoning, content, calls, v41);
+    /* L196: a tool-call turn stops at the closing tool_calls tag (saw_tool_end)
+     * before the model samples an EOS, so the live KV ends there and the tail
+     * (render_live_tool_tail) renders the EOS the replay places next.  A key
+     * that carried the EOS anyway made every consumer tokenise the bytes AFTER
+     * it, so the EOS never entered the bank and the live history byte-diverged
+     * from every later render at that point.  A stop turn sampled its EOS. */
+    if (!(calls && calls->len > 0)) buf_puts(out, PULSAR_RENDER_EOS);
+}
+
+
+
+void append_chat_msg(buf *out, const chat_msgs *msgs, int i, chat_render *r) {
+    const chat_msg *m = &msgs->v[i];
+    if (role_is_system(m->role)) {
+        /* Mid-conversation system message.  V4.1 renders it in place behind the
+         * System token, and it counts as a user turn for the assistant header
+         * that follows (encoding.py find_last_user_index).  V4 wrapped it in a
+         * <system-reminder> note inside a user turn -- the token did not exist
+         * as a template feature for 0731, which is the same fact as
+         * pulsar_shape::chat_system_marker on the engine's side.  Both render in
+         * place, which keeps the rendered prefix append-only across turns
+         * (L113). */
+        if (r->v41) {
+            buf_puts(out, PULSAR_RENDER_SYSTEM);
+        } else {
+            buf_puts(out, PULSAR_RENDER_USER "<system-reminder>\n");
+        }
+        buf_puts_content_images(out, m);
+        if (!r->v41) buf_puts(out, "\n</system-reminder>");
+        r->pending_assistant = true;
+        r->user_turn_open = false;
+        r->pending_tool_result = false;
+    } else if (!strcmp(m->role, "user")) {
+        /* V4.1 (encoding.py merge_tool_messages): consecutive user-side messages
+         * (user text, tool results, in any order) are ONE <｜User｜> turn whose
+         * parts are joined by "\n\n".  V4 opened a fresh turn marker for each
+         * user message and for the first tool result after one. */
+        const bool join = r->v41 ? r->user_turn_open : false;
+        buf_puts(out, join ? "\n\n" : PULSAR_RENDER_USER);
+        buf_puts_content_images(out, m);
+        r->pending_assistant = true;
+        r->user_turn_open = true;
+        r->pending_tool_result = false;
+    } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+        const bool join = r->v41 ? r->user_turn_open : r->pending_tool_result;
+        buf_puts(out, join ? "\n\n" : PULSAR_RENDER_USER);
+        buf_puts(out, "<tool_result>");
+        buf_text_begin(out);
+        append_tool_result_text(out, m->content);
+        buf_text_end(out);
+        buf_puts(out, "</tool_result>");
+        r->pending_assistant = true;
+        r->pending_tool_result = true;
+        r->user_turn_open = true;
+    } else if (!strcmp(m->role, "assistant")) {
+        if (r->pending_assistant) {
+            /* Reasoning replays on every turn under tool context (agentic
+             * clients echo reasoning_content so the model keeps its chain of
+             * thought across tool rounds) and otherwise only on turns after
+             * the last user-side message; a stripped turn renders an empty
+             * think block closed, "</think>", with no opener.  The checkpoint
+             * keys (generate.cpp build_*_suffix) are built from the same two
+             * primitives, so they byte-match this by construction. */
+            const bool replay = r->think && (r->tool_context || i > r->last_user_idx);
+            if (replay) append_assistant_open(out, true);
+            else buf_puts(out, PULSAR_RENDER_ASSISTANT);
+            append_assistant_turn_close(out, true, replay ? (m->reasoning ? m->reasoning : "") : NULL,
+                                        m->content, &m->calls, r->v41);
+        } else {
+            /* A second assistant message in a row: no header (the previous
+             * turn's EOS stands).  V4.1 renders its thinking part by the same
+             * rule as any assistant turn -- reasoning + </think> when replaying,
+             * nothing otherwise (encoding.py render_message); V4 rendered no
+             * reasoning there at all. */
+            const bool replay = r->v41 && r->think &&
+                                (r->tool_context || i > r->last_user_idx);
+            append_assistant_turn_close(out, replay, replay ? (m->reasoning ? m->reasoning : "") : NULL,
+                                        m->content, &m->calls, r->v41);
+        }
+        r->pending_assistant = false;
+        r->user_turn_open = false;
+        r->pending_tool_result = false;
     }
+}
+
+
+
+void chat_render_finish(buf *out, const chat_render *r) {
+    if (r->pending_assistant) append_assistant_open(out, r->think);
+}
+
+
+
+/* L223: the renderer ALSO hands back the byte ranges of the rendered text that
+ * came from client data, so the tokeniser can treat them as plain text.  The
+ * TEXT is byte-identical to what this function always produced -- the spans are a
+ * side channel, not a change to the prompt -- which is what keeps the renderer
+ * gate, the KV keys and every persisted session valid. */
+char *render_chat_prompt_text_spans(const chat_msgs *msgs, const char *tool_schemas,
+                                    pulsar_think_mode think_mode, bool v41,
+                                    chat_text_span **spans_out, uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
+    chat_render r;
+    chat_render_init(&r, msgs, tool_schemas && tool_schemas[0], think_mode, v41);
+    buf system = {0};
+    /* L113: only the LEADING run of system messages (plus the top-level
+     * system/instructions FIELD, wherever the parser appended it) joins the
+     * system region. Mid-conversation system-role messages render IN PLACE
+     * in the history below. Consolidating them here is what broke replay
+     * prefix stability: agent clients append a new system-role nudge per
+     * turn at the array tail, and moving it into the region shifted every
+     * rendered byte after ~the scaffolding, capping warm-forks at the
+     * system prompt (root-caused 2026-08-25 from route-debug token ids). */
+    int leading_end = 0;
+    while (leading_end < msgs->len &&
+           role_is_system(msgs->v[leading_end].role) &&
+           !msgs->v[leading_end].system_field)
+        leading_end++;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
+        if (!m->system_field && i >= leading_end) continue;  /* renders in place */
         if (system.len) buf_puts(&system, "\n\n");
-        buf_puts(&system, m->content ? m->content : "");
+        buf_puts_content(&system, m->content);
     }
-    for (int i = 0; i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
+    /* V4.1 renders the tool schemas AFTER the system content (system + "\n\n" +
+     * render_tools); V4 renders them BEFORE it, which is the order its own
+     * boundary-trim expects.  Same bytes either way? No -- this is a real
+     * difference in the prompt (L218 s123). */
+    if (tool_schemas && tool_schemas[0]) {
+        if (v41) {
+            if (system.len) buf_puts(&system, "\n\n");
+            append_tools_prompt_text(&system, tool_schemas, true);
+        } else {
+            buf tools_first = {0};
+            append_tools_prompt_text(&tools_first, tool_schemas, false);
+            if (system.len) buf_puts(&tools_first, "\n\n");
+            /* V4 renders the schemas FIRST; the system content moves behind
+             * them, so its ranges shift by the tools text's length. */
+            buf_spans_carry(&tools_first, &system, tools_first.len);
+            buf_append(&tools_first, system.ptr, system.len);
+            buf_free(&system);
+            system = tools_first;
+        }
     }
 
     buf out = {0};
     buf_puts(&out, PULSAR_SERVER_RENDER_BOS);
-    buf_puts(&out, pulsar_think_effort_prefix(think_mode));
+    /* V4.1 lead-in (encoding.py render_message, index 0): the System token
+     * when the conversation opens with the effort line (thinking on) or with
+     * system text, then the effort line, then the system region. */
+    const char *effort = pulsar_think_effort_prefix_family(think_mode, v41);
+    /* V4.1 marks the lead-in system region with the System token
+     * (pulsar_shape::chat_system_marker on the engine's side, which is the same
+     * fact); V4 does not -- writing it costs V4 exactly one prompt token, enough
+     * to change the answer. */
+    if (v41 && (effort[0] || system.len)) buf_puts(&out, PULSAR_RENDER_SYSTEM);
+    buf_puts(&out, effort);
+    /* The system region's client ranges land after everything written so far. */
+    buf_spans_carry(&out, &system, out.len);
     buf_puts(&out, system.ptr ? system.ptr : "");
 
-    bool pending_assistant = false;
-    bool pending_tool_result = false;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            continue;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
-            pending_assistant = true;
-            pending_tool_result = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    if (tool_context || i > last_user_idx) {
-                        buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
-                        buf_puts(&out, "</think>");
-                    } else {
-                        buf_puts(&out, "</think>");
-                    }
-                } else {
-                    buf_puts(&out, "</think>");
-                }
-            }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
-            pending_assistant = false;
-            pending_tool_result = false;
-        }
+        if (role_is_system(m->role) && (m->system_field || i < leading_end)) continue;  /* in the region */
+        append_chat_msg(&out, msgs, i, &r);
     }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
-    }
+    chat_render_finish(&out, &r);
 
     buf_free(&system);
+    if (spans_out) {                    /* hand the ranges out; buf_take drops them */
+        *spans_out = out.spans;
+        *n_spans_out = out.n_spans;
+        out.spans = NULL;
+        out.n_spans = out.cap_spans = 0;
+    }
     return buf_take(&out);
 }
+
+/// render_chat_prompt_text_spans without the client-text ranges.
+/// @param msgs         the conversation
+/// @param tool_schemas the tool schema lines (may be NULL)
+/// @param think_mode   the resolved think mode
+/// @param v41          the template variant
+/// @return the prompt text (malloc'd)
+char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                              pulsar_think_mode think_mode, bool v41) {
+    return render_chat_prompt_text_spans(msgs, tool_schemas, think_mode, v41, NULL, NULL);
+}
+
+
+
 
 
 
@@ -424,69 +836,46 @@ char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
  * This is intentionally independent from req.prompt's already-tokenized suffix:
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
- * replay/live-KV boundary. */
-static char *render_live_tool_tail(const chat_msgs *msgs, int start,
-                                   pulsar_think_mode think_mode) {
-    const bool think = pulsar_think_mode_enabled(think_mode);
+ * replay/live-KV boundary.  The bytes are the full render's bytes for the same
+ * messages (append_chat_msg), so the live KV and the next replay agree. */
+char *render_live_tool_tail_spans(const chat_msgs *msgs, int start, bool tools_advertised,
+                                  pulsar_think_mode think_mode, bool v41,
+                                  chat_text_span **spans_out, uint32_t *n_spans_out) {
+    if (spans_out) *spans_out = NULL;
+    if (n_spans_out) *n_spans_out = 0;
+    chat_render r;
+    chat_render_init(&r, msgs, tools_advertised, think_mode, v41);
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
-
-    bool pending_assistant = false;
-    bool pending_tool_result = false;
+    buf_puts(&out, PULSAR_RENDER_EOS);
     for (int i = start; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            continue;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-            pending_tool_result = false;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
-            buf_puts(&out, "</tool_result>");
-            pending_assistant = true;
-            pending_tool_result = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            if (pending_assistant) {
-                buf_puts(&out, "<｜Assistant｜>");
-                if (think) {
-                    buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
-                    buf_puts(&out, "</think>");
-                } else {
-                    buf_puts(&out, "</think>");
-                }
-            }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
-            buf_puts(&out, "<｜end▁of▁sentence｜>");
-            pending_assistant = false;
-            pending_tool_result = false;
-        }
+        /* L113: a system message arriving mid tool-loop renders in place,
+         * exactly as the full-replay render will place it next turn --
+         * dropping it here (the old behavior) both hid it from the model
+         * and made the live KV mismatch the following replay. The
+         * system FIELD never belongs in a continuation tail. */
+        if (role_is_system(msgs->v[i].role) && msgs->v[i].system_field) continue;
+        append_chat_msg(&out, msgs, i, &r);
     }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<｜Assistant｜>");
-        buf_puts(&out, think ? "<think>" : "</think>");
+    chat_render_finish(&out, &r);
+    if (spans_out) {                    /* hand the ranges out; buf_take drops them */
+        *spans_out = out.spans;
+        *n_spans_out = out.n_spans;
+        out.spans = NULL;
+        out.n_spans = out.cap_spans = 0;
     }
     return buf_take(&out);
 }
 
-
-
-static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
-    if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
-    for (int i = 0; i < m->calls.len; i++) {
-        if (m->calls.v[i].id && !strcmp(m->calls.v[i].id, id)) return true;
-    }
-    return false;
+char *render_live_tool_tail(const chat_msgs *msgs, int start, bool tools_advertised,
+                            pulsar_think_mode think_mode, bool v41) {
+    return render_live_tool_tail_spans(msgs, start, tools_advertised, think_mode, v41, NULL, NULL);
 }
 
 
 
+/// Collect a message's tool-result ids (tool_call_id and tool_call_ids), deduplicated.
+/// @param m    the message (NULL: nothing)
+/// @param ids  the list appended to (NULL: nothing)
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
@@ -497,15 +886,33 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
 
 
 
-static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
-                                                     int before,
-                                                     const char *id) {
-    if (!msgs || !id || !id[0]) return NULL;
-    if (before > msgs->len) before = msgs->len;
-    for (int i = before - 1; i >= 0; i--) {
-        if (chat_msg_has_call_id(&msgs->v[i], id)) return &msgs->v[i];
+/* call_id -> the nearest PRECEDING assistant message declaring it, built as
+ * the validators scan forward (upstream ds4 a169cffa): only assistant
+ * messages declare call ids (their calls[]), so registering each as it is
+ * passed and looking up at the tool message reproduces the nearest-preceding
+ * answer without a per-id backward rescan over an uncapped, client-supplied
+ * array (was O(n^2) per request). */
+/// call id -> the nearest preceding assistant message that declared it.
+typedef std::unordered_map<std::string, const chat_msg *> prior_call_map;
+
+/// Register an assistant message's call ids (later messages overwrite earlier ones).
+/// @param map  the map
+/// @param m    the message (not an assistant: nothing)
+static void prior_call_map_add(prior_call_map *map, const chat_msg *m) {
+    if (strcmp(m->role, "assistant")) return;
+    for (int k = 0; k < m->calls.len; k++) {
+        const char *cid = m->calls.v[k].id;
+        if (cid && cid[0]) (*map)[cid] = m;
     }
-    return NULL;
+}
+
+/// @param map  the map
+/// @param id   the call id (NULL or empty: none)
+/// @return the declaring assistant message, or NULL
+static const chat_msg *prior_call_map_find(const prior_call_map *map, const char *id) {
+    if (!id || !id[0]) return NULL;
+    auto it = map->find(id);
+    return it == map->end() ? NULL : it->second;
 }
 
 
@@ -535,8 +942,10 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (requires_live_reasoning) *requires_live_reasoning = false;
     const bool needs_reasoning = pulsar_think_mode_enabled(think_mode);
+    prior_call_map prior_calls;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        prior_call_map_add(&prior_calls, m);
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) continue;
 
         stop_list ids = {0};
@@ -544,7 +953,7 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = s->responses_live_has_call_id(id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            const chat_msg *prior = prior_call_map_find(&prior_calls, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Responses continuation state is not available for call_id %s; retry by replaying the full input history",
@@ -575,6 +984,9 @@ bool server::responses_validate_tool_outputs(const chat_msgs *msgs,
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
+/// Record a Responses request's live-continuation evidence: the trailing tool outputs' call ids and the family's tool-result tail.
+/// @param r     the request (a Responses one with a family; its responses_live_* fields are set)
+/// @param msgs  the parsed conversation
 void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
@@ -603,16 +1015,97 @@ void responses_prepare_live_continuation(request *r,
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
-    r->responses_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+    free(r->responses_live_suffix_spans);
+    r->responses_live_suffix_spans = NULL;
+    r->responses_live_suffix_n_spans = 0;
+    /* the family's tail (L272 P3: NULL = no live continuation on this family; the render refuses a
+     * request that needs one) */
+    r->responses_live_suffix_text = r->family->tool_result_tail
+        ? r->family->tool_result_tail(r, msgs, tail_start, &r->responses_live_suffix_spans,
+                                      &r->responses_live_suffix_n_spans)
+        : NULL;
 }
 
 
 
+/* An Anthropic tool result: a "tool" part as read (chat_msg::anthropic_continues), or after
+ * anthropic_fold_tool_results the user turn it was folded into. */
+/// Whether a message is an Anthropic tool result.
+/// @param m  the message (NULL: false)
+/// @return true for a user or tool message that answers a tool_use id
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
-    return m && !strcmp(m->role, "user") &&
+    return m && (!strcmp(m->role, "user") || !strcmp(m->role, "tool")) &&
            ((m->tool_call_id && m->tool_call_id[0]) ||
             m->tool_call_ids_len > 0);
+}
+
+
+
+/* DeepSeek's template keeps an Anthropic message's tool results inside the user turn they arrived in:
+ * each one is <tool_result>escaped text</tool_result> at its block's position among the message's own
+ * text, an image placeholder unescaped where its block was, and the turn answers every result's id.
+ * The parser reads the message into parts (chat_msg::anthropic_continues); this folds each message's
+ * parts back into that one turn, in place. */
+void anthropic_fold_tool_results(chat_msgs *msgs) {
+    chat_msgs out = {0};
+    for (int i = 0; i < msgs->len;) {
+        int end = i + 1;
+        while (end < msgs->len && msgs->v[end].anthropic_continues) end++;
+        if (end == i + 1 && strcmp(msgs->v[i].role, "tool")) {
+            chat_msgs_push(&out, msgs->v[i]);
+            memset(&msgs->v[i], 0, sizeof(msgs->v[i]));
+            i = end;
+            continue;
+        }
+        chat_msg f = {0};
+        buf content = {0};
+        for (int k = i; k < end; k++) {
+            chat_msg *m = &msgs->v[k];
+            const bool result = !strcmp(m->role, "tool");
+            if (!f.role && !result) f.role = server_xstrdup(m->role);
+            const char *c = m->content ? m->content : "";
+            if (result) {
+                chat_msg_add_tool_call_id(&f, m->tool_call_id);
+                buf_puts(&content, "<tool_result>");
+            }
+            /* the part's text, escaped when it is a result's, around its images' placeholders */
+            size_t at = 0;
+            for (int im = 0; im <= m->images_len; im++) {
+                const size_t ph = im < m->images_len ? m->image_ph_off[im] : strlen(c);
+                char *run = server_xstrndup(c + at, ph - at);
+                if (result) append_tool_result_text(&content, run);
+                else buf_puts(&content, run);
+                free(run);
+                if (im == m->images_len) break;
+                chat_msg_add_image(&f, m->images[im].bytes, m->images[im].len, content.len);
+                m->images[im].bytes = NULL;
+                buf_puts(&content, PULSAR_IMAGE_PLACEHOLDER);
+                at = ph + strlen(PULSAR_IMAGE_PLACEHOLDER);
+            }
+            if (result) buf_puts(&content, "</tool_result>");
+            for (int t = 0; t < m->calls.len; t++) {
+                tool_call tc = m->calls.v[t];
+                tool_calls_push(&f.calls, tc);
+            }
+            f.calls.inputs_cleared = f.calls.inputs_cleared || m->calls.inputs_cleared;   /* L337 */
+            free(m->calls.v);
+            memset(&m->calls, 0, sizeof(m->calls));
+            if (m->reasoning) {
+                buf r = {0};
+                buf_puts(&r, f.reasoning ? f.reasoning : "");
+                buf_puts(&r, m->reasoning);
+                free(f.reasoning);
+                f.reasoning = buf_take(&r);
+            }
+        }
+        if (!f.role) f.role = server_xstrdup("user");
+        f.content = buf_take(&content);
+        if (!f.content) f.content = server_xstrdup("");
+        chat_msgs_push(&out, f);
+        i = end;
+    }
+    chat_msgs_free(msgs);
+    *msgs = out;
 }
 
 
@@ -632,8 +1125,10 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
     auto *s = this;
     if (requires_live_tool_state) *requires_live_tool_state = false;
     if (!msgs) return true;
+    prior_call_map prior_calls;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        prior_call_map_add(&prior_calls, m);
         if (!anthropic_msg_is_tool_result_tail(m)) continue;
 
         stop_list ids = {0};
@@ -641,7 +1136,7 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
         for (int j = 0; j < ids.len; j++) {
             const char *id = ids.v[j];
             const bool live_known = s->anthropic_live_has_call_id(id);
-            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            const chat_msg *prior = prior_call_map_find(&prior_calls, id);
             if (!live_known && !prior) {
                 snprintf(err, errlen,
                          "Anthropic continuation state is not available for tool_use_id %s; retry by replaying the full messages history",
@@ -667,6 +1162,9 @@ bool server::anthropic_validate_tool_results(const chat_msgs *msgs,
  * model sampled.  If the incoming tool_result IDs match the live sampled
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
+/// Record an Anthropic request's live-continuation evidence: the trailing tool results' ids and the family's tool-result tail.
+/// @param r     the request (an Anthropic one with a family; its anthropic_live_* fields are set)
+/// @param msgs  the parsed conversation
 void anthropic_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
@@ -688,7 +1186,12 @@ void anthropic_prepare_live_continuation(request *r,
     if (r->anthropic_live_call_ids.len == 0) return;
 
     free(r->anthropic_live_suffix_text);
-    r->anthropic_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+    free(r->anthropic_live_suffix_spans);
+    r->anthropic_live_suffix_spans = NULL;
+    r->anthropic_live_suffix_n_spans = 0;
+    r->anthropic_live_suffix_text = r->family->tool_result_tail
+        ? r->family->tool_result_tail(r, msgs, tail_start, &r->anthropic_live_suffix_spans,
+                                      &r->anthropic_live_suffix_n_spans)
+        : NULL;
 }
 

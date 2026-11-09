@@ -1,0 +1,40 @@
+# CUTLASS pin.  Header-only dependency: the build wants only
+#   -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
+#
+# This was a git SUBMODULE until 2026-08-23 and it cost more than it bought.
+# Nothing used it AS a submodule -- `git worktree add` never populates one, and
+# the GB10 shared a single clone via a SYMLINK at the submodule path, which git
+# refuses to tolerate: every `git checkout` either failed with
+#   error: expected submodule path 'cutlass' not to be a symbolic link
+# or silently replaced the symlink with an empty directory.  On 2026-08-23 that
+# made three consecutive gate runs test a STALE TREE while reporting 18/18, and
+# put an ungated broken commit on dev.  Git no longer manages this path, so a
+# checkout cannot fight the filesystem over it.
+#
+# This follows the precedent already set by src/cuda/mmq/VENDOR.md, which made
+# the same call for the llama.cpp MMQ kernels: an external build dependency
+# should not be something git has to manage.
+#
+# The Makefile checks the headers exist before compiling the CUTLASS TU and
+# WARNS if the clone's HEAD != this sha (that check found the dev box and
+# the GB10 on different revisions the day it was written).
+#
+# 2026-11-05: v4.8.1 (released 2026-10-20), with the move to CUDA 13.5 (Tyler: "let's migrate to latest"; the policy
+# below: the newest release tag.  main's HEAD adds only SM110 guards and an SM100 blockwise scale-copy fix so far).
+#
+# Before that: v4.8.0 (released 2026-09-22), bumped from v4.7.0 dcf215af on
+# 2026-09-23 (L244; Tyler: "it may have some improvements for us" -- the notes
+# name GeForce/sm_120 blockscaled GEMM, block-32 scale factors and grouped
+# blockscaled GEMM).  The pin was created on 2026-08-23 at v4.7.0 because
+# three machines gave three answers (the GB10 v4.7.0, the dev box v4.6.1,
+# AGENTS.md claiming v4.5.2).
+#
+# POLICY: track the latest CUTLASS *release tag*, not main.  main carries
+# untagged daily churn through the MXFP4 expert GEMM we depend on, and a
+# moving dependency there is not something the gate suite can protect us
+# from.  Bumping this sha is a real change: it is NOT byte-exact, so it
+# needs a full gate run AND a decode A/B (see L096) before it lands.
+#
+# Point CUTLASS_DIR at a clone of this sha, or run `make cutlass`.
+url=https://github.com/NVIDIA/cutlass.git
+sha=2c85f497547eb441f0fe80bfb0fb2e6f9add1719

@@ -1,32 +1,233 @@
+/** @file session_spec.cpp
+ *  @brief The speculation round API: draft schedule, copy drafts, rounds, absorb and commit, for every drafter. */
 #include "pulsar_engine_internal.h"
+#include "pulsar_nvtx.h"
+#include "spec_depth.h"
+#include "spec_internal.h"
 
-/* Confidence-scheduled draft trim threshold.  Defaults to tau=0.25.  At the
- * v0.2.2 default draft depth 3 the 2026-07-17 tau sweep found tau barely moves
- * GREEDY throughput (only 3 positions to trim: full range within 1-3% and the
- * peak wanders inside noise), but tau=0.25 clearly wins under T=1.0 SAMPLING
- * (+25% structured, +10% prose vs verify-all), where the low-confidence tail is
- * real.  The old "optimal trim loosens with depth" was a k=5 artifact — the
- * real driver is acceptance rate, not depth, and it washes out at k=3.  Trim is
- * exact and output-invariant on STRUCTURED, but narrowing the verify batch
- * shifts float accumulation ~1 ULP and can flip near-tie greedy argmax on flat
- * (prose) distributions (benign numerical tie, same class as yield-quench) — so
- * tau is distribution-preserving but NOT byte-identical on greedy prose.
- * PULSAR_DSPARK_CONF_SCHED=<tau> overrides; "0"/"off" disables (verify all
- * n_draft).  Adaptive tau is not worth building at k=3 (payoff ~2-6%, mostly
- * captured by 0.25). */
-static float dspark_conf_sched_tau(void) {
-    static float cached = -1.0f;
-    if (cached < 0.0f) {
-        const char *cs = getenv("PULSAR_DSPARK_CONF_SCHED");
-        if (!cs || !cs[0]) cached = 0.25f;
-        else if (!strcmp(cs, "off") || !strcmp(cs, "false")) cached = 0.0f;
-        else {
-            float v = (float)atof(cs);
-            cached = v > 0.0f ? v : 0.0f;
+
+
+/* --- the draft schedule (L284 P11: one rule, the numbers the drafter's) -----
+ * Depth: a session starts at the configured depth (--spec-depth /
+ * PULSAR_SPEC_DEPTH, engine options spec_depth) or the drafter's, clamped to
+ * the drafter's depth_max; a drafter with an adaptive policy (spec_depth.h,
+ * DSpark's L107 rule and its rationale) moves it +/-1 per round in
+ * spec_round_end.  The stop: pulsar_spec_conf_keep at pulsar_spec_tau. */
+uint32_t pulsar_spec_depth_start(const pulsar_engine *e) {
+    const pulsar_drafter_ops *d = e->drafter_ops;
+    if (!d) return 0;
+    const uint32_t v = e->spec_depth > 0 ? (uint32_t)e->spec_depth : d->depth;
+    return v < 1u ? 1u : v > d->depth_max ? d->depth_max : v;
+}
+
+float pulsar_spec_tau(const pulsar_engine *e) {
+    if (e->spec_tau < 0.0f) return 0.0f;
+    if (e->spec_tau > 0.0f) return e->spec_tau;
+    return e->drafter_ops ? e->drafter_ops->tau : 0.0f;
+}
+
+/* A shadow's depth: the controller's when it has moved it, else the start. */
+/// @param s the session
+/// @param sp a speculative shadow
+/// @return its depth, 1 .. 16
+static uint32_t spec_shadow_depth(const pulsar_session *s, const pulsar_spec_carry_state *sp) {
+    const int d = sp->spec_adaptive_depth;
+    return d > 0 ? (uint32_t)(d > 16 ? 16 : d) : pulsar_spec_depth_start(s->engine);
+}
+
+uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
+    const uint32_t d = spec_shadow_depth(s, &s->spec);
+    return d < 1u ? 1u : d;
+}
+
+/* L288 (tf-gap pass 2): copy drafts (TensorFold #468, after its Nemotron CopyIndex; vLLM's MRV2 n-gram speculator and
+ * exllamav3's hybrid mode are the same idea).  A reply that re-states text it has seen -- an edit of a quoted file, a
+ * rename, a quotation, a tool result read back -- repeats its own history token for token, and no drafter predicts
+ * that as well as the history does.  When the bank's last PULSAR_SPEC_COPY_MATCH tokens (its committed history, then
+ * the carry that opens the next round) occurred earlier, the round drafts what followed the LATEST earlier copy, up to
+ * `max` tokens; a copy whose continuation is shorter than the match (a repeat that runs into its own tail) is none,
+ * unless `max` is.  A copy draft costs no drafter step, only its verify row, so its chain is cut by the verify pick
+ * alone (pulsar_spec_keep_picked, L301) at the copy acceptance the engine has measured.  The verify is unchanged, so
+ * every emitted token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in
+ * step with a history that rewinds and resyncs. */
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out) {
+    const uint32_t m = PULSAR_SPEC_COPY_MATCH;
+    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    if (!h || max == 0u || (uint32_t)h->len + 1u < 2u * m) return 0;
+    const int32_t *v = h->v;
+    const uint32_t L = (uint32_t)h->len + 1u;   /* the history, then next_base at index L - 1 */
+    auto at = [&](uint32_t i) -> int32_t { return i + 1u < L ? v[i] : next_base; };
+    const uint32_t need = max < m ? max : m;
+    uint32_t best = 0, best_at = 0;
+    /* an earlier copy starts at i <= L - m - 1 (L - m is the tail itself); latest first */
+    for (uint32_t i = L - m; i-- > 0;) {
+        if (v[i] != at(L - m)) continue;
+        uint32_t k = 1;
+        while (k < m && at(i + k) == at(L - m + k)) k++;
+        if (k < m) continue;
+        const uint32_t avail = L - (i + m);
+        const uint32_t len = avail < max ? avail : max;
+        if (len > best) {
+            best = len;
+            best_at = i + m;
+            if (best == max) break;
         }
     }
-    return cached;
+    if (best < need) return 0;
+    for (uint32_t k = 0; k < best; k++) out[k] = at(best_at + k);
+    return best;
 }
+
+/* L308: the copy estimate, after Flare's retained-proposal acceptance (NVIDIA/flare-local-inference,
+ * docs/scheduling-runtime-design.md "Retained proposals": an unobserved suffix is priced at its upper bound after 32
+ * tokens, so it can become worth probing).  L288 kept one number per request, and a request whose copies fell under
+ * tau never copied again -- nothing verified a copy after that, so nothing could move it back, and a long reply that
+ * later quoted a file drafted the quote with its drafter.  Now the estimate ages by the tokens committed without a
+ * copy verdict, and once it is PULSAR_SPEC_COPY_REPROBE old it is stale: it describes text the request has left.  A
+ * stale estimate prices the next copy chain as a probe -- its first draft at the upper bound 1 (what an unobserved
+ * draft can be worth), the rest at the old estimate -- cut by the stop rule (a quenched estimate keeps the first
+ * draft and the one that stops it) and then by the verify pick, so a probe is drafted only when the curve says even
+ * that is worth its rows.  The probe's verdict re-seeds the estimate, as a request's first copy verdict seeds it: a
+ * quote that has started is copied from the next round on, and a probe that failed quenches the lane for another
+ * PULSAR_SPEC_COPY_REPROBE tokens.  Counts and verdicts only, so every rank of a TP group holds the same estimate. */
+uint32_t pulsar_spec_copy_price(const pulsar_spec_carry_state *sp, float tau, uint32_t n, float *conf, bool *reprobe) {
+    *reprobe = false;
+    if (n == 0u) return 0u;
+    const float c = sp->copy_accept;
+    if (!(c > 0.0f)) {   /* none measured: every copy draft at its upper bound (L288) */
+        for (uint32_t k = 0; k < n; k++) conf[k] = 1.0f;
+        return n;
+    }
+    if (sp->copy_unseen < PULSAR_SPEC_COPY_REPROBE) {   /* fresh: the request's own number */
+        for (uint32_t k = 0; k < n; k++) conf[k] = c;
+        return pulsar_spec_conf_stops(c, tau) ? 0u : n;
+    }
+    conf[0] = 1.0f;   /* stale: a probe */
+    for (uint32_t k = 1; k < n; k++) conf[k] = c;
+    *reprobe = pulsar_spec_conf_stops(c, tau);
+    return pulsar_spec_conf_keep(conf, n, tau);
+}
+
+/* A verified copy chain's verdict: `commit` of its `K` drafts accepted -- commit successes in commit + (commit < K)
+ * trials of "accepted, given the one before was" -- into the request's copy acceptance (weight 0.1 a round; an
+ * unmeasured or stale estimate is replaced by it). */
+void pulsar_spec_copy_observe(pulsar_spec_carry_state *sp, int commit, uint32_t K) {
+    const uint32_t trials = (uint32_t)commit + ((uint32_t)commit < K ? 1u : 0u);
+    if (trials == 0u) return;
+    const float rate = (float)commit / (float)trials;
+    float &a = sp->copy_accept;
+    const bool seed = !(a > 0.0f) || sp->copy_unseen >= PULSAR_SPEC_COPY_REPROBE;
+    a = !seed ? 0.9f * a + 0.1f * rate : (rate > 0.0f ? rate : 0.01f);
+    sp->copy_unseen = 0u;
+}
+
+void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens) {
+    sp->copy_unseen = sp->copy_unseen > UINT32_MAX - tokens ? UINT32_MAX : sp->copy_unseen + tokens;
+}
+
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+                                float top_p, float min_p) {
+    q->valid = true;
+    q->done = false;
+    q->next_base = (int32_t)next_base;
+    q->n_draft = pulsar_spec_cur_depth(s);
+    q->temperature = temperature;
+    q->top_k = top_k;
+    q->top_p = top_p;
+    q->min_p = min_p;
+    q->sample_drafts = temperature > 0.0f;
+    q->copied = false;
+    q->keep = 0;
+    /* L288: a bank that repeats its history drafts the repeat (pulsar_spec_copy_chain), whichever drafter it has: up
+     * to the drafter's deepest chain and the verify width beside the base row, within the context, priced by the
+     * request's copy estimate (pulsar_spec_copy_price, L308) and cut by the verify pick as a chain alone (L301; the
+     * server's pick rations the shared width); the drafter then leaves this record's drafts as they are.  A request
+     * whose fresh estimate is under the stop rule's tau drafts with its drafter until the estimate goes stale. */
+    const pulsar_drafter_ops *d = spec_drafter(s);
+    const uint32_t width = pulsar_engine_fused_heads_max(s->engine);
+    const int room = s->ctx() - (int)s->checkpoint.len - 1;
+    uint32_t cap = d && width > 1u ? (d->depth_max < width - 1u ? d->depth_max : width - 1u) : 0u;
+    if (cap > 16u) cap = 16u;
+    if (room < (int)cap) cap = room > 0 ? (uint32_t)room : 0u;
+    bool reprobe = false;
+    const uint32_t admit = pulsar_spec_copy_price(&s->spec, pulsar_spec_tau(s->engine), cap, q->conf, &reprobe);
+    if (admit == 0u) return;   /* before the history scan: a quenched request pays nothing for it */
+    int32_t cp[16];
+    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp);
+    if (n_cp == 0) return;
+    q->keep = n_cp < admit ? n_cp : admit;
+    q->refined[0] = q->next_base;
+    for (uint32_t k = 0; k < q->keep; k++) q->refined[k + 1] = cp[k];
+    pulsar_spec_keep_picked(s, 1u, &q, 1u);
+    if (q->keep == 0) return;   /* no copy draft is worth its row: the drafter drafts */
+    q->have_conf = true;
+    q->copied = true;
+    static bool announced = false;   /* rule 5: the copy lane says once that it ran */
+    if (!announced) {
+        announced = true;
+        fprintf(stderr, "pulsar: copy drafts ran: %u of a %u-token repeat drafted (conf %.2f) after a %u-token match\n",
+                q->keep, n_cp, (double)q->conf[q->keep - 1u], PULSAR_SPEC_COPY_MATCH);
+    }
+    if (reprobe) {
+        s->engine->spec_copy_probes++;
+        static bool probe_announced = false;   /* rule 5: and that a quenched copy lane probed again */
+        if (!probe_announced) {
+            probe_announced = true;
+            fprintf(stderr, "pulsar: copy re-probe ran: %u drafts after %u tokens without a copy verdict "
+                            "(estimate %.3f, tau %.2f)\n", q->keep, s->spec.copy_unseen, (double)s->spec.copy_accept,
+                    (double)pulsar_spec_tau(s->engine));
+        }
+    }
+}
+
+/* The target's undo of a round: the snapshot back on the installed bank, then released. */
+/// @param s the session
+/// @param r the round (its snapshot is released)
+static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
+    if (spec_target(s)->restore) (void)spec_target(s)->restore(s, r);
+    if (spec_target(s)->release) spec_target(s)->release(s, r);
+}
+
+/* The drafter's context advances by a committed verify row -- now, or in the batched lane's ONE pass
+ * after every bank's walk (seed_defer, L260: the row is recorded against the installed bank). */
+/// @param s the session
+/// @param row the committed verify row
+/// @param next the token after it
+/// @return false when seed_defer is full (PULSAR_SPEC_LOGITS_ROWS + 1 rows)
+static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
+    if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
+    s->seed_defer.src_row[s->seed_defer.n] = row;
+    s->seed_defer.bank[s->seed_defer.n] = pulsar_session_live_bank(s);
+    s->seed_defer.next_tok[s->seed_defer.n] = next;
+    s->seed_defer.n++;
+    return true;
+}
+
+/* The round's committed rows [row0, row0 + n) go to the drafter: recorded for the batched lane's one
+ * pass after every bank's walk (seed_defer, L260), else row by row (a drafter with a per-row absorb,
+ * DSpark), else as one call (a drafter that pairs rows with their successors, Qwen's MTP). */
+/// @param s the session
+/// @param row0 the first committed row
+/// @param next [n] the token after each row
+/// @param n rows
+/// @return false = the drafter refused (or seed_defer is full)
+static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *next, uint32_t n) {
+    bool ok = true;
+    if (s->seed_defer.active) {
+        for (uint32_t m = 0; ok && m < n; m++) ok = spec_absorb_defer(s, row0 + m, next[m]);
+        return ok;
+    }
+    if (spec_drafter(s)->absorb) {
+        for (uint32_t m = 0; ok && m < n; m++) ok = spec_drafter(s)->absorb(s, row0 + m, next[m]);
+        return ok;
+    }
+    uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1], banks[PULSAR_SPEC_LOGITS_ROWS + 1];
+    const uint32_t bank = pulsar_session_live_bank(s);
+    for (uint32_t m = 0; m < n; m++) { rows[m] = row0 + m; banks[m] = bank; }
+    return spec_drafter(s)->absorb_banked(s, rows, banks, next, n);
+}
+
+
 
 /* --- Terminal yield-quench controller (spec-decode Item 4) ---------------
  * Controller design after the Entrpi ds4 yield quench (v0.1.1, MIT): per
@@ -96,124 +297,105 @@ static float dspark_conf_sched_tau(void) {
  * conditions), small enough that a 400-token losing request recovers nearly
  * all of the loss.
  *
- * The controller reads only (commit, n_batch) — counts, never wall-clock —
- * so for a fixed token stream the quench point is deterministic. Constants
- * are compile-time (no hot-path env reads; project rule). */
-/* REFIT 2026-07-21 (FLAT 95.7 -> 57.0; ROW unchanged). The 2026-07-17 fit went
- * stale: the fused step got ~30-40 ms cheaper (41 commits + the mxfp8head ->
- * type-40/MXFP8_LT model swap) while plain decode did not, so the shipped line
- * OVER-priced the step at EVERY width -- +57% at n_batch=1, +29% at 3, +14-15%
- * at 6..8. Guard = step/plain, so over-pricing raises the break-even, which
- * biases TOWARD quenching: the exact false-quench the design comment says it
- * deliberately biased against. Measured live at 2.7k/n_batch=6, yield 2.964 sat
- * below the shipped guard 3.057 (quench) but above the true 2.732 (spec was
- * ~8% faster than plain).
- *
- * Basis: 7591 steady-state steps over six cells (greedy/T1.0 x prose/structured
- * x 2.7k/9.4k/38k), pooled resid rms 5.88 ms (original fit: 7.2). Per-cell fits
- * are excellent (rms 0.08-2.4 ms), so ONE line is still the right model.
- *
- * Why 57.0 and why ROW stays 18.37:
- *  - Residual structure is by ENGINE DRAFT DEPTH, not temperature or context.
- *    FLAT rises ~3.3 ms per configured draft position (drafting work, which is
- *    NOT in the verify batch) while ROW falls to compensate: draft-2 fits
- *    FLAT 53.3/ROW 20.95, draft-7 fits FLAT 81.0/ROW 16.97. Since
- *    dspark_draft_tokens is fixed per engine and only conf-sched trim moves
- *    n_batch, the WITHIN-engine line is the one the controller actually rides.
- *    57.0 targets the shipped --dspark-draft 3 engine (~56.6); deeper drafts are
- *    then UNDER-priced, which biases against quenching = the safe direction.
- *  - Pooled ROW (20.3) is inflated by smearing cross-engine drafting cost into
- *    the slope. Keeping the lower shipped 18.37 lands the line 3-6% BELOW
- *    measured at every width 2..8, restoring the intended underprice margin.
- *  - Greedy remains the MINIMUM cell (T1.0 costs +3.5..12.4 ms at equal width),
- *    so a greedy-derived FLAT stays the conservative choice, as originally
- *    intended.
- * Depth enters as a small additive FLAT term only (~0.17 ms/1k, +6 ms over 35k)
- * and ROW is depth-invariant, so nothing depth-aware belongs in the step term.
- * NOTE the old comment's premise "spec step cost is ~flat in depth while plain
- * slows" is NOT what was measured: the step's depth slope (0.17 ms/1k) is close
- * to plain's (0.20). The guard ratio still improves with depth, but because the
- * step is 2-3x larger, not because it is flat. */
-#define PULSAR_QUENCH_FLAT_MS    57.0f
-#define PULSAR_QUENCH_ROW_MS     18.37f
+ * The step side of the guard is MEASURED (L263): pulsar_engine::lane_cost[PULSAR_LANE_SPEC] is
+ * an exponentially weighted least-squares fit of a decode round's wall time
+ * on the rows its forward carried, round = flat + row * rows, fed by the
+ * server's round loop (the single lane off TP feeds its own steps).  Nothing
+ * about a deployment is compiled in -- the 2026-07/09 refits that lived here
+ * (FLAT 95.7 -> 57.0 -> 45.0, ROW 18.37 -> 7.17, a plain-by-depth table) went
+ * stale with every kernel landing and could only be right for one machine.
+ * The plain side needs no table: a bank that stops drafting still rides a
+ * round with ONE row, so plain costs the same round at n = 1, at whatever
+ * depth is being served.  A round shared by B banks shares its flat cost, so
+ * the guard for a bank with n rows is (flat/B + row*n) / (flat/B + row);
+ * B = 1 is the single lane's (flat + row*n) / (flat + row).  Until the fit
+ * is valid the controller does not price at all: no number, no quench.
+ * The decision therefore reads the machine's clock through the fit (the
+ * quench point is not fixed for a given token stream); both paths sample the
+ * exact target distribution, so only speed is at stake.  The remaining
+ * constants are the controller's own (EWMA weight, warm-up, minimum
+ * evidence, budget), not a deployment's. */
+/// The quench controller's EWMA weight.
 #define PULSAR_QUENCH_ALPHA      0.125f   /* EWMA weight (Entrpi default) */
+/// Ramp steps charged to no one.
 #define PULSAR_QUENCH_WARMUP     3u      /* ramp steps charged to no one (below) */
+/// The fewest spec steps before a quench.
 #define PULSAR_QUENCH_MINEV      8u      /* min spec steps before quench */
+/// The quench budget, in plain-token equivalents.
 #define PULSAR_QUENCH_BUDGET     4.0f    /* plain-token equivalents */
 
-/* Served plain-decode ms/token vs request depth: piecewise-linear through the
- * measured depth table (re-measured 2026-07-21 — see the block below for the
- * data and for why the 2026-07-15 values were retired). The bottom clamp
- * over-estimates plain and biases AGAINST quenching (conservative for the
- * no-spurious-quench gates). Plain ms/token keeps rising ~linearly with KV
- * depth, so beyond the last anchor we project that segment's slope rather than
- * flat-lining — a flat clamp under-estimates plain, which inflates the guard
- * and biases TOWARD quenching exactly where spec advantage is already marginal.
- * The projection is bounded at ~256k (PULSAR_QUENCH_PLAIN_CAP_POS), well past the
- * measured range, rather than extrapolating without limit. Deterministic
- * (constants only) so the quench point stays reproducible for a fixed stream. */
-/* RE-MEASURED 2026-07-21 (medians of 3, run-to-run spread 0.01-0.11%), matching
- * the ORIGINAL instrument: the server's own `decoding ... avg=` line over a
- * 256-token greedy generation, `--no-dspark`, prose. Confirmed the shipped py
- * was exactly 1000/{16.74,14.85,14.55,13.43} from the 2026-07-15 prose table.
- *
- *   depth    old table   measured   ratio
- *     426      60.18       56.18    0.933
- *    2348      67.31       63.05    0.937
- *    9141      68.67       65.78    0.958
- *   38147      74.53       69.98    0.939
- *  100362      87.10*      80.24    0.921      (*extrapolated, now MEASURED)
- *
- * The table was uniformly ~6% HIGH — plain decode got ~6% faster since
- * 2026-07-15, alongside the fused spec step. The 100k anchor is new and real;
- * `-c` confound controlled (38k reads 70.12 at -c 131072 vs 70.00 at -c 40960,
- * +0.17%).
- *
- * A 2026-07-21 spot check that reported 85.89 ms at 38k (and an alarming
- * 0.675 ms/1k slope) was a MEASUREMENT ARTIFACT, reconstructed to 0.03 ms:
- * it used 128-vs-384 marginal differencing WITHOUT `--no-kv-disk`, so the two
- * legs took different disk-KV hits and prefilled 30011 vs 31163 tokens —
- * 70.20 true marginal + 12.55 unequal prefill + 3.17 client overhead = 85.92.
- * The real 9.1k->38k slope is 0.145 ms/1k, so the beyond-38k extrapolation was
- * if anything slightly too STEEP, never "3x too shallow". LESSON: when
- * differencing two runs to cancel prefill, DISABLE the disk KV cache or the
- * cancellation silently fails.
- *
- * DIRECTION (correcting the earlier note): the FLAT staleness and this table's
- * staleness did NOT compound — they partially CANCELLED. FLAT was over-priced
- * (guard too high) while plain was over-estimated (guard too low). Fixing FLAT
- * alone left the guard ~6-9% too LOW; this correction restores it (+7.0% @2.3k,
- * +6.4% @38k, +8.6% @100k, +11.9% @256k at n_batch=6).
- *
- * The measured curve is mildly convex (0.145 -> 0.165 ms/1k), so the linear
- * projection past 100k slightly UNDER-estimates plain, which inflates the guard
- * — the conservative direction this design already prefers, and now anchored on
- * a real 100k point instead of a 38k one. Past 100k is UNMEASURED: the 256k cap
- * (~105.9 ms) is a bounded guess. Also unmeasured: whether structured/tool
- * output shifts plain ms/token at depth (all five anchors are prose). */
-#define PULSAR_QUENCH_PLAIN_CAP_POS 256000.0f
-static float spec_quench_plain_ms(int pos) {
-    static const float px[5] = { 300.0f, 2300.0f, 9300.0f, 38000.0f, 100000.0f };
-    static const float py[5] = { 55.7f, 62.9f, 65.8f, 70.0f, 80.2f };
-    const float p = (float)pos;
-    if (p <= px[0]) return py[0];
-    for (int i = 1; i < 5; i++)
-        if (p <= px[i])
-            return py[i - 1] + (py[i] - py[i - 1]) * (p - px[i - 1]) /
-                                   (px[i] - px[i - 1]);
-    /* pos > 100000: extend the last segment's slope, capped at the 256k value. */
-    const float slope = (py[4] - py[3]) / (px[4] - px[3]);
-    const float q = p < PULSAR_QUENCH_PLAIN_CAP_POS ? p : PULSAR_QUENCH_PLAIN_CAP_POS;
-    return py[4] + slope * (q - px[4]);
+/* The break-even yield for a bank with `n_batch` rows in a round shared by
+ * `banks` banks (see above).  Integer microseconds in, so every rank of a TP
+ * group computes the same value from the same wire terms. */
+/// @param c the lane cost fit (flat_us, row_us)
+/// @param banks banks sharing the round
+/// @param n_batch the bank's rows
+/// @return the break-even yield, tokens per round (>= 1)
+static float spec_quench_guard(const pulsar_lane_cost_fit *c, int banks, uint32_t n_batch) {
+    const float share = (float)c->flat_us / (float)(banks > 0 ? banks : 1);
+    const float row = (float)c->row_us;
+    return (share + row * (float)n_batch) / (share + row);
 }
 
-static float spec_quench_guard(uint32_t n_batch, int pos) {
-    return (PULSAR_QUENCH_FLAT_MS + PULSAR_QUENCH_ROW_MS * (float)n_batch) /
-           spec_quench_plain_ms(pos);
+/* L263: one observation into the fit (L284: either lane's -- the plain lane's
+ * steps feed the same structure).  Decay 255/256 per step (a window of ~256
+ * steps, 15-25 s of decode: at c1 the rows spread only 2..6, so a 64-round
+ * window let the slope swing 1..6 ms/row between adjacent windows -- the pair,
+ * 2026-10-05); valid once 16 steps are in, the row counts have spread (an EW
+ * variance of at least 1/4: adaptive depth and concurrency move them every few
+ * rounds) and both terms are positive -- anything else is noise, not a price. */
+/// The lane cost fit's per-observation decay (a ~256-step window).
+#define SPEC_COST_DECAY   (1.0 - 1.0 / 256.0)
+/// Observations (decayed weight) before the fit is valid.
+#define SPEC_COST_MIN_OBS 16u
+/// The least EW variance of the row counts for a valid fit.
+#define SPEC_COST_MIN_VAR 0.25
+void lane_cost_fit_observe(pulsar_lane_cost_fit *f, uint32_t rows, double ms) {
+    if (!f || rows == 0 || !(ms > 0.0)) return;
+    const double x = (double)rows, y = ms;
+    f->w   = f->w   * SPEC_COST_DECAY + 1.0;
+    f->sx  = f->sx  * SPEC_COST_DECAY + x;
+    f->sy  = f->sy  * SPEC_COST_DECAY + y;
+    f->sxx = f->sxx * SPEC_COST_DECAY + x * x;
+    f->sxy = f->sxy * SPEC_COST_DECAY + x * y;
+    f->n++;
+    f->valid = false;
+    const double mx = f->sx / f->w, my = f->sy / f->w;
+    const double vx = f->sxx / f->w - mx * mx;
+    const double cxy = f->sxy / f->w - mx * my;
+    if (f->n < SPEC_COST_MIN_OBS || vx < SPEC_COST_MIN_VAR) return;
+    const double row = cxy / vx, flat = my - row * mx;
+    if (!(row > 0.0) || !(flat > 0.0)) return;
+    f->flat_us = (int32_t)(flat * 1000.0 + 0.5);
+    f->row_us = (int32_t)(row * 1000.0 + 0.5);
+    f->valid = f->flat_us > 0 && f->row_us > 0;
 }
 
-/* Re-arm at request boundaries (the same sites that drop the carry and
- * pendings). All-zero == armed, matching the xcalloc'd session. */
+pulsar_lane_cost lane_cost_fit_view(const pulsar_lane_cost_fit *f) {
+    pulsar_lane_cost c;
+    memset(&c, 0, sizeof c);
+    c.flat_us = f->flat_us;
+    c.row_us = f->row_us;
+    c.n = f->n;
+    c.valid = f->valid;
+    if (f->w > 0.0) {
+        c.mean_rows = (float)(f->sx / f->w);
+        c.mean_ms = (float)(f->sy / f->w);
+    }
+    return c;
+}
+
+/* L284: the slope is needed only AWAY from the fit's centre -- a fit whose rows
+ * never spread (a steady N on the plain lane) still knows its cost at N. */
+double pulsar_lane_cost_ms(const pulsar_lane_cost *c, double rows) {
+    if (!c || !(rows > 0.0)) return 0.0;
+    if (c->valid) return ((double)c->flat_us + (double)c->row_us * rows) / 1000.0;
+    if (c->n >= SPEC_COST_MIN_OBS && c->mean_ms > 0.0f && fabs(rows - (double)c->mean_rows) <= 0.5)
+        return (double)c->mean_ms;
+    return 0.0;
+}
+
+/* All-zero == armed, matching the xcalloc'd session. */
 void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quench_debt = 0.0f;
     s->spec.spec_quench_ewma = 0.0f;
@@ -221,251 +403,25 @@ void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quenched = false;
 }
 
-/* Test-only (identity gates): PULSAR_QUENCH_FORCE_STEP=<N> latches the quench
- * unconditionally once N fused spec steps have run, and disables the policy
- * decision. The check runs inside the fused step after steps++, so the
- * earliest possible latch is after step 1 completes: N=0 behaves like N=1
- * (a request that must be fully plain wants dspark_disable, not this hook).
- * Read once; absent in production. */
-static int spec_quench_force_step(void) {
-    static int cached = -2;
-    if (cached == -2) {
-        const char *fs = getenv("PULSAR_QUENCH_FORCE_STEP");
-        cached = fs && fs[0] ? atoi(fs) : -1;
-        if (cached < -1) cached = -1;
-    }
-    return cached;
-}
-
-static void spec_frontier_free(pulsar_spec_frontier *f) {
-    if (!f) return;
-    memset(f, 0, sizeof(*f));
+/* A request boundary: the lookahead goes, the quench re-arms. */
+void spec_lookahead_reset(pulsar_session *s) {
+    s->spec.spec_carry_valid = false;
+    s->spec.copy_accept = 0.0f;   /* L288: copies are measured per request */
+    s->spec.copy_unseen = 0u;
+    pulsar_spec_drop_pendings(&s->spec);
+    spec_quench_reset(s);
 }
 
 
 
-/* Build the batched-copy descriptor tables for the frontier snapshot/restore
- * copy sets. All source/destination tensors are fixed allocations, so the
- * tables are built once and replayed with one kernel launch per direction
- * (previously ~126 cudaMemcpy launches per snapshot, again per restore). A
- * NULL handle (prepare rejected a size, or alloc failed) keeps the loop path. */
-static void spec_frontier_copy_tables_init(pulsar_gpu_graph *g) {
-    if (g->spec_frontier_copy_init) return;
-    g->spec_frontier_copy_init = 1;
-    pulsar_gpu_tensor *dst[PULSAR_MAX_LAYER * 4];
-    pulsar_gpu_tensor *src[PULSAR_MAX_LAYER * 4];
-    uint64_t bytes[PULSAR_MAX_LAYER * 4];
-    uint32_t n = 0;
-    uint64_t mx = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        dst[n] = g->spec_attn_state_kv[il];    src[n] = g->layer_attn_state_kv[il];    bytes[n++] = ab;
-        dst[n] = g->spec_attn_state_score[il]; src[n] = g->layer_attn_state_score[il]; bytes[n++] = ab;
-        if (ab > mx) mx = ab;
-        if (ratio == 4) {
-            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            dst[n] = g->spec_index_state_kv[il];    src[n] = g->layer_index_state_kv[il];    bytes[n++] = ib;
-            dst[n] = g->spec_index_state_score[il]; src[n] = g->layer_index_state_score[il]; bytes[n++] = ib;
-            if (ib > mx) mx = ib;
-        }
-    }
-    if (n == 0) return;
-    g->spec_snap_copies = pulsar_gpu_batched_copy_prepare(dst, src, bytes, n);
-    /* restore = the same set with src/dst swapped */
-    g->spec_restore_copies = pulsar_gpu_batched_copy_prepare(src, dst, bytes, n);
-    g->spec_frontier_copy_n = n;
-    g->spec_frontier_copy_max_bytes = mx;
-}
-
-static bool spec_frontier_snapshot(pulsar_spec_frontier *f, pulsar_session *s) {
-    memset(f, 0, sizeof(*f));
-    pulsar_gpu_graph *g = &s->graph;
-    spec_frontier_copy_tables_init(g);
-
-    bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        f->n_comp[il] = g->layer_n_comp[il];
-        f->n_index_comp[il] = g->layer_n_index_comp[il];
-    }
-    if (ok && g->spec_snap_copies) {
-        ok = pulsar_gpu_batched_copy_run(g->spec_snap_copies,
-                                      g->spec_frontier_copy_n,
-                                      g->spec_frontier_copy_max_bytes) != 0;
-    } else {
-        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = pulsar_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
-                                       g->layer_attn_state_kv[il], 0, ab) != 0 &&
-                 pulsar_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
-                                       g->layer_attn_state_score[il], 0, ab) != 0;
-            if (ratio == 4) {
-                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-                ok = ok &&
-                     pulsar_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
-                                           g->layer_index_state_kv[il], 0, ib) != 0 &&
-                     pulsar_gpu_tensor_copy(g->spec_index_state_score[il], 0,
-                                           g->layer_index_state_score[il], 0, ib) != 0;
-            }
-        }
-    }
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    else (void)pulsar_gpu_synchronize();
-    if (ok) return true;
-
-    spec_frontier_free(f);
-    return false;
-}
 
 
 
-static bool spec_frontier_restore(pulsar_spec_frontier *f, pulsar_session *s) {
-    pulsar_gpu_graph *g = &s->graph;
-    bool ok = pulsar_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_n_comp[il] = f->n_comp[il];
-        g->layer_n_index_comp[il] = f->n_index_comp[il];
-    }
-    if (ok && g->spec_restore_copies) {
-        ok = pulsar_gpu_batched_copy_run(g->spec_restore_copies,
-                                      g->spec_frontier_copy_n,
-                                      g->spec_frontier_copy_max_bytes) != 0;
-    } else {
-        for (uint32_t il = 0; ok && il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint64_t ab = pulsar_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-            ok = pulsar_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                       g->spec_attn_state_kv[il], 0, ab) != 0 &&
-                 pulsar_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                       g->spec_attn_state_score[il], 0, ab) != 0;
-            if (ok && ratio == 4) {
-                const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-                ok = pulsar_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                           g->spec_index_state_kv[il], 0, ib) != 0 &&
-                     pulsar_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                           g->spec_index_state_score[il], 0, ib) != 0;
-            }
-        }
-    }
-    if (ok) ok = pulsar_gpu_end_commands() != 0;
-    else (void)pulsar_gpu_synchronize();
-    return ok;
-}
 
-static float dspark_base_top1_prob(const float *logits, int n) {
-    float m = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > m) m = logits[i];
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += exp((double)(logits[i] - m));
-    return sum > 0.0 ? (float)(1.0 / sum) : 1.0f;
-}
 
-/* Diagnostic: dump the DSpark drafter's per-step inputs (target_h[3], main_x)
- * and pre-markov base logits (spec_logits row 0) so an off-box reference forward
- * can be diffed against ds4 to localize acceptance loss. Enabled by
- * PULSAR_DSPARK_DUMP=<path>; caps at PULSAR_DSPARK_DUMP_STEPS (default 8) records.
- * Record layout (little-endian): pos i32, first_token i32, then f32 arrays
- * target_h[0..2] (PULSAR_N_EMBD each), main_x (PULSAR_N_EMBD), base0 (PULSAR_N_VOCAB). */
-static void dspark_dump_step(pulsar_gpu_graph *g, int pos, int first_token,
-                             const int32_t *refined_ids, int n_draft) {
-    /* Read once (no-hot-path-flags): this is called every spec step, and both
-     * switches are fixed at start.  The common case is "not dumping", which
-     * must cost a single cached load, not two getenv lookups. */
-    static const char *path = NULL;
-    static int max_steps = 8;
-    static int env_read = 0;
-    if (!env_read) {
-        env_read = 1;
-        const char *p = getenv("PULSAR_DSPARK_DUMP");
-        path = (p && p[0]) ? p : NULL;
-        const char *lim = getenv("PULSAR_DSPARK_DUMP_STEPS");
-        if (lim && lim[0]) max_steps = atoi(lim);
-    }
-    if (!path) return;
-    static int dumped = 0;
-    if (dumped >= max_steps) return;
 
-    const uint64_t hcw = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-    float *emb = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
-    float *voc = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
-    float *hc = (float *)xmalloc((size_t)hcw * sizeof(float));
-    FILE *f = fopen(path, dumped == 0 ? "wb" : "ab");
-    if (!f) { free(emb); free(voc); free(hc); return; }
-    /* Lean mode (PULSAR_DSPARK_DUMP_LEAN=1): confidence-head training records only —
-     * hdr + refined_ids + the post-hc_head hidden rows (batch_ffn_cur) that the
-     * engine's confidence kernel consumes (Step 5c), ~64 KB/step at draft=4
-     * instead of ~1 MB. Bulk-collectable for the drafter-retune Phase 0. */
-    static int lean = -1;
-    if (lean < 0) lean = getenv("PULSAR_DSPARK_DUMP_LEAN") != NULL;
-    if (lean) {
-        int32_t hdr[3] = { (int32_t)pos, (int32_t)first_token, (int32_t)n_draft };
-        fwrite(hdr, sizeof(int32_t), 3, f);
-        fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
-        for (int p = 0; p < n_draft; p++) {
-            memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-            (void)pulsar_gpu_tensor_read(g->batch_ffn_cur, (uint64_t)p * PULSAR_N_EMBD * 4,
-                                      emb, (uint64_t)PULSAR_N_EMBD * 4);
-            fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
-        }
-        fclose(f);
-        dumped++;
-        if ((dumped & 1023) == 1)
-            fprintf(stderr, "pulsar: dspark lean dump step %d pos=%d -> %s\n", dumped, pos, path);
-        free(emb); free(voc); free(hc);
-        return;
-    }
-    /* Record: pos, tok, n_draft, refined_ids[0..n_draft], target_h[3], main_x,
-     * base0(vocab), then cur_hc for each of the n_draft block positions. n_draft
-     * is fixed per run -> fixed record size. Used to validate offline whether the
-     * DSpark confidence head predicts per-position acceptance on our requant. */
-    int32_t hdr[3] = { (int32_t)pos, (int32_t)first_token, (int32_t)n_draft };
-    fwrite(hdr, sizeof(int32_t), 3, f);
-    fwrite(refined_ids, sizeof(int32_t), (size_t)n_draft + 1, f);
-    for (int i = 0; i < 3; i++) {
-        memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-        (void)pulsar_gpu_tensor_read(g->dspark_target_h[i], 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
-        fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
-    }
-    memset(emb, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-    (void)pulsar_gpu_tensor_read(g->dspark_main_x, 0, emb, (uint64_t)PULSAR_N_EMBD * 4);
-    fwrite(emb, sizeof(float), PULSAR_N_EMBD, f);
-    memset(voc, 0, (size_t)PULSAR_N_VOCAB * sizeof(float));
-    (void)gpu_graph_read_spec_logits_row(g, 0, voc);
-    fwrite(voc, sizeof(float), PULSAR_N_VOCAB, f);
-    /* block-2 output hidden (pre-hc_head) for each draft position [HC, EMBD]. */
-    for (int p = 0; p < n_draft; p++) {
-        memset(hc, 0, (size_t)hcw * sizeof(float));
-        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p * hcw, hc, hcw);
-        fwrite(hc, sizeof(float), (size_t)hcw, f);
-    }
-    fclose(f);
-    dumped++;
-    fprintf(stderr, "pulsar: dspark dump step %d pos=%d tok=%d n_draft=%d -> %s\n",
-            dumped, pos, first_token, n_draft, path);
-    free(emb); free(voc); free(hc);
-}
 
-/* Fused-loop helper: make batch row `row`'s captured anchor hidden the current
- * drafter conditioning (target_h -> main_x) and seed one drafter-KV row from it.
- * Mirrors the reference invariant "drafter KV row j = f(hidden at position j)". */
-static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
-    pulsar_gpu_graph *g = &s->graph;
-    pulsar_engine *e = s->engine;
-    for (int i = 0; i < 3; i++) {
-        if (!g->dspark_target_h_batch[i] || !g->dspark_target_h[i]) return false;
-        if (!pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
-                                 g->dspark_target_h_batch[i],
-                                 (uint64_t)row * PULSAR_N_EMBD * sizeof(float),
-                                 (uint64_t)PULSAR_N_EMBD * sizeof(float))) return false;
-    }
-    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights)) return false;
-    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
-    return true;
-}
+
 
 /* Fused DSpark loop (P2, PULSAR_DSPARK_FUSED=1): ONE batched target forward per
  * step instead of Step-1 decode + separate verify. The forward runs over
@@ -474,228 +430,344 @@ static bool dspark_seed_from_batch_row(pulsar_session *s, uint32_t row) {
  * drafts, and the batched anchor-hidden capture gives the drafter its
  * conditioning at whatever position ends up last-accepted. Drafting for the
  * NEXT step then conditions on the hidden that PRODUCED the next base token
- * (matching the reference generate.py forward_spec dataflow; the legacy loop
- * conditions on the hidden AFTER re-evaluating the base token -- a one-position
- * train/inference mismatch this path removes).
- * Greedy-only, like the legacy block (generate.c gates on temperature<=0).
+ * (matching the reference generate.py forward_spec dataflow; the deleted
+ * per-round loop conditioned on the hidden AFTER re-evaluating the base token
+ * -- a one-position train/inference mismatch this path removed).
+ * Greedy-only (generate.cpp gates on temperature<=0).
  * Partial/zero accepts restore the frontier and replay the committed prefix
  * (Stage A; the Stage-B transactional state removes the replay). */
-static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_token,
-                                              int max_tokens, int eos_token,
-                                              float temperature, int top_k,
-                                              float top_p, float min_p,
-                                              uint64_t *rng,
-                                              int *accepted, int accepted_cap,
-                                              char *err, size_t errlen) {
-    pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
-    const pulsar_dspark_weights *w = &e->dspark_weights;
-    const uint32_t embed_dim = 256;
-    const uint32_t vocab_size = w->vocab_size;
-    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
-    const void *dmap = e->dspark_model.map;
-    const uint64_t dsize = e->dspark_model.size;
-    static int dspark_stats_env = -1;
-    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    static int dtree_stats_env = -1;
-    const int dtree_stats = gpu_graph_env_flag("PULSAR_DTREE_STATS", &dtree_stats_env);
-    const double t0 = dspark_stats ? now_sec() : 0.0;
-    int n_accept = 0;
 
+/* The accept walk (L288 sdet's rule, L302: on the device).  The target draws its own token at every verified row --
+ * greedy: the row's argmax; sampled: THE sampler's draw at that token's own key, pulsar_sample_key at its index in
+ * the stream -- and a draft is accepted iff it IS that token.  The first row whose token differs ends the round with
+ * that token as the carry; on a full accept the carry is row K's draw at the next index.  Every emitted token is
+ * therefore the plain sampler's token at its index: exact in distribution by construction (it IS the plain draw), and
+ * the same whichever lane, depth or drafter produced the round, so a seeded stream reproduces whatever the lane price
+ * picked when.  The drafter draws a sampled draft at the same key, so it is the target's token with probability at
+ * least (1 - TV) / (1 + TV) of the two distributions (the sampler's race).
+ *
+ * Every row of every round in the step is drawn in ONE sampler launch over the step's device rows, the walk runs as
+ * a second kernel, and what comes back is each round's verdict (pulsar_gpu_spec_walk_out: commit, carry, status, and
+ * L301's calibration labels -- greedy row: the acceptance; sampled row: the target's emitted probability of the
+ * draft).  The logits never leave the device. */
+
+/* L296 toolsample: a round's sampling is decided PER POSITION, as the plain lane decides it token by token.  Row i
+ * (the token after the base and drafts 0..i-1; row K is a full accept's carry) draws greedy when the request is
+ * greedy or its bit in `greedy_rows` is set: the server's tool-call override (a call's structure greedy, its payload
+ * sampled) evaluated at that position (gen_spec_greedy_rows), so a round that crosses between the two draws each
+ * token as plain decoding draws it.  0 = the request's params at every row. */
+/// @param temperature request temperature
+/// @param greedy_rows per-row greedy override bits
+/// @param row the round row (0 = after the base)
+/// @return true when the row draws greedy
+static bool spec_row_greedy(float temperature, uint32_t greedy_rows, uint32_t row) {
+    return temperature <= 0.0f || (row < 32u && ((greedy_rows >> row) & 1u) != 0u);
+}
+
+/* One round's part of a walk: its rows [row0, row0 + K] of the step, its params, its stream at the base and its
+ * masks (pulsar_spec_step.masks). */
+/// One round's slice of a batched walk (spec_walk_rounds): which step rows it owns and how each row draws.
+struct spec_walk_round {
+    /// The round (its K drafts and their ids); borrowed.
+    const pulsar_spec_round *r;
+    /// The step row of the round's base: its rows are [row0, row0 + K] of the session's step rows.
+    uint32_t row0;
+    /// The request's temperature (<= 0: every row greedy).
+    float temperature;
+    /// The request's top-k filter.
+    int top_k;
+    /** @var spec_walk_round::min_p
+     *  The request's min-p filter. */
+    /// The request's top-p filter.
+    float top_p, min_p;
+    /// Per-row greedy override bits: bit j set = row j draws greedy (spec_row_greedy; rows >= 32 never).
+    uint32_t greedy_rows;
+    /// The request's sampling stream at the base: row j draws at pulsar_sample_key(rng, j + 1).
+    uint64_t rng;
+    /// Grammar mask rows, (logits width + 31) / 32 words each; row j uses mask row j while j < mask_rows.
+    const uint32_t *masks;   /* L303: row j of the round draws through mask row j (j < mask_rows); NULL = none */
+    /// Mask rows masks holds.
+    uint32_t mask_rows;
+};
+
+/* The walks of n rounds over the session's step rows: one sampler launch, one walk launch, the verdicts back. */
+/// @param s the session
+/// @param w [n] the rounds' slices of the step
+/// @param n rounds
+/// @param out [n] receives each round's verdict
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return false = refused or failed
+static bool spec_walk_rounds(pulsar_session *s, const spec_walk_round *w, uint32_t n, pulsar_gpu_spec_walk_out *out,
+                             char *err, size_t errlen) {
+    pulsar_gpu_sample_req reqs[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    uint32_t rows[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    pulsar_gpu_spec_run runs[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    const uint32_t *masks[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    const uint32_t words = (spec_vocab(s) + 31u) / 32u;
+    uint32_t m = 0;
+    if (!s->dev.step_rows || n == 0 || n > PULSAR_GPU_SAMPLE_ROWS_MAX) {
+        snprintf(err, errlen, "spec walk: %u rounds over a step that headed %u rows", n,
+                 s->dev.step_rows ? s->dev.step_n : 0u);
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const pulsar_spec_round *r = w[i].r;
+        if (m + r->K + 1u > PULSAR_GPU_SAMPLE_ROWS_MAX || w[i].row0 + r->K >= s->dev.step_n) {
+            snprintf(err, errlen, "spec walk: round %u's rows [%u, %u] are outside the step's %u", i, w[i].row0,
+                     w[i].row0 + r->K, s->dev.step_n);
+            return false;
+        }
+        pulsar_gpu_spec_run &run = runs[i];
+        memset(&run, 0, sizeof(run));
+        run.row0 = m;
+        run.k = r->K;
+        for (uint32_t j = 0; j <= r->K; j++) {
+            pulsar_gpu_sample_req &q = reqs[m];
+            const bool greedy = spec_row_greedy(w[i].temperature, w[i].greedy_rows, j);
+            memset(&q, 0, sizeof(q));
+            q.temperature = w[i].temperature;
+            q.top_k = w[i].top_k;
+            q.top_p = w[i].top_p;
+            q.min_p = w[i].min_p;
+            q.key = pulsar_sample_key(w[i].rng, j + 1u);   /* row j draws the token j + 1 places past the base */
+            q.flags = greedy ? PULSAR_GPU_SAMPLE_GREEDY : 0u;
+            q.probe = j < r->K ? r->pend[j] : -1;
+            rows[m] = w[i].row0 + j;
+            masks[m] = w[i].masks && j < w[i].mask_rows ? w[i].masks + (size_t)j * words : NULL;
+            if (j < r->K) {
+                run.pend[j] = r->pend[j];
+                run.greedy_rows |= greedy ? 1u << j : 0u;
+            }
+            m++;
+        }
+    }
+    const uint64_t walk_off = (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_sample_out);
+    if (!s->draw_rows_dev(s->dev.step_rows, rows, m, reqs, masks) ||
+        !pulsar_gpu_spec_walk(s->dev.out, 0, m, runs, n, s->dev.out, walk_off) ||
+        !pulsar_gpu_tensor_read(s->dev.out, walk_off, out, (uint64_t)n * sizeof(*out))) {
+        snprintf(err, errlen, "spec walk: the device sampler failed over %u rows", m);
+        return false;
+    }
+    return true;
+}
+
+/** inc-6: one speculative ROUND's state, threaded between round_begin (rows
+ * assembled, frontier snapshotted, checkpoint pushed), the verify forward
+ * (classic in the fused loop; the SHARED decode_mixed ALL_ROWS forward in
+ * the batched lane), and round_end (walk, state, emit, redraft). */
+/* L108 P2: a deferred device draft is finished into the installed bank's pendings before anything reads
+ * them (round_begin, the bank save, the conf peek); the drafter's business, a no-op without one. */
+/// @param s the session
+void pulsar_session_spec_chain_harvest(pulsar_session *s) {
+    if (spec_drafter(s) && spec_drafter(s)->harvest) spec_drafter(s)->harvest(s);
+}
+
+/* Assemble the round: load/guard the pendings, seed the prompt window if
+ * fresh, snapshot the frontier, push first_token + pendings onto the
+ * checkpoint. Body verbatim from the fused loop; the locals it declared are
+ * now reference-bound round fields so the batched lane can run one round
+ * per bank around a shared forward. Returns 0 or -1 (snapshot failure,
+ * session poisoned) exactly as before. */
+/// @param s the session
+/// @param first_token the round's base token
+/// @param max_tokens the most tokens the round may emit (caps K at max_tokens - 1)
+/// @param accepted_cap the caller's accepted[] size (caps K at accepted_cap - 1)
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param r the round, filled
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return 0, or -1
+static int spec_round_begin(pulsar_session *s, int first_token,
+                            int max_tokens, int accepted_cap,
+                            float temperature, int top_k, float top_p, float min_p,
+                            pulsar_spec_round *r,
+                            char *err, size_t errlen) {
+    if (first_token < 0 || (uint32_t)first_token >= spec_vocab(s)) {
+        /* -1 is what pulsar_session_spec_next_base returns when the sampler
+         * refused the row; the base token feeds the embedding gather, so a
+         * non-id must stop here. */
+        snprintf(err, errlen, "spec round: base token %d is not a vocab id", first_token);
+        return -1;
+    }
+    {
+        /* the round is reused across rounds; its target snapshot handle
+         * survives the reset, everything else is cleared */
+        void *snap = r->snap;
+        memset(r, 0, sizeof(*r));
+        r->snap = snap;
+        r->base = (int32_t)first_token;
+    }
+    uint32_t &K = r->K;
+    uint32_t &n_batch = r->n_batch;
+    int &saved_len = r->saved_len;
+    int32_t (&pend)[16] = r->pend;
+    float (&pend_conf)[16] = r->pend_conf;
+    (void)pend_conf; (void)n_batch;
     /* Pending drafts continue from the greedy base we predicted last step; if
      * the caller committed something else (tool injection, sampling change),
      * they are stale. */
-    int32_t pend[16];
-    uint32_t K = s->spec.dspark_n_pending;
+    pulsar_session_spec_chain_harvest(s);   /* L108 P2 */
+    K = s->spec.n_pend;
     if (K > 16u) K = 16u;
-    if (K && s->spec.dspark_pending_base != (int32_t)first_token) K = 0;
+    if (K && s->spec.pend_base != (int32_t)first_token) K = 0;
     /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
-     * the old position; dspark_pending_base is a token VALUE, so a plain eval
+     * the old position; pend_base is a token VALUE, so a plain eval
      * that advances the session (tool injection, </think> recovery) followed by
      * a first_token that happens to collide with it would otherwise resurrect
      * them. Dropping them is a throughput choice: a draft conditioned on the
      * wrong position is near-worthless and would just burn a verify row. It is
-     * NOT what keeps the output exact — both accept rules are proposal-agnostic
-     * (see the walk below), so q_oldpos is still exactly the distribution the
-     * draft was drawn from and the rule still yields p at the new position.
-     * Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
+     * NOT what keeps the output exact -- the walk emits the target's own draw
+     * whatever was drafted (spec_accept_walk), so a stale draft can only fail
+     * to match.  Mirrors carry_pos_match. (checkpoint.len is still the drafting-step value
      * here: this runs before the first_token push below.) */
-    if (K && s->spec.dspark_pending_pos != (int32_t)s->checkpoint.len) K = 0;
-    /* Params guard — also acceptance, not exactness. Drafts drawn under params X
-     * and verified under params Y are still verified EXACTLY: the residual
-     * rebuilds q under the stored params X (see the walk below), so the accept
-     * denominator and the residual name one proposal q_X, and the p/q rule
-     * returns exactly p_Y for any q. What a param change costs is acceptance —
-     * q_X is a poor proposal for p_Y — so we drop them and draft afresh.
-     * Mirrors the spec_carry_* params guard in pulsar_session_generate_speculative.
-     *
-     * The same holds for argmax drafts (dspark_pending_sampled == false), which
-     * carry no q: a temp<=0 -> temp>0 change cannot misroute them, because the
-     * walk picks its rule from pend_sampled, not from the live temperature, so
-     * they still meet the deterministic rule — itself exact for an arbitrary
-     * proposal. The guard just keeps a badly-matched proposal from wasting a
-     * row. */
+    if (K && s->spec.pend_pos != (int32_t)s->checkpoint.len) K = 0;
+    /* Params guard -- also acceptance, not exactness. Drafts drawn under params X
+     * and verified under params Y are verified exactly (the walk emits the
+     * target's draw under Y whatever was drafted); drafts drawn under X rarely
+     * match draws under Y, so we drop them and draft afresh rather than spend
+     * verify rows on them.  Mirrors the spec_carry_* params guard in
+     * pulsar_session_generate_speculative. */
     const bool pending_params_match =
-        s->spec.dspark_pending_temp == temperature && s->spec.dspark_pending_top_k == top_k &&
-        s->spec.dspark_pending_top_p == top_p && s->spec.dspark_pending_min_p == min_p;
+        s->spec.pend_temp == temperature && s->spec.pend_top_k == top_k &&
+        s->spec.pend_top_p == top_p && s->spec.pend_min_p == min_p;
     if (K && !pending_params_match) K = 0;
-    /* Proposal rule the pendings were drafted under; the verify walk must apply
-     * the matching rule (see dspark_pending_sampled). */
-    const bool pend_sampled = K ? s->spec.dspark_pending_sampled : false;
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
-    for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.dspark_pending[i];
-    /* DTree Phase 0: carry last step's drafter #2 + conf for these pendings. */
-    int32_t pend_alt[16];
-    float pend_conf[16];
-    if (dtree_stats)
-        for (uint32_t i = 0; i < K; i++) {
-            pend_alt[i] = s->spec.dspark_pending_alt[i];
-            pend_conf[i] = s->spec.dspark_pending_conf[i];
-        }
-    s->spec.dspark_n_pending = 0;
+    for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.pend[i];
+    /* Conf carried unconditionally (L107 controller). */
+    for (uint32_t i = 0; i < K; i++) pend_conf[i] = s->spec.pend_conf[i];
+    r->copy = K > 0u && s->spec.pend_copy;
+    pulsar_spec_drop_pendings(&s->spec);
     s->spec.spec_carry_valid = false;
-    const uint32_t n_batch = 1u + K;
+    n_batch = 1u + K;
 
-    /* Prompt-window seeding (one-time per prompt): fresh drafter state + a
-     * captured prompt window -> replay the last <=128 prompt positions into
-     * the drafter's context-KV ring, exactly as the reference prefills it.
-     * Without this the window starts empty (or, before the invalidate fix,
-     * stale from the previous request), and the drafter is near-useless
-     * without a valid window (masked-window eval: 4.7% vs 86% top-1). */
-    if (g->dspark_n_raw[0] == 0 && g->dspark_prompt_n > 0 && g->dspark_prompt_h[0]) {
-        const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
-        uint32_t avail = g->dspark_prompt_n - g->dspark_prompt_lo;
-        const uint32_t take = avail < win ? avail : win;
-        const uint32_t first = g->dspark_prompt_n - take;
-        bool seed_ok = true;
-        for (uint32_t j = 0; seed_ok && j < take; j++) {
-            const uint32_t slot = (first + j) % win;
-            for (int i = 0; seed_ok && i < 3; i++) {
-                seed_ok = pulsar_gpu_tensor_copy(g->dspark_target_h[i], 0,
-                                              g->dspark_prompt_h[i],
-                                              (uint64_t)slot * PULSAR_N_EMBD * sizeof(float),
-                                              (uint64_t)PULSAR_N_EMBD * sizeof(float)) != 0;
-            }
-            if (seed_ok && gpu_graph_dspark_project_main_x(g, &e->dspark_model, w))
-                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, w, 1);
-        }
-        if (dspark_stats)
-            fprintf(stderr, "pulsar: dspark prompt-window seeded %u rows (prompt_n=%u)\n",
-                    take, g->dspark_prompt_n);
-        g->dspark_prompt_n = 0;   /* consumed; commits take over from here */
-    }
+    /* a fresh drafter context primes itself from the prompt's captured features (DSpark: the last <= 128
+     * prompt positions replayed into its ring); a refusal fails the round with the target untouched */
+    if (spec_drafter(s)->prime && spec_drafter(s)->prime(s, err, errlen) != 0) return -1;
 
-    pulsar_spec_frontier frontier;
-    memset(&frontier, 0, sizeof(frontier));
-    if (!spec_frontier_snapshot(&frontier, s)) {
-        snprintf(err, errlen, "DSpark fused frontier snapshot failed");
+    /* the target's snapshot of what the verify rows will mutate (a family whose verify captures its
+     * own undo state inside the forward has none) */
+    if (spec_target(s)->snapshot && !spec_target(s)->snapshot(s, r, err, errlen)) {
         s->checkpoint_valid = false;
         return -1;
     }
 
-    const int saved_len = s->checkpoint.len;
+    saved_len = s->checkpoint.len;
     token_vec_push(&s->checkpoint, first_token);
     for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, (int)pend[i]);
+    return 0;
+}
 
-    /* ONE batched forward: base decode + draft verify + anchor capture. */
-    int row_tops[16];
-    g->dspark_capture_batch_n = n_batch;
-    g->spec_comp_save_n = n_batch;   /* Stage-B: save per-position comp projections */
-    bool ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
-                                           &s->checkpoint,
-                                           (uint32_t)saved_len, n_batch,
-                                           K ? row_tops : NULL, NULL);
-    g->dspark_capture_batch_n = 0;
-    g->spec_comp_save_n = 0;
-    if (!ok) {
+/* Finish the round over an already-run verify forward: accept walk, EOS
+ * clamp, metrics, quench, logits refresh, carry, state seed/rollback, emit,
+ * pendings redraft. Body verbatim from the fused loop with three seams for
+ * the batched lane: `read_row`/`read_ud` name the forward's logit rows
+ * (classic: spec_logits; batched: the shared ALL_ROWS block at the bank's
+ * offset), and `row0` is this round's first row in the forward's
+ * capture/comp-save buffers (classic: 0). Owns r->frontier's lifetime on
+ * every path. Returns tokens emitted, or -1 (session poisoned). */
+/// @param s the session
+/// @param r the round
+/// @param first_token the round's base token
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param greedy_rows per-row greedy override bits
+/// @param masks grammar mask rows (NULL = none)
+/// @param mask_rows rows in masks
+/// @param rng the request's stream (advanced past the emitted tokens; NULL greedy)
+/// @param wv the round's walk verdict
+/// @param row0 the round's first row in the forward's capture
+/// @param defer_redraft record the redraft for the batched pass
+/// @param t0 the step's start (now_sec), 0 when the forward ran outside the round
+/// @param forced_truth [K + 1] the true continuation for a teacher-forced end, else NULL
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1 (session poisoned)
+static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
+                          int first_token,
+                          float temperature, int top_k, float top_p, float min_p,
+                          uint32_t greedy_rows,
+                          const uint32_t *masks, uint32_t mask_rows,
+                          uint64_t *rng,
+                          const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
+                          bool defer_redraft,
+                          double t0,
+                          const int32_t *forced_truth,
+                          int *accepted, int accepted_cap,
+                          char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    static int dspark_stats_env = -1;
+    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
+    int n_accept = 0;
+    const uint32_t K = r->K;
+    const uint32_t n_batch = r->n_batch;
+    const int saved_len = r->saved_len;
+    int32_t (&pend)[16] = r->pend;
+    float (&pend_conf)[16] = r->pend_conf;
+    (void)pend_conf; (void)t0; (void)dspark_stats;
+    /* Accept the longest prefix the target agrees with: row i's own token --
+     * its argmax (greedy) or its draw at that token's key under the
+     * request's FILTERED target distribution (sampled) -- must equal pend[i];
+     * the first that differs is the carry (the device walk, spec_walk_rounds). */
+    int carry_tok = -1;
+    int commit_rc;
+    bool carry_refused = false;
+    if (forced_truth) {
+        /* TEACHER-FORCED end (gate-facing, L182): the walk is replaced by
+         * equality against the true continuation -- draft i is accepted iff it
+         * IS truth[i], the carry is the first true token the drafts did not
+         * cover, and no draw is made.  The context the redraft conditions on
+         * is the corpus, so the drafter's next proposal is a deterministic
+         * function of (model, drafter, context).  Everything after this point
+         * -- controllers, metrics, the trim, the redraft -- runs as in
+         * production. */
+        commit_rc = 0;
+        while ((uint32_t)commit_rc < K && pend[commit_rc] == forced_truth[commit_rc]) commit_rc++;
+        carry_tok = (int)forced_truth[commit_rc];
+    } else {
+        /* the device walk's verdict: a refused row ends the round -- unless it is a full accept's carry row and the
+         * stop clamp below cuts the round before it (that carry is never emitted; the host walk drew it from the
+         * clamped row, which the walk had already drawn) */
+        commit_rc = (int)wv->commit;
+        carry_tok = wv->carry;
+        carry_refused = wv->status != PULSAR_GPU_SAMPLE_OK;
+        if (carry_refused && wv->commit < K) commit_rc = -1;
+        /* L303: every row the walk judged a draft on must be under a mask (mask_rows > the stop row; a row past
+         * them was drawn unconstrained, and no masks at all is the round's grammar failure): the round is refused.
+         * A full accept's carry row past them is a refused carry, which only the stop clamp below can leave
+         * unused. */
+        if (masks) {
+            const uint32_t judged = wv->commit < K ? wv->commit : K - 1u;   /* the last draft row the walk read */
+            if (K > 0u && judged >= mask_rows) {
+                commit_rc = -1;
+            } else if (wv->commit >= mask_rows) {
+                carry_tok = -1;
+                carry_refused = true;
+            }
+        }
+        /* L301: the drafts the walk reached, against their confidences (a teacher-forced end has no target draw) */
+        if (commit_rc >= 0) pulsar_spec_calibration_note(e, r->copy, pend_conf, wv->label, wv->hit, wv->n_label);
+    }
+    if (commit_rc < 0) {
         s->checkpoint.len = saved_len;
-        (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        snprintf(err, errlen, "DSpark fused verify failed");
+        spec_round_undo(s, r);
+        snprintf(err, errlen, masks ? "spec walk: a row past the round's masks, or a masked row with no drawable "
+                                      "token (L303)" : "spec walk: the sampler refused a verify row");
         s->checkpoint_valid = false;
         return -1;
     }
-
-    /* Accept the longest prefix the target agrees with. Greedy: row i's
-     * argmax must equal pend[i]. Sampled: exact speculative sampling under the
-     * request's FILTERED target distribution p_i, with the rule matched to how
-     * the draft was PROPOSED:
-     *   - sampled proposal (the production path at temperature > 0): pend[i]
-     *     was drawn from a temperature-matched q_i, so accept w.p.
-     *     min(1, p_i/q_i) and on rejection draw the residual (p_i - q_i)+.
-     *     Acceptance is NOT capped at p_i(mode).
-     *   - argmax proposal (drafter/target vocab mismatch fallback): the
-     *     deterministic rule — accept w.p. p_i(pend[i]), residual p_i with
-     *     pend[i] excluded. Capped at p_i(mode).
-     * The rejected row's replacement becomes the carry token. All three paths
-     * yield the exact per-token target distribution. */
-    int commit = 0;
-    int carry_tok = -1;
-    if (temperature <= 0.0f || K == 0) {
-        while (commit < (int)K && row_tops[commit] == (int)pend[commit]) commit++;
-    } else {
-        if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
-        float *row_logits = s->spec_row_scratch;
-        bool walk_ok = true;
-        while (commit < (int)K) {
-            if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, row_logits)) {
-                walk_ok = false;
-                break;
-            }
-            pulsar_sample_dist dist;
-            pulsar_sample_dist_build(row_logits, PULSAR_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &s->sample_scratch, &dist);
-            const bool accepted_row = pend_sampled
-                ? pulsar_sample_dist_accept_pq(&dist, (int)pend[commit],
-                                            s->spec.dspark_pending_q[commit], rng)
-                : pulsar_sample_dist_accept(&dist, (int)pend[commit], rng);
-            if (accepted_row) {
-                pulsar_sample_dist_free(&dist);
-                commit++;
-                continue;
-            }
-            if (pend_sampled) {
-                /* Rebuild THIS position's q from the refined-logits row AND the
-                 * params stored at draft time. Both halves of the rule must name
-                 * the SAME proposal: the accept denominator above is the stored
-                 * scalar q(pend[i]) computed under the draft-time params, so the
-                 * residual's q must be rebuilt under those params too — not the
-                 * live ones. dist_build is pure, so feeding it the persisted row
-                 * + the persisted params reproduces the draft-time q bit-exactly,
-                 * by construction rather than by the params guard's coincidence
-                 * (never recomputed from live drafter state, which has advanced).
-                 * Only the one rejecting position pays this — the walk stops
-                 * here. */
-                pulsar_sample_dist qd;
-                pulsar_sample_dist_build(s->dspark_pending_qrows +
-                                          (size_t)commit * PULSAR_N_VOCAB,
-                                      PULSAR_N_VOCAB, s->spec.dspark_pending_temp,
-                                      s->spec.dspark_pending_top_k, s->spec.dspark_pending_top_p,
-                                      s->spec.dspark_pending_min_p,
-                                      &s->sample_scratch, &qd);
-                /* Holding two dists over one scratch is safe by dist_build's
-                 * aliasing contract: out->ids/probs never point into scratch. */
-                carry_tok = pulsar_sample_dist_draw_residual(&dist, &qd,
-                                                          &s->sample_scratch, rng);
-                pulsar_sample_dist_free(&qd);
-            } else {
-                carry_tok = pulsar_sample_dist_draw_excluding(&dist, (int)pend[commit], rng);
-            }
-            pulsar_sample_dist_free(&dist);
-            break;
-        }
-        /* row_logits is the session-owned reusable row — not freed here. */
-        if (!walk_ok) {
-            s->checkpoint.len = saved_len;
-            (void)spec_frontier_restore(&frontier, s);
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen, "DSpark sampled-accept logits readback failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
-    }
+    int commit = commit_rc;
+    /* L288: the walk's verdict, before the stop clamp, into the copy estimate; L308: any other round ages it */
+    if (r->copy) pulsar_spec_copy_observe(&s->spec, commit_rc, K);
+    else pulsar_spec_copy_age(&s->spec, 1u + (uint32_t)commit_rc);
 
     /* Ghost-token guard: never commit drafts PAST an accepted EOS. The
      * emission loop below stops at EOS, but the checkpoint trim uses commit —
@@ -704,28 +776,60 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
      * thinking-live continuation embeds the ghosts into the next prompt. The
      * EOS row itself stays committed (it was evaluated in the batch, matching
      * the batched lane's convention); hit_eos below invalidates the carry, so
-     * nothing ever samples from a post-EOS row. */
-    if ((int)first_token == (int)eos_token) {
+     * nothing ever samples from a post-EOS row.  "EOS" is the family's whole
+     * stop set (pulsar_token_is_stop; L284: the round cut only at the one eos
+     * id, so a Qwen draft of <|endoftext|> committed past it and the server
+     * invalidated the bank for the ghost tail). */
+    if (pulsar_token_is_stop(e, first_token)) {
         commit = 0;
     } else {
         for (int i = 0; i < commit; i++) {
-            if (pend[i] == (int32_t)eos_token) { commit = i + 1; break; }
+            if (pulsar_token_is_stop(e, (int)pend[i])) { commit = i + 1; break; }
         }
     }
 
     /* Prometheus /metrics spec-decode counters (server /metrics endpoint). The
      * base token is always emitted; K drafts were verified this step and the
-     * accepted prefix is [0,commit). num_drafts counts draft rounds only. */
+     * accepted prefix is [0,commit). num_drafts counts draft rounds only.
+     * verified_per_pos is the per-position ATTEMPT count: position i was put to
+     * the target iff i < K, which under the L107 adaptive depth is not every
+     * round. Without it a scraper can only form accepted[i]/num_drafts, a joint
+     * prefix probability that the depth schedule moves; with it the per-position
+     * rate is accepted[i]/verified[i] at any schedule (pulsar.h). */
     e->spec_gen_tokens += 1u + (uint64_t)commit;
     s->spec.spec_gen_tokens += 1u + (uint64_t)commit;
     if (K > 0) {
         e->spec_draft_tokens += K;
         e->spec_accepted_tokens += (uint64_t)commit;
         e->spec_num_drafts += 1u;
+        for (uint32_t i = 0; i < K && i < 16u; i++) e->spec_verified_per_pos[i]++;
         for (int i = 0; i < commit && i < 16; i++) e->spec_accepted_per_pos[i]++;
         s->spec.spec_draft_tokens += K;
         s->spec.spec_accepted_tokens += (uint64_t)commit;
         s->spec.spec_num_drafts += 1u;
+    }
+
+    /* L107 adaptive draft depth (spec_depth.h: the rule and its rationale).
+     * Runs BEFORE the redraft below so the next chain is drafted at the new
+     * depth. commit == depth implies the stop kept the whole chain AND the
+     * target accepted all of it (commit <= K <= depth always). A tail conf of
+     * -1 (no confidence, e.g. --spec-tau off) passes the UP check: the
+     * full-accept signal alone then drives the climb. Counts-only decision,
+     * deterministic for a fixed stream, same property as yield-quench. */
+    if (K > 0 && spec_drafter(s)->adapt && !r->copy) {   /* L288: a copy round says nothing of the drafter's depth */
+        /* the rule is spec_depth.h's; the numbers are the drafter's (pulsar_drafter_ops::adapt; NULL = a
+         * fixed depth) */
+        const uint32_t depth = pulsar_spec_cur_depth(s);
+        pulsar_spec_depth_state ds = {s->spec.spec_depth_down_forgiven, s->spec.spec_depth_rounds_since_up,
+                                      s->spec.spec_depth_climb_cooldown};
+        const int next = pulsar_spec_depth_next(spec_drafter(s)->adapt, &ds, depth, K, commit, pend_conf);
+        s->spec.spec_depth_down_forgiven = ds.down_forgiven;
+        s->spec.spec_depth_rounds_since_up = ds.rounds_since_up;
+        s->spec.spec_depth_climb_cooldown = ds.climb_cooldown;
+        if (dspark_stats && (uint32_t)next != depth)
+            fprintf(stderr, "pulsar: adaptive-k depth %u -> %d (commit=%d K=%u tail=%.2f)\n",
+                    depth, next, commit, K, (double)pend_conf[K - 1]);
+        s->spec.spec_adaptive_depth = next;
     }
 
     /* Yield-quench controller update (see the constants block up top). Uses
@@ -737,13 +841,11 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
      * distribution, so quenching changes speed, never marginals. */
     if (!s->spec.spec_quenched) {
         s->spec.spec_quench_steps++;
-        const int force = spec_quench_force_step();
         bool fire = false;
-        if (force >= 0) {
-            fire = s->spec.spec_quench_steps >= (uint32_t)force;
-        } else if (s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
+        const pulsar_lane_cost_fit *cost = &e->lane_cost[PULSAR_LANE_SPEC];
+        if (cost->valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(n_batch, saved_len);
+                                 spec_quench_guard(cost, s->spec.spec_round_banks, n_batch);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
@@ -754,130 +856,109 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
         if (fire) {
             s->spec.spec_quenched = true;
             fprintf(stderr,
-                    "pulsar: dspark yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
+                    "pulsar: spec yield-quench pos=%d steps=%u debt=%.2f ewma=%.2f "
                     "-> plain decode for request remainder%s\n",
                     saved_len + 1 + commit, s->spec.spec_quench_steps,
                     (double)s->spec.spec_quench_debt, (double)s->spec.spec_quench_ewma,
-                    force >= 0 ? " (forced)" : "");
+                    "");
         }
     }
 
-    /* DTree Phase 0 (§6): emit one record per ON-POLICY verified position — the
-     * accepted prefix 0..commit-1 plus the split (first rejected draft) at
-     * commit. Each carries that position's drafter confidence, whether the
-     * chain #1 was accepted (acc), and — at the split — whether the target's
-     * corrected token equals the drafter's #2 (alt_hit). This yields both the
-     * accept-rate-by-conf a(c) and the p2-by-conf table the go/no-go gate needs
-     * (the sibling row's marginal yield at a split is (1-a(c))*p2(c)). Positions
-     * past commit are off-policy (conditioned on a rejected token) and skipped. */
-    if (dtree_stats)
-        for (int i = 0; i <= commit && i < (int)K; i++) {
-            const int acc = (i < commit) ? 1 : 0;
-            const int alt_hit = acc ? -1 : (row_tops[i] == pend_alt[i] ? 1 : 0);
-            fprintf(stderr,
-                    "DTREE_V pos=%d k=%d conf=%.4f acc=%d alt_hit=%d r1=%d r2=%d tgt=%d nb=%u\n",
-                    saved_len + 1 + i, i, (double)pend_conf[i], acc, alt_hit,
-                    (int)pend[i], pend_alt[i], row_tops[i], n_batch);
-        }
-
-    /* Refresh s->logits to the last committed position's distribution. */
-    if (!gpu_graph_read_spec_logits_row(g, (uint32_t)commit, s->logits)) {
+    /* The live row: the last committed position's distribution, on the device (L302). */
+    if (!s->live_from_rows(s->dev.step_rows, row0 + (uint32_t)commit)) {
         s->checkpoint.len = saved_len;
-        (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        snprintf(err, errlen, "DSpark fused logits readback failed");
+        spec_round_undo(s, r);
+        snprintf(err, errlen, "spec round: the live row could not be taken from the verify");
         s->checkpoint_valid = false;
         return -1;
     }
 
-    /* Finalize the carry token — the next base, drawn from the refreshed
-     * s->logits (= row[commit]) when the walk did not already draw a residual:
-     * greedy -> argmax (the old next_base); sampled full-accept -> the bonus
-     * draw from the last accepted row's distribution. */
-    if (carry_tok < 0) {
-        if (temperature <= 0.0f) {
-            carry_tok = sample_argmax(s->logits, PULSAR_N_VOCAB);
-        } else {
-            pulsar_sample_dist bonus;
-            pulsar_sample_dist_build(s->logits, PULSAR_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, &s->sample_scratch, &bonus);
-            carry_tok = pulsar_sample_dist_draw(&bonus, rng);
-            pulsar_sample_dist_free(&bonus);
-        }
+    /* The carry -- the next base -- is the walk's draw: the first row that disagreed, or row K's on a full accept,
+     * at that token's own key, greedy or sampled by that row's rule (spec_row_greedy).  When the stop clamp cut the
+     * round below the walk's commit, an EOS ends it and the carry is never used.  The carry ROW's params are what the
+     * carry and the next chain record: the next round's base position's, which the next round's own resolution
+     * reads. */
+    const float carry_temp = spec_row_greedy(temperature, greedy_rows, (uint32_t)commit) ? 0.0f : temperature;
+    if (carry_tok < 0 && !(carry_refused && commit < commit_rc)) {
+        /* the committed row has no drawable distribution (the sampler said why): no carry can be honest, so the
+         * round fails */
+        s->checkpoint.len = saved_len;
+        spec_round_undo(s, r);
+        snprintf(err, errlen, "spec round: the sampler refused the carry row");
+        s->checkpoint_valid = false;
+        return -1;
     }
 
-    bool ok_state = true;
-    /* Every path below leaves main_x projected from the LAST committed hidden:
-     * the two seeding loops go through dspark_seed_from_batch_row, which
-     * projects it itself, and the replay loop projects per token.  The only way
-     * it can be stale is a projection failure in the replay path, which is
-     * tolerated there — so track that instead of re-projecting to find out. */
-    bool main_x_ready = true;
-    if (commit == (int)K) {
-        /* Full accept: the batch advanced the target state by exactly the
-         * committed tokens. Seed drafter rows for every committed position from
-         * its own captured hidden (row j = f(h_j)); the last copy leaves
-         * target_h = the drafting hidden. */
-        s->checkpoint.len = saved_len + 1 + commit;
-        for (int m = 0; ok_state && m <= commit && m < (int)n_batch; m++)
-            ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
-    } else {
-        /* Partial/zero accept: target state includes rejected positions.
-         * Stage A: restore the pre-batch frontier and replay the committed
-         * prefix (first_token + accepted drafts). The decode path re-captures
-         * each position's hidden; seed per position as the legacy loop does.
-         * (Stage B replaces this replay with transactional state rollback.) */
-        s->checkpoint.len = saved_len;
-        ok_state = spec_frontier_restore(&frontier, s);
-        static int no_replay = -1;
-        if (no_replay < 0) no_replay = getenv("PULSAR_DSPARK_REPLAY") == NULL;
-        if (ok_state && no_replay) {
-            /* Stage B: transformer-free rollback. Roll only the recurrent
-             * compressor/indexer pool state forward through the committed
-             * prefix from the projections saved during the verify batch
-             * (bit-identical: same update kernels, same rows, same order).
-             * Raw KV + comp-cache rows are position-addressed and already
-             * correct; counters are set by formula; s->logits was already
-             * read from the fused batch's last committed row; drafter rows
-             * seed from the batch capture. */
-            ok_state = gpu_graph_dspark_compressor_rollforward(g, &e->model, &e->weights,
-                                                               (uint32_t)saved_len,
-                                                               (uint32_t)(1 + commit));
-            if (ok_state) {
-                s->checkpoint.len = saved_len + 1 + commit;
-                for (int m = 0; ok_state && m <= commit; m++)
-                    ok_state = dspark_seed_from_batch_row(s, (uint32_t)m);
-            }
-        } else if (ok_state) {
-            int32_t replay[17];
-            replay[0] = (int32_t)first_token;
-            for (int i = 0; i < commit; i++) replay[1 + i] = pend[i];
-            for (int i = 0; ok_state && i < 1 + commit; i++) {
-                if (s->eval((int)replay[i], err, errlen) != 0) {
-                    ok_state = false;
-                    break;
-                }
-                if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
-                    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
-                else
-                    main_x_ready = false;   /* stale main_x: skip drafting below */
-            }
-            /* Replay refreshed s->logits from the last committed token. */
-        }
+    /* the drafter's conditioning features follow the last committed row through the absorbs below */
+    const bool features_ready = true;
+    /* The target leaves the installed bank's state at saved_len + 1 + commit (a full accept needs
+     * nothing of DeepSeek; a partial one restores its snapshot and rolls the recurrent state forward
+     * from the inputs saved during the verify -- bit-identical, no replay), then the drafter absorbs
+     * the committed rows 0..commit from its own captured features (row j = f(h_j)), each with the
+     * token that follows it: the next committed token, or the carry after the last. */
+    s->checkpoint.len = saved_len;
+    bool ok_state;
+    {
+        PULSAR_NVTX("spec: commit");   /* rule 5: the round's phases are named on the timeline */
+        ok_state = spec_target(s)->commit(s, r, (uint32_t)commit, row0);
     }
-    spec_frontier_free(&frontier);
+    if (ok_state) {
+        PULSAR_NVTX("spec: absorb");
+        s->checkpoint.len = saved_len + 1 + commit;
+        int32_t next[PULSAR_SPEC_LOGITS_ROWS + 1];
+        uint32_t n_abs = 0;
+        for (int m = 0; m <= commit && m < (int)n_batch; m++) next[n_abs++] = m < commit ? pend[m] : (int32_t)carry_tok;
+        ok_state = spec_absorb_rows(s, row0, next, n_abs);
+    }
+    if (spec_target(s)->release) spec_target(s)->release(s, r);
     if (!ok_state) {
-        snprintf(err, errlen, "DSpark fused state update failed");
+        snprintf(err, errlen, "spec round: the state update after the walk failed");
         s->checkpoint_valid = false;
         return -1;
     }
 
     /* Emit first_token + accepted drafts. */
     accepted[n_accept++] = first_token;
-    bool hit_eos = first_token == eos_token;
+    bool hit_eos = pulsar_token_is_stop(e, first_token);
     for (int i = 0; i < commit && n_accept < accepted_cap && !hit_eos; i++) {
         accepted[n_accept++] = (int)pend[i];
-        if (pend[i] == (int32_t)eos_token) hit_eos = true;
+        if (pulsar_token_is_stop(e, (int)pend[i])) hit_eos = true;
+    }
+    /* the stream steps past every token the round emitted: the carry sits at the next index, and the next
+     * chain's drafts past it (L288 sdet; a teacher-forced end draws nothing and leaves the stream alone) */
+    if (rng && !forced_truth) pulsar_sample_advance(rng, (uint32_t)n_accept);
+
+    /* L155 guard: the committed frontier (saved_len + 1 + commit) must equal
+     * what the caller receives.  EOS is already handled -- the ghost-token
+     * guard above clamps commit at an accepted EOS, so no post-EOS draft is
+     * ever committed (I first read this as a live leak; it is not).  The one
+     * way the two can still differ is accepted_cap binding below 1 + commit,
+     * which no current caller does (the server passes its array size).  Enforce
+     * the invariant anyway, where both counts are known: rewind() clamps the
+     * compressor frontier and drops the carry and drafter window (right -- the
+     * carry was conditioned on positions that no longer exist).  `exposed_end`
+     * is an arbitrary position, so the bank is left stale (L264): a further
+     * block on this session refuses until a sync restores a grid checkpoint,
+     * which is the fail-closed answer for a caller that bound accepted_cap.
+     * The server's tripwire (server_sched.cpp) checks the same equality after
+     * every round. */
+    const int exposed_end = saved_len + n_accept;
+    const bool trimmed = exposed_end < s->checkpoint.len;
+    if (trimmed) {
+        /* rewind() drops the drafter window, so this bank's seed rows go too:
+         * the deferred batch must not advance counters the rewind has reset. */
+        if (s->seed_defer.active) {
+            const uint32_t cur = pulsar_session_live_bank(s);
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < s->seed_defer.n; i++) {
+                if (s->seed_defer.bank[i] == cur) continue;
+                s->seed_defer.src_row[k] = s->seed_defer.src_row[i];
+                s->seed_defer.bank[k] = s->seed_defer.bank[i];
+                k++;
+            }
+            s->seed_defer.n = k;
+        }
+        spec_target(s)->cut(s, exposed_end);
     }
 
     /* The carry IS the next base (already correctly distributed). Persist it
@@ -885,292 +966,150 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
     s->spec.spec_carry_token = (int32_t)carry_tok;
-    s->spec.spec_carry_valid = !hit_eos;
+    s->spec.spec_carry_valid = !hit_eos && !trimmed;
     s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
-    s->spec.spec_carry_temp = temperature;
+    s->spec.spec_carry_temp = carry_temp;
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
-    if (n_draft > 16u) n_draft = 16u;
-    if (hit_eos || next_base == eos_token || n_draft == 0 || s->spec.spec_quenched) {
+    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
-         * generate_speculative call consumes before routing plain. */
-        if (dspark_stats)
+         * generate_speculative call consumes before routing plain.  (After an
+         * L155 trim there is no carry: the generation ended at the cap.) */
+        if (dspark_stats && t0 > 0.0)
             fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);
         return n_accept;
     }
 
-    /* Draft forward + markov refine (mirrors the legacy block Steps 3-5).
-     * NOTE: no seed here -- the committed positions' rows were seeded above
-     * (row j = f(h_j)); next_base's own row is seeded NEXT step when it is
-     * processed as batch position 0.
-     *
-     * main_x is NOT re-projected here.  It used to be, "for clarity", after the
-     * seeding loop had already left it at exactly this value — 3 sync copies, a
-     * gemv and a norm per step for a value we already had.  The invariant is
-     * checked at main_x_ready above, and seed_draft_kv only reads main_x, so
-     * nothing between there and here can disturb it. */
-    if (!main_x_ready)
-        return n_accept;   /* drafting is best-effort; the step already succeeded */
-    int32_t draft_ids[16];
-    draft_ids[0] = (int32_t)next_base;
-    for (uint32_t i = 1; i < n_draft; i++) draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
-    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
-                                        &e->dspark_model, &e->dspark_weights,
-                                        g->spec_logits, draft_ids, n_draft))
+    if (defer_redraft) {
+        /* L150: the batched lane drafts every bank in ONE pass after all the
+         * walks (pulsar_session_spec_redraft_batch). Record what this bank's
+         * redraft needs and leave the shadow with no pendings: a bank the batch
+         * cannot serve simply takes a plain n=1 step next round. */
+        pulsar_spec_drop_pendings(&s->spec);
+        spec_redraft_req *q = &r->redraft;
+        pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
+        q->valid = features_ready;
         return n_accept;
-
-    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
-    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return n_accept;
-    int32_t refined[17];
-    /* DTree Phase 0: markov runner-up per draft position. CAVEAT since drafts
-     * are sampled: this is the runner-up to the markov ARGMAX, which is no
-     * longer necessarily the token we drafted. DTREE_V's alt_hit therefore no
-     * longer means "target's correction == drafter's #2 given #1 rejected" —
-     * the p2 table in memory was measured under argmax drafting. Diagnostic
-     * only (dtree_stats), but re-derive p2 before reusing that conclusion. */
-    int32_t refined2[17];
-    refined[0] = (int32_t)next_base;
-    refined2[0] = -1;
-    /* Temperature-matched draft sampling: draw each draft from the refined
-     * logits filtered at the REQUEST's params (q) instead of taking the
-     * drafter's argmax, so the verify walk can use min(1, p/q) — whose
-     * acceptance is not capped at p(mode).
-     *
-     * temperature <= 0 keeps the argmax path untouched: no readback, no
-     * dist_build, and — critically — no rng draw, so the greedy token stream
-     * stays byte-identical (dist_build would collapse to a point mass, but
-     * pulsar_sample_dist_draw would still consume an rng word and shift the
-     * stream). It is also the fast path we do not want to slow down.
-     *
-     * The vocab check is a correctness guard, not an optimization: p is built
-     * over PULSAR_N_VOCAB target logits and q over the drafter's vocab_size. If
-     * they disagree the two are not distributions over the same space (and the
-     * row copy would overrun), so fall back to argmax proposals + the
-     * deterministic accept rule, which needs no q. */
-    const bool sample_drafts = temperature > 0.0f && vocab_size == PULSAR_N_VOCAB;
-    if (sample_drafts) {
-        /* n_draft rows, not 16: the depth is fixed per engine
-         * (e->dspark_draft_tokens, 3 by default), so this is 1.6 MB rather than
-         * 8.3 MB per session. Grow-only, so a depth change is still safe. */
-        const uint32_t need = n_draft * PULSAR_N_VOCAB;
-        if (s->dspark_pending_qrows_cap < need) {
-            free(s->dspark_pending_qrows);
-            s->dspark_pending_qrows = (float *)xmalloc((size_t)need * sizeof(float));
-            s->dspark_pending_qrows_cap = need;
-        }
     }
-    bool draft_ok = true;
-    for (uint32_t pos = 0; pos < n_draft && draft_ok; pos++) {
-        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
-            g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
-        draft_ok = base_row &&
-            pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined[pos + 1],
-                                             dtree_stats ? &refined2[pos + 1] : NULL,
-                                             base_row, dmap, dsize,
-                                             w->markov_w1->abs_offset,
-                                             w->markov_w2->abs_offset,
-                                             refined[pos], vocab_size, embed_dim);
-        pulsar_gpu_tensor_free(base_row);
-        if (!draft_ok || !sample_drafts) continue;
-        /* Read this position's refined logits back BEFORE the next markov step
-         * overwrites the single-row scratch, and keep the row: the residual
-         * needs the full q of whichever position rejects, which is not known
-         * until verify. (This full-vocab D2H per draft position is the
-         * deliberate temporary cost Item 2's fused GPU accept kernel removes.) */
-        float *qrow = s->dspark_pending_qrows + (size_t)pos * PULSAR_N_VOCAB;
-        if (!pulsar_gpu_tensor_read(dspark_logits, 0, qrow, vocab_bytes)) {
-            draft_ok = false;
-            break;
-        }
-        pulsar_sample_dist q;
-        pulsar_sample_dist_build(qrow, PULSAR_N_VOCAB, temperature, top_k, top_p, min_p,
-                              &s->sample_scratch, &q);
-        const int drawn = pulsar_sample_dist_draw(&q, rng);
-        refined[pos + 1] = (int32_t)drawn;   /* the chain continues SAMPLED */
-        s->spec.dspark_pending_q[pos] = pulsar_sample_dist_prob(&q, drawn);
-        /* Diagnostic: how much proposal entropy is there actually? The whole
-         * premise of temperature-matched drafting is that q is a DISTRIBUTION.
-         * If q.n == 1 (or q(top) ~ 1) the draw is the argmax, min(1,p/q)
-         * degenerates to the deterministic rule, and Item 1 is a no-op. */
-        if (dspark_stats)
-            fprintf(stderr, "DSPARK_Q pos=%u q_n=%u q_top=%.4f q_drawn=%.4f "
-                            "drawn_is_argmax=%d\n",
-                    pos, q.n, (double)q.probs[0],
-                    (double)s->spec.dspark_pending_q[pos], drawn == q.ids[0]);
-        pulsar_sample_dist_free(&q);
-    }
-    if (!draft_ok) return n_accept;
-
-    /* Offline-validation / confidence-training dump (same hook as the legacy
-     * loop, which the production fused path previously never reached). Emitted
-     * after markov refine, while batch_ffn_cur still holds the post-hc_head
-     * hidden rows the confidence kernel consumes. */
-    dspark_dump_step(g, (int)s->checkpoint.len, (int)next_base, refined, (int)n_draft);
-
-    /* On-policy trajectory dump (PULSAR_DSPARK_DUMP_ONPOLICY=<max steps>,
-     * _PATH=<file>): self-contained per-step records for teacher-forcing the
-     * offline torch drafter on THE ENGINE'S OWN trajectory — discriminates
-     * "remaining acceptance gap is on-policy distribution" (torch matches the
-     * engine's level on identical data) from "engine draft-forward middle is
-     * numerically wrong" (torch scores much higher). Record: {pos, next_base,
-     * n_draft, n_batch, commit, refined[n_draft+1], th[n_batch][3][4096] f32};
-     * batch row m holds the anchor hiddens of position pos-1-commit+m; rows
-     * 0..commit are the committed positions, row commit the drafting anchor. */
+    uint32_t keep;
     {
-        static int opsteps = -1;
-        if (opsteps < 0) {
-            const char *e2 = getenv("PULSAR_DSPARK_DUMP_ONPOLICY");
-            opsteps = e2 && e2[0] ? atoi(e2) : 0;
-        }
-        static int opdone = 0;
-        /* Read once, and only if the already-cached step budget says this dump
-         * is live at all — the previous form called getenv every spec step even
-         * when opsteps was 0, i.e. always, for everyone. */
-        static const char *oppath = NULL;
-        static int oppath_read = 0;
-        if (opsteps > 0 && !oppath_read) {
-            oppath_read = 1;
-            const char *p = getenv("PULSAR_DSPARK_DUMP_ONPOLICY_PATH");
-            oppath = (p && p[0]) ? p : NULL;
-        }
-        if (opdone < opsteps && oppath) {
-            FILE *f2 = fopen(oppath, opdone == 0 ? "wb" : "ab");
-            if (f2) {
-                int32_t hdr2[5] = { (int32_t)s->checkpoint.len, (int32_t)next_base,
-                                    (int32_t)n_draft, (int32_t)n_batch, (int32_t)commit };
-                fwrite(hdr2, sizeof(int32_t), 5, f2);
-                fwrite(refined, sizeof(int32_t), (size_t)n_draft + 1, f2);
-                float *row2 = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
-                for (uint32_t m2 = 0; m2 < n_batch; m2++) {
-                    for (int sl = 0; sl < 3; sl++) {
-                        memset(row2, 0, (size_t)PULSAR_N_EMBD * sizeof(float));
-                        (void)pulsar_gpu_tensor_read(g->dspark_target_h_batch[sl],
-                                                  (uint64_t)m2 * PULSAR_N_EMBD * sizeof(float),
-                                                  row2,
-                                                  (uint64_t)PULSAR_N_EMBD * sizeof(float));
-                        fwrite(row2, sizeof(float), PULSAR_N_EMBD, f2);
-                    }
-                }
-                free(row2);
-                /* Bug-#4 localization payload (PULSAR_DSPARK_DUMP_RING=1): the
-                 * drafter's context-KV ring + counters as the NEXT draft
-                 * forward will read them (post-seeding for this step's
-                 * commits), plus this step's block outputs (cur_hc rows).
-                 * Lets the torch reference attend over the ENGINE'S OWN ring
-                 * to split "seed rows wrong" from "block compute wrong". */
-                static int dump_ring = -1;
-                if (dump_ring < 0) dump_ring = getenv("PULSAR_DSPARK_DUMP_RING") != NULL;
-                if (dump_ring) {
-                    const uint64_t ring_bytes =
-                        (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
-                    float *ring = (float *)xmalloc(ring_bytes);
-                    for (int li2 = 0; li2 < 3; li2++) {
-                        int32_t nr = (int32_t)g->dspark_n_raw[li2];
-                        fwrite(&nr, sizeof(int32_t), 1, f2);
-                        memset(ring, 0, ring_bytes);
-                        (void)pulsar_gpu_tensor_read(g->dspark_raw_cache[li2], 0, ring, ring_bytes);
-                        fwrite(ring, sizeof(float), ring_bytes / sizeof(float), f2);
-                    }
-                    free(ring);
-                    const uint64_t hcw2 = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
-                    float *hcrow = (float *)xmalloc(hcw2 * sizeof(float));
-                    for (uint32_t p2 = 0; p2 < n_draft; p2++) {
-                        memset(hcrow, 0, hcw2 * sizeof(float));
-                        (void)pulsar_read_hc_carrier_f32(g->batch_cur_hc, (uint64_t)p2 * hcw2,
-                                                      hcrow, hcw2);
-                        fwrite(hcrow, sizeof(float), hcw2, f2);
-                    }
-                    free(hcrow);
-                }
-                fclose(f2);
-                opdone++;
-            }
-        }
+        PULSAR_NVTX("spec: draft");
+        keep = spec_drafter(s)->draft(s, next_base, features_ready, carry_temp, top_k, top_p, min_p, rng);
     }
-
-    /* Confidence-scheduled pending length (P1 head; keep the confident prefix).
-     * DTree Phase 0: compute conf even when conf-sched is off, so the p2 table
-     * can bucket by the actual confidence at every drafted position (collect
-     * with PULSAR_DSPARK_CONF_SCHED=off for an unbiased, fully-verified sample). */
-    uint32_t keep = n_draft;
-    float conf[16];
-    bool have_conf = false;
-    {
-        const float tau = dspark_conf_sched_tau();
-        if (tau > 0.0f || dtree_stats) {
-            /* Persistent graph-owned scratch (n_draft is clamped to 16 above):
-             * the alloc/free pair here ran every fused spec step and each
-             * cudaMalloc/cudaFree serializes the device, which is exactly the
-             * pattern already retired in gpu_decode's dspark projection. */
-            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
-            pulsar_gpu_tensor *tok_dev = g->dspark_conf_tokens;
-            if (conf_dev && tok_dev &&
-                pulsar_gpu_tensor_write(tok_dev, 0, refined, (uint64_t)n_draft * sizeof(int32_t)) &&
-                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
-                                                      dmap, dsize,
-                                                      w->markov_w1->abs_offset,
-                                                      w->confidence_proj->abs_offset,
-                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size) &&
-                pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
-                have_conf = true;
-                if (tau > 0.0f) {
-                    uint32_t k = 0;
-                    while (k < n_draft && conf[k] >= tau) k++;
-                    keep = k;   /* 0 pending = next step is a plain n=1 forward */
-                }
-            }
-        }
+    if (keep == PULSAR_DRAFT_REFUSED) {   /* L306: the drafter refused the next chain (its line says why) */
+        snprintf(err, errlen, "spec round: the drafter refused the next chain");
+        return -1;
     }
-    s->spec.dspark_pending_base = (int32_t)next_base;
-    s->spec.dspark_n_pending = keep;
-    for (uint32_t i = 0; i < keep; i++) s->spec.dspark_pending[i] = refined[i + 1];
-    /* The proposal rule and the exact params these drafts were sampled under.
-     * Stamped unconditionally, in the same straight-line block as
-     * dspark_n_pending above — this is the only site that makes pendings
-     * non-zero, so a populated dspark_pending_q[]/qrows pool (filled in the
-     * drafting loop above, under sample_drafts) always has its params alongside
-     * it. Three consumers: the verify walk picks its accept rule from the flag,
-     * next step's params guard compares against the params, and — load-bearing —
-     * the residual rebuilds q from the qrows under THESE params, so the stored
-     * accept denominator and the residual describe one proposal. */
-    s->spec.dspark_pending_sampled = sample_drafts;
-    s->spec.dspark_pending_pos = (int32_t)s->checkpoint.len;
-    s->spec.dspark_pending_temp = temperature;
-    s->spec.dspark_pending_top_k = top_k;
-    s->spec.dspark_pending_top_p = top_p;
-    s->spec.dspark_pending_min_p = min_p;
-    if (dtree_stats)
-        for (uint32_t i = 0; i < keep; i++) {
-            s->spec.dspark_pending_alt[i] = refined2[i + 1];
-            s->spec.dspark_pending_conf[i] = have_conf ? conf[i] : -1.0f;
-        }
-
-    /* DTree Phase 0: mid-band frequency — how often the drafted chain carries a
-     * position whose confidence lands in the ~[0.25,0.65] split band (where a
-     * confidence-gated sibling row could pay), and where the first such split
-     * point falls. next_base sits at abs position s->checkpoint.len; drafted
-     * position pos is next_base+1+pos. */
-    if (dtree_stats && have_conf) {
-        int firstmid = -1;
-        for (uint32_t i = 0; i < n_draft; i++)
-            if (conf[i] >= 0.25f && conf[i] <= 0.65f) { firstmid = (int)i; break; }
-        char cbuf[160];
-        int off = 0;
-        for (uint32_t i = 0; i < n_draft && off < (int)sizeof(cbuf) - 8; i++)
-            off += snprintf(cbuf + off, sizeof(cbuf) - off, "%s%.3f",
-                            i ? "," : "", (double)conf[i]);
-        fprintf(stderr, "DTREE_MID base_pos=%d nd=%u firstmid=%d conf=[%s]\n",
-                (int)s->checkpoint.len, n_draft, firstmid, cbuf);
-    }
-
-    if (dspark_stats)
+    /* t0 == 0 marks a lane whose forward ran outside this round (the batched
+     * lane) -- step_ms would print the epoch, so skip the line there. */
+    if (dspark_stats && t0 > 0.0)
         fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d pend=%u step_ms=%.1f\n",
                 n_batch, commit, keep, (now_sec() - t0) * 1000.0);
     return n_accept;
+}
+
+
+/* The single lane (the classic API: CLI, eval, warmup): begin, the target's own verify forward over
+ * the round's rows, end -- the batched lane runs the same begin and end around a shared forward. */
+/// @param s the session
+/// @param first_token the base token
+/// @param max_tokens the most tokens to emit
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param rng the request's stream
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1
+static int spec_single_round(pulsar_session *s, int first_token,
+                             int max_tokens,
+                             float temperature, int top_k,
+                             float top_p, float min_p,
+                             uint64_t *rng,
+                             int *accepted, int accepted_cap,
+                             char *err, size_t errlen) {
+    pulsar_engine *e = s->engine;
+    const double t0 = now_sec();
+    pulsar_spec_round r;
+    memset(&r, 0, sizeof r);
+    {
+        const int brc = spec_round_begin(s, first_token, max_tokens, accepted_cap,
+                                         temperature, top_k, top_p, min_p, &r,
+                                         err, errlen);
+        if (brc != 0) { free(r.snap); return brc; }
+    }
+    bool verified;
+    {
+        PULSAR_NVTX("spec: verify");
+        verified = spec_target(s)->verify_single(s, &r, err, errlen);
+    }
+    /* the walk over the verify's rows (row 0 is the base's), on the device */
+    pulsar_gpu_spec_walk_out wv;
+    if (verified) {
+        PULSAR_NVTX("spec: walk");
+        const spec_walk_round w = {&r, 0u, temperature, top_k, top_p, min_p, 0u, rng ? *rng : 0u, NULL, 0u};
+        if (temperature > 0.0f && !rng) {
+            snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
+            verified = false;
+        } else {
+            verified = spec_walk_rounds(s, &w, 1, &wv, err, errlen);
+        }
+    }
+    if (!verified) {
+        s->checkpoint.len = r.saved_len;
+        spec_round_undo(s, &r);
+        s->checkpoint_valid = false;
+        free(r.snap);
+        return -1;
+    }
+    const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
+    s->spec.spec_round_banks = 1;
+    const int na = spec_round_end(s, &r, first_token,
+                                  temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
+                                  NULL, 0u, rng,
+                                  &wv, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
+    free(r.snap);
+    /* L263: this lane's own cost observation -- the whole step, redraft
+     * included.  Off TP only: a group's ranks must hold the same fit, and this
+     * lane has no frame to carry one, so on a group neither rank observes
+     * here (the batched lane ships the leader's with every round's end). */
+    if (na >= 0 && !e->tp) {
+        const double ms = (now_sec() - t0) * 1e3;
+        pulsar_engine_lane_cost_observe(e, PULSAR_LANE_SPEC, n_rows, ms);
+    }
+    return na;
+}
+
+/* The base draw: the live row at the stream's next undrawn key, read without consuming it -- the round that emits
+ * the base advances past it (L288 sdet).  Greedy never reads the key, and a greedy caller may pass no stream. */
+/// @param s the session
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param mask the grammar mask row (NULL = none)
+/// @param rng the request's stream (read, not advanced; may be NULL when greedy)
+/// @return the token, or PULSAR_SAMPLE_REFUSED
+static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float top_p, float min_p,
+                          const uint32_t *mask, const uint64_t *rng) {
+    if (temperature > 0.0f && !rng) return PULSAR_SAMPLE_REFUSED;
+    pulsar_gpu_sample_req q;
+    memset(&q, 0, sizeof(q));
+    q.temperature = temperature;
+    q.top_k = top_k;
+    q.top_p = top_p;
+    q.min_p = min_p;
+    q.key = rng ? pulsar_sample_key(*rng, 0u) : 0u;
+    q.probe = -1;
+    const uint32_t row = 0;
+    pulsar_gpu_sample_out o;
+    return s->draw_rows(s->dev.live, &row, 1, &q, &mask, &o) ? o.token : PULSAR_SAMPLE_REFUSED;   /* L303: through its mask */
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the
@@ -1181,7 +1120,7 @@ static int pulsar_session_eval_speculative_fused(pulsar_session *s, int first_to
  * eval_speculative_block behavior). Returns the number of tokens emitted. */
 int pulsar_session::generate_speculative(float temperature, int top_k,
                                      float top_p, float min_p, uint64_t *rng,
-                                     int max_tokens, int eos_token,
+                                     int max_tokens,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     auto *s = this;
@@ -1210,24 +1149,29 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
          * force greedy): redraw from the current distribution */
         s->spec.spec_carry_valid = false;
-        first = sample_top_p_min_p(s->logits, PULSAR_N_VOCAB, temperature, top_k,
-                                   top_p, min_p, rng, &s->sample_scratch);
+        first = spec_base_draw(s, temperature, top_k, top_p, min_p, NULL, rng);
+        if (first < 0) {
+            snprintf(err, errlen, "the sampler refused the live logits row");
+            return -1;
+        }
     }
-    if (first == eos_token) {
+    if (pulsar_token_is_stop(s->engine, first)) {
         /* never forward EOS through the target (matches the old caller loops,
          * which broke before eval) */
         accepted[0] = first;
+        if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
     /* Yield-quenched requests run plain for their remainder — the same route
      * as a drafterless engine, chosen per request. The carry consumed above is
      * already correctly distributed, so this is a pure speed decision. */
-    if (!s->engine->has_dspark() || s->spec.spec_quenched) {
-        if (s->eval(first, err, errlen) != 0) return -1;
+    if (!spec_drafter(s) || s->spec.spec_quenched) {
+        if (pulsar_session_family_eval(s, first, err, errlen) != 0) return -1;
         accepted[0] = first;
+        if (rng) pulsar_sample_advance(rng, 1u);
         return 1;
     }
-    return pulsar_session_eval_speculative_fused(s, first, max_tokens, eos_token,
+    return spec_single_round(s, first, max_tokens,
                                               temperature, top_k, top_p, min_p, rng,
                                               accepted, accepted_cap, err, errlen);
 }
@@ -1235,7 +1179,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
 
 
 int pulsar_session::eval_speculative_block(int first_token,
-                                        int max_tokens, int eos_token,
+                                        int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     auto *s = this;
@@ -1248,340 +1192,483 @@ int pulsar_session::eval_speculative_block(int first_token,
                  "per-bank state is stale; re-sync the session first");
         return -1;
     }
-    if (!s->engine->has_dspark() || s->spec.spec_quenched) {
-        if (s->eval(first_token, err, errlen) != 0) return -1;
+    if (!spec_drafter(s) || s->spec.spec_quenched) {
+        if (pulsar_session_family_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
-    /* The fused loop (one batched forward/step + transactional no-replay
-     * rollback) is the default: measured 16.4 vs 15.2 t/s legacy-vs-baseline
-     * and byte-identical deterministic output. PULSAR_DSPARK_LEGACY_LOOP restores
-     * the old Step1+verify loop as an operational fallback. */
-    static int fused_cache = -1;
-    if (fused_cache < 0) fused_cache = getenv("PULSAR_DSPARK_LEGACY_LOOP") == NULL;
+    /* The fused loop -- one batched forward/step plus transactional no-replay
+     * rollback -- is the only loop.  It measured 16.4 vs 15.2 t/s against the
+     * old Step1+verify loop with byte-identical deterministic output, and that
+     * legacy loop is DELETED along with PULSAR_DSPARK_LEGACY_LOOP, which had no
+     * setter anywhere and so could never have restored it. */
     /* an externally chosen first_token invalidates any pending carry */
     s->spec.spec_carry_valid = false;
-    if (fused_cache)
-        return pulsar_session_eval_speculative_fused(s, first_token, max_tokens, eos_token,
-                                                  0.0f, 0, 1.0f, 0.0f, NULL,
-                                                  accepted, accepted_cap, err, errlen);
+    return spec_single_round(s, first_token, max_tokens,
+                                                 0.0f, 0, 1.0f, 0.0f, NULL,
+                                                 accepted, accepted_cap, err, errlen);
+}
 
-    pulsar_engine *e = s->engine;
-    pulsar_gpu_graph *g = &s->graph;
-    const uint32_t n_draft = (uint32_t)e->dspark_draft_tokens;
-    int n_accept = 0;
-    static int dspark_stats_env = -1;
-    const int dspark_stats = gpu_graph_env_flag("PULSAR_DSPARK_STATS", &dspark_stats_env);
-    const double dspark_t0 = dspark_stats ? now_sec() : 0.0;
-    double dspark_draft_ms = 0.0;
-    int dspark_base0 = -1;   /* draft-forward's row-0 argmax (pre-markov) */
-    double dspark_markov_ms = 0.0, dspark_snap_ms = 0.0, dspark_verify_ms = 0.0;
-    const int dump_pos = s->checkpoint.len;  /* first_token's sequence position */
+/* ---- plan-34 inc 6: the batched-lane round API (pulsar.h) --------------- */
 
-    /* Step 1: run target decode for the first token */
-    if (s->eval(first_token, err, errlen) != 0) return -1;
+/// Allocate a zeroed round (pulsar.h; the batched lane's per-bank record).
+/// @return the round, freed with pulsar_spec_round_free (xmalloc: dies on OOM)
+pulsar_spec_round *pulsar_spec_round_new(void) {
+    pulsar_spec_round *r = (pulsar_spec_round *)xmalloc(sizeof(pulsar_spec_round));
+    memset(r, 0, sizeof(*r));
+    return r;
+}
 
-    /* Step 2: project main_x from captured target hidden states */
-    if (!gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
-        return -1;
+void pulsar_spec_round_free(pulsar_spec_round *r) {
+    if (!r) return;
+    free(r->snap);            /* the target's snapshot handle */
+    free(r);
+}
 
-    /* Step 2b: seed the current frontier's main_kv into the drafter KV BEFORE the
-     * draft forward, matching the reference DSparkAttention (store main_kv at
-     * start_pos, then attend).  The old code seeded only at the END of the step
-     * (Step 7) and only on accepts, so the draft forward attended to an empty /
-     * stale context.  One row per step -> dspark_n_raw tracks the frontier. */
-    gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
-
-    /* Step 3: build draft input — position 0 = first_token, rest = noise */
-    int32_t draft_ids[16];
-    draft_ids[0] = (int32_t)first_token;
-    for (uint32_t i = 1; i < n_draft; i++)
-        draft_ids[i] = PULSAR_DSPARK_NOISE_TOKEN_ID;
-
-    /* Step 3b: confidence gate. Draft acceptance tracks the base model's own
-     * certainty (the drafter is trained to mimic it), so only spend the
-     * draft+verify budget when the target is peaked; on uncertain tokens the
-     * verify would almost always reject and we'd pay ~100-150ms for nothing.
-     * Skipping here costs exactly a plain decode (first_token already committed
-     * in Step 1, s->logits intact). Steps 2/2b already seeded this position into
-     * the drafter KV, so its rolling context stays complete for later steps.
-     * PULSAR_DSPARK_MIN_CONF=0 (default) preserves the old always-draft behavior. */
-    {
-        static float min_conf = -1.0f;
-        if (min_conf < 0.0f) {
-            const char *mc = getenv("PULSAR_DSPARK_MIN_CONF");
-            const float v = mc ? (float)atof(mc) : 0.0f;
-            min_conf = v > 0.0f ? v : 0.0f;
-        }
-        if (min_conf > 0.0f) {
-            const float p = dspark_base_top1_prob(s->logits, PULSAR_N_VOCAB);
-            if (p < min_conf) {
-                if (dspark_stats)
-                    fprintf(stderr, "pulsar: dspark step draft_n=%d committed=0 conf_skip p=%.3f min=%.3f "
-                                    "step_ms=%.1f\n",
-                            (int)n_draft, (double)p, (double)min_conf,
-                            (now_sec() - dspark_t0) * 1000.0);
-                accepted[n_accept++] = first_token;
-                return n_accept;
-            }
-        }
-    }
-
-    /* Step 4: run draft forward → N-token base logits in g->spec_logits */
-    const double dspark_draft_t0 = dspark_stats ? now_sec() : 0.0;
-    if (!gpu_graph_dspark_draft_forward(g, &e->model, &e->weights,
-                                         &e->dspark_model, &e->dspark_weights,
-                                         g->spec_logits, draft_ids, n_draft))
-        return -1;
-    if (dspark_stats) {
-        (void)pulsar_gpu_synchronize();
-        dspark_draft_ms = (now_sec() - dspark_draft_t0) * 1000.0;
-        float *r0 = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(float));
-        if (gpu_graph_read_spec_logits_row(g, 0, r0))
-            dspark_base0 = sample_argmax(r0, PULSAR_N_VOCAB);
-        free(r0);
-        /* conditioning diagnostics: is target_h captured, main_x sane, KV seeded? */
-        float *tmp = (float *)xmalloc((size_t)PULSAR_N_EMBD * sizeof(float));
-        double mn = 0.0, th[3] = {0, 0, 0};
-        if (pulsar_gpu_tensor_read(g->dspark_main_x, 0, tmp, (uint64_t)PULSAR_N_EMBD * 4))
-            for (int j = 0; j < (int)PULSAR_N_EMBD; j++) mn += (double)tmp[j] * tmp[j];
-        for (int i = 0; i < 3; i++)
-            if (pulsar_gpu_tensor_read(g->dspark_target_h[i], 0, tmp, (uint64_t)PULSAR_N_EMBD * 4))
-                for (int j = 0; j < (int)PULSAR_N_EMBD; j++) th[i] += (double)tmp[j] * tmp[j];
-        free(tmp);
-        fprintf(stderr, "pulsar: dspark cond main_x=%.3f target_h=[%.2f,%.2f,%.2f] n_raw=[%u,%u,%u]\n",
-                sqrt(mn), sqrt(th[0]), sqrt(th[1]), sqrt(th[2]),
-                g->dspark_n_raw[0], g->dspark_n_raw[1], g->dspark_n_raw[2]);
-    }
-
-    /* Step 5: Markov refine — sequential over N positions */
-    const pulsar_dspark_weights *w = &e->dspark_weights;
-    const uint32_t embed_dim = 256;
-    const uint32_t vocab_size = w->vocab_size;
-    const uint64_t vocab_bytes = (uint64_t)vocab_size * sizeof(float);
-    const void *dmap = e->dspark_model.map;
-    const uint64_t dsize = e->dspark_model.size;
-
-    pulsar_gpu_tensor *dspark_logits = g->dspark_markov_logits;   /* persistent scratch */
-    if (!dspark_logits || pulsar_gpu_tensor_bytes(dspark_logits) < vocab_bytes) return -1;
-    const double dspark_mk_t0 = dspark_stats ? now_sec() : 0.0;
-
-    /* refined_ids[0] holds first_token; positions 1..n_draft hold the refined
-     * drafts, so the array needs n_draft + 1 slots (17 at the clamp of 16). */
-    int32_t refined_ids[17];
-    refined_ids[0] = (int32_t)first_token;
-    for (uint32_t pos = 0; pos < n_draft; pos++) {
-        /* Create view of spec_logits row [pos] as base logits */
-        pulsar_gpu_tensor *base_row = pulsar_gpu_tensor_view(
-            g->spec_logits, (uint64_t)pos * vocab_bytes, vocab_bytes);
-        if (!base_row) return -1;
-
-        int32_t prev = refined_ids[pos];
-        bool step_ok = pulsar_gpu_dspark_markov_step_model(dspark_logits, &refined_ids[pos + 1],
-                                               NULL,
-                                               base_row,
-                                               dmap, dsize,
-                                               w->markov_w1->abs_offset,
-                                               w->markov_w2->abs_offset,
-                                               (int32_t)prev, vocab_size, embed_dim);
-        pulsar_gpu_tensor_free(base_row);
-        if (!step_ok) return -1;
-    }
-    if (dspark_stats) dspark_markov_ms = (now_sec() - dspark_mk_t0) * 1000.0;
-
-    dspark_dump_step(g, dump_pos, first_token, refined_ids, (int)n_draft);
-
-    /* Step 5c: confidence-scheduled verification (P1). The trained DSpark
-     * confidence head predicts, per block position, whether the draft will be
-     * accepted (from the post-hc_head hidden in batch_ffn_cur + the drafted
-     * token's markov embed). Size the verify budget to the confident prefix so
-     * we don't spend the batch verify on low-confidence tail drafts. Threshold
-     * PULSAR_DSPARK_CONF_SCHED (defaults to the measured tau in
-     * dspark_conf_sched_tau(); "0"/"off" = verify all n_draft, classic behavior).
-     * OUTPUT-PRESERVING: reducing the budget only limits how many drafts we
-     * verify/commit; the emitted tokens are still exact greedy. */
-    uint32_t eff_draft = n_draft;
-    {
-        const float tau = dspark_conf_sched_tau();
-        if (tau > 0.0f) {
-            /* Persistent graph-owned scratch; see the twin above.  n_draft is
-             * bounded by e->dspark_draft_tokens, clamped to 16 in session.cpp,
-             * which is what sizes these buffers (and the conf[16] below). */
-            pulsar_gpu_tensor *conf_dev = g->dspark_conf_scores;
-            pulsar_gpu_tensor *tok_dev  = g->dspark_conf_tokens;
-            if (conf_dev && tok_dev &&
-                pulsar_gpu_tensor_write(tok_dev, 0, refined_ids, (uint64_t)n_draft * sizeof(int32_t)) &&
-                pulsar_gpu_dspark_confidence_score_model(conf_dev, g->batch_ffn_cur, tok_dev,
-                                                      dmap, dsize,
-                                                      w->markov_w1->abs_offset,
-                                                      w->confidence_proj->abs_offset,
-                                                      n_draft, PULSAR_N_EMBD, embed_dim, vocab_size)) {
-                float conf[16];
-                if (pulsar_gpu_tensor_read(conf_dev, 0, conf, (uint64_t)n_draft * sizeof(float))) {
-                    uint32_t k = 0;
-                    while (k < n_draft && conf[k] >= tau) k++;
-                    eff_draft = k < 1 ? 1u : k;   /* floor 1: draft_1 is free-validated below */
-                    if (dspark_stats)
-                        fprintf(stderr, "pulsar: dspark conf_sched tau=%.2f conf=[%.2f,%.2f,%.2f,%.2f] eff=%u/%u\n",
-                                (double)tau, (double)conf[0],
-                                n_draft > 1 ? (double)conf[1] : 0.0,
-                                n_draft > 2 ? (double)conf[2] : 0.0,
-                                n_draft > 3 ? (double)conf[3] : 0.0, eff_draft, n_draft);
-                }
-            }
-        }
-    }
-
-    /* Step 5b: fast reject. The first draft is validated for FREE against
-     * s->logits (Step 1's P(next | first_token)); only drafts 2..N need the
-     * batch verify. If the first draft already disagrees, commit_drafts is 0 no
-     * matter what the verify says -- so skip the snapshot/verify/restore
-     * entirely (~100-150ms saved) and emit just first_token. Nothing beyond
-     * Step 1 is allocated here (dspark_logits already freed). */
-    if (sample_argmax(s->logits, PULSAR_N_VOCAB) != refined_ids[1]) {
-        if (dspark_stats)
-            fprintf(stderr, "pulsar: dspark step draft_n=%d committed=0 verify_skip "
-                            "draft_ms=%.1f markov_ms=%.1f step_ms=%.1f\n",
-                    (int)n_draft, dspark_draft_ms, dspark_markov_ms,
-                    (now_sec() - dspark_t0) * 1000.0);
-        accepted[n_accept++] = first_token;
-        return n_accept;
-    }
-
-    /* Step 6: verify drafts against target, rejection sampling.
-     *
-     * Step 1 already committed first_token and left s->logits = P(next |
-     * first_token), i.e. the target's prediction of the first draft.  The
-     * batch verify below runs the target over the draft_n draft positions and
-     * fills row_tops[i-1] with its argmax after committing refined_ids[1..i],
-     * so it validates drafts 2..draft_n; the first draft is validated for free
-     * against s->logits. */
-    const int saved_len = s->checkpoint.len;
-    const int draft_n = (int)eff_draft;   /* confidence-scheduled verify budget (Step 5c) */
-
-    pulsar_spec_frontier frontier;
-    memset(&frontier, 0, sizeof(frontier));
-    const double dspark_snap_t0 = dspark_stats ? now_sec() : 0.0;
-    bool have_frontier = spec_frontier_snapshot(&frontier, s);
-    if (dspark_stats) dspark_snap_ms = (now_sec() - dspark_snap_t0) * 1000.0;
-
-    for (int i = 0; i < draft_n; i++)
-        token_vec_push(&s->checkpoint, refined_ids[i + 1]);
-
-    int *row_tops = (int *)xmalloc((size_t)draft_n * sizeof(int));
-    const double dspark_verify_t0 = dspark_stats ? now_sec() : 0.0;
-    bool verify_ok = gpu_graph_verify_suffix_tops(g, &e->model, &e->weights,
-                                                    &s->checkpoint,
-                                                    (uint32_t)saved_len,
-                                                    (uint32_t)draft_n,
-                                                    row_tops, NULL);
-    if (dspark_stats) dspark_verify_ms = (now_sec() - dspark_verify_t0) * 1000.0;
-    if (!verify_ok) {
-        s->checkpoint.len = saved_len;
-        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        free(row_tops);
-        snprintf(err, errlen, "DSpark verifier failed");
-        s->checkpoint_valid = false;
-        return -1;
-    }
-
-    /* Accept the longest prefix the target agrees with.  The first draft is
-     * gated by the free s->logits prediction; each subsequent draft by the
-     * verifier's row_tops.  commit_drafts may be 0 when even the first draft
-     * disagrees. */
-    int commit_drafts = 0;
-    if (sample_argmax(s->logits, PULSAR_N_VOCAB) == refined_ids[1]) {
-        commit_drafts = 1;
-        for (int i = 1; i < draft_n; i++) {
-            if (row_tops[i - 1] != refined_ids[i + 1]) break;
-            commit_drafts++;
-        }
-    }
-
-    if (dspark_stats)
-        fprintf(stderr, "pulsar: dspark step draft_n=%d committed=%d tgt_next=%d base0_top=%d refined1=%d "
-                        "base0_hit=%d refined1_hit=%d draft_ms=%.1f markov_ms=%.1f snap_ms=%.1f "
-                        "verify_ms=%.1f step_ms=%.1f\n",
-                draft_n, commit_drafts,
-                sample_argmax(s->logits, PULSAR_N_VOCAB), dspark_base0, refined_ids[1],
-                dspark_base0 == sample_argmax(s->logits, PULSAR_N_VOCAB),
-                refined_ids[1] == sample_argmax(s->logits, PULSAR_N_VOCAB),
-                dspark_draft_ms, dspark_markov_ms, dspark_snap_ms, dspark_verify_ms,
-                (now_sec() - dspark_t0) * 1000.0);
-
-    bool ok_state = true;
-    if (commit_drafts == draft_n) {
-        /*
-         * Full accept: every draft stays committed and the verifier already
-         * advanced the target KV over all of them, so no rollback is needed.
-         * s->logits is still P(next | first_token) though — refresh it to the
-         * target distribution after the last committed draft (spec_logits row
-         * draft_n-1).
-         */
-        if (!s->spec_row_scratch)
-            s->spec_row_scratch = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(s->spec_row_scratch[0]));
-        float *row_logits = s->spec_row_scratch;
-        ok_state = gpu_graph_read_spec_logits_row(g, (uint32_t)(draft_n - 1), row_logits);
-        if (ok_state)
-            memcpy(s->logits, row_logits, (size_t)PULSAR_N_VOCAB * sizeof(s->logits[0]));
+/* The carry-or-sample head of generate_speculative, verbatim: forward the
+ * carry when it is valid at these params and this position, else draw fresh
+ * from the live logits. The caller owns the EOS short-circuit. */
+int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
+                               int top_k, float top_p, float min_p,
+                               const uint32_t *mask, uint64_t *rng) {
+    int first;
+    const bool carry_params_match =
+        s->spec.spec_carry_temp == temperature && s->spec.spec_carry_top_k == top_k &&
+        s->spec.spec_carry_top_p == top_p && s->spec.spec_carry_min_p == min_p;
+    const bool carry_pos_match = s->spec.spec_carry_pos == (int32_t)s->checkpoint.len;
+    if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
+        first = (int)s->spec.spec_carry_token;
+        s->spec.spec_carry_valid = false;
     } else {
-        /*
-         * Partial accept or full reject: the verifier ran the target over all
-         * draft_n positions, so its KV/compressor frontier is now ahead of the
-         * commit_drafts we are keeping.  Roll back to the pre-draft frontier and
-         * replay exactly the committed drafts, which also refreshes s->logits.
-         * This is only possible with a valid snapshot — treat its absence as a
-         * hard error rather than leaving rejected drafts committed.
-         */
-        if (!have_frontier) {
-            spec_frontier_free(&frontier);
-            free(row_tops);
-            snprintf(err, errlen, "DSpark frontier snapshot failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        s->checkpoint.len = saved_len;
-        ok_state = spec_frontier_restore(&frontier, s);
-        for (int i = 0; ok_state && i < commit_drafts; i++) {
-            if (s->eval(refined_ids[i + 1], err, errlen) != 0) {
-                ok_state = false;
-                break;
-            }
-            /* The single-token decode above just captured THIS accepted
-             * position's anchor-layer target hiddens.  Project them and seed the
-             * drafter KV so each accepted draft gets its OWN conditioning instead
-             * of first_token's (reusing first_token's was measured to hurt).
-             * This is the per-position content fix -- the real lever on
-             * acceptance -- and it is free here (the decode already ran). */
-            if (gpu_graph_dspark_project_main_x(g, &e->dspark_model, &e->dspark_weights))
-                gpu_graph_dspark_seed_draft_kv(g, &e->dspark_model, &e->dspark_weights, 1);
-        }
+        s->spec.spec_carry_valid = false;
+        first = spec_base_draw(s, temperature, top_k, top_p, min_p, mask, rng);
     }
+    return first;
+}
 
-    spec_frontier_free(&frontier);
-    free(row_tops);
-    if (!ok_state) {
-        snprintf(err, errlen, "DSpark state update failed");
-        s->checkpoint_valid = false;
+int pulsar_session_spec_round_begin_local(pulsar_session *s, pulsar_spec_round *r,
+                                 int first_token, int max_tokens, int accepted_cap,
+                                 float temperature, int top_k, float top_p,
+                                 float min_p, char *err, size_t errlen) {
+    return spec_round_begin(s, first_token, max_tokens, accepted_cap,
+                            temperature, top_k, top_p, min_p, r, err, errlen);
+}
+
+uint32_t pulsar_spec_round_n_rows(const pulsar_spec_round *r) {
+    return r->n_batch;
+}
+
+uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, pulsar_multiseq_req *out) {
+    for (uint32_t i = 0; i < r->n_batch; i++) {
+        out[i].bank = bank;
+        out[i].pos = TokPos{r->saved_len + (int32_t)i};   /* L334: the round's body stays raw (P2b) */
+        out[i].token = i == 0 ? (int)r->base : (int)r->pend[i - 1];
+    }
+    return r->n_batch;
+}
+
+/* The batched lane's round end: the round's verdict from the step's walk (spec_walk_rounds), then the one
+ * round_end. */
+/// @param s the session
+/// @param r the round
+/// @param first_token the base token
+/// @param temperature request temperature (<= 0: greedy)
+/// @param top_k request top-k
+/// @param top_p request top-p
+/// @param min_p request min-p
+/// @param greedy_rows per-row greedy override bits
+/// @param masks grammar mask rows (NULL = none)
+/// @param mask_rows rows in masks
+/// @param rng the request's stream
+/// @param wv the walk verdict (NULL only on a teacher-forced end)
+/// @param row0 the round's first step row
+/// @param forced_truth teacher-forced continuation, or NULL
+/// @param accepted [accepted_cap] receives the emitted tokens
+/// @param accepted_cap its size
+/// @param err receives the reason on failure
+/// @param errlen its size
+/// @return tokens emitted, or -1
+static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
+                                 int first_token,
+                                 float temperature, int top_k, float top_p,
+                                 float min_p, uint32_t greedy_rows,
+                                 const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
+                                 const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
+                                 const int32_t *forced_truth,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
+    return spec_round_end(s, r, first_token,
+                          temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
+                          wv, row0,
+                          true /* L150: redraft deferred to the batch */,
+                          0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
+                          forced_truth, accepted, accepted_cap, err, errlen);
+}
+
+/* One round against the last shared forward's rows [row0, row0 + n_batch): its walk, then its end. */
+int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
+                               int first_token,
+                               float temperature, int top_k, float top_p,
+                               float min_p, uint32_t greedy_rows,
+                               const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
+                               uint32_t row0,
+                               int *accepted, int accepted_cap,
+                               char *err, size_t errlen) {
+    if (temperature > 0.0f && !rng) {
+        snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
         return -1;
     }
+    const spec_walk_round w = {r, row0, temperature, top_k, top_p, min_p, greedy_rows, rng ? *rng : 0u,
+                                masks, mask_rows};
+    pulsar_gpu_spec_walk_out wv;
+    if (!spec_walk_rounds(s, &w, 1, &wv, err, errlen)) return -1;
+    return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
+                                 rng, &wv, row0,
+                                 NULL, accepted, accepted_cap, err, errlen);
+}
 
-    /* Step 7: nothing to seed here.  Step 2b seeds first_token's main_kv before
-     * the forward (one row per step, correct content).  Reusing this step's
-     * main_x for the ACCEPTED positions was measured to HURT (28.6% -> 23.9%):
-     * the drafter is sensitive to per-position content, so accepted positions
-     * need their OWN captured target hidden (see verify-capture, TODO). */
-
-    /* Step 8: return first_token followed by the accepted drafts.  The caller
-     * emits only the tokens returned here, so first_token — committed to the
-     * target KV in Step 1 — must lead the list or it is dropped from the
-     * output while remaining in context. */
-    accepted[n_accept++] = first_token;
-    for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
-        if (refined_ids[i + 1] == eos_token) break;
-        accepted[n_accept++] = refined_ids[i + 1];
+int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
+                                      int first_token,
+                                      float temperature, int top_k, float top_p,
+                                      float min_p, uint64_t *rng,
+                                      uint32_t row0,
+                                      const int32_t *truth,
+                                      int *accepted, int accepted_cap,
+                                      char *err, size_t errlen) {
+    if (!truth) {
+        snprintf(err, errlen, "spec round_end_forced: no truth");
+        return -1;
     }
+    return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, NULL, row0,
+                                 truth,
+                                 accepted, accepted_cap, err, errlen);
+}
 
-    return n_accept;
+
+
+
+/* =====================================================================
+ * L150: batched redraft -- one drafter pass for every bank of the tick.
+ *
+ * The batched lane's round_end records each bank's redraft request and
+ * defers. This runs the draft forward over all requesting banks' rows at once
+ * (gpu_graph_dspark_draft_forward_banks: rope/store/visibility positions per
+ * row, bank-major rings), the markov refine with one weight stream per
+ * position across banks, and the confidence head over every row, then leaves
+ * each bank's results in its round. It NEVER switches banks -- it reads the
+ * banks' ring counters from the saved carries (g->ms_dspark_n_raw) and the
+ * rings from the slabs -- so the server's bank_switch bookkeeping stays the
+ * single authority; pulsar_session_spec_redraft_commit stamps a bank's shadow
+ * under the server's switch.
+ *
+ * Byte-exact per bank with the serialized single-bank redraft (the kernels are
+ * exact by construction; each bank draws from its own rng in the same order);
+ * the greedy identity gate pins it. Diagnostics of the single-bank path
+ * (DSPARK_Q lines, the on-policy and ring dumps, dspark_dump_step) are not
+ * emitted here: they are dev instruments of the classic lane. */
+
+/* L150: every live round drafts in ONE drafter pass over all the banks, no bank switch. */
+int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round **rounds,
+                                      const uint32_t *banks, uint64_t **rngs, int n,
+                                      char *err, size_t errlen) {
+    if (!rounds || !banks || !rngs || n <= 0) return 0;
+    if (!spec_drafter(s)) {
+        snprintf(err, errlen, "redraft batch: no drafter is loaded");
+        return -1;
+    }
+    return spec_drafter(s)->draft_batch(s, rounds, banks, rngs, n, err, errlen);
+}
+
+/* L150: stamp the CURRENT bank's shadow from its batched redraft result. The
+ * caller has switched to the round's bank and saves it afterwards. Mirrors the
+ * tail of spec_round_redraft field for field; the greedy identity gate is what
+ * keeps the two in step. */
+void pulsar_session_spec_redraft_commit_local(pulsar_session *s, pulsar_spec_round *r) {
+    spec_redraft_req *q = &r->redraft;
+    if (!q->valid || !q->done) return;
+    pulsar_spec_redraft_stamp(s, q);
+    q->done = false;
+    q->valid = false;
+}
+
+void pulsar_spec_redraft_stamp(pulsar_session *s, spec_redraft_req *q) {
+    s->spec.pend_base = q->next_base;
+    s->spec.dspark_chain_unharvested = false;
+    s->spec.n_pend = q->keep;
+    s->spec.pend_copy = q->copied;
+    for (uint32_t i = 0; i < q->keep; i++) s->spec.pend[i] = q->refined[i + 1];
+    s->spec.pend_pos = (int32_t)s->checkpoint.len;
+    s->spec.pend_temp = q->temperature;
+    s->spec.pend_top_k = q->top_k;
+    s->spec.pend_top_p = q->top_p;
+    s->spec.pend_min_p = q->min_p;
+    for (uint32_t i = 0; i < q->keep; i++)
+        s->spec.pend_conf[i] = q->have_conf ? q->conf[i] : -1.0f;
+}
+
+/* ---- L260: the batched lane's per-bank bookkeeping, one call per phase ----
+ * Each is the per-bank sequence the server ran, in the same order on the same
+ * state: restore, the phase, save.  The public wrappers (engine_api.cpp) send
+ * ONE frame per phase and collect ONE verdict, pulsar_spec_steps_verdict. */
+/// Reset a step's verdict fields (status OK, nothing accepted, no error).
+/// @param st the step
+static void spec_step_reset(pulsar_spec_step *st) {
+    st->status = PULSAR_SPEC_STEP_OK;
+    st->n_accepted = 0;
+    st->err[0] = '\0';
+}
+
+void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
+                                              uint32_t row_budget,
+                                              pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
+    uint32_t rows = 0;
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        st->first_token = -1;
+        st->row0 = 0;
+        st->n_rows = 0;
+        if (!spec_bank_restore(s, st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        const uint32_t cap_rows = st->k_alloc >= 0 ? 1u + (uint32_t)st->k_alloc
+                                                   : pulsar_session_spec_next_rows_max(s);
+        if (s->pos() >= s->ctx()) {
+            st->status = PULSAR_SPEC_STEP_LENGTH;
+        } else if (rows + cap_rows > row_budget) {
+            /* Sit out BEFORE the base draw or begin touch anything: the carry
+             * (possibly a rejection residual, whose exact emission the
+             * acceptance proof needs) and the pendings stay intact. */
+            st->status = PULSAR_SPEC_STEP_SKIPPED;
+        } else {
+            const int first = pulsar_session_spec_next_base_local(s, st->temperature, st->top_k,
+                                                                  st->top_p, st->min_p, st->masks, st->rng);
+            st->first_token = first;
+            if (first < 0) {
+                st->status = PULSAR_SPEC_STEP_FAILED;
+                snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
+            } else if (pulsar_token_is_stop(s->engine, first)) {
+                st->status = PULSAR_SPEC_STEP_EOS;
+            } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
+                                                             st->accepted_cap, st->temperature,
+                                                             st->top_k, st->top_p, st->min_p,
+                                                             st->err, sizeof st->err) != 0) {
+                st->status = PULSAR_SPEC_STEP_FAILED;
+            } else if (rows + pulsar_spec_round_n_rows(st->round) > row_budget) {
+                /* Unreachable: begin only trims below cap_rows.  The backstop
+                 * runs BEFORE fill_reqs writes, so no change to begin's row
+                 * math can overflow reqs[]. */
+                pulsar_session_spec_round_abort_local(s, st->round);
+                st->status = PULSAR_SPEC_STEP_SKIPPED;
+            } else {
+                /* The worker has no reqs: its rows ride the mixed-batch frame. */
+                st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
+                                  : pulsar_spec_round_n_rows(st->round);
+                st->row0 = rows;
+                rows += st->n_rows;
+            }
+        }
+        spec_bank_save(s, st->bank);
+    }
+    *n_rows_out = rows;
+}
+
+void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    /* L302: every round's walk over the shared forward's rows in one launch, before any bank switch (the walk reads
+     * each round's drafts and its stream, both host-side in the step) */
+    spec_walk_round w[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    int widx[PULSAR_MSEQ_MAX];
+    pulsar_gpu_spec_walk_out wv[PULSAR_GPU_SAMPLE_ROWS_MAX];
+    uint32_t nw = 0;
+    char werr[160] = "";
+    bool walked = true;
+    for (int i = 0; i < n && i < (int)PULSAR_MSEQ_MAX; i++) {
+        pulsar_spec_step *st = &steps[i];
+        widx[i] = -1;
+        if (!st->round || st->round->n_batch == 0 || nw == PULSAR_GPU_SAMPLE_ROWS_MAX) continue;
+        if (st->temperature > 0.0f && !st->rng) continue;   /* its round_end refuses below */
+        w[nw] = {st->round, st->row0, st->temperature, st->top_k, st->top_p, st->min_p, st->greedy_rows,
+                 st->rng ? *st->rng : 0u, st->masks, st->mask_rows};
+        widx[i] = (int)nw++;
+    }
+    if (nw > 0) walked = spec_walk_rounds(s, w, nw, wv, werr, sizeof werr);
+    /* L260: each bank's walk records its committed capture rows; one banked seed
+     * after the loop shares the drafter's main_proj / attn_kv reads across every
+     * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
+    s->seed_defer.active = s->engine->family->banks->pooled(s);
+    s->seed_defer.n = 0;
+    s->spec.spec_round_banks = n;   /* L263: the round's flat cost is shared n ways */
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        st->pos_before = TokPos{pulsar_spec_round_saved_len(st->round)};
+        st->pos_after = TokPos::none();   /* until the round ends */
+        if (!spec_bank_restore(s, st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        int na = -1;
+        if (i >= (int)PULSAR_MSEQ_MAX || widx[i] < 0 || !walked)
+            snprintf(st->err, sizeof st->err, "%s", walked ? "spec round: the step's walk did not carry this round"
+                                                           : werr);
+        else
+            na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
+                                       st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
+                                       &wv[widx[i]], st->row0, NULL,
+                                       st->accepted, st->accepted_cap, st->err, sizeof st->err);
+        if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
+        else st->n_accepted = na;
+        st->pos_after = TokPos{s->pos()};
+        spec_bank_save(s, st->bank);
+    }
+    if (!s->seed_defer.active) return;
+    s->seed_defer.active = false;
+    if (!spec_drafter(s)->absorb_banked(s, s->seed_defer.src_row, s->seed_defer.bank, s->seed_defer.next_tok,
+                                        s->seed_defer.n)) {
+        /* No counter advanced: every bank that had rows refuses its round, as a
+         * failed one-row seed did ("DSpark fused state update failed"). */
+        for (int i = 0; i < n; i++) {
+            pulsar_spec_step *st = &steps[i];
+            bool had = false;
+            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
+            if (!had || st->status != PULSAR_SPEC_STEP_OK) continue;
+            st->status = PULSAR_SPEC_STEP_FAILED;
+            st->round->redraft.valid = false;
+            snprintf(st->err, sizeof st->err, "the batched drafter absorb failed");
+        }
+    }
+    s->seed_defer.n = 0;
+}
+
+void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++) {
+        pulsar_spec_step *st = &steps[i];
+        spec_step_reset(st);
+        if (!spec_bank_restore(s, st->bank)) {
+            st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
+            continue;
+        }
+        pulsar_session_spec_redraft_commit_local(s, st->round);
+        spec_bank_save(s, st->bank);
+    }
+}
+
+/* FNV-1a over 32-bit words. */
+/// @param h the running hash
+/// @param v the next word (hashed low byte first)
+/// @return the updated hash
+static uint32_t spec_fp(uint32_t h, uint32_t v) {
+    for (int b = 0; b < 4; b++) h = (h ^ ((v >> (8 * b)) & 0xffu)) * 16777619u;
+    return h;
+}
+
+int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *steps, int n,
+                              uint32_t n_rows) {
+    /* Only what the phase itself decides, which both ranks hold the same way:
+     * a field the phase does not write is the caller's leftover on the leader
+     * and the wire's value on the worker. */
+    uint32_t h = spec_fp(2166136261u, (uint32_t)phase);
+    h = spec_fp(h, (uint32_t)n);
+    h = spec_fp(h, n_rows);
+    for (int i = 0; i < n; i++) {
+        const pulsar_spec_step *st = &steps[i];
+        h = spec_fp(h, st->bank);
+        h = spec_fp(h, (uint32_t)st->status);
+        if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
+            h = spec_fp(h, (uint32_t)st->first_token);
+            h = spec_fp(h, st->row0);
+            h = spec_fp(h, st->n_rows);
+        } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
+            h = spec_fp(h, (uint32_t)st->pos_after.raw());
+            h = spec_fp(h, (uint32_t)st->n_accepted);
+            for (int t = 0; t < st->n_accepted; t++) h = spec_fp(h, (uint32_t)st->accepted[t]);
+        }
+    }
+    return (int)(h & 0x3fffffffu) + 1;
+}
+
+int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17], float conf[16],
+                                     uint32_t *n_draft, uint32_t *keep, int *sampled) {
+    if (!r || !r->redraft.valid || !r->redraft.done) return 0;
+    const spec_redraft_req *q = &r->redraft;
+    if (ids) memcpy(ids, q->refined, sizeof(q->refined));
+    if (conf) memcpy(conf, q->conf, sizeof(q->conf));
+    if (n_draft) *n_draft = q->n_draft;
+    if (keep) *keep = q->keep;
+    if (sampled) *sampled = q->sample_drafts ? 1 : 0;
+    return 1;
+}
+
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+                                      float conf[16]) {
+    /* L108 P2: the live session's pending count may still be an
+     * in-flight chain; complete it before peeking. Logically a lazy
+     * read-completion, not observable-state mutation. */
+    pulsar_session_spec_chain_harvest((pulsar_session *)s);
+
+    *base = -1;
+    const pulsar_spec_carry_state *sp = s ? pulsar_spec_bank_shadow((pulsar_session *)s, bank) : NULL;
+    if (!sp) return 0;
+    uint32_t n = sp->n_pend;
+    if (n > 16u) n = 16u;
+    *base = sp->pend_base;
+    for (uint32_t i = 0; i < n; i++) {
+        tok[i] = sp->pend[i];
+        conf[i] = sp->pend_conf[i];
+    }
+    return n;
+}
+
+const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
+    if (!s) return NULL;
+    if (bank == pulsar_session_live_bank(s)) return &s->spec;
+    /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
+    return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
+}
+
+/* L112 observability: the adaptive draft controller's CURRENT depth for a bank -- the live state for the
+ * installed bank, the saved carry otherwise.  0 = no drafter or nothing valid.  Pure host reads,
+ * worker-thread safe at publish time. */
+int pulsar_spec_bank_depth(pulsar_session *s, uint32_t bank) {
+    if (!s || !spec_drafter(s)) return 0;
+    const pulsar_spec_carry_state *sp = pulsar_spec_bank_shadow(s, bank);
+    return sp ? (int)spec_shadow_depth(s, sp) : 0;
+}
+
+/* The session's speculative shadow into / out of a bank carry: s->spec by value; a harvest first, so no in-flight
+ * chain is ever saved (L108 P2). */
+void pulsar_spec_shadow_save(pulsar_session *s, pulsar_spec_carry_state *dst) {
+    pulsar_session_spec_chain_harvest(s);
+    *dst = s->spec;
+}
+
+void pulsar_spec_shadow_restore(pulsar_session *s, const pulsar_spec_carry_state *src) {
+    s->spec = *src;
+}
+
+int pulsar_spec_round_saved_len(const pulsar_spec_round *r) {
+    return r ? r->saved_len : -1;
+}
+
+uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s) {
+    /* Upper bound on the next round's n_batch: begin's guards (base-token,
+     * position, params, caps) only ever TRIM K from n_pend, so
+     * 1 + pending is safe to budget against before consuming anything. */
+    uint32_t k = s->spec.n_pend;
+    if (k > 16u) k = 16u;
+    return 1u + k;
+}
+
+
+void pulsar_session_spec_arm_capture_local(pulsar_session *s, uint32_t n_rows) {
+    if (spec_target(s)->arm_verify) spec_target(s)->arm_verify(s, n_rows);
+}
+
+void pulsar_session_spec_round_abort_local(pulsar_session *s, pulsar_spec_round *r) {
+    /* Mirror the fused loop's forward-failure branch: drop the pushed rows,
+     * restore the frontier, release the snapshot. */
+    s->checkpoint.len = r->saved_len;
+    spec_round_undo(s, r);
+    s->checkpoint_valid = false;
 }

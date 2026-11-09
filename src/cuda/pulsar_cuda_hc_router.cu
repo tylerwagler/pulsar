@@ -1,54 +1,11 @@
+/** @file
+ *  DeepSeek hidden-carrier (hc) kernels (weighted sum, expand, norm-mix, output weights), SwiGLU / add / steering, and the DS4 router front. */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_router.h"
 
 
 
-__device__ static void hc4_split_one(float *out, const float *mix, const float *scale, const float *base, uint32_t sinkhorn_iters, float epsv) {
-    const float pre_scale = scale[0];
-    const float post_scale = scale[1];
-    const float comb_scale = scale[2];
-    for (int i = 0; i < 4; i++) {
-        float z = mix[i] * pre_scale + base[i];
-        out[i] = 1.0f / (1.0f + expf(-z)) + epsv;
-    }
-    for (int i = 0; i < 4; i++) {
-        float z = mix[4 + i] * post_scale + base[4 + i];
-        out[4 + i] = 2.0f / (1.0f + expf(-z));
-    }
-    float c[16];
-    for (int r = 0; r < 4; r++) {
-        float m = -INFINITY;
-        for (int col = 0; col < 4; col++) {
-            float v = mix[8 + r * 4 + col] * comb_scale + base[8 + r * 4 + col];
-            c[r * 4 + col] = v;
-            m = fmaxf(m, v);
-        }
-        float s = 0.0f;
-        for (int col = 0; col < 4; col++) {
-            float v = expf(c[r * 4 + col] - m);
-            c[r * 4 + col] = v;
-            s += v;
-        }
-        for (int col = 0; col < 4; col++) c[r * 4 + col] = c[r * 4 + col] / s + epsv;
-    }
-    for (int col = 0; col < 4; col++) {
-        float s = epsv;
-        for (int r = 0; r < 4; r++) s += c[r * 4 + col];
-        for (int r = 0; r < 4; r++) c[r * 4 + col] /= s;
-    }
-    for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
-        for (int r = 0; r < 4; r++) {
-            float s = epsv;
-            for (int col = 0; col < 4; col++) s += c[r * 4 + col];
-            for (int col = 0; col < 4; col++) c[r * 4 + col] /= s;
-        }
-        for (int col = 0; col < 4; col++) {
-            float s = epsv;
-            for (int r = 0; r < 4; r++) s += c[r * 4 + col];
-            for (int r = 0; r < 4; r++) c[r * 4 + col] /= s;
-        }
-    }
-    for (int i = 0; i < 16; i++) out[8 + i] = c[i];
-}
 
 
 
@@ -61,6 +18,17 @@ __device__ static void hc4_split_one(float *out, const float *mix, const float *
  * This removes the ~1k-cycle single-thread critical section (24 expf + 20
  * Sinkhorn iterations) that ran while 255 threads idled, x2 per layer per
  * decode token. c is a per-block shared[16] scratch. */
+/** The 4-carrier mHC split of one row by warp 0: out[0..3] = sigmoid(pre) + eps, out[4..7] = 2 sigmoid(post),
+ *  out[8..23] = the Sinkhorn-normalised 4x4 comb (softmax rows + eps, then alternating column / row
+ *  normalisations).  All 32 lanes must enter.
+ *  @param out            out: the row's 24 split coefficients
+ *  @param mix            the row's 24 mix logits
+ *  @param scale          [3] pre / post / comb scales
+ *  @param base           [24] biases
+ *  @param sinkhorn_iters Sinkhorn iterations (the first column pass included)
+ *  @param epsv           epsilon added to pre, the comb entries and each normaliser
+ *  @param lane           this lane (0..31)
+ *  @param c              shared [16] comb scratch */
 __device__ static void hc4_split_par(float *out, const float *mix, const float *scale,
                                      const float *base, uint32_t sinkhorn_iters, float epsv,
                                      uint32_t lane, float *c) {
@@ -117,14 +85,17 @@ __device__ static void hc4_split_par(float *out, const float *mix, const float *
 }
 
 
-__global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, const float *scale, const float *base, uint32_t n_rows, uint32_t sinkhorn_iters, float epsv) {
-    uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_rows) return;
-    hc4_split_one(out + (uint64_t)row * 24, mix + (uint64_t)row * 24, scale, base, sinkhorn_iters, epsv);
-}
 
 
 
+/** HC collapse: out[t][d] = sum_h x[t][h][d] * w[t][h].  1-D grid over n_embd * n_tokens, one thread an output.
+ *  @param out               f32 [n_tokens][n_embd]
+ *  @param x                 HC carrier [n_tokens][n_hc][n_embd]
+ *  @param w                 f32 per-token weights, row t at t * weight_stride_f32
+ *  @param n_embd            hidden width
+ *  @param n_hc              carriers
+ *  @param n_tokens          tokens
+ *  @param weight_stride_f32 floats between tokens' weights */
 __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
@@ -141,6 +112,46 @@ __global__ static void hc_weighted_sum_kernel(float *out, const pulsar_hc_t *x, 
 
 
 
+/* NHC: the hidden-carrier count as a COMPILE-TIME value (4: every DeepSeek V4
+ * artifact, and the only count the fused HC kernels take; L335 deleted the
+ * runtime-loop arm a different count used to take).  The point is
+ * memory-level parallelism, not instruction count.
+ *
+ * The 2026-08-24 SOL sweep found this kernel at 87.5% occupancy with ZERO
+ * barrier stalls and 31.6M long_scoreboard stalls -- i.e. plenty of warps, all
+ * of them waiting on global loads, at only 25.7% of memory throughput.  The
+ * cause was in the source: `n_hc` arrived as a kernel ARGUMENT, so the
+ * src_hc loop could not be unrolled, and its `residual_hc` loads (each n_embd
+ * apart, individually coalesced) issued ONE AT A TIME, each waiting on the last.
+ * Templating on the count lets all NHC loads be in flight together.
+ *
+ * L219: the thread mapping is one thread per (t,d), computing ALL NHC
+ * destinations.  The old per-(t,dst,d) mapping re-read the same NHC residual
+ * values and the same block_out element once per destination -- 4x the residual
+ * traffic, and residual_hc is the bulk of this op's bytes ([t][hc][embd], read
+ * once here instead of four times).  Gathering the residuals once and looping
+ * the destinations in registers changes nothing about the per-output
+ * accumulation order, so it stays bit-exact by construction.
+ *
+ * BIT-EXACT: the per-output accumulation order is unchanged (acc starts at
+ * block_v*post[dst], then src_hc 0..NHC-1 in order), so this is an issue-order
+ * and dedupe change only.  It is graded by the byte-exact prefill gate, not the
+ * reference gate. */
+/** HC expand: out[t][dst][d] = block[t][d] * post[t][dst] + sum_src comb[t][dst + src * n_hc] * res[t][src][d], with
+ *  block = block_out (+ block_add).  1-D grid: one thread a (t, d), all destinations in registers.
+ *  @tparam NHC the carrier count at compile time (4)
+ *  @param out_hc      HC carrier out [n_tokens][n_hc][n_embd]
+ *  @param block_out   f32 [n_tokens][n_embd] the sublayer's output
+ *  @param block_add   f32 [n_tokens][n_embd] added to it when has_add
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param post        per-token post weights, row t at t * post_stride
+ *  @param comb        per-token comb matrices, row t at t * comb_stride
+ *  @param n_embd      hidden width
+ *  @param n_tokens    tokens
+ *  @param post_stride floats between tokens' post rows
+ *  @param comb_stride floats between tokens' comb rows
+ *  @param has_add     nonzero: add block_add */
+template <int NHC>
 __global__ static void hc_expand_kernel(
         pulsar_hc_t *out_hc,
         const float *block_out,
@@ -149,60 +160,100 @@ __global__ static void hc_expand_kernel(
         const float *post,
         const float *comb,
         uint32_t n_embd,
-        uint32_t n_hc,
         uint32_t n_tokens,
         uint32_t post_stride,
         uint32_t comb_stride,
         int has_add) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    if (gid >= n_elem) return;
-    uint32_t d = gid % n_embd;
-    uint64_t tmp = gid / n_embd;
-    uint32_t dst_hc = tmp % n_hc;
-    uint32_t t = tmp / n_hc;
+    static_assert(NHC > 0, "hc_expand_kernel: a compile-time carrier count");
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    {
+        const uint64_t n_elem = (uint64_t)n_tokens * n_embd;
+        if (gid >= n_elem) return;
+        const uint32_t d = (uint32_t)(gid % n_embd);
+        const uint32_t t = (uint32_t)(gid / n_embd);
 
-    float block_v = block_out[(uint64_t)t * n_embd + d];
-    if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
-    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
-    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-        float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
-        float res_v = pulsar_hc_load(residual_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d);
-        acc += comb_v * res_v;
-    }
-    pulsar_hc_store(out_hc, (uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d, acc);
-}
-
-
-
-__global__ static void hc_split_weighted_sum_fused_kernel(
-        float *out,
-        float *split,
-        const float *mix,
-        const pulsar_hc_t *residual_hc,
-        const float *scale,
-        const float *base,
-        uint32_t n_embd,
-        uint32_t n_hc,
-        uint32_t n_rows,
-        uint32_t sinkhorn_iters,
-        float epsv) {
-    uint32_t t = blockIdx.x;
-    uint32_t d = threadIdx.x;
-    if (t >= n_rows || n_hc != 4) return;
-    const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    __shared__ float hc4_c[16];
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
-    __syncthreads();
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
+        float block_v = block_out[(uint64_t)t * n_embd + d];
+        if (has_add) block_v += block_add[(uint64_t)t * n_embd + d];
+        float res_v[NHC];
+#pragma unroll
+        for (int src = 0; src < NHC; src++) {
+            res_v[src] = pulsar_hc_load(residual_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)src * n_embd + d);
         }
-        out[(uint64_t)t * n_embd + col] = acc;
+        /* PLAIN `acc += a*b`, DELIBERATELY, and this is a numerics decision --
+         * read before "fixing" it back to __fmaf_rn.
+         *
+         * With --use_fast_math the compiler REASSOCIATES these four products
+         * into a tree once they are visible.  That is not a defect: pairwise
+         * summation has O(log n) error growth where sequential has O(n), so the
+         * tree is the more accurate arithmetic.  Graded against the B300 source
+         * logits it is CLOSER to the source at 6 of 9 depths, including all
+         * three known-high outliers (story 512 0.643->0.569, story 30464
+         * 0.255->0.173, code 3840 0.196->0.190).
+         *
+         * An earlier revision pinned this with __fmaf_rn purely to keep the
+         * byte gate green, which preserved our own historical rounding instead
+         * of reducing our distance from the source.  Tyler, 2026-08-24: "I
+         * would love to disagree with our past if it puts us closer to the
+         * original model."  The prefill baseline was re-anchored for this
+         * change; see PREFILL_BASELINE_REF in the Makefile. */
+#pragma unroll
+        for (int dst = 0; dst < NHC; dst++) {
+            float acc = block_v * post[(uint64_t)t * post_stride + dst];
+#pragma unroll
+            for (int src = 0; src < NHC; src++) {
+                const float comb_v = comb[(uint64_t)t * comb_stride + dst + (uint64_t)src * (uint64_t)NHC];
+                acc += comb_v * res_v[src];
+            }
+            pulsar_hc_store(out_hc,
+                    (uint64_t)t * (uint64_t)NHC * n_embd + (uint64_t)dst * n_embd + d, acc);
+        }
     }
 }
+
+
+
+/* One dispatch point for the hc_expand callers.  PULSAR_N_HC is 4 on every
+ * DeepSeek V4 artifact, and the fused HC norm / split kernels already take
+ * nothing else; a different count refuses here by name (L335: it used to take
+ * a runtime-loop instantiation no gate ran -- rule 1). */
+/** Launches hc_expand_kernel<4> (refuses n_hc != 4, said once).
+ *  @param threads     block size
+ *  @param out_hc      HC carrier out
+ *  @param block_out   the sublayer's output
+ *  @param block_add   added when has_add
+ *  @param residual_hc the residual carrier
+ *  @param post        post weights
+ *  @param comb        comb matrices
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @param n_tokens    tokens
+ *  @param post_stride floats between tokens' post rows
+ *  @param comb_stride floats between tokens' comb rows
+ *  @param has_add     nonzero: add block_add
+ *  @return 1 launched (the caller checks the launch), 0 refused */
+static int hc_expand_launch(uint32_t threads,
+                            pulsar_hc_t *out_hc, const float *block_out,
+                            const float *block_add, const pulsar_hc_t *residual_hc,
+                            const float *post, const float *comb,
+                            uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens,
+                            uint32_t post_stride, uint32_t comb_stride, int has_add) {
+    if (n_hc != 4u) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "pulsar: hc_expand: n_hc %u -- only 4 carriers have a kernel -- refusing\n", n_hc);
+        }
+        return 0;
+    }
+    const uint64_t elems = (uint64_t)n_tokens * n_embd;
+    const uint32_t blocks = (uint32_t)((elems + threads - 1u) / threads);
+    hc_expand_kernel<4><<<blocks, threads>>>(out_hc, block_out, block_add, residual_hc,
+                                            post, comb, n_embd, n_tokens,
+                                            post_stride, comb_stride, has_add);
+    return 1;
+}
+
 
 
 
@@ -222,280 +273,259 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
  *
  * `residual_hc` is an HC CARRIER (BF16 storage under task #62) and is read
  * through pulsar_hc_load exactly as the generic kernel below does. */
-template <uint32_t BLK, uint32_t VEC>
-__global__ static void hc_split_weighted_sum_norm_fused_kernel(
+/* The MX emit helpers moved to pulsar_cuda_mx.cuh so the swizzle has ONE
+ * definition to keep in step with pulsar_cuda_matmul.cu's quantiser -- a second
+ * producer (dsv4_qkv_rms_norm_rows_kernel) needs the same code, and a divergent
+ * copy is a silent wrong-operand bug rather than a rounding difference. */
+
+
+/* NWBF16: storage of norm_w (attn_norm / ffn_norm), bf16 in source. Promoted
+ * to f32 before it multiplies, so an f32 tensor stays bit-exact.
+ *
+ * SINGLE-PASS mHC (L218, DeepSeek-V4.1 Block.forward): the coefficients a
+ * sublayer derives from its own input are used by the NEXT sublayer's collapse
+ * -- attention collapses with the previous FFN's `pre` (an initial one-hot
+ * before layer 0), the FFN with this attention's, the output head with the
+ * last FFN's.  `pre_carry` [n_rows][4] is that hand-over: each row reads the
+ * pre it was handed, collapses with it, then overwrites the slot with the pre
+ * it derived here for whoever collapses next.  The read happens in the same
+ * threads before the write, and no other block touches the row, so one buffer
+ * carries the value through the whole sweep.  `post` and `comb` (split[4..])
+ * stay with THIS sublayer's expand, as in the reference's hc_post. */
+/* Where the collapse takes its coefficients -- see pulsar_gpu.h's setter.  A
+ * host-side fact pushed once at load, beside the KV row style and for the same
+ * reason: it is a property of the loaded profile, not of the call.  It reaches
+ * the kernel as a LAUNCH ARGUMENT rather than a __device__ symbol because the
+ * setter runs during weight binding, before the graph's first command batch. */
+/// The collapse takes this sublayer's own split (0731) rather than the handed-on pre (V4.1); set once at load.
+static bool g_hc_head_mix = false;
+void pulsar_gpu_set_hc_head_mix(bool on) { g_hc_head_mix = on; }
+
+/* Q column quarters (L241 4g-2): the block is BLK * Q threads.  At decode
+ * the kernel runs one block per row -- 1..3 SMs of 48 -- and its 16 columns
+ * per thread were a serial latency chain (19 us a sublayer on the pair, 86 a
+ * token).  Thread (q, d) now collapses the VEC / Q columns d + u * BLK,
+ * u in [q * VEC/Q, (q+1) * VEC/Q), so four times the loads are in flight.
+ *
+ * BIT-EXACT: each column's collapse is the same expression; the row's sum of
+ * squares is still thread d's serial `sum += acc * acc` over u = 0..VEC-1 in
+ * order (the collapsed values meet in shared memory first), then the same
+ * 256-partial pairwise tree; a warp still spans 32 consecutive columns of one
+ * u, so every MX emit block is the same 32 values. */
+/** Fused mHC split + collapse + RMSNorm of one row, with E4M3 / bf16 epilogues.  Grid n_rows; block BLK * Q; static
+ *  smem VEC x BLK collapsed values + BLK partials + the split scratch.  n_hc must be 4.
+ *  @tparam BLK    columns a thread group spans per step (a multiple of 32)
+ *  @tparam VEC    column steps per row (n_embd <= BLK * VEC)
+ *  @tparam NWBF16 norm_w is stored bf16
+ *  @tparam Q      column quarters (the block is BLK * Q threads)
+ *  @param out                f32 [n_rows][n_embd] pre-norm collapse, or NULL
+ *  @param norm_out           f32 [n_rows][n_embd] normed rows (rows >= norm_f32_keep_from stored)
+ *  @param norm_out_q         E4M3 slot data, or NULL
+ *  @param norm_out_sf        its ue8m0 scales
+ *  @param norm_out_kbp       its scale row pitch
+ *  @param norm_out_b         bf16 [n_rows][n_embd] copy, or NULL
+ *  @param norm_f32_keep_from first row whose f32 normed row is stored
+ *  @param split              out: [n_rows][24] this sublayer's split coefficients
+ *  @param pre_carry          [n_rows][4] the pre handed in; overwritten with this sublayer's
+ *  @param mix                [n_rows][24] mix logits
+ *  @param residual_hc        HC carrier [n_rows][4][n_embd]
+ *  @param scale              [3] split scales
+ *  @param base               [24] split biases
+ *  @param norm_w             norm weight [n_embd]
+ *  @param n_embd             hidden width
+ *  @param n_hc               carriers (4)
+ *  @param n_rows             rows
+ *  @param sinkhorn_iters     Sinkhorn iterations
+ *  @param epsv               split epsilon
+ *  @param norm_eps           RMSNorm epsilon
+ *  @param head_mix           nonzero: collapse with the own split (0731), else with the handed-on pre */
+template <uint32_t BLK, uint32_t VEC, bool NWBF16, uint32_t Q>
+__global__ static void __launch_bounds__(BLK * Q) hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
+        __nv_fp8_e4m3 *norm_out_q,
+        unsigned char *norm_out_sf,
+        int norm_out_kbp,
+        __nv_bfloat16 *norm_out_b,
+        uint32_t norm_f32_keep_from,
         float *split,
+        float *pre_carry,
         const float *mix,
         const pulsar_hc_t *residual_hc,
         const float *scale,
         const float *base,
-        const float *norm_w,
+        const void *norm_w,
         uint32_t n_embd,
         uint32_t n_hc,
         uint32_t n_rows,
         uint32_t sinkhorn_iters,
         float epsv,
-        float norm_eps) {
+        float norm_eps,
+        int head_mix) {
+    static_assert(VEC % Q == 0, "column quarters must split VEC evenly");
+    constexpr uint32_t VQ = VEC / Q;
     const uint32_t t = blockIdx.x;
-    const uint32_t d = threadIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t d = tid % BLK;
+    const uint32_t u0 = (tid / BLK) * VQ;
     if (t >= n_rows || n_hc != 4) return;
     const uint32_t mix_hc = 24;
     float *sp = split + (uint64_t)t * mix_hc;
+    float *pc = pre_carry + (uint64_t)t * 4u;
     __shared__ float hc4_c[16];
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
+    __shared__ float pre_in[4];
+    __shared__ float col_acc[VEC][BLK];
+    if (tid < 4u) pre_in[tid] = pc[tid];           /* the pre handed to this sublayer */
+    if (tid < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, tid, hc4_c);
     __syncthreads();
+    if (tid < 4u) pc[tid] = sp[tid];               /* this sublayer's pre, for the next one */
 
     const uint64_t rbase = (uint64_t)t * 4u * n_embd;
     const uint64_t obase = (uint64_t)t * n_embd;
-    float accs[VEC];
-    float sum = 0.0f;
+    float accs[VQ];
     #pragma unroll
-    for (uint32_t u = 0; u < VEC; u++) {
+    for (uint32_t i = 0; i < VQ; i++) {
+        const uint32_t u = u0 + i;
         const uint32_t col = d + u * BLK;
         if (col < n_embd) {
             float acc = 0.0f;
             #pragma unroll
             for (uint32_t h = 0; h < 4; h++) {
-                acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) * sp[h];
+                /* 0731 collapses with the split this sublayer just derived;
+                 * V4.1 with the pre its predecessor handed on. */
+                acc += pulsar_hc_load(residual_hc, rbase + (uint64_t)h * n_embd + col) *
+                       (head_mix ? sp[h] : pre_in[h]);
             }
-            out[obase + col] = acc;
-            accs[u] = acc;
-            sum += acc * acc;
+            /* hc_pre returns y.to(x.dtype): the collapsed row is bf16 before
+             * the norm sees it (RMSNorm then does its math in fp32 on it).
+             * That narrowing is V4.1's reference; 0731's kernel -- the one that
+             * served this artifact -- does not narrow, and narrowing here cost
+             * V4 a bf16 ULP in attn_norm that grew into a different answer. */
+            if (!head_mix) acc = __bfloat162float(__float2bfloat16(acc));
+            if (out) out[obase + col] = acc;
+            accs[i] = acc;
         } else {
-            accs[u] = 0.0f;
+            accs[i] = 0.0f;
         }
+        col_acc[u][d] = accs[i];
     }
+    __syncthreads();
 
     __shared__ float partial[BLK];
-    partial[d] = sum;
-    __syncthreads();
-    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
-        if (d < stride) partial[d] += partial[d + stride];
-        __syncthreads();
-    }
-    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
-    #pragma unroll
-    for (uint32_t u = 0; u < VEC; u++) {
-        const uint32_t col = d + u * BLK;
-        if (col < n_embd) norm_out[obase + col] = accs[u] * norm_scale * norm_w[col];
-    }
-}
-
-
-/* Generic fallback for n_embd > BLK*VEC (byte-identical to the pre-2026-07-21
- * kernel: same column order, same tree, same global round trip). */
-__global__ static void hc_split_weighted_sum_norm_fused_generic_kernel(
-        float *out,
-        float *norm_out,
-        float *split,
-        const float *mix,
-        const pulsar_hc_t *residual_hc,
-        const float *scale,
-        const float *base,
-        const float *norm_w,
-        uint32_t n_embd,
-        uint32_t n_hc,
-        uint32_t n_rows,
-        uint32_t sinkhorn_iters,
-        float epsv,
-        float norm_eps) {
-    const uint32_t t = blockIdx.x;
-    const uint32_t d = threadIdx.x;
-    if (t >= n_rows || n_hc != 4) return;
-    const uint32_t mix_hc = 24;
-    float *sp = split + (uint64_t)t * mix_hc;
-    __shared__ float hc4_c[16];
-    if (d < 32u) hc4_split_par(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv, d, hc4_c);
-    __syncthreads();
-
-    float sum = 0.0f;
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += pulsar_hc_load(residual_hc, (uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col) * sp[h];
-        }
-        out[(uint64_t)t * n_embd + col] = acc;
-        sum += acc * acc;
-    }
-
-    __shared__ float partial[256];
-    partial[d] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (d < stride) partial[d] += partial[d + stride];
-        __syncthreads();
-    }
-    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        const float v = out[(uint64_t)t * n_embd + col];
-        norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
-    }
-}
-
-
-
-__global__ static void output_hc_weights_kernel(
-        float *out,
-        const float *pre,
-        const float *scale,
-        const float *base,
-        uint32_t n_hc,
-        uint32_t n_tokens,
-        float epsv) {
-    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t n = n_tokens * n_hc;
-    if (gid >= n) return;
-    uint32_t h = gid % n_hc;
-    float z = pre[gid] * scale[0] + base[h];
-    out[gid] = 1.0f / (1.0f + expf(-z)) + epsv;
-}
-
-
-
-__device__ static float softplus_dev(float x) {
-    if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
-}
-
-
-
-__device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
-    return av > bv || (av == bv && ai < bi);
-}
-
-
-
-__global__ static void router_select_warp_topk_kernel(
-        int32_t *selected,
-        float *weights,
-        float *probs,
-        const float *bias,
-        const int32_t *hash,
-        const float *logits,
-        const int32_t *tokens,
-        int32_t token_scalar,
-        uint32_t hash_rows,
-        uint32_t n_tokens,
-        int has_bias,
-        int hash_mode) {
-    const uint32_t lane = threadIdx.x;
-    const uint32_t row_in_block = threadIdx.y;
-    const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
-    if (t >= n_tokens || lane >= 32u) return;
-
-    const float *log = logits + (uint64_t)t * 256u;
-    float *prob = probs + (uint64_t)t * 256u;
-    int32_t *sel = selected + (uint64_t)t * 6u;
-    float *w = weights + (uint64_t)t * 6u;
-    __shared__ float sprob[4][256];
-    float local_prob[8];
-    float local_score[8];
-
-    #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
-        const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
-        local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
-        sprob[row_in_block][e] = p;
-        prob[e] = p;
-    }
-    __syncwarp();
-
-    if (hash_mode) {
-        if (lane == 0) {
-            int32_t tok = tokens ? tokens[t] : token_scalar;
-            if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-            const int32_t *row = hash + (uint64_t)tok * 6u;
-            float sum = 0.0f;
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) {
-                const int32_t e = row[j];
-                sel[j] = e;
-                const float v = (e >= 0 && e < 256) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
-                w[j] = v;
-                sum += v;
-            }
-            sum = fmaxf(sum, 6.103515625e-5f);
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
-        }
-        return;
-    }
-
-    float out_prob[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    uint32_t out_idx[6] = {0, 0, 0, 0, 0, 0};
-    #pragma unroll
-    for (uint32_t k = 0; k < 6u; k++) {
-        float best_score = -INFINITY;
-        float best_prob = 0.0f;
-        uint32_t best_idx = UINT32_MAX;
-        #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
-            const uint32_t e = lane + j * 32u;
-            const float s = local_score[j];
-            if (router_score_better(s, e, best_score, best_idx)) {
-                best_score = s;
-                best_prob = local_prob[j];
-                best_idx = e;
-            }
-        }
-        #pragma unroll
-        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
-            const float other_score = __shfl_xor_sync(0xffffffffu, best_score, mask);
-            const float other_prob = __shfl_xor_sync(0xffffffffu, best_prob, mask);
-            const uint32_t other_idx = __shfl_xor_sync(0xffffffffu, best_idx, mask);
-            if (router_score_better(other_score, other_idx, best_score, best_idx)) {
-                best_score = other_score;
-                best_prob = other_prob;
-                best_idx = other_idx;
-            }
-        }
-        #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
-            const uint32_t e = lane + j * 32u;
-            if (e == best_idx) local_score[j] = -INFINITY;
-        }
-        if (lane == 0) {
-            out_idx[k] = best_idx;
-            out_prob[k] = best_prob;
-        }
-    }
-
-    if (lane == 0) {
+    if (tid < BLK) {
         float sum = 0.0f;
         #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) {
-            sel[j] = (int32_t)out_idx[j];
-            w[j] = out_prob[j];
-            sum += out_prob[j];
+        for (uint32_t u = 0; u < VEC; u++) {
+            if (d + u * BLK < n_embd) {
+                const float acc = col_acc[u][d];
+                sum += acc * acc;
+            }
         }
-        sum = fmaxf(sum, 6.103515625e-5f);
-        #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+        partial[d] = sum;
+    }
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    #pragma unroll
+    for (uint32_t i = 0; i < VQ; i++) {
+        const uint32_t u = u0 + i;
+        const uint32_t col = d + u * BLK;
+        /* (weight * x).to(bf16): the normed row is bf16 -- the value every
+         * consumer sees, f32 plane, bf16 plane and the E4M3 quant alike */
+        const float v = (col < n_embd)
+                ? (head_mix
+                       ? (accs[i] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))
+                       : __bfloat162float(__float2bfloat16(accs[i] * norm_scale * pulsar_w_load_f32_or_bf16<NWBF16>(norm_w, col))))
+                : 0.0f;
+        if (col < n_embd) {
+            /* Row-conditional f32: below keep_from every consumer reads an
+             * emitted encoding (E4M3 slot / bf16 slot), so the f32 write is a
+             * dead store.  Rows >= keep_from stay f32 for the readers that
+             * genuinely want those bytes -- the ratio-4 compressor rebuild
+             * reads the LAST FOUR rows through an offset view.  The engine
+             * passes 0 (store all) unless its skip predicate holds. */
+            if (t >= norm_f32_keep_from) norm_out[obase + col] = v;
+            /* The bf16 copy, from the same register value -- an emission
+             * beside f32/E4M3, so the BF16-weight GEMMs stop paying a
+             * separate whole-tensor convert (L086 T3). */
+            if (norm_out_b) norm_out_b[obase + col] = __float2bfloat16(v);
+        }
+        /* Warp-uniform: every lane must reach the shuffle.  BLK is a multiple of
+         * 32 and columns are contiguous within a warp, so a warp spans exactly
+         * one MX block and lanes past n_embd contribute 0 to the max. */
+        if (norm_out_q) {
+            pulsar_mx_emit_block(v, col, t, n_embd, norm_out_kbp, norm_out_q, norm_out_sf);
+        }
     }
 }
 
 
 
-__global__ static void swiglu_kernel(float *out, const float *gate, const float *up, uint32_t n, float clamp, float weight) {
+
+
+/* make_identity_pre_mix: the pre handed to layer 0's attention -- copy 0
+ * with weight 1, the rest 0 -- one row per token of the sweep. */
+/** @param pre    out: [n_rows][n_hc] one-hot pre (carrier 0 weight 1)
+ *  @param n_rows rows
+ *  @param n_hc   carriers */
+__global__ static void hc_pre_identity_kernel(float *pre, uint32_t n_rows, uint32_t n_hc) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_rows * n_hc) return;
+    pre[gid] = (gid % n_hc) == 0u ? 1.0f : 0.0f;
+}
+
+/// @param p f32 activations
+/// @param i element
+/// @return p[i]
+__device__ static inline float swiglu_act_load(const float *p, uint32_t i) { return p[i]; }
+/// @param p f16 activations
+/// @param i element
+/// @return p[i] widened, an f16 infinity clamped to +-65504
+__device__ static inline float swiglu_act_load(const __half *p, uint32_t i) {
+    float v = __half2float(p[i]);
+    if (isinf(v)) v = copysignf(65504.0f, v);
+    return v;
+}
+
+/** SwiGLU: out = silu(min(g, clamp)) * clamp(u, +-clamp) * weight (no clamp when clamp <= 1e-6), with an optional
+ *  E4M3 epilogue.  1-D grid, block 256, one thread an element.
+ *  @tparam AT the gate / up element type (float or __half)
+ *  @param out     f32 [n] out, or NULL (the E4M3 slot replaces it)
+ *  @param gate    gate activations [n]
+ *  @param up      up activations [n]
+ *  @param n       elements (rows * mid_dim)
+ *  @param clamp   the activation clamp, or <= 1e-6 for none
+ *  @param weight  scale on every output
+ *  @param out_q   E4M3 slot data, or NULL
+ *  @param out_sf  its ue8m0 scales
+ *  @param out_kbp its scale row pitch
+ *  @param mid_dim row width of the slot (a multiple of 32) */
+template <typename AT>
+__global__ static void swiglu_kernel(float *out, const AT *gate, const AT *up, uint32_t n, float clamp, float weight,
+                                     __nv_fp8_e4m3 *out_q, unsigned char *out_sf, int out_kbp, uint32_t mid_dim) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = gate[i];
-    float u = up[i];
-    if (clamp > 1.0e-6f) {
-        g = fminf(g, clamp);
-        u = fminf(fmaxf(u, -clamp), clamp);
+    const float v = pulsar_swiglu_elem(swiglu_act_load(gate, i), swiglu_act_load(up, i), weight, clamp);
+    /* `out` is NULL when the launcher was told the f32 store is dead -- the
+     * MXFP8 consumer reads the encoding below instead.  The branch is uniform
+     * across the whole launch, so it costs nothing in a bandwidth-bound
+     * kernel, and it removes the widest store this kernel makes. */
+    if (out) out[i] = v;
+    if (out_q) {
+        pulsar_mx_emit_block(v, i % mid_dim, i / mid_dim, mid_dim, out_kbp, out_q, out_sf);
     }
-    float s = g / (1.0f + expf(-g));
-    out[i] = s * u * weight;
 }
 
 
 
+/** out = a + b element-wise, f32.  1-D grid.
+ *  @param out f32 [n]
+ *  @param a   f32 [n]
+ *  @param b   f32 [n]
+ *  @param n   elements */
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -504,6 +534,14 @@ __global__ static void add_kernel(float *out, const float *a, const float *b, ui
 
 
 
+/** Directional steering: x[row] -= scale * (x[row] . dir) * dir, dir = directions[layer].  Grid rows; block a power
+ *  of two, at most 256.
+ *  @param x          f32 [rows][width], updated in place
+ *  @param directions f32 [layers][width] unit directions
+ *  @param layer      the layer's direction row
+ *  @param width      row width
+ *  @param rows       rows
+ *  @param scale      projection strength */
 __global__ static void directional_steering_project_kernel(
         float       *x,
         const float *directions,
@@ -536,34 +574,85 @@ __global__ static void directional_steering_project_kernel(
 }
 
 
-int pulsar_gpu_swiglu_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up, uint32_t n, float clamp, float weight) {
+int pulsar_gpu_swiglu_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *gate, const pulsar_gpu_tensor *up,
+                                uint32_t n, float clamp, float weight,
+                                void *out_q, void *out_sf, int out_kbp, uint32_t mid_dim,
+                                int skip_f32) {
+    /* gate/up carry their own element size (L033 increment 2: prefill stages
+     * them f16; decode's fused path passes f32 scratch and takes the float
+     * instantiation untouched).  They must AGREE — one f16 and one f32 means a
+     * caller narrowed half a pair, the [[L035]] shape. */
+    const uint32_t act_esz = pulsar_tensor_esz(gate);
     if (!out || !gate || !up ||
+        act_esz != pulsar_tensor_esz(up) ||
+        (act_esz != sizeof(float) && act_esz != sizeof(__half)) ||
         out->bytes < (uint64_t)n * sizeof(float) ||
-        gate->bytes < (uint64_t)n * sizeof(float) ||
-        up->bytes < (uint64_t)n * sizeof(float)) return 0;
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+        gate->bytes < (uint64_t)n * act_esz ||
+        up->bytes < (uint64_t)n * act_esz) {
+        if (gate && up && pulsar_tensor_esz(gate) != pulsar_tensor_esz(up))
+            fprintf(stderr, "pulsar: swiglu gate/up element sizes disagree (%u vs %u) -- refusing\n",
+                    pulsar_tensor_esz(gate), pulsar_tensor_esz(up));
+        return 0;
+    }
+    /* skip_f32 without an encoding to replace it would write NOTHING and leave
+     * the consumer reading stale bytes.  Same failure shape as a skipped
+     * emission, so it gets the same treatment: refuse, do not silently
+     * downgrade to storing f32 (that would hide a caller bug behind a
+     * correct-looking run). */
+    if (skip_f32 && !out_q) {
+        fprintf(stderr, "pulsar: swiglu asked to skip the f32 store with no E4M3 slot "
+                        "(n=%u mid_dim=%u) -- refusing\n", n, mid_dim);
+        return 0;
+    }
+    /* FAIL LOUD rather than silently skip the emission: the caller arms the
+     * activation cache off the same slot pointer, so a skipped emission leaves
+     * the GEMM reading a memset-zero E4M3 buffer -- a well-formed WRONG answer.
+     * n must fill whole WARPS (the emit's amax shuffle is warp-wide, so no lane
+     * may exit before it: past n whole warps exit, never part of one) and
+     * mid_dim must be a whole number of MX blocks.  (Was n % 256, a whole thread
+     * block -- stricter than the shuffle needs; V4.1's TP shared-expert half,
+     * 1152 = 36 blocks, makes n % 256 != 0 at odd row counts, L269 W1.) */
+    if (out_q && ((n % 32u) != 0u || mid_dim == 0u || (mid_dim % 32u) != 0u)) {
+        fprintf(stderr, "pulsar: swiglu cannot emit MX for n=%u mid_dim=%u "
+                        "(need n %% 32 == 0 and mid_dim %% 32 == 0)\n", n, mid_dim);
+        return 0;
+    }
+    /* Announce once per shape.  A byte-identical gate cannot tell "the store
+     * was skipped" from "the skip never fired", and a silently-inert
+     * optimisation looks exactly like a working one -- same reason the A8 GEMV
+     * arms announce themselves in pulsar_cuda_matmul.cu. */
+    if (skip_f32) {
+        static uint32_t seen_n[8] = {0};
+        static int n_seen = 0;
+        int known = 0;
+        for (int i = 0; i < n_seen; i++) if (seen_n[i] == n) { known = 1; break; }
+        if (!known && n_seen < 8) {
+            seen_n[n_seen++] = n;
+            fprintf(stderr, "pulsar: swiglu f32 store SKIPPED (n=%u mid_dim=%u, %.1f MiB/layer)\n",
+                    n, mid_dim, (double)n * sizeof(float) / (1024.0 * 1024.0));
+        }
+    }
+    if (act_esz == sizeof(__half)) {
+        /* Announce once: a byte gate cannot distinguish "reading the f16
+         * staging" from "the narrowing never went live" (same rule as the
+         * skip announcement above). */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: swiglu reading F16 gate/up staging (n=%u mid_dim=%u)\n",
+                    n, mid_dim);
+        }
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const __half *)gate->ptr, (const __half *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    } else {
+        swiglu_kernel<<<(n + 255) / 256, 256>>>(skip_f32 ? NULL : (float *)out->ptr,
+                                                (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight,
+                                                (__nv_fp8_e4m3 *)out_q, (unsigned char *)out_sf, out_kbp, mid_dim);
+    }
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 
-
-int pulsar_gpu_shared_gate_up_swiglu_mxfp8_tensor(
-        pulsar_gpu_tensor       *gate,
-        pulsar_gpu_tensor       *up,
-        pulsar_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        float                   clamp) {
-    return pulsar_gpu_matmul_mxfp8_tensor(gate, model_map, model_size,
-                                        gate_offset, in_dim, out_dim, x, 1) &&
-           pulsar_gpu_matmul_mxfp8_tensor(up, model_map, model_size,
-                                        up_offset, in_dim, out_dim, x, 1) &&
-           pulsar_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
-}
 
 
 int pulsar_gpu_add_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *a, const pulsar_gpu_tensor *b, uint32_t n) {
@@ -600,93 +689,285 @@ int pulsar_gpu_directional_steering_project_tensor(
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
 
-
-int pulsar_gpu_router_select_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits) {
-    if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
-    int32_t tok = (int32_t)token;
-    int ok = 1;
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
-    if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
-        if (!bias) ok = 0;
-    }
-    if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
-        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
-        else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
-        if (!hash) ok = 0;
-    }
-    if (ok) {
-        dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                     bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                     has_bias && !hash_mode, hash_mode);
-        ok = cuda_ok(cudaGetLastError(), "router_select launch");
-    }
-    return ok;
+/* L295 F2: DeepSeek's router, declared for the shared router (pulsar_cuda_router.cu, which now holds the kernels
+ * this file had): scores sqrt(softplus(logit)); the top-k of score + the correction bias (or, on a vision image slot
+ * -- a token id at or above the vocabulary, model.py's image ids -- score + bias_vl INSTEAD); weights from the
+ * UNBIASED scores, w / max(sum, 2^-14) * route_scale (dev's floor, on the top-k and the hash arm alike).  0731's
+ * leading layers are hash-routed: the token-id table (tid2eid) names the experts, the weights are still their
+ * unbiased scores, and an image slot escapes the table (it has no row) into the vl-biased top-k.  The shared
+ * expert is ungated and runs outside the router. */
+/** @param n_expert            routed experts
+ *  @param n_expert_used       picks per token
+ *  @param expert_weight_scale the route scale
+ *  @return DeepSeek's router declaration (sqrt-softplus scores, sum renorm with a 2^-14 floor, no shared gate) */
+static pulsar_router_cfg ds4_router_cfg(uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale) {
+    pulsar_router_cfg c{};
+    c.n_expert = (int)n_expert;
+    c.top_k = (int)n_expert_used;
+    c.n_shared = 0;
+    c.shared_gate = PULSAR_ROUTER_SHARED_NONE;
+    c.score = PULSAR_ROUTER_SCORE_SQRT_SOFTPLUS;
+    c.renorm = PULSAR_ROUTER_RENORM_SUM;
+    c.logits_bf16 = false;
+    c.weights_bf16 = false;
+    c.sum_floor = 6.103515625e-5f;
+    c.route_scale = expert_weight_scale;
+    c.logit_scale = 1.0f;
+    return c;
 }
 
-
-int pulsar_gpu_router_select_batch_tensor(pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
-    if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
-        n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
+int pulsar_gpu_router_select_batch_tensor(
+        pulsar_gpu_tensor *selected, pulsar_gpu_tensor *weights, pulsar_gpu_tensor *probs,
+        const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, bool has_bias,
+        uint64_t tid2eid_offset, uint32_t tid2eid_rows,
+        const pulsar_gpu_tensor *logits, const pulsar_gpu_tensor *tokens,
+        uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens,
+        uint64_t vl_bias_offset, uint32_t n_vocab, bool has_vl_bias) {
+    if (!selected || !weights || !logits || !model_map || n_tokens == 0 ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        (probs && probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
-    if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
-        if (!bias) return 0;
+    pulsar_router_layer l{};
+    /* The correction bias is OPTIONAL.  Both the target's blk.N.exp_probs_b.bias
+     * and the drafter's dspark.N.exp_probs_b.bias are absent from shipped
+     * artifacts -- Vision-Exp's serving file among them -- and `has_bias` is the
+     * only thing that can distinguish "absent" from "offset 0", which is a real
+     * tensor offset.  A routed layer without it scores sqrt(softplus(logit))
+     * alone. */
+    if (has_bias) {
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
+        l.bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "router_bias");
+        if (!l.bias) return 0;
     }
-    if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
-        if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
-        hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
-        if (!hash) return 0;
+    /* Vision-Exp: the image-token bias, one n_expert-wide row per layer.  A
+     * text-only artifact has no such tensor and this stays NULL. */
+    if (has_vl_bias) {
+        const uint64_t vl_bytes = (uint64_t)n_expert * sizeof(float);
+        if (vl_bias_offset > model_size || model_size - vl_bias_offset < vl_bytes) return 0;
+        l.alt_bias = (const float *)cuda_model_range_ptr(model_map, vl_bias_offset, vl_bytes, "router_bias_vl");
+        if (!l.alt_bias) return 0;
+        l.alt_token_min = (int32_t)n_vocab;
     }
-    dim3 block(32, 4, 1);
-    router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
-                                                                    (float *)weights->ptr,
-                                                                    (float *)probs->ptr,
-                                                                    bias,
-                                                                    hash,
-                                                                    (const float *)logits->ptr,
-                                                                    (const int32_t *)tokens->ptr,
-                                                                    0,
-                                                                    hash_rows,
-                                                                    n_tokens,
-                                                                    has_bias && !hash_mode,
-                                                                    hash_mode);
-    return cuda_ok(cudaGetLastError(), "router_select launch");
+    /* The HASH-routed arm takes precedence when the artifact carries a token-id
+     * table: tid2eid_rows is the table's row count (the vocab size); 0 means the
+     * model has no such table, so no separate presence flag is needed. */
+    if (tid2eid_rows != 0) {
+        if (!tokens) {
+            /* The lookup is per TOKEN: guessing an id would route every row of a
+             * decode batch to the same experts, silently.  The engine's only
+             * caller passes the prompt tokens, so a NULL here means a lane we have
+             * not met -- refuse and name it rather than mis-route. */
+            fprintf(stderr, "pulsar: hash routing needs the token ids and none were "
+                            "passed -- refusing\n");
+            return 0;
+        }
+        const uint64_t table_bytes = (uint64_t)tid2eid_rows * n_expert_used * sizeof(int32_t);
+        if (tid2eid_offset > model_size || model_size - tid2eid_offset < table_bytes ||
+            tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+        l.table = (const int32_t *)cuda_model_range_ptr(model_map, tid2eid_offset, table_bytes, "router_tid2eid");
+        if (!l.table) return 0;
+        l.table_rows = (int32_t)tid2eid_rows;
+    }
+    const pulsar_router_cfg c = ds4_router_cfg(n_expert, n_expert_used, expert_weight_scale);
+    /* L336: the select reads the logits at the router's pitch; this lane's matmul writes them n_expert apart */
+    if (pulsar_router_logit_pitch(&c) != (int)n_expert) {
+        fprintf(stderr, "pulsar: router select: %u experts' logits are %u floats apart, the router reads them %d apart "
+                        "-- refusing\n", n_expert, n_expert, pulsar_router_logit_pitch(&c));
+        return 0;
+    }
+    return pulsar_router_select_launch(&c, &l, (const float *)logits->ptr, tokens ? (const int32_t *)tokens->ptr : NULL,
+                                       (int)n_tokens, (int32_t *)selected->ptr, (float *)weights->ptr, NULL,
+                                       probs ? (float *)probs->ptr : NULL, cudaStreamPerThread) == 0;
 }
 
+/* ---- the HC HEAD MIX (0731) -----------------------------------------------
+ *
+ * The final collapse is SHARED with V4.1 (pulsar_gpu_hc_weighted_sum_tensor
+ * below); what differs is where its n_hc coefficients come from.  V4.1 reads
+ * the pre its last FFN handed on; 0731 computes them: a fused RMSNorm + mix
+ * GEMV, then a sigmoid with a per-stream bias and a row scale.  Restored from
+ * dev (PLAN 96 s17); these are the only two 0731-specific HC kernels.
+ *
+ * Reachable only when the artifact bound output_hc_* / dspark.2.hc_head_*, so
+ * V4.1 never runs them. */
 
-int pulsar_gpu_hc_split_sinkhorn_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
-    if (!out || !mix || !model_map || n_hc != 4) return 0;
-    const uint64_t mix_bytes = 24ull * sizeof(float);
-    if (scale_offset > model_size || model_size - scale_offset < 3ull * sizeof(float) ||
-        base_offset > model_size || model_size - base_offset < mix_bytes ||
-        mix->bytes < mix_bytes || out->bytes < mix_bytes) return 0;
-    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
-    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
+/** out = sigmoid(pre * scale + base[h]) + eps per (token, carrier).  1-D grid over n_tokens * n_hc.
+ *  @param out      f32 [n_tokens][n_hc]
+ *  @param pre      f32 [n_tokens][n_hc] mix outputs
+ *  @param scale    [1] row scale
+ *  @param base     [n_hc] per-carrier bias
+ *  @param n_hc     carriers
+ *  @param n_tokens tokens
+ *  @param epsv     added after the sigmoid */
+__global__ static void output_hc_weights_kernel(
+        float *out,
+        const float *pre,
+        const float *scale,
+        const float *base,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        float epsv) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t n = n_tokens * n_hc;
+    if (gid >= n) return;
+    const uint32_t h = gid % n_hc;
+    const float z = pre[gid] * scale[0] + base[h];
+    out[gid] = 1.0f / (1.0f + expf(-z)) + epsv;
+}
+
+/* Fused RMSNorm + mix GEMV.  Byte-identical to the rms_norm_plain -> matmul
+ * pair it replaces, which ran a 1-block kernel and then a 24-block kernel with a
+ * 64 KB f32 scratch round trip between them (~5.4% of decode, by dev's own
+ * measurement).
+ *
+ * The roundings are PINNED so that no future contraction or reassociation
+ * decision by nvcc can quietly move this off byte-identical: __fmul_rn
+ * reproduces the f32 that rms_norm_plain stored, and __fmaf_rn reproduces the
+ * generic GEMV's contracted `sum += w * x`.  Do not "tidy" these into plain
+ * operators. */
+/** Fused plain RMSNorm of one HC carrier row and the mix GEMV: out[row] = w[row] . (x * rstd).  Grid out_dim (each
+ *  block recomputes the norm); block BLK; static smem BLK partials.
+ *  @tparam BLK    block size (a power of two)
+ *  @tparam UNROLL loads batched per thread
+ *  @tparam WT     weight element type (float or __nv_bfloat16)
+ *  @param out     f32 [out_dim]
+ *  @param w       weight [out_dim][n]
+ *  @param x       HC carrier row [n]
+ *  @param n       input width
+ *  @param out_dim output rows
+ *  @param eps     the norm's epsilon */
+template <uint32_t BLK, uint32_t UNROLL, typename WT>
+__global__ static void hc_norm_mix_kernel(
+        float *out,
+        const WT *w,
+        const pulsar_hc_t *x,
+        uint32_t n,
+        uint32_t out_dim,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= out_dim) return;          /* block-uniform: depends only on blockIdx */
+    const uint32_t tid = threadIdx.x;
+    __shared__ float partial[BLK];
+
+    /* stage 1: plain RMSNorm scale over x -- same order as rms_norm_plain */
+    float sum = 0.0f;
+    uint32_t i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float v[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) v[u] = pulsar_hc_load(x, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) sum += v[u] * v[u];
+    }
+    for (; i < n; i += BLK) {
+        const float v = pulsar_hc_load(x, i);
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    __syncthreads();                     /* partial[] is reused below */
+
+    /* stage 2: dot(w[row], normed x) -- same order as the generic GEMV */
+    const WT *wr = w + (uint64_t)row * n;
+    float dot = 0.0f;
+    i = tid;
+    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
+        float xv[UNROLL];
+        float wv[UNROLL];
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) xv[u] = pulsar_hc_load(x, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) wv[u] = pulsar_wt_load(wr, i + u * BLK);
+        #pragma unroll
+        for (uint32_t u = 0; u < UNROLL; u++) dot = __fmaf_rn(wv[u], __fmul_rn(xv[u], scale), dot);
+    }
+    for (; i < n; i += BLK) {
+        dot = __fmaf_rn(pulsar_wt_load(wr, i), __fmul_rn(pulsar_hc_load(x, i), scale), dot);
+    }
+    partial[tid] = dot;
+    __syncthreads();
+    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[row] = partial[0];
+}
+
+/* The sigmoid step: out = sigmoid(pre * scale + base[h]) + eps.  `scale` is a
+ * single f32 (a per-ROW scale, not per-stream), `base` is n_hc wide. */
+int pulsar_gpu_output_hc_weights_tensor(
+        pulsar_gpu_tensor       *out,
+        const pulsar_gpu_tensor *pre,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint32_t                n_hc,
+        float                   eps) {
+    if (!out || !pre || !model_map || n_hc == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
+    if (out->bytes < row_bytes || out->bytes % row_bytes != 0 || pre->bytes < out->bytes ||
+        scale_offset > model_size || sizeof(float) > model_size - scale_offset ||
+        base_offset > model_size || row_bytes > model_size - base_offset) {
+        return 0;
+    }
+    const uint64_t n_tokens = out->bytes / row_bytes;
+    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, sizeof(float), "output_hc_scale");
+    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, row_bytes, "output_hc_base");
     if (!scale || !base) return 0;
-    uint32_t n_rows = (uint32_t)(mix->bytes / mix_bytes);
-    if (out->bytes / mix_bytes < n_rows) n_rows = (uint32_t)(out->bytes / mix_bytes);
-    hc_split_sinkhorn_kernel<<<(n_rows + 255) / 256, 256>>>(
-        (float *)out->ptr, (const float *)mix->ptr,
-        scale,
-        base,
-        n_rows, sinkhorn_iters, eps);
-    return cuda_ok(cudaGetLastError(), "hc_split_sinkhorn launch");
+    const uint64_t n = n_tokens * n_hc;
+    output_hc_weights_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+            (float *)out->ptr, (const float *)pre->ptr, scale, base,
+            n_hc, (uint32_t)n_tokens, eps);
+    return cuda_ok(cudaGetLastError(), "output hc weights launch");
+}
+
+/* w_type is the ds4 tensor type of the mix weight: 30 BF16, 0 F32.  Templated
+ * on STORAGE rather than gated on one type: it used to be F16-only, which made
+ * the fusion silently unreachable the moment hc_*_fn moved storage.  Anything
+ * else REFUSES rather than falling through to an f16 read at the wrong width. */
+int pulsar_gpu_hc_norm_mix_tensor(
+        pulsar_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const pulsar_gpu_tensor *x,
+        float                   eps,
+        uint32_t                w_type) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t elt = (w_type == PULSAR_TENSOR_F32) ? 4u : 2u;   /* F32 : BF16 */
+    const uint64_t weight_bytes = out_dim * in_dim * elt;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
+    if (x->bytes < in_dim * PULSAR_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "hc_mix");
+    if (!wptr) return 0;
+#define PULSAR_HCMIX(WT, CAST)                                              \
+    hc_norm_mix_kernel<256, 8, WT><<<(uint32_t)out_dim, 256>>>(             \
+            (float *)out->ptr, (const CAST)wptr, (const pulsar_hc_t *)x->ptr, \
+            (uint32_t)in_dim, (uint32_t)out_dim, eps)
+    if (w_type == PULSAR_TENSOR_BF16)      PULSAR_HCMIX(__nv_bfloat16, __nv_bfloat16 *);
+    else if (w_type == PULSAR_TENSOR_F32)  PULSAR_HCMIX(float, float *);
+    else {
+        fprintf(stderr, "pulsar: hc_mix weight type %u is neither BF16 nor F32\n", w_type);
+        return 0;
+    }
+#undef PULSAR_HCMIX
+    return cuda_ok(cudaGetLastError(), "hc norm mix launch");
 }
 
 
@@ -705,71 +986,19 @@ int pulsar_gpu_hc_weighted_sum_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_t
 }
 
 
-int pulsar_gpu_hc_weighted_sum_split_tensor(pulsar_gpu_tensor *out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
-    uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
-    /* Bound the carrier input as well as the output (see the sibling above). */
-    if (residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE ||
-        split->bytes < (uint64_t)n_tokens * stride * sizeof(float)) return 0;
-    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
-        (float *)out->ptr, (const pulsar_hc_t *)residual_hc->ptr, (const float *)split->ptr,
-        n_embd, n_hc, n_tokens, stride);
-    return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
-}
 
 
-int pulsar_gpu_hc_split_weighted_sum_tensor(
-        pulsar_gpu_tensor       *out,
-        pulsar_gpu_tensor       *split,
-        const pulsar_gpu_tensor *mix,
-        const pulsar_gpu_tensor *residual_hc,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps) {
-    if (!out || !split || !mix || !residual_hc || !model_map ||
-        n_embd == 0 || n_hc != 4) {
-        return 0;
-    }
-    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    const uint64_t mix_bytes = mix_hc * sizeof(float);
-    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
-    if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
-        scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
-        base_offset > model_size || mix_bytes > model_size - base_offset) {
-        return 0;
-    }
-    uint64_t n_rows = out->bytes / out_row_bytes;
-    if (mix->bytes < n_rows * mix_bytes ||
-        split->bytes < n_rows * mix_bytes ||
-        residual_hc->bytes < n_rows * residual_row_bytes) {
-        return 0;
-    }
-    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
-    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
-    if (!scale || !base) return 0;
-    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256>>>(
-            (float *)out->ptr,
-            (float *)split->ptr,
-            (const float *)mix->ptr,
-            (const pulsar_hc_t *)residual_hc->ptr,
-            scale,
-            base,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
-    return cuda_ok(cudaGetLastError(), "hc split weighted sum launch");
-}
 
-
-int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
+int pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor(
         pulsar_gpu_tensor       *out,
         pulsar_gpu_tensor       *norm_out,
+        void                    *norm_out_q,
+        void                    *norm_out_sf,
+        int                      norm_out_kbp,
+        void                    *norm_out_b,
+        uint32_t                 norm_f32_keep_from,
         pulsar_gpu_tensor       *split,
+        pulsar_gpu_tensor       *pre_carry,
         const pulsar_gpu_tensor *mix,
         const pulsar_gpu_tensor *residual_hc,
         const void             *model_map,
@@ -777,12 +1006,16 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint64_t                norm_weight_offset,
+        uint32_t                n_rows_in,
         uint32_t                n_embd,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
         float                   eps,
-        float                   norm_eps) {
-    if (!out || !norm_out || !split || !mix || !residual_hc || !model_map ||
+        float                   norm_eps,
+        int                     norm_w_bf16) {
+    /* `out` is OPTIONAL: it is the pre-norm carrier, which nothing reads except
+     * a debug dump, so callers pass NULL unless a dump was requested. */
+    if (!norm_out || !split || !pre_carry || !mix || !residual_hc || !model_map ||
         n_embd == 0 || n_hc != 4) {
         return 0;
     }
@@ -790,17 +1023,19 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
     const uint64_t mix_bytes = mix_hc * sizeof(float);
     const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t residual_row_bytes = (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE;
-    if (out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0 ||
-        norm_out->bytes < out->bytes ||
+    if (n_rows_in == 0 ||
+        norm_out->bytes < (uint64_t)n_rows_in * out_row_bytes ||
+        (out && out->bytes < (uint64_t)n_rows_in * out_row_bytes) ||
         scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
         base_offset > model_size || mix_bytes > model_size - base_offset ||
         norm_weight_offset > model_size ||
-        (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) {
+        (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16) > model_size - norm_weight_offset) {
         return 0;
     }
-    const uint64_t n_rows = out->bytes / out_row_bytes;
+    const uint64_t n_rows = n_rows_in;
     if (mix->bytes < n_rows * mix_bytes ||
         split->bytes < n_rows * mix_bytes ||
+        pre_carry->bytes < n_rows * (uint64_t)n_hc * sizeof(float) ||
         residual_hc->bytes < n_rows * residual_row_bytes) {
         return 0;
     }
@@ -808,103 +1043,119 @@ int pulsar_gpu_hc_split_weighted_sum_norm_tensor(
             3ull * sizeof(float), "hc_scale");
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset,
             mix_bytes, "hc_base");
-    const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
-            (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
+    const void *norm_w = cuda_model_range_ptr(model_map, norm_weight_offset,
+            (uint64_t)n_embd * pulsar_w_elt_bytes(norm_w_bf16), "hc_norm_weight");
     if (!scale || !base || !norm_w) return 0;
 #define PULSAR_HCFUSED_BLK 256u
-#define PULSAR_HCFUSED_VEC 16u
-    if (n_embd <= PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC) {
-        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, PULSAR_HCFUSED_VEC>
-                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK>>>(
-                (float *)out->ptr,
-                (float *)norm_out->ptr,
-                (float *)split->ptr,
-                (const float *)mix->ptr,
-                (const pulsar_hc_t *)residual_hc->ptr,
-                scale,
-                base,
-                norm_w,
-                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
-    }
-    hc_split_weighted_sum_norm_fused_generic_kernel<<<(uint32_t)n_rows, 256>>>(
-            (float *)out->ptr,
-            (float *)norm_out->ptr,
-            (float *)split->ptr,
-            (const float *)mix->ptr,
-            (const pulsar_hc_t *)residual_hc->ptr,
-            scale,
-            base,
-            norm_w,
-            n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
-    return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
-}
-
-
-int pulsar_gpu_output_hc_weights_tensor(
-        pulsar_gpu_tensor       *out,
-        const pulsar_gpu_tensor *pre,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_hc,
-        float                   eps) {
-    if (!out || !pre || !model_map || n_hc == 0) return 0;
-    const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
-    if (row_bytes == 0 || out->bytes < row_bytes || out->bytes % row_bytes != 0 ||
-        pre->bytes < out->bytes ||
-        scale_offset > model_size || sizeof(float) > model_size - scale_offset ||
-        base_offset > model_size || row_bytes > model_size - base_offset) {
+#define PULSAR_HCFUSED_Q 4u     /* column quarters: the block is BLK * Q threads */
+/* The unroll must land EXACTLY on n_embd where it can.  A group past the end is
+ * not free: every unrolled step calls pulsar_mx_emit_block, and a dead group
+ * still runs through its shuffles, so a width that does not divide n_embd
+ * perturbs the emitted E4M3 plane.  That is the s51 bug, and dev's V4 build is
+ * exactly 256*16 == 4096 == n_embd with no dead group at all.  V4.1's 5120
+ * needs 20.  Both are selected here, on the tensor's own shape. */
+#define PULSAR_HCFUSED_VEC_4096 16u
+#define PULSAR_HCFUSED_VEC_5120 20u
+    /* Fail loud rather than ever silently skip the emit again.  There WAS a
+     * generic fallback for wider models; it is deleted -- it could not emit
+     * E4M3 at all (its parameter list had no norm_out_q) while the caller still
+     * marked the activation slot valid, so every MXFP8 consumer downstream read
+     * the previous layer's data against zeroed scales.  And EXACTLY the two
+     * widths (L335): any other n_embd up to 5120 used to launch with dead groups
+     * -- the s51 corruption the paragraph above describes. */
+    if (n_embd != PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096 &&
+        n_embd != PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120) {
+        fprintf(stderr, "pulsar: hc fused norm: n_embd=%u -- only %u and %u have an exact unroll -- refusing\n",
+                n_embd, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_5120);
         return 0;
     }
-    const uint64_t n_tokens = out->bytes / row_bytes;
-    const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, sizeof(float), "output_hc_scale");
-    const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, row_bytes, "output_hc_base");
-    if (!scale || !base) return 0;
-    uint64_t n = n_tokens * n_hc;
-    output_hc_weights_kernel<<<(n + 255) / 256, 256>>>(
-            (float *)out->ptr,
-            (const float *)pre->ptr,
-            scale,
-            base,
-            n_hc,
-            (uint32_t)n_tokens,
-            eps);
-    return cuda_ok(cudaGetLastError(), "output hc weights launch");
+    {
+#define PULSAR_HCFUSED_LAUNCH(VEC, NW)                                               \
+        hc_split_weighted_sum_norm_fused_kernel<PULSAR_HCFUSED_BLK, VEC, NW, PULSAR_HCFUSED_Q> \
+                <<<(uint32_t)n_rows, PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_Q>>>(        \
+                out ? (float *)out->ptr : NULL,                                       \
+                (float *)norm_out->ptr,                                              \
+                (__nv_fp8_e4m3 *)norm_out_q,                                         \
+                (unsigned char *)norm_out_sf,                                        \
+                norm_out_kbp,                                                        \
+                (__nv_bfloat16 *)norm_out_b,                                         \
+                norm_f32_keep_from,                                                  \
+                (float *)split->ptr,                                                 \
+                (float *)pre_carry->ptr,                                             \
+                (const float *)mix->ptr,                                             \
+                (const pulsar_hc_t *)residual_hc->ptr,                               \
+                scale,                                                               \
+                base,                                                                \
+                norm_w,                                                              \
+                n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps,     \
+                g_hc_head_mix ? 1 : 0)
+#define PULSAR_HCFUSED_LAUNCH_NW(VEC)                                                \
+        do { if (norm_w_bf16) PULSAR_HCFUSED_LAUNCH(VEC, true);                       \
+             else             PULSAR_HCFUSED_LAUNCH(VEC, false); } while (0)
+        if (n_embd == PULSAR_HCFUSED_BLK * PULSAR_HCFUSED_VEC_4096)
+            PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_4096);
+        else
+            PULSAR_HCFUSED_LAUNCH_NW(PULSAR_HCFUSED_VEC_5120);
+#undef PULSAR_HCFUSED_LAUNCH_NW
+#undef PULSAR_HCFUSED_LAUNCH
+        return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
+    }
 }
 
 
-int pulsar_gpu_hc_expand_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *post, const pulsar_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
-    if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
-    uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
-                                                    (const float *)block_out->ptr,
-                                                    (const float *)block_out->ptr,
-                                                    (const pulsar_hc_t *)residual_hc->ptr,
-                                                    (const float *)post->ptr,
-                                                    (const float *)comb->ptr,
-                                                    n_embd, n_hc, n_tokens,
-                                                    n_hc, n_hc * n_hc, 0);
-    return cuda_ok(cudaGetLastError(), "hc_expand launch");
+
+
+int pulsar_gpu_hc_pre_identity_tensor(pulsar_gpu_tensor *pre, uint32_t n_rows, uint32_t n_hc) {
+    if (!pre || n_rows == 0 || n_hc == 0 || pre->bytes < (uint64_t)n_rows * n_hc * sizeof(float)) return 0;
+    const uint32_t n = n_rows * n_hc;
+    hc_pre_identity_kernel<<<(n + 255u) / 256u, 256u>>>((float *)pre->ptr, n_rows, n_hc);
+    return cuda_ok(cudaGetLastError(), "hc pre identity launch");
 }
 
+
+
+/* The split expands' operand sizes (L335: they read n_tokens rows of each operand, n_tokens taken from out_hc's
+ * size alone, and checked none of them).  Every operand must cover those rows; out_hc must hold at least one. */
+/** @param what        the entry, for the refusal line
+ *  @param n_tokens    rows (from out_hc's size)
+ *  @param block_out   f32 [n_tokens][n_embd]
+ *  @param block_add   f32 [n_tokens][n_embd], or NULL
+ *  @param residual_hc HC carrier [n_tokens][n_hc][n_embd]
+ *  @param split       f32 [n_tokens][2 n_hc + n_hc^2]
+ *  @param n_embd      hidden width
+ *  @param n_hc        carriers
+ *  @return true when every operand covers n_tokens rows (n_tokens > 0); false refused (said) */
+static bool hc_expand_split_sizes_ok(const char *what, uint32_t n_tokens, const pulsar_gpu_tensor *block_out,
+                                     const pulsar_gpu_tensor *block_add, const pulsar_gpu_tensor *residual_hc,
+                                     const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    const uint64_t row = (uint64_t)n_tokens * n_embd * sizeof(float);
+    const uint64_t mix = (uint64_t)n_tokens * (2u * n_hc + n_hc * n_hc) * sizeof(float);
+    if (n_tokens == 0 || block_out->bytes < row || (block_add && block_add->bytes < row) ||
+        residual_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE || split->bytes < mix) {
+        fprintf(stderr, "pulsar: %s: operands short of %u rows (block %llu B, residual %llu B, split %llu B; "
+                        "n_embd %u, n_hc %u) -- refusing\n", what, n_tokens, (unsigned long long)block_out->bytes,
+                (unsigned long long)residual_hc->bytes, (unsigned long long)split->bytes, n_embd, n_hc);
+        return false;
+    }
+    return true;
+}
 
 int pulsar_gpu_hc_expand_split_tensor(pulsar_gpu_tensor *out_hc, const pulsar_gpu_tensor *block_out, const pulsar_gpu_tensor *residual_hc, const pulsar_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (!hc_expand_split_sizes_ok("hc_expand_split", n_tokens, block_out, NULL, residual_hc, split, n_embd, n_hc))
+        return 0;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+    if (!hc_expand_launch(256,
+                      (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const pulsar_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
-                                                    mix_hc, mix_hc, 0);
+                                                    mix_hc, mix_hc, 0)) return 0;
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
 
@@ -914,192 +1165,32 @@ int pulsar_gpu_hc_expand_add_split_tensor(pulsar_gpu_tensor *out_hc, const pulsa
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE));
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (!hc_expand_split_sizes_ok("hc_expand_add_split", n_tokens, block_out, block_add, residual_hc, split, n_embd,
+                                  n_hc))
+        return 0;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((pulsar_hc_t *)out_hc->ptr,
+    if (!hc_expand_launch(256,
+                      (pulsar_hc_t *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
                                                     (const pulsar_hc_t *)residual_hc->ptr,
                                                     base + n_hc,
                                                     base + 2u * n_hc,
                                                     n_embd, n_hc, n_tokens,
-                                                    mix_hc, mix_hc, 1);
+                                                    mix_hc, mix_hc, 1)) return 0;
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
-
-
-
-int pulsar_gpu_shared_down_hc_expand_mxfp8_tensor(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *shared_mid,
-        const pulsar_gpu_tensor *routed_out,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    return pulsar_gpu_matmul_mxfp8_tensor(shared_out, model_map, model_size,
-                                        weight_offset, in_dim, out_dim,
-                                        shared_mid, 1) &&
-           pulsar_gpu_hc_expand_add_split_tensor(out_hc, shared_out, routed_out,
-                                                residual_hc, split, n_embd, n_hc);
-}
-
-
-
-int pulsar_gpu_matmul_fp8_hc_expand_tensor(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *block_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) {
-    return cuda_matmul_fp8_hc_expand_tensor_labeled(out_hc, block_out,
-                                                    model_map, model_size,
-                                                    weight_offset,
-                                                    in_dim, out_dim,
-                                                    x,
-                                                    NULL,
-                                                    residual_hc,
-                                                    split,
-                                                    n_embd, n_hc,
-                                                    "fp8_hc_expand");
-}
-
-
-
-/* ---------------------------------------------------------------------------
- * Fused plain-RMSNorm + f16 HC-mix GEMV (2026-07-21, BIT-EXACT).
- *
- * The decode graph ran, three times per token per layer-pair:
- *     rms_norm_plain_tensor(flat_hc, cur_hc, hc_dim)      // grid 1  x 256
- *     matmul_f16_tensor(hc_mix, hc_attn_fn, flat_hc, 1)   // grid 24 x 256
- * On a 48-SM GB10 that is one SM followed by 24 SMs, with a 64 KB f32 store and
- * a 24-way re-read of it in between, for 24 (or 4, at the output head) dot
- * products.  The nsys profile put the pair at ~5.4% of decode; the GEMV alone
- * moved 786 KB in 28.3 us = 27.8 GB/s, ~12% of achievable -- i.e. it was never
- * bandwidth, it was 8 warps on 24 SMs with no memory-level parallelism.
- *
- * This kernel keeps the SAME two reductions but runs the norm redundantly in
- * each of the out_dim blocks, so the serial 1-block stage disappears, the
- * 64 KB scratch round trip disappears (flat_hc has no other consumer -- every
- * call site feeds it straight into this GEMV), one launch disappears, and both
- * loops get compile-time strides so UNROLL loads are in flight per warp.
- *
- * `x` is an HC residual CARRIER (cur_hc / after_attn_hc), so it is read through
- * pulsar_hc_load -- BF16 storage promoted to f32 -- matching rms_norm_plain_kernel
- * exactly (task #62).  Reading it as float* would be silent corruption.
- *
- * WHY IT IS BIT-EXACT, not merely close:
- *   - The sum-of-squares keeps thread t on exactly {t, t+BLK, ...} in
- *     increasing order and reuses the identical 256-entry pairwise tree, so
- *     `scale` is the same float rsqrtf produced before.
- *   - flat[i] was stored as f32 and reloaded; here x[i]*scale is consumed from
- *     the register that held that same f32.  Store/load of an f32 is the
- *     identity, so the multiplicand is bit-identical.
- *   - The dot product keeps the same 256 partials over the same index subsets
- *     in the same order and the same pairwise tree as matmul_f16_kernel.
- * There is no split-K, no atomic, and no cross-thread re-association anywhere.
- * ------------------------------------------------------------------------- */
-template <uint32_t BLK, uint32_t UNROLL>
-__global__ static void hc_norm_mix_f16_kernel(
-        float *out,
-        const __half *w,
-        const pulsar_hc_t *x,
-        uint32_t n,
-        uint32_t out_dim,
-        float eps) {
-    const uint32_t row = blockIdx.x;
-    if (row >= out_dim) return;
-    const uint32_t tid = threadIdx.x;
-    __shared__ float partial[BLK];
-
-    /* stage 1: plain RMSNorm scale over x -- same order as rms_norm_plain_kernel */
-    float sum = 0.0f;
-    uint32_t i = tid;
-    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
-        float v[UNROLL];
-        #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) v[u] = pulsar_hc_load(x, i + u * BLK);
-        #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) sum += v[u] * v[u];
-    }
-    for (; i < n; i += BLK) {
-        float v = pulsar_hc_load(x, i);
-        sum += v * v;
-    }
-    partial[tid] = sum;
-    __syncthreads();
-    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
-    __syncthreads();   /* partial[] is reused below */
-
-    /* stage 2: dot(w[row], normed x) -- same order as matmul_f16_kernel */
-    const __half *wr = w + (uint64_t)row * n;
-    float dot = 0.0f;
-    i = tid;
-    for (; i + (UNROLL - 1u) * BLK < n; i += BLK * UNROLL) {
-        float xv[UNROLL];
-        float wv[UNROLL];
-        #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) xv[u] = pulsar_hc_load(x, i + u * BLK);
-        #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) wv[u] = __half2float(wr[i + u * BLK]);
-        /* pinned roundings: __fmul_rn reproduces the f32 that rms_norm_plain
-         * stored into flat_hc, __fmaf_rn reproduces matmul_f16_kernel's
-         * contracted `sum += w * x`.  Written explicitly so no future
-         * contraction/reassociation decision by nvcc can silently move this
-         * off byte-identical. */
-        #pragma unroll
-        for (uint32_t u = 0; u < UNROLL; u++) dot = __fmaf_rn(wv[u], __fmul_rn(xv[u], scale), dot);
-    }
-    for (; i < n; i += BLK) {
-        dot = __fmaf_rn(__half2float(wr[i]), __fmul_rn(pulsar_hc_load(x, i), scale), dot);
-    }
-    partial[tid] = dot;
-    __syncthreads();
-    for (uint32_t stride = BLK >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    if (tid == 0) out[row] = partial[0];
-}
-
-
-int pulsar_gpu_hc_norm_mix_f16_tensor(
-        pulsar_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        float                   eps) {
-    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
-    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
-    const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
-    /* x is an HC residual carrier: PULSAR_HC_ELT_SIZE bytes per sample. */
-    if (x->bytes < in_dim * PULSAR_HC_ELT_SIZE || out->bytes < out_dim * sizeof(float)) return 0;
-    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
-    if (!wptr) return 0;
-    hc_norm_mix_f16_kernel<256, 8><<<(uint32_t)out_dim, 256>>>(
-            (float *)out->ptr, (const __half *)wptr, (const pulsar_hc_t *)x->ptr,
-            (uint32_t)in_dim, (uint32_t)out_dim, eps);
-    return cuda_ok(cudaGetLastError(), "hc norm mix f16 launch");
-}
+/** @def PULSAR_HCMIX(WT, CAST)
+ *  Inside pulsar_gpu_hc_norm_mix_tensor: launches hc_norm_mix_kernel (256 threads, unroll 8) for weight type WT. */
+/** @def PULSAR_HCFUSED_BLK
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: the fused kernel's BLK. */
+/** @def PULSAR_HCFUSED_Q
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: the fused kernel's column quarters. */
+/** @def PULSAR_HCFUSED_VEC_4096
+ *  The fused kernel's VEC for n_embd up to 4096 (256 x 16). */
+/** @def PULSAR_HCFUSED_VEC_5120
+ *  The fused kernel's VEC for n_embd up to 5120 (256 x 20). */
+/** @def PULSAR_HCFUSED_LAUNCH(VEC, NW)
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: launches the fused kernel instance (VEC, NW). */
+/** @def PULSAR_HCFUSED_LAUNCH_NW(VEC)
+ *  Inside pulsar_gpu_hc_split_weighted_sum_norm_f16_tensor: PULSAR_HCFUSED_LAUNCH for the norm weight's storage. */

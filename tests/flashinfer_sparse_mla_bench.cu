@@ -11,9 +11,12 @@
  * include/flashinfer/attention/sparse_mla_sm120 headers are needed; the torch
  * binding TU is deliberately not compiled.
  *
- * OUR REFERENCE, from tests/attn_indexed_bench.cu calibrated to the engine ramp
+ * OUR REFERENCE, from the since-deleted tests/attn_indexed_bench.cu (a71e346)
+ * calibrated to the engine ramp
  * at 3.9%, at the plateau (sub-batch 4+, causal depth >= 2048):
  *     attention_indexed_mixed_heads8_online_kernel<8,16>  6.917 ms / 512 tokens
+ *     (the f32 indexed kernel of the time, deleted in L166; the live kernel
+ *     is attn_f16_kernel in pulsar_cuda_attn_f16.cu)
  *
  * Shape (verified against the gguf and the engine trace):
  *     num_heads 64, head_dim 512 (DSV4: d_qk == d_v == 512), topk 512,
@@ -30,8 +33,8 @@
  *
  * Build:
  *   nvcc -O3 --use_fast_math -arch=sm_120a -std=c++17 \
- *     -I/home/claude/fi/include -o /tmp/fibench \
- *     tests/flashinfer_sparse_mla_bench.cu /home/claude/fi/sparse_mla_sm120_prefill.cu
+ *     -I$FLASHINFER/include -o /tmp/fibench \
+ *     tests/flashinfer_sparse_mla_bench.cu $FLASHINFER/sparse_mla_sm120_prefill.cu   (FLASHINFER: a FlashInfer checkout)
  */
 #include <cstdio>
 #include <cstdlib>

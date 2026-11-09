@@ -1,79 +1,205 @@
+/** @file
+ *  The DSpark drafter's kernels: Markov steps and chains (single and banked), confidence score, concat seeds. */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
+
+/* L335 / L189: every precondition refusal below names its entry and the predicate that failed (they all returned 0
+ * silently, so a refused drafter step was indistinguishable from a launch failure). */
+/// Refuses the enclosing dspark entry (return 0) when `cond` holds, naming the entry and the predicate.
+#define DSPARK_REFUSE_IF(cond)                                                                       \
+    do {                                                                                             \
+        if (cond) {                                                                                  \
+            fprintf(stderr, "pulsar: %s: refused -- %s\n", __func__, #cond);                          \
+            return 0;                                                                                \
+        }                                                                                            \
+    } while (0)
+#include "pulsar_cuda_mx.cuh"   /* L158: pulsar_mx_emit_block for the producer-side E4M3 concat */
 
 
 /*
- * Each block reduces the TOP-2 over its slice of the vocabulary and writes the
- * partial winner + runner-up to block_best_id/val[blockIdx.x] and
- * block_second_id/val[blockIdx.x].  The kernel does NOT reduce across blocks —
- * the host caller reads the grid_dim partials back and merges to the global
- * top-2.  (An earlier version wrote only element 0 into a 4-byte buffer, which
- * both overran the allocation and returned block 0's argmax over just the first
- * blockDim entries.)
- *
- * DTree Phase 0: the top-1 (best) track is BYTE-IDENTICAL to the prior
- * argmax-only kernel — every best_* update below is unchanged and the added
- * second_* track never feeds back into it — so refined_id_dst is bit-exact with
- * or without the runner-up requested.  The runner-up (drafter #2) is used only
- * when the host passes a non-NULL refined_id2_dst (measurement path).
+ * Each block reduces the argmax over its slice of the vocabulary and writes
+ * the partial winner to block_best_id/val[blockIdx.x].  The kernel does NOT
+ * reduce across blocks: dspark_markov_reduce_kernel merges the grid_dim
+ * partials on device.  Ties break toward the lowest id -- the strided loop
+ * visits a thread's ids in ascending order with a strict-'>' update, and the
+ * shared-memory tree keeps the lower-index side as the incumbent.
  */
+/* W1BF16 selects the storage of markov_w1 (pulsar_w_load); W2FMT is markov_w2's
+ * PULSAR_MARKOV_W2_* format.  They are SEPARATE tensors and nothing in the
+ * format forces them to agree, so they get separate descriptors -- a single
+ * shared one silently misreads one of them the first time that stops being true.
+ *
+ * This kernel streams the WHOLE of markov_w2 -- every vocab row, every step --
+ * at one multiply-add per element, so it is pure bandwidth: halving the element
+ * width halves its runtime. That, not the 132 MB, is why the storage matters.
+ *
+ * markov_w2 is stored K-MAJOR (L213): element (v, i) lives at i * vocab + v, so
+ * at each i the 32 lanes of a warp (consecutive v) read 64 contiguous bytes.
+ * The v-major layout it replaced put adjacent lanes 512 bytes apart -- 32
+ * scattered transactions per warp-load -- and the served census measured this
+ * kernel at ~47 GB/s against a ~218 GB/s streaming roofline (rows/L213.md).
+ * The per-thread accumulation order over i is unchanged, so refined logits are
+ * bit-identical to the v-major kernel's. markov_w1 stays v-major: it is read
+ * one whole row (the previous token's) per bank, which that layout serves. */
+/* Every W2 arm reads FOUR consecutive v per lane at each i (L213 step 2): a
+ * warp's load is one contiguous 128 B (mxfp8) .. 512 B (f32) run, where the
+ * one-v-per-lane bf16 kernel it replaces made a 64 B request per warp-load
+ * (half a line) and reached 113 of ~218 GB/s.  Each v still accumulates over i
+ * in order in its own f32 register, so the f32/bf16 arms are bit-identical to
+ * the one-v kernel; the per-thread argmax visits its four v ascending with a
+ * strict '>', so the lowest id still wins a tie into the same block tree. */
+/* (value, id) argmax merge: the lower id wins an exact tie.  Used at EVERY level
+ * -- per thread, the in-block tree, the cross-block reduce -- so the result is
+ * the sequential "first maximum" for any thread -> vocab mapping. */
+/// Merges (v, id) into the running argmax; the lower id wins an exact tie.
+/// @param best_val the running best value, in/out.
+/// @param best_id the running best id, in/out.
+/// @param v a candidate value.
+/// @param id its id.
+__device__ static inline void dspark_argmax_merge(float *best_val, int32_t *best_id,
+                                                  float v, int32_t id) {
+    if (v > *best_val || (v == *best_val && id < *best_id)) { *best_val = v; *best_id = id; }
+}
+
+/// Loads markov_w2[i][v0 .. v0 + 3] as f32.
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param w2 markov_w2 (k-major).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param i the embedding index.
+/// @param v0 the first of four consecutive vocab ids (4-aligned).
+/// @param out out: the four values.
+template <int W2FMT>
+__device__ __forceinline__ static void dspark_w2_load4(const void *w2, uint32_t vocab_size, uint32_t embed_dim,
+                                                       uint32_t i, uint32_t v0, float out[4]) {
+    if constexpr (W2FMT == PULSAR_MARKOV_W2_F32) {
+        const float4 q = *(const float4 *)((const float *)w2 + (uint64_t)i * vocab_size + v0);
+        out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
+    } else if constexpr (W2FMT == PULSAR_MARKOV_W2_BF16) {
+        /* four bf16 in one 8-byte load; bf16 -> f32 is the 16-bit shift, the
+         * value __bfloat162float would give */
+        const uint2 q = *(const uint2 *)((const __nv_bfloat16 *)w2 + (uint64_t)i * vocab_size + v0);
+        out[0] = __uint_as_float(q.x << 16); out[1] = __uint_as_float(q.x & 0xffff0000u);
+        out[2] = __uint_as_float(q.y << 16); out[3] = __uint_as_float(q.y & 0xffff0000u);
+    } else {
+        /* MXFP8 SoA (GGUF 46): type 38's content as two planes -- E8M0 scales
+         * [E][V/32], then E4M3 payload [E][V] -- so the payload is one aligned
+         * 4-byte load.  Stock 38's 33-byte blocks forced five byte loads per
+         * lane per i and held this arm at 152 GB/s (L213 round 5); the planes
+         * took it to 161 us, 212 GB/s.
+         * v0 is 4-aligned so its four v share one scale.  ldexpf keeps byte 0
+         * (2^-127, an f32 subnormal) exact, as the CPU codec's ldexpf does; the
+         * E4M3 -> f32 hardware conversion is exact. */
+        const uint8_t *sc  = (const uint8_t *)w2;
+        const uint8_t *pay = sc + (uint64_t)embed_dim * (vocab_size >> 5);
+        const float scale = ldexpf(1.0f, (int)sc[(uint64_t)i * (vocab_size >> 5) + (v0 >> 5)] - 127);
+        const uint32_t q = *(const uint32_t *)(pay + (uint64_t)i * vocab_size + v0);
+        __nv_fp8_e4m3 f;
+        f.__x = (uint8_t)(q & 0xffu);         out[0] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 8) & 0xffu);  out[1] = (float)f * scale;
+        f.__x = (uint8_t)((q >> 16) & 0xffu); out[2] = (float)f * scale;
+        f.__x = (uint8_t)(q >> 24);           out[3] = (float)f * scale;
+    }
+}
+/* Bytes of a markov_w2 blob in each storage; 0 = unknown format (refuse). */
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @return the blob's bytes, or 0 for an unknown format (MXFP8 also needs vocab_size % 32 == 0).
+static uint64_t dspark_markov_w2_bytes(int w2_fmt, uint32_t vocab_size, uint32_t embed_dim) {
+    const uint64_t n = (uint64_t)vocab_size * embed_dim;
+    switch (w2_fmt) {
+    case PULSAR_MARKOV_W2_F32:   return n * 4u;
+    case PULSAR_MARKOV_W2_BF16:  return n * 2u;
+    case PULSAR_MARKOV_W2_MXFP8: return (vocab_size % 32u) ? 0 : ((uint64_t)vocab_size / 32u) * 33u * embed_dim;
+    default: return 0;
+    }
+}
+/** @def PULSAR_MARKOV_LAUNCH(A, B)
+ *  In the single-bank step: launches `dspark_markov_step_kernel<A, B>` over its operands. */
+/** @def PULSAR_CONF_LAUNCH(A, B)
+ *  In pulsar_gpu_dspark_confidence_score_model: launches `dspark_confidence_score_kernel<A, B>`. */
+/** @def PULSAR_MARKOV_BANKS_LAUNCH(A, B)
+ *  In dspark_markov_banks_launch: grants `dspark_markov_step_banks_kernel<A, B>` its shared memory (once per device),
+ *  then launches it. */
+
+/// Invokes LAUNCH(A, fmt) for the runtime w2_fmt; refuses the enclosing function (return 0, said) on an unknown format.
+#define PULSAR_MARKOV_DISPATCH(LAUNCH, A)                                       \
+    switch (w2_fmt) {                                                           \
+    case PULSAR_MARKOV_W2_F32:   LAUNCH(A, PULSAR_MARKOV_W2_F32);   break;      \
+    case PULSAR_MARKOV_W2_BF16:  LAUNCH(A, PULSAR_MARKOV_W2_BF16);  break;      \
+    case PULSAR_MARKOV_W2_MXFP8: LAUNCH(A, PULSAR_MARKOV_W2_MXFP8); break;      \
+    default:                                                                    \
+        fprintf(stderr, "pulsar: %s: markov w2 format %d has no kernel -- refused\n", __func__, (int)w2_fmt); \
+        return 0;                                                               \
+    }
+
+/// One Markov refine step: refined = base + w2 . w1[prev], and each block's argmax.  Grid grid_dim, 256 threads,
+/// four vocab ids per thread per stride.
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param block_best_id out: each block's argmax id (banked: [n_banks][gridDim.x]).
+/// @param block_best_val out: each block's argmax value, same layout.
+/// @param base_logits the drafter's base logits, f32.
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param markov_w2 markov_w2, k-major [embed_dim][vocab], in the W2FMT storage.
+/// @param prev_token_ptr device: the previous token (out-of-range reads as 0).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+template <bool W1BF16, int W2FMT>
 __global__ static void dspark_markov_step_kernel(
         float *refined_logits,
         int32_t *block_best_id,
         float *block_best_val,
-        int32_t *block_second_id,
-        float *block_second_val,
         const float *base_logits,
-        const float *markov_w1,
-        const float *markov_w2,
-        int32_t prev_token,
+        const void *markov_w1,
+        const void *markov_w2,
+        const int32_t *prev_token_ptr,  /* L108 P1: device-fed so the walk
+                                         * chains without a host round-trip;
+                                         * broadcast read, cached */
         uint32_t vocab_size,
         uint32_t embed_dim) {
-    const float *embed = markov_w1 + (uint64_t)prev_token * embed_dim;
+    int32_t prev_token = *prev_token_ptr;
+    if (prev_token < 0 || (uint32_t)prev_token >= vocab_size) prev_token = 0;
+    const uint64_t embed_base = (uint64_t)prev_token * embed_dim;
     float best_val = -INFINITY;
     int32_t best_id = 0;
-    float second_val = -INFINITY;
-    int32_t second_id = 0;
 
-    for (uint32_t v = threadIdx.x + blockIdx.x * blockDim.x; v < vocab_size;
-         v += blockDim.x * gridDim.x) {
-        float dot = 0.0f;
-        const float *w2_row = markov_w2 + (uint64_t)v * embed_dim;
-        for (uint32_t i = 0; i < embed_dim; i++) dot += w2_row[i] * embed[i];
-        float val = base_logits[v] + dot;
-        refined_logits[v] = val;
-        if (val > best_val) { second_val = best_val; second_id = best_id;
-                              best_val = val; best_id = (int32_t)v; }
-        else if (val > second_val) { second_val = val; second_id = (int32_t)v; }
+    for (uint32_t v0 = 4u * (threadIdx.x + blockIdx.x * blockDim.x); v0 < vocab_size;
+         v0 += 4u * blockDim.x * gridDim.x) {
+        float dot[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t i = 0; i < embed_dim; i++) {
+            float w2v[4];
+            dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i, v0, w2v);
+            const float w1v = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, embed_base + i);
+            for (int k = 0; k < 4; k++) dot[k] += w2v[k] * w1v;
+        }
+        for (int k = 0; k < 4; k++) {
+            const uint32_t v = v0 + k;
+            const float val = base_logits[v] + dot[k];
+            refined_logits[v] = val;
+            if (val > best_val) { best_val = val; best_id = (int32_t)v; }
+        }
     }
 
     __shared__ float best_vals[256];
     __shared__ int32_t best_ids[256];
-    __shared__ float sec_vals[256];
-    __shared__ int32_t sec_ids[256];
     const uint32_t tid = threadIdx.x;
     best_vals[tid] = best_val;
     best_ids[tid] = best_id;
-    sec_vals[tid] = second_val;
-    sec_ids[tid] = second_id;
     __syncthreads();
 
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
         if (tid < stride) {
-            /* Merge two sorted (best>=sec) pairs into the top-2 at tid. The
-             * best branch is exactly the original strict-'>' update, so best_*
-             * evolves identically to the argmax-only kernel. */
-            const float ob = best_vals[tid];        const int32_t oi = best_ids[tid];
-            const float os = sec_vals[tid];         const int32_t oj = sec_ids[tid];
-            const float nb = best_vals[tid + stride]; const int32_t ni = best_ids[tid + stride];
-            const float ns = sec_vals[tid + stride]; const int32_t nj = sec_ids[tid + stride];
-            if (nb > ob) {
-                best_vals[tid] = nb; best_ids[tid] = ni;
-                if (ob > ns) { sec_vals[tid] = ob; sec_ids[tid] = oi; }
-                else         { sec_vals[tid] = ns; sec_ids[tid] = nj; }
-            } else if (nb > os) {
-                sec_vals[tid] = nb; sec_ids[tid] = ni;
-            }
-            (void)oj;
+            /* (value, id) merge, lower id wins -- the cross-block reduce's rule
+             * (L191 #5).  The strict-'>' "lower slot stays the incumbent"
+             * shortcut this replaces equalled "lower id wins" only while no slot
+             * ever inherited a higher thread's value; the tree migrates values
+             * downward, so it never did.  L213 step 2's four-v-per-lane mapping
+             * put five tied ids in one block and it returned the third. */
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         }
         __syncthreads();
     }
@@ -81,101 +207,79 @@ __global__ static void dspark_markov_step_kernel(
     if (tid == 0) {
         block_best_id[blockIdx.x] = best_ids[0];
         block_best_val[blockIdx.x] = best_vals[0];
-        block_second_id[blockIdx.x] = sec_ids[0];
-        block_second_val[blockIdx.x] = sec_vals[0];
     }
 }
 
 /*
- * Merge the per-block top-2 partials to the global top-2 ON DEVICE, then read
- * back only the two winning ids (8 bytes, one copy).  The old path read all
- * four partial arrays to the host (4 device-serializing D2H copies per draft
- * position, 5 positions per spec step at production depth) and merged there.
+ * Merge the per-block argmax partials to the global argmax ON DEVICE.  The
+ * single-step entry reads back only the winning id (4 bytes, one copy); the
+ * chained walk writes it straight into the device id feed.
  *
- * Tie-break: blocks map to ascending contiguous vocab ranges and the
- * per-block reduction breaks ties toward the lowest id.  Each thread here
- * scans its strided subset of blocks in ascending order with the same
- * strict-'>' merge, and the shared-memory tree keeps the lower-index side as
- * the incumbent, so the lowest-id global argmax is preserved exactly —
- * matching a sequential argmax over the vocab (verified logic mirror of the
- * removed host merge).  The best track is exactly the original argmax merge;
- * out_ids[1] (runner-up) feeds the optional refined_id2 path.
+ * Tie-break: the lowest id wins, matching a sequential argmax over the vocab.
+ * Blocks map to ascending contiguous vocab ranges and the per-block reduction
+ * breaks ties toward the lowest id, but a thread here scans blocks {t, t+256,
+ * ...}, so its incumbent can carry a HIGHER id than a later thread's -- so
+ * (value, id) is compared at every level, the strided scan and the
+ * shared-memory tree alike, with the lower id winning a tie.  The strict-'>'
+ * merge this replaces kept the lower THREAD, which at n_blocks > blockDim
+ * (505 > 256) let block 256 beat block 1 on an exact tie (L191 #5; drafts
+ * change only on exact ties).  A thread with no block holds (-inf, INT32_MAX)
+ * so it never wins a tie.
  */
+
+/// Merges the step's per-block partials into the winner.  Grid 1, 256 threads.
+/// @param dst out: the winner id.
+/// @param ids per-block ids, [n_blocks].
+/// @param vals per-block values, [n_blocks].
+/// @param n_blocks partials.
 __global__ static void dspark_markov_reduce_kernel(
-        int32_t *out_ids,           /* [2]: best id, runner-up id */
+        int32_t *dst,               /* winner id (L108 P1: points into the
+                                     * chain's device id array, so the next
+                                     * step kernel reads it directly) */
         const int32_t *ids,
         const float *vals,
-        const int32_t *ids2,
-        const float *vals2,
         uint32_t n_blocks) {
     float best_val = -INFINITY;
-    int32_t best_id = 0;
-    float sec_val = -INFINITY;
-    int32_t sec_id = 0;
-    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
-        const float nb = vals[b];  const int32_t ni = ids[b];
-        const float ns = vals2[b]; const int32_t nj = ids2[b];
-        if (nb > best_val) {
-            if (best_val > ns) { sec_val = best_val; sec_id = best_id; }
-            else               { sec_val = ns;       sec_id = nj; }
-            best_val = nb; best_id = ni;
-        } else if (nb > sec_val) {
-            sec_val = nb; sec_id = ni;
-        }
-    }
+    int32_t best_id = 0x7fffffff;
+    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x)
+        dspark_argmax_merge(&best_val, &best_id, vals[b], ids[b]);
 
     __shared__ float best_vals[256];
     __shared__ int32_t best_ids[256];
-    __shared__ float sec_vals[256];
-    __shared__ int32_t sec_ids[256];
     const uint32_t tid = threadIdx.x;
     best_vals[tid] = best_val;
     best_ids[tid] = best_id;
-    sec_vals[tid] = sec_val;
-    sec_ids[tid] = sec_id;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float ob = best_vals[tid];          const int32_t oi = best_ids[tid];
-            const float os = sec_vals[tid];
-            const float nb = best_vals[tid + stride]; const int32_t ni = best_ids[tid + stride];
-            const float ns = sec_vals[tid + stride];  const int32_t nj = sec_ids[tid + stride];
-            if (nb > ob) {
-                best_vals[tid] = nb; best_ids[tid] = ni;
-                if (ob > ns) { sec_vals[tid] = ob; sec_ids[tid] = oi; }
-                else         { sec_vals[tid] = ns; sec_ids[tid] = nj; }
-            } else if (nb > os) {
-                sec_vals[tid] = nb; sec_ids[tid] = ni;
-            }
-        }
+        if (tid < stride)
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
         __syncthreads();
     }
-    if (tid == 0) {
-        out_ids[0] = best_ids[0];
-        out_ids[1] = sec_ids[0];
-    }
+    if (tid == 0) *dst = best_ids[0];
 }
 
+/// Launches the reduce and, when asked, copies the winner to the host.
+/// @param id_dev the step kernel's per-block ids.
+/// @param val_dev the step kernel's per-block values.
+/// @param out_dev device scratch for the winner, one i32.
+/// @param grid_dim partials (the step kernel's grid).
+/// @param refined_id_dst out: the winner id on the host, or NULL.
+/// @return 1 on success, 0 on a CUDA failure.
 static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
                                         const pulsar_gpu_tensor *val_dev,
-                                        const pulsar_gpu_tensor *id2_dev,
-                                        const pulsar_gpu_tensor *val2_dev,
-                                        pulsar_gpu_tensor *out_dev, /* 2 x int32 */
+                                        pulsar_gpu_tensor *out_dev, /* 1 x int32 */
                                         uint32_t grid_dim,
-                                        int32_t *refined_id_dst,
-                                        int32_t *refined_id2_dst) {
+                                        int32_t *refined_id_dst) {
     dspark_markov_reduce_kernel<<<1, 256>>>(
         (int32_t *)out_dev->ptr,
         (const int32_t *)id_dev->ptr,
         (const float *)val_dev->ptr,
-        (const int32_t *)id2_dev->ptr,
-        (const float *)val2_dev->ptr,
         grid_dim);
-    if (cudaGetLastError() != cudaSuccess) return 0;
-    int32_t out[2];
-    if (!pulsar_gpu_tensor_read(out_dev, 0, out, sizeof(out))) return 0;
-    *refined_id_dst = out[0];
-    if (refined_id2_dst) *refined_id2_dst = out[1];
+    if (!cuda_ok(cudaGetLastError(), "dspark markov reduce launch")) return 0;
+    int32_t out;
+    if (!pulsar_gpu_tensor_read(out_dev, 0, &out, sizeof(out))) return 0;
+    *refined_id_dst = out;
     return 1;
 }
 
@@ -183,7 +287,6 @@ static int dspark_markov_reduce_blocks(const pulsar_gpu_tensor *id_dev,
 int pulsar_gpu_dspark_markov_step_model(
         pulsar_gpu_tensor *refined_logits,
         int32_t *refined_id_dst,
-        int32_t *refined_id2_dst,
         const pulsar_gpu_tensor *base_logits,
         const void *dspark_model_map,
         uint64_t dspark_model_size,
@@ -191,70 +294,113 @@ int pulsar_gpu_dspark_markov_step_model(
         uint64_t markov_w2_offset,
         int32_t prev_token,
         uint32_t vocab_size,
-        uint32_t embed_dim) {
-    if (!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map)
+        uint32_t embed_dim,
+        int w1_bf16,
+        int w2_fmt) {
+    DSPARK_REFUSE_IF(!refined_logits || !refined_id_dst || !base_logits || !dspark_model_map);
+    DSPARK_REFUSE_IF(vocab_size == 0 || embed_dim == 0 || embed_dim > 1024);
+    DSPARK_REFUSE_IF(refined_logits->bytes < (uint64_t)vocab_size * sizeof(float));
+    DSPARK_REFUSE_IF(base_logits->bytes < (uint64_t)vocab_size * sizeof(float));
+    DSPARK_REFUSE_IF((uint64_t)prev_token >= vocab_size);
+
+    /* L108 P1: the kernel now takes the previous id by DEVICE pointer (so the
+     * chained greedy walk needs no host round-trip). This single-step entry
+     * (the sampled path, which routes the chain through a host rng draw)
+     * stages its host id into a persistent 1-int slot -- one 4-byte H2D per
+     * position, noise next to that path's per-position 517 KB qrow read. */
+    static thread_local pulsar_gpu_tensor *staged_id = NULL;
+    if (!staged_id && cuda_grow_refused_under_capture("the dspark staged id")) return 0;   /* L335 */
+    if (!staged_id) staged_id = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+    if (!staged_id) return 0;
+    if (!pulsar_gpu_tensor_write(staged_id, 0, &prev_token, sizeof(int32_t)))
         return 0;
-    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024) return 0;
-    if (refined_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if (base_logits->bytes < (uint64_t)vocab_size * sizeof(float)) return 0;
-    if ((uint64_t)prev_token >= vocab_size) return 0;
 
-    const uint64_t w_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
-    if (markov_w1_offset > dspark_model_size ||
-        w_bytes > dspark_model_size - markov_w1_offset) return 0;
-    if (markov_w2_offset > dspark_model_size ||
-        w_bytes > dspark_model_size - markov_w2_offset) return 0;
+    /* Sized by the STORAGE width, not sizeof(float): a bf16 markov head is half
+     * these bytes and checking it against the f32 size would reject a valid
+     * tensor near the end of the file. */
+    const uint64_t w1_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
+    DSPARK_REFUSE_IF(!w2_bytes);
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset);
 
-    const float *w1 = (const float *)cuda_model_range_ptr(
-        dspark_model_map, markov_w1_offset, w_bytes, "dspark_markov_w1");
-    const float *w2 = (const float *)cuda_model_range_ptr(
-        dspark_model_map, markov_w2_offset, w_bytes, "dspark_markov_w2");
+    const void *w1 = cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const void *w2 = cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
     if (!w1 || !w2) return 0;
 
     const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (vocab_size + block_dim - 1) / block_dim;
-    if (grid_dim > 65535) return 0;
+    /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
+    DSPARK_REFUSE_IF(vocab_size % 4u != 0);
+    const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
+    DSPARK_REFUSE_IF(grid_dim > 65535);
 
-    /* Process-persistent reduce buffers, grown on demand: grid_dim is fixed for a
-     * given vocab, and this runs once per draft position per spec step -- per-call
-     * cudaMalloc/cudaFree pairs were 2 device-serializing allocs each. Single
-     * submission thread. Grouped into one struct (Pulsar C++ port, plan-70 TU
-     * dspark) -- same alloc sizes, free order, and grow-on-demand logic as the
-     * prior loose statics, so the launches are byte-identical. */
+    /* Persistent reduce buffers, grown on demand: grid_dim is fixed for a given
+     * vocab, and this runs once per draft position per spec step -- per-call
+     * cudaMalloc/cudaFree pairs were 2 device-serializing allocs each. Grouped
+     * into one struct (Pulsar C++ port, plan-70 TU dspark) -- same alloc sizes,
+     * free order, and grow-on-demand logic as the prior loose statics, so the
+     * launches are byte-identical.
+     *
+     * ⚠ THREAD_LOCAL, NOT STATIC, AND THAT IS THE WHOLE POINT.  As a process
+     * global this carried three separate hazards the moment a second thread
+     * submitted:
+     *   - the grow path is a read-modify-write on shared state, so two threads
+     *     both seeing grid_dim > rb.cap both free and both allocate: one set of
+     *     pointers is double-freed and the other leaks;
+     *   - a thread growing the buffers frees storage another thread's launched
+     *     kernel may still be reading;
+     *   - and worst because it does not crash: with NO growth at all, two
+     *     threads share the same reduction scratch and silently overwrite each
+     *     other's intermediates, i.e. wrong drafter output, not a fault.
+     * The old comment held this together with the words "Single submission
+     * thread" -- true today (cli_main.cpp creates exactly one worker), but an
+     * assumption, not a guarantee, and invisible from any call site.
+     *
+     * A mutex would be the wrong fix: guarding only the grow leaves the third
+     * hazard, and guarding the whole reduction serialises the drafter across
+     * sessions. Removing the sharing costs ~8 KB per submitting thread
+     * (grid_dim ~505 at vocab 129280) and makes the property structural.
+     * Same reason and same shape as the thread_local activation cache in
+     * pulsar_cuda_matmul.cu. */
     struct DsparkReduceBufs {
-        pulsar_gpu_tensor *id, *val, *id2, *val2, *out;
+        pulsar_gpu_tensor *id, *val, *out;
         uint32_t cap;
     };
-    static DsparkReduceBufs rb = {};
+    static thread_local DsparkReduceBufs rb = {};
     if (grid_dim > rb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark reduce buffers")) return 0;
+        if (rb.id || rb.val || rb.out) pulsar_gpu_seg_note_device_free("the dspark reduce buffers");
         pulsar_gpu_tensor_free(rb.id);
         pulsar_gpu_tensor_free(rb.val);
-        pulsar_gpu_tensor_free(rb.id2);
-        pulsar_gpu_tensor_free(rb.val2);
         pulsar_gpu_tensor_free(rb.out);
-        rb.id   = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-        rb.val  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        rb.id2  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
-        rb.val2 = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
-        rb.out  = pulsar_gpu_tensor_alloc(2u * sizeof(int32_t));
-        rb.cap  = (rb.id && rb.val && rb.id2 && rb.val2 && rb.out) ? grid_dim : 0;
+        rb.id  = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(int32_t));
+        rb.val = pulsar_gpu_tensor_alloc((uint64_t)grid_dim * sizeof(float));
+        rb.out = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+        rb.cap = (rb.id && rb.val && rb.out) ? grid_dim : 0;
     }
-    if (!rb.id || !rb.val || !rb.id2 || !rb.val2 || !rb.out) return 0;
+    if (!rb.id || !rb.val || !rb.out) return 0;
 
-    dspark_markov_step_kernel<<<grid_dim, block_dim>>>(
-        (float *)refined_logits->ptr,
-        (int32_t *)rb.id->ptr,
-        (float *)rb.val->ptr,
-        (int32_t *)rb.id2->ptr,
-        (float *)rb.val2->ptr,
-        (const float *)base_logits->ptr,
-        w1, w2, prev_token, vocab_size, embed_dim);
+#define PULSAR_MARKOV_LAUNCH(A, B)                          \
+    dspark_markov_step_kernel<A, B><<<grid_dim, block_dim>>>( \
+        (float *)refined_logits->ptr,                         \
+        (int32_t *)rb.id->ptr,                                \
+        (float *)rb.val->ptr,                                 \
+        (const float *)base_logits->ptr,                      \
+        w1, w2, (const int32_t *)staged_id->ptr, vocab_size, embed_dim)
+    if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_LAUNCH, true)
+    else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_LAUNCH, false)
+#undef PULSAR_MARKOV_LAUNCH
 
     int rc = 0;
     if (cudaGetLastError() == cudaSuccess)
-        rc = dspark_markov_reduce_blocks(rb.id, rb.val, rb.id2, rb.val2,
-                                         rb.out, grid_dim,
-                                         refined_id_dst, refined_id2_dst);
+        rc = dspark_markov_reduce_blocks(rb.id, rb.val, rb.out, grid_dim,
+                                         refined_id_dst);
     return rc;
 }
 
@@ -264,22 +410,38 @@ int pulsar_gpu_dspark_markov_step_model(
  * hidden is the post-hc_head drafter hidden and markov_embed is a row of markov_w1
  * gathered by token id. Used to size the verify budget (confidence-scheduled
  * verification) -- higher confidence => the draft is more likely accepted. */
+/// Grid n_positions, 256 threads (the tree assumes 256).
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam PROJBF16 proj is bf16 (else f32).
+/// @param scores out: per-position confidence, f32 [n_positions].
+/// @param hidden the drafter hidden rows, f32 [n_positions][hidden_dim].
+/// @param token_ids per-position token ids, i32 [n_positions].
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param proj the confidence projection, [hidden_dim + embed_dim], f32 or bf16.
+/// @param n_positions block positions.
+/// @param hidden_dim hidden width.
+/// @param embed_dim the Markov embedding width.
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+template <bool W1BF16, bool PROJBF16>
 __global__ static void dspark_confidence_score_kernel(
         float *scores,
         const float *hidden,        /* [n_positions, hidden_dim] */
         const int32_t *token_ids,   /* [n_positions] */
-        const float *markov_w1,     /* [vocab, embed_dim] */
-        const float *proj,          /* [hidden_dim + embed_dim] */
+        const void *markov_w1,      /* [vocab, embed_dim], f32 or bf16 */
+        const void *proj,           /* [hidden_dim + embed_dim], f32 or bf16 */
         uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
     uint32_t p = blockIdx.x;
     if (p >= n_positions) return;
     int32_t t = token_ids[p];
     if (t < 0 || (uint32_t)t >= vocab_size) t = 0;
     const float *hp = hidden + (uint64_t)p * hidden_dim;
-    const float *emb = markov_w1 + (uint64_t)t * embed_dim;
+    const uint64_t emb_base = (uint64_t)t * embed_dim;
     float dot = 0.0f;
-    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x) dot += hp[i] * proj[i];
-    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x) dot += emb[i] * proj[hidden_dim + i];
+    for (uint32_t i = threadIdx.x; i < hidden_dim; i += blockDim.x)
+        dot += hp[i] * pulsar_w_load_f32_or_bf16<PROJBF16>(proj, i);
+    for (uint32_t i = threadIdx.x; i < embed_dim; i += blockDim.x)
+        dot += pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, emb_base + i) *
+               pulsar_w_load_f32_or_bf16<PROJBF16>(proj, hidden_dim + i);
     __shared__ float partial[256];
     partial[threadIdx.x] = dot;
     __syncthreads();
@@ -299,66 +461,44 @@ int pulsar_gpu_dspark_confidence_score_model(
         uint64_t dspark_model_size,
         uint64_t markov_w1_offset,
         uint64_t proj_offset,
-        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
-    if (!scores || !hidden || !token_ids || !dspark_model_map) return 0;
-    if (n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0) return 0;
-    if (scores->bytes < (uint64_t)n_positions * sizeof(float)) return 0;
-    if (hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float)) return 0;
-    if (token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t)) return 0;
-    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * sizeof(float);
-    const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * sizeof(float);
-    if (markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset) return 0;
-    if (proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset) return 0;
-    const float *w1 = (const float *)cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
-    const float *proj = (const float *)cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
+        uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size,
+        int w1_bf16, int proj_bf16) {
+    DSPARK_REFUSE_IF(!scores || !hidden || !token_ids || !dspark_model_map);
+    DSPARK_REFUSE_IF(n_positions == 0 || hidden_dim == 0 || embed_dim == 0 || vocab_size == 0);
+    DSPARK_REFUSE_IF(scores->bytes < (uint64_t)n_positions * sizeof(float));
+    DSPARK_REFUSE_IF(hidden->bytes < (uint64_t)n_positions * hidden_dim * sizeof(float));
+    DSPARK_REFUSE_IF(token_ids->bytes < (uint64_t)n_positions * sizeof(int32_t));
+    /* Each sized by its OWN storage width -- w1 and proj are separate tensors. */
+    const uint64_t w1_bytes = (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t proj_bytes = (uint64_t)(hidden_dim + embed_dim) * pulsar_w_elt_bytes(proj_bf16);
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size || w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(proj_offset > dspark_model_size || proj_bytes > dspark_model_size - proj_offset);
+    const void *w1 = cuda_model_range_ptr(dspark_model_map, markov_w1_offset, w1_bytes, "dspark_conf_w1");
+    const void *proj = cuda_model_range_ptr(dspark_model_map, proj_offset, proj_bytes, "dspark_conf_proj");
     if (!w1 || !proj) return 0;
-    dspark_confidence_score_kernel<<<n_positions, 256>>>(
-        (float *)scores->ptr, (const float *)hidden->ptr, (const int32_t *)token_ids->ptr,
-        w1, proj, n_positions, hidden_dim, embed_dim, vocab_size);
+#define PULSAR_CONF_LAUNCH(A, B)                                                    \
+    dspark_confidence_score_kernel<A, B><<<n_positions, 256>>>(                     \
+        (float *)scores->ptr, (const float *)hidden->ptr, (const int32_t *)token_ids->ptr, \
+        w1, proj, n_positions, hidden_dim, embed_dim, vocab_size)
+    if (w1_bf16 && proj_bf16)        PULSAR_CONF_LAUNCH(true, true);
+    else if (w1_bf16)                PULSAR_CONF_LAUNCH(true, false);
+    else if (proj_bf16)              PULSAR_CONF_LAUNCH(false, true);
+    else                             PULSAR_CONF_LAUNCH(false, false);
+#undef PULSAR_CONF_LAUNCH
     return cuda_ok(cudaGetLastError(), "dspark confidence score");
 }
 
-
-/* after_ffn_hc is an HC residual CARRIER (BF16 storage; task #62) — load via
- * pulsar_hc_load, accumulate in f32. Output is a plain f32 embedding row. */
-__global__ static void dspark_hc_mean_reduce_kernel(
-        float *out,
-        const pulsar_hc_t *after_ffn_hc,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    for (uint32_t d = threadIdx.x + blockIdx.x * blockDim.x; d < n_embd;
-         d += blockDim.x * gridDim.x) {
-        float sum = 0.0f;
-        for (uint32_t hc = 0; hc < n_hc; hc++)
-            sum += pulsar_hc_load(after_ffn_hc, (uint64_t)hc * n_embd + d);
-        out[d] = sum / (float)n_hc;
-    }
-}
-
-int pulsar_gpu_dspark_hc_mean_reduce(
-        pulsar_gpu_tensor *out,
-        const pulsar_gpu_tensor *after_ffn_hc,
-        uint32_t n_embd,
-        uint32_t n_hc) {
-    if (!out || !after_ffn_hc || n_embd == 0 || n_hc == 0) return 0;
-    if (out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
-    if (after_ffn_hc->bytes < (uint64_t)n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
-
-    const uint32_t block_dim = 256;
-    const uint32_t grid_dim = (n_embd + block_dim - 1) / block_dim;
-
-    dspark_hc_mean_reduce_kernel<<<grid_dim, block_dim>>>(
-        (float *)out->ptr,
-        (const pulsar_hc_t *)after_ffn_hc->ptr,
-        n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "dspark hc mean reduce");
-}
 
 
 /* Batched variant over a [n_tokens, n_hc, n_embd] HC tensor: out[p] = mean over
  * hc of in[p]. Captures the drafter's anchor-layer hidden for EVERY position of
  * a spec verify batch, so the fused loop can pick the last-accepted position's
  * hidden without replaying. */
+/// Grid (ceil(n_embd / 256), n_tokens), 256 threads.
+/// @param out out: per-row mean over the copies, f32 [n_tokens][n_embd].
+/// @param hc_batch the HC residual rows, [n_tokens][n_hc][n_embd] (pulsar_hc_t).
+/// @param n_embd model width.
+/// @param n_hc hyper-connection copies.
 __global__ static void dspark_hc_mean_reduce_batch_kernel(
         float *out,
         const pulsar_hc_t *hc_batch,   /* HC residual carrier (BF16); task #62 */
@@ -383,9 +523,9 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         uint32_t n_embd,
         uint32_t n_hc,
         uint32_t n_tokens) {
-    if (!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0) return 0;
-    if (out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) return 0;
-    if (hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE) return 0;   /* carrier */
+    DSPARK_REFUSE_IF(!out || !hc_batch || n_embd == 0 || n_hc == 0 || n_tokens == 0);
+    DSPARK_REFUSE_IF(out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float));
+    DSPARK_REFUSE_IF(hc_batch->bytes < (uint64_t)n_tokens * n_hc * n_embd * PULSAR_HC_ELT_SIZE);   /* carrier */
 
     const uint32_t block_dim = 256;
     dim3 grid((n_embd + block_dim - 1) / block_dim, n_tokens, 1);
@@ -394,4 +534,584 @@ int pulsar_gpu_dspark_hc_mean_reduce_batch(
         (const pulsar_hc_t *)hc_batch->ptr,
         n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "dspark hc mean reduce batch");
+}
+
+
+/* --- plan-92 P0: per-row teacher top-64 + tail logsumexp ---------------------
+ * One block per logits row. Selection: each thread keeps a local top-8 over
+ * its strided slice (~505 elems at N_VOCAB/256), the 2048 candidates go to
+ * smem, and 64 rounds of block argmax pick the winners. Exactness is VERIFIED
+ * (a slice holding >8 of the global top-64 would drop one): a final count of
+ * elements above the selected floor bumps `inexact` if it exceeds 64 -- with
+ * real logits this never fires, and the counter makes "never" checkable.
+ * tail_lse = log(sumexp(all) - sumexp(top64)) + max, so the training loss can
+ * renormalize the non-top mass exactly. Collection-rate code: clarity over
+ * throughput. */
+/// Grid n_rows, 256 threads.
+/// @param logits the teacher logits, f32 [n_rows][vocab].
+/// @param vocab vocabulary width.
+/// @param top_ids out: top-64 ids, i32 [cap][64], written at row0 + row.
+/// @param top_vals out: top-64 logits as f16 bits, [cap][64].
+/// @param tail_lse out: the non-top-64 logsumexp as f16 bits, [cap].
+/// @param inexact out: incremented when a row's selection may have dropped a top-64 value.
+/// @param row0 the first output row.
+__global__ static void distill_top64_lse_kernel(
+        const float *logits,      /* [n_rows, vocab] */
+        uint32_t vocab,
+        int32_t *top_ids,         /* [cap, 64], written at row0+row */
+        uint16_t *top_vals,       /* f16 bits */
+        uint16_t *tail_lse,       /* f16 bits */
+        int32_t *inexact,
+        uint32_t row0) {
+    constexpr int kThreads = 256, kLocal = 8, kTop = 64;
+    const uint32_t row = blockIdx.x;
+    const float *x = logits + (uint64_t)row * vocab;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_red[kThreads];
+    /* pass 1: row max */
+    float mx = -INFINITY;
+    for (uint32_t i = tid; i < vocab; i += kThreads) mx = fmaxf(mx, x[i]);
+    s_red[tid] = mx; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] = fmaxf(s_red[tid], s_red[tid + s]);
+        __syncthreads();
+    }
+    const float rmax = s_red[0]; __syncthreads();
+
+    /* pass 2: local top-8 + sumexp */
+    float lv[kLocal]; int li[kLocal];
+    for (int j = 0; j < kLocal; j++) { lv[j] = -INFINITY; li[j] = -1; }
+    float sumexp = 0.0f;
+    for (uint32_t i = tid; i < vocab; i += kThreads) {
+        const float v = x[i];
+        sumexp += __expf(v - rmax);
+        if (v > lv[kLocal - 1]) {
+            int j = kLocal - 1;
+            while (j > 0 && v > lv[j - 1]) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; j--; }
+            lv[j] = v; li[j] = (int)i;
+        }
+    }
+    s_red[tid] = sumexp; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    const float total_sumexp = s_red[0]; __syncthreads();
+
+    __shared__ float c_val[kThreads * kLocal];
+    __shared__ int   c_id[kThreads * kLocal];
+    for (int j = 0; j < kLocal; j++) {
+        c_val[tid * kLocal + j] = lv[j];
+        c_id[tid * kLocal + j]  = li[j];
+    }
+    __syncthreads();
+
+    /* 64 rounds of block argmax over the 2048 candidates */
+    __shared__ int s_arg[kThreads];
+    __shared__ float s_sel_floor;
+    __shared__ float s_top_sumexp;
+    if (tid == 0) s_top_sumexp = 0.0f;
+    for (int t = 0; t < kTop; t++) {
+        float bv = -INFINITY; int bi = -1;
+        for (int j = tid; j < kThreads * kLocal; j += kThreads) {
+            if (c_val[j] > bv) { bv = c_val[j]; bi = j; }
+        }
+        s_red[tid] = bv; s_arg[tid] = bi; __syncthreads();
+        for (int s = kThreads / 2; s > 0; s >>= 1) {
+            if (tid < s && s_red[tid + s] > s_red[tid]) {
+                s_red[tid] = s_red[tid + s]; s_arg[tid] = s_arg[tid + s];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const int w = s_arg[0];
+            const float wv = c_val[w];
+            top_ids[(uint64_t)(row0 + row) * kTop + t] = c_id[w];
+            top_vals[(uint64_t)(row0 + row) * kTop + t] = __half_as_ushort(__float2half(wv));
+            s_top_sumexp += __expf(wv - rmax);
+            c_val[w] = -INFINITY;
+            if (t == kTop - 1) s_sel_floor = wv;
+        }
+        __syncthreads();
+    }
+
+    /* verify: exact top-64 requires <= 64 elements above the floor */
+    uint32_t above = 0;
+    for (uint32_t i = tid; i < vocab; i += kThreads) above += x[i] > s_sel_floor ? 1u : 0u;
+    s_red[tid] = (float)above; __syncthreads();
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        if ((int)s_red[0] > kTop) atomicAdd(inexact, 1);
+        const float tail = total_sumexp - s_top_sumexp;
+        const float lse = tail > 0.0f ? logf(tail) + rmax : -INFINITY;
+        tail_lse[row0 + row] = __half_as_ushort(__float2half(lse));
+    }
+}
+
+int pulsar_gpu_distill_top64_tensor(
+        const pulsar_gpu_tensor *logits_rows,
+        uint32_t n_rows,
+        uint32_t vocab,
+        pulsar_gpu_tensor *top_ids,
+        pulsar_gpu_tensor *top_vals,
+        pulsar_gpu_tensor *tail_lse,
+        pulsar_gpu_tensor *inexact,
+        uint32_t row0) {
+    DSPARK_REFUSE_IF(!logits_rows || !top_ids || !top_vals || !tail_lse || !inexact ||
+        n_rows == 0 || vocab == 0);
+    DSPARK_REFUSE_IF(logits_rows->bytes < (uint64_t)n_rows * vocab * sizeof(float));
+    DSPARK_REFUSE_IF(top_ids->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(int32_t));
+    DSPARK_REFUSE_IF(top_vals->bytes < (uint64_t)(row0 + n_rows) * 64 * sizeof(uint16_t));
+    DSPARK_REFUSE_IF(tail_lse->bytes < (uint64_t)(row0 + n_rows) * sizeof(uint16_t));
+    distill_top64_lse_kernel<<<n_rows, 256>>>(
+        (const float *)logits_rows->ptr, vocab,
+        (int32_t *)top_ids->ptr, (uint16_t *)top_vals->ptr,
+        (uint16_t *)tail_lse->ptr, (int32_t *)inexact->ptr, row0);
+    return cuda_ok(cudaGetLastError(), "distill top64 lse");
+}
+
+
+/* =====================================================================
+ * L150: bank-batched markov refine.
+ *
+ * The single-bank kernels above stream all of markov_w2 (129,280 x 256 bf16,
+ * 66 MB) once per draft position PER BANK; the served lane ran three banks'
+ * drafter passes back to back, so a tick paid 3 x n_draft streams. These
+ * kernels take N banks per launch: each thread loads its vocab entry's w2
+ * element at each i once (k-major, see the single-bank kernel's header) and
+ * dots it against N w1 rows (one per bank's previous token), so one stream
+ * serves every bank.
+ *
+ * L262: one launch carries every bank of a group (up to PULSAR_DSPARK_BANKS_MAX;
+ * it was tiles of 8, so 16 banks streamed w2 twice per position), the banks'
+ * w1 rows are staged in shared memory once per block (they were a global load
+ * per bank per i), and PULSAR_DSPARK_MARKOV_PREFETCH steps of w2 are loaded
+ * before their products.  Bench (16 banks, vocab 129280, embed 256, MXFP8 w2,
+ * cold): 3004 -> 349 us per position, refined logits and block partials
+ * byte-identical (markov_bench.cu, rows/L262.md).
+ *
+ * BYTE-EXACT with the single-bank kernels by construction: per bank the dot
+ * accumulates the same products in the same i order into its own
+ * accumulator, the value is base + dot exactly as before, the per-block argmax
+ * uses the same strict-'>' update over the same block -> vocab mapping, and
+ * the reduce is the same merge. The greedy identity gate (rows/L150.md) pins
+ * it; any red there is a bug, not tolerance.
+ *
+ * Layouts: refined_logits [n_banks][vocab]; per-block partials
+ * [n_banks][gridDim.x]; the bank's base row is base_logits[(base_row[b] +
+ * base_row_add) * base_row_stride]; the previous token for bank b is
+ * prev[b * prev_stride]. n_banks <= PULSAR_DSPARK_BANKS_MAX. */
+/// The banked Markov step: one w2 stream serves every bank.  Grid grid_dim, 256 threads, n_banks * embed_dim * 4 B
+/// dynamic shared memory (the banks' w1 rows).
+/// @tparam W1BF16 markov_w1 is bf16 (else f32).
+/// @tparam W2FMT markov_w2's PULSAR_MARKOV_W2_* storage.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param block_best_id out: each block's argmax id (banked: [n_banks][gridDim.x]).
+/// @param block_best_val out: each block's argmax value, same layout.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row per-bank base-logits row, i32 [n_banks].
+/// @param base_row_add added to every bank's base row (the draft position).
+/// @param base_row_stride base_logits row stride, floats.
+/// @param markov_w1 markov_w1, v-major [vocab][embed_dim], f32 or bf16 (W1BF16).
+/// @param markov_w2 markov_w2, k-major [embed_dim][vocab], in the W2FMT storage.
+/// @param prev per-bank previous token, read at prev[b * prev_stride].
+/// @param prev_stride stride of prev, elements.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+template <bool W1BF16, int W2FMT>
+__global__ static void __launch_bounds__(256) dspark_markov_step_banks_kernel(
+        float *__restrict__ refined_logits,
+        int32_t *__restrict__ block_best_id,
+        float *__restrict__ block_best_val,
+        const float *__restrict__ base_logits,
+        const int32_t *__restrict__ base_row,
+        uint32_t base_row_add,
+        uint64_t base_row_stride,
+        const void *markov_w1,
+        const void *markov_w2,
+        const int32_t *__restrict__ prev,
+        uint32_t prev_stride,
+        uint32_t n_banks,
+        uint32_t vocab_size,
+        uint32_t embed_dim) {
+    enum { MAXB = PULSAR_DSPARK_BANKS_MAX, P = PULSAR_DSPARK_MARKOV_PREFETCH };
+    /* L262: each bank's w1 row (its previous token's embedding), staged once
+     * per block as the f32 value the per-i load returned. */
+    extern __shared__ float s_w1[];   /* [n_banks][embed_dim] */
+    for (uint32_t j = threadIdx.x; j < n_banks * embed_dim; j += blockDim.x) {
+        const uint32_t b = j / embed_dim, i = j % embed_dim;
+        int32_t pt = prev[(uint64_t)b * prev_stride];
+        if (pt < 0 || (uint32_t)pt >= vocab_size) pt = 0;
+        s_w1[j] = pulsar_w_load_f32_or_bf16<W1BF16>(markov_w1, (uint64_t)pt * embed_dim + i);
+    }
+    __syncthreads();
+    const float *base[MAXB];
+    float best_val[MAXB];
+    int32_t best_id[MAXB];
+#pragma unroll
+    for (int b = 0; b < MAXB; b++) {
+        base[b] = base_logits;
+        best_val[b] = -INFINITY; best_id[b] = 0;
+        if (b < (int)n_banks) base[b] = base_logits + ((uint64_t)base_row[b] + base_row_add) * base_row_stride;
+    }
+    for (uint32_t v0 = 4u * (threadIdx.x + blockIdx.x * blockDim.x); v0 < vocab_size;
+         v0 += 4u * blockDim.x * gridDim.x) {
+        float dot[MAXB][4];
+#pragma unroll
+        for (int b = 0; b < MAXB; b++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) dot[b][k] = 0.0f;
+        /* P steps of w2 in flight, then the same per-bank products in i order */
+        for (uint32_t i0 = 0; i0 < embed_dim; i0 += P) {
+            float w2v[P][4];
+#pragma unroll
+            for (int p = 0; p < P; p++) dspark_w2_load4<W2FMT>(markov_w2, vocab_size, embed_dim, i0 + p, v0, w2v[p]);
+#pragma unroll
+            for (int p = 0; p < P; p++)
+#pragma unroll
+                for (int b = 0; b < MAXB; b++) {
+                    if (b < (int)n_banks) {
+                        const float w1v = s_w1[(uint32_t)b * embed_dim + i0 + p];
+#pragma unroll
+                        for (int k = 0; k < 4; k++) dot[b][k] += w2v[p][k] * w1v;
+                    }
+                }
+        }
+#pragma unroll
+        for (int b = 0; b < MAXB; b++) {
+            if (b < (int)n_banks) {
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint32_t v = v0 + k;
+                    const float val = base[b][v] + dot[b][k];
+                    refined_logits[(uint64_t)b * vocab_size + v] = val;
+                    if (val > best_val[b]) { best_val[b] = val; best_id[b] = (int32_t)v; }
+                }
+            }
+        }
+    }
+
+    __shared__ float best_vals[256];
+    __shared__ int32_t best_ids[256];
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t b = 0; b < n_banks; b++) {
+        /* register-indexed by a runtime bank: select it with a static loop */
+        float bv = -INFINITY;
+        int32_t bi = 0;
+#pragma unroll
+        for (int bb = 0; bb < MAXB; bb++)
+            if ((uint32_t)bb == b) { bv = best_val[bb]; bi = best_id[bb]; }
+        best_vals[tid] = bv;
+        best_ids[tid] = bi;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                /* (value, id) merge, lower id wins -- see the single-bank tree */
+                dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                    best_vals[tid + stride], best_ids[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const uint64_t o = (uint64_t)b * gridDim.x + blockIdx.x;
+            block_best_id[o] = best_ids[0];
+            block_best_val[o] = best_vals[0];
+        }
+        __syncthreads();
+    }
+}
+
+/* One block per bank: the same (value, id) merge as dspark_markov_reduce_kernel
+ * over that bank's partials, the winner written to dst[b * dst_stride]. */
+/// Grid n_banks, 256 threads.
+/// @param dst out: the winner id.
+/// @param dst_stride stride of dst between banks, elements.
+/// @param ids per-bank per-block ids, [n_banks][n_blocks].
+/// @param vals per-bank per-block values, [n_banks][n_blocks].
+/// @param n_blocks partials per bank.
+__global__ static void dspark_markov_reduce_banks_kernel(
+        int32_t *__restrict__ dst,
+        uint32_t dst_stride,
+        const int32_t *__restrict__ ids,
+        const float *__restrict__ vals,
+        uint32_t n_blocks) {
+    const uint32_t b = blockIdx.x;
+    ids += (uint64_t)b * n_blocks; vals += (uint64_t)b * n_blocks;
+    float best_val = -INFINITY;
+    int32_t best_id = 0x7fffffff;
+    for (uint32_t k = threadIdx.x; k < n_blocks; k += blockDim.x)
+        dspark_argmax_merge(&best_val, &best_id, vals[k], ids[k]);
+    __shared__ float best_vals[256];
+    __shared__ int32_t best_ids[256];
+    const uint32_t tid = threadIdx.x;
+    best_vals[tid] = best_val;
+    best_ids[tid] = best_id;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            dspark_argmax_merge(&best_vals[tid], &best_ids[tid],
+                                best_vals[tid + stride], best_ids[tid + stride]);
+        __syncthreads();
+    }
+    if (tid == 0) dst[(uint64_t)b * dst_stride] = best_ids[0];
+}
+
+/* Per-bank partials for the banked kernels; grown on demand, thread_local for
+ * the same reasons as DsparkReduceBufs above. */
+/// Per-bank argmax partials of the banked Markov step: one (id, value) slot per (bank, grid CTA), device.
+struct DsparkReduceBufsBanks {
+    pulsar_gpu_tensor *id, *val;
+    /// Slots allocated (PULSAR_DSPARK_BANKS_MAX x the grid it was sized for); 0 after a failed allocation.
+    uint32_t cap;   /* n_banks * grid_dim slots */
+};
+
+/** @var DsparkReduceBufsBanks::id
+ *  Device partial ids, i32 [cap].
+ *  @var DsparkReduceBufsBanks::val
+ *  Device partial values, f32 [cap]. */
+
+/// @param refined_logits the refined logits.
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the base logits.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param n_draft positions the chain will write (ids columns needed: n_draft + 1).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @return true when the banked operands are present and large enough.
+static bool dspark_markov_banks_args_ok(
+        const pulsar_gpu_tensor *refined_logits, const pulsar_gpu_tensor *ids_dev,
+        uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, uint32_t n_banks, uint32_t n_draft,
+        uint32_t vocab_size, uint32_t embed_dim) {
+    if (!refined_logits || !ids_dev || !base_logits || !base_row_dev) return false;
+    if (n_banks == 0 || n_banks > PULSAR_DSPARK_BANKS_MAX || n_draft == 0 || n_draft > 16) return false;
+    if (vocab_size == 0 || embed_dim == 0 || embed_dim > 1024 ||
+        embed_dim % PULSAR_DSPARK_MARKOV_PREFETCH != 0) return false;
+    if (ids_stride < n_draft + 1) return false;
+    if (refined_logits->bytes < (uint64_t)n_banks * vocab_size * sizeof(float)) return false;
+    if (ids_dev->bytes < (uint64_t)n_banks * ids_stride * sizeof(int32_t)) return false;
+    if (base_row_dev->bytes < (uint64_t)n_banks * sizeof(int32_t)) return false;
+    if (base_row_stride_bytes < (uint64_t)vocab_size * sizeof(float) ||
+        base_row_stride_bytes % sizeof(float) != 0) return false;
+    /* the caller's base rows are bounded by its own row budget; the kernel
+     * indexes base_logits by (base_row[b] + pos) * stride and trusts it */
+    return true;
+}
+
+/// Runs pos_count banked steps (step, reduce) from pos_first, chaining through ids_dev.
+/// @param refined_logits out: base + the Markov refinement, f32 [n_banks][vocab_size] (one bank: [vocab_size]).
+/// @param ids_dev the chain's ids, i32 [n_banks][ids_stride]: position p + 1's winner written at column p + 1.
+/// @param ids_stride ids_dev row stride, elements.
+/// @param base_logits the drafter's base logits, f32.
+/// @param base_row_stride_bytes base_logits row stride, bytes.
+/// @param base_row_dev per-bank base-logits row, i32 [n_banks].
+/// @param dspark_model_map the drafter model mapping.
+/// @param dspark_model_size its bytes.
+/// @param markov_w1_offset markov_w1's offset in the mapping.
+/// @param markov_w2_offset markov_w2's offset in the mapping.
+/// @param n_banks banks (<= PULSAR_DSPARK_BANKS_MAX).
+/// @param pos_first first draft position.
+/// @param pos_count draft positions run.
+/// @param prev_override per-bank previous tokens for the first step, or NULL (read from ids_dev).
+/// @param vocab_size vocabulary rows (a multiple of 4; of 32 for MXFP8 w2).
+/// @param embed_dim the Markov embedding width.
+/// @param w1_bf16 markov_w1 is bf16 (else f32).
+/// @param w2_fmt a PULSAR_MARKOV_W2_* storage.
+/// @return 1 on success, 0 on a refusal or launch failure.
+static int dspark_markov_banks_launch(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev,
+        uint32_t ids_stride, const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, const void *dspark_model_map,
+        uint64_t dspark_model_size, uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t pos_first, uint32_t pos_count,
+        const pulsar_gpu_tensor *prev_override, /* NULL: chain feed ids[b][pos]; else [n_banks] i32 */
+        uint32_t vocab_size, uint32_t embed_dim, int w1_bf16, int w2_fmt) {
+    const uint64_t w1_bytes =
+        (uint64_t)vocab_size * embed_dim * pulsar_w_elt_bytes(w1_bf16);
+    const uint64_t w2_bytes = dspark_markov_w2_bytes(w2_fmt, vocab_size, embed_dim);
+    DSPARK_REFUSE_IF(!w2_bytes);
+    DSPARK_REFUSE_IF(markov_w1_offset > dspark_model_size ||
+        w1_bytes > dspark_model_size - markov_w1_offset);
+    DSPARK_REFUSE_IF(markov_w2_offset > dspark_model_size ||
+        w2_bytes > dspark_model_size - markov_w2_offset);
+    const void *w1 = cuda_model_range_ptr(
+        dspark_model_map, markov_w1_offset, w1_bytes, "dspark_markov_w1");
+    const void *w2 = cuda_model_range_ptr(
+        dspark_model_map, markov_w2_offset, w2_bytes, "dspark_markov_w2");
+    if (!w1 || !w2) return 0;
+
+    const uint32_t block_dim = 256;
+    /* 4 consecutive v per lane (L213 step 2); the grid covers vocab/4 lanes */
+    DSPARK_REFUSE_IF(vocab_size % 4u != 0);
+    const uint32_t grid_dim = (vocab_size / 4u + block_dim - 1) / block_dim;
+    DSPARK_REFUSE_IF(grid_dim > 65535);
+    static thread_local DsparkReduceBufsBanks bb = {};
+    const uint32_t need = n_banks * grid_dim;
+    if (need > bb.cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffers */
+        if (cuda_grow_refused_under_capture("the dspark banked reduce buffers")) return 0;
+        if (bb.id || bb.val) pulsar_gpu_seg_note_device_free("the dspark banked reduce buffers");
+        pulsar_gpu_tensor_free(bb.id);
+        pulsar_gpu_tensor_free(bb.val);
+        const uint32_t cap = PULSAR_DSPARK_BANKS_MAX * grid_dim;
+        bb.id  = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(int32_t));
+        bb.val = pulsar_gpu_tensor_alloc((uint64_t)cap * sizeof(float));
+        bb.cap = (bb.id && bb.val) ? cap : 0;
+    }
+    if (!bb.id || !bb.val) return 0;
+
+    int32_t *ids = (int32_t *)ids_dev->ptr;
+    /* the banks' w1 rows in shared memory: up to 16 x 1024 f32 = 64 KB, past the
+     * 48 KB default, so the kernel opts in once per (instantiation, device) */
+    const size_t smem = (size_t)n_banks * embed_dim * sizeof(float);
+    const size_t smem_max = (size_t)PULSAR_DSPARK_BANKS_MAX * 1024u * sizeof(float);
+    for (uint32_t pos = pos_first; pos < pos_first + pos_count; pos++) {
+        const int32_t *prev = prev_override ? (const int32_t *)prev_override->ptr : ids + pos;
+        const uint32_t prev_stride = prev_override ? 1u : ids_stride;
+#define PULSAR_MARKOV_BANKS_LAUNCH(A, B)                                    \
+        do {                                                                \
+            static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* per device (L335) */ \
+            if (!pulsar_cuda_smem_opt_in((const void *)dspark_markov_step_banks_kernel<A, B>, smem_set, smem_max)) { \
+                fprintf(stderr, "pulsar: dspark banked markov: %zu B of shared memory refused by the device -- " \
+                                "refused\n", smem_max);                     \
+                return 0;                                                   \
+            }                                                               \
+            dspark_markov_step_banks_kernel<A, B><<<grid_dim, block_dim, smem>>>( \
+                (float *)refined_logits->ptr,                               \
+                (int32_t *)bb.id->ptr, (float *)bb.val->ptr,                \
+                (const float *)base_logits->ptr, (const int32_t *)base_row_dev->ptr, \
+                pos, base_row_stride_bytes / sizeof(float),                 \
+                w1, w2, prev, prev_stride, n_banks, vocab_size, embed_dim); \
+        } while (0)
+        if (w1_bf16) PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, true)
+        else         PULSAR_MARKOV_DISPATCH(PULSAR_MARKOV_BANKS_LAUNCH, false)
+#undef PULSAR_MARKOV_BANKS_LAUNCH
+        dspark_markov_reduce_banks_kernel<<<n_banks, 256>>>(
+            ids + pos + 1, ids_stride,
+            (const int32_t *)bb.id->ptr, (const float *)bb.val->ptr,
+            grid_dim);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+int pulsar_gpu_dspark_markov_chain_banks_model(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev,
+        const void *dspark_model_map, uint64_t dspark_model_size,
+        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t n_draft, uint32_t vocab_size, uint32_t embed_dim,
+        int w1_bf16, int w2_fmt) {
+    if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
+                                     base_row_stride_bytes, base_row_dev, n_banks, n_draft,
+                                     vocab_size, embed_dim))
+        return 0;
+    return dspark_markov_banks_launch(refined_logits, ids_dev, ids_stride, base_logits,
+                                      base_row_stride_bytes, base_row_dev, dspark_model_map,
+                                      dspark_model_size, markov_w1_offset, markov_w2_offset,
+                                      n_banks, 0u, n_draft, NULL, vocab_size, embed_dim,
+                                      w1_bf16, w2_fmt);
+}
+
+int pulsar_gpu_dspark_markov_step_banks_model(
+        pulsar_gpu_tensor *refined_logits, pulsar_gpu_tensor *ids_dev, uint32_t ids_stride,
+        const pulsar_gpu_tensor *base_logits, uint64_t base_row_stride_bytes,
+        const pulsar_gpu_tensor *base_row_dev, const pulsar_gpu_tensor *prev_dev,
+        const void *dspark_model_map, uint64_t dspark_model_size,
+        uint64_t markov_w1_offset, uint64_t markov_w2_offset,
+        uint32_t n_banks, uint32_t pos, uint32_t vocab_size, uint32_t embed_dim,
+        int w1_bf16, int w2_fmt) {
+    DSPARK_REFUSE_IF(!prev_dev || prev_dev->bytes < (uint64_t)n_banks * sizeof(int32_t));
+    if (!dspark_markov_banks_args_ok(refined_logits, ids_dev, ids_stride, base_logits,
+                                     base_row_stride_bytes, base_row_dev, n_banks, pos + 1,
+                                     vocab_size, embed_dim))
+        return 0;
+    return dspark_markov_banks_launch(refined_logits, ids_dev, ids_stride, base_logits,
+                                      base_row_stride_bytes, base_row_dev, dspark_model_map,
+                                      dspark_model_size, markov_w1_offset, markov_w2_offset,
+                                      n_banks, pos, 1u, prev_dev, vocab_size, embed_dim,
+                                      w1_bf16, w2_fmt);
+}
+
+
+/* ---- L158 (2026-09-03): the drafter's concat of three target hidden states,
+ * emitted as E4M3 at the PRODUCER -----------------------------------------
+ *
+ * The concat [h0 | h1 | h2] (3 x N_EMBD f32) fed main_proj through the dense
+ * GEMV as an f32 activation for the whole A8 campaign: three tensor copies
+ * built the f32 row, nothing armed a slot, and the GEMV fell to the f32
+ * kernel deleted in L158 -- the one W8A32 projection left in the served lane,
+ * on the drafter.  A8 is producer-side: this kernel writes the E4M3 data and
+ * UE8M0 block scales straight into the activation slot with the shared
+ * pulsar_mx_emit_block (same encoder, same bytes every other producer emits),
+ * one warp per 32-block; N_EMBD is a multiple of 32, so no block straddles two
+ * sources.  The f32 concat is never written -- the caller declares the f32
+ * store skipped and the GEMV reads the slot. */
+/* Row r of the slot is the concat of source row src.r[r] of each of h0/h1/h2
+ * (L260: the batched drafter seed gathers the committed rows of every bank
+ * from the verify capture in one launch; the one-row entry is src {0}). */
+/// The seed slot's source rows, passed by value (kernel parameter space).
+struct dspark_concat_rows { uint32_t r[PULSAR_DSPARK_SEED_ROWS]; };
+/** @var dspark_concat_rows::r
+ *  r[i]: the source row of h0 / h1 / h2 that slot row i gathers. */
+
+/// Emits [h0 | h1 | h2] rows as the E4M3 activation slot, one warp per 32-block.  Grid (ceil(3 E / 256), rows), 256 threads.
+/// @param h0 first source hidden rows, f32.
+/// @param h1 second source hidden rows, f32.
+/// @param h2 third source hidden rows, f32.
+/// @param E n_embd (a multiple of 32).
+/// @param src_rows per slot row, its source row.
+/// @param data out: the activation slot's E4M3 plane, [rows][3 E].
+/// @param scale out: its E8M0 plane (pulsar_mx_sfoff).
+/// @param KBp the slot's padded k-block pitch.
+__global__ static void dspark_concat3_e4m3_kernel(const float *h0, const float *h1, const float *h2,
+                                                  uint32_t E, dspark_concat_rows src_rows,
+                                                  __nv_fp8_e4m3 *data,
+                                                  unsigned char *scale, int KBp) {
+    const uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = warp * 32u + lane;
+    if (col >= 3u * E) return;
+    const uint32_t row = blockIdx.y;
+    const uint32_t src = col / E, off = col - src * E;
+    const uint64_t at = (uint64_t)src_rows.r[row] * E + off;
+    const float v = src == 0 ? h0[at] : src == 1 ? h1[at] : h2[at];
+    pulsar_mx_emit_block(v, col, row, 3u * E, KBp, data, scale);
+}
+
+int pulsar_gpu_dspark_concat3_e4m3_rows(void *slot_data, void *slot_scale, int sf_pitch,
+                                        const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                        const pulsar_gpu_tensor *h2, const uint32_t *src_rows,
+                                        uint32_t n_rows, uint32_t n_embd) {
+    DSPARK_REFUSE_IF(!slot_data || !slot_scale || !h0 || !h1 || !h2 || !src_rows || n_rows == 0 ||
+        n_rows > PULSAR_DSPARK_SEED_ROWS || n_embd == 0 || n_embd % 32u != 0);
+    dspark_concat_rows rows = {};
+    uint32_t max_src = 0;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        rows.r[i] = src_rows[i];
+        if (src_rows[i] > max_src) max_src = src_rows[i];
+    }
+    const uint64_t need = ((uint64_t)max_src + 1u) * n_embd * sizeof(float);
+    DSPARK_REFUSE_IF(h0->bytes < need || h1->bytes < need || h2->bytes < need);
+    const uint32_t warps = 3u * n_embd / 32u;
+    dspark_concat3_e4m3_kernel<<<dim3((warps * 32u + 255u) / 256u, n_rows), 256>>>(
+        (const float *)h0->ptr, (const float *)h1->ptr, (const float *)h2->ptr, n_embd, rows,
+        (__nv_fp8_e4m3 *)slot_data, (unsigned char *)slot_scale, sf_pitch);
+    return cuda_ok(cudaGetLastError(), "dspark concat3 e4m3");
+}
+
+int pulsar_gpu_dspark_concat3_e4m3(void *slot_data, void *slot_scale, int sf_pitch,
+                                   const pulsar_gpu_tensor *h0, const pulsar_gpu_tensor *h1,
+                                   const pulsar_gpu_tensor *h2, uint32_t n_embd) {
+    const uint32_t row0 = 0;
+    return pulsar_gpu_dspark_concat3_e4m3_rows(slot_data, slot_scale, sf_pitch, h0, h1, h2, &row0, 1u, n_embd);
 }

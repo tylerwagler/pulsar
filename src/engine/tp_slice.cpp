@@ -1,0 +1,441 @@
+/** @file tp_slice.cpp
+ *  @brief L272 P4b: the tensor-parallel plan; a family declares its rank's slices and the core does them. */
+/* tp_slice.cpp -- L272 P4b: the tensor-parallel plan.  A family DECLARES its rank's slices; the core does them.
+ *
+ * A declaration is a tensor, an axis and the rank's ranges along it -- OUT (a linear's output rows: dim[1], or a
+ * plain tensor's outermost dim), IN (a linear's input: dim[0]) or EXPERTS (whole experts of a stack: dim[2]).
+ * The OPERATION is the core's choice -- one table, plan_op -- by the tensor's format and by how the family's forward
+ * reads its activation (pulsar_family::act_kind): a SLOT reader's linears resolve registered slices in the backend,
+ * a ROWS reader's take a device pointer, so its slices are built and kept on the device:
+ *
+ *   format          axis       slot reader (DeepSeek)                rows reader (Qwen)
+ *   MXFP8_LT        OUT / IN   fp8_rows / fp8_kslice, registered     -- (the scale plane is not row-addressable)
+ *   EXL3            OUT / IN   --                                    exl3_cols / exl3_rows, gathered on the host
+ *   bf16 / f32      OUT        view (one range: offset arithmetic)   <type>_channels, gathered
+ *   CUTLASS MXFP4   OUT / IN   mxfp4_half of every expert            --
+ *     (a stack)
+ *   EXL3 (a stack)  OUT / IN   exl3_half of every expert             --
+ *   any stack       EXPERTS    --                                    stage_range, the rank's whole experts
+ *
+ * A pairing with no operation refuses by name at load.  A tensor whose slice REPLACES it (built, a half, a staged
+ * range) is never staged whole: the plan is the residency rule (pulsar_model::tp_unstaged).  The front doors ask
+ * the plan what a rank reads (pulsar_tp_slice_of: linear.cpp, moe.cpp).
+ *
+ * The plan is built at open after the family's load, before the inspect-only exit (pulsar_tp_plan_build), and
+ * run after the GPU is up (pulsar_tp_plan_run).  RECORD MODE (pulsar_tp_record_begin): the run writes one
+ * canonical line per slice -- the operation, the tensor, its geometry and range, a byte hash of a host-built
+ * slice -- instead of touching the device.  tests/tp_plan_test.cpp records a real model's plan as rank r of n
+ * and make tp-plan-gate diffs it against tests/tp-plan-golden/. */
+#include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"
+#include "cuda/pulsar_cuda_qwen.h"
+
+#include <unordered_map>
+#include <vector>
+
+/** The tensor-parallel plan (see above): the slices a family declared for this rank, built at open and run after
+ *  the GPU is up; held by the engine (pulsar_engine::tp_plan). */
+struct pulsar_tp_plan {
+    /// the declared slices, in declaration order
+    std::vector<pulsar_tp_slice> slices;
+    std::vector<pulsar_tp_op> ops;    ///< per slice, chosen at build
+    std::unordered_map<const pulsar_tensor *, pulsar_gpu_tensor *> built;   ///< the host-built slices, by the tensor
+    std::unordered_map<const pulsar_tensor *, size_t> by_tensor;            ///< a tensor's slice, by its index
+    const void *key = nullptr;   ///< the engine: the key the registered halves and K slices resolve under
+};
+
+/** RECORD MODE's sink (pulsar_tp_record_begin / _end): non-NULL = the run writes one line per slice here instead of
+ *  touching the device.  Borrowed; process-wide, not thread-safe. */
+static FILE *g_tp_record;
+
+void pulsar_tp_record_begin(FILE *f) { g_tp_record = f; }
+void pulsar_tp_record_end(void) { g_tp_record = NULL; }
+
+/** The axis's name for messages and the record.  @param a the axis  @return "out", "in" or "experts" */
+static const char *axis_name(pulsar_tp_axis a) {
+    return a == PULSAR_TP_AXIS_OUT ? "out" : a == PULSAR_TP_AXIS_IN ? "in" : "experts";
+}
+
+/** The operation's name for the record.  @param op the operation  @return its name, "none" for PULSAR_TP_OP_NONE */
+static const char *op_name(pulsar_tp_op op) {
+    switch (op) {
+    case PULSAR_TP_OP_FP8_ROWS: return "fp8_rows";
+    case PULSAR_TP_OP_FP8_K: return "fp8_kslice";
+    case PULSAR_TP_OP_EXL3_COLS: return "exl3_cols";
+    case PULSAR_TP_OP_EXL3_ROWS: return "exl3_rows";
+    case PULSAR_TP_OP_VIEW: return "view";
+    case PULSAR_TP_OP_GATHER: return "gather";
+    case PULSAR_TP_OP_MXFP4_HALF: return "mxfp4_half";
+    case PULSAR_TP_OP_EXL3_HALF: return "exl3_half";
+    case PULSAR_TP_OP_EXPERTS: return "stage_range";
+    case PULSAR_TP_OP_NONE: break;
+    }
+    return "none";
+}
+
+/** Copy the tensor's name into `buf` as a C string (truncated to fit).
+ *  @param t   the tensor
+ *  @param buf the destination
+ *  @param n   bytes of `buf` */
+static void tname(const pulsar_tensor *t, char *buf, size_t n) {
+    snprintf(buf, n, "%.*s", (int)t->name.len, t->name.ptr);
+}
+
+bool pulsar_tp_plan_add(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor *t, pulsar_tp_axis axis, uint32_t n,
+                        const uint64_t *lo, const uint64_t *hi) {
+    if (!t || n == 0 || n > PULSAR_TP_SLICE_RANGES) {
+        fprintf(stderr, "pulsar: TP plan: a slice of %s with %u ranges -- refusing\n", t ? "a tensor" : "no tensor", n);
+        return false;
+    }
+    pulsar_tp_slice s{};
+    s.m = m;
+    s.t = t;
+    s.axis = axis;
+    s.n = n;
+    for (uint32_t i = 0; i < n; i++) { s.lo[i] = lo[i]; s.hi[i] = hi[i]; }
+    p->slices.push_back(s);
+    return true;
+}
+
+bool pulsar_tp_plan_add1(pulsar_tp_plan *p, pulsar_model *m, const pulsar_tensor *t, pulsar_tp_axis axis, uint64_t lo,
+                         uint64_t hi) {
+    return pulsar_tp_plan_add(p, m, t, axis, 1, &lo, &hi);
+}
+
+/* ---- the operation a slice takes, by its tensor's format --------------------------------------------------- */
+
+/** Is `type` a plain stored type a slice views or gathers (bf16 or f32)?  @param type a PULSAR_TENSOR_* value
+ *  @return true for bf16 / f32 */
+static bool plain_type(uint32_t type) { return type == PULSAR_TENSOR_BF16 || type == PULSAR_TENSOR_F32; }
+
+/* The extent of the axis, or 0 = the tensor has no such axis. */
+/// @param t    the tensor
+/// @param axis the cut axis
+/// @return the axis's extent (experts: dim[2]; plain: the outermost dim for OUT; quantised: dim[1] OUT, dim[0] IN)
+static uint64_t axis_full(const pulsar_tensor *t, pulsar_tp_axis axis) {
+    if (axis == PULSAR_TP_AXIS_EXPERTS) return t->ndim == 3 ? t->dim[2] : 0;
+    if (plain_type(t->type)) return axis == PULSAR_TP_AXIS_OUT && t->ndim >= 1 ? t->dim[t->ndim - 1] : 0;
+    if (t->ndim < 2) return 0;
+    return axis == PULSAR_TP_AXIS_OUT ? t->dim[1] : t->dim[0];
+}
+
+/** The operation a slice takes, by its tensor's format and shape and the family's activation kind.
+ *  @param s    the slice
+ *  @param kind the family's reader kind (rows or MX slot)
+ *  @return the operation, PULSAR_TP_OP_NONE when no operation serves */
+static pulsar_tp_op plan_op(const pulsar_tp_slice *s, pulsar_act_kind kind) {
+    const pulsar_tensor *t = s->t;
+    const bool rows = kind == PULSAR_ACT_KIND_ROWS, out = s->axis == PULSAR_TP_AXIS_OUT;
+    if (s->axis == PULSAR_TP_AXIS_EXPERTS)
+        return rows && t->ndim == 3 && t->bytes % t->dim[2] == 0 ? PULSAR_TP_OP_EXPERTS : PULSAR_TP_OP_NONE;
+    if (t->type == PULSAR_TENSOR_MXFP8_LT && t->ndim == 2)
+        return rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_FP8_ROWS : PULSAR_TP_OP_FP8_K;
+    if (exl3_type_k2(t->type) && t->ndim == 2)
+        return !rows ? PULSAR_TP_OP_NONE : out ? PULSAR_TP_OP_EXL3_COLS : PULSAR_TP_OP_EXL3_ROWS;
+    if (plain_type(t->type) && out) return rows ? PULSAR_TP_OP_GATHER : s->n == 1 ? PULSAR_TP_OP_VIEW : PULSAR_TP_OP_NONE;
+    if (t->type == PULSAR_TENSOR_CUTLASS_MXFP4 && t->ndim == 3) return rows ? PULSAR_TP_OP_NONE : PULSAR_TP_OP_MXFP4_HALF;
+    if (exl3_type_k2(t->type) && t->ndim == 3) return rows ? PULSAR_TP_OP_NONE : PULSAR_TP_OP_EXL3_HALF;
+    return PULSAR_TP_OP_NONE;
+}
+
+/* The ranges are in bounds, ascending and disjoint; only a gather takes several; a format's cut is aligned. */
+/// @param s  the slice
+/// @param op its operation
+/// @return true when its ranges are valid for `op`
+static bool plan_ranges_ok(const pulsar_tp_slice *s, pulsar_tp_op op) {
+    const uint64_t full = axis_full(s->t, s->axis);
+    const bool multi = op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_GATHER;
+    const uint64_t align = op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_EXL3_ROWS ||
+                                   op == PULSAR_TP_OP_MXFP4_HALF || op == PULSAR_TP_OP_EXL3_HALF
+                               ? 128u : 1u;
+    if (!full || (s->n > 1 && !multi)) return false;
+    for (uint32_t i = 0; i < s->n; i++) {
+        if (s->lo[i] >= s->hi[i] || s->hi[i] > full || s->lo[i] % align || s->hi[i] % align) return false;
+        if (i && s->lo[i] < s->hi[i - 1]) return false;
+    }
+    return true;
+}
+
+/** Does `op` replace the stored tensor (so the stored one is never staged: pulsar_model::tp_unstaged)?
+ *  @param op the operation
+ *  @return true for the built / ranged operations */
+static bool op_replaces(pulsar_tp_op op) {
+    return op == PULSAR_TP_OP_EXL3_COLS || op == PULSAR_TP_OP_EXL3_ROWS || op == PULSAR_TP_OP_GATHER ||
+           op == PULSAR_TP_OP_MXFP4_HALF || op == PULSAR_TP_OP_EXL3_HALF || op == PULSAR_TP_OP_EXPERTS;
+}
+
+bool pulsar_tp_plan_build(pulsar_engine *e) {
+    if (e->tp_plan) return true;
+    if (!e->family->tp_slices) {
+        fprintf(stderr, "pulsar: family %s declares no tensor-parallel slices -- refusing\n", e->family->name);
+        return false;
+    }
+    /* Declare and validate on a detached plan; attach it and mark the residency rule only once every slice has an
+     * operation.  A refused build leaves nothing behind (no plan, no unstaged marks), so a second call refuses
+     * again instead of finding a half-built plan and returning true. */
+    pulsar_tp_plan *p = new pulsar_tp_plan();
+    p->key = e;
+    if (!e->family->tp_slices(e, p)) {
+        delete p;
+        return false;
+    }
+    for (const pulsar_tp_slice &s : p->slices) {
+        const pulsar_tp_op op = plan_op(&s, e->family->act_kind);
+        if (op == PULSAR_TP_OP_NONE || !plan_ranges_ok(&s, op)) {
+            char nm[256];
+            tname(s.t, nm, sizeof(nm));
+            fprintf(stderr, "pulsar: TP plan: no %s slice of %s (%s, %u range(s) along %s) for a %s reader -- refusing\n",
+                    op == PULSAR_TP_OP_NONE ? "operation for a" : "aligned in-bounds", nm, tensor_type_name(s.t->type),
+                    s.n, axis_name(s.axis), e->family->act_kind == PULSAR_ACT_KIND_ROWS ? "bf16-rows" : "MX-slot");
+            delete p;
+            return false;
+        }
+        p->by_tensor[s.t] = p->ops.size();
+        p->ops.push_back(op);
+    }
+    e->tp_plan = p;
+    e->model.tp_plan = p;
+    e->dspark_model.tp_plan = p;   /* the drafter's tensors are in the plan too (a merged drafter aliases the model) */
+    uint32_t count[9] = {0};   /* one per operation bit */
+    uint64_t unstaged = 0;
+    for (size_t i = 0; i < p->slices.size(); i++) {
+        const pulsar_tp_slice &s = p->slices[i];
+        const pulsar_tp_op op = p->ops[i];
+        for (uint32_t b = 0; b < 9; b++) if ((uint32_t)op == 1u << b) count[b]++;
+        if (op_replaces(op)) {
+            /* the residency rule: the model that holds the tensor (a merged drafter aliases the main model) */
+            pulsar_model *owner = s.t >= e->model.tensors && s.t < e->model.tensors + e->model.n_tensors ? &e->model : s.m;
+            if (!owner->tp_unstaged) owner->tp_unstaged = (uint8_t *)xcalloc((size_t)owner->n_tensors, 1);
+            if (!owner->tp_unstaged[s.t - owner->tensors]) unstaged += s.t->bytes;
+            owner->tp_unstaged[s.t - owner->tensors] = 1;
+        }
+    }
+    fprintf(stderr, "pulsar: TP plan: rank %d/%u, %zu slices (fp8 rows %u, fp8 K %u, exl3 cols %u, exl3 rows %u, "
+                    "views %u, gathers %u, mxfp4 halves %u, expert ranges %u, exl3 halves %u); %.2f GiB of stored "
+                    "tensors unstaged\n",
+            e->model.tp_rank, e->model.tp_n_ranks, p->slices.size(), count[0], count[1], count[2], count[3], count[4],
+            count[5], count[6], count[7], count[8], (double)unstaged / 1073741824.0);
+    return true;
+}
+
+void pulsar_tp_plan_free(pulsar_engine *e) {
+    if (!e->tp_plan) return;
+    for (auto &kv : e->tp_plan->built) pulsar_gpu_tensor_free(kv.second);
+    delete e->tp_plan;
+    e->tp_plan = NULL;
+    e->model.tp_plan = NULL;
+    e->dspark_model.tp_plan = NULL;
+}
+
+bool pulsar_tp_slice_of(const pulsar_model *m, const pulsar_tensor *t, pulsar_tp_op *op, uint64_t *lo, uint64_t *hi,
+                        const void **key) {
+    if (!m->tp_plan) return false;
+    const auto it = m->tp_plan->by_tensor.find(t);
+    if (it == m->tp_plan->by_tensor.end()) return false;
+    const pulsar_tp_slice &s = m->tp_plan->slices[it->second];
+    *op = m->tp_plan->ops[it->second];
+    *lo = s.lo[0];
+    *hi = s.hi[0];
+    if (key) *key = m->tp_plan->key;
+    return true;
+}
+
+const void *pulsar_tp_built_ptr(const pulsar_model *m, const pulsar_tensor *t) {
+    if (!m->tp_plan) return NULL;
+    const auto it = m->tp_plan->built.find(t);
+    return it == m->tp_plan->built.end() ? NULL : pulsar_gpu_tensor_device_ptr(it->second);
+}
+
+/* ---- EXL3 [trellis | suh | svh], trellis in (k-tile, n-tile, word) order (exl3_trellis.h) ---------------------
+ * A rows reader's slice of a 2-D EXL3 linear is its ranges cut into one destination of their summed extent
+ * (exl3_expert_cut: output columns -- per k-tile row a run of n-tiles plus that range of svh, suh whole -- or
+ * input rows -- a run of k-tile rows plus that range of suh, svh whole).  Every cut is 128-aligned, so the
+ * Hadamard blocks on both sides stay whole and a slice is bytes copied -- the rank's matmul is exactly the full
+ * one's rows / columns (a K slice's output is a partial the all-reduce sums). */
+/// @param src the tensor's stored bytes
+/// @param s   the slice (2-D EXL3, IN or OUT axis)
+/// @param out receives the slice's bytes
+/// @return false when a range does not cut as whole tiles or the tensor's stride disagrees
+static bool exl3_slice(const uint8_t *src, const pulsar_tp_slice *s, std::vector<uint8_t> &out) {
+    const int k2 = exl3_type_k2(s->t->type);
+    const bool in_axis = s->axis == PULSAR_TP_AXIS_IN;
+    uint64_t ext = 0, at = 0;
+    for (uint32_t i = 0; i < s->n; i++) ext += s->hi[i] - s->lo[i];
+    for (uint32_t i = 0; i < s->n; i++) {
+        exl3_cut c;
+        if (!exl3_expert_cut(s->t->dim[0], s->t->dim[1], k2, in_axis, s->lo[i], s->hi[i], at, ext, &c) ||
+            c.src_stride != s->t->bytes)
+            return false;
+        out.resize(c.dst_stride);
+        exl3_expert_cut_apply(&c, src, out.data());
+        at += s->hi[i] - s->lo[i];
+    }
+    return true;
+}
+
+/* ---- the run -------------------------------------------------------------------------------------------------- */
+
+/* FNV-1a over a built slice: the record's proof that the gathered bytes are the same */
+/** FNV-1a 64.  @param p bytes  @param n byte count  @return the hash */
+static uint64_t fnv(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/** Keep a host-built slice: upload it into a tensor the plan owns (pulsar_tp_plan::built), or in RECORD MODE print
+ *  its line instead.
+ *  @param p   the plan
+ *  @param s   the slice
+ *  @param how the operation's name for the record
+ *  @param b   the slice's bytes
+ *  @param nm  the tensor's name
+ *  @return false when the upload failed */
+static bool run_built(pulsar_tp_plan *p, const pulsar_tp_slice *s, const char *how, const std::vector<uint8_t> &b,
+                      const char *nm) {
+    if (g_tp_record) {
+        fprintf(g_tp_record, "built %s %s bytes %zu fnv %016llx\n", how, nm, b.size(), (unsigned long long)fnv(b.data(), b.size()));
+        return true;
+    }
+    pulsar_gpu_tensor *g = pulsar_gpu_tensor_alloc(b.size());
+    if (!g || !pulsar_gpu_tensor_write(g, 0, b.data(), b.size())) {
+        pulsar_gpu_tensor_free(g);
+        return false;
+    }
+    p->built[s->t] = g;
+    return true;
+}
+
+/** Run one slice's operation: register it with the backend, build it on the device, or (RECORD MODE) print it.
+ *  @param e     the engine
+ *  @param p     the plan
+ *  @param s     the slice
+ *  @param op    its operation (plan_op's)
+ *  @param bytes accumulates the device bytes the slice builds
+ *  @return false (said where the cause is known) when the operation failed */
+static bool run_slice(pulsar_engine *e, pulsar_tp_plan *p, const pulsar_tp_slice *s, pulsar_tp_op op, uint64_t *bytes) {
+    const pulsar_model *m = s->m;
+    const pulsar_tensor *t = s->t;
+    const unsigned long long off = (unsigned long long)t->abs_offset, lo = s->lo[0], hi = s->hi[0];
+    char nm[256];
+    tname(t, nm, sizeof(nm));
+    switch (op) {
+    case PULSAR_TP_OP_FP8_ROWS:
+        if (g_tp_record) {
+            fprintf(g_tp_record, "fp8_rows %s off %llu in %llu out %llu rows [%llu,%llu)\n", nm, off,
+                    (unsigned long long)t->dim[0], (unsigned long long)t->dim[1], lo, hi);
+            return true;
+        }
+        return pulsar_gpu_register_fp8_lt_row_slice(tensor_map_base(m, t), t->abs_offset, t->dim[0], t->dim[1], lo, hi) != 0;
+    case PULSAR_TP_OP_FP8_K:
+        if (g_tp_record) {
+            fprintf(g_tp_record, "fp8_kslice %s off %llu in %llu out %llu cols [%llu,%llu) key engine+tensor\n", nm, off,
+                    (unsigned long long)t->dim[0], (unsigned long long)t->dim[1], lo, hi);
+            return true;
+        }
+        return pulsar_gpu_register_fp8_lt_kslice(tensor_map_base(m, t), t->abs_offset, t->dim[0], t->dim[1], lo, hi, e,
+                                                 pulsar_tp_kslice_key_offset(t)) != 0;
+    case PULSAR_TP_OP_VIEW:
+        if (g_tp_record)
+            fprintf(g_tp_record, "view %s off %llu rows [%llu,%llu) of %llu\n", nm, off, lo, hi,
+                    (unsigned long long)axis_full(t, s->axis));
+        return true;   /* the forward offsets into the staged tensor */
+    case PULSAR_TP_OP_EXL3_COLS:
+    case PULSAR_TP_OP_EXL3_ROWS: {
+        std::vector<uint8_t> b;
+        if (!exl3_slice((const uint8_t *)tensor_data(m, t), s, b)) {
+            fprintf(stderr, "pulsar: TP: %s does not slice as EXL3 tiles -- refusing\n", nm);
+            return false;
+        }
+        *bytes += b.size();
+        return run_built(p, s, op_name(op), b, nm);
+    }
+    case PULSAR_TP_OP_GATHER: {
+        /* rows of the outermost dim, each t->bytes / full long */
+        const uint64_t row = t->bytes / axis_full(t, s->axis);
+        const uint8_t *src = (const uint8_t *)tensor_data(m, t);
+        std::vector<uint8_t> b;
+        for (uint32_t i = 0; i < s->n; i++) b.insert(b.end(), src + s->lo[i] * row, src + s->hi[i] * row);
+        char how[32];
+        snprintf(how, sizeof(how), "%s_channels", tensor_type_name(t->type));
+        *bytes += b.size();
+        return run_built(p, s, how, b, nm);
+    }
+    case PULSAR_TP_OP_MXFP4_HALF: {
+        /* a stack [k][n] x experts: OUT halves the n rows (gate / up), IN the k columns (down) */
+        const bool k_half = s->axis == PULSAR_TP_AXIS_IN;
+        const uint64_t k = t->dim[0], n = t->dim[1];
+        const uint32_t n_exp = (uint32_t)t->dim[2];
+        uint64_t sd = 0, ssf = 0, ss = 0, hd = 0, hsf = 0, hs = 0;
+        cutlass_mxfp4_expert_layout(k, n, &sd, &ssf, &ss);
+        cutlass_mxfp4_expert_layout(k_half ? hi - lo : k, k_half ? n : hi - lo, &hd, &hsf, &hs);
+        *bytes += (uint64_t)n_exp * hs;
+        if (g_tp_record) {
+            fprintf(g_tp_record, "mxfp4_half %s off %llu key %llu experts %u k %llu n %llu %s [%llu,%llu) src %llu/%llu "
+                                 "dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t), n_exp,
+                    (unsigned long long)k, (unsigned long long)n, k_half ? "kcols" : "rows", lo, hi,
+                    (unsigned long long)ss, (unsigned long long)sd, (unsigned long long)hs, (unsigned long long)hd);
+            return true;
+        }
+        return pulsar_gpu_register_mxfp4_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
+                                                     t->abs_offset, n_exp, k, n, k_half ? 1 : 0, lo, hi, ss, sd, hs,
+                                                     hd) != 0;
+    }
+    case PULSAR_TP_OP_EXL3_HALF: {
+        /* a stack [k][n] x experts: OUT halves the n output columns (gate / up), IN the k input rows (down); the
+         * cut is exl3_expert_cut's, the rank's half of every expert is exl3_expert_layout of the half shape */
+        const bool k_half = s->axis == PULSAR_TP_AXIS_IN;
+        const uint64_t k = t->dim[0], n = t->dim[1];
+        const uint32_t n_exp = (uint32_t)t->dim[2];
+        const int k2 = exl3_type_k2(t->type);
+        exl3_cut c;
+        if (!exl3_expert_cut(k, n, k2, k_half, lo, hi, 0, hi - lo, &c) || c.src_stride * n_exp != t->bytes) {
+            fprintf(stderr, "pulsar: TP: %s is not %u EXL3 experts of %llu x %llu cut at [%llu,%llu) -- refusing\n", nm,
+                    n_exp, (unsigned long long)k, (unsigned long long)n, lo, hi);
+            return false;
+        }
+        *bytes += (uint64_t)n_exp * c.dst_stride;
+        if (g_tp_record) {
+            fprintf(g_tp_record, "exl3_half %s off %llu key %llu experts %u k %llu n %llu %s [%llu,%llu) k2 %d src "
+                                 "%llu/%llu dst %llu/%llu\n", nm, off, (unsigned long long)pulsar_tp_expert_half_offset(m, t),
+                    n_exp, (unsigned long long)k, (unsigned long long)n, k_half ? "kcols" : "rows", lo, hi, k2,
+                    (unsigned long long)c.src_stride, (unsigned long long)c.src_trellis,
+                    (unsigned long long)c.dst_stride, (unsigned long long)c.dst_trellis);
+            return true;
+        }
+        return pulsar_gpu_register_exl3_expert_half(e, pulsar_tp_expert_half_offset(m, t), tensor_map_base(m, t),
+                                                    t->abs_offset, n_exp, k, n, k2, k_half ? 1 : 0, lo, hi) != 0;
+    }
+    case PULSAR_TP_OP_EXPERTS: {
+        const uint64_t stride = t->bytes / t->dim[2], rel = lo * stride, n = (hi - lo) * stride;
+        *bytes += n;
+        if (g_tp_record) {
+            fprintf(g_tp_record, "stage_range %s off %llu +%llu bytes %llu\n", nm, off, (unsigned long long)rel,
+                    (unsigned long long)n);
+            return true;
+        }
+        return pulsar_gpu_weight_range_ptr(tensor_map_base(m, t), t->abs_offset + rel, n, "TP expert range") != NULL;
+    }
+    case PULSAR_TP_OP_NONE: break;
+    }
+    return false;
+}
+
+bool pulsar_tp_plan_run(pulsar_engine *e) {
+    pulsar_tp_plan *p = e->tp_plan;
+    if (!p) return true;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < p->slices.size(); i++)
+        if (!run_slice(e, p, &p->slices[i], p->ops[i], &bytes)) {
+            char nm[256];
+            tname(p->slices[i].t, nm, sizeof(nm));
+            fprintf(stderr, "pulsar: TP rank %d: the %s slice of %s could not be built -- refusing\n", e->model.tp_rank,
+                    op_name(p->ops[i]), nm);
+            return false;
+        }
+    /* L272 B9: resident weights the model's staged count never sees (pulsar_engine::weights_resident_bytes) */
+    if (!g_tp_record) e->tp_built_bytes += bytes;
+    fprintf(stderr, "pulsar: TP rank %d: %zu slices %s, %.2f GiB built or staged\n", e->model.tp_rank, p->slices.size(),
+            g_tp_record ? "recorded" : "in place", (double)bytes / 1073741824.0);
+    return true;
+}

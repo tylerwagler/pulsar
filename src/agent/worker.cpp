@@ -1,4 +1,7 @@
+/** @file
+ *  pulsar-agent: the model worker thread (prefill, generation, tool turns). */
 #include "pulsar_agent_internal.h"
+#include "out_parse_kit.h"
 
 
 
@@ -17,7 +20,11 @@
  * This helper is intentionally derived only from the current streaming parser
  * state.  The state object is local to one assistant round, so malformed output,
  * EOS, Ctrl+C, or the next turn cannot accidentally leave sampling greedy. */
+/// @brief Whether the next token should be drawn greedily (see above).
+/// @param sr the round's stream renderer; NULL = no
+/// @return true inside DSML structure, a held DSML-shaped opening, or a possible parameter close
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
+    if (sr && sr->family) return agent_family_parser_wants_greedy(sr->family);   /* L365 */
     if (!sr || !sr->parser) return false;
     if (sr->parser->state == AGENT_DSML_ERROR ||
         sr->parser->state == AGENT_DSML_DONE)
@@ -40,6 +47,12 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 
 
 
+/** @brief Draw the next token from the session: the configured temperature / top-p / min-p, or greedy.
+ *  @param w      the worker (its session)
+ *  @param cfg    the configuration (sampling knobs)
+ *  @param greedy draw the argmax instead
+ *  @param rng    the request's sampler stream, stepped
+ *  @return the token, or PULSAR_SAMPLE_REFUSED */
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return pulsar_session_sample(w->session,
@@ -52,6 +65,9 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
 
 
 
+/** @brief Publish whether sampling is currently greedy (status.greedy_sampling), waking the UI on a change.
+ *  @param w      the worker; takes w->mu
+ *  @param greedy the new state */
 static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
     pthread_mutex_lock(&w->mu);
     if (w->status.greedy_sampling != greedy) {
@@ -66,9 +82,13 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
+/// @brief Run one user turn, tool iterations included (see above).  Worker thread.
+/// @param w         the worker
+/// @param user_text the user's message
+/// @return 0 (done, or interrupted), or 1 on an error (set with agent_set_error)
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
-    pulsar_think_mode think_mode = effective_think_mode(cfg);
+    pulsar_think_mode think_mode = cfg->gen.think_mode;
     pthread_mutex_lock(&w->mu);
     w->interrupt = false;
     w->status.error[0] = '\0';
@@ -96,7 +116,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    pulsar_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    agent_worker_close_open_turn(w, &w->transcript);   /* L365: a turn left open by an earlier failure */
+    agent_turn_add(w, "user", user_text, false);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -111,8 +132,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * deliberately no artificial "too many tool calls" ceiling here: context
      * pressure, compaction, user Ctrl+C, and the model's final answer are the
      * real stopping conditions.  The transcript is the single source of truth:
-     * after a DSML stanza completes we terminate that assistant message, append
-     * the tool result as a tool message, then ask the model to continue. */
+     * after a DSML stanza completes we terminate that assistant message, add
+     * the tool result to the next turn as a tool message, then ask the model to
+     * continue -- the turn rendered whole by the family's chat front. */
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -127,12 +149,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
-        pulsar_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+        agent_turn_flush(w, think_mode);
 
         const pulsar_tokens *prompt_for_sync = &w->transcript;
-        int old_pos = pulsar_session_pos(w->session);
-        int common = pulsar_session_common_prefix(w->session, &w->transcript);
-        int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
+        const TokPos old_pos = pulsar_session_pos(w->session);
+        const TokCount common = pulsar_session_common_prefix(w->session, &w->transcript);
+        int cached = TokPos::after(common) == old_pos && TokPos{w->transcript.len} >= old_pos ? common.raw() : 0;
 
         int suffix = prompt_for_sync->len - cached;
         agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
@@ -167,7 +189,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
-            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -178,17 +200,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         int max_tokens = cfg->gen.n_predict;
-        int room = pulsar_session_ctx(w->session) - pulsar_session_pos(w->session);
+        int room = (pulsar_session_ctx(w->session) - pulsar_session_pos(w->session).before()).raw();
         if (room <= 1) max_tokens = 0;
         else if (max_tokens > room - 1) max_tokens = room - 1;
 
         bool use_color = isatty(STDOUT_FILENO) != 0;
+        /* L365: where the prompt leaves the turn -- the generation prompt's thinking, or (Gemma) a thought channel
+         * reopened after the tool responses */
+        const bool reasoning_open = pulsar_chat_opens_reasoning(w->engine, &w->transcript, think_mode);
         agent_token_renderer renderer = {
             .engine = w->engine,
             .worker = w,
-            .format_thinking = pulsar_think_mode_enabled(think_mode),
             .format_markdown = use_color,
-            .in_think = pulsar_think_mode_enabled(think_mode),
+            .think = {.in_think = reasoning_open},
             .use_color = use_color,
             .last_output_newline = true,
         };
@@ -196,8 +220,21 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_stream_renderer stream = {
             .renderer = &renderer,
             .parser = &dsml,
-            .in_think = pulsar_think_mode_enabled(think_mode),
         };
+        /* L365: every family but DeepSeek calls tools in its own syntax, read by its output parser; the guard
+         * frees it on every exit from the round */
+        struct family_guard {
+            out_parser *p;
+            ~family_guard() { agent_family_parser_free(p); }
+        } family = {NULL};
+        if (!agent_worker_dsml(w)) {
+            family.p = agent_family_parser_new(w->engine, reasoning_open, err, sizeof(err));
+            if (!family.p) {
+                agent_set_error(w, err);
+                return 1;
+            }
+            stream.family = family.p;
+        }
         agent_edit_upto_forcer upto_forcer = {0};
         bool got_tool = false;
         bool malformed_tool = false;
@@ -220,7 +257,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 status_greedy_sampling = greedy_sampling;
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
-            if (token == pulsar_token_eos(w->engine)) break;
+            if (pulsar_token_is_stop(w->engine, token)) break;
 
             size_t text_len = 0;
             char *text = pulsar_token_text(w->engine, token, &text_len);
@@ -276,7 +313,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
         if (interrupted) {
-            pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
@@ -301,7 +338,21 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "incomplete DSML tool call");
         }
 
-        pulsar_tokens_push(&w->transcript, pulsar_token_eos(w->engine));
+        if (family.p) {   /* the parser has read the whole turn (agent_stream_text's finish above) */
+            if (stream.family_error[0]) {
+                malformed_tool = true;
+                snprintf(dsml.error, sizeof(dsml.error), "%s", stream.family_error);
+            } else if (!family.p->calls().empty()) {
+                if (agent_family_calls_take(family.p, &dsml.calls, dsml.error, sizeof(dsml.error))) got_tool = true;
+                else malformed_tool = true;
+            }
+        }
+
+        /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses */
+        if (family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine))
+            w->model_turn_open = true;
+        else
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
@@ -309,6 +360,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 0;
         }
 
+        std::vector<char *> each;   /* the family path's per-call results (owned) */
+        struct each_guard {
+            std::vector<char *> *v;
+            ~each_guard() { for (char *s : *v) free(s); }
+        } each_free = {&each};
         char *tool_result;
         if (early_tool_error) {
             agent_buf b = {0};
@@ -320,10 +376,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             tool_result = agent_buf_take(&b);
         } else if (malformed_tool) {
             agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
+            agent_buf_puts(&b, family.p ? "Tool error: invalid tool call: " : "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, agent_dsml_syntax_reminder);
+            if (!family.p) agent_buf_puts(&b, agent_dsml_syntax_reminder);
+            tool_result = agent_buf_take(&b);
+        } else if (family.p) {
+            /* L365: one result per call, each its own tool message naming its function (the templates answer calls
+             * one by one); `tool_result` is their concatenation, for the context check */
+            agent_buf b = {0};
+            for (int i = 0; i < dsml.calls.len; i++) {
+                char *res = agent_execute_tool_call_one(w, &dsml.calls.v[i]);
+                each.push_back(res);
+                agent_buf_puts(&b, res);
+            }
             tool_result = agent_buf_take(&b);
         } else {
             tool_result = agent_execute_tool_calls(w, &dsml.calls);
@@ -361,6 +427,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          AGENT_TOOL_RESULT_RESERVE_TOKENS);
                 agent_buf_puts(&b, msg);
                 tool_result = agent_buf_take(&b);
+                for (char *s : each) free(s);
+                each.clear();   /* the one error answers the round's calls */
                 if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
                     free(tool_result);
                     agent_dsml_parser_free(&dsml);
@@ -369,14 +437,18 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        pulsar_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        if (!each.empty()) {
+            for (size_t i = 0; i < each.size(); i++) agent_turn_add_tool(w, dsml.calls.v[i].name, each[i]);
+        } else {
+            agent_turn_add_tool(w, family.p && dsml.calls.len > 0 ? dsml.calls.v[0].name : NULL, tool_result);
+        }
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
             agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            pulsar_chat_append_message(w->engine, &w->transcript, "user", queued_user);
+            agent_turn_add(w, "user", queued_user, false);
             pthread_mutex_lock(&w->mu);
             w->user_activity = true;
             w->session_dirty = true;
@@ -409,6 +481,9 @@ void worker_request_compact(agent_worker *w) {
 
 
 
+/** @brief Take (read and clear, under w->mu) the UI's save request.
+ *  @param w the worker
+ *  @return true when a save was requested */
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
@@ -419,6 +494,9 @@ static bool worker_take_save_requested(agent_worker *w) {
 
 
 
+/** @brief Take (read and clear, under w->mu) the UI's compaction request.
+ *  @param w the worker
+ *  @return true when a compaction was requested */
 static bool worker_take_compact_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->compact_requested;
@@ -429,6 +507,8 @@ static bool worker_take_compact_requested(agent_worker *w) {
 
 
 
+/** @brief Run a requested session save on the worker thread and report it; nothing when none was requested.
+ *  @param w the worker */
 static void worker_run_deferred_save(agent_worker *w) {
     if (!worker_take_save_requested(w)) return;
     agent_set_status(w, AGENT_WORKER_SAVING);
@@ -444,6 +524,8 @@ static void worker_run_deferred_save(agent_worker *w) {
 
 
 
+/** @brief Run a requested compaction on the worker thread and report it; nothing when none was requested.
+ *  @param w the worker */
 static void worker_run_deferred_compact(agent_worker *w) {
     if (!worker_take_compact_requested(w)) return;
     if (!agent_worker_has_user_session(w)) {

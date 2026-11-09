@@ -1,4 +1,7 @@
+/** @file
+ *  pulsar-agent: the interactive runtime loop (and the non-interactive one-shot run). */
 #include "pulsar_agent_internal.h"
+#include "pulsar_ctxmem.h"
 
 
 
@@ -7,6 +10,8 @@
  * ============================================================================
  */
 
+/** @brief Write one protocol marker line to stderr (the non-interactive mode's readiness / status lines).
+ *  @param msg the marker text, without the newline */
 static void agent_noninteractive_marker(const char *msg) {
     write_all(STDERR_FILENO, msg, strlen(msg));
     write_all(STDERR_FILENO, "\n", 1);
@@ -14,6 +19,10 @@ static void agent_noninteractive_marker(const char *msg) {
 
 
 
+/** @brief Read everything stdin has available now (non-blocking stdin) into `in`.
+ *  @param in  the input buffer appended to
+ *  @param eof set true when stdin reached end of file
+ *  @return 0, or -1 on a read error (said on stderr) */
 static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
     char buf[4096];
     for (;;) {
@@ -40,6 +49,10 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
+/// @brief The non-interactive agent: one-shot with -p, else the stdin protocol (see above).
+/// @param engine the loaded engine
+/// @param cfg    the resolved configuration
+/// @return the process exit code: 0, or 1 on a failure
 static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
@@ -196,6 +209,10 @@ static int run_agent_non_interactive(pulsar_engine *engine, agent_config *cfg) {
 /* Main UI loop.  poll() multiplexes stdin with the worker wake pipe; all
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
+/// @brief The interactive agent: the terminal UI loop (see above).
+/// @param engine the loaded engine
+/// @param cfg    the resolved configuration
+/// @return the process exit code: 0, or 1 when the worker or terminal could not start
 static int run_agent(pulsar_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
@@ -500,13 +517,13 @@ static int run_agent(pulsar_engine *engine, agent_config *cfg) {
                         while (*arg && *arg != ' ' && *arg != '\t') arg++;
                         if (*arg) *arg = '\0';
                         char sha[41] = {0};
-                        uint32_t tokens = 0;
+                        uint64_t freed = 0;
                         char err[160] = {0};
                         if (agent_worker_strip_session(&worker, sha_arg,
-                                                       sha, &tokens,
+                                                       sha, &freed,
                                                        err, sizeof(err)))
-                            printf("stripped session %.8s (%u tokens)\n",
-                                   sha, tokens);
+                            printf("stripped session %.8s (released %.1f MiB of cached KV)\n",
+                                   sha, (double)freed / (1024.0 * 1024.0));
                         else
                             printf("strip failed: %s\n", err);
                     }
@@ -579,8 +596,10 @@ static int run_agent(pulsar_engine *engine, agent_config *cfg) {
 
 
 
-#ifndef PULSAR_AGENT_TEST_NO_MAIN
-
+/** @brief pulsar-agent's entry point: parse options, open the engine, run interactively or not.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit code */
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
@@ -588,11 +607,40 @@ int main(int argc, char **argv) {
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
+    agent_workspace_init(cfg.allow_outside_workspace);
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &cfg.engine) != 0) return 1;
-    log_context_memory(cfg.engine.backend,
-                       cfg.gen.ctx_size,
-                       cfg.engine.prefill_chunk);
+    /* the agent takes text: a family whose tokenizer and chat front this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-agent: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        return 1;
+    }
+    /* The think mode is the loaded family's, the rule pulsar applies (L284 P14): an unset mode is the family's
+     * default; an effort its template cannot spell is refused here by name rather than rendered. */
+    if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);
+    {
+        char why[200];
+        if (!pulsar_engine_think_mode_supported(engine, cfg.gen.think_mode, why, sizeof why)) {
+            fprintf(stderr, "pulsar-agent: thinking effort %d: %s\n", (int)cfg.gen.think_mode, why);
+            pulsar_engine_close(engine);
+            return 2;
+        }
+        /* L365: tools are called in the family's own syntax; a family the agent cannot do that on is refused */
+        if (!agent_family_tools_supported(engine, why, sizeof why)) {
+            fprintf(stderr, "pulsar-agent: %s family: %s\n", pulsar_engine_family_name(engine), why);
+            pulsar_engine_close(engine);
+            return 2;
+        }
+    }
+    {
+        char ctxmem_line[256];
+        fprintf(stderr, "%s\n",
+                pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-agent",
+                                           cfg.engine.backend, cfg.gen.ctx_size,
+                                           cfg.engine.prefill_chunk));
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
@@ -610,7 +658,3 @@ int main(int argc, char **argv) {
     pulsar_engine_close(engine);
     return rc;
 }
-
-
-#endif
-

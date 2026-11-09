@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: context compaction (summarise the task state, rebuild the transcript around it). */
 #include "pulsar_agent_internal.h"
 
 
@@ -14,6 +16,10 @@
 /* Decide when to compact before an ordinary turn or before appending a large
  * tool result.  The fixed free-token threshold is capped proportionally for
  * smaller contexts so tests with tiny contexts still compact rather than fail. */
+/// @brief Whether the transcript is full enough to compact (see above).
+/// @param w the worker
+/// @return true at AGENT_COMPACT_SOFT_PERCENT of the context, or when free tokens fall to
+///         min(AGENT_COMPACT_MIN_FREE_TOKENS, ctx / 4)
 static bool agent_worker_should_compact(agent_worker *w) {
     int ctx = w->cfg->gen.ctx_size;
     int used = w->transcript.len;
@@ -27,6 +33,12 @@ static bool agent_worker_should_compact(agent_worker *w) {
 
 
 
+/* The id `rendered` tokenizes to as ONE special token, or -1 when the loaded family has none (Qwen spells
+ * DeepSeek's DSML marker as text). */
+/// @brief The single special token `rendered` tokenizes to (see above).
+/// @param engine   the loaded engine
+/// @param rendered the special token's text
+/// @return its id, or -1 when it is not exactly one token
 static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
     pulsar_tokenize_rendered_chat(engine, rendered, &t);
@@ -39,6 +51,11 @@ static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
 
 /* Pick a recent verbatim tail for the compacted transcript.  Prefer a user
  * boundary inside the budget so the rebuilt context starts at a natural turn. */
+/// @brief Where the verbatim tail of a compacted transcript starts (see above).
+/// @param w       the worker (its transcript and ctx_size)
+/// @param bottom  end of the region to keep, token index (exclusive)
+/// @param sys_len tokens of the system prompt, never cut into
+/// @return the first user-turn marker in [bottom - budget, bottom), else bottom - budget (clamped to sys_len)
 static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int tail_budget = w->cfg->gen.ctx_size / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
@@ -48,17 +65,22 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int target = bottom - tail_budget;
     if (target < sys_len) target = sys_len;
 
-    int user_id = agent_special_token_id(w->engine, "<｜User｜>");
-    if (user_id < 0) return target;
+    pulsar_turn_markers markers;
+    if (!pulsar_chat_turn_markers(w->engine, &markers)) return target;
 
     for (int i = target; i < bottom; i++) {
-        if (w->transcript.v[i] == user_id) return i;
+        if (pulsar_turn_marker_at(&markers, w->transcript.v, bottom, i) == 1) return i;
     }
     return target;
 }
 
 
 
+/** @brief Append src->v[start, end) to `dst` (the range clamped to src).
+ *  @param dst   destination tokens
+ *  @param src   source tokens
+ *  @param start first index
+ *  @param end   end index (exclusive) */
 static void agent_tokens_append_range(pulsar_tokens *dst, const pulsar_tokens *src,
                                       int start, int end) {
     if (start < 0) start = 0;
@@ -71,6 +93,9 @@ static void agent_tokens_append_range(pulsar_tokens *dst, const pulsar_tokens *s
 /* Build the private prompt used to ask the model for durable state.  The prompt
  * explicitly forbids tool calls because the result is consumed internally, not
  * delivered as an assistant turn. */
+/// @brief The compaction request prompt (see above).
+/// @param reason why compaction runs, appended when non-empty; may be NULL
+/// @return the prompt, malloc'd; caller frees
 static char *agent_compact_make_prompt(const char *reason) {
     agent_buf b = {0};
     agent_buf_puts(&b,
@@ -117,9 +142,10 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char *prompt_text = agent_compact_make_prompt(reason);
     pulsar_tokens prompt = {0};
     pulsar_tokens_copy(&prompt, &w->transcript);
-    pulsar_chat_append_message(w->engine, &prompt, "user", prompt_text);
+    agent_worker_close_open_turn(w, &prompt);   /* L365: the private request never lands inside an open turn */
+    const pulsar_chat_message request = {"user", prompt_text, false};
+    agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
-    pulsar_chat_append_assistant_prefix(w->engine, &prompt, PULSAR_THINK_NONE);
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -176,7 +202,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
-    int think_end_id = agent_special_token_id(w->engine, "</think>");
+    int think_end_id = pulsar_token_think_close(w->engine);
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = agent_now_sec();
     for (int i = 0; i < summary_max; i++) {
@@ -193,7 +219,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             return false;
         }
         int token = pulsar_session_argmax(w->session);
-        if (token == pulsar_token_eos(w->engine)) break;
+        if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
             if (token == dsml_id && summary.len && summary.ptr[summary.len - 1] == '<') {
                 summary.ptr[--summary.len] = '\0';
@@ -214,7 +240,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         size_t text_len = 0;
         char *text = pulsar_token_text(w->engine, token, &text_len);
         agent_buf_append(&summary, text, text_len);
-        agent_publish(w, text, text_len);
+        agent_publish_untrusted(w, text, text_len);
         free(text);
 
         double dt = agent_now_sec() - t0;
@@ -247,7 +273,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     if (summary_msg.len && summary_msg.ptr[summary_msg.len - 1] != '\n')
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
-    pulsar_chat_append_message(w->engine, &compacted, "system", summary_msg.ptr);
+    const pulsar_chat_message summary_note = {"system", summary_msg.ptr, false};
+    pulsar_chat_append_turn(w->engine, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
     free(summary_msg.ptr);
     free(summary.ptr);
 
@@ -273,7 +300,10 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     pulsar_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
     if (bash_update) {
-        pulsar_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
+        /* L365: a tool message answers an open turn's calls where calls continue the turn (Gemma); with none
+         * open there, the observation is the user's note */
+        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) || w->model_turn_open;
+        agent_turn_add(w, as_tool ? "tool" : "user", bash_update, false);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
         agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",

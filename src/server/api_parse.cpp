@@ -1,235 +1,505 @@
+/** @file
+ *  The protocol parsers: OpenAI chat / completions, Anthropic Messages and Responses request bodies into a request
+ *  (and chat_conversation), plus the sampling knobs every surface shares.
+ */
 #include "pulsar_server_internal.h"
 
 
 
-/* The API parsers are intentionally selective JSON parsers: they keep only
- * fields that affect model semantics, rendering, streaming, or cache keys, and
- * skip extension fields.  The output is always a rendered DS4 chat/completion
- * prompt plus the small amount of protocol state needed to translate the reply. */
-bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
-    request_init(r, REQ_CHAT, def_tokens);
-    const char *p = body;
-    bool got_messages = false;
-    bool tool_choice_none = false;
-    bool tool_choice_required = false;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
-    chat_msgs msgs = {0};
-    char *tool_schemas = NULL;
+/* The set of ignored top-level keys already named in the log.  Keys are client
+ * input, so the set is bounded: past the cap, further new keys are not
+ * tracked, and that is said once. */
+/// The most (endpoint, key) pairs api_key_first_seen tracks; past it new keys are not named (said once).
+#define API_SEEN_KEYS_MAX 256
+/// Guards the ignored-key set below (the parsers run on client threads).
+static pthread_mutex_t api_seen_mu = PTHREAD_MUTEX_INITIALIZER;
+/// The "endpoint/key" names already logged, heap strings, never freed (process lifetime).
+static char *api_seen_keys[API_SEEN_KEYS_MAX];
+/// Entries used in api_seen_keys.
+static int api_seen_n = 0;
+/// The set-is-full line was said.
+static bool api_seen_full_warned = false;
 
-    json_ws(&p);
-    if (*p != '{') goto bad;
-    p++;
-    json_ws(&p);
-    while (*p && *p != '}') {
-        char *key = NULL;
-        if (!json_string(&p, &key)) goto bad;
-        json_ws(&p);
-        if (*p != ':') {
-            free(key);
-            goto bad;
+bool api_key_first_seen(const char *api, const char *key) {
+    char name[160];
+    snprintf(name, sizeof(name), "%s/%s", api, key);
+    bool first = false;
+    pthread_mutex_lock(&api_seen_mu);
+    int i = 0;
+    while (i < api_seen_n && strcmp(api_seen_keys[i], name)) i++;
+    if (i == api_seen_n) {
+        if (api_seen_n < API_SEEN_KEYS_MAX) {
+            api_seen_keys[api_seen_n++] = server_xstrdup(name);
+            first = true;
+        } else if (!api_seen_full_warned) {
+            api_seen_full_warned = true;
+            server_log(PULSAR_LOG_WARNING,
+                       "ignored-key log is full (%d keys); further new keys are not named",
+                       API_SEEN_KEYS_MAX);
         }
-        p++;
-        if (!strcmp(key, "messages")) {
-            chat_msgs_free(&msgs);
-            if (!parse_messages(&p, &msgs)) {
-                free(key);
-                goto bad;
-            }
-            got_messages = true;
-        } else if (!strcmp(key, "tools")) {
-            free(tool_schemas);
-            tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders, false, NULL)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "tool_choice")) {
-            json_ws(&p);
-            if (*p == '"') {
-                char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
-                }
-                tool_choice_none = !strcmp(choice, "none");
-                tool_choice_required = !strcmp(choice, "required");
-                free(choice);
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "model")) {
-            free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
-            r->model_from_request = true;
-        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* Same convention as top_p's range handling in the engine
-             * samplers (sample_top_p_min_p): an out-of-range value disables
-             * the filter instead of erroring.  Unvalidated, min_p > 1
-             * silently collapses sampling to greedy (only the max-prob
-             * candidate survives the cutoff). */
-            if (v < 0.0 || v > 1.0) v = 0.0;
-            r->min_p = (float)v;
-            r->has_min_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
-        } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
-            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
-                    : v > 0.0                                 ? UINT64_MAX
-                                                              : 0;
-        } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "stream_options")) {
-            if (!parse_stream_options(&p, &r->stream_include_usage)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
-            got_thinking = true;
-        } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
-            /* enable_thinking is the Qwen/vLLM spelling; accept it as a bool
-             * alias for our existing `think` field. Both remain additive to the
-             * Anthropic-style `thinking` object handled above. */
-            if (!json_bool(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
-            got_thinking = true;
-        } else if (!strcmp(key, "stop")) {
-            if (!parse_stop(&p, &r->stops)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!json_skip_value(&p)) {
-            free(key);
-            goto bad;
+    }
+    pthread_mutex_unlock(&api_seen_mu);
+    return first;
+}
+
+/* The default arm of every top-level body parser: skip the value, and name the
+ * key in the log the first time this process ignores it.  The key is client
+ * text, so only printable ASCII reaches the log. */
+/// Skip an ignored top-level value, naming the key once per process (api_key_first_seen).
+/// @param api  the endpoint
+/// @param key  the key, client text (only printable ASCII is logged)
+/// @param p    the parse cursor, advanced past the value
+/// @return json_skip_value's verdict
+static bool skip_ignored_key(const char *api, const char *key, const char **p) {
+    if (api_key_first_seen(api, key)) {
+        char shown[65];
+        size_t n = 0;
+        for (; key[n] && n < sizeof(shown) - 1; n++) {
+            unsigned char c = (unsigned char)key[n];
+            shown[n] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
         }
-        free(key);
-        json_ws(&p);
-        if (*p == ',') p++;
-        json_ws(&p);
+        shown[n] = '\0';
+        server_log(PULSAR_LOG_WARNING,
+                   "%s: ignoring request key \"%s\"%s (named once per process)",
+                   api, shown, key[n] ? "..." : "");
     }
-    if (*p != '}') goto bad;
-    if (!got_messages) {
-        snprintf(err, errlen, "missing messages");
-        chat_msgs_free(&msgs);
-        free(tool_schemas);
-        request_free(r);
-        return false;
-    }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    /* parse_chat_request accepts a NULL server (parse-without-server, exercised
-     * by the tool-call-quality test). The predecessor free functions no-op'd on
-     * null s via their internal `if (!s) return` guard; as members that guard is
-     * dead under -O3 null-check elision, so keep the null test OUTSIDE the call. */
-    if (s) {
-        s->kv_cache_restore_tool_memory_for_messages(&msgs);
-        s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
-    }
-    const char *active_tool_schemas;
-    active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
-    /* tool_choice="required": force a tool call by prefilling the assistant turn
-     * into an open DSML tool_calls block. render_chat_prompt_text ends the turn
-     * with "<｜Assistant｜><think>" (or "</think>"); rewrite it to skip thinking
-     * and open the block so generation must complete an invoke. generate_job
-     * seeds the output with the same opener so the parser sees a full block. */
-    if (tool_choice_required && r->has_tools && r->prompt_text) {
-        r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
-    }
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
-    free(tool_schemas);
-    return true;
-bad:
-    chat_msgs_free(&msgs);
-    free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
-    request_free(r);
-    return false;
+    return json_skip_value(p);
 }
 
 
 
-bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
-    request_init(r, REQ_CHAT, def_tokens);
-    r->api = API_ANTHROPIC;
+/* Shared sampling-knob parsing for every request surface. Returns 1 if `key`
+ * was a sampling knob and its value was consumed, 0 if it is not a sampling
+ * knob (caller keeps matching), -1 on a malformed value (caller frees key and
+ * goes to its error label). One definition so a knob is never silently dropped
+ * by whichever arm a given endpoint's copy-paste happened to include -- every
+ * surface accepts temperature/top_p/min_p/top_k/seed identically. logprobs
+ * stays endpoint-local (chat only). */
+/// Parse one sampling knob (temperature, top_p, min_p, top_k, seed) shared by every surface.
+/// @param key  the member name just read
+/// @param p    the parse cursor, at the member's value (advanced past it when consumed)
+/// @param r    the request whose sampling fields are set
+/// @return 1 consumed, 0 not a sampling knob, -1 malformed value
+int parse_sampling_key(const char *key, const char **p, request *r) {
+    if (!strcmp(key, "temperature")) {
+        double v = 0.0;
+        /* strtod also accepts nan/inf lexemes.  A NaN fails every range test
+         * below (and the engine's `temperature <= 0` greedy test), so it would
+         * reach the sampler as a non-finite distribution (review B2).  Refuse
+         * non-finite knobs at the surface. */
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
+        r->temperature = (float)v;
+        r->has_temperature = true;
+    } else if (!strcmp(key, "top_p")) {
+        double v = 0.0;
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
+        /* The engine maps anything outside (0,1] to 1.0 (THE sampler, pulsar_cuda_sampler.cu).
+         * Clamp here too so the stored request matches what will run, and say so
+         * once: top_p=0 is a common near-greedy idiom that clients expect to
+         * narrow the nucleus, not widen it to the full vocab. */
+        if (!(v > 0.0 && v <= 1.0)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                server_log(PULSAR_LOG_WARNING,
+                           "top_p=%g is outside (0,1]; using 1.0 (full nucleus)", v);
+            }
+            v = 1.0;
+        }
+        r->top_p = (float)v;
+        r->has_top_p = true;
+    } else if (!strcmp(key, "min_p")) {
+        double v = 0.0;
+        if (!json_number(p, &v) || !isfinite(v)) return -1;
+        /* out-of-range disables the filter, matching the engine sampler
+         * (pulsar_cuda_sampler.cu); an unvalidated min_p>1 collapses to greedy. */
+        if (v < 0.0 || v > 1.0) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                server_log(PULSAR_LOG_WARNING,
+                           "min_p=%g is outside [0,1]; filter disabled", v);
+            }
+            v = 0.0;
+        }
+        r->min_p = (float)v;
+        r->has_min_p = true;
+    } else if (!strcmp(key, "top_k")) {
+        if (!json_int(p, &r->top_k)) return -1;
+        /* Same range the engine enforces (>1024 -> 1024, <=0 -> 0). */
+        if (r->top_k < 0 || r->top_k > 1024) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                server_log(PULSAR_LOG_WARNING,
+                           "top_k=%d is outside [0,1024]; using %d",
+                           r->top_k, r->top_k < 0 ? 0 : 1024);
+            }
+            r->top_k = r->top_k < 0 ? 0 : 1024;
+        }
+        r->has_top_k = true;
+    } else if (!strcmp(key, "seed")) {
+        double v = 0.0;
+        if (!json_number(p, &v)) return -1;
+        /* NaN fails v>0; +inf or >=2^64 would be UB in the cast. */
+        r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
+                : v > 0.0                                 ? UINT64_MAX
+                                                          : 0;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+
+/* The API parsers are intentionally selective JSON parsers: they keep only
+ * fields that affect model semantics, rendering, streaming, or cache keys, and
+ * skip extension fields.  Each reads ITS protocol into a chat_conversation and
+ * the request's protocol fields; render_chat_conversation (chat_family.cpp) is
+ * the loaded family's half -- thinking, the prompt, its tokens (L267). */
+
+/* One thinking / effort control, kept as sent for the family (chat_control). */
+/// L354: a request's explicit cap is at least one token: 0 (and a negative, which json_int folds to 0) used to answer 200 with
+/// nothing and finish_reason "length".
+/// @param max_tokens the parsed value
+/// @param err        receives the refusal
+/// @param errlen     bytes at err
+/// @return true when it is a usable cap
+static bool max_tokens_ok(int max_tokens, char *err, size_t errlen) {
+    if (max_tokens > 0) return true;
+    snprintf(err, errlen, "max_tokens must be at least 1");
+    return false;
+}
+
+/// Keep one thinking / effort control as sent, for the family.
+/// @param p    the parse cursor, at the control's value (advanced past it)
+/// @param c    the conversation the control is kept on
+/// @param key  the control's key (static storage)
+/// @return false when the value is not well-formed JSON
+static bool take_control(const char **p, chat_conversation *c, const char *key) {
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    chat_conversation_control(c, key, raw);
+    return true;
+}
+
+/* L303: the answer's format from the protocol's object -- OpenAI chat's response_format itself, Responses'
+ * text.format (`member` "format" of `text`), Anthropic's output_config.format. */
+/// Read the answer's response format from the protocol's object (L303).
+/// @param p       the parse cursor, at the object (advanced past it)
+/// @param c       the conversation (its response_format is set)
+/// @param member  the member of the object that holds the format (NULL: the object itself); absent = no format
+/// @param err     receives the reason on a malformed format
+/// @param errlen  size of `err`
+/// @return false when the value or the format is malformed
+static bool take_response_format(const char **p, chat_conversation *c, const char *member, char *err, size_t errlen) {
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    char *fmt = member ? json_object_member_raw(raw, member) : NULL;
+    const bool ok = (member && !fmt) || response_format_parse(member ? fmt : raw, &c->response_format, err, errlen);
+    free(fmt);
+    free(raw);
+    return ok;
+}
+
+/* Anthropic's output_config: its effort is a thinking control (kept as sent), its format the answer's (L303). */
+/// Read Anthropic's output_config: its format and, as a control, its effort.
+/// @param p       the parse cursor, at the object (advanced past it)
+/// @param c       the conversation
+/// @param err     receives the reason on a malformed format
+/// @param errlen  size of `err`
+/// @return false when the object or its format is malformed
+static bool take_output_config(const char **p, chat_conversation *c, char *err, size_t errlen) {
+    const char *at = *p;
+    if (!take_response_format(&at, c, "format", err, errlen)) return false;
+    return take_control(p, c, "output_config");
+}
+
+/* The controls a chat protocol may carry, by request key; the static spelling is the control's key. */
+/// The thinking / effort controls a chat protocol may carry.
+/// @param key  a request member name
+/// @return the control's static key, or NULL when `key` is not a thinking / effort control
+static const char *chat_control_key(const char *key) {
+    static const char *const keys[] = {"thinking", "think", "enable_thinking", "reasoning_effort",
+                                       "output_config", "chat_template_kwargs"};
+    for (const char *k : keys)
+        if (!strcmp(key, k)) return k;
+    return NULL;
+}
+
+/* The tools array: as sent (NULL for null), and one function schema a line with
+ * their declared order (parse_tools_value, every protocol's dialect), the deferred
+ * ones (defer_loading, L325) apart.  Anthropic's server-tool entries are checked
+ * first, with the Messages API's own wording. */
+/// Read the tools array: as sent, as schema lines with their order, the deferred ones apart.
+/// @param p          the parse cursor, at the tools array (advanced past it)
+/// @param c          the conversation (tools_raw, tool_schemas, deferred_tool_schemas replaced)
+/// @param r          the request (its tool_orders)
+/// @param anthropic  the Messages API: check its server-tool entries first
+/// @param err        receives the reason on refusal
+/// @param errlen     size of `err`
+/// @return false when the array is malformed, names an unsupported tool or holds a function schema that does not
+///         canonicalize (parse_tools_value)
+static bool take_tools(const char **p, chat_conversation *c, request *r, bool anthropic, char *err,
+                       size_t errlen) {
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    if (anthropic && !anthropic_tools_supported(raw, err, errlen)) {
+        free(raw);
+        return false;
+    }
+    free(c->tool_schemas);
+    c->tool_schemas = NULL;
+    free(c->deferred_tool_schemas);
+    c->deferred_tool_schemas = NULL;
+    const char *tp = raw;
+    if (!parse_tools_value(&tp, &c->tool_schemas, &r->tool_orders, &c->deferred_tool_schemas, err, errlen)) {
+        free(raw);
+        return false;
+    }
+    free(c->tools_raw);
+    c->tools_raw = NULL;
+    const char *q = raw;
+    json_ws(&q);
+    if (json_lit(&q, "null")) free(raw);
+    else c->tools_raw = raw;
+    return true;
+}
+
+/* OpenAI's tool_choice: "none" | "auto" | "required", or a named function
+ * {"type":"function","function":{"name":...}}. */
+/// Read OpenAI's tool_choice.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param c       the conversation (tool_choice, tool_choice_wire and the named function set)
+/// @param r       the request
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false when the value is malformed or not one of the accepted forms
+static bool parse_openai_tool_choice(const char **p, chat_conversation *c, request *r, char *err,
+                                     size_t errlen) {
+    json_ws(p);
+    if (**p == '"') {
+        char *choice = NULL;
+        if (!json_string(p, &choice)) return false;
+        free(c->tool_choice_wire);
+        c->tool_choice_wire = choice;
+        if (!strcmp(choice, "none")) c->tool_choice = CHAT_TOOL_CHOICE_NONE;
+        else if (!strcmp(choice, "auto")) c->tool_choice = CHAT_TOOL_CHOICE_AUTO;
+        else if (!strcmp(choice, "required")) c->tool_choice = CHAT_TOOL_CHOICE_ANY;
+        else {
+            snprintf(err, errlen, "tool_choice: \"%.40s\" is not one of \"none\", \"auto\" or \"required\"", choice);
+            return false;
+        }
+        return true;
+    }
+    if (**p == '{') {
+        char *raw = NULL;
+        if (!json_raw_value(p, &raw)) return false;
+        char *function = json_object_member_raw(raw, "function");
+        char *name_raw = function ? json_object_member_raw(function, "name") : NULL;
+        const char *np = name_raw;
+        char *name = NULL;
+        const bool ok = np && json_string(&np, &name) && name[0];
+        free(raw);
+        free(function);
+        free(name_raw);
+        if (!ok) {
+            free(name);
+            snprintf(err, errlen, "tool_choice: a function object needs function.name");
+            return false;
+        }
+        free(r->forced_tool_name);
+        r->forced_tool_name = name;
+        free(c->tool_choice_wire);
+        c->tool_choice_wire = NULL;
+        c->tool_choice = CHAT_TOOL_CHOICE_NAMED;
+        return true;
+    }
+    c->tool_choice = CHAT_TOOL_CHOICE_AUTO;
+    return json_skip_value(p);
+}
+
+bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err,
+                                    size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     const char *p = body;
     bool got_messages = false;
-    bool tool_choice_none = false;
-    bool tool_choice_forced = false;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
-    chat_msgs msgs = {0};
+    bool got_top_logprobs = false;
+    int skr = 0;
+    json_ws(&p);
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        bool ok = true;
+        const char *control = chat_control_key(key);
+        if (!strcmp(key, "messages")) {
+            chat_msgs_free(&c->msgs);
+            ok = parse_messages(&p, &c->msgs, err, errlen);
+            got_messages = true;
+        } else if (!strcmp(key, "tools")) {
+            ok = take_tools(&p, c, r, false, err, errlen);
+        } else if (!strcmp(key, "tool_choice")) {
+            ok = parse_openai_tool_choice(&p, c, r, err, errlen);
+        } else if (!strcmp(key, "model")) {
+            free(r->model);
+            ok = json_string(&p, &r->model);
+            r->model_from_request = true;
+        } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            ok = skr > 0;
+        } else if (!strcmp(key, "logprobs")) {
+            /* OpenAI SDKs send an explicit null for "not set" on both logprobs
+             * fields, so accept it as absent rather than as malformed JSON. */
+            json_ws(&p);
+            ok = json_lit(&p, "null") || json_bool(&p, &r->logprobs);
+        } else if (!strcmp(key, "top_logprobs")) {
+            /* Range and the logprobs:true dependency are checked after the loop
+             * (the two keys can arrive in either order).  Not parsed with
+             * json_int: that folds negatives to 0 and truncates fractions, so
+             * the post-loop rejection could never fire for exactly the inputs
+             * it exists to reject. */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                double v = 0.0;
+                ok = json_number(&p, &v);
+                r->top_logprobs = (v >= 0 && v <= PULSAR_SERVER_MAX_TOP_LOGPROBS
+                                   && v == (double)(int)v) ? (int)v : -1;
+                got_top_logprobs = true;
+            }
+        } else if (!strcmp(key, "stream")) {
+            ok = json_bool(&p, &r->stream);
+        } else if (!strcmp(key, "stream_options")) {
+            ok = parse_stream_options(&p, &r->stream_include_usage);
+        } else if (!strcmp(key, "response_format")) {
+            ok = take_response_format(&p, c, NULL, err, errlen);
+        } else if (control && strcmp(control, "output_config")) {
+            ok = take_control(&p, c, control);
+        } else if (!strcmp(key, "stop")) {
+            ok = parse_stop(&p, &r->stops);
+        } else {
+            ok = skip_ignored_key("/v1/chat/completions", key, &p);   /* L249: named once per process */
+        }
+        free(key);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p != '}') return false;
+    p++;
+    json_ws(&p);
+    if (*p) return false;   /* L354: nothing after the object, as pyjson_parse */
+    if (!got_messages) {
+        snprintf(err, errlen, "missing messages");
+        return false;
+    }
+    /* OpenAI's two logprobs rules, both 400s there: top_logprobs is meaningless
+     * without logprobs:true, and the per-position alternative count is capped.
+     * Rejecting is the whole point -- a silently clamped k would hand back a
+     * distribution the client did not ask for and cannot detect. */
+    if (got_top_logprobs && !r->logprobs) {
+        snprintf(err, errlen, "top_logprobs requires logprobs to be true");
+        return false;
+    }
+    if (r->top_logprobs < 0 || r->top_logprobs > PULSAR_SERVER_MAX_TOP_LOGPROBS) {
+        snprintf(err, errlen, "top_logprobs must be an integer between 0 and %d",
+                 PULSAR_SERVER_MAX_TOP_LOGPROBS);
+        return false;
+    }
+    if (!r->logprobs) r->top_logprobs = 0;
+    return true;
+}
+
+/* A protocol half, then the loaded family's: the one shape every chat endpoint
+ * takes.  The engine is optional (the renderer gate renders with no model). */
+/// The protocol's parse, then the loaded family's render: every chat endpoint's shape.
+/// @param e         the engine (may be NULL: the renderer gate)
+/// @param fmt       the chat format to render in (the engine's, or the one a no-engine caller names)
+/// @param s         the server (may be NULL)
+/// @param body      the request body
+/// @param r         the request, initialized by the caller; freed on failure
+/// @param err       receives the reason on failure ("invalid JSON request" when none was named)
+/// @param errlen    size of `err`
+/// @param protocol  the protocol's parser into a chat_conversation
+/// @return false when parsing or rendering failed
+static bool parse_and_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body, request *r,
+                             char *err, size_t errlen,
+                             bool (*protocol)(const char *, chat_conversation *, request *, char *, size_t)) {
+    chat_conversation c;
+    memset(&c, 0, sizeof(c));
+    const bool ok = protocol(body, &c, r, err, errlen) &&
+                    render_chat_conversation(e, fmt, s, &c, r, err, errlen);
+    chat_conversation_free(&c);
+    if (!ok) {
+        /* A refusal that named its reason keeps it; only a plain shape error
+         * falls back to the generic. */
+        if (err && errlen && !err[0]) snprintf(err, errlen, "invalid JSON request");
+        request_free(r);
+    }
+    return ok;
+}
+
+bool parse_chat_request_render(pulsar_engine *e, pulsar_chat_format fmt, server *s, const char *body, int def_tokens,
+                               request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    return parse_and_render(e, fmt, s, body, r, err, errlen, parse_chat_conversation_openai);
+}
+
+/* L335: the format a request through the engine renders in -- the engine's; no engine is no family
+ * (PULSAR_CHAT_NONE: a render refuses it), never DeepSeek by default */
+/// @param e the engine, or NULL
+/// @return its chat format, or PULSAR_CHAT_NONE
+static pulsar_chat_format engine_chat_format(const pulsar_engine *e) {
+    return e ? pulsar_engine_chat_format(e) : PULSAR_CHAT_NONE;
+}
+
+
+
+/// Parse and render an OpenAI chat completions request (parse_chat_request_render).
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
+bool parse_chat_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
+                        request *r, char *err, size_t errlen) {
+    return parse_chat_request_render(e, engine_chat_format(e), s, body, def_tokens, r, err, errlen);
+}
+
+
+
+/// Read an Anthropic Messages body into a conversation and the request's protocol fields (api = ANTHROPIC).
+/// @param body    the request body
+/// @param c       receives the conversation
+/// @param r       the request (protocol fields set)
+/// @param err     receives the reason on refusal (cleared first)
+/// @param errlen  size of `err`
+/// @return false on a malformed or refused body
+bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
+                                       size_t errlen) {
+    r->api = API_ANTHROPIC;
+    if (err && errlen) err[0] = '\0';
+    const char *p = body;
+    bool got_messages = false;
+    int skr = 0;
     char *system = NULL;
-    char *tool_schemas = NULL;
+    char *turn_effort = NULL;   /* L249 D: the per-turn effort in effect for the reply (parse_anthropic_messages) */
 
     json_ws(&p);
-    if (*p != '{') goto bad;
+    if (*p != '{') return false;
     p++;
     json_ws(&p);
     while (*p && *p != '}') {
@@ -241,228 +511,158 @@ bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int 
             goto bad;
         }
         p++;
+        bool ok;
+        ok = true;
         if (!strcmp(key, "messages")) {
-            chat_msgs_free(&msgs);
-            if (!parse_anthropic_messages(&p, &msgs)) {
-                free(key);
-                goto bad;
-            }
+            chat_msgs_free(&c->msgs);
+            free(turn_effort);
+            ok = parse_anthropic_messages(&p, &c->msgs, err, errlen, &turn_effort);
             got_messages = true;
         } else if (!strcmp(key, "system")) {
             free(system);
-            if (!parse_anthropic_system(&p, &system)) {
-                free(key);
-                goto bad;
-            }
+            ok = parse_anthropic_system(&p, &system);
         } else if (!strcmp(key, "tools")) {
-            free(tool_schemas);
-            tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders,
-                                   s && s->web_search_url,
-                                   &r->web_search_max_uses)) {
-                free(key);
-                goto bad;
-            }
+            ok = take_tools(&p, c, r, true, err, errlen);
         } else if (!strcmp(key, "tool_choice")) {
+            /* {"type":"auto"|"any"|"none"|"tool", "name":...}: "any" and "tool"
+             * require a call (a named one for "tool"). */
             json_ws(&p);
             if (*p == '{') {
                 p++;
                 json_ws(&p);
-                while (*p && *p != '}') {
+                while (ok && *p && *p != '}') {
                     char *ckey = NULL;
-                    if (!json_string(&p, &ckey)) {
-                        free(key);
-                        goto bad;
-                    }
+                    ok = json_string(&p, &ckey);
                     json_ws(&p);
-                    if (*p != ':') {
-                        free(ckey);
-                        free(key);
-                        goto bad;
-                    }
-                    p++;
-                    if (!strcmp(ckey, "type")) {
+                    ok = ok && *p == ':';
+                    if (ok) p++;
+                    if (ok && !strcmp(ckey, "type")) {
                         char *choice = NULL;
-                        if (!json_string(&p, &choice)) {
-                            free(ckey);
-                            free(key);
-                            goto bad;
+                        ok = json_string(&p, &choice);
+                        if (ok) {
+                            c->tool_choice = !strcmp(choice, "none") ? CHAT_TOOL_CHOICE_NONE
+                                           : !strcmp(choice, "any")  ? CHAT_TOOL_CHOICE_ANY
+                                           : !strcmp(choice, "tool") ? CHAT_TOOL_CHOICE_NAMED
+                                                                     : CHAT_TOOL_CHOICE_AUTO;
+                            free(c->tool_choice_wire);
+                            c->tool_choice_wire = choice;
                         }
-                        tool_choice_none = !strcmp(choice, "none");
-                        /* {"type":"any"} and {"type":"tool","name":X} force a
-                         * tool call via the same DSML prefill as the OpenAI
-                         * "required" path (named invoke opener for "tool"). */
-                        tool_choice_forced = !strcmp(choice, "any") ||
-                                             !strcmp(choice, "tool");
-                        free(choice);
-                    } else if (!strcmp(ckey, "name")) {
+                    } else if (ok && !strcmp(ckey, "name")) {
                         free(r->forced_tool_name);
                         r->forced_tool_name = NULL;
-                        if (!json_string(&p, &r->forced_tool_name)) {
-                            free(ckey);
-                            free(key);
-                            goto bad;
-                        }
-                    } else if (!json_skip_value(&p)) {
-                        free(ckey);
-                        free(key);
-                        goto bad;
+                        ok = json_string(&p, &r->forced_tool_name);
+                    } else if (ok) {
+                        ok = json_skip_value(&p);
                     }
                     free(ckey);
                     json_ws(&p);
                     if (*p == ',') p++;
                     json_ws(&p);
                 }
-                if (*p != '}') {
-                    free(key);
-                    goto bad;
-                }
-                p++;
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
+                ok = ok && *p == '}';
+                if (ok) p++;
+            } else {
+                ok = json_skip_value(&p);
             }
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            ok = json_string(&p, &r->model);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            ok = skr > 0;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            ok = json_bool(&p, &r->stream);
         } else if (!strcmp(key, "stop_sequences")) {
-            if (!parse_stop(&p, &r->stops)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
-            got_thinking = true;
+            ok = parse_stop(&p, &r->stops);
         } else if (!strcmp(key, "output_config")) {
-            if (!parse_output_config_effort(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!json_skip_value(&p)) {
-            free(key);
-            goto bad;
+            ok = take_output_config(&p, c, err, errlen);
+        } else if (!strcmp(key, "context_management")) {
+            ok = ctx_management_parse(&p, c, r, err, errlen);   /* L337: applied by parse_anthropic_request_render */
+        } else if (!strcmp(key, "thinking") || !strcmp(key, "reasoning_effort")) {
+            ok = take_control(&p, c, chat_control_key(key));
+        } else {
+            ok = skip_ignored_key("/v1/messages", key, &p);   /* L249: named once per process */
         }
         free(key);
+        if (!ok) goto bad;
         json_ws(&p);
         if (*p == ',') p++;
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
-        chat_msgs_free(&msgs);
-        free(system);
-        free(tool_schemas);
-        request_free(r);
-        return false;
+        goto bad;
     }
+    /* The system FIELD renders in the system region (chat_msg::system_field). */
     if (system && system[0]) {
         chat_msg msg = {0};
-        msg.role = xstrdup("system");
+        msg.role = server_xstrdup("system");
         msg.content = system;
+        msg.system_field = true;
         system = NULL;
-        chat_msgs_push(&msgs, msg);
+        chat_msgs_push(&c->msgs, msg);
     }
-    r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (s && !s->anthropic_validate_tool_results(&msgs,
-                                         &r->anthropic_requires_live_tool_state,
-                                         err, errlen))
-    {
-        chat_msgs_free(&msgs);
-        free(system);
-        free(tool_schemas);
-        request_free(r);
-        return false;
-    }
-    if (s) {  /* null server = parse-without-server (test path); no-op like the predecessor free fns */
-        s->kv_cache_restore_tool_memory_for_messages(&msgs);
-        s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
-    }
-    anthropic_prepare_live_continuation(r, &msgs);
-    const char *active_tool_schemas;
-    active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
-    if (tool_choice_forced && r->has_tools && r->prompt_text) {
-        r->force_tool_call = true;
-        request_apply_forced_tool_prefill(r);
-    }
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
     free(system);
-    free(tool_schemas);
+    /* the per-turn effort overrides the request-level output_config.effort: the controls are read in arrival
+     * order, a later one replacing an earlier one's value */
+    if (turn_effort) chat_conversation_control(c, "output_config", turn_effort);
     return true;
 bad:
-    chat_msgs_free(&msgs);
     free(system);
-    free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
-    request_free(r);
+    free(turn_effort);
     return false;
+}
+
+/// Parse and render an Anthropic Messages request.
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
+bool parse_anthropic_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
+                                    request *r, char *err, size_t errlen) {
+    /* L337: the protocol half and the family's render with the request's context edits between them */
+    return parse_anthropic_request_render(e, engine_chat_format(e), s, body, def_tokens, r, err, errlen);
 }
 
 
 
-/* Responses API: convert a content-array item (input_text/output_text/text) into a
- * concatenated string. Strict shape check: bare string, null, or an array of
- * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
- * level all reject so the client sees a 400 instead of an answer built on
- * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+/* Responses API: convert a content-array item (input_text/output_text/text/
+ * input_image) into a concatenated string. Strict shape check: bare string,
+ * null, or an array of recognized blocks. Numbers / objects / arrays-of-
+ * primitives at the top level all reject so the client sees a 400 instead of an
+ * answer built on silently dropped context.
+ *
+ * An `input_image` block decodes exactly like a chat `image_url` block (one
+ * authority: server_add_image_block): the encoded file is attached to `msg` and
+ * a PULSAR_IMAGE_PLACEHOLDER takes the block's position in the text, so the
+ * renderer's image expander sees the same shape it sees from the other two
+ * endpoints.  `msg` is NULL in the two positions where an image is not a thing
+ * (a tool output's content, a reasoning summary) and an image there fails
+ * closed. */
+/// Read a Responses content value (string, null, or an array of text / image blocks) into text.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param out     receives the concatenated text (malloc'd; NULL on failure)
+/// @param msg     the message images attach to (NULL: an image fails)
+/// @param err     receives the reason on refusal
+/// @param errlen  size of `err`
+/// @return false on a malformed value or an unsupported block
+static bool parse_responses_content_array(const char **p, char **out, chat_msg *msg,
+                                          char *err, size_t errlen) {
+    *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
@@ -481,12 +681,16 @@ static bool parse_responses_content_array(const char **p, char **out) {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *image_url = NULL;
+            char *file_id = NULL;
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 json_ws(p);
@@ -494,6 +698,8 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 (*p)++;
@@ -502,6 +708,8 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     if (!json_string(p, &type)) {
                         free(key);
                         free(text);
+                        free(image_url);
+                        free(file_id);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
@@ -511,16 +719,99 @@ static bool parse_responses_content_array(const char **p, char **out) {
                      * upstream serializers that emit null for empty blocks. */
                     json_ws(p);
                     if (json_lit(p, "null")) {
-                        text = xstrdup("");
+                        text = server_xstrdup("");
                     } else if (!json_string(p, &text)) {
                         free(key);
                         free(type);
+                        free(image_url);
+                        free(file_id);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    /* The Responses schema spells this field as a bare string;
+                     * tolerate OpenAI's {"url": ...} wrapper too, exactly as the
+                     * chat reader does, so a payload ported between the two
+                     * surfaces lands instead of dying on a shape difference. */
+                    free(image_url);
+                    json_ws(p);
+                    if (**p == '{') {
+                        (*p)++;
+                        json_ws(p);
+                        while (**p && **p != '}') {
+                            char *ik = NULL;
+                            if (!json_string(p, &ik)) {
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            json_ws(p);
+                            if (**p != ':') {
+                                free(ik);
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            (*p)++;
+                            if (!strcmp(ik, "url")) {
+                                free(image_url);
+                                if (!json_string(p, &image_url)) {
+                                    free(ik);
+                                    free(key);
+                                    free(type);
+                                    free(text);
+                                    free(file_id);
+                                    goto fail;
+                                }
+                            } else if (!json_skip_value(p)) {
+                                free(ik);
+                                free(key);
+                                free(type);
+                                free(text);
+                                free(file_id);
+                                goto fail;
+                            }
+                            free(ik);
+                            json_ws(p);
+                            if (**p == ',') (*p)++;
+                            json_ws(p);
+                        }
+                        if (**p != '}') {
+                            free(key);
+                            free(type);
+                            free(text);
+                            free(file_id);
+                            goto fail;
+                        }
+                        (*p)++;
+                    } else if (!json_string(p, &image_url)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(file_id);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "file_id")) {
+                    /* An uploaded-file reference. This server does not fetch
+                     * remote content, so the value is captured only to name it
+                     * in the refusal below rather than being dropped silently. */
+                    free(file_id);
+                    if (!json_string(p, &file_id)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(image_url);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
+                    free(file_id);
                     goto fail;
                 }
                 free(key);
@@ -531,28 +822,65 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(image_url);
+                free(file_id);
                 goto fail;
             }
             (*p)++;
-            /* Fail closed: a content object must carry a known text-like type
-             * AND a text field. Anything else — missing type, missing text,
-             * image/file/audio types, future schema-drift — is rejected so the
+            /* Fail closed: a content object must carry a known type AND the
+             * field that type needs. Anything else -- missing type, missing
+             * text, file/audio types, future schema-drift -- is rejected so the
              * client gets a 400 instead of an answer built on context the
-             * server discarded silently. */
-            bool is_text_block = type && (
+             * server discarded silently. `image_url` is accepted as an alias of
+             * `input_image` for the same reason the text branch accepts five
+             * spellings. */
+            const bool is_text_block = type && (
                 !strcmp(type, "input_text") ||
                 !strcmp(type, "output_text") ||
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            if (!is_text_block || !text) {
+            const bool is_image_block = type && (
+                !strcmp(type, "input_image") ||
+                !strcmp(type, "image_url"));
+            if (is_image_block) {
+                if (!image_url || !image_url[0]) {
+                    if (err && errlen) {
+                        snprintf(err, errlen,
+                                 "input_image needs an inline \"image_url\" base64 data: URL%s",
+                                 file_id ? " (a file_id is not fetched by this server)" : "");
+                    }
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    free(file_id);
+                    goto fail;
+                }
+                if (!server_add_image_block(msg, image_url, &b, err, errlen)) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    free(file_id);
+                    goto fail;
+                }
+            } else if (!is_text_block || !text) {
+                if (!is_text_block && err && errlen) {
+                    snprintf(err, errlen,
+                             "unsupported content block type \"%s\"; this server accepts text, "
+                             "input_image and image_url blocks", type ? type : "(missing)");
+                }
                 free(type);
                 free(text);
+                free(image_url);
+                free(file_id);
                 goto fail;
+            } else {
+                buf_puts(&b, text);
             }
-            buf_puts(&b, text);
             free(type);
             free(text);
+            free(image_url);
+            free(file_id);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -589,15 +917,34 @@ fail:
  *     visible transcript rather than killing a recoverable agent session.
  *
  * Reasoning items are merged into the next assistant message so
- * render_chat_prompt_text can wrap them in <think>. */
+ * render_chat_prompt_text can wrap them in <think>.
+ *
+ * L326: a tool_search_output's `tools` (the tools the search loaded) go to
+ * `loaded`, one function schema a line (declared: tool_orders, the parser, the
+ * grammar), and the item's message records one tool_reference per tool at the
+ * end of its body -- L325's mechanism: chat_expand_tool_refs renders their
+ * definitions THERE, in the family's encoding, so a load leaves every earlier
+ * byte of the prompt (the tools block included) as it was.  The caller makes
+ * `loaded` part of the conversation's deferred tools. */
 bool parse_responses_input(const char **p, chat_msgs *msgs,
-                                  buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders) {
+                                  buf *loaded,
+                                  tool_schema_orders *orders,
+                                  char *err, size_t errlen) {
+    char local_err[192];
+    if (!err || errlen == 0) {
+        err = local_err;
+        errlen = sizeof local_err;
+    }
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
 
     buf pending_reasoning = {0};
+    /* An item's content is parsed before the item's type is known (JSON keys
+     * arrive in any order), so images land here first and are adopted by the
+     * message the item turns out to be -- or dropped when it is not a
+     * message. */
+    chat_msg item_images = {0};
 
     json_ws(p);
     while (**p && **p != ']') {
@@ -642,7 +989,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array(p, &content, &item_images, err, errlen)) {
                     free(key);
                     goto item_fail;
                 }
@@ -686,7 +1033,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array(p, &output, NULL, err, errlen)) {
                         free(key);
                         goto item_fail;
                     }
@@ -713,7 +1060,7 @@ bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array(p, &summary, NULL, err, errlen)) {
                     free(key);
                     goto item_fail;
                 }
@@ -776,6 +1123,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -822,6 +1170,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -842,30 +1191,43 @@ item_fail:
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
-            flush_msg.role = xstrdup("assistant");
-            flush_msg.content = xstrdup("");
+            flush_msg.role = server_xstrdup("assistant");
+            flush_msg.content = server_xstrdup("");
             flush_msg.reasoning = buf_take(&pending_reasoning);
             chat_msgs_push(msgs, flush_msg);
         }
         if (!strcmp(t, "message")) {
             chat_msg msg = {0};
-            msg.role = xstrdup(role ? role : "user");
-            msg.content = content ? content : xstrdup("");
+            msg.role = server_xstrdup(role ? role : "user");
+            msg.content = content ? content : server_xstrdup("");
             content = NULL;
+            /* Adopt the item's images: they belong to this message, and each
+             * block's placeholder already sits in `content` at its position.
+             * The placeholder offsets move with them -- one fact, one owner:
+             * without them the renderer cannot tell the placeholder the parser
+             * wrote from text the client typed, and the image is lost. */
+            msg.images = item_images.images;
+            msg.images_len = item_images.images_len;
+            msg.images_cap = item_images.images_cap;
+            msg.image_ph_off = item_images.image_ph_off;
+            item_images.images = NULL;
+            item_images.image_ph_off = NULL;
+            item_images.images_len = 0;
+            item_images.images_cap = 0;
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
                 msg.reasoning = buf_take(&pending_reasoning);
             }
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
             tool_call tc = {0};
-            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            tc.id = server_xstrdup(call_id ? call_id : item_id ? item_id : "");
             /* function_call uses `arguments` (JSON string); custom_tool_call uses
              * `input` (free text). Treat both as the same on-wire argument blob —
              * append_dsml_arguments_from_json will fall back to a single text param
              * if the value isn't a JSON object. */
             const char *args_src = arguments ? arguments :
                                    input_str ? input_str : "{}";
-            tc.arguments = xstrdup(args_src);
+            tc.arguments = server_xstrdup(args_src);
             if (strcmp(t, "custom_tool_call") && tool_namespace && tool_namespace[0] &&
                 name && name[0])
             {
@@ -874,7 +1236,7 @@ item_fail:
                 buf_puts(&qualified, name);
                 tc.name = buf_take(&qualified);
             } else {
-                tc.name = xstrdup(name ? name : "");
+                tc.name = server_xstrdup(name ? name : "");
             }
             /* A Responses turn that has both message text and tool calls splits
              * them across separate output items; the chat template renders the
@@ -890,16 +1252,16 @@ item_fail:
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
-                msg.role = xstrdup("assistant");
-                msg.content = xstrdup("");
+                msg.role = server_xstrdup("assistant");
+                msg.content = server_xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
         } else if (!strcmp(t, "function_call_output") || !strcmp(t, "custom_tool_call_output")) {
             chat_msg msg = {0};
-            msg.role = xstrdup("tool");
-            msg.content = output ? output : xstrdup("");
+            msg.role = server_xstrdup("tool");
+            msg.content = output ? output : server_xstrdup("");
             output = NULL;
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
@@ -924,18 +1286,18 @@ item_fail:
              * model used them in a prior turn. Surface them as function_call
              * shaped history so the next prompt retains the action that ran. */
             tool_call tc = {0};
-            tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
+            tc.id = server_xstrdup(call_id ? call_id : item_id ? item_id : "");
             if (!strcmp(t, "tool_search_call")) {
-                tc.name = xstrdup("tool_search");
+                tc.name = server_xstrdup("tool_search");
             } else if (!strcmp(t, "local_shell_call")) {
-                tc.name = xstrdup("local_shell");
+                tc.name = server_xstrdup("local_shell");
             } else {
-                tc.name = xstrdup(t);
+                tc.name = server_xstrdup(t);
             }
             const char *args_src = action ? action :
                                    arguments ? arguments :
                                    input_str ? input_str : "{}";
-            tc.arguments = xstrdup(args_src);
+            tc.arguments = server_xstrdup(args_src);
             chat_msg *last = msgs->len ? &msgs->v[msgs->len - 1] : NULL;
             if (last && !strcmp(last->role, "assistant")) {
                 if (pending_reasoning.len && (!last->reasoning || !last->reasoning[0])) {
@@ -945,8 +1307,8 @@ item_fail:
                 tool_calls_push(&last->calls, tc);
             } else {
                 chat_msg msg = {0};
-                msg.role = xstrdup("assistant");
-                msg.content = xstrdup("");
+                msg.role = server_xstrdup("assistant");
+                msg.content = server_xstrdup("");
                 if (pending_reasoning.len) msg.reasoning = buf_take(&pending_reasoning);
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
@@ -957,12 +1319,10 @@ item_fail:
                    !strcmp(t, "tool_search_call_output") ||
                    !strcmp(t, "image_generation_call_output"))
         {
-            if (!strcmp(t, "tool_search_output") && tools_json &&
-                loaded_tool_schemas && orders)
-            {
+            char *schemas = NULL;
+            if (!strcmp(t, "tool_search_output") && tools_json) {
                 const char *tools_p = tools_json;
-                char *schemas = NULL;
-                if (!parse_tools_value(&tools_p, &schemas, orders, false, NULL)) {
+                if (!parse_tools_value(&tools_p, &schemas, orders, NULL, err, errlen)) {
                     free(schemas);
                     free(type);
                     free(role);
@@ -982,18 +1342,32 @@ item_fail:
                     buf_free(&pending_reasoning);
                     return false;
                 }
-                if (schemas && schemas[0]) {
-                    if (loaded_tool_schemas->len) buf_putc(loaded_tool_schemas, '\n');
-                    buf_puts(loaded_tool_schemas, schemas);
+                if (schemas[0]) {
+                    if (loaded->len) buf_putc(loaded, '\n');
+                    buf_puts(loaded, schemas);
                 }
-                free(schemas);
             }
             chat_msg msg = {0};
-            msg.role = xstrdup("tool");
+            msg.role = server_xstrdup("tool");
+            /* a tool_search_output's tools are its loads (above): their definitions render at its references */
             const char *body = output ? output :
                                result ? result :
-                               tools_json ? tools_json : "";
-            msg.content = xstrdup(body);
+                               tools_json && !schemas ? tools_json : "";
+            msg.content = server_xstrdup(body);
+            for (const char *at = schemas ? schemas : ""; *at;) {
+                const char *nl = strchr(at, '\n');
+                const size_t len = nl ? (size_t)(nl - at) : strlen(at);
+                char *line = server_xstrndup(at, len);
+                at += len + (nl ? 1 : 0);
+                char *raw = json_object_member_raw(line, "name");
+                const char *rp = raw;
+                char *tool_name = NULL;
+                if (rp && json_string(&rp, &tool_name)) chat_msg_add_tool_ref(&msg, strlen(body), tool_name);
+                free(tool_name);
+                free(raw);
+                free(line);
+            }
+            free(schemas);
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
@@ -1019,6 +1393,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msg_clear_images(&item_images);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -1038,6 +1413,9 @@ item_fail:
         free(result);
         free(tools_json);
         free(status_str);
+        /* Anything the item collected but did not adopt (a non-message item
+         * that carried a content array, or a message that failed to push). */
+        chat_msg_clear_images(&item_images);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -1050,14 +1428,15 @@ item_fail:
      * a reasoning-only incomplete turn and the client replays the history. */
     if (pending_reasoning.len) {
         chat_msg msg = {0};
-        msg.role = xstrdup("assistant");
-        msg.content = xstrdup("");
+        msg.role = server_xstrdup("assistant");
+        msg.content = server_xstrdup("");
         msg.reasoning = buf_take(&pending_reasoning);
         chat_msgs_push(msgs, msg);
     }
     buf_free(&pending_reasoning);
     return true;
 fail:
+    chat_msg_clear_images(&item_images);
     buf_free(&pending_reasoning);
     return false;
 }
@@ -1065,12 +1444,17 @@ fail:
 
 
 /* Responses API has `reasoning: {"effort": "...", "summary": "..."}`. effort
- * controls thinking depth; summary mode (auto/concise/detailed) controls
- * whether the wire emits summary deltas at all — per the spec, no reasoning
- * summary is surfaced unless the client opts in. */
-static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
-                                      bool *summary_opted_in,
-                                      bool *effort_seen) {
+ * controls thinking depth -- kept as sent, for the family (the
+ * "reasoning.effort" control; null is the same as omitting it); summary mode
+ * (auto/concise/detailed) controls whether the wire emits summary deltas at
+ * all -- per the spec, no reasoning summary is surfaced unless the client opts
+ * in. */
+/// Read Responses' reasoning object: effort as a control, summary as the opt-in.
+/// @param p                 the parse cursor, at the value (advanced past it)
+/// @param c                 the conversation (the reasoning.effort control)
+/// @param summary_opted_in  set when summary is auto, concise or detailed
+/// @return false on a malformed object
+static bool parse_responses_reasoning(const char **p, chat_conversation *c, bool *summary_opted_in) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p != '{') return json_skip_value(p);
@@ -1085,47 +1469,28 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
             return false;
         }
         (*p)++;
+        bool ok = true;
         if (!strcmp(key, "effort")) {
             json_ws(p);
-            /* A `null` effort doesn't change thinking_enabled — it's the same
-             * as omitting the field. Only treat the field as a control if it
-             * carried an actual value. */
-            if (json_lit(p, "null")) {
-                /* nothing */
-            } else {
-                if (!parse_reasoning_effort_value(p, effort)) {
-                    free(key);
-                    return false;
-                }
-                if (effort_seen) *effort_seen = true;
-            }
+            if (!json_lit(p, "null")) ok = take_control(p, c, "reasoning.effort");
         } else if (!strcmp(key, "summary")) {
             json_ws(p);
             if (json_lit(p, "null")) {
                 /* explicit null disables summary */
             } else if (**p == '"') {
                 char *mode = NULL;
-                if (!json_string(p, &mode)) {
-                    free(key);
-                    return false;
-                }
-                if (summary_opted_in &&
-                    (!strcmp(mode, "auto") ||
-                     !strcmp(mode, "concise") ||
-                     !strcmp(mode, "detailed")))
-                {
+                ok = json_string(p, &mode);
+                if (ok && (!strcmp(mode, "auto") || !strcmp(mode, "concise") || !strcmp(mode, "detailed")))
                     *summary_opted_in = true;
-                }
                 free(mode);
-            } else if (!json_skip_value(p)) {
-                free(key);
-                return false;
+            } else {
+                ok = json_skip_value(p);
             }
-        } else if (!json_skip_value(p)) {
-            free(key);
-            return false;
+        } else {
+            ok = json_skip_value(p);
         }
         free(key);
+        if (!ok) return false;
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -1137,23 +1502,25 @@ static bool parse_responses_reasoning(const char **p, pulsar_think_mode *effort,
 
 
 
-bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
-    request_init(r, REQ_CHAT, def_tokens);
+/// Read a Responses API body into a conversation and the request's protocol fields (api = RESPONSES).
+/// @param body    the request body
+/// @param c       receives the conversation
+/// @param r       the request (protocol fields set)
+/// @param err     receives the reason on refusal (cleared first)
+/// @param errlen  size of `err`
+/// @return false on a malformed or refused body
+bool parse_chat_conversation_responses(const char *body, chat_conversation *c, request *r, char *err,
+                                       size_t errlen) {
     r->api = API_RESPONSES;
+    if (err && errlen) err[0] = '\0';
     const char *p = body;
     bool got_input = false;
-    bool tool_choice_none = false;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
-    chat_msgs msgs = {0};
-    buf loaded_tool_schemas = {0};
+    int skr = 0;
     char *instructions = NULL;
-    char *tool_schemas = NULL;
+    buf loaded = {0};   /* L326: the input's tool_search_output loads (parse_responses_input) */
 
     json_ws(&p);
-    if (*p != '{') goto bad;
+    if (*p != '{') return false;
     p++;
     json_ws(&p);
     while (*p && *p != '}') {
@@ -1165,136 +1532,99 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
             goto bad;
         }
         p++;
+        bool ok;
+        ok = true;
         if (!strcmp(key, "input")) {
-            chat_msgs_free(&msgs);
+            chat_msgs_free(&c->msgs);
+            buf_free(&loaded);
             json_ws(&p);
             /* Codex CLI always sends `input` as an array; tolerate bare strings
              * for parity with other Responses-API callers. */
             if (*p == '"') {
                 char *plain = NULL;
-                if (!json_string(&p, &plain)) {
-                    free(key);
-                    goto bad;
+                ok = json_string(&p, &plain);
+                if (ok) {
+                    chat_msg msg = {0};
+                    msg.role = server_xstrdup("user");
+                    msg.content = plain;
+                    chat_msgs_push(&c->msgs, msg);
                 }
-                chat_msg msg = {0};
-                msg.role = xstrdup("user");
-                msg.content = plain;
-                chat_msgs_push(&msgs, msg);
-            } else if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas,
-                                              &r->tool_orders)) {
-                free(key);
-                goto bad;
+            } else {
+                ok = parse_responses_input(&p, &c->msgs, &loaded, &r->tool_orders, err, errlen);
             }
             got_input = true;
         } else if (!strcmp(key, "instructions")) {
             free(instructions);
             instructions = NULL;
             json_ws(&p);
-            if (json_lit(&p, "null")) {
-                instructions = xstrdup("");
-            } else if (!json_string(&p, &instructions)) {
-                free(key);
-                goto bad;
-            }
+            if (json_lit(&p, "null")) instructions = server_xstrdup("");
+            else ok = json_string(&p, &instructions);
         } else if (!strcmp(key, "tools")) {
-            free(tool_schemas);
-            tool_schemas = NULL;
-            if (!parse_tools_value(&p, &tool_schemas, &r->tool_orders, false, NULL)) {
-                free(key);
-                goto bad;
-            }
+            ok = take_tools(&p, c, r, false, err, errlen);
         } else if (!strcmp(key, "tool_choice")) {
+            /* "none" | "auto" | "required", or {"type":"function","name":X} (the Responses shape: the name beside
+             * the type).  L303: a forced call is the family's seed under the call grammar, as on chat. */
             json_ws(&p);
             if (*p == '"') {
                 char *choice = NULL;
-                if (!json_string(&p, &choice)) {
-                    free(key);
-                    goto bad;
+                ok = json_string(&p, &choice);
+                if (ok && !strcmp(choice, "none")) {
+                    c->tool_choice = CHAT_TOOL_CHOICE_NONE;
+                } else if (ok && !strcmp(choice, "required")) {
+                    c->tool_choice = CHAT_TOOL_CHOICE_ANY;
+                } else if (ok && strcmp(choice, "auto") != 0) {
+                    snprintf(err, errlen, "tool_choice: \"%.40s\" is not one of \"none\", \"auto\" or \"required\"",
+                             choice);
+                    ok = false;
                 }
-                /* DS4 honours "none" (disable tools) and "auto" (model decides).
-                 * "required" and explicit function targets need constrained
-                 * decoding we don't implement — reject so clients see the
-                 * limitation instead of silently downgrading to auto. */
-                if (!strcmp(choice, "none")) {
-                    tool_choice_none = true;
-                } else if (strcmp(choice, "auto") != 0) {
-                    snprintf(err, errlen, "tool_choice=%s not supported", choice);
-                    free(choice);
-                    free(key);
-                    chat_msgs_free(&msgs);
-                    buf_free(&loaded_tool_schemas);
-                    free(instructions);
-                    free(tool_schemas);
-                    request_free(r);
-                    return false;
+                if (ok) {
+                    free(c->tool_choice_wire);
+                    c->tool_choice_wire = choice;
+                    choice = NULL;
                 }
                 free(choice);
             } else if (*p == '{') {
-                snprintf(err, errlen, "forced tool_choice not supported");
-                free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
-            } else if (!json_skip_value(&p)) {
-                free(key);
-                goto bad;
+                char *raw = NULL;
+                ok = json_raw_value(&p, &raw);
+                char *type = ok ? json_object_member_raw(raw, "type") : NULL;
+                char *name_raw = ok ? json_object_member_raw(raw, "name") : NULL;
+                const char *np = name_raw;
+                char *name = NULL;
+                const bool function = type && !strcmp(type, "\"function\"");
+                if (ok && !(function && np && json_string(&np, &name) && name[0])) {
+                    snprintf(err, errlen, "tool_choice: an object must be {\"type\": \"function\", \"name\": ...}");
+                    ok = false;
+                }
+                if (ok) {
+                    free(r->forced_tool_name);
+                    r->forced_tool_name = name;
+                    name = NULL;
+                    free(c->tool_choice_wire);
+                    c->tool_choice_wire = NULL;
+                    c->tool_choice = CHAT_TOOL_CHOICE_NAMED;
+                }
+                free(name);
+                free(type);
+                free(name_raw);
+                free(raw);
+            } else {
+                ok = json_skip_value(&p);
             }
+        } else if (!strcmp(key, "text")) {
+            ok = take_response_format(&p, c, "format", err, errlen);
         } else if (!strcmp(key, "model")) {
             free(r->model);
-            if (!json_string(&p, &r->model)) {
-                free(key);
-                goto bad;
-            }
+            ok = json_string(&p, &r->model);
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
+            ok = json_int(&p, &r->max_tokens) && max_tokens_ok(r->max_tokens, err, errlen);
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            ok = skr > 0;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
-                free(key);
-                goto bad;
-            }
+            ok = json_bool(&p, &r->stream);
         } else if (!strcmp(key, "reasoning")) {
-            bool effort_seen = false;
-            if (!parse_responses_reasoning(&p, &reasoning_effort,
-                                           &r->reasoning_summary_emit,
-                                           &effort_seen)) {
-                free(key);
-                goto bad;
-            }
-            /* Only an explicit effort value counts as the client opting into
-             * thinking control. summary alone, or `reasoning: null`, leaves the
-             * default behaviour (and the model_alias_* fallbacks below) intact. */
-            if (effort_seen) {
-                got_thinking = true;
-                /* Responses-API effort of "minimal" / "none" maps to disabled
-                 * thinking. Other effort values choose between HIGH and MAX. */
-                if (reasoning_effort == PULSAR_THINK_NONE) thinking_enabled = false;
-            }
-        } else if (!strcmp(key, "previous_response_id") ||
-                   !strcmp(key, "conversation"))
-        {
+            ok = parse_responses_reasoning(&p, c, &r->reasoning_summary_emit);
+        } else if (!strcmp(key, "previous_response_id") || !strcmp(key, "conversation")) {
             /* Official Responses state can be durable:
              *   previous_response_id chains to a stored prior response, and
              *   conversation points at a persistent Conversations object.
@@ -1307,149 +1637,145 @@ bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int 
              * prompt, so reject it explicitly. */
             json_ws(&p);
             if (!json_lit(&p, "null")) {
-                snprintf(err, errlen,
-                         "%s is not supported; replay full input instead",
-                         key);
-                free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
+                snprintf(err, errlen, "%s is not supported; replay full input instead", key);
+                ok = false;
             }
-        } else if (!json_skip_value(&p)) {
-            free(key);
-            goto bad;
+        } else {
+            ok = skip_ignored_key("/v1/responses", key, &p);   /* L249: named once per process */
         }
         free(key);
+        if (!ok) goto bad;
         json_ws(&p);
         if (*p == ',') p++;
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!got_input) {
         snprintf(err, errlen, "missing input");
-        chat_msgs_free(&msgs);
-        buf_free(&loaded_tool_schemas);
-        free(instructions);
-        free(tool_schemas);
-        request_free(r);
-        return false;
+        goto bad;
     }
-    /* instructions in the Responses API replaces any system message — for Codex
-     * it carries the full agent system prompt. Prepend it so render produces a
-     * standard system+chat layout. */
+    /* instructions in the Responses API replaces any system message -- for Codex
+     * it carries the full agent system prompt.  It goes first, as the system
+     * FIELD, so render produces a standard system+chat layout. */
     if (instructions && instructions[0]) {
         chat_msg msg = {0};
-        msg.role = xstrdup("system");
+        msg.role = server_xstrdup("system");
         msg.content = instructions;
+        msg.system_field = true;
         instructions = NULL;
-        /* Insert at the head so it precedes the conversation. */
-        chat_msgs_push(&msgs, msg);
-        if (msgs.len > 1) {
-            chat_msg tmp = msgs.v[msgs.len - 1];
-            for (int i = msgs.len - 1; i > 0; i--) msgs.v[i] = msgs.v[i - 1];
-            msgs.v[0] = tmp;
-        }
+        chat_msgs_push(&c->msgs, msg);
+        chat_msg tmp = c->msgs.v[c->msgs.len - 1];
+        for (int i = c->msgs.len - 1; i > 0; i--) c->msgs.v[i] = c->msgs.v[i - 1];
+        c->msgs.v[0] = tmp;
     }
-    buf combined_tool_schemas;
-    combined_tool_schemas = {};
-    if (tool_schemas && tool_schemas[0]) buf_puts(&combined_tool_schemas, tool_schemas);
-    if (loaded_tool_schemas.len) {
-        if (combined_tool_schemas.len) buf_putc(&combined_tool_schemas, '\n');
-        buf_append(&combined_tool_schemas, loaded_tool_schemas.ptr,
-                   loaded_tool_schemas.len);
-    }
-    const char *active_tool_schemas;
-    active_tool_schemas =
-        (!tool_choice_none && combined_tool_schemas.len) ?
-        combined_tool_schemas.ptr : NULL;
-    r->has_tools = active_tool_schemas && active_tool_schemas[0];
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (s && !s->responses_validate_tool_outputs(&msgs, r->think_mode,
-                                         &r->responses_requires_live_tool_state,
-                                         &r->responses_requires_live_reasoning,
-                                         err, errlen)) {
-        chat_msgs_free(&msgs);
-        buf_free(&combined_tool_schemas);
-        buf_free(&loaded_tool_schemas);
-        free(instructions);
-        free(tool_schemas);
-        request_free(r);
-        return false;
-    }
-    if (s) {  /* null server = parse-without-server (test path); no-op like the predecessor free fns */
-        s->kv_cache_restore_tool_memory_for_messages(&msgs);
-        s->tool_memory_attach_to_messages(&msgs, &r->tool_replay);
-    }
-    r->prompt_preserves_reasoning =
-        chat_history_preserves_reasoning(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(r, &msgs);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    chat_msgs_free(&msgs);
-    buf_free(&combined_tool_schemas);
-    buf_free(&loaded_tool_schemas);
     free(instructions);
-    free(tool_schemas);
+    /* L326: the loads are deferred tools of the conversation (after the tools array, whichever key came first):
+     * declared, rendered only at their tool_search_output (chat_expand_tool_refs), never in the tools block */
+    if (loaded.len) {
+        buf all = {0};
+        if (c->deferred_tool_schemas && c->deferred_tool_schemas[0]) {
+            buf_puts(&all, c->deferred_tool_schemas);
+            buf_putc(&all, '\n');
+        }
+        buf_append(&all, loaded.ptr, loaded.len);
+        buf_free(&loaded);
+        free(c->deferred_tool_schemas);
+        c->deferred_tool_schemas = buf_take(&all);
+    }
     return true;
 bad:
-    chat_msgs_free(&msgs);
-    buf_free(&loaded_tool_schemas);
     free(instructions);
-    free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
-    request_free(r);
+    buf_free(&loaded);
     return false;
 }
 
+/// Parse and render a Responses API request.
+/// @param e           the engine
+/// @param s           the server
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
+bool parse_responses_request(pulsar_engine *e, server *s, const char *body, int def_tokens,
+                                    request *r, char *err, size_t errlen) {
+    request_init(r, REQ_CHAT, def_tokens);
+    return parse_and_render(e, engine_chat_format(e), s, body, r, err, errlen, parse_chat_conversation_responses);
+}
 
 
-static bool parse_prompt(const char **p, char **out) {
+
+/* L335: the OpenAI completions "prompt" is a string, an array of strings (a BATCH: one choice per prompt), or
+ * token ids (an array of integers, or of integer arrays).  This server answers one prompt, as text: a string, or an
+ * array holding exactly one string.  Every other shape refuses by name -- it used to read as "" (a non-string) or as
+ * its first element (the rest of a batch dropped). */
+/// Read a completions "prompt": a string, or an array of exactly one string.
+/// @param p       the parse cursor, at the value (advanced past it)
+/// @param out     receives the prompt (malloc'd; NULL on failure)
+/// @param err     receives the reason for a refused shape (NULL: not written; left as is on malformed JSON)
+/// @param errlen  size of `err`
+/// @return false on malformed JSON, or (+ err) a prompt that is not one string
+static bool parse_prompt(const char **p, char **out, char *err, size_t errlen) {
+    /* Build into a local and publish to *out only on success, so every
+     * failure return leaves *out == NULL (the double-free contract, see
+     * json_string_n) rather than a partially-parsed heap value. */
+    *out = NULL;
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (**p != '[') {
-        if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
-        return true;
+        if (err && errlen) snprintf(err, errlen, "prompt must be a string (or an array of one string)");
+        return false;
     }
     (*p)++;
     json_ws(p);
-    if (**p == '"') {
-        if (!json_string(p, out)) return false;
-    } else {
-        *out = xstrdup("");
-        if (**p && **p != ']' && !json_skip_value(p)) return false;
+    if (**p != '"') {
+        if (err && errlen)
+            snprintf(err, errlen, **p == ']' ? "prompt is an empty array: send one string"
+                                             : "prompt: token-id prompts are not supported; send the text as a string");
+        return false;
     }
-    while (**p && **p != ']') {
-        json_ws(p);
-        if (**p == ',') {
-            (*p)++;
-            if (!json_skip_value(p)) return false;
-        } else {
-            break;
-        }
+    char *s = NULL;
+    if (!json_string(p, &s)) return false;
+    json_ws(p);
+    if (**p == ',') {
+        if (err && errlen)
+            snprintf(err, errlen, "prompt: an array of more than one prompt is a batch, and batch completions are not "
+                     "supported (send one request per prompt)");
+        free(s);
+        return false;
     }
-    if (**p != ']') return false;
+    if (**p != ']') { free(s); return false; }
     (*p)++;
+    *out = s;
     return true;
 }
 
 
 
+/// Parse a /v1/completions request: the prompt continues raw (no chat template), thinking controls refused.
+/// @param e           the engine (its family)
+/// @param body        the request body
+/// @param def_tokens  the generation cap when the request sets none
+/// @param r           receives the request (freed on failure)
+/// @param err         receives the reason on failure
+/// @param errlen      size of `err`
+/// @return false on a malformed or refused request
 bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+                                     request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    r->family = e ? server_family_for_engine(e) : NULL;   /* L335: no engine, no family (never DeepSeek's) */
+    if (errlen) err[0] = '\0';
     const char *p = body;
     char *prompt = NULL;
-    bool got_thinking = false;
-    bool thinking_enabled = true;
-    pulsar_think_mode reasoning_effort = PULSAR_THINK_LOW;
+    int skr = 0;
+    /* the thinking controls as sent, read by the chat endpoints' one rule (a raw continuation refuses them) */
+    chat_control controls[8];
+    int n_controls = 0;
+    chat_effort_ask ask;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -1466,7 +1792,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         p++;
         if (!strcmp(key, "prompt")) {
             free(prompt);
-            if (!parse_prompt(&p, &prompt)) {
+            if (!parse_prompt(&p, &prompt, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -1478,56 +1804,15 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (!json_int(&p, &r->max_tokens) || !max_tokens_ok(r->max_tokens, err, errlen)) {
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
+        } else if ((skr = parse_sampling_key(key, &p, r)) != 0) {
+            if (skr < 0) {
                 free(key);
                 goto bad;
             }
-            r->temperature = (float)v;
-            r->has_temperature = true;
-        } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            r->top_p = (float)v;
-            r->has_top_p = true;
-        } else if (!strcmp(key, "min_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* Same convention as top_p's range handling in the engine
-             * samplers (sample_top_p_min_p): an out-of-range value disables
-             * the filter instead of erroring.  Unvalidated, min_p > 1
-             * silently collapses sampling to greedy (only the max-prob
-             * candidate survives the cutoff). */
-            if (v < 0.0 || v > 1.0) v = 0.0;
-            r->min_p = (float)v;
-            r->has_min_p = true;
-        } else if (!strcmp(key, "top_k")) {
-            if (!json_int(&p, &r->top_k)) {
-                free(key);
-                goto bad;
-            }
-            r->has_top_k = true;
-        } else if (!strcmp(key, "seed")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
-            }
-            /* NaN fails v > 0.0; +inf or >= 2^64 would be UB in the cast. */
-            r->seed = (v > 0.0 && v < 18446744073709551616.0) ? (uint64_t)v
-                    : v > 0.0                                 ? UINT64_MAX
-                                                              : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -1538,32 +1823,41 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+        } else if (!strcmp(key, "thinking") || !strcmp(key, "think") || !strcmp(key, "enable_thinking") ||
+                   !strcmp(key, "reasoning_effort")) {
+            static const char *const kc[] = {"thinking", "think", "enable_thinking", "reasoning_effort"};
+            const char *k = NULL;
+            for (const char *c : kc)
+                if (!strcmp(key, c)) k = c;
+            char *raw = NULL;
+            if (n_controls == (int)(sizeof controls / sizeof controls[0]) || !json_raw_value(&p, &raw)) {
                 free(key);
                 goto bad;
             }
-            got_thinking = true;
-        } else if (!strcmp(key, "reasoning_effort")) {
-            if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
-                free(key);
-                goto bad;
-            }
-        } else if (!strcmp(key, "think") || !strcmp(key, "enable_thinking")) {
-            /* enable_thinking is the Qwen/vLLM spelling; accept it as a bool
-             * alias for our existing `think` field. Both remain additive to the
-             * Anthropic-style `thinking` object handled above. */
-            if (!json_bool(&p, &thinking_enabled)) {
-                free(key);
-                goto bad;
-            }
-            got_thinking = true;
+            controls[n_controls++] = {k, raw};
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
                 free(key);
                 goto bad;
             }
-        } else if (!json_skip_value(&p)) {
+        } else if (!strcmp(key, "logprobs") || !strcmp(key, "top_logprobs")) {
+            /* This surface has NO logprobs path: the ledger append and the
+             * response field are chat/Responses only (parse_chat_request owns
+             * the key there).  The catch-all below used to SKIP it, so a client
+             * that asked for distributions got HTTP 200, no payload, and
+             * speculation still enabled -- a silent fail-open.  Refuse loudly;
+             * an explicit null is "not set" (the OpenAI SDKs send it on both
+             * logprobs fields) and stays accepted, as it is on the chat
+             * surface. */
+            json_ws(&p);
+            if (!json_lit(&p, "null")) {
+                snprintf(err, errlen,
+                         "%s is not supported on /v1/completions; use "
+                         "/v1/chat/completions with logprobs:true", key);
+                free(key);
+                goto bad;   /* the controls read so far go with it */
+            }
+        } else if (!skip_ignored_key("/v1/completions", key, &p)) {
             free(key);
             goto bad;
         }
@@ -1573,30 +1867,52 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         json_ws(&p);
     }
     if (*p != '}') goto bad;
+    p++;
+    json_ws(&p);
+    if (*p) goto bad;   /* L354: nothing after the object, as pyjson_parse */
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
-        request_free(r);
-        return false;
+        goto bad;
     }
-    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
-    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
-    r->think_mode = pulsar_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    buf rendered;
-    rendered = {};
-    buf_puts(&rendered, PULSAR_SERVER_RENDER_BOS);
-    buf_puts(&rendered, pulsar_think_effort_prefix(r->think_mode));
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
-    buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, pulsar_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    r->prompt_text = buf_take(&rendered);
-    pulsar_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
-    free(prompt);
+    /* L284 P2: a completion is a RAW continuation on every family (OpenAI's and vLLM's /v1/completions): no
+     * chat template, no thinking block, and nothing before the prompt (neither family's HF tokenizer adds a
+     * BOS on encode).  All of it is client text, so no added token matches in it.  A thinking control has
+     * nothing to act on: thinking on or an effort is refused. */
+    {
+        const bool read = chat_effort_ask_read(controls, n_controls, &ask, err, errlen);
+        for (int i = 0; i < n_controls; i++) free(controls[i].raw);
+        n_controls = 0;
+        if (!read) {
+            free(prompt);
+            request_free(r);
+            return false;
+        }
+        if (ask.thinking == 1 || ask.level > 0 || ask.value) {
+            snprintf(err, errlen, "/v1/completions continues the prompt raw (no chat template): it has no thinking "
+                                  "to switch on or set an effort for -- use /v1/chat/completions");
+            free(prompt);
+            request_free(r);
+            return false;
+        }
+    }
+    r->think_mode = PULSAR_THINK_NONE;
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    r->prompt_text = prompt;
+    prompt = NULL;
+    if (r->prompt_text[0]) {
+        r->prompt_spans = (pulsar_text_span *)server_xmalloc(sizeof(pulsar_text_span));
+        r->prompt_spans[0].lo = 0;
+        r->prompt_spans[0].hi = (uint32_t)strlen(r->prompt_text);
+        r->prompt_n_spans = 1;
+    }
+    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
     return true;
 bad:
+    for (int i = 0; i < n_controls; i++) free(controls[i].raw);
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* a refusal that named its reason keeps it */
     request_free(r);
     return false;
 }

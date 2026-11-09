@@ -1,0 +1,154 @@
+/** @file
+ *  DSML, the tool-call markup DeepSeek V4 / V4.1 samples: the one authority for its spelling and its small scanners. */
+#ifndef PULSAR_DSML_H
+#define PULSAR_DSML_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+/* DSML -- the tool-call markup DeepSeek V4.1 samples -- has ONE authority for
+ * its spelling in this tree: this header.  The server's prompt renderer
+ * writes these literals, the server's parser and both stream projections
+ * match them, and the agent's prompts, parser and detector match them; none
+ * of them carries a copy (L184).  Adding a syntax means adding a row to
+ * pulsar_dsml_syntaxes; every consumer loops over the table.
+ *
+ * V4.1 (L218) renamed the three tag names and gave each a LEADING SPACE, so
+ * the byte after the "｜DSML｜" token is ' ' and the name tokenises on its
+ * own: "<｜DSML｜ calls>", "<｜DSML｜ invoke name=...>", "<｜DSML｜ parameter
+ * name=... string=...>".  V4's "tool_calls"/"invoke"/"parameter" spellings
+ * are gone with the model that sampled them. */
+
+/// The DSML marker token with both full-width bars, as V4.1 and V4 sample it.
+#define PULSAR_DSML "｜DSML｜"
+/// The DSML marker with its first bar omitted (a spelling the models also sample).
+#define PULSAR_DSML_SHORT "DSML｜"
+/// V4.1's tool-calls block tag name, with its leading space.
+#define PULSAR_DSML_CALLS_NAME " calls"
+/// V4.1's invocation tag name, with its leading space.
+#define PULSAR_DSML_INVOKE_NAME " invoke"
+/// V4.1's parameter tag name, with its leading space.
+#define PULSAR_DSML_PARAM_NAME " parameter"
+/// V4.1: the tag that opens the tool-calls block.
+#define PULSAR_TOOL_CALLS_START "<" PULSAR_DSML PULSAR_DSML_CALLS_NAME ">"
+/// V4.1: the tag that closes the tool-calls block.
+#define PULSAR_TOOL_CALLS_END "</" PULSAR_DSML PULSAR_DSML_CALLS_NAME ">"
+/// V4.1: the start of an invocation's opening tag (attributes and the closing angle bracket follow).
+#define PULSAR_INVOKE_START "<" PULSAR_DSML PULSAR_DSML_INVOKE_NAME
+/// V4.1: the tag that closes an invocation.
+#define PULSAR_INVOKE_END "</" PULSAR_DSML PULSAR_DSML_INVOKE_NAME ">"
+/// V4.1: the start of a parameter's opening tag (attributes and the closing angle bracket follow).
+#define PULSAR_PARAM_START "<" PULSAR_DSML PULSAR_DSML_PARAM_NAME
+/// V4.1: the tag that closes a parameter.
+#define PULSAR_PARAM_END "</" PULSAR_DSML PULSAR_DSML_PARAM_NAME ">"
+/// V4.1, first bar omitted: opens the tool-calls block.
+#define PULSAR_TOOL_CALLS_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_CALLS_NAME ">"
+/// V4.1, first bar omitted: closes the tool-calls block.
+#define PULSAR_TOOL_CALLS_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_CALLS_NAME ">"
+/// V4.1, first bar omitted: the start of an invocation's opening tag.
+#define PULSAR_INVOKE_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_INVOKE_NAME
+/// V4.1, first bar omitted: closes an invocation.
+#define PULSAR_INVOKE_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_INVOKE_NAME ">"
+/// V4.1, first bar omitted: the start of a parameter's opening tag.
+#define PULSAR_PARAM_START_SHORT "<" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME
+/// V4.1, first bar omitted: closes a parameter.
+#define PULSAR_PARAM_END_SHORT "</" PULSAR_DSML_SHORT PULSAR_DSML_PARAM_NAME ">"
+
+/* V4 (0731): the same markup with NO leading space in the tag name -- the
+ * spelling dev's tree renders and this artifact samples.  Both families are
+ * PARSED either way (the table below carries every row and the parsers loop);
+ * this set exists for the RENDERER, which must prime the model with the tags it
+ * was trained on. */
+/// V4's tool-calls block tag name (no leading space).
+#define PULSAR_DSML_V4_CALLS_NAME "tool_calls"
+/// V4's invocation tag name (no leading space).
+#define PULSAR_DSML_V4_INVOKE_NAME "invoke"
+/// V4's parameter tag name (no leading space).
+#define PULSAR_DSML_V4_PARAM_NAME "parameter"
+/// V4: the tag that opens the tool-calls block.
+#define PULSAR_TOOL_CALLS_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_CALLS_NAME ">"
+/// V4: the tag that closes the tool-calls block.
+#define PULSAR_TOOL_CALLS_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_CALLS_NAME ">"
+/// V4: the start of an invocation's opening tag (attributes and the closing angle bracket follow).
+#define PULSAR_INVOKE_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_INVOKE_NAME
+/// V4: the tag that closes an invocation.
+#define PULSAR_INVOKE_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_INVOKE_NAME ">"
+/// V4: the start of a parameter's opening tag (attributes and the closing angle bracket follow).
+#define PULSAR_PARAM_START_V4 "<" PULSAR_DSML PULSAR_DSML_V4_PARAM_NAME
+/// V4: the tag that closes a parameter.
+#define PULSAR_PARAM_END_V4 "</" PULSAR_DSML PULSAR_DSML_V4_PARAM_NAME ">"
+/// V4, first bar omitted: opens the tool-calls block.
+#define PULSAR_TOOL_CALLS_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_CALLS_NAME ">"
+/// V4, first bar omitted: closes the tool-calls block.
+#define PULSAR_TOOL_CALLS_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_CALLS_NAME ">"
+/// V4, first bar omitted: the start of an invocation's opening tag.
+#define PULSAR_INVOKE_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_INVOKE_NAME
+/// V4, first bar omitted: closes an invocation.
+#define PULSAR_INVOKE_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_INVOKE_NAME ">"
+/// V4, first bar omitted: the start of a parameter's opening tag.
+#define PULSAR_PARAM_START_SHORT_V4 "<" PULSAR_DSML_SHORT PULSAR_DSML_V4_PARAM_NAME
+/// V4, first bar omitted: closes a parameter.
+#define PULSAR_PARAM_END_SHORT_V4 "</" PULSAR_DSML_SHORT PULSAR_DSML_V4_PARAM_NAME ">"
+
+/** The six marker literals of one DSML spelling. */
+typedef struct {
+    const char *tool_calls_start;  ///< opens the tool-calls block
+    const char *tool_calls_end;    ///< closes it
+    const char *invoke_start;      ///< opens one invocation (attributes follow, then '>')
+    const char *invoke_end;        ///< closes it
+    const char *param_start;       ///< opens a parameter (attributes follow, then '>')
+    const char *param_end;         ///< closes it
+} pulsar_dsml_syntax;
+
+/** Rows: [0] V4.1's "<｜DSML｜ calls>", [1] V4.1 with the first bar omitted, [2]
+ * V4's "<｜DSML｜tool_calls>", [3] V4 with the first bar omitted.  The renderer
+ * WRITES one family's row (see pulsar_dsml_canonical); the parser loops over
+ * ALL of them, so a model that samples the other family's spelling -- or a
+ * client replaying an old transcript -- still parses.  Order is the parser's
+ * preference when a text carries more than one. */
+#define PULSAR_DSML_SYNTAXES 4
+/// Every DSML spelling the parser accepts, in preference order (see the comment above).
+extern const pulsar_dsml_syntax pulsar_dsml_syntaxes[PULSAR_DSML_SYNTAXES];
+
+/** The renderer-side spelling of the loaded model's family: V4.1's row when
+ * `v41`, V4's otherwise.  One call site per writer, one authority (the engine's
+ * variant) behind it. */
+/// @param v41 true when the loaded model is V4.1 (pulsar_engine's variant)
+/// @return the row the renderer writes: pulsar_dsml_syntaxes[0] for V4.1, [2] for V4
+const pulsar_dsml_syntax *pulsar_dsml_canonical(bool v41);
+
+/** V4.1's row (the default profile's / agent-UI spelling). */
+#define PULSAR_DSML_CANONICAL (&pulsar_dsml_syntaxes[0])
+/** V4's row. */
+#define PULSAR_DSML_CANONICAL_V4 (&pulsar_dsml_syntaxes[2])
+
+/* ---- the one entity encode/decode pair ----------------------------------
+ *
+ * The renderer escapes attribute values (tool and parameter names) so a name
+ * can carry '&', '<', '>' or '"'; the parser undoes exactly those entities
+ * in attributes AND in string parameter values (the model is told to write
+ * the closing parameter tag inside a value as "&lt;/｜DSML｜parameter>").
+ * "&apos;" is decode-only: the renderer never writes it, the model does. */
+
+/** Malloc'd copy of `s` with every entity the decoder knows replaced by its
+ * character; an '&' that starts no known entity is kept.  Never NULL
+ * (NULL input reads as ""). */
+/// @param s the text to decode, or NULL (read as "")
+/// @return the decoded copy (caller frees); never NULL
+char *pulsar_dsml_unescape(const char *s);
+
+/** Malloc'd copy of `s` with '&', '<', '>' and '"' as entities -- the
+ * attribute-value encoding pulsar_dsml_unescape reverses.  Never NULL. */
+/// @param s the attribute value to encode
+/// @return the encoded copy (caller frees); never NULL
+char *pulsar_dsml_escape_attr(const char *s);
+
+/** The value of attribute `name` in `tag` (an opening tag's bytes), decoded
+ * with pulsar_dsml_unescape; malloc'd, NULL when the attribute is absent or
+ * unterminated. */
+/// @param tag  an opening tag's bytes
+/// @param name the attribute's name
+/// @return the decoded value (caller frees), or NULL when the attribute is absent or unterminated
+char *pulsar_dsml_attr(const char *tag, const char *name);
+
+#endif

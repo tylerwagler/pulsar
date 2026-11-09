@@ -100,7 +100,7 @@ def lt_layout(in_dim, out_dim):
 def build_scale_dest_index(out_dim, KB, KBp):
     """Vectorized mx_sfoff(o, kb, KBp) for the full (o in [0,out), kb in [0,KB))
     grid -> flat destination index into the zero-padded scale buffer. Mirrors the
-    __device__ mx_sfoff in src/cuda/ds4_cuda_matmul.cu exactly."""
+    __device__ mx_sfoff in src/cuda/pulsar_cuda_matmul.cu exactly."""
     o = np.arange(out_dim, dtype=np.int64)[:, None]     # (out,1)
     kb = np.arange(KB, dtype=np.int64)[None, :]         # (1,KB)
     return (((o // 128) * (KBp // 4) + (kb // 4)) * 512

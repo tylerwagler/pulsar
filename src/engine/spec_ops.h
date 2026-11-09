@@ -1,0 +1,134 @@
+/** @file spec_ops.h
+ *  @brief The speculation seam: what a target family and a drafter each provide to the round API. */
+/* spec_ops.h -- the speculation seam (L272 P1 S2): what a TARGET family provides so any drafter can run
+ * against its forward, and what a DRAFTER provides -- two plugins, one round API (session_spec.cpp) and
+ * one server lane between them.
+ *
+ * The drafter is not the family.  A target family can carry several drafters (Qwen3.8 ships an MTP
+ * head and has DSpark and DFlash2 drafters trained for it; a Flash-Next DFlash has been served on two
+ * DGX Sparks), so the family's part is only the verify side of the round -- snapshot and roll back the
+ * state a verify run mutates, arm the forward's per-row captures and its logits readback, read a
+ * bank's rows out of the shared forward, leave the bank's state at the committed position, and cut the
+ * history on the L155 trim -- and the drafter's part is its own weights and state: prime its context
+ * from the prompt's captured features, absorb a committed row, draft a chain of up to K ids with
+ * per-position confidences (sampled drafts with their proposal q recorded), finish a deferred device
+ * draft, and the banked forms of those.  The core owns the round object, the per-bank pendings / carry /
+ * depth / quench / counters, the accept walk, the EOS clamp, the emit, the L155 trim decision and the
+ * batch plumbing (assemble / round_end / redraft, one step per bank, one verdict per phase on a pair).
+ *
+ * A verify row carries its position in the chain today (parent = row - 1); a tree verifier (DDTree,
+ * TreeSpark) would add ancestor masks to the target's attention and per-branch recurrent state, and
+ * that is a target capability this seam does not declare. */
+#ifndef PULSAR_SPEC_OPS_H
+#define PULSAR_SPEC_OPS_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "spec_depth.h"
+
+struct pulsar_session;
+struct pulsar_engine;
+struct pulsar_spec_round;
+
+/** The TARGET family's verify hooks.  A hook marked optional may be NULL: the core then does nothing
+ *  there (a family whose verify captures its own undo state inside the forward has no snapshot). */
+typedef struct pulsar_spec_target_ops {
+    /** Optional.  Snapshot, on the installed bank, the state verify rows mutate and position-addressed
+     *  KV cannot undo (DeepSeek: the compressor and indexer pending groups and the n_comp counters).  The
+     *  round owns the handle (`pulsar_spec_round::snap`, malloc'd; the core frees it with the round).
+     *  false with `err` = refuse the round. */
+    bool (*snapshot)(struct pulsar_session *s, struct pulsar_spec_round *r, char *err, size_t errlen);
+    /** Optional.  Put the snapshot back on the installed bank (an abort, a failed walk). */
+    bool (*restore)(struct pulsar_session *s, struct pulsar_spec_round *r);
+    /** Optional.  The snapshot is no longer needed (the round ended or aborted). */
+    void (*release)(struct pulsar_session *s, struct pulsar_spec_round *r);
+    /** Optional.  Before the shared verify forward over n_rows rows (0 = disarm after it): keep each
+     *  row's drafter features and state inputs.  A family whose decode_mixed treats a heads-on-every-row
+     *  step as the verify needs none. */
+    void (*arm_verify)(struct pulsar_session *s, uint32_t n_rows);
+    /** The single lane's verify: ONE forward over the round's rows [base, pend...] at saved_len on the
+     *  installed bank, features and state inputs kept, every row headed into the session's step rows
+     *  (pulsar_session_dev_rows: the walk reads them on the device, L302).  false with `err` = the round is
+     *  undone by the core. */
+    bool (*verify_single)(struct pulsar_session *s, struct pulsar_spec_round *r, char *err, size_t errlen);
+    /** The walk accepted `commit` of the K drafts: the verify advanced the installed bank's state by all
+     *  n_batch rows; leave it at saved_len + 1 + commit -- nothing to do on a full accept (DeepSeek), a
+     *  snapshot restore plus a roll-forward of the recurrent state from the inputs saved during the
+     *  verify on a partial one; a recurrent family also moves its position counters here. */
+    bool (*commit)(struct pulsar_session *s, struct pulsar_spec_round *r, uint32_t commit, uint32_t row0);
+    /** The L155 trim: the bank's history ends at `pos`, below what the round committed (DeepSeek: rewind;
+     *  a recurrent family invalidates or restores a grid checkpoint). */
+    void (*cut)(struct pulsar_session *s, int pos);
+    /* The rows one shared verify forward carries -- and so the decoders it carries, one base row each -- are the
+     * family's session fact pulsar_family_session_ops::fused_heads_max (L284), not a field here. */
+} pulsar_spec_target_ops;
+
+/** A DRAFTER: its own weights and per-bank context, behind the round API.
+ *
+ *  The draft schedule is one rule for every drafter (L284 P11), its numbers declared per drafter below:
+ *  a chain is at most the session's depth long and ENDS AT ITS FIRST DRAFT WHOSE CONFIDENCE IS UNDER tau,
+ *  that draft still verified (pulsar_spec_conf_stops / pulsar_spec_conf_keep).  L284 measured this against
+ *  excluding that draft, on both families: including it won on Qwen (+4..+11% decode) and tied DeepSeek
+ *  once DSpark's tau moved from 0.25 to 0.55.  A draft's confidence is known before the draft is drawn
+ *  (DSpark: its confidence head, scored from the prefix; MTP: the head's top probability), and whether a
+ *  draft is verified depends only on the confidences before it, so the stop is a stopping time and a
+ *  sampled chain's kept drafts are still draws from q.  How a drafter reaches the stop is its own: DSpark
+ *  drafts the whole chain in one forward and trims after; MTP drafts token by token and stops there.
+ *  --spec-depth / --spec-tau (PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU) override the numbers for whichever
+ *  drafter the model carries.  L301: every drafter's chains are then cut by the verify pick (verify_curve.cpp:
+ *  the round's drafts by survival, as many as raise its tokens per ms on the measured verify curve), and a drafter
+ *  that drafts token by token stops a chain whose next draft no longer pays the step that drafts it on that same
+ *  curve (pulsar_spec_chain_step).  L288: a bank that repeats its history
+ *  takes a copy chain instead of the drafter's (pulsar_spec_copy_chain, up to depth_max): the record arrives from
+ *  pulsar_spec_draft_req_init with `copied` set and its drafts in place, and the drafter leaves them. */
+/** pulsar_drafter_ops::draft's refusal (L306): no chain, and the round that asked for it refuses. */
+#define PULSAR_DRAFT_REFUSED UINT32_MAX
+
+/** A drafter's implementation behind the round API: static constants and hooks, one table per drafter kind
+ *  (DSpark, MTP, the block drafter), selected at load; never freed. */
+typedef struct pulsar_drafter_ops {
+    /// The drafter's name, for log lines and announcements (static string).
+    const char *name;
+    uint32_t depth;       ///< the depth a fresh session drafts at (the adaptive controller moves it from here)
+    uint32_t depth_max;   ///< the deepest chain the drafter can draft (<= 16); a configured depth is clamped to it
+    float tau;            ///< the stop threshold; 0 = every drafted position is kept
+    /** The adaptive depth controller's constants (spec_depth.h), or NULL = a fixed depth.  Opt-in per drafter:
+     *  it measured slower on the MTP drafter, whose in-round stop already adapts. */
+    const pulsar_spec_depth_policy *adapt;
+    /** Optional.  A fresh context: prime it from the prompt's captured features before the first draft.
+     *  0 = done or nothing to do, -1 with `err` = refuse the round. */
+    int (*prime)(struct pulsar_session *s, char *err, size_t errlen);
+    /** Optional.  The installed bank's context advances by one committed row of the last verify (`row`
+     *  is the row's absolute index in that forward's capture; `next` the token that follows it -- the
+     *  next committed token, or the round's carry after the last one).  NULL = the drafter absorbs a
+     *  round's rows together (absorb_banked), in the single lane too. */
+    bool (*absorb)(struct pulsar_session *s, uint32_t row, int32_t next);
+    /** Every deferred row in one pass, no bank switch: rows[i] of banks[i], followed by next[i]. */
+    bool (*absorb_banked)(struct pulsar_session *s, const uint32_t *rows, const uint32_t *banks,
+                          const int32_t *next, uint32_t n);
+    /** Draft the installed bank's next chain after `next_base`: up to the session's depth, cut by the stop
+     *  rule, each draft with a confidence (or -1), sampled drafts (temperature > 0) drawn from the
+     *  request-filtered proposal q at the draft's own key -- draft j at pulsar_sample_key(*rng, j), the key the
+     *  target's draw for that token reads; `rng` is read, never advanced (L288 sdet) -- stamped into the bank's
+     *  pendings.
+     *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
+     *  the round refuses with it (L306) -- it never continues as a plain round.  `features_ready` = the drafter's
+     *  conditioning features are those of the last committed row. */
+    uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,
+                      int top_k, float top_p, float min_p, uint64_t *rng);
+    /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
+    void (*harvest)(struct pulsar_session *s);
+    /** N banks' drafts in one pass, no bank switch, each result into rounds[i]->redraft; byte-exact with
+     *  `draft` for each bank.  0, or -1 with `err` on a device failure. */
+    int (*draft_batch)(struct pulsar_session *s, struct pulsar_spec_round **rounds, const uint32_t *banks,
+                       uint64_t **rngs, int n, char *err, size_t errlen);
+    /** Optional (L306).  The drafter's own graph catalog at the startup warmup: run every shape its captured draft
+     *  pass takes live (bank counts x attention bounds) twice on the installed bank, writing no state, inside the
+     *  warmup's segment window (pulsar_gpu_seg_catalog_open) -- so no live round pays the capture.  0, or -1 with
+     *  `err`.  NULL = the drafter graphs nothing (or its shapes ride the verify walk). */
+    int (*warm)(struct pulsar_session *s, char *err, size_t errlen);
+} pulsar_drafter_ops;
+
+#endif /* PULSAR_SPEC_OPS_H */

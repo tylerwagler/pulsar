@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: worker / UI synchronisation (submit, interrupt, stop, status, wake pipes) and prompt echo. */
 #include "pulsar_agent_internal.h"
 
 

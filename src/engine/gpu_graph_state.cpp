@@ -1,11 +1,26 @@
+/** @file gpu_graph_state.cpp
+ *  @brief DeepSeek graph teardown and release, and directional-steering vector loading. */
 #include "pulsar_engine_internal.h"
 
 
 
-/* Release every GPU tensor owned by the whole-model graph runtime. */
+/* Tear down a graph that has run: the cached segment graphs bake THIS graph's
+ * device allocations and must not survive it (a later session reusing the
+ * addresses would replay against freed state; the multiseq gates caught
+ * this), then every tensor goes. */
 void gpu_graph_free(pulsar_gpu_graph *g) {
-    pulsar_gpu_tensor_free(g->descr_diag_pos);
-    pulsar_gpu_tensor_free(g->descr_diag_seq);
+    pulsar_gpu_seg_reset();
+    gpu_graph_release(g);
+}
+
+/* Release every GPU tensor (and host table) the graph owns, and nothing else:
+ * the allocator's own failure paths and the dry-run pricer use this -- a graph
+ * that never ran has baked no segment graph, and a pricing run must not reset
+ * the live session's. */
+/// @param g the graph; zeroed after
+void gpu_graph_release(pulsar_gpu_graph *g) {
+    gpu_graph_engram_release(g);
+    pulsar_ckpt_release(&g->ckpt);
     pulsar_gpu_tensor_free(g->batch_positions);
     pulsar_gpu_tensor_free(g->batch_seq_id);
     free(g->ms_positions);
@@ -18,7 +33,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_routed_down);
     pulsar_gpu_tensor_free(g->batch_routed_mid);
     pulsar_gpu_tensor_free(g->batch_routed_up);
-    pulsar_gpu_tensor_free(g->batch_routed_gate);
     pulsar_gpu_tensor_free(g->batch_router_weights);
     pulsar_gpu_tensor_free(g->batch_router_selected);
     pulsar_gpu_tensor_free(g->batch_router_probs);
@@ -35,9 +49,13 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_heads);
     pulsar_gpu_tensor_free(g->batch_indexer_weights);
     pulsar_gpu_tensor_free(g->batch_indexer_q);
+    pulsar_gpu_tensor_free(g->batch_indexer_qp);
+    pulsar_gpu_tensor_free(g->batch_index_comp_sc);
+    pulsar_gpu_tensor_free(g->batch_index_comp_kv);
     pulsar_gpu_tensor_free(g->batch_comp_sc);
     pulsar_gpu_tensor_free(g->batch_comp_kv);
     pulsar_gpu_tensor_free(g->batch_kv);
+    pulsar_gpu_tensor_free(g->batch_kv_pack);
     pulsar_gpu_tensor_free(g->batch_kv_raw);
     pulsar_gpu_tensor_free(g->batch_q);
     pulsar_gpu_tensor_free(g->batch_qr_norm);
@@ -45,18 +63,31 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->batch_attn_norm);
     pulsar_gpu_tensor_free(g->batch_attn_cur);
     pulsar_gpu_tensor_free(g->batch_hc_split);
+    pulsar_gpu_tensor_free(g->batch_hc_pre);
     pulsar_gpu_tensor_free(g->batch_hc_mix);
     pulsar_gpu_tensor_free(g->batch_flat_hc);
     pulsar_gpu_tensor_free(g->batch_next_hc);
     pulsar_gpu_tensor_free(g->batch_cur_hc);
     pulsar_gpu_tensor_free(g->prefill_tokens);
-    pulsar_gpu_tensor_free(g->logits);
+    pulsar_gpu_tensor_free(g->vision_visible);
     pulsar_gpu_tensor_free(g->spec_logits);
+    pulsar_gpu_tensor_free(g->tp_vocab_own);
+    g->tp_vocab_own = NULL;
+    pulsar_gpu_tensor_free(g->tp_ain_own);
+    g->tp_ain_own = NULL;
+    pulsar_gpu_tensor_free(g->tp_stage_ticket);
+    g->tp_stage_ticket = NULL;
     pulsar_gpu_tensor_free(g->dspark_main_x);
     for (int i = 0; i < 3; i++) {
         pulsar_gpu_tensor_free(g->dspark_target_h[i]);
         pulsar_gpu_tensor_free(g->dspark_raw_cache[i]);
         pulsar_gpu_tensor_free(g->dspark_bulk_h[i]);
+        if (i == 0) {
+            pulsar_gpu_tensor_free(g->distill_top_ids);
+            pulsar_gpu_tensor_free(g->distill_top_vals);
+            pulsar_gpu_tensor_free(g->distill_tail_lse);
+            pulsar_gpu_tensor_free(g->distill_inexact);
+        }
         pulsar_gpu_tensor_free(g->dspark_prompt_h[i]);
         pulsar_gpu_tensor_free(g->dspark_target_h_batch[i]);
     }
@@ -75,41 +106,19 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     pulsar_gpu_tensor_free(g->dspark_markov_logits);
     pulsar_gpu_tensor_free(g->dspark_conf_scores);
     pulsar_gpu_tensor_free(g->dspark_conf_tokens);
+    pulsar_gpu_tensor_free(g->dspark_embed_tokens);
+    pulsar_gpu_tensor_free(g->dspark_refined_ids);
+    pulsar_gpu_tensor_free(g->dspark_row_meta);
+    pulsar_gpu_tensor_free(g->dspark_bank_meta);
     pulsar_gpu_tensor_free(g->output_norm);
     pulsar_gpu_tensor_free(g->output_embd);
-    pulsar_gpu_tensor_free(g->output_weights);
-    pulsar_gpu_tensor_free(g->output_pre);
-    pulsar_gpu_tensor_free(g->after_ffn_hc);
-    pulsar_gpu_tensor_free(g->ffn_out);
-    pulsar_gpu_tensor_free(g->routed_out);
-    pulsar_gpu_tensor_free(g->routed_down);
-    pulsar_gpu_tensor_free(g->routed_mid);
-    pulsar_gpu_tensor_free(g->routed_up);
-    pulsar_gpu_tensor_free(g->routed_gate);
-    pulsar_gpu_tensor_free(g->router_weights);
-    pulsar_gpu_tensor_free(g->router_selected);
-    pulsar_gpu_tensor_free(g->router_probs);
-    pulsar_gpu_tensor_free(g->router_logits);
-    pulsar_gpu_tensor_free(g->shared_out);
-    pulsar_gpu_tensor_free(g->shared_mid);
-    pulsar_gpu_tensor_free(g->shared_up);
-    pulsar_gpu_tensor_free(g->shared_gate);
     pulsar_gpu_tensor_free(g->ffn_norm);
-    pulsar_gpu_tensor_free(g->ffn_cur);
-    pulsar_gpu_tensor_free(g->after_attn_hc);
-    pulsar_gpu_tensor_free(g->attn_out);
-    pulsar_gpu_tensor_free(g->attn_low);
-    pulsar_gpu_tensor_free(g->heads);
-    pulsar_gpu_tensor_free(g->comp_sc_cur);
-    pulsar_gpu_tensor_free(g->comp_kv_cur);
     pulsar_gpu_tensor_free(g->attn_comp_stage);
-    pulsar_gpu_tensor_free(g->attn_comp_dequant);
     pulsar_gpu_tensor_free(g->idx_comp_stage);
-    pulsar_gpu_tensor_free(g->comp_mask);
     pulsar_gpu_tensor_free(g->comp_selected);
+    pulsar_gpu_tensor_free(g->cand_mask);
+    pulsar_gpu_tensor_free(g->cand_bscore);
     pulsar_gpu_tensor_free(g->indexer_scores);
-    pulsar_gpu_tensor_free(g->indexer_weights);
-    pulsar_gpu_tensor_free(g->indexer_q);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->layer_raw_cache[il]);
     }
@@ -127,8 +136,6 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
-    }
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
     }
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
@@ -153,6 +160,10 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.assc[il]);
         pulsar_gpu_tensor_free(g->banks.iskv[il]);
         pulsar_gpu_tensor_free(g->banks.issc[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_askv[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_assc[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_iskv[il]);
+        pulsar_gpu_tensor_free(g->banks.spec_issc[il]);
     }
     /* Option F per-bank drafter-ring slabs (dspark_raw_cache[i]/dspark_prompt_h[i]
      * freed above were bank views into these). */
@@ -160,11 +171,8 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
         pulsar_gpu_tensor_free(g->banks.dspark_raw[i]);
         pulsar_gpu_tensor_free(g->banks.dspark_prompt[i]);
     }
-    /* plan-33 inc C: partial-fork boundary-row stash. */
-    pulsar_gpu_tensor_free(g->emit_stash_comp);
-    pulsar_gpu_tensor_free(g->emit_stash_index);
-    g->emit_stash_comp = NULL;
-    g->emit_stash_index = NULL;
+    /* plan-33 inc C boundary-row stash (one pair for the whole pool, so outside
+     * the per-layer loop above). */
     /* The batched-copy tables cache raw device pointers into the state tensors
      * freed above; drop them so a rebuilt graph re-prepares fresh tables. */
     pulsar_gpu_batched_copy_free(g->spec_snap_copies);
@@ -173,25 +181,29 @@ void gpu_graph_free(pulsar_gpu_graph *g) {
     g->spec_restore_copies = NULL;
     g->spec_frontier_copy_n = 0;
     g->spec_frontier_copy_init = 0;
+    /* L260: and every parked bank's tables (pulsar_bank_slabs) */
+    for (uint32_t bk = 0; bk < PULSAR_MSEQ_MAX; bk++) {
+        pulsar_gpu_batched_copy_free(g->banks.spec_snap_copies[bk]);
+        pulsar_gpu_batched_copy_free(g->banks.spec_restore_copies[bk]);
+        g->banks.spec_snap_copies[bk] = NULL;
+        g->banks.spec_restore_copies[bk] = NULL;
+        g->banks.spec_frontier_copy_init[bk] = 0;
+    }
     pulsar_gpu_tensor_free(g->kv);
-    pulsar_gpu_tensor_free(g->kv_raw);
-    pulsar_gpu_tensor_free(g->q);
-    pulsar_gpu_tensor_free(g->qr_norm);
-    pulsar_gpu_tensor_free(g->qr);
     pulsar_gpu_tensor_free(g->attn_norm);
-    pulsar_gpu_tensor_free(g->attn_cur);
     pulsar_gpu_tensor_free(g->hc_comb);
     pulsar_gpu_tensor_free(g->hc_post);
-    pulsar_gpu_tensor_free(g->hc_pre);
     pulsar_gpu_tensor_free(g->hc_split);
-    pulsar_gpu_tensor_free(g->hc_mix);
-    pulsar_gpu_tensor_free(g->flat_hc);
     pulsar_gpu_tensor_free(g->cur_hc);
     memset(g, 0, sizeof(*g));
 }
 
 
 
+/// @param t the tensor
+/// @param v the value
+/// @param n f32 elements to fill
+/// @return false = the fill failed
 bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n) {
     return pulsar_gpu_tensor_fill_f32(t, v, n) != 0;
 }
@@ -213,6 +225,12 @@ bool gpu_tensor_fill_f32(pulsar_gpu_tensor *t, float v, uint64_t n) {
  * the normal inference path.
  */
 
+/// Load the per-layer steering directions and scales (both scales 0: nothing loaded).
+/// @param g the graph
+/// @param path the direction file, PULSAR_N_LAYER x PULSAR_N_EMBD f32
+/// @param attn_scale the attention outputs' scale
+/// @param ffn_scale the FFN outputs' scale
+/// @return false (said) on a missing path or a bad file
 bool gpu_graph_load_directional_steering(
         pulsar_gpu_graph *g,
         const char      *path,

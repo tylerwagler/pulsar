@@ -1,0 +1,241 @@
+# Every test tier's one list: what runs, in what order, and what it is allowed to cost (L357).
+#
+#   check    no GPU, no model time: beside production, every commit
+#   kernels  a GPU, no model
+#   release  real models, production down; `tests/run.py release` runs every tier, in this order
+#
+# overlap = true: during `release` the test runs in the background alongside the runner, which is the long GPU tail.
+# budget is seconds; a test over budget is flagged, not failed.  [sections] budgets what one test reports for each model.
+
+[limits]
+release = 3600   # L357 2026-11-08: #676 measured 3446 s (21 -> 11 server starts; Gemma + Nemotron reference gates added)
+
+[sections]
+"cuda-runner-gate [Qwen4-exp]" = 1200
+"cuda-runner-gate [Nemotron-H]" = 450   # its two reference gates since L357 (#676: 409 s)
+"cuda-runner-gate [Gemma 4]" = 90
+"live-legs [qwen]" = 1500
+"live-legs [nemotron]" = 420
+
+[[test]]
+name = "warnings-gate"
+tier = "check"
+budget = 150   # L357 2026-11-08: the engine + every test program (Sparky #676: 89 s)
+
+[[test]]
+name = "doxygen-gate"
+tier = "check"
+budget = 120
+
+[[test]]
+name = "unit-test-gate"
+tier = "release"
+budget = 240
+
+[[test]]
+name = "agent-test-gate"
+tier = "check"
+budget = 10
+
+[[test]]
+name = "cuda-regression"
+tier = "kernels"
+budget = 70
+
+[[test]]
+name = "cuda-kv-rows-pack-gate"
+tier = "kernels"
+budget = 10
+
+[[test]]
+name = "cuda-sampler-device-gate"
+tier = "kernels"
+budget = 30
+
+[[test]]
+name = "cuda-chat-smoke-gate"
+tier = "release"
+budget = 35
+
+[[test]]
+name = "agent-tools-gate"
+tier = "release"
+budget = 300   # L365: three model loads (Qwen, Nemotron-H, Gemma 4), two tool rounds each; #678: 82 s without Gemma
+
+[[test]]
+name = "cuda-attn-gates"
+tier = "kernels"
+budget = 60
+
+[[test]]
+name = "cuda-attn-pack-gate"
+tier = "kernels"
+budget = 5
+
+[[test]]
+name = "indexer-hadamard-kernel-check"
+tier = "kernels"
+budget = 5
+
+[[test]]
+name = "state-kinds-gate"
+tier = "kernels"
+budget = 5
+
+[[test]]
+name = "vision-qwen-tower-gate"
+tier = "release"
+budget = 10
+
+[[test]]
+name = "blockdraft-gate"
+tier = "kernels"
+budget = 5
+
+[[test]]
+name = "nvfp4-rows-gate"
+tier = "kernels"
+budget = 10
+
+[[test]]
+name = "lilicorr-head-gate"
+tier = "kernels"
+budget = 10
+
+[[test]]
+name = "model-smoke"
+tier = "release"
+budget = 900
+
+[[test]]
+name = "cuda-runner-gate"
+tier = "release"
+
+[[test]]
+name = "live-legs"
+tier = "release"
+
+[[test]]
+name = "server-kv-headroom-live"
+tier = "release"
+budget = 420   # #676: 361 s (Super, its balloon)
+
+[[test]]
+name = "cuda-reap-router-audit"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-layout-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-pixel-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-codec-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-span-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-visible-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-placeholder-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "vision-qwen-pixel-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "nemotron-vision-pixel-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "seam-check"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "exl3-dequant-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "host-checks"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "qwen-chat-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "nemotron-chat-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "api-golden-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "sse-golden-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "spec-depth-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "loader-contract-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "prefix-stability-gate"
+tier = "check"
+overlap = true
+budget = 90
+
+[[test]]
+name = "segstore-tsan"
+tier = "check"
+overlap = true
+budget = 90

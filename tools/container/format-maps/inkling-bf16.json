@@ -1,0 +1,19 @@
+{
+ "schema": "pulsar.recipe.v1",
+ "recipe": "inkling-bf16",
+ "model_type": "inkling_mm_model",
+ "about": "Inkling, every tensor in its source dtype from the HF BF16 checkpoint (bf16; the router's selection bias and output scale f32): the BF16 reference container. The routed / shared experts and the dense MLP are split out of the fused w13 tensors by the Source view (inkling.py); the drafter and the hmlp tower are written; model.audio.* is consumed by name. Fits any Inkling checkpoint (the 3-layer mini and Inkling-Small).",
+ "rows": [
+  {"role": "dense", "format": "native"},
+  {"role": "shared_expert", "format": "native"},
+  {"role": "expert_gate", "format": "native"},
+  {"role": "expert_up", "format": "native"},
+  {"role": "expert_down", "format": "native"},
+  {"role": "router", "format": "native"},
+  {"role": "norm", "format": "native"},
+  {"role": "embed", "format": "native"},
+  {"role": "head", "format": "native"},
+  {"role": "other", "format": "native"},
+  {"role": "vision", "format": "native"}
+ ]
+}

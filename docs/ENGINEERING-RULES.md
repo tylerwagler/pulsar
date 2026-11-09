@@ -1,0 +1,335 @@
+# Engineering rules for the pulsar engine
+
+Tyler, 2026-09-03: *"no more fallbacks. no more dead code kept."*  This is the
+rule book that came out of L158, the day a routine cleanup found the drafter
+had been multiplying f32 activations for the whole A8 campaign while every
+gate stayed green.  Every rule below is here because its absence cost real
+time on this engine; the evidence is cited so the rule can be argued with,
+not just obeyed.  The goal these rules serve has not changed: serve every
+model family the engine carries correctly and as fast as GB10 allows, with
+the smallest tree that does it.
+
+These rules bind every change on `dev`, by anyone, including Claude.  A
+change that needs an exception says so in its commit message and the ledger
+row, and the exception is a decision Tyler makes, not a default.
+
+## 1. One path or an error. No fallbacks.
+
+A GEMM, a kernel, a lane has ONE implementation for a given input.  If the
+input a path needs is not there (no E4M3 slot, no de-interleaved weight, no
+grouped encoding), the call **refuses loudly** -- it does not switch to an
+older kernel, a different activation format, or a slower arm.
+
+*Why:* a fallback is a second implementation that runs exactly when
+something upstream is wrong, so it is the code nobody measures and no gate
+exercises.  L158 found the f32 GEMV fallback carrying the drafter for weeks;
+L151 measured a fallback kernel as if it were production; the mixed-batch
+suffix re-quantised f32 through a fallback on every step.  Each one passed
+every gate because the gates only ever ran the path the fallback masked.
+
+*How enforced:* the refusal names the shape and the producer that did not
+emit (see `act_a8_missing_fail`); the release tier surfaces it as a failed gate.
+There are no announce-on-miss lines: if the miss cannot happen, there is
+nothing to announce.  A review question for every branch: *if this branch is
+taken, is a different numeric answer produced?*  If yes, it is a fallback.
+
+## 2. No dead code kept.
+
+If nothing calls it, it is deleted in the same commit that orphaned it.  Not
+`#if 0`, not "kept for reference", not "might be useful for the next format".
+The reference is git.
+
+*Why:* dead arms are where the next fallback comes from, and they carry
+comments that describe a world that no longer exists (the MoE still said
+"q8_1" weeks after q8_1 died).  The compiler already reports orphaned
+statics; on 2026-09-01 three of them had been reported for weeks because
+builds were piped through `grep error`.
+
+*How enforced:* the warning baseline is **zero** and stays zero (`-Wall
+-Wextra`, nvcc `#177-D`/`#550-D`); a landing with a new warning is not a
+landing.  Read the whole build log, never `| grep error`.  `nm` is blind to
+statics, types and macros -- delete by reading the callers, and grep the
+macro set when retiring a header (a feature macro nothing defines any more
+silently compiles every `#if` it guards to the off arm).
+
+## 3. Producers emit; consumers never convert.
+
+An activation's format is decided where it is produced.  The producer kernel
+emits E4M3 (or bf16 for a bf16-weight GEMM) into the slot; the consumer
+reads the slot or refuses.  A consumer that quantises, rounds, gathers-from-
+f32 or re-encodes "just in case" is a fallback in disguise (rule 1).  A
+standalone encode pass is allowed only at the producer's stage, for a
+producer whose kernel has no epilogue yet (the drafter's raw attention, the
+MoE's SwiGLU output), and it is the ONE encoder for that buffer.
+
+*Why:* three encoders for one SwiGLU output; a cuBLASLt arm that quantised
+for itself whenever a slot was missing, so nobody noticed the slot was
+missing; "W8A8 above the cap and W8A32 below it" more than once.
+Consumer-side conversion is also where the −15% decode of the pre-A8 era
+lived.
+
+*How enforced:* the `<<<` launches of the quantise kernels are countable;
+every one must sit at a producer site.  Tests and tools that synthesise an
+activation are its producer and call `pulsar_gpu_mxfp8_act_cache_encode_f32`
+themselves.
+
+## 4. One authority per fact.
+
+A layout, a cap, a stride, a threshold lives in exactly one place and is
+read from there.  Two copies "kept in sync by hand" are a bug that has not
+fired yet.  Prose that says "must match X exactly" is the tell.
+
+*Why:* the scale swizzle, the neutral-rows cap (drifted once: 8 vs 16), the
+frontier counters (a fix landed on one of two copies, L133), the A8
+kernels' group stride (used the call's row count where the slot's was
+meant).
+
+*How enforced:* replace the copy with a call or a shared constant; where a
+runtime invariant must hold between two places, assert it in code once
+(the static_asserts on the caps), never in a comment.
+
+## 5. An instrument proves it ran the lane.
+
+A gate, a sweep or a profile is evidence only if its log shows WHICH arm
+executed.  Every measurement names the lane (armed/unarmed, slot present or
+not, which kernel) and the tree it ran on (sha asserted, clean asserted,
+binary mtime after the build stamp).
+
+*Why:* the L151 sweep measured the f32 kernel for weeks; five instruments
+measured nothing after L118 moved production to the batch lane (L129); the
+reference gate skips silently without `PULSAR_REF_DIR`; a tracked gate
+binary passed for a day after its source stopped compiling.
+
+*How enforced:* once-per-shape announce lines for the path TAKEN (never for
+a miss); gate scripts assert sha + clean tree + binary freshness; when a
+format or lane migrates, the instruments migrate in the same row, and the
+row is not closed until they do.
+
+## 6. Delete the premise before building on it.
+
+Before a row's work starts, grep the code the row describes.  Rows go
+stale; comments go stale; a plan written last week describes last week's
+lane.
+
+*Why:* four rows in one day sent work at solved problems (2026-08-20); L151's
+10% premise described a lane that L149 had already changed; L145's "9-row
+step" was quoted for a week after the quench made it 3 rows.
+
+*How enforced:* the first entry of any increment states what the code does
+TODAY, with file:line, and where that differs from the row, the row is
+corrected first.
+
+## 7. Bit-exact is the default; fidelity is graded, never argued.
+
+A refactor is bit-identical or it is a numerics change.  A numerics change
+is graded against the B300 reference (`cuda-reference-gate` with
+`PULSAR_REF_DIR`) and lands only if it moves toward the source or Tyler
+accepts the move.  "It's the same math" is not evidence.
+
+*Why:* the norm+mix fusion looked equivalent and was 39% further from
+source; the byte gate once rejected a change that was closer to source
+because nobody graded it.
+
+*How enforced:* every landing says which of the two it is.  Bit-exact
+changes cite the passing byte gates; numerics changes cite the reference
+gate's per-depth table and, on the decode lane, the spec oracle's alpha.
+
+**Batch-width neutrality is NOT a requirement (Tyler 2026-10-08: "I care way
+less about M-Neutral now.  If cuBLASLt or CUTLASS is faster, use it.").**  A
+decode or verify row may take the fastest arm for its width -- cuBLASLt,
+CUTLASS, any tensor-core GEMM -- even though its bytes then depend on how many
+rows ride with it.  `PULSAR_GPU_MNEUTRAL_ROWS_MAX` (16) is the width of the
+kernels that ARE M-independent, not a ceiling on a lane's rows: a lane past it
+takes the faster arms instead of being refused.  Choosing such an arm is a
+numerics change and is graded, not byte-gated: the spec oracle
+(`make cuda-spec-sampling-gate`: the sampled distribution still the target's)
+for any verify-path change, KL of the row against a one-token decode, and the
+reference gate where the prefill moves.  The width and row neutrality gates
+and the session contract's batched and verify legs (B2, B6, F1, F4) still run;
+past the M-independent width they report the drift (KL) instead of failing on
+bytes.  What stays bit-exact: a refactor, the same rows at the same
+width, and a resume against the cold prefill of the same chunking.  Rule 8
+picks the arm: measured at the production lane's widths, the fastest wins.
+
+## 8. Measure at the shape production runs.
+
+Performance claims are made at the served lane's real row counts (drafting
+client: 3-6 rows; two clients: 6-12; three clients quench to 3-4; drafter
+off: 1) and with the production activation format armed.  Microbenchmarks
+that keep a weight L2-resident, or feed f32 where production feeds E4M3,
+are labelled as such.
+
+*Why:* L151-C won 1.4x at 16 rows and lost 4-10% in production; the nt
+kernels' "580 GB/s" was an L2 artefact.
+
+*How enforced:* a served A/B at 1/2/3 clients + drafter-off is the
+throughput oracle for any dense-step change (`tools/serve-bench/scoreboard.sh`
+measures the served lane); the sweep tool arms the slot.
+
+## 9. Fail closed, loudly, once.
+
+An engine that hits an impossible state stops the call and says exactly
+what was missing, once per shape.  It never returns a well-formed number
+from a different computation.  Warnings that fire per token are noise; a
+missing announce is a fact nobody can see; a refusal is a gate failure the
+release tier reports.
+
+## 10. Landing discipline.
+
+Every landing: the test tier its paths call for (below) at an asserted sha
+and clean tree, zero build warnings and zero doxygen warnings (`warnings-gate`
+and `doxygen-gate`, both in `make check`), the unit suite (`unit-test-gate`, in
+`make release`), and the ledger row updated in the same session.
+Byte-exact or graded (rule 7).  Production A/B when the change touches a
+served kernel.  Squash to one commit whose message says what was
+deleted as clearly as what was added.  Delete the topic branch when it lands;
+park a branch only with a row that says why and for how long.
+
+**Doxygen clean means fully documented (0.5.0).**  `docs/Doxyfile` runs with
+`EXTRACT_ALL = NO` and every file in scope carries `@file`, so an undocumented
+file, function, type, member or macro is a warning, and the gate is an EMPTY
+`docs/api/doxygen-warnings.log` from `doxygen docs/Doxyfile` at the engine
+root.  Vendored mirrors stay out through the Doxyfile's `EXCLUDE` list, not
+through comments.  For contributors:
+
+- `@file` on every new file, with a line saying what it holds.
+- Measure with `GENERATE_HTML = YES` (the Doxyfile's setting): doxygen 1.9.8
+  skips the `@param` checks when no output is generated, so a run with HTML
+  off reads clean when it is not.
+- A macro defined inside a function body is documented with an `@def NAME`
+  block in front of the function; doxygen attaches a doc comment inside a body
+  to the function, not to the macro.
+- Literal tags in prose go in backticks (`` `<think>` ``): doxygen reads a bare
+  `<tag>` as HTML and warns or swallows it.
+- One doc location per function: the declaration when it carries the full
+  docs, else the definition, and the other location carries no doc comment.
+  Doxygen merges the two, so `@param` in both is a "multiple @param
+  documentation sections" warning, and a brief-only block at one of them can
+  read as an undocumented parameter list, depending on which file it parses
+  first.
+
+**The tiers (L357).**  Every test is a make target, listed once in
+`tests/manifest.toml` with its tier and its budget; `tests/run.py` runs a tier
+from it.  The tier says what a test needs:
+
+- `make check`: no GPU, no model time.  It runs beside a serving production
+  box.  Every commit.
+- `make kernels`: a GPU, no model.
+- `make release`: the real models, production down.  It runs every tier:
+  check and kernels first, the host tests overlapping the runner.
+
+`make gates` is `make release` under its old name: the Makefile keeps no list
+of its own (L357, 2026-11-08).  `tests/run.py --verify` checks that every
+manifest test is named once and is a make target, and every run checks it
+first.  `make gates-dev` stays the iteration tier: a subset chosen from the
+paths the working tree touches.  It is not a release gate.
+
+A run leaves its logs, `results.json` and `sections.tsv` in
+`.build/tests/<tier>-<sha>/`.  A test over its budget is flagged, not failed.
+
+**The tier follows the paths (2026-09-23, Tyler: "we spend way too much time
+on batteries").**  `make check` on every commit.  ONE `make release` per
+landing SERIES, on the last sha whose numeric paths changed -- not one per
+increment, and not again for a delta that cannot move a number:
+
+- `src/engine`, `src/families`, `src/cuda`, `src/server`, `src/tp` changed on a path a token
+  takes: `make release` at that sha.
+- After that release run, a delta of refusal paths, announces, tests, tools,
+  docs or Makefile recipes: the test that covers it plus `make gates-dev`
+  for the touched paths, at the sha that lands.  The release run already
+  proved the numerics; re-running it proves nothing the dev tier does not.
+- `tools/`, `docs/`, test helpers, Makefile recipes only: `make check` plus
+  `make gates-dev`.
+
+A measurement (the perf A/B, a census) goes AHEAD of a release run in the GPU
+queue when someone is waiting on the number; the release run waits behind it.
+
+**What a test may do (L357).**
+
+- *Read the published containers.*  Tests read each model from the Hugging
+  Face cache; `local.mk` resolves each repo's `refs/main` to its snapshot.  On
+  the GB10 host the cache sits on local NVMe: streaming the Qwen PLE rows over
+  NFS doubled the release time.  A local copy instead of the cache needs a
+  good reason, and the reason is written down.
+- *No silent SKIP.*  A test that cannot run its check FAILS by name.  A log
+  line that starts with `SKIP` is listed by `tests/run.py` under "NOT FULLY
+  RUN", and `--strict` fails its test.
+  An `N/A` line is not a skip: it names a leg the loaded family cannot have
+  (a capability it lacks, such as step graphs on Qwen).
+- *No generated model pieces.*  A test builds no zero-weight or mini
+  containers of its own; it runs on a published one.
+- *No system-wide memory measurement in a gate.*  Measure per process or per
+  device.  The box's free memory counts every other process on it, so a
+  verdict read from it is not the test's.  One written exception:
+  `server-kv-headroom-live` grades the server's memory guard, which on GB10's
+  unified memory is defined on the system's MemAvailable, so it measures that,
+  and runs only alone on the box (a quiet gpuq job, production stopped).
+
+## 11. Never free device memory at exit.
+
+Device allocations are freed by code that runs while the context is alive --
+eviction, growth, explicit shutdown -- never from a static destructor or an
+`atexit` handler.  Globals holding device memory are raw pointers that leak
+at exit; the leak is the design, not slop (rule 2 does not reach it).
+
+*Why:* the CUDA runtime tears the context down in its own exit handler, and
+whether a static destructor runs before or after it is registration order,
+not code we control.  exllamav3 hit exactly this in v1.6.4 (their `350debfa`,
+2026-10-19): static device workspaces in the routing GEMM freed in their
+destructors after the allocator had gone, and under
+`PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` every TP worker aborted at
+exit with `freeAsync` "CUDA error: no error".  Our scratch arenas
+(`g_cuda_tmp[]`), cuBLASLt plan caches and MXFP8 act cache already leak at
+exit by design; this rule is what stops a future RAII deleter on one of them
+from reintroducing the ordering bug silently.
+
+## Named exceptions to rule 1
+
+Two places let the same input take two paths on purpose.  Each is listed
+with the instrument that grades it; an exception without an instrument is a
+fallback and goes back under rule 1.  Adding to this list is a decision Tyler
+makes.
+
+*Retired 2026-10-04 (L264):* **warm fork / in-place continuation vs cold
+prefill** was exception 1 -- a continuation off a chunk-aligned cut took
+different GEMM shapes than the cold prefill, kill switch `PULSAR_WARM_FORK`.
+Every warm resume is now a restore of a grid checkpoint the prefill captured
+followed by a prefill from that grid point, which IS the cold prefill's
+computation, so the exception has no remaining case; the switch, the 3-way
+scripts and the router's fork paths are deleted.  The instrument that says so
+is `cuda-chunk-neutrality-gate` (schedules L, M, N: restored resumes
+byte-identical to cold).
+
+1. **`PULSAR_CUDA_PREFILL_CHUNK`** (read by the prefill chunk-cap helper at
+   the top of `src/engine/layers.cpp`): a test
+   knob for the prefill chunk width.  Chunk width changes GEMM shapes and so
+   cuBLASLt's algorithm choice; a prompt prefilled at chunk 1024 and at chunk
+   4096 does not produce the same KV bytes.  *Instrument:* the prefill byte
+   gate (`tests/prefill_bitexact_gate.cpp`, `make cuda-prefill-gate`) pins
+   its depths -- 512, 2048, 4096, 4102, 6144, 8196, 16388 (`g_prefill_depths`)
+   -- at the default chunk of 4096; a run with the knob set is not a byte-gate
+   run and says so.
+
+2. **`--spec-tau` / `PULSAR_SPEC_TAU`** (the engine's `spec_tau`, read in
+   `src/engine/session.cpp` and resolved by `pulsar_spec_tau`; each drafter's
+   default in its `pulsar_drafter_ops::tau`; set by `tools/confhead/bench.sh`,
+   `collect.sh`, `smoke.sh`): a draft-schedule knob.  The one stop rule
+   (`pulsar_spec_conf_keep`) ends a chain at its first draft under tau, which
+   changes WHICH rows are drafted and verified -- never a committed row's numerics: verify
+   rows are decode rows, and every decode row takes the M-independent kernels
+   whatever the batch width (row kind chooses the arm, `src/pulsar_gpu.h`,
+   `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend
+   on how many drafts ride with it (within the M-independent width; past it
+   the faster arms are allowed and the drift is graded -- rule 7, 2026-10-08).
+   *Instruments:* `session-contract-gate` B6 / F1 (a verify
+   step over several banks' runs gives each run's rows byte-identical to the
+   same rows verified alone) for the per-row claim (it replaced
+   `cuda-mixed-neutrality-gate`, retired with DeepSeek's mechanism gates, L357); the spec oracle (`make cuda-spec-sampling-gate`) grades
+   alpha at the default tau.
+
+## What "clean" means here
+
+Smaller.  One path per input.  No comment that describes a mechanism the
+reader cannot find in the code.  A gate for every lane production runs, and
+an announce line that proves it ran.  When in doubt between adding a guard
+and deleting a path: delete the path.

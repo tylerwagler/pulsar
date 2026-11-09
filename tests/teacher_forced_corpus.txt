@@ -1,0 +1,736 @@
+# Engineering rules for the pulsar engine
+
+Tyler, 2026-09-03: *"no more fallbacks. no more dead code kept."*  This is the
+rule book that came out of L158, the day a routine cleanup found the drafter
+had been multiplying f32 activations for the whole A8 campaign while every
+gate stayed green.  Every rule below is here because its absence cost real
+time on this engine; the evidence is cited so the rule can be argued with,
+not just obeyed.  The goal these rules serve has not changed: serve
+DeepSeek-V4-Flash correctly and as fast as GB10 allows, with the smallest
+tree that does it.
+
+These rules bind every change on `dev`, by anyone, including Claude.  A
+change that needs an exception says so in its commit message and the ledger
+row, and the exception is a decision Tyler makes, not a default.
+
+## 1. One path or an error. No fallbacks.
+
+A GEMM, a kernel, a lane has ONE implementation for a given input.  If the
+input a path needs is not there (no E4M3 slot, no de-interleaved weight, no
+grouped encoding), the call **refuses loudly** -- it does not switch to an
+older kernel, a different activation format, or a slower arm.
+
+*Why:* a fallback is a second implementation that runs exactly when
+something upstream is wrong, so it is the code nobody measures and no gate
+exercises.  L158 found the f32 GEMV fallback carrying the drafter for weeks;
+L151 measured a fallback kernel as if it were production; the mixed-batch
+suffix re-quantised f32 through a fallback on every step.  Each one passed
+every gate because the gates only ever ran the path the fallback masked.
+
+*How enforced:* the refusal names the shape and the producer that did not
+emit (see `act_a8_missing_fail`); the battery surfaces it as a failed gate.
+There are no announce-on-miss lines: if the miss cannot happen, there is
+nothing to announce.  A review question for every branch: *if this branch is
+taken, is a different numeric answer produced?*  If yes, it is a fallback.
+
+## 2. No dead code kept.
+
+If nothing calls it, it is deleted in the same commit that orphaned it.  Not
+`#if 0`, not "kept for reference", not "might be useful for the next format".
+The reference is git.
+
+*Why:* dead arms are where the next fallback comes from, and they carry
+comments that describe a world that no longer exists (the MoE still said
+"q8_1" weeks after q8_1 died).  The compiler already reports orphaned
+statics; on 2026-09-01 three of them had been reported for weeks because
+builds were piped through `grep error`.
+
+*How enforced:* the warning baseline is **zero** and stays zero (`-Wall
+-Wextra`, nvcc `#177-D`/`#550-D`); a landing with a new warning is not a
+landing.  Read the whole build log, never `| grep error`.  `nm` is blind to
+statics, types and macros -- delete by reading the callers, and grep the
+macro set when retiring a header (see [feature-macros-die-silently]).
+
+## 3. Producers emit; consumers never convert.
+
+An activation's format is decided where it is produced.  The producer kernel
+emits E4M3 (or bf16 for a bf16-weight GEMM) into the slot; the consumer
+reads the slot or refuses.  A consumer that quantises, rounds, gathers-from-
+f32 or re-encodes "just in case" is a fallback in disguise (rule 1).  A
+standalone encode pass is allowed only at the producer's stage, for a
+producer whose kernel has no epilogue yet (the drafter's raw attention, the
+MoE's SwiGLU output), and it is the ONE encoder for that buffer.
+
+*Why:* three encoders for one SwiGLU output; a cuBLASLt arm that quantised
+for itself whenever a slot was missing, so nobody noticed the slot was
+missing; "W8A8 above the cap and W8A32 below it" more than once.
+Consumer-side conversion is also where the −15% decode of the pre-A8 era
+lived.
+
+*How enforced:* the `<<<` launches of the quantise kernels are countable;
+every one must sit at a producer site.  Tests and tools that synthesise an
+activation are its producer and call `pulsar_gpu_mxfp8_act_cache_encode_f32`
+themselves.
+
+## 4. One authority per fact.
+
+A layout, a cap, a stride, a threshold lives in exactly one place and is
+read from there.  Two copies "kept in sync by hand" are a bug that has not
+fired yet.  Prose that says "must match X exactly" is the tell.
+
+*Why:* the scale swizzle, the neutral-rows cap (drifted once: 8 vs 16), the
+frontier counters (a fix landed on one of two copies, L133), the A8
+kernels' group stride (used the call's row count where the slot's was
+meant).
+
+*How enforced:* replace the copy with a call or a shared constant; where a
+runtime invariant must hold between two places, assert it in code once
+(`ft_layouts_match`, the static_asserts on the caps), never in a comment.
+
+## 5. An instrument proves it ran the lane.
+
+A gate, a sweep or a profile is evidence only if its log shows WHICH arm
+executed.  Every measurement names the lane (armed/unarmed, slot present or
+not, which kernel) and the tree it ran on (sha asserted, clean asserted,
+binary mtime after the build stamp).
+
+*Why:* the L151 sweep measured the f32 kernel for weeks; five instruments
+measured nothing after L118 moved production to the batch lane (L129); the
+reference gate skips silently without `PULSAR_REF_DIR`; a tracked gate
+binary passed for a day after its source stopped compiling.
+
+*How enforced:* once-per-shape announce lines for the path TAKEN (never for
+a miss); gate scripts assert sha + clean tree + binary freshness; when a
+format or lane migrates, the instruments migrate in the same row, and the
+row is not closed until they do.
+
+## 6. Delete the premise before building on it.
+
+Before a row's work starts, grep the code the row describes.  Rows go
+stale; comments go stale; a plan written last week describes last week's
+lane.
+
+*Why:* four rows in one day sent work at solved problems (2026-08-20); L151's
+10% premise described a lane that L149 had already changed; L145's "9-row
+step" was quoted for a week after the quench made it 3 rows.
+
+*How enforced:* the first entry of any increment states what the code does
+TODAY, with file:line, and where that differs from the row, the row is
+corrected first.
+
+## 7. Bit-exact is the default; fidelity is graded, never argued.
+
+A refactor is bit-identical or it is a numerics change.  A numerics change
+is graded against the B300 reference (`cuda-reference-gate` with
+`PULSAR_REF_DIR`) and lands only if it moves toward the source or Tyler
+accepts the move.  "It's the same math" is not evidence.
+
+*Why:* the norm+mix fusion looked equivalent and was 39% further from
+source; the byte gate once rejected a change that was closer to source
+because nobody graded it.
+
+*How enforced:* every landing says which of the two it is.  Bit-exact
+changes cite the passing byte gates; numerics changes cite the reference
+gate's per-depth table and, on the decode lane, the spec oracle's alpha.
+
+## 8. Measure at the shape production runs.
+
+Performance claims are made at the served lane's real row counts (drafting
+client: 3-6 rows; two clients: 6-12; three clients quench to 3-4; drafter
+off: 1) and with the production activation format armed.  Microbenchmarks
+that keep a weight L2-resident, or feed f32 where production feeds E4M3,
+are labelled as such.
+
+*Why:* L151-C won 1.4x at 16 rows and lost 4-10% in production; the nt
+kernels' "580 GB/s" was an L2 artefact.
+
+*How enforced:* `prod-ab2.sh` at 1/2/3 clients + drafter-off is the
+throughput oracle for any dense-step change; the sweep tool arms the slot.
+
+## 9. Fail closed, loudly, once.
+
+An engine that hits an impossible state stops the call and says exactly
+what was missing, once per shape.  It never returns a well-formed number
+from a different computation.  Warnings that fire per token are noise; a
+missing announce is a fact nobody can see; a refusal is a gate failure the
+battery reports.
+
+## 10. Landing discipline.
+
+Every landing: battery 25/25 on sparky at an asserted sha and clean tree,
+zero build warnings, doxygen zero warnings, the unit suite (in the battery
+since L158), and the ledger row updated in the same session.  Byte-exact or
+graded (rule 7).  Production A/B when the change touches a served kernel.
+Squash to one commit whose message says what was deleted as clearly as what
+was added.  Delete the topic branch when it lands; park a branch only with
+a row that says why and for how long.
+
+## Named exceptions to rule 1
+
+Three places let the same input take two paths on purpose.  Each is listed
+with the instrument that grades it; an exception without an instrument is a
+fallback and goes back under rule 1.  Adding to this list is a decision Tyler
+makes.
+
+1. **Warm fork / in-place continuation vs cold prefill.**  A request whose
+   token prefix matches a warm bank's frontier continues from that bank's KV
+   -- forked (`src/engine/session_banks.cpp:99-172`) or in place
+   (`src/engine/session.cpp:820-847`), routed in
+   `src/server/server_jobs.cpp:747` onward, kill switch `PULSAR_WARM_FORK` --
+   instead of re-prefilling it.  Off chunk-aligned cuts the KV bytes differ
+   from a cold prefill's: the continuation's chunks have different widths,
+   so its GEMMs take different shapes.  *Instruments:*
+   `tests/warm_fork_3way.sh` (lines 16-17 state the exception; the gate is
+   OUTPUT-TEXT identity of the branch replies across the cold, in-place and
+   forked routings) and `cuda-fork-gate` (`Makefile:475`,
+   `tests/bank_fork_gate`) for the chunk-aligned case, where the KV bytes
+   must match.
+
+2. **`PULSAR_CUDA_PREFILL_CHUNK`** (`src/engine/layers.cpp:22-29`): a test
+   knob for the prefill chunk width.  Chunk width changes GEMM shapes and so
+   cuBLASLt's algorithm choice; a prompt prefilled at chunk 1024 and at chunk
+   4096 does not produce the same KV bytes.  *Instrument:* the prefill byte
+   gate (`tests/prefill_bitexact_gate.cpp`, `make cuda-prefill-gate`) pins
+   its depths -- 512, 2048, 4096, 4102, 6144 -- at the default chunk of
+   4096; a run with the knob set is not a byte-gate run and says so.
+
+3. **`PULSAR_DSPARK_CONF_SCHED`** (`src/engine/session_spec.cpp:17-29`,
+   read at `:860`, `:954`, `:1981`; set by `tools/confhead/bench.sh:33`,
+   `collect.sh:45`, `smoke.sh:26`): a draft-schedule knob.  The confidence
+   head trims the verify batch to the drafts above tau, which changes WHICH
+   rows are drafted and verified -- never a committed row's numerics: verify
+   rows are decode rows, and every decode row takes the M-independent kernels
+   whatever the batch width (row kind chooses the arm, `src/pulsar_gpu.h`,
+   `pulsar_gpu_matmul_set_batch_decode_rows`), so a row's bytes do not depend
+   on how many drafts ride with it.  *Instruments:* `cuda-mixed-neutrality-gate` GATE 5/5R (a
+   run's rows batched == the same run alone, byte-identical, 1..16 rows) for
+   the per-row claim; the spec oracle (`make cuda-spec-sampling-gate`) grades
+   alpha at the default tau.
+
+## What "clean" means here
+
+Smaller.  One path per input.  No comment that describes a mechanism the
+reader cannot find in the code.  A gate for every lane production runs, and
+an announce line that proves it ran.  When in doubt between adding a guard
+and deleting a path: delete the path.
+# DeepSeek v4 model card synopsis
+
+This document extracts the most important information from the official
+DeepSeek-V4-Flash Hugging Face model card, with emphasis on facts that matter
+for local inference, Pulsar development, and benchmark interpretation.
+
+Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash
+
+## Model Family
+
+DeepSeek-V4 is a preview model family with two Mixture-of-Experts language
+models:
+
+| Model | Total parameters | Active parameters | Context length |
+|---|---:|---:|---:|
+| DeepSeek-V4-Flash | 284B | 13B | 1M tokens |
+| DeepSeek-V4-Pro | 1.6T | 49B | 1M tokens |
+
+Flash is the smaller and more efficient model. The model card says Flash-Max can
+approach Pro reasoning performance when given a larger thinking budget, while
+remaining behind Pro on pure knowledge and the most complex agentic tasks.
+
+## Architecture
+
+DeepSeek-V4 uses long-context compressed attention. The model card calls the
+hybrid design Compressed Sparse Attention (CSA) plus Heavily Compressed
+Attention (HCA). In Pulsar terms, each layer keeps a raw sliding-window KV cache
+for the latest 128 tokens. This is the high-resolution local context.
+
+After that raw window, the model uses layer-dependent compressed KV rows:
+
+| 0-based layer indexes | Pulsar ratio | Extra state | Meaning |
+|---|---:|---|---|
+| 0, 1 | none | none | Raw 128-token sliding window only |
+| even layers from 2 onward | 4 | compressed KV + indexer KV | One compressed row per 4 tokens, with an indexer selecting visible compressed rows |
+| odd layers from 3 onward | 128 | compressed KV | One compressed row per 128 tokens |
+
+So, after the first two layers, the model alternates ratio-4 and ratio-128
+compressed attention. A token in a compressed layer attends over both the raw
+latest-128-token window and the older compressed history. The compression here
+is time-axis compression: several token positions are pooled into one KV row.
+The attention rows still use the model attention/value dimensions, so raw and
+compressed rows can be consumed by the same mixed-attention computation.
+
+Ratio-4 layers are the selective compressed-attention layers. They maintain a
+second compressed stream for the indexer, and when the compressed history is
+larger than the configured top-k, Pulsar scores the compressed rows and selects up
+to 512 of them for attention. Ratio-128 layers are the heavily compressed path:
+they do not have the indexer stream and use the available ratio-128 compressed
+rows directly.
+
+Pulsar validates these details from the GGUF metadata. The relevant fixed
+implementation constants are:
+
+- Layers: 43
+- Raw sliding-window attention: 128 tokens
+- Indexer heads: 64
+- Indexer head dimension: 128
+- Indexer top-k: 512
+
+This is the practical reason the model can expose a 1M-token context without a
+standard full KV cache for every token in every layer. The model card reports
+that, at 1M tokens, DeepSeek-V4-Pro needs much less single-token inference
+compute and KV cache than DeepSeek-V3.2.
+
+The family also uses:
+
+- Manifold-Constrained Hyper-Connections (mHC), intended to improve signal
+  propagation stability across layers.
+- The Muon optimizer, used for faster convergence and training stability.
+- A post-training pipeline with domain expert cultivation followed by unified
+  consolidation via on-policy distillation.
+
+## Precision And Weights
+
+Official download entries include:
+
+| Model | Precision |
+|---|---|
+| DeepSeek-V4-Flash-Base | FP8 Mixed |
+| DeepSeek-V4-Flash | FP4 + FP8 Mixed |
+| DeepSeek-V4-Pro-Base | FP8 Mixed |
+| DeepSeek-V4-Pro | FP4 + FP8 Mixed |
+
+For the instruct models, the model card describes FP4 + FP8 Mixed as using FP4
+for MoE expert parameters and FP8 for most other parameters.
+
+## Reasoning Modes
+
+The instruct models support a non-thinking mode plus three reasoning-effort
+levels (restructured in the 0731 release):
+
+| Mode | Intended behavior | Output shape |
+|---|---|---|
+| Non-think | Fast, intuitive replies | `</think>` summary |
+| Low | Default thinking, no effort prefix | `<think>... </think>` summary |
+| High | Deliberate reasoning for harder tasks | Effort prompt prefix plus thinking and summary |
+| Max | Largest reasoning budget | Stronger effort prompt prefix plus thinking and summary |
+
+The model card recommends a 384K-token output budget for the high and max
+levels.
+
+## Important Flash Benchmarks
+
+### DeepSeek-V4-Flash Across Reasoning Modes
+
+| Benchmark | Non-Think | High | Max |
+|---|---:|---:|---:|
+| GPQA Diamond Pass@1 | 71.2 | 87.4 | 88.1 |
+| MMLU-Pro EM | 83.0 | 86.4 | 86.2 |
+| SimpleQA-Verified Pass@1 | 23.1 | 28.9 | 34.1 |
+| Chinese-SimpleQA Pass@1 | 71.5 | 73.2 | 78.9 |
+| HLE Pass@1 | 8.1 | 29.4 | 34.8 |
+| LiveCodeBench Pass@1 | 55.2 | 88.4 | 91.6 |
+| HMMT 2026 Feb Pass@1 | 40.8 | 91.9 | 94.8 |
+| IMOAnswerBench Pass@1 | 41.9 | 85.1 | 88.4 |
+| SWE Verified Resolved | 73.7 | 78.6 | 79.0 |
+| Terminal Bench 2.0 Acc | 49.1 | 56.6 | 56.9 |
+| MCPAtlas Pass@1 | 64.0 | 67.4 | 69.0 |
+| Toolathlon Pass@1 | 40.7 | 43.5 | 47.8 |
+
+### DeepSeek-V4-Flash-Base
+
+The base-model table reports these Flash-Base scores:
+
+| Benchmark | Shots | Score |
+|---|---:|---:|
+| SuperGPQA EM | 5-shot | 46.5 |
+| MMLU EM | 5-shot | 88.7 |
+| MMLU-Pro EM | 5-shot | 68.3 |
+| Simple-QA verified EM | 25-shot | 30.1 |
+| HumanEval Pass@1 | 0-shot | 69.5 |
+| GSM8K EM | 8-shot | 90.8 |
+| LongBench-V2 EM | 1-shot | 44.7 |
+
+The model card reports SuperGPQA for the base model table, not in the instruct
+reasoning-mode comparison table.
+
+## Chat Template And Encoding
+
+The release does not use a Jinja chat template as the source of truth. The
+official prompt renderer is the Python code in
+`encoding/encoding_dsv4.py`, with examples and tests in the same `encoding`
+directory:
+
+- https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/raw/main/encoding/encoding_dsv4.py
+- https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/raw/main/encoding/test_encoding_dsv4.py
+
+The important special tokens are:
+
+| Purpose | Token |
+|---|---|
+| Beginning of sequence | `<｜begin▁of▁sentence｜>` |
+| End of assistant turn | `<｜end▁of▁sentence｜>` |
+| User turn prefix | `<｜User｜>` |
+| Assistant turn prefix | `<｜Assistant｜>` |
+| Latest reminder prefix | `<｜latest_reminder｜>` |
+| Thinking start | `<think>` |
+| Thinking end / non-thinking marker | `</think>` |
+| DSML tool markup marker | `｜DSML｜` |
+
+The renderer accepts `system`, `user`, `assistant`, `tool`,
+`latest_reminder`, and `developer` roles. The `developer` role is described in
+the Python comments as an internal search-agent role, not as a normal public
+chat role.
+
+Normal chat mode starts with the BOS token, then system text if present, then
+alternating user and assistant markers. In non-thinking chat mode, a new
+assistant generation is opened with:
+
+```text
+<｜Assistant｜></think>
+```
+
+That immediate `</think>` tells the model to skip hidden reasoning and produce
+the visible answer. In thinking mode, a new assistant generation is opened with:
+
+```text
+<｜Assistant｜><think>
+```
+
+Completed assistant thinking turns are rendered as reasoning content inside
+`<think>...</think>`, followed by the visible answer and the EOS token.
+
+By default, the Python renderer drops earlier assistant reasoning content before
+the last user message. If tools are present on any message, it disables that
+reasoning drop and keeps the full reasoning/tool context. In thinking mode the
+0731 renderer prepends a fixed instruction prefix for `reasoning_effort=high`
+or `max` before the first rendered message (`low`, the default, adds nothing;
+the `high` text is what the original release used for `max`, and 0731's `max`
+text is new and stronger).
+
+Tool definitions are passed in OpenAI-compatible function schema form, but the
+model is instructed to emit DSML. A tool call is rendered as a DSML
+`tool_calls` block containing one or more `invoke` entries, each with named
+parameters. Parameters carry a `string="true"` flag for raw strings and
+`string="false"` for JSON values such as numbers, booleans, arrays, or objects.
+
+DeepSeek-V4 does not render standalone `tool` role messages. The Python
+preprocessor converts tool results into user content blocks and renders each
+result as:
+
+```text
+<tool_result>...</tool_result>
+```
+
+Tool-result bodies are rendered as raw text. Literal `<`, `>`, and `&` from
+file contents or shell output are preserved; only the exact closing sentinel
+`</tool_result>` is escaped so the wrapper cannot be terminated by data.
+
+When there are multiple tool results, the renderer sorts them to match the
+order of the preceding assistant tool calls.
+
+The same script also defines special task tokens for internal quick tasks such
+as title generation, search-query generation, action selection, authority
+classification, domain classification, and URL-read decisions. Those are
+separate from normal chat/tool rendering.
+
+## Local Running Notes
+
+The model card lists vLLM and SGLang examples for OpenAI-compatible serving.
+For local deployment, it recommends:
+
+- `temperature = 1.0`
+- `top_p = 1.0`
+- A 384K-token output budget for the high and max reasoning-effort levels
+
+These are deployment recommendations from the model card, not necessarily the
+same settings used for deterministic benchmarking. Pulsar keeps `top_p=1.0` but
+adds a local `min_p=0.05` default to avoid sampling tokens whose probability is
+far below the best token.
+
+## Licensing
+
+The repository and model weights are licensed under the MIT License.
+
+## Citation
+
+The model card cites:
+
+```bibtex
+@misc{deepseekai2026deepseekv4,
+      title={DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence},
+      author={DeepSeek-AI},
+      year={2026},
+}
+```
+# QA Before Releases
+
+This is the release gate for Pulsar.  Run it before tagging or pushing a
+release build.  The goal is not to prove every code path exhaustively; it is to
+exercise the paths that have historically regressed: CUDA graph inference,
+disk KV cache, server APIs, and the agent TUI/tool state
+machine.
+
+This fork is CUDA-only and targets the DGX Spark (GB10, ~128 GB unified
+memory); all release testing happens on that host.  Do not run multiple huge
+model processes at the same time.  Record the commit, GGUF file, context size,
+and any non-default flags for every manual run.
+
+## 1. Repository And Build Sanity
+
+- Start from a clean tree except intentional release notes:
+  `git status --short`.
+- Build the release binary:
+  `make clean && make cuda-spark` (this builds **only `pulsar-server`** — the
+  shipped release).  Build the development tools by name with the same arch:
+  `make pulsar pulsar-agent pulsar-bench pulsar-eval CUDA_ARCH=sm_120f`.
+- Run whitespace checks before committing:
+  `git diff --check`.
+- Confirm `./pulsar --help`, `./pulsar-server --help`, and `./pulsar-agent --help` render
+  cleanly, with readable section colors and no broken wrapping.
+
+## 2. Core Regression Tests
+
+- Run the default suite:
+  `make test` (also the first entry of `make gates`, as `unit-test-gate`,
+  since 2026-09-03 -- a battery run covers it).
+- Run the CUDA smoke regression:
+  `make cuda-regression`.
+- Run the vector checks explicitly after any tokenizer, template, KV, kernel,
+  quantization, or prompt-rendering change:
+  `./pulsar_test --logprob-vectors`
+  (the local golden-vector leg was retired 2026-09-02, L156; the reference
+  gate `make cuda-reference-gate` with `PULSAR_REF_DIR` set is the fidelity
+  oracle).
+- Run server tests when HTTP, SSE, prompt rendering, cache policy, or tool-call
+  replay changed:
+  `./pulsar_test --server`.
+- Build and run the agent unit tests: `make pulsar_agent_test CUDA_ARCH=sm_120f
+  && ./pulsar_agent_test` (they are not part of `make test`).
+- Run `./pulsar-eval --self-test-extractors`.
+
+### CUDA gates ledger
+
+**Run them with one command:**
+
+```
+make gates FRONTIER_MODEL=/srv/models/<artifact>.gguf
+```
+
+It runs every gate below, continues past failures so one break does not hide
+the rest, prints a PASS/FAIL summary, and exits non-zero if any failed.
+
+> ⚠ **Do not hand-run these individually and tick them off.** That is what this
+> checklist used to say, and on 2026-08-14 a sweep found the prefill gate
+> rotted (its baseline ref predated type-43, so it could not run *at all*), two
+> attention gates uncompilable since an API parameter was removed that morning,
+> and a real production bug — fp16 attention breaking mixed-batch prefill —
+> that had shipped six days earlier.  **None of it was visible to the product
+> build.**  A gate nobody invokes is a gate that silently stops compiling.
+>
+> Two rules that follow:
+> * After removing or changing any engine API parameter, run `make gates`.
+>   Gates are separate targets; the product build will not tell you.
+> * Re-baseline `PREFILL_BASELINE_REF` whenever a numerics change **ships**, and
+>   only then.  Anchoring it before a deliberate precision change makes the gate
+>   fail forever, and a gate that always fails is one you learn to ignore.
+
+The individual targets, all needing the GB10 and (except the first two) the
+model.  Record pass/fail against the release commit:
+
+- `make cuda-regression` — modelless kernel smokes.
+- `make cuda-attn-gates` — fp16 attention kernel oracle (dense, compressed,
+  indexed, decode-batch, one-row), banked cross-session KV-leak isolation
+  (modelless).
+- `make cuda-prefill-gate` — full-vocab frontier byte-compare against the
+  `PREFILL_BASELINE_REF` blob.  **The baseline ref must postdate type-43**
+  (the aligned-MMQ pre-store): a pre-type-43 baseline build cannot load the
+  shipped artifact and the gate cannot certify the release.  Rebuild the blob
+  with `make cuda-prefill-gate-baseline` after bumping the ref.
+- `make cuda-evict-restore-gate` and `make cuda-fork-gate` — bank evict/restore
+  bit-identity and fork==cold oracle (covers warm-fork routing).  Since L115
+  the fork validators compare BYTES, not token ids, so this gate also covers
+  forking a conversation onto its own history across token-boundary seams.
+- `make cuda-rewind-gate` — compressor frontier position-truth across ghost
+  rewinds (L120): counters equal pos/ratio at every mod-4 residue and the
+  ratio-128 boundary, plus the value leg (a ghost rewind must not contaminate
+  re-emitted comp rows) and the ratio-128 undo walk (L124).
+- `make cuda-mseq-rewind-gate` — a rewind must clamp BOTH frontier
+  representations. L120 clamped the scalars; the served path validates the next
+  multiseq step against the PER-BANK slots (ms_n_comp[bank]), which rewind did
+  not touch, so a rewound bank decoded again with no bank switch-away between
+  was rejected with production's own "frontier not position-true". Reproduces
+  that deterministically and asserts both copies agree.
+- `make cuda-seam-gate` — token-boundary seams keep the live KV (L115).
+  Discovers a seam pair from the model's own vocabulary, then pins the byte
+  walk, the sync rescue, the shorter-echo shape, and a fork across seams.
+  Needs `PULSAR_MSEQ_BANKS>=2` for its fork leg (the target sets it).
+- `warm_fork_3way` / `warm_partial_fork_3way` (`make warm-fork-3way
+  warm-partial-fork-3way`) — server-level warm-fork determinism.
+- `make cuda-frontier-gate`, `make cuda-multiseq-gate`,
+  `make cuda-multiseq-gate-nodspark` — multiseq isolation and throughput.
+- `make cuda-bank-spec-gate`, `make cuda-accounting-gate`,
+  `make cuda-algo-stability-gate` — bank/spec interaction, admission
+  accounting exactness, cuBLASLt M-independence.
+- `make cuda-mixed-prefill-gate`, `make cuda-mixed-neutrality-gate` — mixed
+  decode+prefill batching neutrality.
+- `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
+
+## 3. Flash Inference Path
+
+Use the normal Flash GGUF that 128 GB users run.
+
+- One-shot CLI:
+  `./pulsar -m ds4flash.gguf --ctx 32768 --nothink -p "Explain C pointers in one paragraph."`
+- Thinking and max-thinking prompts:
+  run one short coding prompt with default thinking and one with max thinking.
+- Long-context recall:
+  run the long name/number or archive recall test used for catching attention
+  and MoE routing drift.
+- Logprob sanity:
+  `./pulsar --nothink --temp 0 --dump-logprobs /tmp/ds4-logprobs.json --logprobs-top-k 20 -p "..."`
+  and inspect that the continuation is sane.
+- Speed sanity:
+  run `pulsar-bench` with `speed-bench/promessi_sposi.txt` and compare prefill,
+  generation speed, and KV bytes with the last known good numbers for the same
+  machine.
+- Run a longer prompt that exercises routed experts past a few thousand tokens.
+
+## 4. Disk KV Cache
+
+Disk KV cache bugs are high impact for server users.
+
+- Start the server with:
+  `./pulsar-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192`.
+- Run the same request twice and verify the second request hits cache.
+- Fill the cache enough to trigger eviction; verify the newly-written entry is
+  not evicted and useful anchors are retained.
+- Test rejection of incompatible checkpoints when model, quantization, context,
+  or raw/compressed KV layout changes.
+- Test stripped agent sessions: `/strip <id>` then `/switch <id>` should rebuild
+  by prefill and render sane history.
+
+## 5. Server APIs
+
+The server must keep compatibility across OpenAI, Responses, and Anthropic
+clients.
+
+- `GET /v1/models/deepseek-v4-flash` and `GET /v1/models/deepseek-v4-pro`
+  should both serve whichever GGUF is loaded.
+- Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
+- Test SSE streaming with thinking enabled and disabled.
+- Test keepalive during long prefill and confirm clients do not time out.
+- Test `--trace` and confirm rendered prompts, cache decisions, generated text,
+  and tool-parser events are useful without leaking unrelated state.
+- `curl /metrics` and confirm the Prometheus page renders: spec-decode
+  acceptance, token totals, request latency, per-slot generation phase, pool
+  churn and admission pressure counters all present and moving after a request.
+- Reasoning effort: send Anthropic requests at `low`, `high`, and `max` effort
+  and confirm the reported `prompt_tokens` reflects the three distinct effort
+  prefixes (and that `xhigh` maps to `max`).
+- web_search smoke (needs a reachable SearXNG endpoint): start with
+  `--web-search-url`, send a Claude-Code-style request advertising
+  `web_search_20250305`, and confirm the model's search call executes, results
+  splice into the answer, and a second turn replays the search block from
+  cache. Without the flag, confirm the tool entry is dropped and the model
+  never emits a dead search call.
+
+## 6. pulsar-agent
+
+The agent is the most stateful component.  Test it manually, not only by build.
+
+- Startup banner, status bar, help, `/save`, `/list`, `/switch`,
+  `/history`, `/compact`, `/new`, `/del`, and `/strip`.
+- Ctrl+C during generation, during prefill, during a web fetch, and during a
+  long tool call.  After `Stopped by user`, typing a new prompt must work.
+- Queue messages while the model is busy.  Queued messages must not skip tool
+  execution; after tool results, the queued user text must be provided.
+- Read/search/edit/write tools:
+  create a temp project, ask for edits, verify old/new and `[upto]` anchored
+  edits fail safely on ambiguous matches and do not require retyping whole files.
+- Real coding edit loop:
+  delete `/tmp/mymandel`, ask pulsar-agent to create a small C ASCII Mandelbrot
+  program there, build and run it, then in a second user turn ask for a small
+  modification that should naturally use the edit tool, such as changing the
+  ASCII character ramp or output dimensions.  Verify the agent edits the
+  existing file instead of rewriting the whole project, and that the final
+  program still builds and runs.
+- Bash tools:
+  test short output, large output truncation, non-zero exit output, long-running
+  jobs, `bash_status`, and `bash_stop`.
+- TUI:
+  test multiline prompt editing, history navigation, queued prompt display,
+  status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
+  and SSH/remote terminal flicker.
+
+## 7. Download Script And Model Files
+
+- Test `download_model.sh` in a temporary directory so local weights are not
+  overwritten.
+- Test one Flash target enough to verify URL, resume, Hugging Face CLI/curl
+  behavior, file naming, and symlink policy.
+- Verify legacy removed targets fail clearly.
+- Verify README model names match the script and Hugging Face repository.
+- Run the artifact-type gate on every shipped gguf:
+  `python3 gguf-tools/audit_artifact_types.py MODEL.gguf`
+  It fails if any tensor ships in a PLAIN type that has a pre-formatted twin
+  (16 -> 42/43, 38 -> 41, 39 -> 40). Those are pure byte permutations, so the
+  plain form is never *wrong* -- the engine just converts at first use and
+  keeps a second device copy beside the mmap, silently. The drafter shipped
+  0.429 GiB of type-38 double-store this way from its first build until
+  2026-08-12, because it is built from a separate pinned type table
+  (`gguf-tools/dspark_type_flags.txt`) that was never revisited when the main
+  model moved to MXFP8_LT. Use `--census` for the full type breakdown.
+
+## 8. Performance
+
+- Run `pulsar-bench` on the release machine and compare with tracked CSV baselines.
+- Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
+  match expectations for 32k, 100k, and any release-advertised context size.
+
+### Client-side serving gates
+
+These talk HTTP to an already-running `pulsar-server`, because they measure what
+a client experiences rather than what the engine reports about itself.  Start the
+server with `--no-kv-disk` for all three: a warm disk checkpoint skips prefill
+outright, so TTFT and wall-clock t/s from a warm run cannot be compared against a
+cold one.  Each writes a machine-readable JSON record — keep it with the release
+notes, since a number with no run record is not a baseline.
+
+- `make decode-floor-gate` — five workloads (Python, Rust, TypeScript, CUDA, Go)
+  at 512 tokens, concurrency 1.  **Scored on the worst workload, not the mean**:
+  averaging one bad prompt shape against four healthy ones produces a number that
+  still looks fine while the regression ships.  Fails (exit 1) when the worst
+  workload drops more than `--tolerance` (default 10%) below the recorded floor.
+
+  The floor is ours, captured with `make decode-floor-baseline` on a known-good
+  build — not a competitor's published figure, which was measured on a different
+  harness, depth and sampler and is therefore not a floor.  Re-record it
+  deliberately when a change is *expected* to move decode, and say so in the
+  release notes; never re-record it to make a red gate go green.
+
+- `make sse-decode-bench` — decode rate measured between SSE delta arrivals,
+  reported **alongside** the wall-clock rate rather than replacing it.  When the
+  two disagree the gap is the finding: a slot starved behind another job's
+  prefill shows a healthy inter-delta rate and a poor wall-clock one.
+
+- `make context-coherence-probe` — plants three facts at the beginning, middle
+  and end of a long context and asks for them back in free prose, with no grammar
+  mask or constrained decoding (under a mask a wrong answer still comes out
+  structurally perfect, so the probe cannot fail in the way that matters).  A
+  checksum question requiring all three values at once guards against partial
+  latching.  Fails (exit 1) if any depth misses a fact or the sum.
+
+## 9. Release Sign-off
+
+Do not sign off until:
+
+- `make test` and `make cuda-regression` passed on the GB10 host.
+- The CUDA gates ledger (section 2) passed against the release commit and the
+  shipped artifact, with a post-type-43 prefill-gate baseline.
+- The Flash inference path (CLI, thinking modes, long-context recall) was
+  exercised.
+- Disk KV cache was exercised.
+- Server API streaming was exercised.
+- Agent interruption and tool loops were exercised manually.
+- Speed is within expected variance for the same hardware and model.
+- `make decode-floor-gate` passed against the recorded floor, and its JSON run
+  record is filed with the release notes.
+- Any skipped item is written down with the reason.

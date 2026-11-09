@@ -1,5 +1,67 @@
 # Vendored llama.cpp mmq kernels
 
+> ## ⚠ 2026-08-18: THE VENDORED KERNELS ARE GONE. READ THIS FIRST.
+>
+> **10,135 lines across 17 files were deleted** (ledger L066).  Everything below
+> that describes `mmq.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`,
+> `vecdotq.cuh`, `mmvq.*`, `quantize.*` or the `mmq-config-*` family is
+> HISTORICAL — those files no longer exist.
+>
+> **Why.** The routed experts moved to E4M3 activations, and the IQ2 GEMM now
+> unpacks weights to E4M3 in-register and issues a block-scaled MXFP8 MMA
+> (`ds4_mmq_d2r.cu`, ours).  The path that could still have reached upstream's
+> int8 `mul_mat_q` makes D2R a hard requirement and *fails closed*, so the
+> vendored kernel family became unreachable **by construction**.  Verified
+> before deletion with the linker's own view: `mul_mat_q_case` had 3 definitions
+> and **0 undefined references**, as did `ds4_mmq_q8_0_aligned_dense_vec`,
+> `ds4_mmq_iq2_xxs_aligned_bytes` and `quantize_mmq_q8_1_cuda`.
+>
+> **What is still vendored, and it is now a short list:**
+>
+> | file | why it survives |
+> |---|---|
+> | `mma.cuh` | `ggml_cuda_mma::tile` / `load_ldmatrix`, used by our D2R GEMM (trimmed 2026-08-19 to the live slice: 1,456 -> 241 lines; no longer byte-identical to the pin) |
+> | `mmid.cu` + `mmid.cuh` | `#include`d by `ds4_mmid.cu` because upstream's `launch_mm_ids_helper<N>` is file-static (carries ds4 patches) |
+> | `ggml-common.h` | `QK8_1` and the `iq2xxs_grid` table (trimmed to 103 lines) |
+> | `ds4_cuda_env.cuh` | the reachable extract of upstream's `common.cuh` (derived work) |
+>
+> The `ggml.h` / `ggml-impl.h` / `ggml-cuda.h` redirect headers and `vendors/`
+> are gone too (2026-08-19).  The adapter that remains is ours:
+> `ds4_ggml_stubs.{h,cu}`, `ds4_mmq.{h,cu}`, `ds4_mmid.*`, `ds4_mmq_d2r.*`,
+> `ds4_act_block.cuh`, `ds4_quantize_e4m3.cu`, and the EXL3 / Tessera files
+> beside them (`exl3_moe*`, `ds4_exl3_*`, `qwen_exl3_dense_prefill.cu`,
+> `pulsar_tessera.*`; Tessera's own note is `VENDOR-TESSERA.md`).
+>
+> **Everything from "File inventory" down to "pulsar-side provenance" is the
+> as-imported record** (2026-08-07 .. 2026-08-13): file names, line counts, the
+> testing matrix and the performance table describe the tree as vendored, not
+> as it is now.
+>
+> **`common.cuh` and `unary.cuh` are GONE (2026-08-18, L066 step 3.)**  `unary.cuh`
+> was 114 lines of declarations for functions we never implemented or called --
+> its only consumer, `mmvq.cu`, was deleted in step 2, and after that nothing but
+> this document referenced it.  `common.cuh` was 1,669 lines held open by
+> **nineteen** symbols, and the two that mattered were `ggml_backend_cuda_context`
+> and `ggml_cuda_pool_alloc`: the MoE entries took per-call scratch from the ggml
+> pool.  They now take it from the engine's own arena on a dedicated scratch slot
+> (`CUDA_SCRATCH_MMQ` -- the slot exists because the MoE launcher holds an arena
+> across the call, so sharing one region would alias live buffers).  With the pool
+> gone the remaining surface is small enough to state: device info, `CUDA_CHECK`,
+> five constants, two arch predicates, two warp reduces and `memcpy_1` -- and it
+> now lives in `ds4_cuda_env.cuh` (297 lines today), which is still derived work and
+> still tracked below.
+>
+> **Constants that outlived their files** now live in `ds4_act_block.cuh`:
+> `block_mx_act_mmq` (renamed from `block_q8_1_mmq`; it holds E4M3, not q8_1),
+> `DS4_ACT_BLOCK_VALS` (was `QK8_1_MMQ`), `DS4_ACT_QUANT_BLOCK` (was
+> `CUDA_QUANTIZE_BLOCK_SIZE_MMQ`).  `MMQ_DP4A_MAX_BATCH_SIZE` survived here until
+> L321, read by `ds4_mmq_should_use`'s pre-Turing knee; that gate now asks only
+> whether the device has the sm_12x block-scaled MMA, and the constant, the
+> compiled-arch fold and the turing/fp16 MMA predicates are deleted with it.
+>
+> **A re-vendor is now much smaller, and the rename conflict noted below is
+> moot** for `mmq.cuh` and `quantize.cu` — both are deleted.
+
 This directory contains source files copied verbatim from
 [llama.cpp's `ggml-cuda` backend](https://github.com/ggml-org/llama.cpp/tree/master/ggml/src/ggml-cuda),
 plus a thin ds4-side adapter (`ds4_ggml_stubs.{h,cu}` and `ds4_mmq.{h,cu}`)
@@ -41,9 +103,10 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 | `mmid.cu`             | `ggml/src/ggml-cuda/mmid.cu`                 | verbatim                                                                 |   164 |
 | `mmvq.cuh`            | `ggml/src/ggml-cuda/mmvq.cuh`                | patched (Step 6): `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | ~36 |
 | `mmvq.cu`             | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | 1163 |
-| `unary.cuh`           | `ggml/src/ggml-cuda/unary.cuh`               | verbatim (needed by `mmvq.cu` for inline GLU epilogues)                  |   114 |
-| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | verbatim                                                                 |  1489 |
-| `ggml-common.h`       | `ggml/src/ggml-common.h`                     | verbatim                                                                 |  1900 |
+| ~~`unary.cuh`~~       | ~~`ggml/src/ggml-cuda/unary.cuh`~~           | **DELETED 2026-08-18**: its consumer `mmvq.cu` went in L066 step 2, after which nothing included it | — |
+| ~~`common.cuh`~~      | `ggml/src/ggml-cuda/common.cuh`              | **DELETED 2026-08-18**: replaced by `ds4_cuda_env.cuh`, which carries the nineteen live symbols. Upstream's NVIDIA arms verbatim; the AMD/HIP/MUSA halves dropped as unreachable (`cc` is read from the device, and we run GB10) | — |
+| `ds4_cuda_env.cuh`    | `ggml/src/ggml-cuda/common.cuh` (extract)    | the reachable subset of `common.cuh`; see its header for exactly what was dropped | 256 |
+| `ggml-common.h`       | `ggml/src/ggml-common.h` (extract)           | **TRIMMED 2026-08-18**: an empty-shim compile of every built MMQ TU found exactly two things referenced -- `QK8_1` and the `iq2xxs_grid` table. The table is carried BYTE-IDENTICAL (diffed); the other ~1,600 lines were block layouts and grids for quant types this engine does not run. ⚠ the table is EMITTED, not declared -- it needs `GGML_COMMON_IMPL_CUDA` defined before the include, and vanishes silently without it |   103 |
 | `vendors/cuda.h`      | `ggml/src/ggml-cuda/vendors/cuda.h`          | verbatim                                                                 |    28 |
 | `ggml.h`              | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
 | `ggml-impl.h`         | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
@@ -71,7 +134,7 @@ Symbols the vendored files reference, and how they resolve in this directory:
 |------------------------------------------------|--------------------------------------------------------------------------------------------------|
 | `GGML_ASSERT`, `GGML_ABORT`, `GGML_UNUSED`     | Macros in `ds4_ggml_stubs.h`                                                                     |
 | `GGML_PAD`, `GGML_UNUSED_VARS`                 | Macros in `ds4_ggml_stubs.h`                                                                     |
-| `GGML_CUDA_CC_*` constants                     | Defined in vendored `common.cuh`                                                                 |
+| `GGML_CUDA_CC_*` constants                     | Defined in `ds4_cuda_env.cuh` (the five still referenced)                                        |
 | `GGML_TYPE_*` enum values                      | Defined in `ds4_ggml_stubs.h::enum ggml_type`                                                    |
 | `GGML_CUDA_MAX_DEVICES`, `GGML_CUDA_NAME`      | Macros in `ds4_ggml_stubs.h`                                                                     |
 | `GGML_MAX_DIMS`, `GGML_MAX_SRC`                | Macros in `ds4_ggml_stubs.h`                                                                     |
@@ -81,10 +144,10 @@ Symbols the vendored files reference, and how they resolve in this directory:
 | `ggml_cuda_info()`                             | Singleton in `ds4_ggml_stubs.cu`, populated via `cudaGetDeviceProperties`                        |
 | `ggml_cuda_get_device`, `ggml_cuda_set_device` | Thin wrappers in `ds4_ggml_stubs.cu`                                                             |
 | `ggml_time_us`                                 | `std::chrono::steady_clock` in `ds4_ggml_stubs.cu`                                               |
-| `ggml_cuda_pool`, `ggml_cuda_pool_alloc`       | Defined in vendored `common.cuh`. Concrete `ds4_naive_pool` subclass in `ds4_ggml_stubs.cu`      |
-| `ggml_backend_cuda_context`                    | Defined in vendored `common.cuh`. `new_pool_for_device` and `~dtor` provided in `ds4_ggml_stubs.cu` |
+| ~~`ggml_cuda_pool`, `ggml_cuda_pool_alloc`~~   | **GONE 2026-08-18**: MMQ scratch is the `CUDA_SCRATCH_MMQ` arena slot; `ds4_naive_pool` deleted   |
+| ~~`ggml_backend_cuda_context`~~                | **GONE 2026-08-18**: existed only to hand out `pool()`                                            |
 | `ggml_tensor`                                  | Forward declaration in `ds4_ggml_stubs.h`. Never dereferenced - only held as pointer.            |
-| `ggml_glu_op`                                  | Enum stub in `ds4_ggml_stubs.h` (fusion args present in common.cuh but unused by ds4)            |
+| `ggml_glu_op`                                  | Enum stub in `ds4_ggml_stubs.h` (unused by ds4; kept so the stub header compiles)                |
 | `CUDA_CHECK`, `CUBLAS_CHECK`                   | Macros in `ds4_ggml_stubs.h`                                                                     |
 | `ggml_cuda_launch_mm_ids_helper`               | Defined in vendored `mmid.cu`                                                                    |
 | `ggml_cuda_should_use_mmq`                     | Defined in vendored `mmq.cu` - **we re-implement in `ds4_mmq.cu`** since we don't vendor mmq.cu  |
@@ -105,17 +168,29 @@ Diffing every vendored file against pinned `5c0e946` shows we carry
 pair was previously documented; the `mmq.cuh` and `mmid` patches were not,
 which is exactly how a re-vendor turns into a surprise.
 
+⚠ **`block_q8_1_mmq` is renamed `block_mx_act_mmq` throughout (2026-08-18).**
+A pure rename — same fields, same 144-byte layout — but it WILL conflict on
+every re-vendor, so it is listed per file below.  It is worth the conflict: the
+routed-expert path stopped filling that struct with int8 q8_1 and now fills it
+with e4m3 bit patterns plus a ue8m0 byte in `d4[]` (see `ds4_quantize_e4m3.cu`),
+and the stale name cost real time — it was read as evidence that the MoE still
+ran q8_1 activations, and a whole scoping verdict was written on that mistake
+before Tyler caught it (ledger L065).  Upstream's name is correct upstream,
+where MMQ really does quantise activations to q8_1; in this fork it is not.
+
 | File            | ds4 delta vs pin | What it is |
 |-----------------|------------------|------------|
-| `mmq.cuh`       | +255 / −18 | **(a)** `load_tiles_q2_K_soa` and `load_tiles_iq2_xxs_soa` — aligned-SoA twins of upstream's `load_tiles_q2_K` / `load_tiles_iq2_xxs`, reading the weight-server artifact (P4 Inc3).  **(b)** the `x_soa` / `soa_blocks` fields on `mmq_args` plus the `if constexpr (type == …) { if (x_soa != nullptr) … }` dispatch that selects them.  **(c)** a `DS4_CUDA_MMQ_X_MAX` env clip (Step-4 experiment hook). |
+| `mmq.cuh`       | +255 / −18 | **(a)** `load_tiles_q2_K_soa` and `load_tiles_iq2_xxs_soa` — aligned-SoA twins of upstream's `load_tiles_q2_K` / `load_tiles_iq2_xxs`, reading the weight-server artifact (P4 Inc3).  **(b)** the `x_soa` / `soa_blocks` fields on `mmq_args` plus the `if constexpr (type == …) { if (x_soa != nullptr) … }` dispatch that selects them.  **(c)** a `DS4_CUDA_MMQ_X_MAX` env clip (Step-4 experiment hook).  **(d)** `block_q8_1_mmq` RENAMED to `block_mx_act_mmq` (2026-08-18, rename only — layout and size are byte-identical). |
+| `quantize.cu`   | rename only | same `block_q8_1_mmq` → `block_mx_act_mmq` rename; `quantize_mmq_q8_1_cuda` itself has no live caller in this build. |
 | `mmid.cu`       | +177 / −2  | ds4 expert-routing entries |
 | `mmvq.cu`       | +26 / −4   | `mul_mat_vec_q_switch_type` promoted from `static`; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` |
 | `mmvq.cuh`      | +18 / −0   | matching prototype exposure + the same gate |
 | `mmid.cuh`      | +4 / −0    | prototype exposure for the above |
 
-Byte-identical to the pin, and therefore free to replace outright:
-`mma.cuh`, `vecdotq.cuh`, `quantize.cuh`, `quantize.cu`, `unary.cuh`,
-`common.cuh`, `ggml-common.h`, `vendors/cuda.h`.
+Byte-identical to the pin at the time of that measurement: `mma.cuh`,
+`ggml-common.h`, `vendors/cuda.h`, and the `ds4_cuda_env.cuh` extract.  Since
+2026-08-19 `mma.cuh` and `ggml-common.h` are trimmed extracts and
+`vendors/cuda.h` is gone, so none of them can be replaced outright any more.
 
 ## Re-syncing with upstream
 
@@ -142,7 +217,7 @@ diff /tmp/symbols.last /tmp/symbols.new
 #    plausible numbers, so compiling is not evidence of correctness.
 ```
 
-New `GGML_CUDA_CC_*`-style constants usually arrive via `common.cuh`, which we
+New `GGML_CUDA_CC_*`-style constants usually arrive via `common.cuh`, from which we now extract (`ds4_cuda_env.cuh`) and which we
 vendor, and need no shim change.  New `ggml_*` host helpers need
 `ds4_ggml_stubs.h` extended.
 
@@ -208,9 +283,8 @@ default `DS4_CUDA_MMQ_MOE_MIN_TOKENS=2` (legacy decode preserved):
 | 16384  | 357.99          | 1001.29    | **2.80x**  | 38.71            | 37.86       | 0.978x    |
 
 Sustained ~2.80x prefill speedup across the swept context range; gen
-within 2.5% of baseline (run-to-run variance).  See `local/docs/`
-(auto-round companion repo) for the full Phase 0-7 execution log,
-parity-test output, and detailed plan.
+within 2.5% of baseline (run-to-run variance).  (Measured by the fork this
+tree was imported from; its execution log is not in this repository.)
 
 ---
 
@@ -250,6 +324,19 @@ Result: routed IQ2 down 33.24 -> 8.98 ms/layer, and all IQ2 MoE moved from
 
 The llama.cpp files may be refreshed from upstream normally. The four files
 above carry pulsar-only additions that are **purely additive** (new symbols and
-one new dispatch branch); re-apply them after any re-sync.
-`gguf-tools/d2r_iq2_single_launch.inc` and `gguf-tools/patch_iq2_d2r_single.py`
-reproduce both mechanically.
+one new dispatch branch); re-apply them after any re-sync.  (The
+`gguf-tools/` scripts that reproduced them mechanically were archived with the
+GGUF tooling, tag `archive/gguf-tooling-2026-09-24`.)
+
+## Local modifications: `ds4_mmq.cu` -- the EXL3 arms left (task #44)
+
+`ds4_mmq_moe_impl` / `ds4_mmq_moe_pair_impl` serve the IQ2 D2R arm only.  The EXL3 routed experts (L245's
+`exl3_k2`, L251's `exl3_fused` and `act_bf16`, L266's `prompt` parameters, and the five `ds4_exl3_moe_*`
+wrappers that set them) moved to their own front door, `exl3_moe.cu`: it reuses `ds4_launch_mm_ids_helper`
+for the expert-sorted schedule (once per layer -- the down reads the gate / up schedule with the pair as its
+source row) and hands the producer's activation to the GEMV in place (no `ds4_gather_mmq_e4m3_cuda` staging,
+no id-map memsets: every consumer stops at `expert_bounds[E]`).
+
+**On re-sync:** nothing EXL3-specific is left in the vendored drivers; `mm_ids_helper`'s contract
+(`ids_src1` = source row, `ids_dst` = flat output row, picks below expert 0 sorting first) is what
+`exl3_moe.cu` relies on.

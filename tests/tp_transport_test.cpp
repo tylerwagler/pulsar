@@ -1,0 +1,918 @@
+/*
+ * TP transport loopback test (branch tensor_parallel, docs/tensor-parallel-
+ * port.md slice 3).  Host-only: no CUDA, no RDMA — the transport rides its
+ * full-duplex TCP fallback over 127.0.0.1 (libibverbs is absent on this box,
+ * so rdma_ok=0 and is_rdma() must be false).
+ *
+ * The test forks on the leader side: parent = LEADER (binds a free loopback
+ * port, learned via getsockname) and child = WORKER (dials it, port + role
+ * passed through the environment before fork).  Both sides build the same
+ * pulsar_tp_identity (43 layers / 4096 embd, the slab-layout test shape),
+ * hello must succeed, and every exchange is driven symmetrically by the same
+ * code path on both ranks: the leader writes a known f32 pattern into its
+ * gate-out slot, the pattern must land in the worker's in-slot (and vice
+ * versa), batch and big gates round-trip the same way, and one lockstep pair
+ * runs send_eval -> recv_command -> send_command_ack -> wait_command_ack.
+ *
+ * Exit: 0 on success, 1 on any mismatch; mismatches are counted in a global
+ * and printed per side before _exit so the parent can aggregate.
+ */
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+#include "tp/pulsar_tp.h"
+
+static int g_failures = 0;
+/* Set when run via the remote-leader/remote-worker subcommands: two processes
+ * on separate hosts (the pair) instead of the forked loopback default.  In
+ * that mode the transport may legitimately be RDMA, so the loopback-only
+ * "must be TCP" assert is relaxed. */
+static bool g_remote_mode = false;
+#define CHECK(cond, ...)                                                     \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            g_failures++;                                                    \
+            std::fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);        \
+            std::fprintf(stderr, __VA_ARGS__);                               \
+            std::fprintf(stderr, "\n");                                      \
+        }                                                                    \
+    } while (0)
+
+#define N_LAYER 43u
+#define N_EMBD 4096u
+#define TEST_CTX_SIZE 1048576u
+
+static pulsar_tp_identity test_identity(void) {
+    pulsar_tp_identity id = {};
+    id.gguf_bytes = 87000000000ull;
+    id.model_id = 3u;
+    id.n_layer = N_LAYER;
+    id.n_embd = N_EMBD;
+    id.n_vocab = 129280u;
+    id.quant_bits = 2u;
+    id.ctx_size = TEST_CTX_SIZE;
+    id.gate_slot_start = 0u;
+    id.gate_slot_step = 0u;
+    id.gates_per_token = 0u;   /* identity slot mapping: slot = (seq-1) % slots */
+    return id;
+}
+
+/* Deterministic f32 that is exactly representable and distinct per rank. */
+static float pat(int rank, uint32_t slot, uint32_t i) {
+    return (float)((int)(rank == 0 ? 100000 : 70000) + (int)slot * 1000 + (int)i);
+}
+
+/* A logits digest both ranks agree on (the protocol carries it; the ranks compute theirs on the device, L302). */
+static uint64_t agreed_digest(uint32_t slot) { return 0x9E3779B97F4A7C15ull * (slot + 1u); }
+
+static float *slot_at(uint8_t *base, const pulsar_tp_slab *s, uint32_t layer,
+                      uint32_t gate, uint64_t vec, int in) {
+    const uint64_t off = in ? pulsar_tp_slab_in_offset(s, layer, gate, vec)
+                            : pulsar_tp_slab_out_offset(s, layer, gate, vec);
+    return reinterpret_cast<float *>(base + off);
+}
+
+static void gate_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_slab *s,
+                       uint64_t vec, uint32_t layer_lo, uint32_t layer_hi,
+                       uint32_t sender) {
+    for (uint32_t layer = layer_lo; layer < layer_hi; layer++) {
+        for (uint32_t gate = 0; gate < PULSAR_TP_GATES_PER_LAYER; gate++) {
+            const uint64_t slot = (uint64_t)layer * PULSAR_TP_GATES_PER_LAYER + gate;
+            const uint64_t seq = slot + 1;   /* identity-schedule slot */
+            const uint32_t n = (uint32_t)(vec / sizeof(float));
+            float *out = slot_at(base, s, layer, gate, vec, 0);
+            float *in = slot_at(base, s, layer, gate, vec, 1);
+            if (rank == (int)sender)
+                for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, (uint32_t)slot, i);
+            else
+                std::memset(out, 0, vec);
+            if (!pulsar_tp_gate_exchange(tp, layer, gate, seq)) {
+                CHECK(0, "rank %d gate_exchange l=%u g=%u seq=%llu failed", rank,
+                      layer, gate, (unsigned long long)seq);
+                return;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                const float expected = (rank == (int)sender) ? 0.0f
+                    : pat(sender, (uint32_t)slot, i);
+                if (in[i] != expected) {
+                    CHECK(0, "rank %d gate l=%u g=%u i=%u: in %g want %g", rank,
+                          layer, gate, i, in[i], expected);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+static void batch_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_slab *s,
+                        uint64_t vec, uint32_t layer, uint32_t rows, uint64_t seq,
+                        uint32_t sender) {
+    const uint64_t bytes = (uint64_t)rows * vec;
+    const uint32_t n = (uint32_t)(bytes / sizeof(float));
+    float *out = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_out_offset(s, layer, vec));
+    float *in = reinterpret_cast<float *>(base + pulsar_tp_slab_batch_in_offset(s, layer, vec));
+    if (rank == (int)sender)
+        for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, layer, i);
+    else
+        std::memset(out, 0, bytes);
+    if (!pulsar_tp_batch_gate_exchange(tp, layer, rows, seq)) {
+        CHECK(0, "rank %d batch_gate_exchange l=%u rows=%u failed", rank, layer, rows);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const float expected = (rank == (int)sender) ? 0.0f : pat(sender, layer, i);
+        if (in[i] != expected) {
+            CHECK(0, "rank %d batch l=%u i=%u: in %g want %g", rank, layer, i,
+                  in[i], expected);
+            return;
+        }
+    }
+}
+
+static void big_phase(pulsar_tp *tp, int rank, uint32_t layer, uint64_t seq,
+                      uint64_t bytes, uint32_t sender) {
+    const uint32_t n = (uint32_t)(bytes / sizeof(float));
+    float *out = static_cast<float *>(std::calloc(n ? n : 1u, sizeof(float)));
+    float *in = static_cast<float *>(std::calloc(n ? n : 1u, sizeof(float)));
+    if (!out || !in) {
+        CHECK(out && in, "rank %d big_phase alloc %llu failed", rank,
+              (unsigned long long)bytes);
+        std::free(out);
+        std::free(in);
+        return;
+    }
+    if (rank == (int)sender)
+        for (uint32_t i = 0; i < n; i++) out[i] = pat(sender, 999, i);
+    if (!pulsar_tp_big_gate_exchange(tp, layer, seq, out, in, bytes)) {
+        CHECK(0, "rank %d big_gate_exchange l=%u bytes=%llu failed", rank, layer,
+              (unsigned long long)bytes);
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            const float expected = (rank == (int)sender) ? 0.0f : pat(sender, 999, i);
+            if (in[i] != expected) {
+                CHECK(0, "rank %d big l=%u i=%u: in %g want %g", rank, layer, i,
+                      in[i], expected);
+                break;
+            }
+        }
+    }
+    std::free(out);
+    std::free(in);
+}
+
+/* The pipelined identity check (L241 4g-2) leaves a worker's eval ack in the
+ * leader's CONTROL socket while the next step's data plane runs, so no data-
+ * plane exchange may read that socket.  Through protocol v26 the RDMA arming
+ * handshake did: the leader read the deferred ack as the peer's ARMED and
+ * refused the gate (L269).  Here the ack is sent, then a big gate and a batch
+ * gate run (each arms an RDMA receive window on an RDMA pair -- run this test
+ * in remote mode on an HCA to exercise that), then the leader settles the
+ * ack.  Over TCP it pins the same ordering. */
+static void acks_ahead_phase(pulsar_tp *tp, uint8_t *base, int rank, const pulsar_tp_slab *s,
+                             uint64_t vec) {
+    char err[256];
+    const uint64_t sid = 7171u;
+    const uint64_t digest = agreed_digest(71u);
+    if (rank == 0) {
+        CHECK(pulsar_tp_send_eval(tp, sid, 1, 21) == 1, "acks ahead: send_eval");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
+              "acks ahead: defer");
+    } else {
+        pulsar_tp_command cmd;
+        std::memset(&cmd, 0, sizeof(cmd));
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "acks ahead: worker recv: %s", err);
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack_digest(tp, sid, 0, digest) == 1, "acks ahead: worker ack");
+    }
+    big_phase(tp, rank, 2, 3, 262144ull, 1);
+    batch_phase(tp, base, rank, s, vec, 7, 2, 3, 0);
+    if (rank == 0) {
+        err[0] = 0;
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
+              "acks ahead: the deferred ack must still be in the socket, unread: %s", err);
+    }
+}
+
+static void lockstep_phase(pulsar_tp *tp, int rank) {
+    char err[256];
+    const uint64_t sid = 4242u;
+    if (rank == 0) {
+        if (!pulsar_tp_send_eval(tp, sid, 77, 1234)) {
+            CHECK(0, "leader send_eval failed");
+            return;
+        }
+        if (!pulsar_tp_wait_command_ack(tp, sid, "eval", err, sizeof(err)))
+            CHECK(0, "leader wait_command_ack failed: %s", err);
+    } else {
+        pulsar_tp_command cmd;
+        std::memset(&cmd, 0, sizeof(cmd));
+        if (!pulsar_tp_recv_command(tp, &cmd, err, sizeof(err))) {
+            CHECK(0, "worker recv_command failed: %s", err);
+            return;
+        }
+        CHECK(cmd.type == PULSAR_TP_FRAME_EVAL, "worker recv type %d want EVAL",
+              (int)cmd.type);
+        CHECK(cmd.session_id == sid, "worker recv session %llu want %llu",
+              (unsigned long long)cmd.session_id, (unsigned long long)sid);
+        CHECK(cmd.seq == 77, "worker recv seq %llu want 77",
+              (unsigned long long)cmd.seq);
+        CHECK(cmd.value == 1234, "worker recv token %d want 1234", cmd.value);
+        pulsar_tp_command_free(&cmd);
+        if (!pulsar_tp_send_command_ack(tp, sid, 0))
+            CHECK(0, "worker send_command_ack failed");
+    }
+}
+
+/* Round-trip every remaining control-plane frame type over the control
+ * socket, strictly ordered so neither side blocks ahead.  Leader sends,
+ * worker recv_commands + acks, except verify_commit and logits-half which
+ * are one-way. */
+static void frames_phase(pulsar_tp *tp, int rank) {
+    char err[256];
+    const uint64_t sid = 5150u;
+    if (rank == 0) {
+        const int toks[4] = { 1, 2, 3, 4 };
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 4) == 1, "leader send_sync");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)),
+              "leader sync ack: %s", err);
+
+        pulsar_tp_batch_item items[2] = { {1001, 3, 40, 61, 0}, {1002, 4, 41, 62, 0} };
+        CHECK(pulsar_tp_send_eval_batch(tp, items, 2) == 1,
+              "leader send_eval_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "eval_batch", err, sizeof(err)),
+              "leader eval_batch ack: %s", err);
+
+        /* The mixed step rides the SAME row payload on its own frame type
+         * (4e increment 5): rows only, no separate prefill prompt. */
+        pulsar_tp_batch_item m = { 2001, 5, 90, 71, 0 };
+        CHECK(pulsar_tp_send_mixed_batch(tp, &m, 1, 4u) == 1,
+              "leader send_mixed_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "mixed_batch", err, sizeof(err)),
+              "leader mixed_batch ack: %s", err);
+
+        /* v19 (L260 fusion): the fused step -- the same rows behind its shape --
+         * and the record of a chunk it prefilled, whose head index rides the
+         * token header's value (-1 = an intermediate chunk). */
+        pulsar_tp_batch_item f[3] = { {3001, 1, 50, 81, 0}, {3001, 2, 0, 82, 0}, {3001, 2, 1, 83, 0} };
+        pulsar_fused_shape shape;
+        std::memset(&shape, 0, sizeof shape);
+        shape.n_dec = 1;
+        shape.n_pf = 1;
+        shape.head_last[0] = 1;
+        CHECK(pulsar_tp_send_fused_batch(tp, f, 3, &shape) == 1, "leader send_fused_batch");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "fused_batch", err, sizeof(err)),
+              "leader fused_batch ack: %s", err);
+        const int chunk[2] = { 82, 83 };
+        CHECK(pulsar_tp_send_note_prefilled(tp, 3001, chunk, 2, 0) == 1, "leader send_note_prefilled");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "note_prefilled", err, sizeof(err)),
+              "leader note_prefilled ack: %s", err);
+        CHECK(pulsar_tp_send_note_prefilled(tp, 3001, chunk, 2, -1) == 1,
+              "leader send_note_prefilled (intermediate)");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "note_prefilled", err, sizeof(err)),
+              "leader note_prefilled (intermediate) ack: %s", err);
+
+        /* L264 S4e: the segment frames -- save and load are acked verdicts,
+         * drop and reconcile are void; a key that is not a key never ships. */
+        {
+            pulsar_tp_segment_command sc;
+            std::memset(&sc, 0, sizeof sc);
+            sc.session_id = 3001;
+            sc.G_prev = 128;
+            sc.G = 256;
+            std::memcpy(sc.key, "0123456789abcdef0123456789abcdef01234567", 40);
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_SAVE, &sc) == 1, "leader send segment save");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "segment save", err, sizeof(err)),
+                  "leader segment save ack: %s", err);
+            sc.last = 1;
+            sc.digest = 0x1122334455667788ull;
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_LOAD, &sc) == 1, "leader send segment load");
+            CHECK(pulsar_tp_wait_command_ack(tp, sid, "segment load", err, sizeof(err)),
+                  "leader segment load ack: %s", err);
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_DROP, &sc) == 1, "leader send segment drop");
+            const char keys[] = "0123456789abcdef0123456789abcdef01234567"
+                                "fedcba9876543210fedcba9876543210fedcba98";
+            CHECK(pulsar_tp_send_segment_reconcile(tp, keys, 2) == 1, "leader send segment reconcile");
+            sc.key[3] = 'G';
+            CHECK(pulsar_tp_send_segment(tp, PULSAR_TP_FRAME_SEGMENT_DROP, &sc) == 0,
+                  "a segment frame with a malformed key must not ship");
+        }
+
+        /* L315: the verify curve's profile, run by every rank in step on the leader's bank and width (v29); the
+         * verdict is acked */
+        {
+            pulsar_tp_spec_command pc;
+            std::memset(&pc, 0, sizeof pc);
+            pc.session_id = sid;
+            pc.bank = 2;
+            pc.i0 = 32;
+            CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_VERIFY_PROFILE, &pc, NULL, NULL) == 1,
+                  "leader send verify profile");
+            int peers = -1;
+            CHECK(pulsar_tp_wait_command_status(tp, sid, "verify profile", &peers, err, sizeof(err)) && peers == 0,
+                  "leader verify profile verdict (%d): %s", peers, err);
+        }
+
+        const int drafts[3] = { 7, 8, 9 };
+        CHECK(pulsar_tp_send_verify(tp, sid, drafts, 3) == 1,
+              "leader send_verify");
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "verify", err, sizeof(err)),
+              "leader verify ack: %s", err);
+
+        CHECK(pulsar_tp_send_verify_commit(tp, 1, 0) == 1,
+              "leader send_verify_commit");
+
+    } else {
+        pulsar_tp_command cmd;
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv sync: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SYNC, "worker sync frame type %d",
+              (int)cmd.type);
+        CHECK(cmd.session_id == sid && cmd.n_tokens == 4, "worker sync header");
+        CHECK(cmd.tokens && cmd.tokens[0] == 1 && cmd.tokens[3] == 4,
+              "worker sync tokens");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker sync ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv eval_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_EVAL_BATCH && cmd.n_items == 2,
+              "worker eval_batch type/items");
+        CHECK(cmd.items && cmd.items[0].session_id == 1001 &&
+              cmd.items[0].bank == 3 && cmd.items[0].pos == 40 &&
+              cmd.items[0].token == 61 && cmd.items[1].bank == 4 &&
+              cmd.items[1].pos == 41 && cmd.items[1].token == 62,
+              "worker eval_batch items");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
+              "worker eval_batch ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv mixed_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_MIXED_BATCH,
+              "worker mixed_batch type %d", (int)cmd.type);
+        CHECK(cmd.n_items == 1 && cmd.n_tokens == 0 && cmd.value == 4 && cmd.session_id == 2001,
+              "worker mixed_batch header (rows only; head_runs + the rows' session ride it)");
+        CHECK(cmd.items && cmd.items[0].session_id == 2001 && cmd.items[0].bank == 5 &&
+              cmd.items[0].pos == 90 && cmd.items[0].token == 71,
+              "worker mixed_batch payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1,
+              "worker mixed_batch ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv fused_batch: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_FUSED_BATCH, "worker fused_batch type %d", (int)cmd.type);
+        CHECK(cmd.n_items == 3 && cmd.session_id == 3001 && cmd.fused.n_dec == 1 &&
+              cmd.fused.n_pf == 1 && cmd.fused.head_last[0] == 1 && cmd.fused.head_last[1] == 0,
+              "worker fused_batch shape");
+        CHECK(cmd.items && cmd.items[0].bank == 1 && cmd.items[0].pos == 50 && cmd.items[0].token == 81 &&
+              cmd.items[2].bank == 2 && cmd.items[2].pos == 1 && cmd.items[2].token == 83,
+              "worker fused_batch rows");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker fused_batch ack");
+
+        for (int want_head = 0; want_head >= -1; want_head--) {
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "worker recv note_prefilled: %s", err);
+            CHECK(cmd.type == PULSAR_TP_FRAME_NOTE_PREFILLED && cmd.session_id == 3001 &&
+                  cmd.n_tokens == 2 && cmd.tokens && cmd.tokens[0] == 82 && cmd.tokens[1] == 83 &&
+                  cmd.value == want_head,
+                  "worker note_prefilled payload (head %d, got %d)", want_head, cmd.value);
+            pulsar_tp_command_free(&cmd);
+            CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker note_prefilled ack");
+        }
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment save: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_SAVE && cmd.session_id == 3001 && cmd.segment.G_prev == 128 &&
+              cmd.segment.G == 256 && !std::memcmp(cmd.segment.key, "0123456789abcdef0123456789abcdef01234567", 40),
+              "worker segment save payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker segment save ack");
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment load: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_LOAD && cmd.segment.G == 256 && cmd.segment.last == 1 &&
+              cmd.segment.digest == 0x1122334455667788ull, "worker segment load payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker segment load ack");
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment drop: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_DROP, "worker segment drop type %d", (int)cmd.type);
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv segment reconcile: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_SEGMENT_RECONCILE && cmd.n_keys == 2 && cmd.keys &&
+              !std::memcmp(cmd.keys + 40, "fedcba9876543210fedcba9876543210fedcba98", 40),
+              "worker segment reconcile payload");
+        pulsar_tp_command_free(&cmd);
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)), "worker recv verify profile: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_VERIFY_PROFILE && cmd.session_id == sid && cmd.spec.bank == 2 &&
+              cmd.spec.i0 == 32, "worker verify profile payload");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker verify profile ack");
+
+        CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+              "worker recv verify: %s", err);
+        CHECK(cmd.type == PULSAR_TP_FRAME_VERIFY && cmd.n_tokens == 3,
+              "worker verify type/tokens");
+        CHECK(cmd.tokens[0] == 7 && cmd.tokens[2] == 9, "worker verify drafts");
+        pulsar_tp_command_free(&cmd);
+        CHECK(pulsar_tp_send_command_ack(tp, sid, 0) == 1, "worker verify ack");
+
+        int32_t full = 0, replay = -1;
+        CHECK(pulsar_tp_recv_verify_commit(tp, &full, &replay) == 1,
+              "worker recv_verify_commit");
+        CHECK(full == 1 && replay == 0, "worker verify_commit values");
+
+    }
+}
+
+/* The PIPELINED identity check (L241 4g-2): the leader defers a step's digest
+ * collect and settles it one step later -- explicitly, or implicitly at the
+ * next ack collect of any shape (the peers answer in frame order).  A second
+ * deferral with one pending refuses.  The late MISMATCH is exercised at the
+ * end of identity_phase, because it latches failed(). */
+static void deferred_phase(pulsar_tp *tp, int rank) {
+    char err[512];
+    const uint64_t sid = 6262u;
+    const uint64_t digest = agreed_digest(78u);
+    if (rank == 0) {
+        uint64_t f0 = 0, m0 = 0, frames = 0, matched = 0;
+        pulsar_tp_identity_stats(tp, &f0, &m0);
+        /* a. eval, defer, eval, settle: the first step's ack is read after the
+         * second step's frame went out. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 1, 11) == 1, "deferred: send_eval #1");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 1", digest) == 1,
+              "deferred: defer #1");
+        CHECK(pulsar_tp_send_eval(tp, sid, 2, 12) == 1, "deferred: send_eval #2");
+        err[0] = 0;
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
+              "deferred: settling an agreeing step must pass: %s", err);
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
+              "deferred: settling with nothing pending is a no-op");
+        /* b. a PLAIN collect settles the pending digest first. */
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 2", digest) == 1,
+              "deferred: defer #2");
+        const int toks[2] = { 1, 2 };
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "deferred: send_sync");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 1,
+              "deferred: a plain collect must settle the deferred step and line up: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 2 && matched - m0 == 2, "deferred: tally %llu/%llu want 2/2",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        /* c. one deferral at a time. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 3, 13) == 1, "deferred: send_eval #3");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 3", digest) == 1,
+              "deferred: defer #3");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 3", digest) == 0,
+              "deferred: a second deferral with one pending must refuse");
+        err[0] = 0;
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 1,
+              "deferred: settle #3: %s", err);
+        CHECK(!pulsar_tp_failed(tp), "deferred: agreement must not mark the group failed");
+        /* d. chunk verdicts (v15): the leader's per-chunk stop/continue arrive
+         * in order, read by the worker's prefill loop, not its command loop. */
+        CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 0) == 1, "verdict: send continue");
+        CHECK(pulsar_tp_send_chunk_verdict(tp, sid, 1) == 1, "verdict: send stop");
+        /* e. sync check (v16, L250): the leader's cached position + prefix
+         * digest before a sync.  The worker's verdict comes back as a plain
+         * status, and a divergence (1) is an ANSWER -- the leader invalidates
+         * and refuses the sync -- not a transport failure. */
+        const uint64_t dg = 0x0123456789abcdefull;
+        int st = -1;
+        CHECK(pulsar_tp_send_sync_check(tp, sid, 20480, dg) == 1, "sync check: send #1");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status(tp, sid, "sync check", &st, err, sizeof(err)) == 1 && st == 0,
+              "sync check: agreement (status %d): %s", st, err);
+        CHECK(pulsar_tp_send_sync_check(tp, sid, 7, dg ^ 1u) == 1, "sync check: send #2");
+        st = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status(tp, sid, "sync check", &st, err, sizeof(err)) == 1 && st == 1,
+              "sync check: divergence verdict (status %d): %s", st, err);
+        CHECK(!pulsar_tp_failed(tp), "sync check: a divergence verdict must not mark the group failed");
+    } else {
+        pulsar_tp_command cmd;
+        for (int step = 0; step < 4; step++) {
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "deferred: worker recv step %d: %s", step, err);
+            pulsar_tp_command_free(&cmd);
+            const int ok = step == 2 ? pulsar_tp_send_command_ack(tp, sid, 0)               /* the sync */
+                                     : pulsar_tp_send_command_ack_digest(tp, sid, 0, digest);
+            CHECK(ok == 1, "deferred: worker ack step %d", step);
+        }
+        int stop = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_recv_chunk_verdict(tp, sid, &stop, err, sizeof(err)) == 1 && stop == 0,
+              "verdict: worker reads continue (stop %d): %s", stop, err);
+        stop = -1;
+        CHECK(pulsar_tp_recv_chunk_verdict(tp, sid, &stop, err, sizeof(err)) == 1 && stop == 1,
+              "verdict: worker reads stop (stop %d): %s", stop, err);
+        for (int k = 0; k < 2; k++) {
+            const int want_pos = k == 0 ? 20480 : 7;
+            const uint64_t want_dg = k == 0 ? 0x0123456789abcdefull : (0x0123456789abcdefull ^ 1u);
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "sync check: worker recv #%d: %s", k + 1, err);
+            CHECK(cmd.type == PULSAR_TP_FRAME_SYNC_CHECK && cmd.session_id == sid &&
+                  cmd.value == want_pos && cmd.seq == want_dg,
+                  "sync check: worker parsed type %d session %llu pos %d digest %016llx",
+                  (int)cmd.type, (unsigned long long)cmd.session_id, cmd.value,
+                  (unsigned long long)cmd.seq);
+            pulsar_tp_command_free(&cmd);
+            CHECK(pulsar_tp_send_command_ack(tp, sid, k == 0 ? 0 : 1) == 1,
+                  "sync check: worker ack #%d", k + 1);
+        }
+    }
+}
+
+/* The cross-rank logits identity ack (L243, protocol v11).  Both ranks hold
+ * the same agreed digest; the worker answers an eval with the digest ack;
+ * the leader's digest collect must accept an equal digest and count it, refuse
+ * a different one by name (marking the group failed), and refuse a shape
+ * confusion in both directions: a digest on a plain collect and a plain ack on
+ * a digest collect.  The refusals latch failed(), so this phase runs last. */
+static void identity_phase(pulsar_tp *tp, int rank) {
+    char err[512];
+    const uint64_t sid = 6161u;
+    const uint64_t digest = agreed_digest(77u);
+
+    if (rank == 0) {
+        uint64_t frames = 0, matched = 0, f0 = 0, m0 = 0;
+        pulsar_tp_identity_stats(tp, &f0, &m0);
+        /* 1. Agreement. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 5, 42) == 1, "identity: leader send_eval #1");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 1,
+              "identity: an equal digest must be accepted: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 1 && matched - m0 == 1, "identity tally after agreement: %llu/%llu want 1/1",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        CHECK(!pulsar_tp_failed(tp), "identity: agreement must not mark the group failed");
+        /* 1b. A positive verdict carrying an equal digest (generate_speculative's
+         * shape): the verdict comes back and the tally counts it. */
+        pulsar_tp_spec_command sc;
+        std::memset(&sc, 0, sizeof(sc));
+        sc.session_id = sid;
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #1");
+        int verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 1 && verdict == 33,
+              "identity: a positive verdict with an equal digest must come back (verdict %d): %s",
+              verdict, err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 2 && matched - m0 == 2, "identity tally after the verdict: %llu/%llu want 2/2",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        /* 1c. A zero verdict (the run failed on the peer) is plain and still a
+         * verdict, not a shape refusal. */
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #2");
+        verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 1 && verdict == 0,
+              "identity: a plain zero verdict must come back as 0 (verdict %d): %s", verdict, err);
+        CHECK(!pulsar_tp_failed(tp), "identity: a zero verdict must not mark the group failed");
+        /* 1d. A positive verdict with a different digest refuses by name. */
+        CHECK(pulsar_tp_send_spec(tp, PULSAR_TP_FRAME_GENERATE_SPECULATIVE, &sc, NULL, NULL) == 1,
+              "identity: leader send_spec #3");
+        verdict = -1;
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_status_digest(tp, sid, "generate_speculative", &verdict, digest,
+                                                   err, sizeof(err)) == 0 &&
+              std::strstr(err, "logits differ from the leader's on generate_speculative") != NULL,
+              "identity: a verdict with a different digest must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 3 && matched - m0 == 2, "identity tally after the verdict mismatch: %llu/%llu want 2/3",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        CHECK(pulsar_tp_failed(tp), "identity: a verdict digest mismatch must mark the group failed");
+        /* 2. A plain ack where a digest is due. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 6, 43) == 1, "identity: leader send_eval #2");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
+              std::strstr(err, "with no logits digest") != NULL,
+              "identity: a plain ack on a digest collect must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 3 && matched - m0 == 2, "identity: a shape refusal is not a frame: %llu/%llu",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        /* 3. A digest where a plain ack is due. */
+        const int toks[2] = { 1, 2 };
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 0 &&
+              std::strstr(err, "an unexpected logits digest") != NULL,
+              "identity: a digest ack on a plain collect must refuse by name: %s", err);
+        /* 4. Disagreement: the refusal names both digests and latches failed. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 7, 44) == 1, "identity: leader send_eval #3");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack_digest(tp, sid, "eval", digest, err, sizeof(err)) == 0 &&
+              std::strstr(err, "logits differ from the leader's on eval") != NULL,
+              "identity: a different digest must refuse by name: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 4 && matched - m0 == 2, "identity tally after disagreement: %llu/%llu want 2/4",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        CHECK(pulsar_tp_failed(tp), "identity: a disagreement must mark the group failed");
+        /* 5. The drain reads an ack of either shape and keeps the stream aligned:
+         * the next collect sees the next frame's ack, not a stale one. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 8, 45) == 1, "identity: leader send_eval #4");
+        pulsar_tp_drain_command_acks(tp);
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync #2");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 1,
+              "identity: after a drain the next plain collect must line up: %s", err);
+        pulsar_tp_identity_stats(tp, &frames, &matched);
+        CHECK(frames - f0 == 4 && matched - m0 == 2, "identity: a drain counts nothing: %llu/%llu",
+              (unsigned long long)(matched - m0), (unsigned long long)(frames - f0));
+        /* 6. A DEFERRED mismatch (pulsar_session_eval's pipelined check): the
+         * step at position 9 disagrees, the leader has already shipped 10, and
+         * the settle refuses naming the step whose logits differed; the drain
+         * then reads 10's ack so nothing is left in the socket. */
+        CHECK(pulsar_tp_send_eval(tp, sid, 9, 46) == 1, "identity: leader send_eval #5");
+        CHECK(pulsar_tp_defer_command_ack_digest(tp, sid, "eval at position 9", digest) == 1,
+              "identity: defer the disagreeing step");
+        CHECK(pulsar_tp_send_eval(tp, sid, 10, 47) == 1, "identity: leader send_eval #6");
+        err[0] = 0;
+        CHECK(pulsar_tp_settle_deferred_ack(tp, err, sizeof(err)) == 0 &&
+              std::strstr(err, "logits differ from the leader's on eval at position 9") != NULL,
+              "identity: a deferred mismatch must refuse naming its step: %s", err);
+        pulsar_tp_drain_command_acks(tp);
+        CHECK(pulsar_tp_send_sync(tp, sid, toks, 2) == 1, "identity: leader send_sync #3");
+        err[0] = 0;
+        CHECK(pulsar_tp_wait_command_ack(tp, sid, "sync", err, sizeof(err)) == 1,
+              "identity: after a deferred mismatch and a drain the stream must line up: %s", err);
+    } else {
+        pulsar_tp_command cmd;
+        for (int step = 0; step < 12; step++) {
+            std::memset(&cmd, 0, sizeof(cmd));
+            CHECK(pulsar_tp_recv_command(tp, &cmd, err, sizeof(err)),
+                  "identity: worker recv step %d: %s", step, err);
+            pulsar_tp_command_free(&cmd);
+            int ok = 0;
+            switch (step) {
+            case 0: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* agree */
+            case 1: ok = pulsar_tp_send_command_ack_digest(tp, sid, 33, digest); break;       /* verdict 33, agree */
+            case 2: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* verdict 0: the run failed here, plain */
+            case 3: ok = pulsar_tp_send_command_ack_digest(tp, sid, 33, digest ^ 2ull); break; /* verdict 33, disagree */
+            case 4: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* plain where digest due */
+            case 5: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* digest where plain due */
+            case 6: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest ^ 1ull); break; /* disagree */
+            case 7: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;        /* drained */
+            case 8: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                       /* the aligned sync */
+            case 9: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest ^ 4ull); break; /* deferred: disagree */
+            case 10: ok = pulsar_tp_send_command_ack_digest(tp, sid, 0, digest); break;       /* shipped before the settle */
+            case 11: ok = pulsar_tp_send_command_ack(tp, sid, 0); break;                      /* the aligned sync */
+            }
+            CHECK(ok == 1, "identity: worker ack step %d", step);
+        }
+    }
+}
+
+static int run_rank(pulsar_tp *tp, int rank) {
+    static const char *rname[2] = { "leader", "worker" };
+    CHECK(pulsar_tp_rank(tp) == rank, "rank %d: pulsar_tp_rank()=%d", rank,
+          pulsar_tp_rank(tp));
+    if (g_remote_mode) {
+        std::printf("rank %d transport=%s peer_ctx=%u\n", rank,
+                    pulsar_tp_is_rdma(tp) ? "rdma" : "tcp",
+                    pulsar_tp_peer_ctx(tp));
+        const char *want = getenv("PULSAR_TP_EXPECT_RDMA");
+        if (want && want[0])
+            CHECK(pulsar_tp_is_rdma(tp), "rank %d: PULSAR_TP_EXPECT_RDMA set but transport is TCP", rank);
+    } else {
+        CHECK(!pulsar_tp_is_rdma(tp), "rank %d: expected TCP transport (no verbs device)",
+              rank);
+        CHECK(pulsar_tp_peer_ctx(tp) == TEST_CTX_SIZE, "rank %d: peer_ctx=%u want %u",
+              rank, pulsar_tp_peer_ctx(tp), TEST_CTX_SIZE);
+    }
+    CHECK(!pulsar_tp_failed(tp), "rank %d: failed() set at startup", rank);
+
+    const uint64_t vec = (uint64_t)N_EMBD * sizeof(float);
+    pulsar_tp_slab s;
+    pulsar_tp_slab_layout_init(N_LAYER, N_EMBD, &s);
+    uint8_t *base = static_cast<uint8_t *>(std::malloc((size_t)s.slab_bytes));
+    if (!base) {
+        CHECK(0, "rank %d: slab alloc %llu failed", rank,
+              (unsigned long long)s.slab_bytes);
+        return 1;
+    }
+    std::memset(base, 0, (size_t)s.slab_bytes);
+    char err[256];
+    if (!pulsar_tp_attach_slab(tp, base, err, sizeof(err))) {
+        CHECK(0, "rank %d: attach_slab failed: %s", rank, err);
+        std::free(base);
+        return 1;
+    }
+
+    /* Gate exchanges over a handful of (layer,gate) pairs, one phase per
+     * direction: leader writes first, worker writes second. */
+    gate_phase(tp, base, rank, &s, vec, 0, 3, 0);   /* slots 0..5,  seq 1..6  L->W */
+    gate_phase(tp, base, rank, &s, vec, 3, 6, 1);   /* slots 6..11, seq 7..12 W->L */
+
+    batch_phase(tp, base, rank, &s, vec, 5, 3, 1, 0);   /* 3 rows, L->W */
+    batch_phase(tp, base, rank, &s, vec, 9, 4, 1, 1);   /* 4 rows, W->L */
+    batch_phase(tp, base, rank, &s, vec, 12, 8, 2, 0);  /* max 8 rows, L->W */
+
+    big_phase(tp, rank, 0, 1, 262144ull, 0);   /* 256 KiB  L->W */
+    big_phase(tp, rank, 1, 2, 3145728ull, 1);  /* 3 MiB   W->L (2 MiB round split) */
+
+    acks_ahead_phase(tp, base, rank, &s, vec);
+    lockstep_phase(tp, rank);
+    frames_phase(tp, rank);
+    deferred_phase(tp, rank);
+    identity_phase(tp, rank);   /* last: its refusals latch failed() by design */
+
+    /* Clean shutdown: leader stops, worker sees the STOP frame. */
+    if (rank == 0) {
+        if (!pulsar_tp_send_stop(tp)) CHECK(0, "rank %d: send_stop failed", rank);
+    } else {
+        pulsar_tp_command cmd;
+        std::memset(&cmd, 0, sizeof(cmd));
+        if (!pulsar_tp_recv_command(tp, &cmd, err, sizeof(err))) {
+            CHECK(0, "rank %d: recv_command(STOP) failed: %s", rank, err);
+        } else {
+            CHECK(cmd.type == PULSAR_TP_FRAME_STOP, "rank %d: recv frame %d want STOP",
+                  rank, (int)cmd.type);
+            pulsar_tp_command_free(&cmd);
+        }
+    }
+
+    std::free(base);
+    if (g_failures)
+        std::fprintf(stderr, "tp_transport_test: %s: %d FAILURE(S)\n", rname[rank],
+                     g_failures);
+    else
+        std::fprintf(stdout, "tp_transport_test: %s ok\n", rname[rank]);
+    return g_failures != 0;
+}
+
+static int create_rank_ex(int rank, const char *peer, int port, pulsar_tp **out,
+                          char *err, size_t errlen) {
+    pulsar_tp_options opt;
+    std::memset(&opt, 0, sizeof(opt));
+    opt.role = rank == 0 ? PULSAR_TP_ROLE_LEADER : PULSAR_TP_ROLE_WORKER;
+    /* worker: dial `peer`; leader: bind `peer` (NULL -> 0.0.0.0). */
+    opt.peer = peer;
+    opt.port = port;
+    pulsar_tp_identity id = test_identity();
+    return pulsar_tp_create(out, &opt, &id, err, errlen);
+}
+
+static int create_rank(int rank, int port, pulsar_tp **out, char *err, size_t errlen) {
+    return create_rank_ex(rank, rank == 0 ? NULL : "127.0.0.1", port, out, err, errlen);
+}
+
+static int free_port(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a;
+    std::memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, reinterpret_cast<struct sockaddr *>(&a), sizeof(a)) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t len = sizeof(a);
+    if (getsockname(fd, reinterpret_cast<struct sockaddr *>(&a), &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    const int port = ntohs(a.sin_port);
+    close(fd);
+    return port;
+}
+
+static int run_worker(int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank(1, port, &tp, err, sizeof(err))) {
+        CHECK(0, "worker create failed: %s", err);
+        std::fprintf(stderr, "tp_transport_test: worker: create failed\n");
+        return 1;
+    }
+    const int rc = run_rank(tp, 1);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+static int run_leader(int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank(0, port, &tp, err, sizeof(err))) {
+        CHECK(0, "leader create failed: %s", err);
+        std::fprintf(stderr, "tp_transport_test: leader: create failed\n");
+        return 1;
+    }
+    const int rc = run_rank(tp, 0);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+/* Remote-pair entry points (see main): one process per host; both run the
+ * full phase set; the leader ends by sending STOP, the worker by receiving it. */
+static int run_remote_leader(const char *bind_host, int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank_ex(0, (bind_host && bind_host[0]) ? bind_host : NULL,
+                        port, &tp, err, sizeof(err))) {
+        std::fprintf(stderr, "tp_transport_test remote-leader: create: %s\n", err);
+        return 1;
+    }
+    std::printf("tp_transport_test remote-leader: connected (transport=%s); "
+                "run the full phase set\n", pulsar_tp_is_rdma(tp) ? "rdma" : "tcp");
+    const int rc = run_rank(tp, 0);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+static int run_remote_worker(const char *peer_host, int port) {
+    char err[256];
+    pulsar_tp *tp = NULL;
+    if (!create_rank_ex(1, peer_host, port, &tp, err, sizeof(err))) {
+        std::fprintf(stderr, "tp_transport_test remote-worker: create: %s\n", err);
+        return 1;
+    }
+    std::printf("tp_transport_test remote-worker: connected (transport=%s)\n",
+                pulsar_tp_is_rdma(tp) ? "rdma" : "tcp");
+    const int rc = run_rank(tp, 1);
+    pulsar_tp_free(tp);
+    return rc;
+}
+
+int main(int argc, char **argv) {
+    /* Remote mode: `tp_transport_test remote-leader [bind-host] PORT` on one
+     * box and `tp_transport_test remote-worker PEER-HOST PORT` on the other
+     * (the pair).  g_remote_mode relaxes the loopback-only TCP assert and
+     * PULSAR_TP_EXPECT_RDMA=1 turns it into a must-RDMA check. */
+    if (argc >= 4 && !std::strcmp(argv[1], "remote-leader")) {
+        g_remote_mode = true;
+        const int rc = run_remote_leader(argv[2], atoi(argv[3]));
+        std::fflush(stdout);
+        return rc;
+    }
+    if (argc >= 4 && !std::strcmp(argv[1], "remote-worker")) {
+        g_remote_mode = true;
+        const int rc = run_remote_worker(argv[2], atoi(argv[3]));
+        std::fflush(stdout);
+        return rc;
+    }
+
+    const char *role = getenv("TP_TRANSPORT_TEST_ROLE");
+
+    /* Direct worker invocation (or the forked child): dial the given port. */
+    if (role && std::strcmp(role, "worker") == 0) {
+        const char *ps = getenv("TP_TRANSPORT_TEST_PORT");
+        const int port = ps ? atoi(ps) : 0;
+        const int rc = run_worker(port);
+        std::fflush(stdout);
+        _exit(rc != 0);
+    }
+
+    /* Leader side: pick a free loopback port, hand it to the forked worker. */
+    const int port = free_port();
+    if (port <= 0) {
+        std::fprintf(stderr, "tp_transport_test: no free loopback port\n");
+        return 1;
+    }
+    char pbuf[16];
+    std::snprintf(pbuf, sizeof(pbuf), "%d", port);
+    setenv("TP_TRANSPORT_TEST_PORT", pbuf, 1);
+    setenv("TP_TRANSPORT_TEST_ROLE", "worker", 1);
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::fprintf(stderr, "tp_transport_test: fork failed\n");
+        return 1;
+    }
+    if (pid == 0) {
+        const int rc = run_worker(port);
+        std::fflush(stdout);
+        _exit(rc != 0);
+    }
+
+    const int lrc = run_leader(port);
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, 0) < 0) {
+        std::fprintf(stderr, "tp_transport_test: waitpid failed: %s\n",
+                     std::strerror(errno));
+        return 1;
+    }
+    const int child_fail = !WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0;
+    if (lrc != 0 || child_fail) {
+        std::fprintf(stderr, "tp_transport_test: FAILED (%s)\n",
+                     child_fail ? "worker side" : "leader side");
+        return 1;
+    }
+    std::printf("tp_transport_test: ok "
+                "(loopback TCP: hello, attach, gate/batch/big exchange, "
+                "lockstep + all control-plane frames)\n");
+    return 0;
+}

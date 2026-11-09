@@ -1,3 +1,5 @@
+/** @file
+ *  Internal shared declarations for the cuda/ translation units: device helpers, host globals, scratch and announce tables. */
 /* pulsar_cuda_internal.h — internal shared declarations for the cuda/ translation units.
  * Produced by the multi-TU split of pulsar_cuda.cu; edit freely (the
  * generator is not part of the build).
@@ -18,6 +20,7 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
+#include <type_traits>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -35,26 +38,37 @@
 #include "pulsar_gpu.h"
 
 #ifndef M_PI
+/// pi, for toolchains whose math.h does not define M_PI.
 #define M_PI 3.14159265358979323846
 #endif
 
+/// The k-quant super-block size in elements (ggml's QK_K): routed expert widths must be multiples of it.
 #define CUDA_QK_K 256
-#define PULSAR_CUDA_UNUSED __attribute__((unused))
 
 enum {
-    /* attention_decode_mixed_kernel stores raw-window scores plus visible
-     * compressed scores in shared memory.  The host routes larger unmasked
-     * decode calls to the online attention kernel so this fixed buffer never
-     * becomes an out-of-bounds write at long context.  11712 fits under the
-     * GB10 48 KB shared-memory limit. */
-    PULSAR_CUDA_ATTENTION_SCORE_CAP = 11712u,
+    /* The decode kernels' per-token raw-row scratch: a raw window wider than
+     * this is refused at the descriptor check (attention.cu). */
     PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP = 256u,
     PULSAR_CUDA_TOPK_MERGE_GROUP = 8u
 };
 
-#define PULSAR_FP8_KV_BLOCK 64u
-#define PULSAR_FP8_KV_NBLK(HD) (((HD) + PULSAR_FP8_KV_BLOCK - 1u) / PULSAR_FP8_KV_BLOCK)
-#define PULSAR_FP8_KV_ROWBYTES(HD) ((HD) + PULSAR_FP8_KV_NBLK(HD) * sizeof(float))
+/* The indexer scorer tier is TILED PER HEAD COUNT rather than pinned to one
+ * model: V4.1 runs 32 indexer heads (L218) and V4 ran 64.  L218 de-generalised
+ * the kernel to 32 and refused every other count, which is what left V4's
+ * indexer with no scorer at all.  The MXFP4 kernel is a template instantiated
+ * for each count and both entry gates ask THIS predicate, so a third count
+ * refuses by name instead of quietly tiling a different M. */
+/// Indexer head count of V4.1 (an MXFP4 scorer instance).
+#define PULSAR_IDX_MXFP4_HEADS_V41 32u
+/// Indexer head count of V4 (an MXFP4 scorer instance).
+#define PULSAR_IDX_MXFP4_HEADS_V4  64u
+/* constexpr so the kernel templates and the probes can assert it at compile
+ * time, which is where "a third head count" should be caught. */
+/// @param n_head indexer heads
+/// @return true when the MXFP4 indexer scorer has an instance for n_head (32 or 64)
+constexpr bool pulsar_idx_mxfp4_heads_supported(uint32_t n_head) {
+    return n_head == PULSAR_IDX_MXFP4_HEADS_V41 || n_head == PULSAR_IDX_MXFP4_HEADS_V4;
+}
 
 /*
  * Microscaling (MX / OCP) compressed-KV storage.  One E8M0 (power-of-two)
@@ -64,63 +78,122 @@ enum {
  * This is the CUTLASS-consumable layout (float_ue8m0_t scales, block 32); the
  * GEMM path re-tiles the scales into CUTLASS's swizzled SF layout at use time.
  */
-#define PULSAR_MXKV_BLOCK 32u
-#define PULSAR_MXKV_NBLK(HD) (((HD) + PULSAR_MXKV_BLOCK - 1u) / PULSAR_MXKV_BLOCK)
-#define PULSAR_MXKV_FP8_ROWBYTES(HD) ((HD) + PULSAR_MXKV_NBLK(HD))
-#define PULSAR_MXKV_FP4_ROWBYTES(HD) (((HD) + 1u) / 2u + PULSAR_MXKV_NBLK(HD))
-/* KV cache storage format selector (compile/runtime). */
-#define PULSAR_MXKV_FMT_NONE 0u
-#define PULSAR_MXKV_FMT_FP8  1u
-#define PULSAR_MXKV_FMT_FP4  2u
-#define PULSAR_MXKV_ROWBYTES(FMT, HD) \
-    ((FMT) == PULSAR_MXKV_FMT_FP4 ? PULSAR_MXKV_FP4_ROWBYTES(HD) \
-   : (FMT) == PULSAR_MXKV_FMT_FP8 ? PULSAR_MXKV_FP8_ROWBYTES(HD) \
-   : (HD) * sizeof(float))
+/* There was a format SELECTOR here (NONE/FP4 plus a rowbytes switch) from when
+ * the indexer cache could be f32 or FP4.  It cannot: the cache is FP4, every
+ * reader decodes it in place, and the f32 arm had no caller left. */
 
 /*
- * PULSAR_ATTN_PACK compressed-KV storage (value-preserving).  A comp row today is
- * f32 with the nope dims already fp8-roundtripped in place (fp8_kv_quantize:
- * per-64 block scale = exp2f(ceilf(log2f(fmaxf(amax,1e-4)/448))), e4m3
- * clamp-roundtrip) and the n_rot rope tail bf16-roundtripped in place.  The
- * packed row stores exactly those values:
- *   [n_nope e4m3 bytes][n_nope/64 E8M0 scale bytes][pad to 4B][n_rot bf16]
- * head_dim 512 / n_rot 64 -> 448 + 7 + 1 + 128 = 584 B/row (vs 2048 f32).
- * The E8M0 byte is the scale exponent + 127 (power-of-two by construction),
- * so decode (e4m3 value * 2^(e8-127); rope __bfloat162float) is bit-identical
- * to the f32 cache.  Must stay in sync with PULSAR_ENGINE_ATTN_PACK_ROWBYTES.
+ * The KV rows -- WINDOW (the rings) and MAIN (the kv sources' pools) for a
+ * CSA2 (V4.1) profile, UNIFIED PULSAR_ATTN_PACK for a 0731 one -- are laid
+ * out and documented in src/pulsar_gpu.h, the one definition both sides of
+ * the seam read.  Their decoders live below (winkv_row_ld4 /
+ * mainkv_row_ld4 / the packed-row accessors), the packers in
+ * pulsar_cuda_kvrows.cu.
  *
- * This row is BYTE-IDENTICAL to vLLM's `fp8_ds_mla` DSv4 cache line (448 e4m3 +
- * 7 ue8m0-per-64 + 1 pad + 64 bf16 = 584 B).  The rope tail was f32 (712 B/row)
- * until 2026-08-11; the source model runs a BF16 residual, so f32 there stored
- * precision the model never had.  Keep the two layouts in step: a divergence
- * costs the cross-engine KV diff that validates this cache against a stock vLLM
- * run.  Bumping this row layout MUST bump PULSAR_SESSION_PAYLOAD_VERSION.
+ * UNIFIED row (NVFP4, head_dim 512 / n_rot 64 -> 384 B):
+ *   [n_nope/2 e2m1 nibbles, low nibble first][n_nope/16 E4M3 scale codes]
+ *   [f32 row scale][n_rot bf16 rope] = 224 + 28 + 4 + 128.  A multiple of 16
+ * (cp.async stages whole 16 B chunks), the rope tail is 2-aligned and the f32
+ * row scale 4-aligned at +252.  Scale decode = e4m3(code) * row_scale via
+ * attn_pack_e4m3.  The nope payload is a lossy re-quantization of the QAT
+ * e4m3 values (L111 verdict: closer to source, accept >= the retired e4m3
+ * row); rope is bf16 verbatim -- quantized rope is what killed ATTN_MX.
+ *
+ * ⚠ Quantise EXACTLY ONCE (attn_pack_store_kernel); re-encoding decoded FP4
+ * misrounds ~33%% of blocks.  Every later move is a byte move; there is no
+ * conversion path from the retired e4m3 row -- stale payloads refuse.  The
+ * geometry macros (PULSAR_ATTN_PACK_*, PULSAR_KV4_NV_*, PULSAR_MXKV_*,
+ * PULSAR_WINKV_*, PULSAR_MAINKV_*) live in src/pulsar_gpu.h, the one
+ * definition both sides of the seam read (L159 inc 5).  Bumping any of these
+ * layouts MUST bump PULSAR_SESSION_KV_PAYLOAD_VERSION.
  */
-#define PULSAR_ATTN_PACK_NROT 64u
-#define PULSAR_ATTN_PACK_NOPE(HD) ((HD) - PULSAR_ATTN_PACK_NROT)
-#define PULSAR_ATTN_PACK_SCALES_PAD(HD) \
-    ((PULSAR_ATTN_PACK_NOPE(HD) / PULSAR_FP8_KV_BLOCK + 3u) & ~3u)
-#define PULSAR_ATTN_PACK_ROWBYTES(HD) \
-    ((uint64_t)PULSAR_ATTN_PACK_NOPE(HD) + PULSAR_ATTN_PACK_SCALES_PAD(HD) + \
-     (uint64_t)PULSAR_ATTN_PACK_NROT * 2u)
 
-/* Default-ON env gate for the measured fast tiers.  Suite-v1 KL cleared the
- * fp16 attention and MXFP4 indexer tiers on 2026-08-08 (exact per-position
- * KL(off||on) p95 well inside the quant's own divergence-from-reference
- * budget; docs/engine-perf-map.md, "fidelity ledger"), so presence-means-on
- * flipped to on-unless-"0".  Setting the variable to "0" opts out; any other
- * value (or unset) leaves the tier enabled. */
-static inline int pulsar_env_tier_on(const char *name) {
-    const char *v = getenv(name);
-    return !(v && v[0] == '0' && v[1] == '\0');
-}
+/* Stored Q element type; pairs with PULSAR_Q_ELT_SIZE in pulsar_gpu.h.
+ * __half since the L045 flip. */
+/// Stored Q element type (f16); its width and format tag are asserted against pulsar_gpu.h below.
+typedef __half pulsar_q_t;
 
-/* e4m3 byte * scale by pure bit math — bit-identical to the textbook
+/* The typedef and the host-side byte macro live in different headers and are
+ * both authorities on the same fact.  HC already has this bridge (below); Q --
+ * the buffer whose width mismatch actually shipped as defect nine -- did not:
+ * changing either alone compiled clean. */
+static_assert(PULSAR_Q_ELT_FMT == PULSAR_ELT_F16 &&
+              std::is_same<pulsar_q_t, __half>::value,
+              "q format tag and pulsar_q_t state the same type; move both or neither");
+static_assert(sizeof(pulsar_q_t) == PULSAR_Q_ELT_SIZE,
+              "pulsar_q_t and PULSAR_Q_ELT_SIZE state the same width; move both or neither");
+
+/* The cudaDataType the stored Q presents to cuBLAS.  Derived from pulsar_q_t
+ * rather than written out, so a GEMM's operand type can never drift from the
+ * buffer it reads -- that failure mode is a silent wrong answer, not a fault.
+ * Compile-time constant: it folds, so this is not a hot-path branch. */
+/// The cudaDataType of the stored Q buffer, derived from pulsar_q_t (CUDA_R_16F today).
+static const cudaDataType_t PULSAR_Q_CUDA_TYPE =
+        (sizeof(pulsar_q_t) == sizeof(float)) ? CUDA_R_32F : CUDA_R_16F;
+
+/* ---- Q-buffer element access (L045) -------------------------------------
+ *
+ * batch_q is migrating f32 -> f16.  The STORAGE narrows; the ARITHMETIC does
+ * not.  Every kernel templated on QT below loads to f32, accumulates in f32,
+ * and narrows only at the store -- so the <float> instantiation is bit-identical
+ * to the code that shipped, and the <__half> one differs by exactly one
+ * round-to-nearest-even per stored element.
+ *
+ * That distinction is the whole reason this is templated rather than rewritten:
+ * the f32 arm must remain provable by the byte-exact prefill gate while the f16
+ * arm is graded by cuda-reference-gate, which is a different contract.
+ *
+ * ⚠ The head RMS norm reads this buffer to form a SUM OF SQUARES over head_dim.
+ * Under q_prep_active batch_q holds UNNORMALISED q_b output -- the widest
+ * magnitudes in the activation path -- so the <__half> arm narrows the inputs
+ * to that reduction, not merely its result.  Measured neutral at mid depths
+ * (L045 stage 1), but it is a fidelity change and must never be described as
+ * bit-exact. */
+/** Loads Q element i as f32.
+ *  @tparam QT the Q storage type (float or __half)
+ *  @param p the Q buffer
+ *  @param i element index
+ *  @return the element widened to f32 */
+template <typename QT>
+__device__ __forceinline__ float q_load(const QT *p, uint64_t i);
+/// @param p f32 Q buffer
+/// @param i element index
+/// @return p[i]
+template <>
+__device__ __forceinline__ float q_load<float>(const float *p, uint64_t i) { return p[i]; }
+/// @param p f16 Q buffer
+/// @param i element index
+/// @return p[i] widened to f32
+template <>
+__device__ __forceinline__ float q_load<__half>(const __half *p, uint64_t i) { return __half2float(p[i]); }
+
+/** Stores an f32 value as Q element i (one round to nearest even for __half).
+ *  @tparam QT the Q storage type (float or __half)
+ *  @param p the Q buffer
+ *  @param i element index
+ *  @param v the value */
+template <typename QT>
+__device__ __forceinline__ void q_store(QT *p, uint64_t i, float v);
+/// @param p f32 Q buffer
+/// @param i element index
+/// @param v the value, stored as is
+template <>
+__device__ __forceinline__ void q_store<float>(float *p, uint64_t i, float v) { p[i] = v; }
+/// @param p f16 Q buffer
+/// @param i element index
+/// @param v the value, rounded to f16
+template <>
+__device__ __forceinline__ void q_store<__half>(__half *p, uint64_t i, float v) { p[i] = __float2half(v); }
+
+/* e4m3 byte * scale by pure bit math -- bit-identical to the textbook
  * decode (1 + mant/8)*2^(exp-7) * scale with the sign applied (normals become
  * that exact float built directly from its bit pattern;
  * subnormals use the same mant*2^-9 product; scale is an exact power of two,
  * and (-v)*s == -(v*s) in IEEE), but with no exp2f in the inner loops. */
-__device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
+/// @param b     an E4M3 byte (sign, 4-bit exponent, 3-bit mantissa)
+/// @param scale the multiplier (an exact power of two where exactness matters)
+/// @return the decoded value times scale
+__device__ static inline float pulsar_e4m3_times(uint32_t b, float scale) {
     const uint32_t e = (b >> 3) & 15u;
     const uint32_t m = b & 7u;
     const float v = e ? __uint_as_float(((e + 120u) << 23) | (m << 20))
@@ -129,22 +202,355 @@ __device__ static inline float attn_pack_e4m3(uint32_t b, float scale) {
     return (b & 0x80u) ? -sv : sv;
 }
 
-__device__ static inline float attn_comp_pack_ld(const float *comp_kv, uint64_t row, uint32_t d, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    const uint8_t *r = (const uint8_t *)comp_kv + row * PULSAR_ATTN_PACK_ROWBYTES(head_dim);
-    if (d < n_nope) {
-        const float scale = __uint_as_float((uint32_t)r[n_nope + (d / PULSAR_FP8_KV_BLOCK)] << 23);
-        return attn_pack_e4m3(r[d], scale);
-    }
-    return __bfloat162float(((const __nv_bfloat16 *)(r + n_nope +
-                             PULSAR_ATTN_PACK_SCALES_PAD(head_dim)))[d - n_nope]);
+/* E2M1 magnitude decode: 3-bit code -> value, kept as bit math (not a memory
+ * table) so the inner attention loops pay ALU, not LDC traffic. */
+/// @param nib   an E2M1 nibble (bit 3 the sign)
+/// @param scale the block scale
+/// @return the decoded value times scale
+__device__ static inline float pulsar_e2m1_times(uint32_t nib, float scale) {
+    const uint32_t c = nib & 7u;
+    /* codes 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6.  Codes >= 2 are normals
+     * (exponent 126 + c>>1, mantissa bit c&1); 0 and 0.5 are the format's
+     * zero and subnormal, handled as the exact halves they are. */
+    const float v = (c >= 2u) ? __uint_as_float(((126u + (c >> 1)) << 23) | ((c & 1u) << 22))
+                              : (float)c * 0.5f;
+    const float sv = v * scale;
+    return (nib & 8u) ? -sv : sv;
 }
 
+/* E8M0 scale byte -> 2^(b - 127) (b == 255 is the format's NaN; never stored). */
+/// @param b an E8M0 scale byte (0..254)
+/// @return 2^(b - 127)
+__device__ static inline float pulsar_e8m0_scale(uint32_t b) {
+    return __uint_as_float(b << 23);
+}
+
+/* The reference's fast_round_scale (kernel.py): the E8M0 byte for scale
+ * 2^ceil(log2(y)), y = amax * fp_max_inv already formed in fp32, read off y's
+ * IEEE fields -- exponent field plus one when the mantissa is non-zero.  NOT
+ * log2f/ceilf, which round differently at the boundaries; every E8M0 scale
+ * the engine writes (window KV rows, indexer rows) comes from here. */
+/// @param y the unrounded scale (amax * 1 / fp_max), positive f32
+/// @return the E8M0 byte of 2^ceil(log2(y)), capped at 254
+__device__ static inline uint32_t pulsar_e8m0_round_up(float y) {
+    const uint32_t b = __float_as_uint(y);
+    const uint32_t e8 = ((b >> 23) & 0xFFu) + (((b & 0x7FFFFFu) != 0u) ? 1u : 0u);
+    return e8 > 254u ? 254u : e8;
+}
+
+/* The OCP E2M1 nibble codec: [sign:1][magnitude:3], magnitudes 0, 0.5, 1,
+ * 1.5, 2, 3, 4, 6 -- CUTLASS float_e2m1_t.  Encode is round-to-nearest with
+ * ties to the even code, i.e. hardware RNE. */
+/// @param i a magnitude code (low 3 bits used)
+/// @return its E2M1 magnitude (0, 0.5, 1, 1.5, 2, 3, 4, 6)
+__device__ static inline float dsv4_e2m1fn_value_dev(int i) {
+    switch (i & 7) {
+    case 0: return 0.0f;
+    case 1: return 0.5f;
+    case 2: return 1.0f;
+    case 3: return 1.5f;
+    case 4: return 2.0f;
+    case 5: return 3.0f;
+    case 6: return 4.0f;
+    default: return 6.0f;
+    }
+}
+/// Encodes x as E2M1, round to nearest, ties to the even code; |x| saturates at 6.
+/// @param x the value (already divided by its block scale)
+/// @return the nibble, bit 3 the sign
+__device__ static inline uint8_t dsv4_e2m1fn_encode_dev(float x) {
+    float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_dev(0));
+    for (int i = 1; i < 8; i++) {
+        float diff = fabsf(ax - dsv4_e2m1fn_value_dev(i));
+        if (diff < best_diff || (diff == best_diff && ((i & 1) == 0) && ((best & 1) != 0))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return (uint8_t)((best & 7) | ((x < 0.0f) ? 0x8u : 0u));
+}
+/* The E2M1 data code of `v` under block scale `s` (s > 0): the ONE quotient + encode every FP4 KV writer uses
+ * (V4.1's MAIN row and FP4 index-K row, 0731's unified NVFP4 row).  The divide is IEEE (__fdiv_rn) whatever the
+ * TU's fast-math flags: E2M1's RNE ties sit on exactly representable ratios, and --use_fast_math's `/`
+ * (div.approx = MUFU.RCP x FMUL, a rounded reciprocal) lands next to them -- b12x e2bdfc80, L292.  Saturates at
+ * +-6. */
+/// @param v the value
+/// @param s the block scale (> 0)
+/// @return the E2M1 nibble of v / s (IEEE divide), saturated at +-6
+__device__ static inline uint8_t pulsar_e2m1_quant_dev(float v, float s) {
+    return dsv4_e2m1fn_encode_dev(fminf(6.0f, fmaxf(-6.0f, __fdiv_rn(v, s))));
+}
+/// Decodes an E2M1 nibble times its scale (pulsar_e2m1_times).
+/// @param nib   the nibble
+/// @param scale the block scale
+/// @return the value
+__device__ static inline float dsv4_e2m1fn_decode_dev(uint8_t nib, float scale) {
+    return pulsar_e2m1_times(nib, scale);
+}
+
+/* WHERE A BATCH ROW LANDS IN THE RING.  One definition, deliberately: the
+ * window packer (quantise then store) and the scatter (copy packed bytes)
+ * write the same ring from the same batch, and a disagreement puts a token's
+ * KV in the wrong slot -- a position-dependent wrong answer, not a crash.
+ * raw_cap == 0: consecutive rows from out_row0 (a pack buffer, not a ring).
+ * Returns PULSAR_KV_RING_DEAD_ROW when seq_id puts the row outside the pool;
+ * the decision depends only on the row, so a block-uniform early-out. */
+/// pulsar_kv_ring_slot's "no slot": the row's seq_id is outside the pool, the row stores nothing.
+#define PULSAR_KV_RING_DEAD_ROW (~0ull)
+/** @param row       the batch row
+ *  @param out_row0  the batch's first position (raw_cap 0: the first output row)
+ *  @param raw_cap   ring rows per bank, or 0 for a plain pack buffer
+ *  @param n_banks   banks in the pool (seq_id must be below it)
+ *  @param positions device [rows] positions, or NULL: out_row0 + row
+ *  @param seq_id    device [rows] bank ids, or NULL: bank 0
+ *  @return the destination row (bank * raw_cap + pos % raw_cap), or PULSAR_KV_RING_DEAD_ROW */
+__device__ __forceinline__ static uint64_t pulsar_kv_ring_slot(
+        uint32_t row, uint32_t out_row0, uint32_t raw_cap, uint32_t n_banks,
+        const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id) {
+    if (!raw_cap) return (uint64_t)(out_row0 + row);
+    if (seq_id && (uint32_t)seq_id[row] >= n_banks) return PULSAR_KV_RING_DEAD_ROW;
+    const uint32_t pos = positions ? (uint32_t)positions[row] : out_row0 + row;
+    return (uint64_t)(seq_id ? (uint32_t)seq_id[row] * raw_cap : 0u) + pos % raw_cap;
+}
+
+/* 0731's unified NVFP4 row, packed by src/cuda/pulsar_cuda_attnpack.cu.  The
+ * contiguous store is declared in pulsar_gpu.h because tests/attn_pack_gate.cpp
+ * grades it; the rest are reached only through pulsar_cuda_norm_kv.cu's
+ * dispatchers, so no engine caller names a row family. */
+/** Quantises a batch of f32 KV rows into (banked) ring slots: the prefill store.
+ *  @param raw_cache the ring (n_banks banks of raw_cap rows with a descriptor, else one)
+ *  @param kv        f32 [n_tokens][head_dim] rows
+ *  @param raw_cap   ring rows per bank (nonzero)
+ *  @param pos0      the batch's first position
+ *  @param n_tokens  rows
+ *  @param head_dim  the row width (512)
+ *  @param positions int32 [n_tokens] positions, or NULL (no descriptor)
+ *  @param seq_id    int32 [n_tokens] bank ids (with positions)
+ *  @param n_banks   banks (with positions)
+ *  @return 1 launched (or nothing to do), 0 refused or failed */
+int pulsar_gpu_attn_pack_ring_store_batch_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv,
+                                                 uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+                                                 uint32_t head_dim, const pulsar_gpu_tensor *positions,
+                                                 const pulsar_gpu_tensor *seq_id, uint32_t n_banks);
+/** Copies already-packed rows into (banked) ring slots: a byte move, no re-quantisation.
+ *  @param raw_cache the ring
+ *  @param packed    packed rows [n_tokens][PULSAR_ATTN_PACK_ROWBYTES(head_dim)]
+ *  @param raw_cap   ring rows per bank (nonzero)
+ *  @param pos0      the batch's first position
+ *  @param n_tokens  rows
+ *  @param head_dim  the row width
+ *  @param positions int32 [n_tokens] positions, or NULL (then seq_id NULL too)
+ *  @param seq_id    int32 [n_tokens] bank ids, or NULL
+ *  @param n_banks   banks (nonzero with a descriptor)
+ *  @return 1 launched (or nothing to do), 0 refused or failed */
+int pulsar_gpu_attn_pack_scatter_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *packed,
+                                        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens,
+                                        uint32_t head_dim, const pulsar_gpu_tensor *positions,
+                                        const pulsar_gpu_tensor *seq_id, uint32_t n_banks);
+
+/* The sanctioned element reads of the two KV rows (every KV buffer -- see
+ * pulsar_gpu.h).  The opaque carriers pulsar_winkv_row_t / pulsar_mainkv_row_t
+ * are declared there. */
+/// @param kv       the WINDOW rows
+/// @param row      the row
+/// @param d        the dimension
+/// @param head_dim the row width
+/// @return element d of the row: its E4M3 byte times its block's E8M0 scale
+__device__ static inline float winkv_ld(const pulsar_winkv_row_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_WINKV_ROWBYTES(head_dim);
+    return pulsar_e4m3_times(r[d], pulsar_e8m0_scale(r[head_dim + d / PULSAR_WINKV_BLOCK]));
+}
+/// @param kv       the MAIN rows
+/// @param row      the row
+/// @param d        the dimension
+/// @param head_dim the row width
+/// @return element d of the row: its E2M1 nibble times its block's E4M3 scale
+__device__ static inline float mainkv_ld(const pulsar_mainkv_row_t *kv, uint64_t row, uint32_t d, uint32_t head_dim) {
+    const uint8_t *r = (const uint8_t *)kv + row * PULSAR_MAINKV_ROWBYTES(head_dim);
+    const float scale = pulsar_e4m3_times(r[head_dim / 2u + d / PULSAR_MAINKV_BLOCK], 1.0f);
+    const uint32_t nib = (r[d >> 1] >> ((d & 1u) * 4u)) & 0xFu;
+    return pulsar_e2m1_times(nib, scale);
+}
+
+/* Four consecutive dims [c4*4, c4*4+4) from a ROW POINTER -- global or the
+ * smem copy a cp.async stage filled; byte offsets are row-relative either way.
+ * Four dims never straddle a scale block, so one scale each. */
+/// @param pr       a WINDOW row's first byte (global or shared)
+/// @param c4       the 4-dim group: dims [4 c4, 4 c4 + 4)
+/// @param head_dim the row width
+/// @return the four dims, decoded
+__device__ static inline float4 winkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t base = c4 << 2;
+    const float scale = pulsar_e8m0_scale(pr[head_dim + base / PULSAR_WINKV_BLOCK]);
+    const uint32_t w = *(const uint32_t *)(pr + base);
+    float4 v;
+    v.x = pulsar_e4m3_times(w & 0xFFu, scale);
+    v.y = pulsar_e4m3_times((w >> 8) & 0xFFu, scale);
+    v.z = pulsar_e4m3_times((w >> 16) & 0xFFu, scale);
+    v.w = pulsar_e4m3_times(w >> 24, scale);
+    return v;
+}
+/// @param pr       a MAIN row's first byte (global or shared)
+/// @param c4       the 4-dim group: dims [4 c4, 4 c4 + 4)
+/// @param head_dim the row width
+/// @return the four dims, decoded
+__device__ static inline float4 mainkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t base = c4 << 2;
+    const float scale = pulsar_e4m3_times(pr[head_dim / 2u + base / PULSAR_MAINKV_BLOCK], 1.0f);
+    const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
+    float4 v;
+    v.x = pulsar_e2m1_times(b0 & 0xFu, scale);
+    v.y = pulsar_e2m1_times(b0 >> 4, scale);
+    v.z = pulsar_e2m1_times(b1 & 0xFu, scale);
+    v.w = pulsar_e2m1_times(b1 >> 4, scale);
+    return v;
+}
+
+/* The 0731 UNIFIED NVFP4 row's four-dim read -- the THIRD family, packed by
+ * src/cuda/pulsar_cuda_attnpack.cu and graded by tests/attn_pack_gate.cpp.
+ *
+ * Layout, in this order (PULSAR_ATTN_PACK_ROWBYTES is their sum):
+ *   [n_nope/2 E2M1 nibble bytes][n_nope/16 E4M3 block codes][4 B f32 row
+ *   scale][n_rot bf16 rope values]
+ * so a dim's value is its e4m3 code times the row scale.  The per-ROW scale is
+ * what stops this from borrowing mainkv_row_ld4 with a different stride: the
+ * two families' recipes are not the same shape at different widths.  Four dims
+ * share one block code, exactly as in the siblings above.
+ *
+ * This is what a V4 attention reads, and it had no caller at all before L218
+ * s46: the fp16 kernel carried only the two V4.1 families, so a V4 layer's
+ * 384-byte rows were staged at WINDOW's 528-byte stride -- reading past every
+ * row into its neighbour's bytes and decoding those. */
+/// @param pr       a unified row's first byte (global or shared)
+/// @param c4       the 4-dim group: dims [4 c4, 4 c4 + 4) (the nope dims, then the bf16 rope tail)
+/// @param head_dim the row width (nope + PULSAR_ATTN_PACK_NROT)
+/// @return the four dims, decoded
+__device__ static inline float4 attnkv_row_ld4(const uint8_t *pr, uint32_t c4, uint32_t head_dim) {
+    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
+    const uint32_t nib_bytes = n_nope / 2u;
+    const uint32_t nblk = n_nope / PULSAR_KV4_NV_BLOCK;
+    const uint32_t base = c4 << 2;
+    float4 v;
+    if (base < n_nope) {
+        const float row_scale = *(const float *)(pr + nib_bytes + nblk);
+        const float scale = pulsar_e4m3_times(pr[nib_bytes + base / PULSAR_KV4_NV_BLOCK], row_scale);
+        const uint32_t b0 = pr[base >> 1], b1 = pr[(base >> 1) + 1u];
+        v.x = pulsar_e2m1_times(b0 & 0xFu, scale);
+        v.y = pulsar_e2m1_times(b0 >> 4, scale);
+        v.z = pulsar_e2m1_times(b1 & 0xFu, scale);
+        v.w = pulsar_e2m1_times(b1 >> 4, scale);
+    } else {
+        const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + nib_bytes + nblk + 4u);
+        v.x = __bfloat162float(rope[base - n_nope + 0u]);
+        v.y = __bfloat162float(rope[base - n_nope + 1u]);
+        v.z = __bfloat162float(rope[base - n_nope + 2u]);
+        v.w = __bfloat162float(rope[base - n_nope + 3u]);
+    }
+    return v;
+}
+
+/** A device buffer plus the metadata needed to interpret its bytes.
+ *
+ * Deliberately NOT a shaped tensor: no dimensions, no strides. Shape lives at
+ * the call site, which is what lets one allocation be viewed several ways
+ * across a layer. What the buffer must carry is how wide an element is and
+ * what format it is in -- see `esz` and `fmt`, both of which exist because
+ * leaving that knowledge to consumers produced silent, type-legal bugs.
+ */
 struct pulsar_gpu_tensor {
-    void *ptr;
-    uint64_t bytes;
-    int owner;
+    void *ptr;        ///< device pointer
+    uint64_t bytes;   ///< allocation size
+    int owner;        ///< non-zero when this struct owns `ptr` and must free it
+    /** Non-zero for a placeholder handed out while pulsar_gpu_tensor_dry_begin
+     * is in force: nothing is behind `ptr`, and every device operation on the
+     * tensor (fill, write, read, copy, free) is a no-op that reports success.
+     * Exists so the allocation code can be run to PRICE a session without
+     * touching the device -- one authority for what a session costs. */
+    int dry;
+    /** Bytes per element.  0 = unspecified, which reads as f32: that keeps
+     * every pre-existing alloc meaning exactly what it meant, so only a
+     * buffer that is NOT f32 has to say so, once, where it is created.
+     *
+     * This field exists because the alternative -- every consumer taking an
+     * out_f16/q_f16 flag, every bound writing sizeof(float), every view
+     * restating the stride -- produced eight distinct defects in one
+     * narrowing, all of them type-legal and all of them silent. */
+    uint32_t esz;
+    /** Element FORMAT (L106 K15).  0 (PULSAR_ELT_F32) for every plain alloc,
+     * so pre-existing zero-initialised tensors keep meaning what they meant;
+     * set from the *_ELT_FMT authority at alloc_elt, inherited by views. */
+    uint32_t fmt;
 };
+
+/* The element size to actually use.  Never read t->esz directly. */
+/// @param t the tensor, or NULL
+/// @return its element size in bytes (4 when unstated)
+static inline uint32_t pulsar_tensor_esz(const pulsar_gpu_tensor *t) {
+    return (t && t->esz) ? t->esz : 4u;
+}
+
+/* The element FORMAT to actually use (L106 K15).  Never read t->fmt directly.
+ * A tensor with no stated format is f32, matching pulsar_tensor_esz's default
+ * -- the two defaults must stay in agreement. */
+/// @param t the tensor, or NULL
+/// @return its element format (PULSAR_ELT_F32 when unstated)
+static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
+    return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
+}
+
+/* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
+ * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
+ * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).
+ * The grow sites call this first. */
+/// @param what the buffer, for the refusal line
+/// @return true when the calling thread's stream is capturing: the caller refuses (said, once per site label)
+static inline bool cuda_grow_refused_under_capture(const char *what) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone)
+        return false;
+    (void)cudaGetLastError();
+    fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing\n",
+            what);
+    return true;
+}
+
+/* Stack sub-view that INHERITS the base's element size.  The hand-rolled
+ * aggregate initialisers this replaces dropped it, which silently retyped a
+ * narrowed buffer as f32 halfway through a split. */
+/// @param b     the base tensor
+/// @param off   byte offset of the view
+/// @param bytes the view's size
+/// @return a non-owning view carrying b's element size, format and dry-run placeholder flag
+static inline pulsar_gpu_tensor pulsar_tensor_subview(const pulsar_gpu_tensor *b,
+                                                     uint64_t off, uint64_t bytes) {
+    pulsar_gpu_tensor t;
+    t.ptr = (char *)b->ptr + off;
+    t.bytes = bytes;
+    t.owner = 0;
+    t.dry = b->dry;   /* L335: left unset, a view of a real tensor could read as a placeholder (and back) */
+    t.fmt = b->fmt;
+    t.esz = b->esz;
+    return t;
+}
+
+/* Constant-fill of an f32 device buffer.  This lived TWICE, byte-identical and
+ * `static`, in pulsar_cuda_norm_kv.cu and pulsar_cuda_runtime.cu -- one of the
+ * two duplicate kernel definitions the 2026-08-17 inventory turned up.  It is
+ * still `static`, so each TU that uses it still gets its own copy in the binary
+ * (cross-TU __global__ linkage would need -rdc=true, which this build does not
+ * use); what the move buys is ONE definition to keep correct instead of two
+ * that can drift apart silently. */
+/** x[i] = v for i < n.  One thread an element; any grid covering n.
+ *  @param x device f32 buffer
+ *  @param n elements
+ *  @param v the value */
+__global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v;
+}
+
 
 /* Hyper-connection residual-stream stored sample type (task #62; see the
  * PULSAR_HC_ELT_SIZE note in pulsar_gpu.h). pulsar_hc_t is the on-device STORAGE type of
@@ -153,100 +559,386 @@ struct pulsar_gpu_tensor {
  * bf16 storage, f32 math). Only the carriers use this — flat_hc (RMSNorm out)
  * and hc_mix/hc_split (Sinkhorn control weights) stay f32. sizeof(pulsar_hc_t)
  * MUST equal PULSAR_HC_ELT_SIZE. */
-#ifdef PULSAR_HC_F32
-typedef float pulsar_hc_t;
-__device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return p[i]; }
-__device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = v; }
-#else
+/// Stored type of the HC residual carriers (bf16; asserted against PULSAR_HC_ELT_SIZE below).
 typedef __nv_bfloat16 pulsar_hc_t;
+/// @param p an HC carrier
+/// @param i element index
+/// @return p[i] as f32
 __device__ __forceinline__ static float pulsar_hc_load(const pulsar_hc_t *p, uint64_t i) { return __bfloat162float(p[i]); }
+/// @param p an HC carrier
+/// @param i element index
+/// @param v the value, rounded to bf16
 __device__ __forceinline__ static void  pulsar_hc_store(pulsar_hc_t *p, uint64_t i, float v) { p[i] = __float2bfloat16(v); }
-#endif
+static_assert(PULSAR_HC_ELT_FMT == PULSAR_ELT_BF16 &&
+              std::is_same<pulsar_hc_t, __nv_bfloat16>::value,
+              "hc format tag and pulsar_hc_t state the same type; move both or neither");
 static_assert(sizeof(pulsar_hc_t) == PULSAR_HC_ELT_SIZE, "pulsar_hc_t size must match PULSAR_HC_ELT_SIZE");
 
-typedef struct {
-    float d;
-    int8_t qs[CUDA_QK_K];
-    int16_t bsums[CUDA_QK_K / 16];
-} cuda_block_q8_K;
+/* Stored attention-output (heads) element type; pairs with
+ * PULSAR_HEADS_ELT_SIZE in pulsar_gpu.h.  Same contract as pulsar_hc_t: the
+ * STORAGE narrows, every kernel still loads to f32 and accumulates in f32.
+ *
+ * FLIPPED to __nv_bfloat16 2026-08-24, after increments 1-7 landed the whole
+ * plumbing inert at f32 and the full suite went green on it byte-exact.  The
+ * static_assert below is the whole point of declaring the two together: the
+ * Q buffer's width mismatch shipped as a real defect because changing either
+ * side alone compiled clean. */
+/// Stored type of the attention-output (heads) buffer (bf16; asserted against PULSAR_HEADS_ELT_SIZE below).
+typedef __nv_bfloat16 pulsar_heads_t;
+/* Both casts are valid for float AND __nv_bfloat16 (the bf16 type carries a
+ * float conversion operator and a float constructor), so the flip really is
+ * one line in pulsar_gpu.h plus one in the typedef above. */
+/// @param p the heads buffer
+/// @param i element index
+/// @return p[i] as f32
+__device__ __forceinline__ static float heads_load(const pulsar_heads_t *p, uint64_t i) {
+    return (float)p[i];
+}
+/// @param p the heads buffer
+/// @param i element index
+/// @param v the value, rounded to pulsar_heads_t
+__device__ __forceinline__ static void heads_store(pulsar_heads_t *p, uint64_t i, float v) {
+    p[i] = (pulsar_heads_t)v;
+}
+/** The value heads_store(v) leaves in the buffer, as a float: what every E4M3
+ * encoder of the heads must quantise (L195: the fused attention epilogue and
+ * the rope tail encoded their f32 registers, the read-back encoder the stored
+ * bf16 -- one operand, two encodings, different attn-out bytes per arm). */
+/** @param v an f32 value
+ *  @return v rounded through pulsar_heads_t, as f32 */
+__device__ __forceinline__ static float heads_round(float v) {
+    return (float)(pulsar_heads_t)v;
+}
+static_assert(PULSAR_HEADS_ELT_FMT == PULSAR_ELT_BF16 &&
+              std::is_same<pulsar_heads_t, __nv_bfloat16>::value,
+              "heads format tag and pulsar_heads_t state the same type; move both or neither");
+static_assert(sizeof(pulsar_heads_t) == PULSAR_HEADS_ELT_SIZE,
+              "pulsar_heads_t and PULSAR_HEADS_ELT_SIZE state the same width; move both or neither");
 
-typedef struct {
-    uint16_t d;
-    uint16_t qs[CUDA_QK_K / 8];
-} cuda_block_iq2_xxs;
+/* A weight tensor stored EITHER f32 or bf16, decided per tensor at load time
+ * rather than per build (unlike pulsar_hc_t above, which is one compile-time
+ * choice for the whole engine).  Several families moved to bf16 storage to stop
+ * paying f32 bytes for values the checkpoint only ever held in bf16; the
+ * drafter's f32-source tensors, and any artifact built before that, still
+ * carry f32.  Both must work in one binary, so the storage is a template
+ * parameter: the inner loop keeps a plain indexed load and there is no branch
+ * per element.  Math stays f32 either way -- bf16 is storage, not precision. */
+/* NAME THE OTHER HALF. These take a void* and pick the decode from a bool, so
+ * nothing in the type system stops you calling the wrong one -- and the false
+ * branch is a DIFFERENT WIDTH in each (4 bytes vs 2). Passing an f16 tensor to
+ * the f32 variant reads twice the bytes and runs off the end of the tensor,
+ * which faults asynchronously and surfaces as a failure in whatever CUDA call
+ * comes next. That is exactly what happened on 2026-08-15 with token_embd.
+ * The suffix is the contract: check it against the tensor's actual type. */
+/** @tparam BF16 the tensor is bf16 (else f32)
+ *  @param w the weight
+ *  @param i element index
+ *  @return w[i] as f32 */
+template <bool BF16>
+__device__ __forceinline__ static float pulsar_w_load_f32_or_bf16(const void *w, uint64_t i) {
+    if constexpr (BF16) return __bfloat162float(((const __nv_bfloat16 *)w)[i]);
+    else                return ((const float *)w)[i];
+}
+
+/* Typed weight load: the POINTER carries the storage, so a mismatched width is
+ * a compile error rather than a silent wrong-width read. Prefer these over the
+ * bool-templated void* pair above for anything newly written -- that pair is
+ * what let the embed kernels read an f16 table as f32 on 2026-08-15. */
+/// @param p an f32 weight
+/// @param i element index
+/// @return p[i]
+__device__ __forceinline__ static float pulsar_wt_load(const float *p, uint64_t i) { return p[i]; }
+/// @param p a bf16 weight
+/// @param i element index
+/// @return p[i] as f32
+__device__ __forceinline__ static float pulsar_wt_load(const __nv_bfloat16 *p, uint64_t i) { return __bfloat162float(p[i]); }
+
+
+/* pulsar_w_load_f16_or_bf16<BF16> lived here: the false arm read __half. It had
+ * no callers, and the artifact has had ZERO F16 tensors since the source-format
+ * migration -- the type survives only as an enum value with no loader and no
+ * validator that accepts it. Deleted 2026-08-17 with the __half overload of
+ * pulsar_wt_load, for the same reason. */
+
+/* Bytes per element for the above.  Every bounds check on such a weight must
+ * use THIS, not sizeof(float): a bf16 tensor is half the bytes, and validating
+ * it against the f32 size rejects a legitimate tensor sitting near the end of
+ * the file. */
+/// @param w_bf16 nonzero for a bf16 weight
+/// @return its bytes per element (2 or 4)
+__host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf16) {
+    return w_bf16 ? 2u : 4u;
+}
+
+/* cuda_block_q8_K was here: the Q8_K activation block, int8 quants with an f32
+ * scale and per-16 partial sums.  Zero references in the tree -- the int8
+ * activation arms it belonged to are gone and every expert GEMM stages E4M3. */
 
 /* ---- shared types ---- */
 
+/** A span of the memory-mapped model file, and where it lives on the device.
+ *
+ * A range can reach the GPU two ways: copied into the arena, or the host pages
+ * registered so the device addresses them directly. The `registered_*` fields
+ * describe the second case and the `arena_allocated` flag the first; they are
+ * mutually exclusive, and the flags are what tell teardown which cleanup a
+ * given range needs.
+ */
 struct cuda_model_range {
-    const void *host_base;
-    uint64_t offset;
-    uint64_t bytes;
-    char *device_ptr;
-    void *registered_base;
-    char *registered_device_base;
-    uint64_t registered_bytes;
-    int host_registered;
-    int arena_allocated;
+    const void *host_base;          ///< mapping base this range is an offset into
+    uint64_t offset;                ///< byte offset of the range within the mapping
+    uint64_t bytes;                 ///< range length
+    char *device_ptr;               ///< device address of the range's first byte
+    void *registered_base;          ///< page-aligned host base actually registered
+    char *registered_device_base;   ///< device address corresponding to registered_base
+    uint64_t registered_bytes;      ///< bytes registered (>= `bytes`, page-rounded)
+    int host_registered;            ///< the host pages are registered and must be unregistered
+    int arena_allocated;            ///< the bytes were copied into the arena instead
 };
 
+/** Bump allocator holding model weights on the device. One allocation, carved
+ * by offset -- weights are written once at load and never freed individually,
+ * so nothing more is needed. */
 struct cuda_model_arena {
-    char *device_ptr;
-    uint64_t bytes;
-    uint64_t used;
+    char *device_ptr;  ///< base of the arena allocation
+    uint64_t bytes;    ///< total arena size
+    uint64_t used;     ///< bytes handed out so far; the bump pointer
 };
 
-struct fp8_mx_weight { const void *host_base; uint64_t offset, in_dim, out_dim; __nv_fp8_e4m3 *data; unsigned char *scale; };
+/** An MXFP8 weight matrix on the device: E4M3 values with their block scales
+ * kept in a separate table. */
+struct fp8_mx_weight {
+    const void *host_base;   ///< mapping base the source bytes came from
+    uint64_t offset,         ///< byte offset within that mapping
+             in_dim,         ///< input width (K)
+             out_dim;        ///< output width (N)
+    __nv_fp8_e4m3 *data;     ///< device E4M3 values
+    unsigned char *scale;    ///< device block scales, one per 32 values
+};
 
 /* ---- shared host globals ---- */
 
-extern cublasHandle_t g_cublas;
-extern int g_cublas_ready;
-extern int g_quality_mode;
+/// The process's cuBLASLt handle (created by cublaslt_ensure in pulsar_cuda_matmul.cu).
 extern cublasLtHandle_t g_cublaslt;
-extern std::unordered_set<uint64_t> g_fp8_offsets;
+/* Every FP8 registry below is keyed by (MAPPING, offset), never by offset
+ * alone.  A safetensors checkpoint is one file per layer, so each shard's
+ * offsets restart near zero: an offset-only key collides across layers, the
+ * fast path then misses its `host_base` check, and -- worse than a miss --
+ * each miss WROTE the entry back, evicting the other layer's every time.  One
+ * resolve per weight per step, for 43 layers. */
+/// Registry key: a weight's (mapping base, byte offset) pair -- unique across per-layer shards.
+struct map_offset_key {
+    /// host base address of the weight's mapping (its shard file)
+    const void *base;
+    /// byte offset of the weight within that mapping
+    uint64_t offset;
+    /// @param o the other key
+    /// @return true when both fields are equal
+    bool operator==(const map_offset_key &o) const {
+        return base == o.base && offset == o.offset;
+    }
+};
+/// Hash of a map_offset_key (boost-style combine of the base and offset hashes).
+struct map_offset_key_hash {
+    /// @param k the key
+    /// @return the combined hash
+    size_t operator()(const map_offset_key &k) const {
+        size_t h = std::hash<const void *>()(k.base);
+        h ^= std::hash<uint64_t>()(k.offset) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+/// Weights registered at load for the FP8 (MXFP8) path, by (mapping, offset); anything else is refused.
+extern std::unordered_set<map_offset_key, map_offset_key_hash> g_fp8_offsets;
+
+/* ---- once-per-shape bookkeeping that never goes quiet (L189) ----
+ *
+ * The announce and refusal lines that prove which arm ran (rule 5) and which
+ * precondition refused (rule 9) are printed once per distinct shape.  Until
+ * L189 every such site kept `static uint64_t seen[16]` and stopped RECORDING
+ * at the 17th shape, so a new shape after sixteen was neither printed nor
+ * counted -- a refusal in silence, forever, at exactly the instrument
+ * ENGINEERING-RULES.md section 1 names as the enforcement mechanism.
+ *
+ * This table records every distinct key it is given (open-addressed, 256
+ * slots, one probe on the hot repeat) and counts EVERY call.  When it is full
+ * it says so once, with the running call count, and keeps counting; the
+ * caller's own return value (refuse / launch) is never affected. */
+/// Slots of a pulsar_shape_once table (a power of two).
+#define PULSAR_SHAPE_ONCE_CAP 256u
+/// Once-per-shape announce table (see the block above): PULSAR_SHAPE_ONCE_CAP keys, every call counted.
+struct pulsar_shape_once {
+    uint64_t keys[PULSAR_SHAPE_ONCE_CAP];   ///< 0 = empty; stored keys carry bit 63 so none is 0
+    uint32_t n_keys;                         ///< distinct shapes recorded
+    uint64_t n_calls;                        ///< every call, listed or not
+    int      full_said;                      ///< the "further shapes not listed" line printed
+};
+
+/** The (a, b) shape pair as a table key -- (in_dim, out_dim), (q_n, 0), ... */
+/** @param a the first dimension (high 32 bits)
+ *  @param b the second dimension (xored into the low bits)
+ *  @return the key */
+static inline uint64_t pulsar_shape_key(uint64_t a, uint64_t b) {
+    return (a << 32) ^ b;
+}
+
+/** Count this call; return 1 exactly once per distinct `key` (the caller then
+ * prints its line, which may quote t->n_calls).  A full table prints once, with
+ * `what` and the call count, that further shapes are not listed, and returns 0. */
+/** @param t    the call site's table
+ *  @param key  the shape key (pulsar_shape_key)
+ *  @param what the call site's name for the table-full line
+ *  @return 1 the first time key is seen, else 0 */
+static inline int pulsar_shape_once_first(pulsar_shape_once *t, uint64_t key, const char *what) {
+    t->n_calls++;
+    const uint64_t k = key | (1ull << 63);
+    uint32_t i = (uint32_t)((k ^ (k >> 29) ^ (k >> 47)) & (PULSAR_SHAPE_ONCE_CAP - 1u));
+    for (uint32_t probe = 0; probe < PULSAR_SHAPE_ONCE_CAP; probe++) {
+        const uint64_t cur = t->keys[i];
+        if (cur == k) return 0;
+        if (cur == 0) {
+            t->keys[i] = k;
+            t->n_keys++;
+            return 1;
+        }
+        i = (i + 1u) & (PULSAR_SHAPE_ONCE_CAP - 1u);
+    }
+    if (!t->full_said) {
+        t->full_said = 1;
+        fprintf(stderr, "pulsar: %s: %u distinct shapes recorded, table full -- further shapes are NOT "
+                        "listed (calls so far: %llu; every call is still counted)\n",
+                what, t->n_keys, (unsigned long long)t->n_calls);
+    }
+    return 0;
+}
 
 /* ---- shared host functions ---- */
 
-void *cuda_tmp_alloc(uint64_t bytes, const char *what);
+#include "pulsar_cuda_scratch.h"   /* cuda_tmp_alloc + the slotted bump arena */
+/// Drops every FP8 / MXFP8 / f32-source weight registration and cache (pulsar_cuda_matmul.cu): engine close.
 void cuda_fp8_weight_cache_clear(void);
-int cuda_attention_score_buffer_fits(uint32_t n_comp);
+/** L188: read-and-clear the routed experts' non-finite flag (pulsar_cuda_moe.cu).
+ * Returns 1 and names the first (layer, arm) whose per-token reduction summed a
+ * non-finite value, 0 when the flag is clear, -1 on a CUDA error.  Called once
+ * per step at the stream drain (pulsar_gpu_end_commands); a 1 fails the step. */
+/** @param layer_index out: the first flagged layer (may be NULL)
+ *  @param arm         out: the flagged arm's name (may be NULL)
+ *  @return 1 flagged (and cleared), 0 clear, -1 CUDA error */
+int pulsar_gpu_routed_moe_nonfinite_take(uint32_t *layer_index, const char **arm);
+/** PLAN 94 phase 1 (L217): read-and-clear the routed experts' ROUTE BOUNDS flag
+ * (pulsar_cuda_moe_pairs.cu).  Returns 1 and names the first (layer, arm) whose
+ * sorted-pair build saw a `selected[]` expert id with no expert behind it (an
+ * id >= `n_expert_present`, which the REAP-padded router can emit and nothing
+ * remaps), 0 when the flag is clear, -1 on a CUDA error.  A negative id is the
+ * router's designed NaN route and is NOT a violation.  Called once per step at
+ * the stream drain; a 1 fails the step.  With L188's non-finite flag it is one
+ * of the two invariants `pulsar_gpu_end_commands` enforces before a step's
+ * bytes are used. */
+/** @param layer_index out: the first flagged layer (may be NULL)
+ *  @param arm         out: the flagged arm's name (may be NULL)
+ *  @return 1 flagged (and cleared), 0 clear, -1 CUDA error */
+int pulsar_gpu_routed_moe_route_oob_take(uint32_t *layer_index, const char **arm);
+
+/* PLAN 94 phase 1 (L217): the per-expert ADDRESS TABLE for a routed type-40
+ * (CUTLASS MXFP4) stack (pulsar_cuda_moe.cu).  Returns a device array of
+ * `n_total` pointers, entry e holding expert e's first byte -- today that is
+ * `base + e*stride`, built once per (base, stride, n_total) and cached for the
+ * life of the engine.  Phase 2 changes only what FILLS it.  NULL on failure.
+ * The entries point into the model arena, so they are freed by
+ * `mxfp4_expert_tables_clear()` at backend cleanup -- a second engine open in
+ * the same process would otherwise be served the first model's addresses (the
+ * fp8 pointer cache's hazard, same contract). */
+/** @param base    the stack's first expert byte (device)
+ *  @param stride  bytes between experts
+ *  @param n_total experts
+ *  @return the cached device pointer table, or NULL */
+const uint8_t *const *mxfp4_expert_table(const void *base, uint64_t stride, uint32_t n_total);
+/** PLAN 94 phase 1: the same table for a TYPE 44 (IQ2_XXS_MMQ_K) stack, whose
+ *  expert is TWO planes (d and q).  Returns an interleaved device array of
+ *  [d,q] pointer pairs -- one eviction unit -- laid out exactly as
+ *  ds4_mmq_d2r.cu:918-926 derives it: d[e] = base + e*nb*M halves,
+ *  q[e] = base + align64(E*nb*M*2) + e*nb*8*M uint2s, with nb = K/256. */
+/** @param base    the stack's base (device)
+ *  @param n_total experts (E)
+ *  @param nb      super-blocks a row (K / 256)
+ *  @param M       rows an expert
+ *  @return the cached device [d, q] pointer pairs, or NULL */
+const void *const *iq2_expert_table(const void *base, uint32_t n_total, uint32_t nb, uint32_t M);
+/** L245: the same table for an EXL3 stack, whose expert is ONE contiguous
+ *  [trellis | scales] slice of `stride` bytes with the fp16 scales `split`
+ *  bytes in (exl3_expert_layout).  Interleaved [trellis, scales] pointer
+ *  pairs; refuses a split that is not strictly inside the slice. */
+/** @param base    the stack's base (device)
+ *  @param n_total experts
+ *  @param stride  bytes an expert slice
+ *  @param split   byte offset of the fp16 scales within a slice (0 < split < stride)
+ *  @return the cached device [trellis, scales] pointer pairs, or NULL */
+const void *const *exl3_expert_table(const void *base, uint32_t n_total, uint64_t stride, uint64_t split);
+/// Frees every cached expert address table (backend cleanup).
+void mxfp4_expert_tables_clear(void);
+
+/* ---- the routed-expert sorted-pair builders (pulsar_cuda_moe_pairs.cu) ----
+ * They turn `selected[]` -- one router id per (token, slot) -- into the
+ * expert-major schedule the grouped CUTLASS MXFP4 lane and the mixed type-40/44
+ * lane consume.  They own the route-bounds rule: an id with no expert behind it
+ * is clamped in bounds so the maps stay consistent, and recorded in the flag
+ * above.  The arm tag says which launch saw it, so the refusal can name both. */
+/// Which sorted-pair launch recorded a route-bounds violation (bits 8..15 of the flag code).
+enum moe_route_oob_arm {
+    MOE_OOB_ARM_GROUPED_COUNT   = 1,   ///< grouped CUTLASS MXFP4 count (routed_moe_launch_cutlass_grouped)
+    MOE_OOB_ARM_GROUPED_SCATTER = 2,   ///< grouped CUTLASS MXFP4 scatter (routed_moe_launch_cutlass_grouped)
+    MOE_OOB_ARM_MIXED_COUNT     = 3,   ///< mixed type-40/44 count (routed_moe_launch_mixed40)
+    MOE_OOB_ARM_MIXED_SCATTER   = 4,   ///< mixed type-40/44 scatter (routed_moe_launch_mixed40)
+};
+
+/** The flag value a sorted-pair builder stores when it sees a `selected[]` id
+ *  with no expert behind it.  Code layout: bits 0..7 = layer_index + 1 (0 means
+ *  "clear"), bits 8..15 = arm -- the same layout as L188's non-finite flag. */
+/** @param layer_index the layer
+ *  @param arm         a moe_route_oob_arm value
+ *  @return the flag code */
+static __host__ __device__ __forceinline__ uint32_t moe_route_oob_code(uint32_t layer_index, uint32_t arm) {
+    return (arm << 8) | ((layer_index + 1u) & 0xffu);
+}
+
+__global__ void moe_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected,
+                                              uint32_t pair_count, uint32_t n_total, uint32_t oob_code);
+__global__ void moe_prefix_sorted_pairs_kernel(uint32_t *offsets, uint32_t *cursors,
+                                               const uint32_t *counts, uint32_t expert_count);
+__global__ void moe_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors,
+                                                const int32_t *selected, uint32_t pair_count,
+                                                uint32_t n_total, uint32_t oob_code);
+/** Device address of a model byte range (the cached device copy, a registered mapping, or the staged fd route).
+ *  @param model_map the host mapping base
+ *  @param offset    byte offset in the mapping
+ *  @param bytes     range length (0: the plain base pointer)
+ *  @param what      caller label for the diagnostics
+ *  @return the device pointer, or NULL when the range cannot be resolved */
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what);
+/** Checks a CUDA status; on failure reports @p what and returns 0.  Called
+ *  after nearly every launch, so its caller graph is past DOT_GRAPH_MAX_NODES
+ *  and is not drawn.
+ *  @param err  the CUDA status
+ *  @param what the operation, for the error message
+ *  @return 1 when @p err is cudaSuccess, else 0
+ *  \hidecallergraph */
 int cuda_ok(cudaError_t err, const char *what);
-int cublas_ok(cublasStatus_t st, const char *what);
-int cuda_matmul_fp8_hc_expand_tensor_labeled(
-        pulsar_gpu_tensor       *out_hc,
-        pulsar_gpu_tensor       *block_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const pulsar_gpu_tensor *x,
-        const pulsar_gpu_tensor *block_add,
-        const pulsar_gpu_tensor *residual_hc,
-        const pulsar_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc,
-        const char             *label);
+/** L302: count one host<->device synchronisation (pulsar_gpu_sync_stats): kind 0 stream drain, 1 device drain, 2 a
+ *  blocking device -> host copy of `bytes`, 3 a blocking host -> device copy. */
+/** @param kind  0 stream drain, 1 device drain, 2 device-to-host copy, 3 host-to-device copy
+ *  @param bytes the copy's bytes (kinds 2 and 3) */
+void pulsar_cuda_sync_note(int kind, uint64_t bytes);
 
 /* ---- shared __device__ inline helpers (per-TU copies; no -rdc) ---- */
 
+/// @param v this lane's value
+/// @return the warp sum, valid in lane 0 (a __shfl_down tree)
 __device__ static __forceinline__ float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
     return v;
-}
-
-__device__ static __forceinline__ float warp_max_f32(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
-    }
-    return v;
-}
-
-__device__ static __forceinline__ float dot4_f32(float4 a, float4 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
 #endif /* PULSAR_CUDA_INTERNAL_H */

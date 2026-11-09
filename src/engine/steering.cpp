@@ -1,19 +1,32 @@
+/** @file steering.cpp
+ *  @brief Directional steering on the DeepSeek graph, and the graph's KV-cache sizing and debug-dump config. */
 #include "pulsar_engine_internal.h"
 
 
 
+/// @param g the graph (NULL allowed)
+/// @return true when directions are loaded and the attention scale is non-zero
 bool gpu_graph_directional_steering_attn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_attn_scale != 0.0f;
 }
 
 
 
+/// @param g the graph (NULL allowed)
+/// @return true when directions are loaded and the FFN scale is non-zero
 bool gpu_graph_directional_steering_ffn_enabled(const pulsar_gpu_graph *g) {
     return g && g->directional_steering_dirs && g->directional_steering_ffn_scale != 0.0f;
 }
 
 
 
+/// Project the loaded steering direction of layer il out of x's rows, at `scale`.
+/// @param g the graph (no directions or scale 0: nothing)
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @param scale the projection's scale
+/// @return false = the launch refused
 static bool gpu_graph_apply_directional_steering(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -31,6 +44,12 @@ static bool gpu_graph_apply_directional_steering(
 
 
 
+/// Steer x's rows at layer il by the attention scale.
+/// @param g the graph
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @return false = the launch refused (true when steering is off)
 bool gpu_graph_apply_directional_steering_attn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -41,6 +60,12 @@ bool gpu_graph_apply_directional_steering_attn(
 
 
 
+/// Steer x's rows at layer il by the FFN scale.
+/// @param g the graph
+/// @param x the rows, [rows][PULSAR_N_EMBD]
+/// @param il the layer
+/// @param rows rows
+/// @return false = the launch refused (true when steering is off)
 bool gpu_graph_apply_directional_steering_ffn(
         pulsar_gpu_graph  *g,
         pulsar_gpu_tensor *x,
@@ -51,61 +76,86 @@ bool gpu_graph_apply_directional_steering_ffn(
 
 
 
-static uint64_t gpu_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_t raw_cap) {
-    /* Must track the ACTUAL storage formats (raw f16, packed attn comp, MXFP4
-     * indexer) — an f32-priced estimate overshoots ~3x under the default-on
-     * packed formats and needlessly trips the managed-KV (demand-paged) path
-     * at the 512k+ contexts where performance matters most. */
-    const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
-                                                          : sizeof(float);
-    uint64_t bytes = (uint64_t)PULSAR_N_LAYER * raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
-
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+/* The comp + index caches of one bank at ctx_size, in their stored row
+ * formats (packed attn comp, MXFP4 indexer), per-layer capacity from
+ * gpu_graph_comp_cap -- the same capacity gpu_graph_compute_dims hands the
+ * allocator.  Three readers: the KV-policy sizing below, the overcommit
+ * split (gpu_graph_demand_paged_bytes_per_bank) and the boot-line estimate
+ * (pulsar_context_memory_estimate). */
+uint64_t gpu_graph_comp_index_bytes_for_context(uint32_t ctx_size) {
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+    uint64_t bytes = 0;
+    /* CSA2 (L218): one comp pool per kv SOURCE, and one index-K pool beside it
+     * only where that source runs an indexer -- 0731's ratio-128 HCA layers
+     * publish none, so pricing one for them would overshoot the real allocation
+     * (and the accounting gate reads the allocation, not this formula).  The
+     * member layers read the pools and own nothing. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        const uint64_t comp_cap = gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il));
         bytes += comp_cap * attn_row;
-        if (ratio == 4) {
-            bytes += comp_cap * idx_row;
-        }
+        if (gpu_graph_layer_has_index_pool(il)) bytes += comp_cap * idx_row;
     }
     return bytes;
 }
 
+uint64_t gpu_graph_raw_ring_bytes_for_context(uint32_t raw_cap) {
+    /* Stored formats, not f32 upper bounds: an f32-priced size overshoots ~3x
+     * and trips the managed-KV (demand-paged) policy at the 512k+ contexts
+     * where performance matters most.  The raw ring is WINDOW rows,
+     * as gpu_graph_bank_slabs_alloc sizes it (raw_bank_bytes). */
+    return (uint64_t)PULSAR_N_LAYER * raw_cap * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
+}
 
-
-uint64_t gpu_graph_context_bytes_for_kv_policy(
-        uint32_t  ctx_size,
-        uint32_t  raw_cap,
-        uint32_t  prefill_cap,
-        uint64_t *kv_cache_bytes_out) {
+uint32_t gpu_graph_comp_cap_max(uint32_t ctx_size) {
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    uint64_t comp_cap = (uint64_t)(ctx_size / min_ratio + 2u);
-    if (comp_cap < 2u) comp_cap = 2u;
-    const uint64_t kv_cache_bytes = gpu_graph_kv_cache_bytes_for_context(ctx_size, raw_cap);
+    return gpu_graph_comp_cap(ctx_size, min_ratio);
+}
+
+
+
+/// The context-dependent device bytes of one graph: the KV caches plus the indexer scores and candidate buffers.
+/// @param ctx_size the context, tokens
+/// @param raw_cap the raw ring's rows
+/// @param prefill_cap the prefill chunk's rows
+/// @param kv_cache_bytes_out receives the KV caches' part alone (NULL ok)
+/// @return bytes
+uint64_t gpu_graph_context_bytes_for_kv_policy(
+        uint32_t  ctx_size,
+        uint32_t  raw_cap,
+        uint32_t  prefill_cap,
+        uint64_t *kv_cache_bytes_out) {
+    const uint64_t comp_cap = gpu_graph_comp_cap_max(ctx_size);
+    const uint64_t kv_cache_bytes = gpu_graph_raw_ring_bytes_for_context(raw_cap) +
+                                    gpu_graph_comp_index_bytes_for_context(ctx_size);
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
-    /* indexer_scores/comp_mask token rows shrink to the slice size under
+    /* indexer_scores token rows shrink to the slice size under
      * PULSAR_PREFILL_SLICE (see gpu_graph_prefill_slice / the gpu_diag alloc). */
     uint64_t score_rows = (uint64_t)prefill_cap;
     if (gpu_graph_prefill_slice() != 0u && (uint64_t)gpu_graph_prefill_slice() < score_rows) {
         score_rows = (uint64_t)gpu_graph_prefill_slice();
     }
+    /* CSA2 candidate pool: the per-row block bitmask over the deepest pool
+     * and one span's block-max scratch (gpu_diag's alloc, same formulas). */
+    const uint64_t mask_words = pulsar_gpu_candidate_mask_words((uint32_t)comp_cap, PULSAR_CANDIDATE_BLOCK_SIZE);
     uint64_t bytes = kv_cache_bytes +
-                     2ull * comp_cap * score_rows * sizeof(float);
+                     comp_cap * score_rows * sizeof(float) +                     /* one indexer_scores buffer */
+                     (uint64_t)prefill_cap * mask_words * sizeof(uint32_t) +    /* cand_mask */
+                     score_rows * mask_words * 32u * sizeof(float);             /* cand_bscore */
     return bytes;
 }
 
 
 
+/// @param managed allocate managed (oversubscribable) memory
+/// @param bytes size
+/// @return the tensor, or NULL
 pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
     return managed ? pulsar_gpu_tensor_alloc_managed(bytes) : pulsar_gpu_tensor_alloc(bytes);
 }
@@ -123,36 +173,55 @@ pulsar_gpu_tensor *gpu_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes)
 
 /* Is graph dumping enabled AT ALL this process?  Read once and cached.  Exposed
  * so graph allocation can skip buffers that exist ONLY to be dumped: the routed
- * MoE gate/up staging slabs are written by the qwarp32 kernels and read by
+ * MoE gate/up staging slabs are written by the routed-expert kernels and read by
  * nothing except gpu_graph_debug_dump_tensor, yet cost ~400 MB per session at
  * the default prefill_cap and ~2-4 MB/token of pointless device writes. */
-bool gpu_graph_debug_dump_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
+/* The graph-dump knobs, parsed ONCE (L159 inc 4).  The filters used to be
+ * re-read from the environment on every dump call -- three getenv scans per
+ * tensor per layer whenever dumping was armed.  One struct, one parse. */
+/** The graph-dump knobs (PULSAR_CUDA_GRAPH_DUMP_*), parsed once into a static by gpu_graph_dump_cfg_get. */
+struct gpu_graph_dump_cfg {
+    int         enabled;      ///< PULSAR_CUDA_GRAPH_DUMP_PREFIX set
+    const char *prefix;       ///< file prefix
+    const char *name;         ///< PULSAR_CUDA_GRAPH_DUMP_NAME substring filter, or NULL
+    long        layer;        ///< PULSAR_CUDA_GRAPH_DUMP_LAYER, -1 = all
+    long        pos;          ///< PULSAR_CUDA_GRAPH_DUMP_POS, -1 = all
+};
+/// @return the graph-dump knobs, parsed from the environment on first call (static)
+static const gpu_graph_dump_cfg *gpu_graph_dump_cfg_get(void) {
+    static gpu_graph_dump_cfg cfg;
+    static int parsed = 0;
+    if (!parsed) {
+        parsed = 1;
         const char *p = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
-        enabled = (p && p[0]) ? 1 : 0;
+        cfg.enabled = (p && p[0]) ? 1 : 0;
+        cfg.prefix = cfg.enabled ? p : NULL;
+        const char *n = getenv("PULSAR_CUDA_GRAPH_DUMP_NAME");
+        cfg.name = (n && n[0]) ? n : NULL;
+        const char *l = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
+        cfg.layer = (l && l[0] && strcmp(l, "all") != 0) ? (long)strtoul(l, NULL, 10) : -1;
+        const char *q = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
+        cfg.pos = (q && q[0]) ? (long)strtoul(q, NULL, 10) : -1;
     }
-    return enabled != 0;
+    return &cfg;
 }
-
+bool gpu_graph_debug_dump_enabled(void) {
+    return gpu_graph_dump_cfg_get()->enabled != 0;
+}
+/// @return PULSAR_CUDA_GRAPH_DUMP_PREFIX, or NULL when dumping is off
+const char *gpu_graph_debug_dump_prefix(void) {
+    return gpu_graph_dump_cfg_get()->prefix;
+}
+/// @param name the dump name (matched against the NAME filter as a substring of it)
+/// @param il the layer
+/// @param pos the position
+/// @return true when dumping is on and every set filter matches
 bool gpu_graph_debug_wants(const char *name, uint32_t il, uint32_t pos) {
-    /* Called ~60x/layer x 43 layers/token on the release decode path, where it
-     * is a no-op unless dumping is enabled.  Cache the enabled flag so the
-     * common (disabled) case costs one branch, not a linear environ scan per
-     * call.  The dump env vars are read once at process start like every other
-     * flag; caching does not change runtime behavior. */
-    if (!gpu_graph_debug_dump_enabled()) return false;
-
-    const char *name_env = getenv("PULSAR_CUDA_GRAPH_DUMP_NAME");
-    if (name_env && name_env[0] && strstr(name_env, name) == NULL) return false;
-
-    const char *layer_env = getenv("PULSAR_CUDA_GRAPH_DUMP_LAYER");
-    if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0 &&
-        (uint32_t)strtoul(layer_env, NULL, 10) != il) return false;
-
-    const char *pos_env = getenv("PULSAR_CUDA_GRAPH_DUMP_POS");
-    if (pos_env && pos_env[0] && (uint32_t)strtoul(pos_env, NULL, 10) != pos) return false;
-
+    const gpu_graph_dump_cfg *c = gpu_graph_dump_cfg_get();
+    if (!c->enabled) return false;
+    if (c->name && strstr(c->name, name) == NULL) return false;
+    if (c->layer >= 0 && (uint32_t)c->layer != il) return false;
+    if (c->pos >= 0 && (uint32_t)c->pos != pos) return false;
     return true;
 }
 

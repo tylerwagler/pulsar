@@ -1,4 +1,10 @@
+/** @file
+ *  pulsar-agent: streaming tool visualisation -- hides raw DSML and paints compact per-tool
+ *  progress while the model is still sampling. */
 #include "pulsar_agent_internal.h"
+#include "out_parse_kit.h"
+#include "pyjson.h"
+#include "chat_render_kit.h"
 
 
 
@@ -12,6 +18,13 @@
  * "Reading file 1:500...".
  */
 
+/** @brief Whether `s` equals any of up to four candidates.
+ *  @param s the string
+ *  @param a candidate; NULL = none
+ *  @param b candidate; NULL = none
+ *  @param c candidate; NULL = none
+ *  @param d candidate; NULL = none
+ *  @return true on a match */
 static bool streq_any(const char *s, const char *a, const char *b,
                       const char *c, const char *d) {
     return (a && !strcmp(s, a)) || (b && !strcmp(s, b)) ||
@@ -20,6 +33,10 @@ static bool streq_any(const char *s, const char *a, const char *b,
 
 
 
+/** @brief How a tool parameter is displayed (bash command, edit old / new diff, path, offset, content, ...).
+ *  @param tool  the tool's name; NULL = ""
+ *  @param param the parameter's name; NULL = ""
+ *  @return its AGENT_TOOL_PARAM_* kind */
 static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const char *param) {
     if (!tool) tool = "";
     if (!param) param = "";
@@ -42,6 +59,9 @@ static agent_tool_param_kind agent_tool_param_kind_for(const char *tool, const c
 
 
 
+/** @brief The SGR colour a parameter kind is shown in.
+ *  @param kind the kind
+ *  @return the escape sequence (static) */
 static const char *agent_tool_param_color(agent_tool_param_kind kind) {
     switch (kind) {
     case AGENT_TOOL_PARAM_PATH: return "\x1b[32m";
@@ -56,6 +76,10 @@ static const char *agent_tool_param_color(agent_tool_param_kind kind) {
 
 
 
+/** @brief Write visualizer bytes through the renderer (plain, no markdown) and track the line start.
+ *  @param sr the stream renderer
+ *  @param s  bytes
+ *  @param n  byte count */
 static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_t n) {
     renderer_plain(sr->renderer, s, n);
     for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
@@ -63,12 +87,18 @@ static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_
 
 
 
+/** @brief agent_tool_viz_write of a NUL-terminated string.
+ *  @param sr the stream renderer
+ *  @param s  the string */
 static void agent_tool_viz_puts(agent_stream_renderer *sr, const char *s) {
     agent_tool_viz_write(sr, s, strlen(s));
 }
 
 
 
+/** @brief Reset and activate the visualizer for a new DSML block (clearing the partial row on the live UI, or
+ *  ending the line in replay).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_start(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     bool line_open = !sr->renderer->last_output_newline;
@@ -91,6 +121,8 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
 
 
 
+/** @brief Start a visualizer line: a newline if needed, then the tool glyph.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
@@ -100,6 +132,9 @@ static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
 
 
 
+/** @brief The display prefix for a tool's line ("$ " for bash, "read ", "write ", "edit ", "search ").
+ *  @param name the tool's name
+ *  @return the prefix (static), or NULL for other tools */
 static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "bash")) return "$ ";
     if (!strcmp(name, "read")) return "read ";
@@ -111,6 +146,9 @@ static const char *agent_tool_viz_prefix(const char *name) {
 
 
 
+/** @brief Announce the tool being called (once per name); read gets its own `Reading <path>` style.
+ *  @param sr   the stream renderer
+ *  @param name the tool's name; NULL = "tool" */
 static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->tool_announced && !strcmp(v->tool_name, name)) return;
@@ -140,6 +178,10 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
 
 
 
+/** @brief Append one byte to a NUL-terminated fixed buffer, dropping it when full.
+ *  @param dst the buffer
+ *  @param cap bytes at `dst`
+ *  @param c   the byte */
 static void agent_tool_viz_append(char *dst, size_t cap, char c) {
     size_t len = strlen(dst);
     if (len + 1 >= cap) return;
@@ -149,6 +191,10 @@ static void agent_tool_viz_append(char *dst, size_t cap, char c) {
 
 
 
+/** @brief Collect one byte of a read call's path / start_line / max_lines / whole argument (the path also echoes
+ *  once its prefix is shown).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (!strcmp(v->param_name, "path")) {
@@ -165,6 +211,8 @@ static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Paint a read call's summary line (path and range) once; nothing for other tools or when already painted.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->read_style || v->read_line_rendered) return;
@@ -202,6 +250,10 @@ static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
 
 
 
+/** @brief Whether the current parameter is a code body (write content, edit old / new / content) shown
+ *  through the syntax highlighter.
+ *  @param v the visualizer
+ *  @return true for a code body */
 static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
     if (!strcmp(v->tool_name, "write") &&
         v->param_kind == AGENT_TOOL_PARAM_CONTENT)
@@ -216,6 +268,10 @@ static bool agent_tool_viz_param_is_code_body(agent_tool_visualizer *v) {
 
 
 
+/** @brief The diff prefix and colour of an edit parameter: "- " red for old, "+ " green for new.
+ *  @param kind  the parameter kind
+ *  @param color receives the colour (NULL when there is no prefix); may be NULL
+ *  @return the prefix, or NULL for other kinds */
 static const char *agent_tool_viz_diff_prefix(agent_tool_param_kind kind,
                                               const char **color) {
     if (color) *color = NULL;
@@ -232,6 +288,8 @@ static const char *agent_tool_viz_diff_prefix(agent_tool_param_kind kind,
 
 
 
+/** @brief At a line start inside a diff parameter, write its coloured diff prefix.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_prefix(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->at_line_start) return;
@@ -249,6 +307,9 @@ static void agent_tool_viz_code_prefix(agent_stream_renderer *sr) {
 
 
 
+/** @brief Start streaming a code-body parameter through the renderer's code stream, with the syntax of the
+ *  call's path (and [upto] highlighting for edit's old text).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_begin(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     const agent_syntax *syntax = agent_syntax_for_path(v->tool_path);
@@ -272,6 +333,8 @@ static void agent_tool_viz_code_begin(agent_stream_renderer *sr) {
 
 
 
+/** @brief End an active code-body parameter's code stream.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_code_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->code_param_active) return;
@@ -283,6 +346,9 @@ static void agent_tool_viz_code_end(agent_stream_renderer *sr) {
 
 
 
+/** @brief One byte of a code-body parameter (diff prefix at line starts).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_code_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     agent_tool_viz_code_prefix(sr);
@@ -293,6 +359,9 @@ static void agent_tool_viz_code_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief A parameter opened: record its name and kind and start its display (colour, code stream, label).
+ *  @param sr   the stream renderer
+ *  @param name the parameter's name; NULL = "" */
 static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *name) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->tool_announced && sr->parser->current.name)
@@ -343,6 +412,8 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
 
 
 
+/** @brief A parameter closed: end its code stream and colour, clear its state.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     v->param_end_len = 0;
@@ -354,6 +425,9 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
 
 
 
+/** @brief Display one byte of a parameter value already known not to be part of its closing tag.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->read_style) {
@@ -385,6 +459,8 @@ static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Re-emit the active parameter's colour (after the UI reset terminal attributes between chunks).
+ *  @param sr the stream renderer */
 static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active || !v->param_active || v->read_style) return;
@@ -396,6 +472,9 @@ static void agent_tool_viz_restore_param_color(agent_stream_renderer *sr) {
 /* Stream one DSML parameter byte into the visualizer.  The visualizer must not
  * wait for the whole parameter: large write/edit contents should show progress
  * as the model emits them, while still detecting the closing parameter tag. */
+/// @brief Stream one parameter byte into the visualizer (see above), holding a possible closing tag.
+/// @param sr the stream renderer
+/// @param c  the byte
 static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
 
@@ -428,6 +507,9 @@ static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
 
 
 
+/** @brief Close the visualizer: end an open parameter, paint a pending read line, show `status` in grey.
+ *  @param sr     the stream renderer
+ *  @param status a closing note (e.g. "[tool call interrupted]"); NULL or empty = none */
 static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -445,6 +527,8 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
 
 
 
+/** @brief Show the exact DSML bytes the parser rejected (in red), so a parse failure is visible as evidence.
+ *  @param sr the stream renderer */
 static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -470,6 +554,9 @@ static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
 
 
 
+/** @brief Report a tool call ignored because it was inside thinking: mark it, trace it, show it in red.
+ *  @param sr     the stream renderer
+ *  @param detail the reason; NULL or empty = the default message */
 static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const char *detail) {
     const char *msg =
         detail && detail[0] ? detail :
@@ -491,6 +578,10 @@ static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const ch
 
 
 
+/** @brief Mark the parser failed with a malformed-DSML error (once), trace it and show it in red; the model gets
+ *  it as a tool error.
+ *  @param sr     the stream renderer
+ *  @param detail the reason; NULL or empty = the default message */
 static void agent_stream_malformed_dsml(agent_stream_renderer *sr,
                                         const char *detail) {
     const char *msg = detail && detail[0] ? detail :
@@ -511,6 +602,8 @@ static void agent_stream_malformed_dsml(agent_stream_renderer *sr,
 
 /* Mirror parser progress into the terminal visualizer.  Parser state is the
  * source of truth; this function only decides what the user should see. */
+/// @brief Mirror the parser's progress into the visualizer (see above).
+/// @param sr the stream renderer
 static void agent_stream_tool_events(agent_stream_renderer *sr) {
     agent_dsml_parser *p = sr->parser;
     agent_tool_visualizer *v = &sr->viz;
@@ -534,6 +627,9 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
 
 
 
+/** @brief When edit's `old` parameter closes (live UI only), check it against the file before `new` streams;
+ *  a failure is recorded in tool_preflight_error / _msg and stops the call.
+ *  @param sr the stream renderer */
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
     if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
         return;
@@ -559,6 +655,10 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
 
 
 
+/** @brief Feed one byte of an open DSML block to the parser and the visualizer; handles the parameter close,
+ *  the edit preflight and the block's end.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
     bool was_param = !sr->dsml_ignored && sr->viz.param_active;
     agent_dsml_feed(sr->parser, &c, 1);
@@ -604,6 +704,9 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
 /* Start a DSML block from the streaming detector.  The detector may accept a
  * known malformed opening form for robustness, but the parser is seeded with
  * canonical bytes so all later parsing remains strict. */
+/// @brief Open a DSML block from the streaming detector (see above).
+/// @param sr      the stream renderer
+/// @param ignored the block is inside thinking: parse it but never show or execute it
 static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
     sr->dsml_active = true;
     sr->dsml_ignored = ignored;
@@ -625,6 +728,8 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr, char c)
 
 
 
+/** @brief Release the bytes the start detector held as ordinary text (they did not open a DSML block).
+ *  @param sr the stream renderer */
 static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
     if (!sr->dsml_start_len) return;
     sr->post_think_gap = false;
@@ -638,30 +743,34 @@ static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
 
 
 
+/* Is `tail` (the bytes held since a '<') a prefix of -- or exactly -- an
+ * opener the detector accepts?  Every syntax's tool_calls opener counts.  A
+ * bare invoke opener also starts a block (the model often knows it wants a
+ * tool but forgets the outer wrapper), but only in the marker-bearing
+ * spellings: a plain "<invoke" is ordinary XML in prose. */
+/// @brief Match held bytes against the accepted DSML openers (see above).
+/// @param tail            the bytes held since a '<'
+/// @param len             byte count
+/// @param complete        receives true when `tail` is a whole opener
+/// @param implicit_invoke receives true when it is a bare invoke opener
+/// @return true when `tail` is a prefix of (or equal to) an opener
 static bool agent_stream_dsml_start_match(const char *tail, size_t len,
                                           bool *complete,
                                           bool *implicit_invoke) {
-    static const char canonical[] = "<｜DSML｜tool_calls>";
-    static const char missing_bar[] = "<DSML｜tool_calls>";
-    static const char invoke[] = "<｜DSML｜invoke";
-    static const char invoke_missing_bar[] = "<DSML｜invoke";
-    struct {
-        const char *text;
-        bool implicit_invoke;
-    } forms[] = {
-        {canonical, false},
-        {missing_bar, false},
-        {invoke, true},
-        {invoke_missing_bar, true},
-    };
     *complete = false;
     *implicit_invoke = false;
-    for (size_t i = 0; i < sizeof(forms)/sizeof(forms[0]); i++) {
-        size_t form_len = strlen(forms[i].text);
-        if (len <= form_len && memcmp(forms[i].text, tail, len) == 0) {
-            *complete = len == form_len;
-            *implicit_invoke = forms[i].implicit_invoke;
-            return true;
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        const bool marker_bearing = strstr(syn->invoke_start, PULSAR_DSML_SHORT) != NULL;
+        const char *forms[2] = {syn->tool_calls_start, marker_bearing ? syn->invoke_start : NULL};
+        for (size_t f = 0; f < 2; f++) {
+            if (!forms[f]) continue;
+            size_t form_len = strlen(forms[f]);
+            if (len <= form_len && memcmp(forms[f], tail, len) == 0) {
+                *complete = len == form_len;
+                *implicit_invoke = f == 1;
+                return true;
+            }
         }
     }
     return false;
@@ -669,6 +778,12 @@ static bool agent_stream_dsml_start_match(const char *tail, size_t len,
 
 
 
+/** @brief Whether the tail ends with `needle`.
+ *  @param tail       the bytes
+ *  @param len        byte count
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`
+ *  @return true on a match */
 static bool agent_tail_matches(const char *tail, size_t len,
                                const char *needle, size_t needle_len) {
     return len >= needle_len &&
@@ -682,6 +797,10 @@ static bool agent_tail_matches(const char *tail, size_t len,
  * <think> the marker means "tool call attempted too early", while in normal
  * assistant output it means malformed DSML that the model should see as a tool
  * error. */
+/// @brief Feed one byte to a DSML-marker detector (see above).
+/// @param d the detector (a sliding tail)
+/// @param c the byte
+/// @return true when the tail now ends in a DSML-looking marker
 static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
                                             char c) {
     if (d->len == sizeof(d->tail)) {
@@ -690,10 +809,10 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
     }
     d->tail[d->len++] = c;
 
-    static const char fullwidth_marker[] = "｜DSML｜";
-    static const char ascii_marker[] = "|DSML|";
-    static const char missing_open[] = "<DSML｜";
-    static const char missing_close[] = "</DSML｜";
+    static const char fullwidth_marker[] = PULSAR_DSML;
+    static const char ascii_marker[] = "|DSML|";   /* an ASCII-bar typo, not a syntax */
+    static const char missing_open[] = "<" PULSAR_DSML_SHORT;
+    static const char missing_close[] = "</" PULSAR_DSML_SHORT;
     return agent_tail_matches(d->tail, d->len,
                               fullwidth_marker, sizeof(fullwidth_marker) - 1) ||
            agent_tail_matches(d->tail, d->len,
@@ -706,19 +825,25 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
 
 
 
+/** @brief Inside thinking, watch for DSML markers; one sets dsml_in_think (a tool call attempted too early).
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
                                                  char c) {
-    if (!sr->in_think || sr->dsml_in_think) return;
+    if (!sr->renderer->think.in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->think_dsml, c))
         sr->dsml_in_think = true;
 }
 
 
 
+/** @brief In ordinary output outside any DSML block, a DSML marker is malformed DSML: report it.
+ *  @param sr the stream renderer
+ *  @param c  the byte */
 static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
                                               char c) {
     if (sr->parser->state == AGENT_DSML_ERROR) return;
-    if (sr->dsml_active || sr->in_think || sr->dsml_in_think) return;
+    if (sr->dsml_active || sr->renderer->think.in_think || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->plain_dsml, c)) {
         agent_stream_malformed_dsml(
             sr, "DSML markup outside a valid tool_calls block");
@@ -729,10 +854,13 @@ static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr,
 
 /* Route ordinary assistant bytes either to normal markdown rendering or into
  * the DSML detector.  The detector must hold short prefixes because the model
- * can split "<｜DSML｜tool_calls>" across arbitrary tokens. */
+ * can split "<｜DSML｜ calls>" across arbitrary tokens. */
+/// @brief Route one ordinary assistant byte (see above).
+/// @param sr the stream renderer
+/// @param c  the byte
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
-    static const char start[] = "<｜DSML｜tool_calls>";
-    static const char canonical_invoke[] = "<｜DSML｜invoke";
+    const char *start = PULSAR_DSML_CANONICAL->tool_calls_start;
+    const char *canonical_invoke = PULSAR_DSML_CANONICAL->invoke_start;
     if (sr->parser->state == AGENT_DSML_ERROR) return;
     agent_stream_note_thinking_dsml_byte(sr, c);
 
@@ -757,14 +885,14 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         {
             if (complete) {
                 /* Accept the common missing-leading-bar typo
-                 * "<DSML｜tool_calls>" here, but seed the parser with the
+                 * "<DSML｜ calls>" here, but seed the parser with the
                  * canonical marker so the rest of the DSML parser stays
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
-                agent_stream_start_dsml(sr, sr->in_think);
+                agent_stream_start_dsml(sr, sr->renderer->think.in_think);
                 if (implicit_invoke) {
-                    for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
+                    for (size_t i = 0; i < strlen(canonical_invoke); i++)
                         agent_stream_feed_dsml_byte(sr, canonical_invoke[i]);
                 }
             }
@@ -804,15 +932,125 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
  * parser continue building executable calls, and paints semantic tool output
  * from parser state changes.  The sampled transcript remains unchanged: only
  * the terminal projection is rewritten. */
-void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = sr->pending_len + len;
-    char *buf = (char *)agent_xmalloc(total ? total : 1);
-    if (sr->pending_len) memcpy(buf, sr->pending, sr->pending_len);
-    if (len) memcpy(buf + sr->pending_len, text, len);
-    sr->pending_len = 0;
+/** The agent's sink for pulsar_think_scan: tags are prose only outside a DSML
+ * block; a held DSML start tail flushes before the reasoning state flips; the
+ * blank line owed after `</think>` is swallowed by agent_stream_normal_byte
+ * while post_think_gap is set. */
+struct agent_stream_think_sink {
+    agent_stream_renderer *sr;  ///< the stream being projected
+    /** DSML bytes are not prose: no tag recognition while a block is parsed. */
+    /** @return true when no DSML block is open */
+    bool tags_enabled() const { return !sr->dsml_active; }
+    /** `<think>` consumed: release a held marker tail in the pre-think state. */
+    void think_open_tag() { sr->post_think_gap = false; agent_stream_flush_start_tail(sr); }
+    /** `</think>` consumed: release the tail, drop the dim style, arm the gap. */
+    void think_close_tag() {
+        agent_stream_flush_start_tail(sr);
+        renderer_reset_color(sr->renderer);
+        sr->post_think_gap = true;
+    }
+    /** Whether the renderer's last byte was a newline. */
+    /** @return true at the start of a line */
+    bool at_line_start() const { return sr->renderer->last_output_newline; }
+    /** Raw newline, outside markdown (renderer_write tracks last_output_newline). */
+    void newline() { renderer_write(sr->renderer, "\n", 1); }
+    /** One byte: into the DSML parser while a block is open, else the normal
+     * route -- thinking bytes included, so an accidental in-think tool stanza
+     * is suppressed cleanly instead of shown raw or, worse, executed. */
+    /** @param c the byte */
+    void text(char c) {
+        if (sr->dsml_active) agent_stream_feed_dsml_byte(sr, c);
+        else agent_stream_normal_byte(sr, c);
+    }
+};
 
+/** @brief L365: paint one completed family call through the tool visualizer -- the same projection a DSML call
+ *  gets, fed from the call's arguments object instead of the stream.
+ *  @param sr        the stream renderer
+ *  @param name      the function name
+ *  @param arguments the arguments, a JSON object's text */
+static void agent_stream_family_call(agent_stream_renderer *sr, const std::string &name, const std::string &arguments) {
+    agent_tool_viz_start(sr);
+    agent_tool_viz_tool(sr, name.c_str());
+    pyjson_value v;
+    char jerr[160];
+    if (pyjson_parse(arguments.data(), arguments.size(), &v, jerr, sizeof jerr) && v.kind == pyjson_value::OBJ) {
+        for (const auto &m : v.o) {
+            const std::string text = m.second.kind == pyjson_value::STR ? m.second.s : py_tojson(m.second);
+            agent_tool_viz_param_begin(sr, m.first.c_str());
+            for (char c : text) agent_tool_viz_param_value_byte(sr, c);
+            agent_tool_viz_param_end(sr);
+        }
+    }
+    agent_tool_viz_render_read(sr);
+    agent_tool_viz_finish(sr, NULL);
+}
+
+/** @brief L365: a non-DSML family's stream -- the raw bytes to its output parser, the display from its events.
+ *  Reasoning shows grey, the reply as markdown; a call shows once it closes; a malformed call is reported and its
+ *  diagnostic kept for the retry (family_error).
+ *  @param sr     the stream renderer (sr->family set)
+ *  @param text   the bytes (NULL with finish)
+ *  @param len    byte count
+ *  @param finish the round ended: release held bytes, report an unterminated call */
+static void agent_stream_family_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
+    std::vector<out_event> ev;
+    if (len) sr->family->feed(text, len, &ev);
+    if (finish) sr->family->finish(&ev);
+    agent_token_renderer *r = sr->renderer;
+    for (const out_event &e : ev) {
+        switch (e.kind) {
+        case out_event::REASONING:
+            if (!r->think.in_think) {
+                r->think.in_think = true;
+                renderer_restore_text_attrs(r);
+            }
+            for (char c : e.text) renderer_write_char(r, c);
+            break;
+        case out_event::CONTENT:
+            if (r->think.in_think) {
+                r->think.in_think = false;
+                renderer_reset_color(r);
+                sr->family_gap = true;
+            }
+            for (char c : e.text) {
+                if (sr->family_gap && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) continue;
+                sr->family_gap = false;
+                renderer_write_char(r, c);
+            }
+            break;
+        case out_event::TOOL_END:
+            if (r->think.in_think) {
+                r->think.in_think = false;
+                renderer_reset_color(r);
+            }
+            sr->family_gap = true;
+            agent_trace(r->worker, "family call %d %s", e.index, e.name.c_str());
+            agent_stream_family_call(sr, e.name, e.arguments);
+            break;
+        case out_event::ERROR: {
+            if (!sr->family_error[0])
+                snprintf(sr->family_error, sizeof sr->family_error, "%s", e.text.c_str());
+            agent_trace(r->worker, "family call error %s", e.text.c_str());
+            char status[300];
+            snprintf(status, sizeof status, "[invalid tool call: %s]\n", e.text.c_str());
+            agent_tool_viz_start(sr);
+            agent_tool_viz_finish(sr, status);
+            break;
+        }
+        case out_event::TOOL_BEGIN:
+        case out_event::TOOL_ARGS:
+            break;
+        }
+    }
+}
+
+void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
+    if (sr->family) {
+        if (len) renderer_restore_text_attrs(sr->renderer);
+        agent_stream_family_text(sr, text, len, finish);
+        return;
+    }
     /* The UI may reset terminal attributes while redrawing the editable prompt
      * between generated chunks.  If a DSML parameter is still streaming, make
      * each new token fragment self-contained by restoring the active parameter
@@ -821,56 +1059,8 @@ void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, 
     if (len) agent_tool_viz_restore_param_color(sr);
     if (len && !sr->dsml_active) renderer_restore_text_attrs(sr->renderer);
 
-    size_t i = 0;
-    while (i < total) {
-        char *cur = buf + i;
-        size_t rem = total - i;
-        if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_open)) {
-            agent_stream_flush_start_tail(sr);
-            sr->post_think_gap = false;
-            sr->in_think = true;
-            sr->renderer->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (!sr->dsml_active && bytes_has_prefix(cur, rem, think_close)) {
-            agent_stream_flush_start_tail(sr);
-            sr->in_think = false;
-            sr->renderer->in_think = false;
-            renderer_reset_color(sr->renderer);
-            if (!sr->renderer->last_output_newline)
-                renderer_write(sr->renderer, "\n", 1);
-            renderer_write(sr->renderer, "\n", 1);
-            sr->renderer->last_output_newline = true;
-            sr->post_think_gap = true;
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && !sr->dsml_active && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(sr->pending)) {
-                memcpy(sr->pending, cur, rem);
-                sr->pending_len = rem;
-            }
-            break;
-        }
-
-        if (sr->dsml_active) {
-            agent_stream_feed_dsml_byte(sr, cur[0]);
-        } else if (sr->in_think) {
-            /* Tool calls are executable only after thinking has closed.  Still
-             * route thinking bytes through the DSML start detector so an
-             * accidental in-think tool stanza can be suppressed cleanly instead
-             * of being shown as raw markup or, worse, executed. */
-            agent_stream_normal_byte(sr, cur[0]);
-        } else {
-            agent_stream_normal_byte(sr, cur[0]);
-        }
-        i++;
-    }
-    free(buf);
+    agent_stream_think_sink sink = { sr };
+    pulsar_think_scan(&sr->renderer->think, text, len, finish, 1, sink);
 
     if (finish) {
         agent_stream_flush_start_tail(sr);

@@ -1,7 +1,13 @@
+/** @file tokenizer.cpp
+ *  @brief DeepSeek's byte-level BPE tokenizer: vocabulary tables, BPE merge and chat tokenization. */
 #include "pulsar_engine_internal.h"
+#include "pulsar_utf8.h"
+#include "gemma4_chat.h"
+#include <string>
 
 
 
+/** The smallest power of two >= n (1 for n <= 1).  @param n the value  @return the power of two */
 static uint64_t next_pow2(uint64_t n) {
     uint64_t p = 1;
     while (p < n) p <<= 1;
@@ -10,6 +16,9 @@ static uint64_t next_pow2(uint64_t n) {
 
 
 
+/** Allocate an empty open-addressing table sized for `expected` entries (capacity a power of two >= 2x + 16).
+ *  @param t        the table
+ *  @param expected entries it will hold */
 static void table_init(str_i32_table *t, uint64_t expected) {
     t->cap = next_pow2(expected * 2 + 16);
     t->used = 0;
@@ -18,6 +27,7 @@ static void table_init(str_i32_table *t, uint64_t expected) {
 
 
 
+/** Free a table's entries and zero it (keys are borrowed, not freed).  @param t the table */
 static void table_free(str_i32_table *t) {
     free(t->entry);
     memset(t, 0, sizeof(*t));
@@ -25,6 +35,10 @@ static void table_free(str_i32_table *t) {
 
 
 
+/** Insert or overwrite `key` (linear probing; the table never grows, so it must be sized for every key).
+ *  @param t     the table
+ *  @param key   the key; borrowed, must outlive the table
+ *  @param value the value */
 static void table_put(str_i32_table *t, pulsar_str key, int value) {
     uint64_t mask = t->cap - 1;
     uint64_t i = hash_bytes(key.ptr, key.len) & mask;
@@ -45,6 +59,11 @@ static void table_put(str_i32_table *t, pulsar_str key, int value) {
 
 
 
+/// @param t     the table
+/// @param ptr   the key's bytes
+/// @param len   their count
+/// @param value receives the value when found
+/// @return true when found
 static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int *value) {
     if (t->cap == 0) return false;
 
@@ -64,6 +83,7 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
 
 
 
+/** Append a token, growing the vector by doubling (from 64).  @param tv the vector  @param token the token id */
 void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
         tv->cap = tv->cap ? tv->cap * 2 : 64;
@@ -74,6 +94,7 @@ void token_vec_push(token_vec *tv, int token) {
 
 
 
+/** Free the vector's storage and zero it.  @param tv the vector */
 void token_vec_free(token_vec *tv) {
     free(tv->v);
     memset(tv, 0, sizeof(*tv));
@@ -94,8 +115,18 @@ void pulsar_tokens_free(pulsar_tokens *tv) {
 
 
 void pulsar_tokens_copy(pulsar_tokens *dst, const pulsar_tokens *src) {
+    /* Reserve once and memcpy: the push loop this replaced called xrealloc O(n)
+     * times on the first copy into an empty vector, and the spec bank carry
+     * copies a whole 100k-token history several times per round (L219).  The
+     * growth policy is unchanged so allocation behavior does not shift. */
     dst->len = 0;
-    for (int i = 0; i < src->len; i++) token_vec_push(dst, src->v[i]);
+    if (src->len <= 0) return;
+    if (dst->cap < src->len) {
+        while (dst->cap < src->len) dst->cap = dst->cap ? dst->cap * 2 : 16;
+        dst->v = (int *)xrealloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
+    }
+    memcpy(dst->v, src->v, (size_t)src->len * sizeof(dst->v[0]));
+    dst->len = src->len;
 }
 
 
@@ -110,41 +141,17 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
 
 
 
-bool cpu_directional_steering_enabled(
-        const float *dirs,
-        float        scale) {
-    return dirs && scale != 0.0f;
-}
-
-
-
-void cpu_directional_steering_project_rows(
-        float       *x,
-        const float *dirs,
-        uint32_t     il,
-        uint32_t     rows,
-        float        scale) {
-    if (!cpu_directional_steering_enabled(dirs, scale) || !x || rows == 0) return;
-
-    const float *dir = dirs + (uint64_t)il * PULSAR_N_EMBD;
-    for (uint32_t row = 0; row < rows; row++) {
-        float *xr = x + (uint64_t)row * PULSAR_N_EMBD;
-        float dot = 0.0f;
-        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
-            dot += xr[i] * dir[i];
-        }
-        const float coeff = scale * dot;
-        for (uint32_t i = 0; i < PULSAR_N_EMBD; i++) {
-            xr[i] -= coeff * dir[i];
-        }
-    }
-}
 
 
 
 
 
 
+
+
+
+/** Write `cp` as UTF-8 at *p and advance *p (1-4 bytes; no validation).  @param p the write cursor
+ *  @param cp the codepoint */
 static void utf8_put(char **p, uint32_t cp) {
     if (cp <= 0x7f) {
         *(*p)++ = (char)cp;
@@ -165,6 +172,8 @@ static void utf8_put(char **p, uint32_t cp) {
 
 
 
+/** GPT-2's byte-to-unicode map: printable bytes map to themselves, the rest to 256 + their rank.
+ *  @param b the byte  @return the codepoint */
 static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
     if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) {
         return b;
@@ -185,6 +194,9 @@ static uint32_t gpt2_byte_to_codepoint(uint8_t b) {
 
 /* GPT-2 byte-level BPE first maps raw bytes to printable Unicode codepoints
  * so merges can operate on UTF-8 strings without losing byte identity. */
+/// @param in      the raw bytes
+/// @param out_len receives the encoded length in bytes
+/// @return the NUL-terminated encoding, xmalloc'd (the caller frees it)
 static char *byte_encode(pulsar_str in, uint64_t *out_len) {
     char *out = (char *)xmalloc((size_t)in.len * 4 + 1);
     char *p = out;
@@ -199,16 +211,32 @@ static char *byte_encode(pulsar_str in, uint64_t *out_len) {
 
 
 
-static int utf8_len_from_first_byte(uint8_t c) {
-    if (c < 0x80) return 1;
-    if ((c & 0xe0) == 0xc0) return 2;
-    if ((c & 0xf0) == 0xe0) return 3;
-    if ((c & 0xf8) == 0xf0) return 4;
-    return 1;
+/* Decode the UTF-8 sequence at s[pos] (strict rule: pulsar_utf8.h).  An
+ * ill-formed byte -- bad lead, bad or truncated continuation, Table 3-7
+ * violation -- is its own one-byte unit and decodes to its byte value.  Sets
+ * *next just past the consumed bytes. */
+/// @param s    the text
+/// @param len  its length in bytes
+/// @param pos  the position decoded, < len
+/// @param next receives the position after the unit
+/// @return the codepoint (an ill-formed byte's value)
+static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
+    const unsigned char *p = (const unsigned char *)s + pos;
+    const int n = utf8_seq_ok(p, (size_t)(len - pos));
+    if (n <= 1) {
+        *next = pos + 1;
+        return p[0];
+    }
+    uint32_t cp = p[0] & (0x7fu >> n);
+    for (int i = 1; i < n; i++) cp = (cp << 6) | (p[i] & 0x3fu);
+    *next = pos + (uint64_t)n;
+    return cp;
 }
 
 
 
+/** A heap copy of [ptr, ptr + len) (not NUL-terminated).  @param ptr the bytes  @param len their count
+ *  @return the copy (its ptr xmalloc'd; the owner frees it) */
 static owned_str owned_copy(const char *ptr, uint64_t len) {
     owned_str s;
     s.ptr = (char *)xmalloc((size_t)len);
@@ -250,8 +278,8 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
     owned_str *sym = (owned_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
-        int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
-        if (off + (uint64_t)n > encoded_len) n = 1;
+        int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
+        if (n == 0) n = 1;
         if (n_sym == cap_sym) {
             cap_sym *= 2;
             sym = (owned_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
@@ -310,26 +338,30 @@ void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
 
 
 
+/** The position after the UTF-8 unit at pos (an ill-formed byte is one unit).  @param s the text
+ *  @param len its length  @param pos the position, < len  @return the next position */
 static uint64_t next_utf8_char(const char *s, uint64_t len, uint64_t pos) {
-    int n = utf8_len_from_first_byte((uint8_t)s[pos]);
-    if (pos + (uint64_t)n > len) n = 1;
-    return pos + (uint64_t)n;
+    const int n = utf8_seq_ok((const unsigned char *)s + pos, (size_t)(len - pos));
+    return pos + (uint64_t)(n ? n : 1);
 }
 
 
 
+/** ASCII A-Z / a-z.  @param c the byte  @return true for a letter */
 static bool ascii_alpha(uint8_t c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
 
 
+/** ASCII 0-9.  @param c the byte  @return true for a digit */
 static bool ascii_digit(uint8_t c) {
     return c >= '0' && c <= '9';
 }
 
 
 
+/** ASCII space, \\t, \\n, \\r, \\v, \\f.  @param c the byte  @return true for whitespace */
 static bool ascii_space(uint8_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
            c == '\v' || c == '\f';
@@ -337,12 +369,14 @@ static bool ascii_space(uint8_t c) {
 
 
 
+/** \\n or \\r.  @param c the byte  @return true for a newline byte */
 static bool ascii_newline(uint8_t c) {
     return c == '\n' || c == '\r';
 }
 
 
 
+/** The JoyAI pre-tokenizer's ASCII punctuation / symbol class.  @param c the byte  @return true when in it */
 static bool joyai_ascii_punct_symbol(uint8_t c) {
     return (c >= '!' && c <= '/') ||
            (c >= ':' && c <= '@') ||
@@ -352,6 +386,8 @@ static bool joyai_ascii_punct_symbol(uint8_t c) {
 
 
 
+/** CJK unified ideographs (U+4E00-U+9FA5), hiragana or katakana.  @param cp the codepoint
+ *  @return true when in those ranges */
 static bool utf8_is_cjk_hira_kata(uint32_t cp) {
     return (cp >= 0x4e00 && cp <= 0x9fa5) ||
            (cp >= 0x3040 && cp <= 0x309f) ||
@@ -360,30 +396,8 @@ static bool utf8_is_cjk_hira_kata(uint32_t cp) {
 
 
 
-static uint32_t utf8_peek_one(const char *s, uint64_t len, uint64_t pos, uint64_t *next) {
-    const uint8_t c0 = (uint8_t)s[pos];
-    int n = utf8_len_from_first_byte(c0);
-    if (pos + (uint64_t)n > len) n = 1;
-    *next = pos + (uint64_t)n;
-
-    if (n == 1) return c0;
-    if (n == 2) {
-        return ((uint32_t)(c0 & 0x1f) << 6) |
-               ((uint32_t)((uint8_t)s[pos + 1] & 0x3f));
-    }
-    if (n == 3) {
-        return ((uint32_t)(c0 & 0x0f) << 12) |
-               ((uint32_t)((uint8_t)s[pos + 1] & 0x3f) << 6) |
-               ((uint32_t)((uint8_t)s[pos + 2] & 0x3f));
-    }
-    return ((uint32_t)(c0 & 0x07) << 18) |
-           ((uint32_t)((uint8_t)s[pos + 1] & 0x3f) << 12) |
-           ((uint32_t)((uint8_t)s[pos + 2] & 0x3f) << 6) |
-           ((uint32_t)((uint8_t)s[pos + 3] & 0x3f));
-}
-
-
-
+/** Does a "letter" start at pos (an ASCII letter, or any non-ASCII byte; see below)?  @param s the text
+ *  @param len its length (unused)  @param pos the position  @return true for a letter-like unit */
 static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
     (void)len;
     uint8_t c = (uint8_t)s[pos];
@@ -402,6 +416,8 @@ static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
 
 
 
+/** Skip a run of letter-like units.  @param s the text  @param len its length  @param pos the run's start
+ *  @return the position after the run */
 static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos) {
     while (pos < len && joyai_letter_like_at(s, len, pos)) {
         pos = next_utf8_char(s, len, pos);
@@ -411,10 +427,12 @@ static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos)
 
 
 
+/** Does a CJK / kana character start at pos?  @param s the text  @param len its length  @param pos the position
+ *  @return true when it does */
 static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
     if ((uint8_t)s[pos] < 128) return false;
     uint64_t next = pos;
-    uint32_t cp = utf8_peek_one(s, len, pos, &next);
+    uint32_t cp = utf8_decode_at(s, len, pos, &next);
     return utf8_is_cjk_hira_kata(cp);
 }
 
@@ -518,8 +536,20 @@ int pulsar_vocab::vocab_lookup(const char *text) const {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "pulsar: required tokenizer token is missing: %s\n", text);
-        exit(1);
+        pulsar_load_refuse();   /* L272: load time only (vocab_load); the load fails at its stage boundary */
+        return -1;
     }
+    return token;
+}
+
+
+
+/* The optional counterpart: an artifact legitimately lacks the image
+ * placeholder, so its absence is a fact (no image path), not a refusal. */
+int pulsar_vocab::vocab_find(const char *text) const {
+    const auto *vocab = this;
+    int token = -1;
+    if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) return -1;
     return token;
 }
 
@@ -533,12 +563,12 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     pulsar_array_ref tokens;
     pulsar_array_ref merges;
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
-        tokens.type != GGUF_VALUE_STRING ||
+        tokens.type != PULSAR_META_STRING ||
         tokens.len > INT32_MAX) {
         pulsar_die("GGUF tokenizer token table is missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) ||
-        merges.type != GGUF_VALUE_STRING) {
+        merges.type != PULSAR_META_STRING) {
         pulsar_die("GGUF tokenizer merge table is missing or invalid");
     }
 
@@ -564,9 +594,22 @@ void pulsar_vocab::vocab_load(const pulsar_model *model) {
     vocab->eos_id       = vocab->vocab_lookup("<｜end▁of▁sentence｜>");
     vocab->user_id      = vocab->vocab_lookup("<｜User｜>");
     vocab->assistant_id = vocab->vocab_lookup("<｜Assistant｜>");
+    /* The System marker is V4.1's (the template that writes it is), and the
+     * 0731 artifacts built before that encoding landed do not carry it -- their
+     * vocab is otherwise complete.  Required-vs-optional is therefore a
+     * two-profile decision, not a format check: requiring it makes the unified
+     * engine refuse a 0731 artifact it served the day before.  Optional here;
+     * the V4.1 profile, whose template writes it, refuses a vocab without it at
+     * load (pulsar_ds4_family_load, once the profile is known). */
+    vocab->system_id    = vocab->vocab_find("<｜System｜>");
     vocab->think_start_id = vocab->vocab_lookup("<think>");
     vocab->think_end_id = vocab->vocab_lookup("</think>");
     vocab->dsml_id = vocab->vocab_lookup("｜DSML｜");
+    /* The image placeholder is resolved BY STRING, never a literal id: an
+     * artifact without the token leaves image_id < 0 and cannot serve images,
+     * and one that has it gets whichever id its own table assigned.  This is
+     * the optional lookup -- a text-only artifact must still load. */
+    vocab->image_id = vocab->vocab_find(PULSAR_IMAGE_PLACEHOLDER);
 }
 
 
@@ -581,37 +624,255 @@ void pulsar_vocab::vocab_free() {
 
 
 
-/* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
- * marker, and either <think> or </think> depending on the requested mode.  Max
- * thinking is only a prompt prefix: the model still enters through <think>. */
-static void encode_chat_prompt(
-        const pulsar_vocab *vocab,
-        const char      *system,
-        const char      *prompt,
-        pulsar_think_mode   think_mode,
-        token_vec       *out) {
-    token_vec_push(out, vocab->bos_id);
-    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
-    if (effort_prefix[0]) {
-        vocab->bpe_tokenize_text(effort_prefix, out);
+/* The V4.1 conversation lead-in after BOS: the System token when the
+ * conversation opens with the effort line (thinking on) or with system text,
+ * then the effort line.  One authority for the CLI path; the server renderer
+ * writes the same bytes (prompt_render.cpp). */
+/* --- L185: the chat template's TEXT rules, ONE authority --------------------
+ *
+ * The server renders the template as TEXT and tokenises it once, so a message's
+ * tokens span the text RUN between two markers: `user text` + `\n\n` +
+ * `<tool_result>` + body + `</tool_result>` is ONE BPE run, and a mid-conversation
+ * system message drags its `<system-reminder>` wrapper into the run around it.
+ * The twin used to tokenise each piece separately, which is why it disagreed
+ * with the renderer on four measured shapes.
+ *
+ * The twin now appends the same TEXT and RE-TOKENISES the open run -- the tokens
+ * after the last template marker -- whenever text joins it.  The run's text is
+ * recovered from the tokens themselves (vocab_token_text is the inverse the KV
+ * keys already rely on), so the twin carries NO state of its own: the rules
+ * below are the only authority, and token surgery by a caller (the CLI REPL's
+ * head swap, compaction's transcript swap) cannot desynchronise a state
+ * copy because there is none.
+ *
+ * The flush is eager: a run is tokenised as soon as its text is known, and
+ * joining more text re-tokenises it.  That can move tokens inside the OPEN run,
+ * which is exactly what the renderer does too -- a caller that has already synced
+ * that prefix sees a shorter common prefix and re-prefills from there. */
+
+/** The ids that bound a text run: every marker this template emits. */
+/// @param v  the vocab
+/// @param id the token id
+/// @return true for a BOS / EOS / role / think marker
+static bool chat_tmpl_marker(const pulsar_vocab *v, int id) {
+    return id == v->bos_id || id == v->eos_id || id == v->system_id ||
+           id == v->user_id || id == v->assistant_id ||
+           id == v->think_start_id || id == v->think_end_id;
+}
+
+/** Where the open text run starts: just after the last marker.  @param v the vocab  @param t the tokens
+ *  @return the run's first index (0 when no marker) */
+static int chat_tmpl_run_start(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = t->len - 1; i >= 0; i--)
+        if (chat_tmpl_marker(v, t->v[i])) return i + 1;
+    return 0;
+}
+
+/** The last marker's id.  @param v the vocab  @param t the tokens  @return the id, -1 when none */
+static int chat_tmpl_last_marker(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = t->len - 1; i >= 0; i--)
+        if (chat_tmpl_marker(v, t->v[i])) return t->v[i];
+    return -1;
+}
+
+/** Has a user or assistant message been appended yet?  A system message before
+ * one is the LEADING system region (plain content); after one it is a
+ * mid-conversation note (the wrapper rule applies). */
+/// @param v the vocab
+/// @param t the tokens
+/// @return true once a user or assistant marker is present
+static bool chat_tmpl_saw_turn(const pulsar_vocab *v, const pulsar_tokens *t) {
+    for (int i = 0; i < t->len; i++)
+        if (t->v[i] == v->user_id || t->v[i] == v->assistant_id) return true;
+    return false;
+}
+
+/** The text of tokens [start, len), recovered from the vocab.  @param v the vocab  @param t the tokens
+ *  @param start the first index  @param n_out receives the byte length (may be NULL)
+ *  @return the NUL-terminated text, xmalloc'd (the caller frees it) */
+static char *chat_tmpl_run_text(const pulsar_vocab *v, const pulsar_tokens *t,
+                                int start, size_t *n_out) {
+    size_t n = 0;
+    for (int i = start; i < t->len; i++) {
+        size_t l = 0;
+        char *p = vocab_token_text(v, t->v[i], &l);
+        n += l;
+        free(p);
     }
-    if (system && system[0]) {
-        vocab->bpe_tokenize_text(system, out);
+    char *out = (char *)xmalloc(n + 1);
+    size_t at = 0;
+    for (int i = start; i < t->len; i++) {
+        size_t l = 0;
+        char *p = vocab_token_text(v, t->v[i], &l);
+        memcpy(out + at, p, l);
+        at += l;
+        free(p);
     }
-    token_vec_push(out, vocab->user_id);
-    vocab->bpe_tokenize_text(prompt, out);
-    token_vec_push(out, vocab->assistant_id);
-    if (pulsar_think_mode_enabled(think_mode)) {
-        token_vec_push(out, vocab->think_start_id);
-    } else {
-        token_vec_push(out, vocab->think_end_id);
-    }
+    out[at] = '\0';
+    if (n_out) *n_out = at;
+    return out;
+}
+
+/** Append a marker id.  @param t the tokens  @param id the marker */
+static void chat_tmpl_push_marker(pulsar_tokens *t, int id) {
+    token_vec_push((token_vec *)t, id);
+}
+
+/** Push the System MARKER (V4.1's template only).
+ *
+ * The marker is the V4.1 template's (see encode_chat_lead_in), and V4.1's own
+ * vocab always carries it -- but the 0731 artifacts built before the V4.1
+ * encoding landed do NOT, and their vocab is otherwise complete (checked: the
+ * three shipped 0731 GGUFs differ in exactly this one marker).  Making the
+ * LOOKUP required therefore refused artifacts the engine served happily the day
+ * before, which is a two-profile regression, not a format check: at f5bea7aa
+ * `v5mx4-0731-srcfmt-v1-reapfix-lt.gguf` ran; one commit later it exited at load
+ * with "required tokenizer token is missing".
+ *
+ * So the lookup is optional (like the image placeholder) and the requirement is
+ * the PROFILE's: a V4.1 vocab without the marker is refused at load, by name
+ * (pulsar_ds4_family_load, L335 -- this used to exit the process at the first
+ * render), because a V4.1 prompt rendered without it would silently drop it --
+ * exactly the silent-template-drift class the render-bytes gate exists for.  A
+ * template that writes the marker is therefore only ever rendered against a
+ * vocab that has it. */
+/// @param v the vocab (its system_id is a token: the load refused a V4.1 vocab without one)
+/// @param t the tokens, the marker appended
+static void chat_tmpl_push_system_marker(const pulsar_vocab *v, pulsar_tokens *t) {
+    chat_tmpl_push_marker(t, v->system_id);
+}
+
+/** Append TEXT to the open run and re-tokenise the run -- the one primitive that
+ * makes the twin's BPE boundary the renderer's. */
+/// @param v    the vocab
+/// @param t    the tokens
+/// @param text NUL-terminated text (NULL or empty: nothing)
+static void chat_tmpl_append_text(const pulsar_vocab *v, pulsar_tokens *t, const char *text) {
+    if (!text || !text[0]) return;
+    const int start = chat_tmpl_run_start(v, t);
+    size_t run = 0;
+    char *have = chat_tmpl_run_text(v, t, start, &run);
+    const size_t add = strlen(text);
+    char *joined = (char *)xmalloc(run + add + 1);
+    memcpy(joined, have, run);
+    memcpy(joined + run, text, add + 1);
+    free(have);
+    t->len = start;                          /* drop the run, re-tokenise it joined */
+    v->tokenize_span(joined, run + add, (token_vec *)t);
+    free(joined);
+}
+
+/** chat_tmpl_escape_emit's user data: where the escaped tool-result pieces are appended (both borrowed). */
+struct chat_tmpl_escape_sink {
+    /// the vocab that tokenises each piece
+    const pulsar_vocab *vocab;
+    /// the token run the pieces are appended to (its open run, re-tokenised joined)
+    pulsar_tokens *tokens;
+};
+
+/** pulsar_tool_result_escape's sink: append one escaped piece to the open run.  @param ud a chat_tmpl_escape_sink
+ *  @param bytes the piece  @param n its length */
+static void chat_tmpl_escape_emit(void *ud, const char *bytes, size_t n) {
+    auto *sink = (chat_tmpl_escape_sink *)ud;
+    char *piece = (char *)xmalloc(n + 1);
+    memcpy(piece, bytes, n);
+    piece[n] = '\0';
+    chat_tmpl_append_text(sink->vocab, sink->tokens, piece);
+    free(piece);
+}
+
+/** Append a tool-result body with the sentinel escaped (pulsar_tool_result_escape
+ * is the ONE authority for that rule), into the open run. */
+/// @param v       the vocab
+/// @param t       the tokens
+/// @param content the tool result's body
+static void chat_tmpl_append_tool_body(const pulsar_vocab *v, pulsar_tokens *t,
+                                       const char *content) {
+    chat_tmpl_escape_sink sink = { v, t };
+    pulsar_tool_result_escape(content, chat_tmpl_escape_emit, &sink);
+}
+
+/** Does the open run end with the tool-result wrapper's close?  That is the
+ * renderer's `pending_tool_result` fact, derived instead of stored. */
+/// @param v the vocab
+/// @param t the tokens
+/// @return true when the open run's text ends with "</tool_result>"
+static bool chat_tmpl_run_ends_tool_result(const pulsar_vocab *v, const pulsar_tokens *t) {
+    static const char end[] = "</tool_result>";
+    const size_t endlen = sizeof(end) - 1;
+    const int start = chat_tmpl_run_start(v, t);
+    size_t run = 0;
+    char *text = chat_tmpl_run_text(v, t, start, &run);
+    const bool yes = run >= endlen && memcmp(text + run - endlen, end, endlen) == 0;
+    free(text);
+    return yes;
+}
+
+
+/** The chat's lead-in: the System marker (V4.1, when there is an effort line or a system message) and the effort
+ *  line's text in the open run.
+ *  @param vocab      the vocab
+ *  @param has_system a system message follows
+ *  @param think_mode the reasoning effort
+ *  @param out        the tokens appended to */
+static void encode_chat_lead_in(const pulsar_vocab *vocab, bool has_system,
+                                pulsar_think_mode think_mode, token_vec *out) {
+    /* The effort line is the FAMILY's spelling (the same fact as the marker
+     * below: V4.1 marks the region and writes the numeric line; 0731 does
+     * neither at low and writes its own texts at high/max) -- L239: the CLI's
+     * 0731 prompt carried V4.1's numeric line, as the server's did. */
+    const char *effort_prefix = pulsar_think_effort_prefix_family(think_mode, PULSAR_CHAT_SYSTEM_MARKER);
+    /* The MARKER is the template's, and the template is the model family's:
+     * V4.1 marks its lead-in system region, 0731 does not.  Writing it for both
+     * cost V4 exactly one prompt token -- enough to change the answer. */
+    if (PULSAR_CHAT_SYSTEM_MARKER && (effort_prefix[0] || has_system))
+        chat_tmpl_push_system_marker(vocab, out);
+    /* The effort line is TEXT, and the system region joins it unchanged (the
+     * renderer writes marker + effort + region as one run), so it goes into the
+     * open run rather than being tokenised on its own. */
+    chat_tmpl_append_text(vocab, out, effort_prefix);
 }
 
 
 
-void pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    e->vocab.bpe_tokenize_text(text ? text : "", out);
+/* The tokenizer entries serve a family with a tokenizer table (pulsar_family::tokenizer); the chat front's entries
+ * (chat_open / chat_turn / chat_end_assistant) a family that also declares its chat front (family.h
+ * PULSAR_FAMILY_CAP_CHAT) -- L295: a family's tokenizer can be wired before its chat renderer is (token ids and
+ * text in and out without the turn-by-turn chat front).  A family without what an entry needs is refused there,
+ * by name, once per entry (pulsar_refusal_first), and the entry returns its failure value (pulsar.h) -- never
+ * tokenizes with an empty vocabulary, never exits the process (L335).  The front ends refuse such an engine at
+ * startup (pulsar_engine_has_tokenizer, which asks for both), so a served path never reaches the refusal. */
+/** The engine's tokenizer, or NULL (said once per entry) when its family has none.  @param e the engine
+ *  @param op names the entry (a string literal)  @return the tokenizer ops, or NULL */
+static const pulsar_family_tokenizer *tokenizer_require(const pulsar_engine *e, const char *op) {
+    if (e && e->family->tokenizer) return e->family->tokenizer;
+    if (pulsar_refusal_first(op))
+        fprintf(stderr, "pulsar: %s has no tokenizer table (%s) -- refusing\n", e ? e->family->name : "(no engine)", op);
+    return NULL;
+}
+/** The engine's tokenizer for a chat entry, or NULL (said once per entry) when the family has no chat front.
+ *  @param e the engine  @param op names the entry (a string literal)  @return the tokenizer ops, or NULL */
+static const pulsar_family_tokenizer *chat_require(const pulsar_engine *e, const char *op) {
+    if (e && !pulsar_family_require(e, PULSAR_FAMILY_CAP_CHAT, op)) return NULL;   /* said by the require */
+    return tokenizer_require(e, op);
+}
+
+bool pulsar_engine_has_tokenizer(const pulsar_engine *e) {
+    return !e || ((e->family->caps & PULSAR_FAMILY_CAP_CHAT) != 0 && e->family->tokenizer);
+}
+
+bool pulsar_token_is_stop(pulsar_engine *e, int token) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_is_stop");
+    return !t || t->is_stop(e, token);   /* refused: every token is a stop (the generation ends, fail closed) */
+}
+
+
+
+bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_text");
+    if (!t) return false;
+    t->encode_text(e, text, out);
+    return true;
 }
 
 
@@ -626,12 +887,15 @@ bool pulsar_vocab::special_token_at(const char *p, int *token, size_t *len) cons
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
+        {"<｜System｜>",            vocab->system_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"｜DSML｜",                vocab->dsml_id},
+        {PULSAR_IMAGE_PLACEHOLDER, vocab->image_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
+        if (specials[i].token < 0) continue;   /* absent in this artifact's vocab */
         size_t n = strlen(specials[i].text);
         if (!strncmp(p, specials[i].text, n)) {
             *token = specials[i].token;
@@ -680,95 +944,353 @@ void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
 
 
 
-void pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
-    e->vocab.tokenize_rendered_chat_vocab(text, out);
+/* L223: as above, but a byte inside one of the n half-open [lo, hi) ranges is
+ * PLAIN TEXT -- special-token matching is suppressed there.  The renderer records
+ * those ranges for every byte it copied from client data, so a client typing
+ * `<|Assistant|>` or `｜DSML｜` into a message gets ordinary text tokens instead of
+ * a control token.  Ranges are ascending and disjoint; a range is clamped to the
+ * string's end. */
+void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
+                                                      const pulsar_text_span *spans,
+                                                      uint32_t n_spans,
+                                                      token_vec *out) const {
+    const auto *vocab = this;
+    if (!text) text = "";
+    const char *base = text;
+    const char *end_of_text = text + strlen(text);
+    const char *span = text;
+    const char *p = text;
+    uint32_t si = 0;
+    while (*p) {
+        const size_t off = (size_t)(p - base);
+        while (si < n_spans && (off >= spans[si].hi || spans[si].hi <= spans[si].lo)) si++;
+        if (si < n_spans && off >= spans[si].lo) {
+            const char *end = base + spans[si].hi;
+            if (end > end_of_text) end = end_of_text;   /* clamp to the string */
+            vocab->tokenize_span(span, (size_t)(p - span), out);   /* flush the pending plain run */
+            vocab->tokenize_span(p, (size_t)(end - p), out);       /* client text: BPE only */
+            p = span = end;
+            si++;
+            continue;
+        }
+        int token = -1;
+        size_t len = 0;
+        if (vocab->special_token_at(p, &token, &len)) {
+            vocab->tokenize_span(span, (size_t)(p - span), out);
+            token_vec_push(out, token);
+            p += len;
+            span = p;
+            continue;
+        }
+        p++;
+    }
+    vocab->tokenize_span(span, (size_t)(p - span), out);
+}
+
+bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat");
+    if (!t) return false;
+    t->encode_rendered(e, text, NULL, 0u, out);
+    return true;
+}
+
+bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
+                                         const pulsar_text_span *spans, uint32_t n_spans,
+                                         pulsar_tokens *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
+    if (!t) return false;
+    t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out);
+    return true;
+}
+
+pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
+                                          size_t skip, size_t len, uint32_t *n_out) {
+    if (n_out) *n_out = 0;
+    if (!spans || !n_spans || !len) return NULL;
+    pulsar_text_span *out = (pulsar_text_span *)xmalloc((size_t)n_spans * sizeof *out);
+    const size_t end = skip + len;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n_spans; i++) {
+        size_t lo = spans[i].lo, hi = spans[i].hi;
+        if (hi <= skip || lo >= end) continue;
+        if (lo < skip) lo = skip;
+        if (hi > end) hi = end;
+        if (hi <= lo) continue;
+        out[k].lo = (uint32_t)(lo - skip);
+        out[k].hi = (uint32_t)(hi - skip);
+        k++;
+    }
+    if (!k) { free(out); return NULL; }
+    if (n_out) *n_out = k;
+    return out;
 }
 
 
 
-void pulsar_chat_begin(pulsar_engine *e, pulsar_tokens *tokens) {
-    token_vec_push(tokens, e->vocab.bos_id);
+bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                      pulsar_think_mode think_mode) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open");
+    if (!t) return false;
+    t->chat_open(e, tokens, trusted, system, NULL, think_mode);
+    return true;
+}
+
+bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                            const char *tools_json, pulsar_think_mode think_mode) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open_tools");
+    if (!t) return false;
+    const pulsar_chat_format f = pulsar_engine_chat_format(e);
+    if (tools_json && (f == PULSAR_CHAT_DS4_V4 || f == PULSAR_CHAT_DS4_V41)) {
+        fprintf(stderr, "pulsar: pulsar_chat_open_tools: DeepSeek has no tools head (its tools are DSML prompt "
+                        "text, passed as trusted)\n");
+        return false;
+    }
+    t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
+    return true;
+}
+
+bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                             bool generation_prompt, pulsar_think_mode think_mode) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_append_turn");
+    if (!t) return false;
+    t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
+    return true;
+}
+
+bool pulsar_chat_calls_continue_turn(const pulsar_engine *e) {
+    return pulsar_engine_chat_format(e) == PULSAR_CHAT_GEMMA4;
+}
+
+bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    if (pulsar_engine_chat_format(e) != PULSAR_CHAT_GEMMA4) return pulsar_think_mode_enabled(think_mode);
+    /* the tail is enough: the markers it looks for close a turn's last few tokens */
+    const int from = tokens && tokens->len > 64 ? tokens->len - 64 : 0;
+    std::string text;
+    for (int i = from; tokens && i < tokens->len; i++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, tokens->v[i], &n);
+        text.append(t, n);
+        free(t);
+    }
+    return gemma4_prompt_opens_reasoning(text.c_str());
+}
+
+bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_end_assistant");
+    if (!t) return false;
+    t->chat_end_assistant(e, tokens);
+    return true;
+}
+
+bool pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
+                               pulsar_tokens *out) {
+    if (!pulsar_chat_open(e, out, NULL, system, think_mode)) return false;
+    const pulsar_chat_message user = {"user", prompt ? prompt : "", false};
+    return pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
 }
 
 
 
-void pulsar_encode_chat_prompt(
-        pulsar_engine *e,
-        const char *system,
-        const char *prompt,
-        pulsar_think_mode think_mode,
-        pulsar_tokens *out) {
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
-}
-
-
-
-void pulsar_chat_append_effort_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    const char *effort_prefix = pulsar_think_effort_prefix(think_mode);
-    if (effort_prefix[0]) e->vocab.bpe_tokenize_text(effort_prefix, tokens);
-}
-
-
-
-void pulsar_vocab::bpe_tokenize_tool_result_text(const char *content, token_vec *out) {
-    auto *vocab = this;
-    /* Tool output is plain data inside <tool_result>...</tool_result>.
-     * Preserve literal '<', '>' and '&' so shell output and file snippets stay
-     * intact, but escape the exact closing sentinel so a malicious or accidental
-     * tool payload cannot terminate the wrapper early. */
-    const char *end = "</tool_result>";
-    const size_t endlen = strlen(end);
-    const char *span = content ? content : "";
+size_t pulsar_tool_result_escape(const char *s,
+                                 void (*emit)(void *ud, const char *bytes, size_t n),
+                                 void *ud) {
+    /* Tool output is plain data inside <tool_result>...</tool_result>.  Preserve
+     * literal '<', '>' and '&' so shell output and file snippets stay intact, but
+     * escape the exact closing sentinel so a malicious or accidental tool payload
+     * cannot terminate the wrapper early.  ONE authority (L185): the server's
+     * renderer and the engine's token-level twin both walk this. */
+    static const char end[] = "</tool_result>";
+    static const char entity[] = "&lt;";
+    const size_t endlen = sizeof(end) - 1;
+    size_t total = 0;
+    const char *span = s ? s : "";
     const char *p = span;
     while (*p) {
         if (!strncmp(p, end, endlen)) {
-            vocab->tokenize_span(span, (size_t)(p - span), out);
-            vocab->bpe_tokenize_text("&lt;", out);
+            const size_t n = (size_t)(p - span);
+            if (n) { emit(ud, span, n); total += n; }
+            emit(ud, entity, sizeof(entity) - 1);
+            total += sizeof(entity) - 1;
             p++;
             span = p;
         } else {
             p++;
         }
     }
-    vocab->tokenize_span(span, (size_t)(p - span), out);
+    if (p != span) { emit(ud, span, (size_t)(p - span)); total += (size_t)(p - span); }
+    return total;
 }
 
 
 
-void pulsar_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content) {
+
+
+
+
+/* Front-end control text in DeepSeek's markers (pulsar_chat_message::trusted), tokenised as rendered chat into a
+ * piece of its own: joining it to the open run would re-tokenise its markers (the DSML ids) as plain text. */
+/// @param vocab  the vocab
+/// @param tokens the tokens appended to
+/// @param text   the trusted control text, tokenised as rendered chat
+static void ds4_chat_append_trusted(pulsar_vocab *vocab, pulsar_tokens *tokens, const char *text) {
+    vocab->tokenize_rendered_chat_vocab(text, (token_vec *)tokens);
+}
+
+/* One message of a DeepSeek turn: the renderer's rules, appended to the run they join. */
+/// @param e       the engine
+/// @param tokens  the tokens appended to
+/// @param role    the message's role ("system", "user", "assistant", "tool", ...)
+/// @param content the message's text
+/// @param trusted the content is front-end control text in DeepSeek's markers
+static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
+                                    bool trusted) {
     pulsar_vocab *vocab = &e->vocab;
+    const bool v41 = pulsar_engine_chat_v41(e);
     if (!role) role = "user";
     if (!content) content = "";
 
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        vocab->bpe_tokenize_text(content, tokens);
-    } else if (!strcmp(role, "assistant")) {
-        token_vec_push(tokens, vocab->assistant_id);
-        if (strncmp(content, "<think>", 7) != 0 && strncmp(content, "</think>", 8) != 0) {
-            token_vec_push(tokens, vocab->think_end_id);
+        /* The renderer's system rule: a system message BEFORE any user/assistant
+         * turn is the leading system region (plain content, joined into the
+         * lead-in's run); after one it is a mid-conversation note -- V4.1 marks
+         * it in place with the System token, V4 wraps it in a user turn. */
+        if (!chat_tmpl_saw_turn(vocab, tokens)) {
+            if (trusted) ds4_chat_append_trusted(vocab, tokens, content);
+            else chat_tmpl_append_text(vocab, tokens, content);
+        } else if (v41) {
+            chat_tmpl_push_system_marker(vocab, tokens);
+            if (trusted) ds4_chat_append_trusted(vocab, tokens, content);
+            else chat_tmpl_append_text(vocab, tokens, content);
+        } else {
+            chat_tmpl_push_marker(tokens, vocab->user_id);
+            if (trusted) {
+                std::string note = std::string("<system-reminder>\n") + content + "\n</system-reminder>";
+                ds4_chat_append_trusted(vocab, tokens, note.c_str());
+            } else {
+                chat_tmpl_append_text(vocab, tokens, "<system-reminder>\n");
+                chat_tmpl_append_text(vocab, tokens, content);
+                chat_tmpl_append_text(vocab, tokens, "\n</system-reminder>");
+            }
         }
-        vocab->bpe_tokenize_text(content, tokens);
+    } else if (trusted) {
+        pulsar_die("pulsar_chat_append_turn: only a system message carries trusted control text");
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-        token_vec_push(tokens, vocab->user_id);
-        vocab->bpe_tokenize_text("<tool_result>", tokens);
-        vocab->bpe_tokenize_tool_result_text(content, tokens);
-        vocab->bpe_tokenize_text("</tool_result>", tokens);
+        /* V4.1 joins consecutive user-SIDE messages (user text and tool results in
+         * any order) into one turn; V4 opens a fresh turn for each user message
+         * and for the first tool result after one, and joins after a tool result. */
+        const bool join = v41 ? chat_tmpl_last_marker(vocab, tokens) == vocab->user_id
+                              : chat_tmpl_run_ends_tool_result(vocab, tokens);
+        if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
+        else chat_tmpl_append_text(vocab, tokens, "\n\n");
+        chat_tmpl_append_text(vocab, tokens, "<tool_result>");
+        chat_tmpl_append_tool_body(vocab, tokens, content);
+        chat_tmpl_append_text(vocab, tokens, "</tool_result>");
+    } else if (!strcmp(role, "assistant")) {
+        /* Not reachable from this tree (no caller passes "assistant": the agent
+         * and the CLI append a SAMPLED turn's tokens, and the server owns the
+         * replay rules).  The old branch guessed a stripped replay and could not
+         * be right; refuse instead of guessing. */
+        pulsar_die("pulsar_chat_append_turn: an assistant turn cannot be "
+                   "appended here -- append the sampled tokens, or render it "
+                   "through the server's renderer (L185)");
     } else {
-        token_vec_push(tokens, vocab->user_id);
-        vocab->bpe_tokenize_text(content, tokens);
+        const bool join = v41 && chat_tmpl_last_marker(vocab, tokens) == vocab->user_id;
+        if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
+        else chat_tmpl_append_text(vocab, tokens, "\n\n");
+        chat_tmpl_append_text(vocab, tokens, content);
     }
 }
 
 
 
-void pulsar_chat_append_assistant_prefix(pulsar_engine *e, pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    token_vec_push(tokens, e->vocab.assistant_id);
-    token_vec_push(tokens, pulsar_think_mode_enabled(think_mode) ?
-                   e->vocab.think_start_id : e->vocab.think_end_id);
+/* ---- the DeepSeek family's chat front, turn by turn (pulsar.h pulsar_chat_open, L284 P14) ---------------- */
+
+/* BOS, the lead-in (the System marker and effort line), then the leading system region: trusted control text
+ * as a rendered piece of its own, and client text joining the open run (the effort line's, when there is no
+ * trusted text -- as the renderer writes it). */
+/// pulsar_family_tokenizer::chat_open for DeepSeek.
+/// @param e          the engine
+/// @param tokens     the tokens appended to
+/// @param trusted    trusted control text for the system region, or NULL
+/// @param system     the client's system message, or NULL
+/// @param tools_json unused (refused upstream)
+/// @param think_mode the reasoning effort
+static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                          const char *tools_json, pulsar_think_mode think_mode) {
+    (void)tools_json;   /* refused by pulsar_chat_open_tools: DeepSeek's tools are DSML text in `trusted` */
+    pulsar_vocab *vocab = &e->vocab;
+    const bool has_system = system && system[0];
+    chat_tmpl_push_marker(tokens, vocab->bos_id);
+    encode_chat_lead_in(vocab, has_system, think_mode, (token_vec *)tokens);
+    if (trusted && trusted[0]) ds4_chat_append_trusted(vocab, tokens, trusted);
+    if (!has_system) return;
+    if (trusted && trusted[0]) vocab->tokenize_span(system, strlen(system), (token_vec *)tokens);
+    else chat_tmpl_append_text(vocab, tokens, system);
+}
+
+/** pulsar_family_tokenizer::chat_turn for DeepSeek: the messages, then (generation_prompt) the assistant marker and
+ *  the think open / close marker.
+ *  @param e                 the engine
+ *  @param tokens            the tokens appended to
+ *  @param msgs              [n] the messages
+ *  @param n                 messages
+ *  @param generation_prompt open the assistant's turn
+ *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker) */
+static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                          bool generation_prompt, pulsar_think_mode think_mode) {
+    for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
+    if (!generation_prompt) return;
+    chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
+    chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
+                          e->vocab.think_start_id : e->vocab.think_end_id);
+}
+
+/* the sampled turn's stop token is the template's turn end */
+/// pulsar_family_tokenizer::chat_end_assistant for DeepSeek.
+/// @param e      the engine
+/// @param tokens the tokens appended to (EOS)
+static void ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    chat_tmpl_push_marker(tokens, e->vocab.eos_id);
 }
 
 
 
+/* Print a decoded piece as a quoted string: printable ASCII and well-formed
+ * UTF-8 verbatim, \n \r \t \" \\ as escapes, every other byte as \xNN. */
+void pulsar_dump_piece_quoted(FILE *fp, const char *s, size_t n) {
+    fputc('"', fp);
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = (unsigned char)s[i];
+        const int seq = utf8_seq_ok((const unsigned char *)s + i, n - i);
+        if (seq > 1) {
+            fwrite(s + i, 1, (size_t)seq, fp);
+            i += (size_t)seq;
+            continue;
+        }
+        switch (c) {
+        case '\n': fputs("\\n", fp); break;
+        case '\r': fputs("\\r", fp); break;
+        case '\t': fputs("\\t", fp); break;
+        case '"':  fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        default:
+            if (c >= 0x20 && c < 0x7f) fputc(c, fp);
+            else fprintf(fp, "\\x%02x", c);
+        }
+        i++;
+    }
+    fputc('"', fp);
+}
+
+
+
+/* --dump-tokens: the ids, then one line per token with the DECODED bytes (what
+ * pulsar_token_text hands the server and the CLI) followed by the raw GPT-2
+ * byte-encoded vocab string, so a tokenization mismatch can be read against
+ * either form. */
+/// @param fp     the output stream
+/// @param vocab  the vocab
+/// @param tokens the tokens (ids outside the vocab are listed but get no line)
 void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
@@ -780,52 +1302,24 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
     for (int i = 0; i < tokens->len; i++) {
         int id = tokens->v[i];
         if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
+            size_t n = 0;
+            char *piece = vocab_token_text(vocab, id, &n);
+            fprintf(fp, "%6d  ", id);
+            pulsar_dump_piece_quoted(fp, piece, n);
+            fprintf(fp, "  raw=%.*s\n", (int)vocab->token[id].len, vocab->token[id].ptr);
+            free(piece);
         }
     }
 }
 
 
 
-void pulsar_vocab::dump_tokens(const token_vec *tokens) const {
-    const auto *vocab = this;
-    dump_tokens_fp(stdout, vocab, tokens);
-}
 
 
 
-static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
-    const uint8_t c = (uint8_t)s[*pos];
-    if (c < 0x80 || *pos + 1 >= len) {
-        (*pos)++;
-        return c;
-    }
-    if ((c & 0xe0) == 0xc0 && *pos + 1 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x1f) << 6) | ((uint8_t)s[*pos + 1] & 0x3f);
-        *pos += 2;
-        return cp;
-    }
-    if ((c & 0xf0) == 0xe0 && *pos + 2 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x0f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 2] & 0x3f);
-        *pos += 3;
-        return cp;
-    }
-    if ((c & 0xf8) == 0xf0 && *pos + 3 < len) {
-        uint32_t cp = ((uint32_t)(c & 0x07) << 18) |
-                      ((uint32_t)((uint8_t)s[*pos + 1] & 0x3f) << 12) |
-                      ((uint32_t)((uint8_t)s[*pos + 2] & 0x3f) << 6) |
-                      ((uint8_t)s[*pos + 3] & 0x3f);
-        *pos += 4;
-        return cp;
-    }
-    (*pos)++;
-    return c;
-}
 
 
-
+/** The inverse of gpt2_byte_to_codepoint.  @param cp the codepoint  @return the byte, -1 when cp is no byte's */
 static int gpt2_codepoint_to_byte(uint32_t cp) {
     if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
         return (int)cp;
@@ -844,6 +1338,8 @@ static int gpt2_codepoint_to_byte(uint32_t cp) {
 
 
 
+/** Is the vocab string a literal special token (it contains U+FF5C, the fullwidth bar DeepSeek's markers use), whose
+ *  text is its own bytes rather than GPT-2 byte-encoded?  @param s the vocab string  @return true when it is */
 static bool vocab_token_is_literal_special(pulsar_str s) {
     const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
     if (s.len < sizeof(bar)) return false;
@@ -856,7 +1352,17 @@ static bool vocab_token_is_literal_special(pulsar_str s) {
 
 
 char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
-    pulsar_vocab *vocab = &e->vocab;
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_text");
+    if (!t) {
+        if (len) *len = 0;
+        return NULL;
+    }
+    return t->token_text(e, token, len);
+}
+
+
+
+char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len) {
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = (char *)xmalloc(1);
@@ -876,7 +1382,7 @@ char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
     size_t n = 0;
     uint64_t pos = 0;
     while (pos < s.len) {
-        uint32_t cp = utf8_decode_one(s.ptr, s.len, &pos);
+        uint32_t cp = utf8_decode_at(s.ptr, s.len, pos, &pos);
         int b = gpt2_codepoint_to_byte(cp);
         if (b >= 0) out[n++] = (char)b;
     }
@@ -888,994 +1394,119 @@ char *pulsar_token_text(pulsar_engine *e, int token, size_t *len) {
 
 
 int pulsar_token_eos(pulsar_engine *e) {
-    return e->vocab.eos_id;
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_eos");
+    return t ? t->eos(e) : -1;
 }
 
 
 
-int pulsar_token_user(pulsar_engine *e) {
-    return e->vocab.user_id;
-}
-
-
-
-int pulsar_token_assistant(pulsar_engine *e) {
-    return e->vocab.assistant_id;
-}
-
-
-
-int sample_argmax(const float *logits, uint32_t n_vocab) {
-    int best = 0;
-    float best_v = PULSAR_NEG_INF;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (v > best_v) {
-            best_v = v;
-            best = (int)i;
-        }
-    }
-    return best;
-}
-
-
-
-static uint64_t sample_rng_next(uint64_t *state) {
-    uint64_t x = *state;
-    if (x == 0) x = 0x9e3779b97f4a7c15ULL;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    return x * 0x2545f4914f6cdd1dULL;
-}
-
-
-
-static float sample_rng_f32(uint64_t *state) {
-    const uint64_t x = sample_rng_next(state);
-    return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
-}
-
-
-
-/* IEEE-754 float32 -> uint32 whose UNSIGNED ASCENDING order is the float's
- * DESCENDING order: flip negatives entirely, set the sign bit on
- * non-negatives (the standard monotonic transform, giving float-ascending),
- * then complement to reverse it. Only finite values reach here — the callers
- * filter !isfinite — so NaN ordering is not a concern.
- *
- * -0.0f is canonicalized to +0.0f first: it is a distinct bit pattern but
- * compares EQUAL to +0.0f, so the comparator this replaces called them a
- * tie, and by the tie note below, ordering what it tied can change the
- * nucleus. Real, not hypothetical: logits arrive by memcpy from the GPU, and
- * device code is built --use_fast_math (FTZ), so it writes exactly this.
- *
- * Subnormals are deliberately NOT flushed, and the reasoning is worth
- * recording because it is a trap. -ffast-math would set FPCR.FZ (flushing
- * subnormal FCMP inputs, making the comparator tie them) — but ONLY via
- * crtfastmath.o, which the LINKER pulls in, and every binary carrying this
- * code (ds4, pulsar-server, pulsar_test) is linked by nvcc, not by gcc -ffast-math.
- * Measured in the real link config: FPCR = 0x0, FZ = 0, and the comparator
- * ORDERS subnormals. So keying them strictly is what matches. A gcc-linked
- * probe of the same source reports FPCR = 0x1000000 and the opposite answer —
- * do not test this outside the real linkage. tests/pulsar_test.c --sampler
- * covers it (shape "subnormals + zeros (FZ range)"). */
-static inline uint32_t sample_desc_key(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof(u));
-    if (u == 0x80000000u) u = 0u;   /* -0.0 == +0.0 to the comparator */
-    const uint32_t asc = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    return ~asc;
-}
-
-
-
-/* Stable LSD radix sort of packed (sample_desc_key << 32 | id) on the key
- * half — 4 byte passes, O(n), no comparator calls. Replaces a qsort over the
- * whole 129k-entry vocab that cost ~10.6 ms per call (~97% of dist_build) and
- * ran once per accepted position in the sampled speculative walk.
- *
- * Order is bit-for-bit what the qsort produced, ties included.
- *
- * STABILITY IS LOAD-BEARING — do not swap in an unstable sort (parallel,
- * in-place, MSD) on the theory that ties are harmless. They are not. It is
- * true that permuting tied candidates permutes IDENTICAL prob values, so
- * `sum`, `min_prob`, `filtered`, `filtered_sum` and every out->probs entry
- * are bit-invariant under any tie order. But `filtered` is a COUNT, and a tie
- * group straddling the cutoff changes which ids fall inside it — i.e. nucleus
- * MEMBERSHIP, not just order within the nucleus. Concretely, all-equal logits
- * with top_p=0.5 give filtered=64640 of 129280: ascending ties yield
- * ids [0..64639], descending ties yield ids [64640..129279] — disjoint.
- * pulsar_sample_dist_prob returns 0 for an id outside the nucleus, so
- * pulsar_sample_dist_accept would then REJECT a draft the other order ACCEPTS,
- * changing the emitted token stream.
- *
- * So: the caller fills `a` in ascending-id order and this sort is stable,
- * making ascending-id the canonical tie order. That also matches what the
- * replaced qsort produced at this size (glibc takes its stable msort_with_tmp
- * path for a 129280 x 12B array -- verified), but nothing here depends on that
- * unspecified detail: this sort is stable by construction and libc-independent.
- * tests/pulsar_test.c --sampler pins the order explicitly (and catches a
- * tie-order flip on a realistic shape -- ties are common, not adversarial).
- *
- * Requires n >= 1. */
-static void sample_radix_sort_desc(uint64_t *a, uint64_t *tmp, uint32_t n) {
-    uint32_t hist[4][256];
-    memset(hist, 0, sizeof(hist));
-    for (uint32_t i = 0; i < n; i++) {
-        const uint32_t k = (uint32_t)(a[i] >> 32);
-        hist[0][k & 0xffu]++;
-        hist[1][(k >> 8) & 0xffu]++;
-        hist[2][(k >> 16) & 0xffu]++;
-        hist[3][(k >> 24) & 0xffu]++;
-    }
-    uint64_t *src = a;
-    uint64_t *dst = tmp;
-    for (int pass = 0; pass < 4; pass++) {
-        const int sh = 32 + pass * 8;
-        /* Whole pass is a no-op when every element shares this key byte —
-         * e.g. the all-equal-logits degenerate case skips all four. */
-        if (hist[pass][(uint32_t)(src[0] >> sh) & 0xffu] == n) continue;
-        uint32_t off[256];
-        uint32_t run = 0;
-        for (int b = 0; b < 256; b++) {
-            off[b] = run;
-            run += hist[pass][b];
-        }
-        for (uint32_t i = 0; i < n; i++)
-            dst[off[(uint32_t)(src[i] >> sh) & 0xffu]++] = src[i];
-        uint64_t *swap = src;
-        src = dst;
-        dst = swap;
-    }
-    if (src != a) memcpy(a, src, (size_t)n * sizeof(*a));
-}
-
-
-
-/* =====
- * min-p prefilter threshold (shared by sample_full_vocab and
- * pulsar_sample_dist_build's full-vocab paths).
- *
- * The min-p cutoff both paths apply post-sort keeps candidate i (i > 0) iff
- *
- *     fl(p_i / sum) >= min_prob,   min_prob = fl(fl(p_max / sum) * min_p)
- *
- * where p_max = expf((max - max)/T) = expf(0.0f) == 1.0f EXACTLY. In exact
- * arithmetic the sum cancels and the condition is p_i >= min_p. In float,
- * each of the three roundings perturbs by at most one unit roundoff
- * u = 2^-24, so:
- *   - any candidate the cutoff CAN keep satisfies
- *         p_i >= min_p * (1-u)^2 / (1+u) > min_p * (1 - 3u);
- *   - any candidate with p_i < min_p * (1 - 3u) is cut for EVERY value of
- *     `sum`, i.e. regardless of summation order.
- * A logit-side prefilter that keeps p_i >= min_p * (1 - 4e-6) (~67u of
- * slack, which also absorbs the rounding of this threshold product itself)
- * therefore keeps a SUPERSET of whatever the exact cutoff keeps, under any
- * sum. Because probs are monotone in the logit, that superset is a PREFIX of
- * the descending sort — so the byte-exact cutoff loop, run unchanged over
- * the sorted survivors, walks exactly the candidates it would have walked
- * over the full sorted vocab and trims the boundary with the SAME float
- * comparisons as before. Membership is never decided by the prefilter.
- *
- * The max candidate is kept unconditionally (mirrors the loop's i > 0
- * exemption; also covers min_p > 1 and a NaN temperature poisoning p).
- *
- * DOMAIN: the one-roundoff-per-operation bound only holds while min_prob and
- * pr are NORMAL floats; if min_prob lands in the subnormals (min_p on the
- * order of 1e-38 * sum), ties-to-even at a few ulps can round the cutoff
- * below what the slack covers and the superset claim fails (review finding,
- * 2026-07-17: min_p = 13*2^-149, sum = 2.0, p_i = 12*2^-149 flips). min_p is
- * NOT range-checked server-side, so both paths take the prefilter only for
- * min_p > SAMPLE_MINP_PREFILTER_MIN and fall back to the exact full sort
- * below it: sum <= n_vocab <= ~1.3e5 keeps min_prob >= min_p/sum > 7e-36 —
- * normal, with ~650x margin over FLT_MIN — and boundary p_i ~ min_p are
- * normal too. Requests with 0 < min_p <= 1e-30 are absurd but stay correct. */
-#define SAMPLE_MINP_PREFILTER_SLACK (1.0f - 4e-6f)
-#define SAMPLE_MINP_PREFILTER_MIN 1e-30f
-
-
-
-/* NOTE: the free below also drops `qmap` (and its all-zero invariant with it),
- * because pulsar_sample_scratch_free clears the whole struct. That is safe only
- * because no caller holds live qmap state across a dist_build — the residual
- * draw scatters, reads and re-zeros within one call. Do not cache anything in
- * qmap across calls without decoupling this. */
-static void sample_scratch_reserve(pulsar_sample_scratch *s, uint32_t cap) {
-    if (s->cap >= cap) return;
-    pulsar_sample_scratch_free(s);
-    s->cand = (sample_candidate *)xmalloc((size_t)cap * sizeof(*s->cand));
-    s->keys = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->keys));
-    s->tmp = (uint64_t *)xmalloc((size_t)cap * sizeof(*s->tmp));
-    s->cand2 = (sample_candidate *)xmalloc((size_t)cap * sizeof(*s->cand2));
-    s->cap = cap;
-}
-
-
-
-void pulsar_sample_scratch_free(pulsar_sample_scratch *s) {
-    free(s->cand);
-    free(s->keys);
-    free(s->tmp);
-    free(s->cand2);
-    free(s->qmap);
-    memset(s, 0, sizeof(*s));
-}
-
-
-
-/* Reserve the dense q map, zero-filled. Sized by token id, independent of
- * sample_scratch_reserve's `cap` (which is top_k on the preselect path). Grows
- * by free+calloc: callers restore every entry they set, so a fresh all-zero
- * buffer preserves the invariant. */
-static void sample_qmap_reserve(pulsar_sample_scratch *s, uint32_t cap) {
-    if (s->qmap_cap >= cap) return;
-    free(s->qmap);
-    s->qmap = (float *)xcalloc((size_t)cap, sizeof(*s->qmap));
-    s->qmap_cap = cap;
-}
-
-
-
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        pulsar_sample_scratch *scratch) {
-    float max_logit = PULSAR_NEG_INF;
-    int best = 0;
-    uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
-        }
-    }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
-
-    if (top_p >= 1.0f) {
-        float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
-            if (p < min_rel) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
-    }
-
-    /* Same full-vocab qsort the speculative dist_build had (~10.6 ms a call),
-     * on the PLAIN per-token path — reached whenever a client sends top_p < 1
-     * without a top_k, which is a common shape. Radix-sorted for the same
-     * reason and with the same byte-exactness argument.
-     *
-     * `sum` here accumulates in VOCAB order, BEFORE the sort (unlike
-     * dist_build, which sums post-sort) — so this loop must stay exactly as it
-     * was: it still adds EVERY finite candidate's prob, in the same order, so
-     * `sum` is bit-identical with the prefilter on or off. probs are computed
-     * once and carried THROUGH the sort by packing the compaction index as the
-     * radix payload, rather than recomputed post-sort: a second expf loop
-     * could be vectorized differently from this one under -ffast-math and
-     * differ in the last ulp.
-     *
-     * With min_p > 0 only the prefilter's survivors (a superset of the min-p
-     * cutoff's survivors — see SAMPLE_MINP_PREFILTER_SLACK) are collected for
-     * sorting, which is what turns the 129k-candidate sort into a
-     * tens-of-candidates sort at the default min_p. The cutoff loop below is
-     * unchanged and trims the boundary byte-exactly, so this path's output
-     * (token and rng stream) is bit-identical to the unfiltered build. */
-    /* Borrow the caller's reusable scratch when there is one.  These three
-     * buffers are ~5 MB at full vocab and were malloc/free'd PER SAMPLED TOKEN
-     * on this path — which is the plain sampler, reached whenever a client
-     * sends top_p < 1 without a top_k (a common shape).  pulsar_sample_dist_build
-     * already reuses exactly these buffers for the speculative walk; this path
-     * simply never did.  A NULL scratch keeps the original malloc behaviour for
-     * pulsar_sample_logits, which has no session to borrow from. */
-    sample_candidate *cand;
-    uint64_t *keys;
-    uint64_t *tmp;
-    if (scratch) {
-        sample_scratch_reserve(scratch, finite);
-        cand = scratch->cand;
-        keys = scratch->keys;
-        tmp  = scratch->tmp;
-    } else {
-        cand = (sample_candidate *)xmalloc((size_t)finite * sizeof(cand[0]));
-        keys = (uint64_t *)xmalloc((size_t)finite * sizeof(keys[0]));
-        tmp  = (uint64_t *)xmalloc((size_t)finite * sizeof(tmp[0]));
-    }
-    uint32_t n = 0;
-    float sum = 0.0f;
-    const float prefilter = min_p > SAMPLE_MINP_PREFILTER_MIN
-        ? min_p * SAMPLE_MINP_PREFILTER_SLACK : -1.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
-        sum += p;
-        if (p >= prefilter || (int)i == best) {
-            keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
-            cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
-        }
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        if (!scratch) {
-            free(cand);
-            free(keys);
-            free(tmp);
-        }
-        return best;
-    }
-
-    /* finite >= 1 here (checked above), so n >= 1 as sample_radix_sort_desc
-     * requires. Stable over an ascending fill => ties keep ascending vocab id,
-     * matching the qsort this replaces. */
-    sample_radix_sort_desc(keys, tmp, n);
-    /* The gather cannot run in place, so it needs a second buffer: scratch->cand2
-     * exists for exactly this (see its comment) and is reserved to the same cap. */
-    sample_candidate *sorted = scratch
-        ? scratch->cand2
-        : (sample_candidate *)xmalloc((size_t)n * sizeof(sorted[0]));
-    for (uint32_t i = 0; i < n; i++) sorted[i] = cand[(uint32_t)keys[i]];
-    if (!scratch) {
-        free(cand);
-        free(keys);
-        free(tmp);
-    }
-    cand = sorted;
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
-        filtered_sum += cand[i].prob;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) {
-        if (!scratch) free(cand);
-        return best;
-    }
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            if (!scratch) free(cand);
-            return id;
-        }
-    }
-    const int id = cand[filtered - 1].id;
-    if (!scratch) free(cand);
-    return id;
-}
-
-
-
-/* =====
- * Filtered-distribution object for speculative sampling.
- *
- * Builds the SAME final sampling distribution sample_top_p_min_p draws from
- * (temperature scaling, top-k preselect, min-p relative floor, top-p nucleus
- * with the crossing candidate included), but materialized so the speculative
- * path can (a) query p(token), (b) draw, and (c) draw excluding a rejected
- * token — the exact residual rule for deterministic-proposal speculative
- * sampling. Mirrors the sampler branch-for-branch; the spec_sampling harness
- * chi-square-checks the equivalence.
- *
- * NOTE on optimizing this: `sum` is taken over ALL n candidates BEFORE any
- * cutoff, and both cutoffs are relative to it (min_prob =
- * (cand[0].prob/sum)*min_p; the top_p test is filtered_sum/sum). Dropping
- * candidates from `sum` — the NAIVE min-p pre-filter — therefore changes
- * `sum`, hence `filtered`, hence `filtered_sum`, hence EVERY output
- * probability. It is not an equivalent rewrite; tests/pulsar_test.c --sampler
- * catches it (n 6 != 5). The full-vocab sum is load-bearing.
- *
- * What the top_k <= 0, min_p > 0 path DOES do (the LEGAL prefilter): the sum
- * still covers every finite candidate, but is accumulated in VOCAB-INDEX
- * order in the same pass that computes each prob once and collects only the
- * prefilter survivors (see SAMPLE_MINP_PREFILTER_SLACK: a strict superset of
- * the min-p cutoff's survivors under ANY sum, forming a prefix of the
- * descending sort). Only the survivors are sorted — tens instead of 129k at
- * the server-default min_p = 0.05 — and the byte-exact cutoff loop then
- * trims the boundary with the same comparisons as ever, evaluated against
- * that sum. Distribution-preserving by construction; NOT stream-preserving:
- * summing in index order instead of the old sorted-descending order rounds
- * differently (~1e-7 relative), so every output prob moves by that much and
- * rng draws near a bucket edge can flip. Survivor membership and order are
- * unchanged (tests/pulsar_test.c --sampler-prefilter pins set/order identity
- * against the old-sum reference and characterizes the prob delta; --sampler
- * is byte-exact against the re-derived index-order-sum reference). The
- * min_p <= 0 full sort and the top_k > 0 preselect keep the old sorted-order
- * sum and remain byte-identical to the pre-prefilter build.
- *
- * ALIASING CONTRACT: `out`'s ids/probs must never point into `scratch`. The
- * spec walk (session.c) holds one dist at a time while reusing the scratch
- * across accepted positions, so handing `out` a scratch pointer to save the
- * malloc would be silently wrong the moment two dists overlap — and the
- * --sampler gate builds one dist at a time, so it would NOT catch it.
- */
-int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
-                          float temperature, int top_k, float top_p, float min_p,
-                          pulsar_sample_scratch *scratch, pulsar_sample_dist *out) {
+/* L272 B5: the turn markers the server's prefix anchors scan for.  DeepSeek names a turn with one
+ * special token; Qwen's template spells it as <|im_start|> plus the role word, which the checkpoint's
+ * BPE holds as one token (Qwen3.8-Flash-Next: "user", "assistant").  A tokenizer that splits either
+ * word leaves the anchors off, said once -- never a marker that matches at the wrong place. */
+bool pulsar_chat_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_chat_turn_markers");
     memset(out, 0, sizeof(*out));
-    if (temperature <= 0.0f) {
-        out->ids = (int *)xmalloc(sizeof(int));
-        out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = sample_argmax(logits, n_vocab);
-        out->probs[0] = 1.0f;
-        out->n = 1;
+    return t && t->turn_markers(e, out);
+}
+
+int pulsar_turn_marker_at(const pulsar_turn_markers *m, const int *v, int n, int i) {
+    if (!m || !v || i < 0) return 0;
+    if (m->n_user > 0 && i + m->n_user <= n && v[i] == m->user[0] &&
+        (m->n_user < 2 || v[i + 1] == m->user[1])) {
+        /* L351: a tool result rendered as a user turn */
+        const int t = i + m->n_user;
+        if (m->n_tool > 0 && t + m->n_tool <= n) {
+            int k = 0;
+            while (k < m->n_tool && v[t + k] == m->tool[k]) k++;
+            if (k == m->n_tool) return 3;
+        }
         return 1;
     }
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0 || top_k > 1024) top_k = top_k <= 0 ? 0 : 1024;
-
-    /* collect candidates: full vocab, or top-k preselect like the sampler.
-     * Buffers come from the caller's scratch and are reused across calls —
-     * the sampled speculative walk calls this per accepted position. */
-    uint32_t cap = top_k > 0 ? (uint32_t)top_k : n_vocab;
-    sample_scratch_reserve(scratch, cap);
-    sample_candidate *cand = scratch->cand;
-    /* `sc` is the descending-order candidate view the cutoff tail walks. The
-     * prefilter path gathers into scratch->cand2 (probs and sum already
-     * computed, index-order sum); the other paths sort `cand` in place and
-     * compute probs + sum post-sort, in sorted order, exactly as before. */
-    sample_candidate *sc = cand;
-    /* LAZY-MATERIALIZATION view for the full-vocab (top_k<=0, min_p small)
-     * path. That path used to materialize a 12-byte sample_candidate for
-     * EVERY finite vocab entry (129,280 x 12 B = 1.55 MB of strided stores,
-     * each pulling logits[id] through a random gather) and then walk the same
-     * array AGAIN to fill in .prob — while the cutoff loop below almost always
-     * breaks within a few dozen entries and only `filtered` entries are ever
-     * read out. Instead it now makes ONE fused pass that writes only the
-     * probabilities, PACKED (4 B/entry, into cand's storage — cand itself is
-     * unused on that path), and leaves the ids where the radix sort already
-     * put them: the low 32 bits of keys[i]. `pv`/`idk` are the resulting
-     * lazy view; SC_PROB/SC_ID below read whichever representation is live.
-     * Arithmetic is UNCHANGED: same max_logit (logits[keys[0]] IS cand[0].logit),
-     * same expf inputs in the same sorted order, same `sum` accumulation
-     * order, hence the same cutoff, `filtered` set and output probabilities. */
-    const float *pv = NULL;         /* packed probs, sorted order (or NULL) */
-    const uint64_t *idk = NULL;     /* sorted keys; id = low 32 bits (or NULL) */
-#define SC_PROB(i) (pv ? pv[(i)] : sc[(i)].prob)
-#define SC_ID(i)   (idk ? (int)(uint32_t)idk[(i)] : sc[(i)].id)
-    uint32_t n = 0;
-    int have_probs = 0;
-    float sum = 0.0f;
-    if (top_k > 0) {
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            if (n == (uint32_t)top_k && v <= cand[n - 1].logit) continue;
-            uint32_t j = n < (uint32_t)top_k ? n++ : n - 1;
-            while (j > 0 && cand[j - 1].logit < v) {
-                cand[j] = cand[j - 1];
-                j--;
-            }
-            cand[j].id = (int)i;
-            cand[j].logit = v;
-        }
-    } else if (min_p > SAMPLE_MINP_PREFILTER_MIN) {
-        /* min-p prefilter path (see the block comment above; the MIN floor
-         * keeps the cutoff arithmetic normal — below it the exact full sort
-         * runs instead). Pass 1: the
-         * true max over finite logits, first occurrence on ties — the same
-         * candidate the stable descending sort put at cand[0]. */
-        float max_logit = 0.0f;
-        uint32_t max_id = 0;
-        uint32_t finite = 0;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            if (finite == 0 || v > max_logit) {
-                max_logit = v;
-                max_id = i;
-            }
-            finite++;
-        }
-        /* Pass 2: one prob per finite candidate, computed ONCE and carried
-         * through the sort; `sum` over ALL of them, in this (index) order;
-         * survivors collected in ascending-id order so the stable radix keeps
-         * ascending-id as the canonical tie order. */
-        if (finite > 0) {
-            uint64_t *keys = scratch->keys;
-            const float prefilter = min_p * SAMPLE_MINP_PREFILTER_SLACK;
-            for (uint32_t i = 0; i < n_vocab; i++) {
-                const float v = logits[i];
-                if (!isfinite(v)) continue;
-                const float p = expf((v - max_logit) / temperature);
-                sum += p;
-                if (p >= prefilter || i == max_id) {
-                    keys[n] = ((uint64_t)sample_desc_key(v) << 32) | n;
-                    cand[n] = (sample_candidate){
-                        .id = (int)i, .logit = v, .prob = p};
-                    n++;
-                }
-            }
-            /* n >= 1: the max candidate is always kept. */
-            sample_radix_sort_desc(keys, scratch->tmp, n);
-            for (uint32_t i = 0; i < n; i++)
-                scratch->cand2[i] = cand[(uint32_t)keys[i]];
-            sc = scratch->cand2;
-            have_probs = 1;
-        }
-    } else {
-        uint64_t *keys = scratch->keys;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            keys[n++] = ((uint64_t)sample_desc_key(v) << 32) | (uint32_t)i;
-        }
-        if (n) {
-            sample_radix_sort_desc(keys, scratch->tmp, n);
-            /* Fused prob pass over the packed view (see the note at `pv`).
-             * Byte-identical to the old materialize-then-!have_probs-loop:
-             * max_logit, the expf inputs and the `sum` order all match. */
-            float *probs = (float *)cand;   /* n*4 <= cap*sizeof(sample_candidate) */
-            const float max_logit = logits[(uint32_t)keys[0]];
-            for (uint32_t i = 0; i < n; i++) {
-                const float p =
-                    expf((logits[(uint32_t)keys[i]] - max_logit) / temperature);
-                probs[i] = p;
-                sum += p;
-            }
-            pv = probs;
-            idk = keys;
-            have_probs = 1;
-        }
-    }
-    if (n == 0) {
-        out->ids = (int *)xmalloc(sizeof(int));
-        out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = sample_argmax(logits, n_vocab);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
-    }
-
-    if (!have_probs) {
-        const float max_logit = sc[0].logit;
-        for (uint32_t i = 0; i < n; i++) {
-            sc[i].prob = expf((sc[i].logit - max_logit) / temperature);
-            sum += sc[i].prob;
-        }
-    }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        out->ids = (int *)xmalloc(sizeof(int));
-        out->probs = (float *)xmalloc(sizeof(float));
-        out->ids[0] = SC_ID(0);
-        out->probs[0] = 1.0f;
-        out->n = 1;
-        return 1;
-    }
-    const float min_prob = (SC_PROB(0) / sum) * min_p;
-    float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = SC_PROB(i);
-        const float pr = p / sum;
-        if (i > 0 && pr < min_prob) break;
-        filtered_sum += p;
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered == 0) filtered = 1;
-    out->ids = (int *)xmalloc((size_t)filtered * sizeof(int));
-    out->probs = (float *)xmalloc((size_t)filtered * sizeof(float));
-    out->n = filtered;
-    for (uint32_t i = 0; i < filtered; i++) {
-        out->ids[i] = SC_ID(i);
-        out->probs[i] = SC_PROB(i) / filtered_sum;   /* renormalized nucleus */
-    }
-    return 1;
-#undef SC_PROB
-#undef SC_ID
+    if (m->n_assistant > 0 && i + m->n_assistant <= n && v[i] == m->assistant[0] &&
+        (m->n_assistant < 2 || v[i + 1] == m->assistant[1]))
+        return 2;
+    return 0;
 }
 
-void pulsar_sample_dist_free(pulsar_sample_dist *d) {
-    free(d->ids);
-    free(d->probs);
-    memset(d, 0, sizeof(*d));
+int pulsar_turn_endpoint(const pulsar_turn_markers *m, const int *v, int n) {
+    if (!m || !v || n < 2) return -1;
+    /* where the client's own last turn hands over to the model: the first assistant marker after its last USER turn
+     * (a tool result is not one).  An agent loop's later requests in that turn (tool results, the model again) all
+     * name the same position, so its record is the one the next user turn can resume at: a template that re-renders
+     * the turn's replies once the user speaks again (Nemotron's truncate_history_thinking drops their reasoning)
+     * diverges right after it.  Without a tool result after the last user turn this is the last marker, the
+     * generation header, as before L351. */
+    int last_user = -1;
+    for (int i = n - 1; i > 0 && last_user < 0; i--)
+        if (pulsar_turn_marker_at(m, v, n, i) == 1) last_user = i;
+    int E = -1;
+    if (last_user > 0)
+        for (int i = last_user + 1; i < n && E < 0; i++)
+            if (pulsar_turn_marker_at(m, v, n, i) == 2) E = i;
+    /* no assistant turn after it (a prompt that ends on the user's turn) or no user turn: the last marker */
+    for (int i = n - 1; E < 0 && i > 0; i--)
+        if (pulsar_turn_marker_at(m, v, n, i) != 0) E = i;
+    return E;
 }
 
-float pulsar_sample_dist_prob(const pulsar_sample_dist *d, int token) {
-    for (uint32_t i = 0; i < d->n; i++)
-        if (d->ids[i] == token) return d->probs[i];
-    return 0.0f;
-}
-
-int pulsar_sample_dist_accept(const pulsar_sample_dist *d, int token, uint64_t *rng) {
-    const float pd = pulsar_sample_dist_prob(d, token);
-    if (pd >= 1.0f) return 1;
-    if (pd <= 0.0f) return 0;
-    return sample_rng_f32(rng) < pd;
-}
-
-int pulsar_sample_dist_draw(const pulsar_sample_dist *d, uint64_t *rng) {
-    float r = sample_rng_f32(rng);
-    for (uint32_t i = 0; i < d->n; i++) {
-        r -= d->probs[i];
-        if (r <= 0.0f) return d->ids[i];
+void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const char *tool_token,
+                                  pulsar_turn_markers *m) {
+    m->n_tool = 0;
+    const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
+    if (!t || !t->encode_rendered || !opener || !tool_token || m->n_user <= 0) return;
+    pulsar_tokens r = {0}, tok = {0};
+    t->encode_rendered(e, opener, NULL, 0, &r);
+    t->encode_rendered(e, tool_token, NULL, 0, &tok);
+    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE added token, so the render's
+     * own text after it cannot merge into it */
+    const int suffix = r.len - m->n_user;
+    bool ok = tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
+              r.v[r.len - 1] == tok.v[0];
+    for (int k = 0; ok && k < m->n_user; k++) ok = r.v[k] == m->user[k];
+    if (ok) {
+        for (int k = 0; k < suffix; k++) m->tool[k] = r.v[m->n_user + k];
+        m->n_tool = suffix;
     }
-    return d->ids[d->n - 1];
+    pulsar_tokens_free(&r);
+    pulsar_tokens_free(&tok);
 }
 
-/* =====
- * Sampled-proposal speculative rule (Leviathan/Chen). The pair above
- * (_accept / _draw_excluding) is the DETERMINISTIC-proposal rule: it accepts an
- * argmax draft with probability p(draft), so its acceptance is mathematically
- * capped at p(mode). Drawing the draft from a temperature-matched q instead and
- * accepting w.p. min(1, p/q) removes that cap; both rules emit exactly p.
+int pulsar_token_think_close(pulsar_engine *e) {
+    const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_token_think_close");
+    return t ? t->think_close(e) : -1;
+}
+
+
+
+/* The request's sampler stream (L288 sdet): a Weyl state.  The KEY of the token `ahead` places past the stream's
+ * next undrawn one is mix(state + (ahead + 1) * STEP) -- a function of (seed, token index) only, so a lane reads a
+ * token's key without consuming anything, and a token's draw is the same whichever lane makes it, whatever was
+ * drafted around it (session_spec.cpp's walk is why that matters).  Every committed token advances the state one
+ * STEP (pulsar_sample_advance).
  *
- * Two bugs in the reference implementation this is modelled on
- * (xangel82/DS4-GB10-GX10-DSpark-CUDA — technique only, no code taken) are
- * fixed here, and the unit gate tests/pulsar_test.c --spec-math pins both:
- *   (a) its `u <= ap` accept test can emit a token with p(x) == 0 (u==0 draws
- *       accept an impossible token). We reject p <= 0 outright and use a
- *       strict `<`, matching pulsar_sample_dist_accept's discipline.
- *   (b) its residual fallback can land on a token whose residual mass is zero.
- *       We track the last STRICTLY POSITIVE residual index instead.
- */
-int pulsar_sample_dist_accept_pq(const pulsar_sample_dist *p, int token, float q, uint64_t *rng) {
-    const float pd = pulsar_sample_dist_prob(p, token);
-    /* bug (a): a token outside p's nucleus is impossible under the target and
-     * must never be emitted, whatever u is. */
-    if (pd <= 0.0f) return 0;
-    /* Defensive: the token was drawn from q, so q(token) > 0 by construction.
-     * A non-positive q here would mean the stored q lost sync with the draft;
-     * accepting is the exact-preserving choice (p(token) > 0 is established). */
-    if (q <= 0.0f) return 1;
-    /* min(1, p/q) == 1: certain accept, and — like _accept's `pd >= 1` fast
-     * path — consume no rng. Load-bearing for temperature<=0 byte-identity:
-     * greedy makes p and q both point masses of 1.0 at the argmax, so this
-     * returns 1 having touched neither the rng stream nor its ordering. */
-    if (pd >= q) return 1;
-    /* u < p/q, written without the divide. u in [0,1). */
-    return sample_rng_f32(rng) * q < pd;
+ * STEP is deliberately NOT SplitMix64's golden-ratio gamma: two seeds that differ by k steps share their streams
+ * shifted by k tokens, and seeds spaced by that gamma are a common idiom -- the spec-sampling oracle seeds its
+ * trajectories gamma * (t + 1), which made trajectory t's token i + 1 draw at trajectory t + 1's token i key and
+ * inflated its chi-squares with correlated samples.  An arbitrary odd constant puts any seed family nobody builds
+ * from it ~2^63 steps apart. */
+/** The sampler stream's Weyl step (see above). */
+#define SAMPLE_STREAM_STEP 0xa0761d6478bd642fULL
+
+/** SplitMix64's output mix.  @param z the state  @return the mixed value */
+static uint64_t sample_mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
 }
 
-int pulsar_sample_dist_draw_residual(const pulsar_sample_dist *p, const pulsar_sample_dist *q,
-                                  pulsar_sample_scratch *scratch, uint64_t *rng) {
-    /* r(x) = max(0, p(x) - q(x)). r(x) > 0 requires p(x) > 0, so the union of
-     * the two supports collapses to p's support: an x in q but not in p has
-     * r = max(0, 0 - q(x)) = 0 and cannot be drawn. Iterating p alone is
-     * therefore complete, and every id considered already has p(x) > 0. */
-    uint32_t maxid = 0;
-    for (uint32_t i = 0; i < q->n; i++) {
-        if (q->ids[i] < 0) continue;
-        if ((uint32_t)q->ids[i] > maxid) maxid = (uint32_t)q->ids[i];
-    }
-    sample_qmap_reserve(scratch, maxid + 1u);
-    for (uint32_t i = 0; i < q->n; i++)
-        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = q->probs[i];
-
-    float mass = 0.0f;
-    for (uint32_t i = 0; i < p->n; i++) {
-        const int id = p->ids[i];
-        const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
-        const float r = p->probs[i] - qv;
-        if (r > 0.0f) mass += r;
-    }
-
-    int out;
-    if (mass <= 0.0f) {
-        /* Degenerate: q dominates p across p's whole support. Exactness is
-         * already lost in the numerics here; emit SOMETHING p can produce
-         * rather than an impossible token. */
-        out = pulsar_sample_dist_draw(p, rng);
-    } else {
-        float r_acc = sample_rng_f32(rng) * mass;
-        int last = -1;
-        out = -1;
-        for (uint32_t i = 0; i < p->n; i++) {
-            const int id = p->ids[i];
-            const float qv = (id >= 0 && (uint32_t)id <= maxid) ? scratch->qmap[id] : 0.0f;
-            const float r = p->probs[i] - qv;
-            if (r <= 0.0f) continue;
-            /* bug (b): remember the last id with STRICTLY POSITIVE residual, so
-             * the float-rounding overrun below cannot land on a zero-residual
-             * token. Every candidate here has p(x) > 0 by construction. */
-            last = id;
-            r_acc -= r;
-            if (r_acc <= 0.0f) { out = id; break; }
-        }
-        if (out < 0) out = last;   /* overrun: mass > 0 guarantees last >= 0 */
-    }
-
-    /* restore the all-zero invariant (only q's own ids were touched) */
-    for (uint32_t i = 0; i < q->n; i++)
-        if (q->ids[i] >= 0) scratch->qmap[q->ids[i]] = 0.0f;
-    return out;
+uint64_t pulsar_sample_key(uint64_t rng, uint32_t ahead) {
+    return sample_mix64(rng + ((uint64_t)ahead + 1u) * SAMPLE_STREAM_STEP);
 }
 
-int pulsar_sample_dist_draw_excluding(const pulsar_sample_dist *d, int excluded, uint64_t *rng) {
-    /* residual of a rejected deterministic proposal: p with `excluded`
-     * removed, renormalized. If the nucleus is exactly {excluded}, there is
-     * no residual mass — the caller treats that as accept-forced. */
-    float mass = 0.0f;
-    for (uint32_t i = 0; i < d->n; i++)
-        if (d->ids[i] != excluded) mass += d->probs[i];
-    if (mass <= 0.0f) return excluded;
-    float r = sample_rng_f32(rng) * mass;
-    int last = excluded;
-    for (uint32_t i = 0; i < d->n; i++) {
-        if (d->ids[i] == excluded) continue;
-        last = d->ids[i];
-        r -= d->probs[i];
-        if (r <= 0.0f) return d->ids[i];
-    }
-    return last;
+void pulsar_sample_advance(uint64_t *rng, uint32_t n) {
+    *rng += (uint64_t)n * SAMPLE_STREAM_STEP;
 }
-
-
-
-int sample_top_p_min_p(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        int          top_k,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        pulsar_sample_scratch *scratch) {
-    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
-    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-    if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng, scratch);
-    if (top_k > 1024) top_k = 1024;
-    if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
-
-    int ids[1024];
-    float vals[1024];
-    int n = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        float v = logits[i];
-        if (!isfinite(v)) continue;
-        if (n == top_k && v <= vals[n - 1]) continue;
-        int j = n < top_k ? n++ : n - 1;
-        while (j > 0 && vals[j - 1] < v) {
-            vals[j] = vals[j - 1];
-            ids[j] = ids[j - 1];
-            j--;
-        }
-        vals[j] = v;
-        ids[j] = (int)i;
-    }
-    if (n == 0) return sample_argmax(logits, n_vocab);
-
-    float probs[1024];
-    const float max_logit = vals[0];
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        probs[i] = expf((vals[i] - max_logit) / temperature);
-        sum += probs[i];
-    }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
-
-    const float min_prob = (probs[0] / sum) * min_p;
-    float filtered_sum = 0.0f;
-    int filtered = 0;
-    for (int i = 0; i < n; i++) {
-        float p = probs[i] / sum;
-        if (i > 0 && p < min_prob) break;
-        filtered_sum += probs[i];
-        filtered++;
-        if (filtered_sum / sum >= top_p) break;
-    }
-    if (filtered <= 0) return ids[0];
-
-    float r = sample_rng_f32(rng) * filtered_sum;
-    for (int i = 0; i < filtered; i++) {
-        r -= probs[i];
-        if (r <= 0.0f) return ids[i];
-    }
-    return ids[filtered - 1];
-}
-
-
-
-static void print_top_logits(
-        FILE          * fp,
-        const char    * label,
-        const pulsar_vocab * vocab,
-        const float   * logits,
-        uint32_t        n_vocab,
-        int             k) {
-    int best[16];
-    if (k > 16) k = 16;
-    for (int i = 0; i < k; i++) best[i] = -1;
-
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        for (int j = 0; j < k; j++) {
-            if (best[j] < 0 || logits[i] > logits[best[j]]) {
-                for (int l = k - 1; l > j; l--) best[l] = best[l - 1];
-                best[j] = (int)i;
-                break;
-            }
-        }
-    }
-
-    fprintf(fp, "pulsar: top logits %s:\n", label);
-    for (int i = 0; i < k && best[i] >= 0; i++) {
-        const int id = best[i];
-        fprintf(fp, "  %2d %7d % .9g  ", i, id, logits[id]);
-        if (id >= 0 && id < vocab->n_vocab) {
-            fprintf(fp, "%.*s", (int)vocab->token[id].len, vocab->token[id].ptr);
-        }
-        fputc('\n', fp);
-    }
-}
-
-
-
-
-
-
-/* GPU generation entry point.  The model runs as one local whole-graph
- * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
- * use decode-style prefill for short prompts. */
-int generate_gpu_graph_raw_swa(
-        const pulsar_model   * model,
-        const pulsar_vocab   * vocab,
-        const pulsar_weights * weights,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        bool                quality,
-        uint32_t            prefill_chunk,
-        const char        * directional_steering_file,
-        float               directional_steering_attn,
-        float               directional_steering_ffn,
-        pulsar_token_emit_fn   emit,
-        pulsar_generation_done_fn done,
-        void              * emit_ud,
-        pulsar_session_progress_fn progress,
-        void              * progress_ud) {
-    fprintf(stderr, "pulsar: using GPU graph generation with graph prefill\n");
-
-    if (prompt->len <= 0 || prompt->len > ctx_size) {
-        fprintf(stderr, "pulsar: prompt is empty or exceeds context size\n");
-        return 1;
-    }
-
-    const uint32_t prefill_cap =
-        gpu_graph_prefill_cap_for_prompt(prompt->len, prefill_chunk);
-    const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, prefill_cap);
-    if (prefill_cap < (uint32_t)prompt->len) {
-        fprintf(stderr,
-                "pulsar: using chunked GPU prefill (%u-token chunks for %d prompt tokens)\n",
-                prefill_cap,
-                prompt->len);
-    }
-    pulsar_gpu_graph g;
-    bool ok = gpu_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
-    if (!ok) {
-        fprintf(stderr, "pulsar: failed to allocate GPU graph runtime\n");
-        return 1;
-    }
-    g.quality = quality;
-    if (!gpu_graph_load_directional_steering(&g,
-                                               directional_steering_file,
-                                               directional_steering_attn,
-                                               directional_steering_ffn)) {
-        gpu_graph_free(&g);
-        return 1;
-    }
-    const bool memory_report = getenv("PULSAR_CUDA_MEMORY_REPORT") != NULL;
-    if (memory_report) pulsar_gpu_print_memory_report("after graph alloc");
-
-    float *logits = (float *)xmalloc((size_t)PULSAR_N_VOCAB * sizeof(logits[0]));
-    const bool trace_top = getenv("PULSAR_TRACE_TOP") != NULL;
-    const bool token_timing = getenv("PULSAR_TOKEN_TIMING") != NULL;
-
-    const double t_prefill0 = now_sec();
-    if (prefill_cap < (uint32_t)prompt->len) {
-        ok = gpu_graph_prefill_chunked(&g, model, weights, prompt,
-                                         prompt->len, logits, false,
-                                         progress, progress_ud,
-                                         progress, progress_ud,
-                                         NULL, NULL, NULL);
-    } else {
-        ok = gpu_graph_prefill_raw_swa(&g, model, weights, prompt,
-                                         prompt->len, logits, true,
-                                         progress, progress_ud,
-                                         NULL, NULL, NULL);
-    }
-    const double t_prefill1 = now_sec();
-    if (memory_report) pulsar_gpu_print_memory_report("after prefill");
-
-    if (!ok) {
-        free(logits);
-        gpu_graph_free(&g);
-        return 1;
-    }
-    const char *dump_prefill_logits = getenv("PULSAR_CUDA_DUMP_PREFILL_LOGITS");
-    if (dump_prefill_logits && dump_prefill_logits[0]) {
-        if (!write_f32_binary_file(dump_prefill_logits, logits, PULSAR_N_VOCAB)) {
-            free(logits);
-            gpu_graph_free(&g);
-            return 1;
-        }
-        fprintf(stderr, "pulsar: wrote GPU prefill logits to %s\n", dump_prefill_logits);
-    }
-
-    int pos = prompt->len;
-    int n_generated = 0;
-    int n_decode_eval = 0;
-    const double t_decode0 = now_sec();
-    for (int i = 0; i < n_predict && pos < ctx_size; i++) {
-        if (trace_top) {
-            char label[64];
-            snprintf(label, sizeof(label), "step %d", i);
-            print_top_logits(stderr, label, vocab, logits, PULSAR_N_VOCAB, 10);
-        }
-
-        int token = sample_argmax(logits, PULSAR_N_VOCAB);
-        if (token == vocab->eos_id) break;
-
-        if (emit) emit(emit_ud, token);
-        n_generated++;
-
-        if (i == n_predict - 1 || pos + 1 >= ctx_size) {
-            pos++;
-            break;
-        }
-
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = gpu_graph_eval_token_raw_swa(&g,
-                                            model,
-                                            weights,
-                                            (uint32_t)token,
-                                            (uint32_t)pos,
-                                            logits);
-        if (!ok) break;
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr, "pulsar: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
-        pos++;
-    }
-    const double t_decode1 = now_sec();
-    if (done) done(emit_ud);
-
-    const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
-    pulsar_log(stderr,
-            PULSAR_LOG_TIMING,
-            "pulsar: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
-
-    if (memory_report) pulsar_gpu_print_memory_report("before graph free");
-    free(logits);
-    gpu_graph_free(&g);
-    return ok ? 0 : 1;
-}
-
 
 
 
@@ -1895,3 +1526,67 @@ const char *pulsar_backend_name(pulsar_backend backend) {
     return "unknown";
 }
 
+
+
+/* ---- the DeepSeek family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2) ---------------- */
+
+/** pulsar_family_tokenizer::encode_text for DeepSeek: plain BPE.  @param e the engine  @param text the text
+ *  (NULL = "")  @param out receives the tokens */
+static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+    e->vocab.bpe_tokenize_text(text ? text : "", out);
+}
+
+/// pulsar_family_tokenizer::encode_rendered for DeepSeek.
+/// @param e       the engine
+/// @param text    the rendered text
+/// @param spans   [n_spans] the trusted spans, or NULL (the whole text is rendered chat)
+/// @param n_spans spans
+/// @param out     receives the tokens
+static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                                    uint32_t n_spans, pulsar_tokens *out) {
+    if (!spans || !n_spans) e->vocab.tokenize_rendered_chat_vocab(text, out);
+    else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
+}
+
+/** pulsar_family_tokenizer::is_stop: EOS only.  @param e the engine  @param token the id  @return true for EOS */
+static bool ds4_tok_is_stop(pulsar_engine *e, int token) { return token == e->vocab.eos_id; }
+/** pulsar_family_tokenizer::eos.  @param e the engine  @return the EOS id */
+static int ds4_tok_eos(pulsar_engine *e) { return e->vocab.eos_id; }
+/** pulsar_family_tokenizer::token_text (vocab_token_text).  @param e the engine  @param token the id
+ *  @param len receives the length  @return the malloc'd text */
+static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { return vocab_token_text(&e->vocab, token, len); }
+/** pulsar_family_tokenizer::think_close.  @param e the engine  @return the think-end marker id */
+static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id; }
+
+/* DeepSeek names a turn with one special token */
+/** pulsar_family_tokenizer::turn_markers: one special token each.  @param e the engine
+ *  @param out receives the markers  @return true, always */
+static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
+    out->user[0] = e->vocab.user_id;
+    out->n_user = 1;
+    out->assistant[0] = e->vocab.assistant_id;
+    out->n_assistant = 1;
+    return true;
+}
+
+/** pulsar_family_tokenizer::dump (dump_tokens_fp).  @param e the engine  @param fp the stream
+ *  @param tokens the tokens */
+static void ds4_tok_dump(pulsar_engine *e, FILE *fp, const pulsar_tokens *tokens) { dump_tokens_fp(fp, &e->vocab, tokens); }
+
+/** pulsar_family_tokenizer::n_tokens.  @param e the engine  @return the vocab size */
+static int ds4_tok_n_tokens(pulsar_engine *e) { return e->vocab.n_vocab; }
+
+const pulsar_family_tokenizer k_ds4_tokenizer = {
+    /* .encode_text              = */ ds4_tok_encode_text,
+    /* .encode_rendered          = */ ds4_tok_encode_rendered,
+    /* .chat_open                = */ ds4_chat_open,
+    /* .chat_turn                = */ ds4_chat_turn,
+    /* .chat_end_assistant       = */ ds4_chat_end_assistant,
+    /* .is_stop                  = */ ds4_tok_is_stop,
+    /* .eos                      = */ ds4_tok_eos,
+    /* .token_text               = */ ds4_tok_token_text,
+    /* .think_close              = */ ds4_tok_think_close,
+    /* .turn_markers             = */ ds4_tok_turn_markers,
+    /* .dump                     = */ ds4_tok_dump,
+    /* .n_tokens                 = */ ds4_tok_n_tokens,
+};

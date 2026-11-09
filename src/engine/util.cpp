@@ -1,10 +1,12 @@
+/** @file util.cpp
+ *  @brief Small stateless leaf helpers: string views, hashing, alignment. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_file.hpp"
 
 /* Small leaf helpers with no state: string views, hashing, alignment,
  * wall-clock, and f32 blob file I/O. Everything with a real concern of its
  * own moved to its own TU in the C++ port (log.cpp, alloc.cpp,
- * thread_pool.cpp, gguf_cursor.cpp, model_layout.cpp). */
+ * thread_pool.cpp, cursor.cpp, model_layout.cpp). */
 
 bool pulsar_streq(pulsar_str s, const char *z) {
     size_t n = strlen(z);
@@ -46,19 +48,6 @@ double now_sec(void) {
 
 
 
-void sleep_sec(double sec) {
-    if (sec <= 0.0 || !isfinite(sec)) return;
-    struct timespec req;
-    req.tv_sec = (time_t)sec;
-    req.tv_nsec = (long)((sec - (double)req.tv_sec) * 1000000000.0);
-    if (req.tv_nsec < 0) req.tv_nsec = 0;
-    if (req.tv_nsec >= 1000000000L) {
-        req.tv_sec++;
-        req.tv_nsec -= 1000000000L;
-    }
-    /* Do not resume after EINTR: Ctrl+C should cut through throttling sleeps. */
-    (void)nanosleep(&req, &req);
-}
 
 
 

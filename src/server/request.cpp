@@ -1,64 +1,102 @@
+/** @file
+ *  Request plumbing: ids, tool calls, chat messages and conversations (build, free, fold), forced tool-choice
+ *  prefill and the request's own lifecycle.
+ */
 #include "pulsar_server_internal.h"
 
+#include <string>
+
+#include <atomic>
+#include <climits>
+#include <cmath>
 
 
-void random_tool_id(char *dst, size_t dstlen, api_style api) {
+
+void random_prefixed_id(char *dst, size_t dstlen, const char *prefix, size_t nbytes) {
     unsigned char bytes[16];
-    const char *prefix = api == API_ANTHROPIC ? "toolu_" : "call_";
+    if (nbytes > sizeof(bytes)) {
+        pulsar_die("random_prefixed_id: more than 16 random bytes asked");
+        return;   /* unreachable (pulsar_die exits); tells the compiler nbytes <= 16 below */
+    }
+    /* L335: the whole id fits or nothing is written -- a shortened id is a weaker one nobody asked for */
+    if (strlen(prefix) + 2 * nbytes + 1 > dstlen) {
+        pulsar_die("random_prefixed_id: the id does not fit its buffer");
+        return;   /* unreachable */
+    }
     size_t pos = snprintf(dst, dstlen, "%s", prefix);
-    if (pos >= dstlen) return;
 
-    if (!random_bytes(bytes, sizeof(bytes))) {
-        /* Fail closed: tool-call IDs must not be predictable, and with
-         * getrandom() + /dev/urandom both unavailable something is deeply
-         * wrong with the host. */
-        pulsar_die("random_bytes failed; cannot generate tool-call ids");
+    if (!random_bytes(bytes, nbytes)) {
+        /* Fail closed: ids must not be predictable, and with getrandom() +
+         * /dev/urandom both unavailable something is deeply wrong with the
+         * host. */
+        pulsar_die("random_bytes failed; cannot generate ids");
     }
 
     static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
+    for (size_t i = 0; i < nbytes; i++) {
         dst[pos++] = hex[bytes[i] >> 4];
         dst[pos++] = hex[bytes[i] & 15];
     }
     dst[pos] = '\0';
 }
 
-
-
-/* The exact byte sequence a forced tool call is seeded with: close thinking,
- * open the tool_calls block, and (when a specific tool was requested) open
- * the named invoke. Used for BOTH the prompt suffix and the generate_job
- * output seed - they must stay byte-identical or the DSML tracker and the
- * prompt disagree about parser state. */
-void request_forced_tool_seed(const request *r, buf *out) {
-    buf_puts(out, "</think>\n\n" PULSAR_TOOL_CALLS_START "\n");
-    if (r->forced_tool_name && r->forced_tool_name[0]) {
-        buf_puts(out, PULSAR_INVOKE_START " name=\"");
-        buf_puts(out, r->forced_tool_name);
-        buf_puts(out, "\">\n");
-    }
+/// @brief A fresh random tool-call id in the protocol's format: "toolu_" (Anthropic) or "call_" + 32 hex digits.
+/// @param dst receives the NUL-terminated id
+/// @param dstlen bytes at `dst`
+/// @param api the protocol
+void random_tool_id(char *dst, size_t dstlen, api_style api) {
+    random_prefixed_id(dst, dstlen, api == API_ANTHROPIC ? "toolu_" : "call_", 16);
 }
 
-/* Rewrite the rendered prompt tail for a forced tool call: drop a trailing
- * "<think>" opener, then append the forced-tool seed (which begins with the
- * "</think>" close; if the render already ended with one, skip the extra). */
-void request_apply_forced_tool_prefill(request *r) {
-    if (!r->force_tool_call || !r->prompt_text) return;
+
+
+/* Rewrite the rendered prompt's tail for a forced tool call: the family says how much of the tail to
+ * keep and what to append (server_family_ops::forced_call_prefill); this keeps the prompt's client-data
+ * ranges, clamping one that reached into the dropped tail.  L272: the forced name is a declared tool --
+ * a named choice that is not one refuses, and a required call with exactly one declared tool is that
+ * tool by name, so the model cannot sample an undeclared one (Qwen answered "required" with "reply"). */
+/// @param r the rendered request (no forced call or no prompt text: nothing to do)
+/// @param err receives the client error on false
+/// @param errlen bytes at `err`
+/// @return false when tool_choice names an undeclared tool
+bool request_apply_forced_tool_prefill(request *r, char *err, size_t errlen) {
+    if (!r->force_tool_call || !r->prompt_text) return true;
+    if (r->forced_tool_name && r->forced_tool_name[0]) {
+        if (!tool_schema_orders_find(&r->tool_orders, r->forced_tool_name)) {
+            snprintf(err, errlen, "tool_choice names \"%.60s\", which is not a declared tool", r->forced_tool_name);
+            return false;
+        }
+    } else if (r->tool_orders.len == 1 && r->tool_orders.v[0].name) {
+        free(r->forced_tool_name);
+        r->forced_tool_name = server_xstrdup(r->tool_orders.v[0].name);
+    }
     buf pt = {0};
     const char *base = r->prompt_text;
     size_t blen = strlen(base);
-    if (blen >= 7 && !memcmp(base + blen - 7, "<think>", 7)) blen -= 7;
-    buf_append(&pt, base, blen);
     buf seed = {0};
-    request_forced_tool_seed(r, &seed);
-    if (pt.len >= 8 && !memcmp(pt.ptr + pt.len - 8, "</think>", 8)) {
-        buf_puts(&pt, seed.ptr + 8);   /* already closed: skip seed's close */
-    } else {
-        buf_puts(&pt, seed.ptr);
-    }
+    r->family->forced_call_prefill(r, base, &blen, &seed);
+    buf_append(&pt, base, blen);
+    if (seed.len) buf_append(&pt, seed.ptr, seed.len);
     buf_free(&seed);
     free(r->prompt_text);
+    if (r->prompt_spans) {
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < r->prompt_n_spans; i++) {
+            pulsar_text_span sp = r->prompt_spans[i];
+            if (sp.lo >= blen) continue;
+            if (sp.hi > blen) sp.hi = (uint32_t)blen;
+            r->prompt_spans[k++] = sp;
+        }
+        pt.spans = r->prompt_spans;
+        pt.cap_spans = r->prompt_n_spans;
+        pt.n_spans = k;
+    }
+    r->prompt_spans = pt.spans;
+    r->prompt_n_spans = pt.n_spans;
+    pt.spans = NULL;
+    pt.n_spans = pt.cap_spans = 0;
     r->prompt_text = buf_take(&pt);
+    return true;
 }
 
 
@@ -68,16 +106,13 @@ void request_apply_forced_tool_prefill(request *r) {
 
 
 
-void stop_list_clear(stop_list *stops);
 
 
-bool id_list_contains(const stop_list *ids, const char *id);
 
 
 void id_list_push_unique(stop_list *ids, const char *id);
 
 
-void id_list_free(stop_list *ids);
 
 
 
@@ -85,6 +120,8 @@ void id_list_free(stop_list *ids);
 
 
 
+/// @brief Free one call's id, name and arguments and zero it.
+/// @param tc the call
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
     free(tc->name);
@@ -94,15 +131,20 @@ static void tool_call_free(tool_call *tc) {
 
 
 
+/// @brief Free every call, the raw sampled bytes and the array, and zero the list.
+/// @param calls the list
 void tool_calls_free(tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) tool_call_free(&calls->v[i]);
-    free(calls->raw_dsml);
+    free(calls->raw_calls);
     free(calls->v);
     memset(calls, 0, sizeof(*calls));
 }
 
 
 
+/// @brief Append a call; the list takes ownership of its strings.
+/// @param calls the list
+/// @param tc the call
 void tool_calls_push(tool_calls *calls, tool_call tc) {
     if (calls->len == calls->cap) {
         calls->cap = calls->cap ? calls->cap * 2 : 4;
@@ -113,9 +155,13 @@ void tool_calls_push(tool_calls *calls, tool_call tc) {
 
 
 
+/// @brief Record a tool-call id the message refers to (copied; duplicates ignored); the first also becomes
+/// m->tool_call_id.
+/// @param m the message (NULL: no-op)
+/// @param id the id (NULL or empty: no-op)
 void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     if (!m || !id || !id[0]) return;
-    if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
+    if (!m->tool_call_id) m->tool_call_id = server_xstrdup(id);
     for (int i = 0; i < m->tool_call_ids_len; i++) {
         if (m->tool_call_ids[i] && !strcmp(m->tool_call_ids[i], id)) return;
     }
@@ -124,11 +170,97 @@ void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
         m->tool_call_ids = (char **)server_xrealloc(m->tool_call_ids,
             (size_t)m->tool_call_ids_cap * sizeof(m->tool_call_ids[0]));
     }
-    m->tool_call_ids[m->tool_call_ids_len++] = xstrdup(id);
+    m->tool_call_ids[m->tool_call_ids_len++] = server_xstrdup(id);
 }
 
 
 
+/* De-static'd for api_parse.cpp: the Responses reader parses an item's content
+ * into a scratch message and must drop the images it collected when the item
+ * turns out not to be a message (see parse_responses_input).  Frees the
+ * placeholder offsets with the images -- one fact, one lifetime. */
+/// @param m the message whose images and placeholder offsets are freed
+void chat_msg_clear_images(chat_msg *m) {
+    for (int i = 0; i < m->images_len; i++) free(m->images[i].bytes);
+    free(m->images);
+    free(m->image_ph_off);
+    m->images = NULL;
+    m->image_ph_off = NULL;
+    m->images_len = 0;
+    m->images_cap = 0;
+}
+
+
+
+/* Take ownership of one decoded image and record WHERE its placeholder sits in
+ * `content`.  Both are pushed together so an image and its offset cannot
+ * desync; `placeholder_off` is the offset the placeholder was (or is about to
+ * be) written at. */
+void chat_msg_add_image(chat_msg *m, uint8_t *bytes, size_t len, size_t placeholder_off) {
+    if (m->images_len == m->images_cap) {
+        m->images_cap = m->images_cap ? m->images_cap * 2 : 4;
+        m->images = (chat_image *)server_xrealloc(m->images,
+                                                  (size_t)m->images_cap * sizeof(m->images[0]));
+        m->image_ph_off = (size_t *)server_xrealloc(m->image_ph_off,
+                                                    (size_t)m->images_cap * sizeof(m->image_ph_off[0]));
+    }
+    m->images[m->images_len].bytes = bytes;
+    m->images[m->images_len].len = len;
+    m->image_ph_off[m->images_len] = placeholder_off;
+    m->images_len++;
+}
+
+/* L335: the one check of a message's image offsets.  Each placeholder must sit inside the content at
+ * its recorded offset, and the offsets must ascend without overlap (each starts at or after the previous
+ * placeholder's end) -- the renderers walk them in order and copy the text between two of them, so an
+ * offset behind the previous end would underflow that length. */
+bool chat_msg_image_offsets_check(const chat_msg *m, char *err, size_t errlen) {
+    if (m->images_len <= 0) return true;
+    const char *c = m->content ? m->content : "";
+    const size_t n = strlen(c), ph = strlen(PULSAR_IMAGE_PLACEHOLDER);
+    size_t at = 0;
+    for (int k = 0; k < m->images_len; k++) {
+        const size_t off = m->image_ph_off ? m->image_ph_off[k] : SIZE_MAX;
+        if (off == SIZE_MAX || off > n || n - off < ph || memcmp(c + off, PULSAR_IMAGE_PLACEHOLDER, ph)) {
+            snprintf(err, errlen, "image %d of a message has no placeholder at its offset", k);
+            return false;
+        }
+        if (off < at) {
+            snprintf(err, errlen, "image %d of a message: its placeholder offset %zu is before the previous "
+                     "image's end %zu (offsets out of order or overlapping)", k, off, at);
+            return false;
+        }
+        at = off + ph;
+    }
+    return true;
+}
+
+
+
+/* L325: one tool_reference at byte `off` of the message's content (chat_msg::tool_ref_off). */
+void chat_msg_add_tool_ref(chat_msg *m, size_t off, const char *name) {
+    if (m->tool_refs_len == m->tool_refs_cap) {
+        m->tool_refs_cap = m->tool_refs_cap ? m->tool_refs_cap * 2 : 4;
+        m->tool_ref_off = (size_t *)server_xrealloc(m->tool_ref_off, (size_t)m->tool_refs_cap * sizeof(size_t));
+        m->tool_ref_name = (char **)server_xrealloc(m->tool_ref_name, (size_t)m->tool_refs_cap * sizeof(char *));
+    }
+    m->tool_ref_off[m->tool_refs_len] = off;
+    m->tool_ref_name[m->tool_refs_len] = server_xstrdup(name ? name : "");
+    m->tool_refs_len++;
+}
+
+void chat_msg_clear_tool_refs(chat_msg *m) {
+    for (int i = 0; i < m->tool_refs_len; i++) free(m->tool_ref_name[i]);
+    free(m->tool_ref_off);
+    free(m->tool_ref_name);
+    m->tool_ref_off = NULL;
+    m->tool_ref_name = NULL;
+    m->tool_refs_len = 0;
+    m->tool_refs_cap = 0;
+}
+
+/// @brief Free everything a message owns and zero it.
+/// @param m the message
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
     free(m->content);
@@ -136,12 +268,16 @@ static void chat_msg_free(chat_msg *m) {
     free(m->tool_call_id);
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
+    chat_msg_clear_images(m);
+    chat_msg_clear_tool_refs(m);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
 
 
 
+/// @brief Free every message and the array, and zero the list.
+/// @param msgs the list
 void chat_msgs_free(chat_msgs *msgs) {
     for (int i = 0; i < msgs->len; i++) chat_msg_free(&msgs->v[i]);
     free(msgs->v);
@@ -150,6 +286,9 @@ void chat_msgs_free(chat_msgs *msgs) {
 
 
 
+/// @brief Append a message; the list takes ownership of what it owns.
+/// @param msgs the list
+/// @param msg the message
 void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
     if (msgs->len == msgs->cap) {
         msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
@@ -160,6 +299,8 @@ void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
 
 
 
+/// @brief Free one tool's schema order (name, wire name, namespace, properties) and zero it.
+/// @param o the order
 static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
@@ -171,6 +312,8 @@ static void tool_schema_order_free(tool_schema_order *o) {
 
 
 
+/// @brief Free every order and the array, and zero the table.
+/// @param orders the table
 void tool_schema_orders_free(tool_schema_orders *orders) {
     for (int i = 0; i < orders->len; i++) tool_schema_order_free(&orders->v[i]);
     free(orders->v);
@@ -179,6 +322,9 @@ void tool_schema_orders_free(tool_schema_orders *orders) {
 
 
 
+/// @brief Append a property name, in schema order.
+/// @param o the order
+/// @param prop the name (malloc'd; the order takes it)
 static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
@@ -189,6 +335,9 @@ static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
 
 
 
+/// @param orders the table (NULL: -1)
+/// @param name the tool name (NULL: -1)
+/// @return the index of the order for `name`, or -1
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
     if (!orders || !name) return -1;
     for (int i = 0; i < orders->len; i++) {
@@ -199,6 +348,9 @@ static int tool_schema_orders_find_index(const tool_schema_orders *orders, const
 
 
 
+/// @brief Add an order, replacing (and freeing) an existing one of the same name; the table takes ownership.
+/// @param orders the table
+/// @param order the order
 static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_order order) {
     int idx = tool_schema_orders_find_index(orders, order.name);
     if (idx >= 0) {
@@ -215,95 +367,148 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 
 
 
+/// @param orders the table
+/// @param name the tool name
+/// @return the order for `name` (owned by the table), or NULL
 const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
 
-
-void request_init(request *r, req_kind kind, int max_tokens) {
-    memset(r, 0, sizeof(*r));
-    r->kind = kind;
-    r->api = API_OPENAI;
-    r->model = xstrdup("deepseek-v4-flash");
-    r->max_tokens = max_tokens;
-    r->top_k = 0;
-    r->temperature = PULSAR_DEFAULT_TEMPERATURE;
-    r->top_p = PULSAR_DEFAULT_TOP_P;
-    r->min_p = PULSAR_DEFAULT_MIN_P;
-    r->think_mode = PULSAR_THINK_LOW;
-}
-
-
-
-void request_free(request *r) {
-    pulsar_tokens_free(&r->prompt);
-    free(r->model);
-    free(r->forced_tool_name);
-    for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
-    free(r->stops.v);
-    free(r->raw_body);
-    free(r->prompt_text);
-    stop_list_clear(&r->responses_live_call_ids);
-    free(r->responses_live_call_ids.v);
-    free(r->responses_live_suffix_text);
-    stop_list_clear(&r->anthropic_live_call_ids);
-    free(r->anthropic_live_call_ids.v);
-    free(r->anthropic_live_suffix_text);
-    tool_schema_orders_free(&r->tool_orders);
-    memset(r, 0, sizeof(*r));
-}
-
-
-
-pulsar_think_mode think_mode_from_enabled(bool enabled, pulsar_think_mode effort) {
-    if (!enabled || effort == PULSAR_THINK_NONE) return PULSAR_THINK_NONE;
-    return effort;
-}
-
-
-
-/* DS4 exposes the 0731 levels low/high/max above zero. OpenAI-style names
- * collapse onto them: "minimal"/"medium" join "low" (the prefix-free
- * default), "xhigh" joins "max". Callers that need *no* reasoning must use
- * "none" instead. */
-bool parse_reasoning_effort_name(const char *s, pulsar_think_mode *out) {
-    if (!s) return false;
-    if (!strcmp(s, "max") || !strcmp(s, "xhigh")) {
-        *out = PULSAR_THINK_MAX;
-        return true;
-    }
-    if (!strcmp(s, "high")) {
-        *out = PULSAR_THINK_HIGH;
-        return true;
-    }
-    if (!strcmp(s, "medium") || !strcmp(s, "low") || !strcmp(s, "minimal")) {
-        *out = PULSAR_THINK_LOW;
-        return true;
-    }
-    if (!strcmp(s, "none")) {
-        *out = PULSAR_THINK_NONE;
-        return true;
+/* L272: a parsed call is executable only when it names a tool the request declared -- request::tool_orders,
+ * the one table every protocol's tools fill (parse_tools_value; Responses tool_search loads too).  The model
+ * samples names freely (Qwen answered a tool_choice "required" turn with an undeclared "reply"), so each
+ * family's parser treats an undeclared name as a malformed call: dropped, never streamed, and retried with
+ * the model-visible tool error this writes (the name, then the declared ones, cut to fit). */
+bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len) {
+    if (name && tool_schema_orders_find(&r->tool_orders, name)) return true;
+    if (detail && detail_len) {
+        buf b = {0};
+        buf_printf(&b, "unknown tool \"%s\"; the declared tools are:", name ? name : "");
+        for (int i = 0; i < r->tool_orders.len; i++)
+            buf_printf(&b, "%s %s", i ? "," : "", r->tool_orders.v[i].name ? r->tool_orders.v[i].name : "");
+        if (r->tool_orders.len == 0) buf_printf(&b, " (none)");
+        snprintf(detail, detail_len, "%s", b.ptr ? b.ptr : "");
+        buf_free(&b);
     }
     return false;
 }
 
 
 
-bool parse_reasoning_effort_value(const char **p, pulsar_think_mode *out) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    char *effort = NULL;
-    if (!json_string(p, &effort)) return false;
-    bool ok = parse_reasoning_effort_name(effort, out);
-    free(effort);
-    return ok;
+/* ---- L249 D: the gateway hint headers ---- */
+
+/// The request class names, /metrics label values (pulsar_server_internal.h).
+extern const char *const k_request_class_names[REQ_CLASS_COUNT] = {"none", "main", "subagent", "workflow",
+                                                                   "compaction", "auxiliary", "other"};
+
+/// Copy a header value into a fixed field: printable ASCII only (a value with anything else is dropped), cut to fit.
+/// @param dst  the field
+/// @param cap  its size
+/// @param v    the value
+/// @param n    bytes at `v`
+static void hint_copy(char *dst, size_t cap, const char *v, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)v[i] < 0x20 || (unsigned char)v[i] > 0x7e) return;
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, v, n);
+    dst[n] = '\0';
+}
+
+void client_hints_read_line(client_hints *h, const char *line, size_t len) {
+    static const char prefix[] = "x-claude-code-";
+    const size_t pl = sizeof prefix - 1;
+    if (len <= pl || strncasecmp(line, prefix, pl)) return;
+    const char *colon = (const char *)memchr(line, ':', len);
+    if (!colon) return;
+    const char *name = line + pl;
+    const size_t nlen = (size_t)(colon - name);
+    const char *v = colon + 1, *end = line + len;
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    while (end > v && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) end--;
+    const size_t vlen = (size_t)(end - v);
+    auto is = [&](const char *n) { return nlen == strlen(n) && !strncasecmp(name, n, nlen); };
+    if (is("session-id")) hint_copy(h->session, sizeof h->session, v, vlen);
+    else if (is("agent-id")) hint_copy(h->agent, sizeof h->agent, v, vlen);
+    else if (is("parent-agent-id")) hint_copy(h->parent_agent, sizeof h->parent_agent, v, vlen);
+    else if (is("prompt-id")) hint_copy(h->prompt, sizeof h->prompt, v, vlen);
+    else if (is("compaction")) hint_copy(h->compaction, sizeof h->compaction, v, vlen);
+    else if (is("context-compacted")) hint_copy(h->context_compacted, sizeof h->context_compacted, v, vlen);
+    else if (is("request-class")) {
+        h->cls = REQ_CLASS_OTHER;
+        for (int c = REQ_CLASS_MAIN; c < REQ_CLASS_OTHER; c++)
+            if (vlen == strlen(k_request_class_names[c]) && !strncasecmp(v, k_request_class_names[c], vlen))
+                h->cls = (request_class)c;
+    }
+    /* the summarization request of a compaction, whatever class it was sent as */
+    if (h->compaction[0]) h->cls = REQ_CLASS_COMPACTION;
 }
 
 
 
-bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+/// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs.  No model and no
+///        family: the family is the loaded engine's (the render or the completions parse sets it), the model the
+///        client's or the served id (http_server); server::enqueue dies on a request without either (L335).
+/// @param r the request
+/// @param kind chat or completion
+/// @param max_tokens the generation cap
+void request_init(request *r, req_kind kind, int max_tokens) {
+    memset(r, 0, sizeof(*r));
+    r->kind = kind;
+    r->api = API_OPENAI;
+    r->max_tokens = max_tokens;
+    r->top_k = 0;
+    r->temperature = PULSAR_DEFAULT_TEMPERATURE;
+    r->top_p = PULSAR_DEFAULT_TOP_P;
+    r->min_p = PULSAR_DEFAULT_MIN_P;
+    r->think_mode = PULSAR_THINK_DEFAULT;
+}
+
+
+
+/// @brief Free everything a request owns and zero it.
+/// @param r the request
+void request_free(request *r) {
+    pulsar_tokens_free(&r->prompt);
+    for (int i = 0; i < r->n_images; i++) free((void *)r->images[i].bytes);
+    free(r->images);
+    free(r->model);
+    free(r->forced_tool_name);
+    for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
+    free(r->stops.v);
+    free(r->raw_body);
+    free(r->prompt_text);
+    free(r->prompt_spans);
+    r->prompt_spans = NULL;
+    r->prompt_n_spans = 0;
+    stop_list_clear(&r->responses_live_call_ids);
+    free(r->responses_live_call_ids.v);
+    free(r->responses_live_suffix_text);
+    free(r->responses_live_suffix_spans);
+    r->responses_live_suffix_spans = NULL;
+    r->responses_live_suffix_n_spans = 0;
+    stop_list_clear(&r->anthropic_live_call_ids);
+    free(r->anthropic_live_call_ids.v);
+    free(r->anthropic_live_suffix_text);
+    free(r->anthropic_live_suffix_spans);
+    r->anthropic_live_suffix_spans = NULL;
+    r->anthropic_live_suffix_n_spans = 0;
+    tool_schema_orders_free(&r->tool_orders);
+    free(r->tools_json);
+    constrain_plan_free(r->constrain);
+    memset(r, 0, sizeof(*r));
+}
+
+
+
+/// @brief Read a thinking control: null (unchanged), a bool, or an object whose "type" is "enabled" /
+/// "disabled" and whose "budget_tokens" (L344) is an integer; any other value is skipped.
+/// @param p the cursor; advanced past the value
+/// @param thinking_enabled set when the value says on or off
+/// @param budget_tokens receives "budget_tokens" when the object carries one (else untouched); NULL: skipped
+/// @return false on malformed JSON (a "budget_tokens" that is not an integer included)
+bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -328,42 +533,14 @@ bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
-        } else if (!json_skip_value(p)) {
-            free(key);
-            return false;
-        }
-        free(key);
-        json_ws(p);
-        if (**p == ',') (*p)++;
-        json_ws(p);
-    }
-    if (**p != '}') return false;
-    (*p)++;
-    return true;
-}
-
-
-
-bool parse_output_config_effort(const char **p, pulsar_think_mode *effort) {
-    json_ws(p);
-    if (json_lit(p, "null")) return true;
-    if (**p != '{') return json_skip_value(p);
-    (*p)++;
-    json_ws(p);
-    while (**p && **p != '}') {
-        char *key = NULL;
-        if (!json_string(p, &key)) return false;
-        json_ws(p);
-        if (**p != ':') {
-            free(key);
-            return false;
-        }
-        (*p)++;
-        if (!strcmp(key, "effort")) {
-            if (!parse_reasoning_effort_value(p, effort)) {
+        } else if (budget_tokens && !strcmp(key, "budget_tokens")) {
+            /* an integer, sign kept (json_int truncates 1.5 and folds -5 to 0): the caller refuses < 1 by value */
+            double v = 0.0;
+            if (!json_number(p, &v) || !(v == floor(v)) || v < (double)INT_MIN + 1.0 || v > (double)INT_MAX) {
                 free(key);
                 return false;
             }
+            *budget_tokens = (int)v;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -380,35 +557,37 @@ bool parse_output_config_effort(const char **p, pulsar_think_mode *effort) {
 
 
 
-bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-chat");
-}
-
-
-
-bool model_alias_enables_thinking(const char *model) {
-    return model && !strcmp(model, "deepseek-reasoner");
-}
-
-
-
+/// @param engine the loaded engine (NULL dies in the server: there is no served model without one, L335; the
+///               host-only test harnesses, built PULSAR_SERVER_TEST, have none and get "(no engine)")
+/// @return the served model id (static storage)
 const char *server_model_id_from_engine(pulsar_engine *engine) {
-    return pulsar_engine_model_id(engine) == 1 ?
-           "deepseek-v4-pro" : "deepseek-v4-flash";
+    /* the family's answer, fixed at load: a plain read of immutable engine state on the client threads */
+    if (!engine) {
+#ifdef PULSAR_SERVER_TEST
+        return "(no engine)";
+#else
+        pulsar_die("server_model_id_from_engine: no engine, so no served model id");
+#endif
+    }
+    return pulsar_engine_served_model_id(engine);
 }
 
+/// @param s the server
+/// @return the model id the API reports
 const char *server_served_model_id(const server *s) {
-    return s->served_model_id ? s->served_model_id
-                              : server_model_id_from_engine(s->engine);
+    return server_model_id_from_engine(s->engine);
 }
 
+/// @param s the server
+/// @return the loaded model's name (pulsar_engine_model_name)
 const char *server_served_model_name(const server *s) {
-    return s->served_model_name ? s->served_model_name
-                                : pulsar_engine_model_name(s->engine);
+    return pulsar_engine_model_name(s->engine);
 }
 
 
 
+/// @brief Free the entries and empty the list (its array is kept).
+/// @param stops the list
 void stop_list_clear(stop_list *stops) {
     for (int i = 0; i < stops->len; i++) free(stops->v[i]);
     stops->len = 0;
@@ -417,6 +596,9 @@ void stop_list_clear(stop_list *stops) {
 
 
 
+/// @brief Append a stop string and track the longest; an empty one is dropped.
+/// @param stops the list
+/// @param s the string (malloc'd; the list takes it, or frees it)
 void stop_list_push(stop_list *stops, char *s) {
     if (!s || !s[0]) {
         free(s);
@@ -433,6 +615,10 @@ void stop_list_push(stop_list *stops, char *s) {
 
 
 
+/// @brief Read "stop": a string or an array of strings (other entries and values skipped).
+/// @param p the cursor; advanced past the value
+/// @param out the list, cleared first
+/// @return false on malformed JSON
 bool parse_stop(const char **p, stop_list *out) {
     json_ws(p);
     stop_list_clear(out);
@@ -464,6 +650,13 @@ bool parse_stop(const char **p, stop_list *out) {
 
 
 
+/// @brief The earliest match of any stop string at or after `from`.
+/// @param stops the list
+/// @param text the generated text (NUL-terminated)
+/// @param from the byte offset to search from
+/// @param pos receives the match's byte offset
+/// @param len receives the matched string's length in bytes
+/// @return false when nothing matches
 bool stop_list_find_from(const stop_list *stops, const char *text,
                                 size_t from, size_t *pos, size_t *len) {
     if (!stops->len || !text) return false;
@@ -488,6 +681,9 @@ bool stop_list_find_from(const stop_list *stops, const char *text,
 
 
 
+/// @param stops the request's stop strings
+/// @param text_len bytes of text generated so far
+/// @return how many of them may stream now: all but the longest stop's length - 1
 size_t stop_list_stream_safe_len(const stop_list *stops, size_t text_len) {
     /* Streaming cannot emit the last max_stop_len-1 bytes yet: a stop sequence
      * may start there and finish in the next token.  The final flush releases
@@ -499,21 +695,23 @@ size_t stop_list_stream_safe_len(const stop_list *stops, size_t text_len) {
 
 
 
-static int utf8_expected_len(unsigned char c) {
-    if (c < 0x80) return 1;
-    if (c >= 0xc2 && c <= 0xdf) return 2;
-    if (c >= 0xe0 && c <= 0xef) return 3;
-    if (c >= 0xf0 && c <= 0xf4) return 4;
-    return 1;
-}
-
-
-
 /* Tokenizers can split a multi-byte UTF-8 character across two tokens.  If an
  * SSE delta ends at that boundary, some clients replace the incomplete byte
  * sequence with U+FFFD and later send the corrupted text back, destroying KV
  * cache prefix matches.  Hold only the trailing incomplete character; the next
- * generated token will complete it. */
+ * generated token will complete it.
+ *
+ * The lead table is the lib's (utf8_seq_len, L187); the hold-back itself stays
+ * LENIENT on purpose: it counts continuation bytes and never judges the
+ * sequence well-formed, so a byte-fallback token that can never complete
+ * (E0 80 ...) is held until the next token or the final flush exactly as
+ * before.  A strict test here would move SSE delta boundaries for ill-formed
+ * output while changing nothing about the concatenated stream. */
+/// @param s the text
+/// @param start the first byte not yet streamed
+/// @param limit the release point the other holds allow
+/// @param final the final flush (nothing is held)
+/// @return `limit`, lowered to the start of a trailing incomplete UTF-8 sequence
 size_t utf8_stream_safe_len(const char *s, size_t start,
                                    size_t limit, bool final) {
     if (final || !s || limit <= start) return limit;
@@ -528,18 +726,24 @@ size_t utf8_stream_safe_len(const char *s, size_t start,
     }
 
     if (p == limit) {
-        return utf8_expected_len((unsigned char)s[limit - 1]) > 1 ?
+        return utf8_seq_len((unsigned char)s[limit - 1]) > 1 ?
                limit - 1 : limit;
     }
     if (p == start && (((unsigned char)s[p] & 0xc0) == 0x80)) return start;
 
     size_t lead = p - 1;
-    int need = utf8_expected_len((unsigned char)s[lead]);
+    /* a non-lead byte reads 0 here: (limit - lead) >= 1 always, so the
+     * text is released, as it was when the local table said 1 */
+    int need = utf8_seq_len((unsigned char)s[lead]);
     return (limit - lead) < (size_t)need ? lead : limit;
 }
 
 
 
+/// @brief Read "stream_options" (only include_usage is used; any other value is skipped).
+/// @param p the cursor; advanced past the value
+/// @param include_usage set from include_usage
+/// @return false on malformed JSON
 bool parse_stream_options(const char **p, bool *include_usage) {
     json_ws(p);
     if (**p != '{') return json_skip_value(p);
@@ -575,6 +779,11 @@ bool parse_stream_options(const char **p, bool *include_usage) {
 
 
 
+/// @brief Read an OpenAI call's "function" object: its name and arguments (a JSON string's text, or any other
+/// value's raw text).
+/// @param p the cursor; advanced past the object
+/// @param tc receives name and arguments (owned)
+/// @return false on malformed JSON
 static bool parse_function_call(const char **p, tool_call *tc) {
     json_ws(p);
     if (**p != '{') return false;
@@ -625,6 +834,11 @@ bad:
 
 
 
+/// @brief Read an assistant message's "tool_calls" array (null: none); a call without a name or arguments is
+/// dropped.
+/// @param p the cursor; advanced past the value
+/// @param calls the calls are appended here
+/// @return false on malformed JSON or an entry that is not an object
 static bool parse_tool_calls_value(const char **p, tool_calls *calls) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -687,6 +901,9 @@ bad:
 
 
 
+/// @brief Append one JSON text as a line (newline-separated from what is there); NULL or empty: nothing.
+/// @param b the buffer
+/// @param json the text
 static void append_raw_json_line(buf *b, const char *json) {
     if (!json || !json[0]) return;
     if (b->len) buf_putc(b, '\n');
@@ -695,7 +912,6 @@ static void append_raw_json_line(buf *b, const char *json) {
 
 
 
-void json_escape(buf *b, const char *s);
 
 
 
@@ -703,6 +919,9 @@ void json_escape(buf *b, const char *s);
  * Decoded JSON strings may contain an embedded U+0000, so the ordinary
  * NUL-terminated json_escape() helper is not safe here.  (Ported from
  * upstream ds4 3196149.) */
+/// @param b the buffer
+/// @param s the decoded string's bytes (may hold NUL)
+/// @param n bytes at `s`
 static void json_prompt_escape_n(buf *b, const char *s, size_t n) {
     buf_putc(b, '"');
     for (size_t i = 0; i < n; i++) {
@@ -738,6 +957,10 @@ static void json_prompt_escape_n(buf *b, const char *s, size_t n) {
  * off the trained distribution for picky clients, and (pulsar-specific) it
  * fragments warm-bank prefix matching and disk-cache keys across clients
  * that serialize the same toolset differently. */
+/// @param p the cursor; advanced past the value
+/// @param out the canonical spelling is appended here
+/// @param depth the nesting depth so far (refused at JSON_MAX_NESTING)
+/// @return false on malformed JSON, too deep a nesting or a non-finite number
 static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
     if (depth >= JSON_MAX_NESTING) return false;
     json_ws(p);
@@ -833,6 +1056,9 @@ static bool json_prompt_value_depth(const char **p, buf *out, int depth) {
     return true;
 }
 
+/// @brief The whole of `json` in the canonical prompt spelling (json_prompt_value_depth).
+/// @param json one JSON value
+/// @return malloc'd text, or NULL when it does not convert (trailing bytes included)
 static char *json_prompt_value(const char *json) {
     const char *p = json;
     buf out = {0};
@@ -848,44 +1074,65 @@ static char *json_prompt_value(const char *json) {
     return buf_take(&out);
 }
 
-static char *openai_function_schema_from_tool(const char *raw) {
+/// @brief An OpenAI tool entry's "function" object, canonicalized (json_prompt_value).
+/// @param raw     the tool entry's JSON
+/// @param index   the entry's position in the tools array (named in a refusal)
+/// @param out     receives the malloc'd schema text when the entry has a "function"
+/// @param err     receives the reason on a refusal (NULL: none written)
+/// @param errlen  size of `err`
+/// @return 1 with *out set; 0 when the entry has no "function" (another dialect's entry); -1 + err when its
+///         "function" does not canonicalize (L335: refused, never forwarded in the client's spelling -- rule 1)
+static int openai_function_schema_from_tool(const char *raw, int index, char **out, char *err, size_t errlen) {
+    *out = NULL;
     const char *p = raw;
     json_ws(&p);
-    if (*p != '{') return NULL;
+    if (*p != '{') return 0;
     p++;
     json_ws(&p);
     while (*p && *p != '}') {
         char *key = NULL;
         char *value = NULL;
-        if (!json_string(&p, &key)) return NULL;
+        if (!json_string(&p, &key)) return 0;
         json_ws(&p);
         if (*p != ':') {
             free(key);
-            return NULL;
+            return 0;
         }
         p++;
         if (!strcmp(key, "function")) {
             free(key);
-            if (!json_raw_value(&p, &value)) return NULL;
-            /* Canonicalize the schema's JSON spelling; fail OPEN to the
-             * verbatim bytes so a schema the mini-walker cannot round-trip
-             * still reaches the prompt the way it always did. */
+            if (!json_raw_value(&p, &value)) return 0;
+            /* The schema's JSON spelling is canonicalized (the prompt's tokens and the KV keys must not depend
+             * on the client's serializer); a schema the canonicalizer refuses is refused with the request. */
             char *prompt_value = json_prompt_value(value);
-            if (!prompt_value) return value;
+            if (!prompt_value) {
+                char *name = json_object_member_raw(value, "name");
+                if (err && errlen)
+                    snprintf(err, errlen, "tools[%d] (function %.48s): its schema does not canonicalize (a "
+                             "non-finite number, a bad string escape or nesting past %d)", index,
+                             name ? name : "without a name", JSON_MAX_NESTING);
+                free(name);
+                free(value);
+                return -1;
+            }
             free(value);
-            return prompt_value;
+            *out = prompt_value;
+            return 1;
         }
         free(key);
-        if (!json_skip_value(&p)) return NULL;
+        if (!json_skip_value(&p)) return 0;
         json_ws(&p);
         if (*p == ',') p++;
         json_ws(&p);
     }
-    return NULL;
+    return 0;
 }
 
 
 
+/// @brief The function schema for a Responses built-in tool pulsar renders as a function: tool_search only.
+/// @param raw the tool entry's JSON
+/// @return malloc'd {"name","description","parameters"} text, or NULL for any other entry
 static char *responses_special_schema_from_tool(const char *raw) {
     const char *p = raw;
     json_ws(&p);
@@ -955,6 +1202,11 @@ done:
 
 
 
+/// @brief One function of a Responses namespace item as a flat schema named namespace + name.
+/// @param raw the function entry's JSON
+/// @param tool_namespace the namespace's name (the prompt name's prefix)
+/// @param wire_name receives the client-facing name (malloc'd; may be NULL)
+/// @return malloc'd schema text, or NULL when the entry is not a named function
 static char *responses_namespace_function_schema_from_tool(const char *raw,
                                                            const char *tool_namespace,
                                                            char **wire_name) {
@@ -1028,7 +1280,7 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
                  "{\"type\":\"object\",\"properties\":{}}");
         buf_putc(&b, '}');
         out = buf_take(&b);
-        if (wire_name) *wire_name = xstrdup(name);
+        if (wire_name) *wire_name = server_xstrdup(name);
         buf_free(&prompt_name);
     }
 
@@ -1042,6 +1294,10 @@ done:
 
 
 
+/// @brief Record a parameters schema's "properties" names, in order.
+/// @param json the schema's JSON
+/// @param order receives the property names
+/// @return false on malformed JSON
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1093,6 +1349,12 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
 
 
 
+/// @brief Add the order of one function schema (its name and its parameters' property order).
+/// @param orders the table (NULL: no-op)
+/// @param json the schema's JSON (one with no name adds nothing)
+/// @param tool_namespace its Responses namespace, or NULL
+/// @param wire_name its client-facing name, or NULL
+/// @param responses_tool_search the entry is Responses' tool_search
 static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
                                              const char *json,
                                              const char *tool_namespace,
@@ -1138,8 +1400,8 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         json_ws(&p);
     }
     if (order.name) {
-        if (tool_namespace && tool_namespace[0]) order.tool_namespace = xstrdup(tool_namespace);
-        if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
+        if (tool_namespace && tool_namespace[0]) order.tool_namespace = server_xstrdup(tool_namespace);
+        if (wire_name && wire_name[0]) order.wire_name = server_xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
@@ -1150,12 +1412,20 @@ done:
 
 
 
+/// @brief tool_schema_orders_add_json_wire with no namespace.
+/// @param orders the table
+/// @param json the schema's JSON
 void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
     tool_schema_orders_add_json_wire(orders, json, NULL, NULL, false);
 }
 
 
 
+/// @brief Flatten a Responses namespace item: each of its functions as a schema line and an order.
+/// @param schemas the schema lines are appended here
+/// @param orders the orders are added here
+/// @param raw the namespace item's JSON
+/// @return true when at least one function was appended
 static bool append_responses_namespace_tool_schemas(buf *schemas,
                                                     tool_schema_orders *orders,
                                                     const char *raw) {
@@ -1243,47 +1513,230 @@ done:
 
 
 
+/* The "type" member of one JSON object (a tool entry or a content block),
+ * malloc'd, or NULL when it has none. */
+/// @param raw_tool_json the object's JSON (NULL reads as "")
+/// @return the malloc'd "type" string, or NULL
+static char *anthropic_type_member(const char *raw_tool_json) {
+    const char *p = raw_tool_json ? raw_tool_json : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) break;
+        json_ws(&p);
+        if (*p != ':') { free(key); break; }
+        p++;
+        bool is_type = !strcmp(key, "type");
+        free(key);
+        if (is_type) {
+            char *type = NULL;
+            if (!json_string(&p, &type)) return NULL;
+            return type;
+        }
+        if (!json_skip_value(&p)) break;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+/* The raw JSON text of member `key` of the object `obj` (malloc'd), or NULL when
+ * `obj` is not an object or has no such member. */
+char *json_object_member_raw(const char *obj, const char *key) {
+    const char *p = obj ? obj : "";
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *k = NULL;
+        if (!json_string(&p, &k)) return NULL;
+        json_ws(&p);
+        if (*p != ':') { free(k); return NULL; }
+        p++;
+        const bool hit = !strcmp(k, key);
+        free(k);
+        if (hit) {
+            char *raw = NULL;
+            return json_raw_value(&p, &raw) ? raw : NULL;
+        }
+        if (!json_skip_value(&p)) return NULL;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return NULL;
+}
+
+/* An Anthropic SERVER tool entry: a tool object typed by a versioned
+ * "web_search_YYYYMMDD" string (Claude Code advertises
+ * {"type":"web_search_20250305","name":"web_search",...}).  This server does
+ * not execute Anthropic server tools -- the router upstream owns web search
+ * and injects results into the prompt -- so the entry is recognised only to
+ * be dropped.  Only the "type" member is inspected. */
+bool anthropic_server_tool_entry(const char *raw_tool_json) {
+    char *type = anthropic_type_member(raw_tool_json);
+    bool is_server_tool = type && !strncmp(type, "web_search", strlen("web_search"));
+    free(type);
+    return is_server_tool;
+}
+
+/* An Anthropic tools array may name only client tools (no "type", or
+ * "custom") and web search.  Any other typed entry -- the advisor tool
+ * (advisor_20260301), code execution, memory -- is a server tool nothing here
+ * runs.  It is refused with the Messages API's own wording, "Input tag '<type>'",
+ * which is what Claude Code matches to retry once without that tool and leave
+ * it out for the session; passing it on would let the model call a tool
+ * nobody can execute. */
+/// @param tools_json the tools array's JSON (not an array: true, parse_tools_value refuses it)
+/// @param err receives the Messages-API refusal on false
+/// @param errlen bytes at `err`
+/// @return false when an entry's type is a server tool other than web_search
+bool anthropic_tools_supported(const char *tools_json, char *err, size_t errlen) {
+    const char *p = tools_json ? tools_json : "";
+    json_ws(&p);
+    if (*p != '[') return true;   /* not an array: parse_tools_value refuses it */
+    p++;
+    for (int i = 0;; i++) {
+        json_ws(&p);
+        if (*p == ']' || !*p) return true;
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) return true;
+        char *type = anthropic_type_member(raw);
+        free(raw);
+        bool ok = !type || !strcmp(type, "custom") ||
+                  !strncmp(type, "web_search", strlen("web_search"));
+        if (!ok) {
+            snprintf(err, errlen,
+                     "tools.%d: Input tag '%s' found using 'type' does not match any of "
+                     "the expected tags", i, type);
+        }
+        free(type);
+        if (!ok) return false;
+        json_ws(&p);
+        if (*p == ',') p++;
+    }
+}
+
 /* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
  * the function schema directly as {"name":...,"input_schema":...}. The DS4
  * prompt wants one raw function schema per line, so unwrap OpenAI tools and keep
  * already-direct schemas unchanged. Responses can additionally group tools in a
  * namespace item; those are flattened for DSML prompt rendering while preserving
  * their client-facing name and namespace for response output. */
-bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
-                       bool web_search_enabled, int *web_search_max_uses) {
+/// @brief Append the conversation's rendered tool schema lines (the deferred tools excluded).
+/// @param c the conversation
+/// @param out the buffer
+void conversation_tool_schema_lines(const chat_conversation *c, buf *out) {
+    if (c->tool_schemas && c->tool_schemas[0]) buf_puts(out, c->tool_schemas);
+}
+
+/// @brief Append every DECLARED tool's schema line: the rendered ones, then the deferred ones.
+/// @param c the conversation
+/// @param out the buffer
+void conversation_declared_tool_schema_lines(const chat_conversation *c, buf *out) {
+    conversation_tool_schema_lines(c, out);
+    if (c->deferred_tool_schemas && c->deferred_tool_schemas[0]) {
+        if (out->len) buf_putc(out, '\n');
+        buf_puts(out, c->deferred_tool_schemas);
+    }
+}
+
+char *tool_schema_lines_openai_tools(const char *lines, size_t len, char *err, size_t errlen) {
+    buf out = {0};
+    buf_putc(&out, '[');
+    int n = 0;
+    for (size_t at = 0; at < len;) {
+        const char *nl = (const char *)memchr(lines + at, '\n', len - at);
+        const size_t end = nl ? (size_t)(nl - lines) : len;
+        std::string line(lines + at, end - at);
+        at = end + 1;
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        char *name = json_object_member_raw(line.c_str(), "name");
+        char *desc = json_object_member_raw(line.c_str(), "description");
+        char *params = json_object_member_raw(line.c_str(), "parameters");
+        if (!params) params = json_object_member_raw(line.c_str(), "input_schema");
+        if (!name) {
+            snprintf(err, errlen, "tool %d has no name", n);
+            free(desc);
+            free(params);
+            buf_free(&out);
+            return NULL;
+        }
+        buf_puts(&out, n++ ? ", " : "");
+        buf_puts(&out, "{\"type\": \"function\", \"function\": {\"name\": ");
+        buf_puts(&out, name);
+        if (desc) {
+            buf_puts(&out, ", \"description\": ");
+            buf_puts(&out, desc);
+        }
+        buf_puts(&out, ", \"parameters\": ");
+        buf_puts(&out, params ? params : "{}");
+        buf_puts(&out, "}}");
+        free(name);
+        free(desc);
+        free(params);
+    }
+    buf_putc(&out, ']');
+    return buf_take(&out);
+}
+
+/* L325: the tool entry says defer_loading: true (Anthropic's tool search, Responses' too): declared, loaded later. */
+/// @param raw the tool entry's JSON
+/// @return true when its defer_loading is true
+static bool tool_entry_deferred(const char *raw) {
+    char *v = json_object_member_raw(raw, "defer_loading");
+    const char *vp = v;
+    bool deferred = false;
+    if (vp && !json_bool(&vp, &deferred)) deferred = false;
+    free(v);
+    return deferred;
+}
+
+bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders, char **deferred, char *err,
+                       size_t errlen) {
+    if (deferred) *deferred = NULL;
+    int index = 0;
     json_ws(p);
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') return false;
     (*p)++;
-    buf schemas = {0};
+    buf all_schemas = {0};
+    buf deferred_schemas = {0};
 
     json_ws(p);
     while (**p && **p != ']') {
         char *raw = NULL;
-        int ws_uses = 0;
         if (!json_raw_value(p, &raw)) goto bad;
-        if (web_search_tool_entry(raw, &ws_uses)) {
-            /* Anthropic web_search server tool: with a backend configured it
-             * becomes a synthesized internal tool the SERVER executes; without
-             * one it is dropped entirely so the model never emits a call
-             * nobody can run. */
-            if (web_search_enabled) {
-                append_raw_json_line(&schemas, web_search_schema_line());
-                tool_schema_orders_add_json(orders, web_search_schema_line());
-                if (orders && orders->len > 0)
-                    orders->v[orders->len - 1].server_web_search = true;
-                if (web_search_max_uses) *web_search_max_uses = ws_uses;
-            }
+        const int at = index++;   /* the entry's position in the client's array */
+        if (anthropic_server_tool_entry(raw)) {
+            /* Dropped from the schemas so the model never emits a call nobody
+             * here can run; the router upstream performs web search. */
+            server_log(PULSAR_LOG_TOOL,
+                       "pulsar-server: dropping Anthropic server tool entry %.40s: "
+                       "this server does not execute Anthropic server tools "
+                       "(the router upstream owns web search)", raw);
             free(raw);
             json_ws(p);
             if (**p == ',') (*p)++;
             json_ws(p);
             continue;
         }
-        char *function = openai_function_schema_from_tool(raw);
+        /* L325: a deferred tool's line goes to `deferred` (the tools block never renders it); one write path below */
+        buf &schemas = deferred && tool_entry_deferred(raw) ? deferred_schemas : all_schemas;
+        char *function = NULL;
+        const int fn = openai_function_schema_from_tool(raw, at, &function, err, errlen);
+        if (fn < 0) {
+            free(raw);
+            goto bad;
+        }
         if (function) {
             append_raw_json_line(&schemas, function);
             tool_schema_orders_add_json(orders, function);
@@ -1300,12 +1753,24 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
                  * into the prompt with the CALLER's JSON spelling.  That is
                  * Claude Code's surface.  Canonicalize here for the same
                  * reasons (reference tokenization + warm-bank prefix
-                 * stability), failing OPEN to the verbatim bytes.  Schemas we
-                 * synthesize ourselves (web_search, responses namespaces) are
-                 * already deterministic and need no canonicalization — only
-                 * CLIENT-supplied spelling can vary. */
+                 * stability).  L335: an entry the canonicalizer refuses is
+                 * refused with the request, never forwarded in the client's
+                 * spelling (rule 1).  Schemas we synthesize ourselves
+                 * (responses namespaces) are already deterministic and need no
+                 * canonicalization — only CLIENT-supplied spelling can vary. */
                 char *canon = json_prompt_value(raw);
-                append_raw_json_line(&schemas, canon ? canon : raw);
+                if (!canon) {
+                    char *name = json_object_member_raw(raw, "name");
+                    if (err && errlen)
+                        snprintf(err, errlen, "tools[%d] (tool %.48s): its schema does not canonicalize (a "
+                                 "non-finite number, a bad string escape or nesting past %d)", at,
+                                 name ? name : "without a name", JSON_MAX_NESTING);
+                    free(name);
+                    free(special);
+                    free(raw);
+                    goto bad;
+                }
+                append_raw_json_line(&schemas, canon);
                 tool_schema_orders_add_json(orders, raw);
                 free(canon);
             }
@@ -1319,16 +1784,284 @@ bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders,
     }
     if (**p != ']') goto bad;
     (*p)++;
-    *out = buf_take(&schemas);
+    *out = buf_take(&all_schemas);
+    if (deferred) *deferred = buf_take(&deferred_schemas);
     return true;
 bad:
-    buf_free(&schemas);
+    buf_free(&all_schemas);
+    buf_free(&deferred_schemas);
     return false;
 }
 
 
 
-bool parse_messages(const char **p, chat_msgs *msgs) {
+/* Decode an inline image URL (the chat image_url block, /v1/parse).  Only an inline base64 data:
+ * URL is accepted.  A remote http(s) URL is refused with a clear message: this
+ * server does not fetch remote content, and quietly dropping the image is
+ * exactly the silent-context loss this path exists to prevent.  Returns
+ * malloc'd encoded-file bytes (PNG or JPEG) and sets `*len_out`, or NULL with
+ * `err` set. */
+uint8_t *server_decode_image_data_url(const char *url, size_t *len_out,
+                                      char *err, size_t errlen) {
+    *len_out = 0;
+    if (!url || !url[0]) {
+        snprintf(err, errlen, "the image URL is missing");
+        return NULL;
+    }
+    if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
+        snprintf(err, errlen,
+                 "the image is a remote http(s) URL, but this server does not fetch remote "
+                 "content; send the image inline as a base64 data: URL");
+        return NULL;
+    }
+    static const char prefix[] = "data:";
+    if (strncmp(url, prefix, sizeof(prefix) - 1)) {
+        snprintf(err, errlen, "an image must be an inline base64 data: URL");
+        return NULL;
+    }
+    const char *comma = strchr(url, ',');
+    if (!comma) {
+        snprintf(err, errlen, "malformed image data: URL (no ',' before the payload)");
+        return NULL;
+    }
+    /* `data:[<mediatype>][;base64],<payload>`.  Only base64 images are
+     * supported: a percent-encoded payload would need a second decoder, and the
+     * engine only decodes PNG/JPEG. */
+    const char *semi = NULL;
+    for (const char *q = url + sizeof(prefix) - 1; q < comma; q++) {
+        if (*q == ';') { semi = q; break; }
+    }
+    const char *media_end = semi ? semi : comma;
+    if (media_end != url + sizeof(prefix) - 1 &&
+        strncmp(url + sizeof(prefix) - 1, "image/", 6) != 0) {
+        snprintf(err, errlen, "image data: URL must carry an image/* media type");
+        return NULL;
+    }
+    if (!semi || strncmp(semi, ";base64", 7) != 0) {
+        snprintf(err, errlen, "image data: URL must be base64-encoded");
+        return NULL;
+    }
+    uint8_t *bytes = base64_decode(comma + 1, strlen(comma + 1), len_out);
+    if (!bytes || *len_out == 0) {
+        free(bytes);
+        snprintf(err, errlen, "malformed base64 in the image data: URL");
+        return NULL;
+    }
+    return bytes;
+}
+
+
+
+/* The ONE authority for attaching an inline image to a message: decode the
+ * block's data: URL, take ownership of the encoded file, and write the sentinel
+ * the renderer later expands back into that image at this position.  Both
+ * readers that accept images -- the chat `image_url` block and the Responses
+ * `input_image` block -- call this, so the two surfaces cannot drift on what an
+ * image block means or on how a bad URL is refused.  `err` may be NULL; the
+ * decode messages are then discarded rather than written. */
+/// @param msg the message the image attaches to (NULL: images refused here)
+/// @param url the block's data: URL
+/// @param out the content buffer the placeholder is written to
+/// @param err receives the refusal (may be NULL)
+/// @param errlen bytes at `err`
+/// @return false when images are not accepted here or the URL does not decode
+bool server_add_image_block(chat_msg *msg, const char *url, buf *out,
+                            char *err, size_t errlen) {
+    char local_err[192];
+    if (!err || errlen == 0) {
+        err = local_err;
+        errlen = sizeof local_err;
+    }
+    if (!msg) {
+        snprintf(err, errlen, "images are not accepted in this position");
+        return false;
+    }
+    size_t n = 0;
+    uint8_t *bytes = server_decode_image_data_url(url, &n, err, errlen);
+    if (!bytes) return false;
+    chat_msg_add_image(msg, bytes, n, out->len);
+    buf_puts(out, PULSAR_IMAGE_PLACEHOLDER);
+    return true;
+}
+
+
+
+/* Message content: a plain string, null, or an array of typed blocks.  Unlike
+ * json_content (which extracts any "text" field and drops the rest), this is
+ * the FAIL-CLOSED reader for a chat message's content: a text-like block
+ * contributes its text, an OpenAI image_url block is decoded to raw encoded
+ * bytes attached to `msg` with PULSAR_IMAGE_PLACEHOLDER written into the
+ * content at the block's position, and any other block is refused so the client
+ * gets a 400 instead of an answer built on context the server discarded. */
+/// @param p the cursor; advanced past the value
+/// @param msg the message: content set, images attached
+/// @param err receives the refusal of an unsupported block
+/// @param errlen bytes at `err`
+/// @return false on malformed JSON or a refused block
+static bool parse_chat_content(const char **p, chat_msg *msg, char *err, size_t errlen) {
+    json_ws(p);
+    if (**p == '"') {
+        free(msg->content);
+        return json_string(p, &msg->content);
+    }
+    if (json_lit(p, "null")) {
+        free(msg->content);
+        msg->content = server_xstrdup("");
+        return true;
+    }
+    if (**p != '[') {
+        snprintf(err, errlen, "message content must be a string or an array of content blocks");
+        return false;
+    }
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) goto fail;
+            buf_puts(&b, s);
+            free(s);
+        } else if (**p == '{') {
+            (*p)++;
+            char *type = NULL;
+            char *text = NULL;
+            char *url = NULL;
+            bool image = false;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto block_fail;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto block_fail;
+                }
+                (*p)++;
+                if (!strcmp(key, "type")) {
+                    free(type);
+                    if (!json_string(p, &type)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                    image = !strcmp(type, "image_url");
+                } else if (!strcmp(key, "text")) {
+                    free(text);
+                    json_ws(p);
+                    if (json_lit(p, "null")) {
+                        text = server_xstrdup("");
+                    } else if (!json_string(p, &text)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    /* OpenAI wraps the URL in {"url": ...}; a bare string is
+                     * tolerated so a slightly-off client still lands here. */
+                    free(url);
+                    json_ws(p);
+                    if (**p == '{') {
+                        (*p)++;
+                        json_ws(p);
+                        while (**p && **p != '}') {
+                            char *ik = NULL;
+                            if (!json_string(p, &ik)) {
+                                free(key);
+                                goto block_fail;
+                            }
+                            json_ws(p);
+                            if (**p != ':') {
+                                free(ik);
+                                free(key);
+                                goto block_fail;
+                            }
+                            (*p)++;
+                            if (!strcmp(ik, "url")) {
+                                free(url);
+                                if (!json_string(p, &url)) {
+                                    free(ik);
+                                    free(key);
+                                    goto block_fail;
+                                }
+                            } else if (!json_skip_value(p)) {
+                                free(ik);
+                                free(key);
+                                goto block_fail;
+                            }
+                            free(ik);
+                            json_ws(p);
+                            if (**p == ',') (*p)++;
+                            json_ws(p);
+                        }
+                        if (**p != '}') {
+                            free(key);
+                            goto block_fail;
+                        }
+                        (*p)++;
+                    } else if (!json_string(p, &url)) {
+                        free(key);
+                        goto block_fail;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    goto block_fail;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') goto block_fail;
+            (*p)++;
+            if (image) {
+                if (!server_add_image_block(msg, url, &b, err, errlen)) goto block_fail;
+            } else if (text) {
+                buf_puts(&b, text);
+            } else {
+                snprintf(err, errlen,
+                         "unsupported content block type \"%s\"; this server accepts text and image_url blocks",
+                         type ? type : "(missing)");
+                goto block_fail;
+            }
+            free(type);
+            free(text);
+            free(url);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+            continue;
+block_fail:
+            free(type);
+            free(text);
+            free(url);
+            goto fail;
+        } else {
+            snprintf(err, errlen, "content array elements must be strings or typed blocks");
+            goto fail;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    free(msg->content);
+    msg->content = buf_take(&b);
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
+
+
+/// @brief Read an OpenAI chat "messages" array into `msgs` (role, content, reasoning_content, tool calls and ids).
+/// @param p the cursor; advanced past the array
+/// @param msgs the messages are appended here
+/// @param err receives a refusal's reason ("" for malformed JSON)
+/// @param errlen bytes at `err`
+/// @return false on malformed JSON or a refused message
+bool parse_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -1355,8 +2088,10 @@ bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
+                chat_msg_clear_images(&msg);
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                msg.content = NULL;
+                if (!parse_chat_content(p, &msg, err, errlen)) {
                     free(key);
                     goto fail;
                 }
@@ -1391,8 +2126,8 @@ bool parse_messages(const char **p, chat_msgs *msgs) {
         }
         if (**p != '}') goto fail;
         (*p)++;
-        if (!msg.role) msg.role = xstrdup("user");
-        if (!msg.content) msg.content = xstrdup("");
+        if (!msg.role) msg.role = server_xstrdup("user");
+        if (!msg.content) msg.content = server_xstrdup("");
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -1410,10 +2145,13 @@ fail:
 
 
 
-void append_tool_result_text(buf *b, const char *s);
 
 
 
+/// @brief Append a block's text (NULL or empty: nothing).
+/// @param dst the buffer
+/// @param text the text
+/// @return true
 static bool append_anthropic_block_content(buf *dst, const char *text) {
     if (!text || !text[0]) return true;
     buf_puts(dst, text);
@@ -1423,14 +2161,123 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
 
 
 /* Anthropic content is block-structured, while the engine consumes one compact
- * chat_msg per role.  Parsing collapses text/thinking into strings, converts
- * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
- * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role,
-                                          chat_msg *msg, chat_msgs *msgs) {
-    (void)role;
+ * chat_msg per part.  Parsing collapses text/thinking into strings, converts
+ * assistant tool_use blocks to tool_calls, reads each tool_result block into a
+ * part of its own (role "tool", its id, its text and images -- L267: where a
+ * result sits in the prompt is the family template's, see
+ * anthropic_fold_tool_results), and decodes an
+ * image block's inline base64 into an attached encoded image file with
+ * PULSAR_IMAGE_PLACEHOLDER written into the content at the block's position --
+ * the same contract, and the same refusal wording, as the OpenAI image_url
+ * reader.  Three more types are handled: a document is inlined when it is
+ * text and otherwise shown as a notice, a tool_reference names the tool, and
+ * redacted_thinking is dropped.  A block type this parser does
+ * not know is refused: silently dropping one is how an image request used to
+ * answer as if no image were sent. */
+static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat_msg *single,
+                                          char *err, size_t errlen);
+
+/* A tool_result's content -- a string, or an array of blocks -- read into its
+ * part.  Each block is read by the same parser as a message's blocks, so a
+ * document, tool_reference or unknown type is handled identically wherever it
+ * appears; an IMAGE block is attached to the part, its placeholder at the
+ * block's position in the result's text (L261: Claude Code's Read and
+ * screenshot tools return images this way).  The text is the client's own:
+ * escaping and wrapping it is the family template's (L267). */
+/// @param part the tool result's part: content set, images attached
+/// @param content_raw the result's "content" JSON (NULL: empty)
+/// @param err receives a refusal's reason
+/// @param errlen bytes at `err`
+/// @return false on malformed JSON or a refused block
+static bool anthropic_tool_result_read(chat_msg *part, const char *content_raw, char *err, size_t errlen) {
+    buf out = {0};
+    const char *p = content_raw ? content_raw : "";
+    json_ws(&p);
+    if (*p != '[') {
+        char *whole = NULL;
+        if (content_raw && !json_content(&p, &whole)) { free(whole); return false; }
+        buf_puts(&out, whole ? whole : "");
+        free(whole);
+    } else {
+        p++;
+        for (;;) {
+            json_ws(&p);
+            if (*p == ']') break;
+            if (*p == '"') {
+                char *s = NULL;
+                if (!json_string(&p, &s)) goto fail;
+                buf_puts(&out, s);
+                free(s);
+            } else {
+                char *raw = NULL;
+                if (!json_raw_value(&p, &raw)) goto fail;
+                char *type = anthropic_type_member(raw);
+                const bool image = type && !strcmp(type, "image");
+                free(type);
+                const char *rp = raw;
+                if (image) {
+                    /* the block parser attaches the image and writes its
+                     * placeholder at this position */
+                    free(part->content);
+                    part->content = buf_take(&out);
+                    const bool ok = parse_anthropic_content_block(&rp, NULL, part, err, errlen);
+                    free(raw);
+                    if (!ok) return false;
+                    buf_puts(&out, part->content ? part->content : "");
+                } else {
+                    chat_msg inner = {0};
+                    const bool ok = parse_anthropic_content_block(&rp, NULL, &inner, err, errlen);
+                    /* L325: a tool_reference's position moves with the text it sits in */
+                    for (int k = 0; ok && k < inner.tool_refs_len; k++)
+                        chat_msg_add_tool_ref(part, out.len + inner.tool_ref_off[k], inner.tool_ref_name[k]);
+                    if (ok && inner.content) buf_puts(&out, inner.content);
+                    chat_msg_free(&inner);
+                    free(raw);
+                    if (!ok) goto fail;
+                }
+            }
+            json_ws(&p);
+            if (*p == ',') p++;
+        }
+    }
+    free(part->content);
+    part->content = buf_take(&out);
+    if (!part->content) part->content = server_xstrdup("");
+    return true;
+fail:
+    buf_free(&out);
+    return false;
+}
+
+/* The part a message's next text, image or tool_use block goes into: the last
+ * one, unless that is a tool result (then a new part continues the message). */
+/// @param parts the message's parts
+/// @return the part to write into (owned by `parts`; valid until the next push)
+static chat_msg *anthropic_text_part(chat_msgs *parts) {
+    if (parts->len == 0 || (parts->v[parts->len - 1].role && !strcmp(parts->v[parts->len - 1].role, "tool"))) {
+        chat_msg m = {0};
+        m.anthropic_continues = parts->len > 0;
+        chat_msgs_push(parts, m);
+    }
+    return &parts->v[parts->len - 1];
+}
+
+/* `parts` is the message being read (NULL inside a tool_result's content, where
+ * `single` -- that result's part -- takes every block). */
+/// @brief Read one Anthropic content block (text, thinking, image, document, tool_use, tool_result,
+/// tool_reference, ...) into the message's parts.
+/// @param p the cursor, at the block's '{'; advanced past it
+/// @param parts the message being read (NULL inside a tool_result)
+/// @param single the tool_result's part when `parts` is NULL
+/// @param err receives a refusal's reason
+/// @param errlen bytes at `err`
+/// @return false on malformed JSON or a refused block
+static bool parse_anthropic_content_block(const char **p, chat_msgs *parts, chat_msg *single,
+                                          char *err, size_t errlen) {
     if (**p != '{') return false;
     (*p)++;
+    bool tool_result = false;   /* the block's classification, after it is read */
+    chat_msg *msg = single;     /* and the part it goes into */
     char *type = NULL;
     char *text = NULL;
     char *thinking = NULL;
@@ -1438,6 +2285,11 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
     char *name = NULL;
     char *input = NULL;
     char *content_raw = NULL;
+    char *source_type = NULL;
+    char *media_type = NULL;
+    char *data = NULL;
+    char *url = NULL;
+    char *tool_name = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1479,6 +2331,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "tool_name")) {
+            free(tool_name);
+            if (!json_string(p, &tool_name)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "input")) {
             free(input);
             if (!json_raw_value(p, &input)) {
@@ -1487,13 +2345,81 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
             }
         } else if (!strcmp(key, "content")) {
             /* Captured raw: "type" may not have been seen yet, and only the
-             * final classification knows whether this is collapsible text
-             * blocks (tool_result) or web_search_result objects. */
+             * final classification (tool_result) knows how to collapse the
+             * text blocks. */
             free(content_raw);
             if (!json_raw_value(p, &content_raw)) {
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "source")) {
+            /* An image block's payload: {"type":"base64","media_type":...,
+             * "data":...} (or {"type":"url","url":...}).  Captured into locals
+             * and classified after the whole block is read, because "type"
+             * (the block's) may not have been seen yet. */
+            json_ws(p);
+            if (**p != '{') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *sk = NULL;
+                if (!json_string(p, &sk)) {
+                    free(key);
+                    goto bad;
+                }
+                json_ws(p);
+                if (**p != ':') {
+                    free(sk);
+                    free(key);
+                    goto bad;
+                }
+                (*p)++;
+                if (!strcmp(sk, "type")) {
+                    free(source_type);
+                    if (!json_string(p, &source_type)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "media_type")) {
+                    free(media_type);
+                    if (!json_string(p, &media_type)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "data")) {
+                    free(data);
+                    if (!json_string(p, &data)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!strcmp(sk, "url")) {
+                    free(url);
+                    if (!json_string(p, &url)) {
+                        free(sk);
+                        free(key);
+                        goto bad;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(sk);
+                    free(key);
+                    goto bad;
+                }
+                free(sk);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') {
+                free(key);
+                goto bad;
+            }
+            (*p)++;
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
@@ -1511,56 +2437,74 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
      * caller may not know the enclosing role yet while parsing content blocks.
      * Classify protocol blocks by their own "type" field; later rendering and
      * validation use the final message role. */
-    if (type && (!strcmp(type, "tool_use") || !strcmp(type, "server_tool_use"))) {
-        /* server_tool_use replays a call the SERVER executed (web_search):
-         * structurally identical to tool_use, and carrying the remembered id
-         * lets exact-DSML tool memory restore the sampled bytes. */
-        tool_call tc = {0};
-        tc.id = id ? xstrdup(id) : NULL;
-        tc.name = name ? xstrdup(name) : xstrdup("");
-        tc.arguments = input ? xstrdup(input) : xstrdup("{}");
-        tool_calls_push(&msg->calls, tc);
-    } else if (type && !strcmp(type, "tool_result")) {
-        char *tool_result = NULL;
-        const char *cp = content_raw ? content_raw : "";
-        if (content_raw && !json_content(&cp, &tool_result)) {
-            free(tool_result);
+    tool_result = type && !strcmp(type, "tool_result");
+    msg = parts && !tool_result ? anthropic_text_part(parts) : single;
+    if (tool_result) {
+        if (!parts) {
+            snprintf(err, errlen, "a tool_result block cannot sit inside another tool_result");
             goto bad;
         }
-        chat_msg_add_tool_call_id(msg, id);
+        chat_msg part = {0};
+        part.role = server_xstrdup("tool");
+        part.anthropic_continues = parts->len > 0;
+        chat_msg_add_tool_call_id(&part, id);
+        if (!anthropic_tool_result_read(&part, content_raw, err, errlen)) {
+            chat_msg_free(&part);
+            goto bad;
+        }
+        chat_msgs_push(parts, part);
+    } else if (type && !strcmp(type, "tool_use")) {
+        tool_call tc = {0};
+        tc.id = id ? server_xstrdup(id) : NULL;
+        tc.name = name ? server_xstrdup(name) : server_xstrdup("");
+        tc.arguments = input ? server_xstrdup(input) : server_xstrdup("{}");
+        tool_calls_push(&msg->calls, tc);
+    } else if (type && !strcmp(type, "image")) {
+        if (!source_type) {
+            snprintf(err, errlen, "image block has no source.type");
+            goto bad;
+        }
+        if (!strcmp(source_type, "url")) {
+            snprintf(err, errlen,
+                     "image source is a remote URL, but this server does not fetch remote content; "
+                     "send the image inline as base64");
+            goto bad;
+        }
+        if (strcmp(source_type, "base64")) {
+            snprintf(err, errlen,
+                     "unsupported image source.type \"%s\"; this server accepts base64",
+                     source_type);
+            goto bad;
+        }
+        /* The engine decodes PNG and JPEG only (pulsar_decode_image), so a
+         * media_type it cannot decode is refused here rather than handed over
+         * to fail deeper. */
+        if (!media_type ||
+            (strcmp(media_type, "image/png") && strcmp(media_type, "image/jpeg"))) {
+            snprintf(err, errlen,
+                     "unsupported image media_type \"%s\"; this server decodes image/png and image/jpeg",
+                     media_type ? media_type : "(missing)");
+            goto bad;
+        }
+        if (!data || !data[0]) {
+            snprintf(err, errlen, "image source has no base64 data");
+            goto bad;
+        }
+        size_t n = 0;
+        uint8_t *bytes = base64_decode(data, strlen(data), &n);
+        if (!bytes || n == 0) {
+            free(bytes);
+            snprintf(err, errlen, "malformed base64 in the image source data");
+            goto bad;
+        }
+        const size_t ph_off = msg->content ? strlen(msg->content) : 0;
+        chat_msg_add_image(msg, bytes, n, ph_off);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
-        buf_puts(&b, "<tool_result>");
-        append_tool_result_text(&b, tool_result);
-        buf_puts(&b, "</tool_result>");
+        buf_puts(&b, PULSAR_IMAGE_PLACEHOLDER);
         free(msg->content);
         msg->content = buf_take(&b);
-        free(tool_result);
-    } else if (type && !strcmp(type, "web_search_tool_result")) {
-        /* An assistant message that searched maps to THREE template turns:
-         * the call turn (DSML + EOS), the result turn (<｜User｜><tool_result>)
-         * and the continuation turn.  Split here so rendering reproduces the
-         * live transcript byte-for-byte: the result text is rebuilt from the
-         * echoed encrypted_content chunks (web_search.cpp owns that format). */
-        chat_msg call_turn = *msg;
-        memset(msg, 0, sizeof(*msg));
-        if (!call_turn.role) call_turn.role = xstrdup("assistant");
-        chat_msgs_push(msgs, call_turn);
-
-        char *rebuilt = web_search_rebuild_result_text(content_raw);
-        chat_msg result_turn = {0};
-        result_turn.role = xstrdup("user");
-        buf rb = {0};
-        buf_puts(&rb, "<tool_result>");
-        append_tool_result_text(&rb, rebuilt);
-        buf_puts(&rb, "</tool_result>");
-        result_turn.content = buf_take(&rb);
-        chat_msg_add_tool_call_id(&result_turn, id);
-        chat_msgs_push(msgs, result_turn);
-        free(rebuilt);
-
-        msg->role = xstrdup("assistant");
-    } else {
+    } else if (type && (!strcmp(type, "text") || !strcmp(type, "thinking"))) {
         if (text) {
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
@@ -1575,6 +2519,43 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
             free(msg->reasoning);
             msg->reasoning = buf_take(&b);
         }
+    } else if (type && !strcmp(type, "document")) {
+        /* A text document is read like text.  Anything else (base64 PDF, a
+         * URL, nested content) cannot be read here; a notice keeps the
+         * conversation going and tells the model something was attached,
+         * where a refusal would fail every later turn that resends it. */
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        if (source_type && !strcmp(source_type, "text") && data) {
+            append_anthropic_block_content(&b, data);
+        } else {
+            buf_printf(&b, "[document omitted: %s is not supported by this server]",
+                       media_type ? media_type : source_type ? source_type : "this document");
+        }
+        free(msg->content);
+        msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "tool_reference")) {
+        /* Tool search loaded this tool.  L325: only its position is read here (the tools array may follow the
+         * messages); chat_expand_tool_refs writes the definition, or a notice, there before the family renders. */
+        if (!msg->content) msg->content = server_xstrdup("");
+        chat_msg_add_tool_ref(msg, strlen(msg->content), tool_name ? tool_name : "(unnamed)");
+    } else if (type && !strcmp(type, "redacted_thinking")) {
+        /* Encrypted reasoning only Anthropic's API can read.  It arrives only
+         * in history produced there (a resumed session); nothing here can use
+         * it, and refusing would fail every later turn of that session. */
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: dropping redacted_thinking blocks: encrypted Anthropic "
+                       "reasoning this server cannot read (logged once per process)");
+        }
+    } else {
+        snprintf(err, errlen,
+                 "unsupported content block type \"%s\"; this server accepts text, thinking, "
+                 "redacted_thinking, tool_use, tool_result, tool_reference, document and "
+                 "image blocks",
+                 type ? type : "(missing)");
+        goto bad;
     }
 
     free(type);
@@ -1584,6 +2565,11 @@ static bool parse_anthropic_content_block(const char **p, const char *role,
     free(name);
     free(input);
     free(content_raw);
+    free(source_type);
+    free(media_type);
+    free(data);
+    free(url);
+    free(tool_name);
     return true;
 bad:
     free(type);
@@ -1593,18 +2579,26 @@ bad:
     free(name);
     free(input);
     free(content_raw);
+    free(source_type);
+    free(media_type);
+    free(data);
+    free(url);
+    free(tool_name);
     return false;
 }
 
 
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg, chat_msgs *msgs) {
+/* One message's content into `parts` (anthropic_text_part, tool results). */
+/// @param p the cursor; advanced past the value (a string, null, or an array of strings and blocks)
+/// @param parts the message's parts
+/// @param err receives a refusal's reason
+/// @param errlen bytes at `err`
+/// @return false on malformed JSON or a refused block
+static bool parse_anthropic_content(const char **p, chat_msgs *parts, char *err, size_t errlen) {
     json_ws(p);
-    if (**p == '"') return json_string(p, &msg->content);
-    if (json_lit(p, "null")) {
-        msg->content = xstrdup("");
-        return true;
-    }
+    if (**p == '"') return json_string(p, &anthropic_text_part(parts)->content);
+    if (json_lit(p, "null")) return true;
     if (**p != '[') return json_skip_value(p);
     (*p)++;
     json_ws(p);
@@ -1612,6 +2606,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, chat_msgs *ms
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) return false;
+            chat_msg *msg = anthropic_text_part(parts);
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
             buf_puts(&b, s);
@@ -1619,7 +2614,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, chat_msgs *ms
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg, msgs)) return false;
+            if (!parse_anthropic_content_block(p, parts, NULL, err, errlen)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -1629,22 +2624,56 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, chat_msgs *ms
     }
     if (**p != ']') return false;
     (*p)++;
-    if (!msg->content) msg->content = xstrdup("");
     return true;
 }
 
 
 
-bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+/* L249 D: per-turn effort.  A role:"system" entry may carry output_config.effort (the effort-only form has empty
+ * content).  Placed directly after a user turn with new input it sets the level of the reply to that turn; anywhere
+ * else it takes effect from the next user turn with new input (a user turn of tool_result blocks only is not new
+ * input), and the level holds until a later entry changes it.  So the reply this request asks for runs at the
+ * effort of the last entry that took effect, and the request-level output_config.effort when none did. */
+/// Whether a user message's parts hold new input (anything but tool results).
+/// @param parts  the message's parts (a tool result's part has role "tool")
+/// @return true when a text, image or document part is not empty
+static bool anthropic_parts_new_input(const chat_msgs *parts) {
+    for (int i = 0; i < parts->len; i++) {
+        const chat_msg *m = &parts->v[i];
+        if (m->role && !strcmp(m->role, "tool")) continue;
+        if ((m->content && m->content[0]) || m->images_len > 0 || m->tool_refs_len > 0) return true;
+    }
+    return false;
+}
+
+/// @brief Read an Anthropic "messages" array: each message becomes one or more parts (text, tool results).
+/// Empty role:"system" entries (the per-turn effort form) are not kept: they carry no text to render.
+/// @param p the cursor; advanced past the array
+/// @param msgs the parts are appended here
+/// @param err receives a refusal's reason ("" for malformed JSON)
+/// @param errlen bytes at `err`
+/// @param turn_effort receives the output_config (raw JSON, malloc'd) of the system entry whose effort is in
+///        effect for the reply, NULL when none is (NULL: not read)
+/// @return false on malformed JSON or a refused block
+bool parse_anthropic_messages(const char **p, chat_msgs *msgs, char *err, size_t errlen, char **turn_effort) {
+    if (err && errlen) err[0] = '\0';
+    if (turn_effort) *turn_effort = NULL;
+    char *pending_effort = NULL;      /* an entry waiting for the next user turn with new input */
+    bool after_new_input = false;     /* the last non-system message was a user turn with new input */
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
 
     json_ws(p);
     while (**p && **p != ']') {
-        if (**p != '{') return false;
+        if (**p != '{') goto fail_effort;
         (*p)++;
-        chat_msg msg = {0};
+        char *role;
+        role = NULL;
+        char *output_config;
+        output_config = NULL;
+        chat_msgs parts;
+        parts = {0};
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -1656,15 +2685,21 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             }
             (*p)++;
             if (!strcmp(key, "role")) {
-                free(msg.role);
-                if (!json_string(p, &msg.role)) {
+                free(role);
+                if (!json_string(p, &role)) {
                     free(key);
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(msg.content);
-                msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg, msgs)) {
+                chat_msgs_free(&parts);
+                if (!parse_anthropic_content(p, &parts, err, errlen)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "output_config")) {
+                free(output_config);
+                output_config = NULL;
+                if (!json_raw_value(p, &output_config)) {
                     free(key);
                     goto fail;
                 }
@@ -1679,31 +2714,87 @@ bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         }
         if (**p != '}') goto fail;
         (*p)++;
-        if (!msg.role) msg.role = xstrdup("user");
-        if (!msg.content) msg.content = xstrdup("");
-        chat_msgs_push(msgs, msg);
-        memset(&msg, 0, sizeof(msg));
+        /* The role may follow the content (JSON member order is not meaningful),
+         * so the parts take it now; a tool result's part keeps "tool". */
+        if (parts.len == 0) anthropic_text_part(&parts);
+        {
+            const bool system = role && !strcmp(role, "system");
+            const bool user = !role || !strcmp(role, "user");
+            if (system) {
+                /* an entry's effort, if it has one: in effect now, or from the next user turn with new input */
+                char *effort = output_config ? json_object_member_raw(output_config, "effort") : NULL;
+                if (effort) {
+                    char **slot = after_new_input ? turn_effort : &pending_effort;
+                    if (slot) {
+                        free(*slot);
+                        *slot = output_config;
+                        output_config = NULL;
+                    }
+                }
+                free(effort);
+            } else if (user && anthropic_parts_new_input(&parts)) {
+                after_new_input = true;
+                if (pending_effort && turn_effort) {
+                    free(*turn_effort);
+                    *turn_effort = pending_effort;
+                    pending_effort = NULL;
+                }
+            } else {
+                after_new_input = false;
+            }
+            /* an empty system entry has nothing to render (the effort-only form): dropped, so a request without
+             * one renders exactly as before */
+            const chat_msg *only = parts.len == 1 ? &parts.v[0] : NULL;
+            if (system && only && (!only->content || !only->content[0]) && only->images_len == 0 &&
+                only->tool_refs_len == 0) {
+                chat_msgs_free(&parts);
+            }
+        }
+        for (int i = 0; i < parts.len; i++) {
+            chat_msg *m = &parts.v[i];
+            if (!m->role) m->role = server_xstrdup(role ? role : "user");
+            if (!m->content) m->content = server_xstrdup("");
+            chat_msgs_push(msgs, *m);
+        }
+        free(parts.v);
+        free(role);
+        free(output_config);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
         continue;
 fail:
-        chat_msg_free(&msg);
-        return false;
+        chat_msgs_free(&parts);
+        free(role);
+        free(output_config);
+        goto fail_effort;
     }
-    if (**p != ']') return false;
+    if (**p != ']') goto fail_effort;
     (*p)++;
+    free(pending_effort);
     return true;
+fail_effort:
+    free(pending_effort);
+    if (turn_effort) {
+        free(*turn_effort);
+        *turn_effort = NULL;
+    }
+    return false;
 }
 
 
 
+/// @param s a system text part
+/// @return true for Claude Code's private "x-anthropic-" parts, which are not rendered
 static bool anthropic_system_part_is_private(const char *s) {
     return s && !strncmp(s, "x-anthropic-", 12);
 }
 
 
 
+/// @brief Append a system text part on its own line (empty and private parts dropped).
+/// @param b the buffer
+/// @param s the part's text
 static void append_anthropic_system_part(buf *b, const char *s) {
     if (!s || !s[0] || anthropic_system_part_is_private(s)) return;
     if (b->len && b->ptr[b->len - 1] != '\n') buf_putc(b, '\n');
@@ -1712,6 +2803,10 @@ static void append_anthropic_system_part(buf *b, const char *s) {
 
 
 
+/// @brief Read one system block object; its "text" is appended.
+/// @param p the cursor, at the '{'; advanced past it
+/// @param out the system text buffer
+/// @return false on malformed JSON
 static bool parse_anthropic_system_object(const char **p, buf *out) {
     if (**p != '{') return false;
     (*p)++;
@@ -1749,7 +2844,13 @@ static bool parse_anthropic_system_object(const char **p, buf *out) {
 
 
 
+/// @brief Read Anthropic's "system": a string, null, or an array of strings and text blocks, joined by newlines
+/// (other values read as "").
+/// @param p the cursor; advanced past the value
+/// @param out receives the malloc'd text (NULL until it succeeds)
+/// @return false on malformed JSON
 bool parse_anthropic_system(const char **p, char **out) {
+    *out = NULL;  /* reparse-in-place double-free guard, see json_string_n */
     json_ws(p);
     buf b = {0};
     if (**p == '"') {
@@ -1761,12 +2862,12 @@ bool parse_anthropic_system(const char **p, char **out) {
         return true;
     }
     if (json_lit(p, "null")) {
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     if (**p != '[') {
         if (!json_skip_value(p)) return false;
-        *out = xstrdup("");
+        *out = server_xstrdup("");
         return true;
     }
     (*p)++;

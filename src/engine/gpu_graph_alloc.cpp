@@ -1,19 +1,20 @@
+/** @file gpu_graph_alloc.cpp
+ *  @brief DeepSeek graph allocation helpers: raw-ring spans per batch and env flags. */
 #include "pulsar_engine_internal.h"
 
 
 
-bool gpu_graph_alloc(
-        pulsar_gpu_graph *g,
-        const pulsar_weights     *weights,
-        const pulsar_layer_weights *layer) {
-    return gpu_graph_alloc_raw_cap(g, weights, layer, PULSAR_N_SWA, PULSAR_N_SWA, 1, false);
-}
 
 
 
 
 
 
+/// The raw-window rows a batch attends: its own plus the sliding window, capped by the positions so far and raw_cap.
+/// @param g the graph
+/// @param pos0 the batch's first position
+/// @param n_tokens rows
+/// @return rows (0 with no raw ring or no rows)
 uint32_t gpu_graph_raw_span_for_batch(
         const pulsar_gpu_graph *g,
         uint32_t               pos0,
@@ -34,6 +35,10 @@ uint32_t gpu_graph_raw_span_for_batch(
 
 
 
+/// @param g the graph
+/// @param last_pos the span's last position
+/// @param n_raw its raw rows
+/// @return the ring row of the span's first raw position
 uint32_t gpu_graph_raw_start_for_span(
         const pulsar_gpu_graph *g,
         uint32_t               last_pos,
@@ -45,40 +50,6 @@ uint32_t gpu_graph_raw_start_for_span(
 
 
 
-uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
-    (void)g;
-    static int parsed = -1;
-    static uint32_t cached = 0;
-    if (parsed < 0) {
-        parsed = 0;
-        const char *env = getenv("PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD");
-        if (env && env[0]) {
-            char *end = NULL;
-            unsigned long v = strtoul(env, &end, 10);
-            while (end && isspace((unsigned char)*end)) end++;
-            if (end != env && end && *end == '\0' &&
-                (v == 64ul || v == 128ul || v == 256ul || v == 512ul ||
-                 v == 1024ul || v == 2048ul || v == 4096ul)) {
-                cached = (uint32_t)v;
-                parsed = 1;
-            } else {
-                fprintf(stderr,
-                        "pulsar: invalid PULSAR_CUDA_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
-                        "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
-                        env);
-            }
-        }
-    }
-    if (parsed > 0) return cached;
-
-    /* Keep dense attention longer than the legacy 512-row window by default.
-     * Around the 2K frontier the sparse path's score/top-k setup dominates
-     * the smaller attention scan, while larger contexts benefit from sparse
-     * indexed attention.  This threshold changes only the implementation used
-     * to consume the compressed rows; it must not lower the 512-row indexer
-     * selection defined by PULSAR_N_INDEXER_TOP_K. */
-    return 1024u;
-}
 
 
 
@@ -86,11 +57,16 @@ uint32_t gpu_graph_decode_indexer_sparse_threshold(const pulsar_gpu_graph *g) {
  * GPU Decode Release Helpers and Reference Fallbacks.
  * =========================================================================
  *
- * The normal generation path uses the fused helpers below.  The older unfused
- * kernels remain available as diagnostic reference paths selected only by the
- * PULSAR_CUDA_DISABLE_*_FUSION environment switches.
+ * The generation path uses the fused helpers below.  (The unfused reference
+ * arms and their PULSAR_CUDA_DISABLE_*_FUSION switches were deleted in the
+ * 133->108 flag purge -- an opt-out with no real caller gets deleted; this
+ * header said otherwise until L106 K4.)
  */
 
+/// An environment flag, read once into *cache: set, non-empty and not "0".
+/// @param name the variable
+/// @param cache the caller's cache (-1 = unread)
+/// @return the flag
 bool gpu_graph_env_flag(const char *name, int *cache) {
     if (*cache == -1) {
         const char *env = getenv(name);

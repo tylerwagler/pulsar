@@ -1,0 +1,1170 @@
+/* QWEN S4 GATE (L251): the Qwen3.8-Flash-Next router, MoE block, Gated Residual
+ * and PLE injection -- the production objects (src/cuda/pulsar_cuda_qwen_*.o,
+ * the EXL3 arms, the MMQ drivers) against the double host references in
+ * tests/qwen_ref.h.  Model-free: random weights at the real shapes, activations
+ * with heavy tails and outlier channels, the A8 encodings where the device
+ * encodes.
+ *
+ *   A. router: logits vs double; the top-10 decision from the device's logits
+ *      (set, order, bf16 weights); a crafted TIE at the top-10 boundary must go to
+ *      the lower expert id; a NaN row routes to 0..9 with NaN weights; T = 1 and
+ *      T = 8 rows bit-identical to the T = 37 run's; refusal of a foreign shape.
+ *   B. GR: the read (block input bf16 row, its E4M3 slot, inj) and the mixer vs
+ *      double; the write; T = 1 bit-identical to the batch's row; mutations of
+ *      W_down and W_up move the output.
+ *   C. PLE: three sequences in one batch over two batches (the conv state carried
+ *      between them) vs double; the second batch re-run as single-token steps is
+ *      bit-identical (streams AND state) -- decode == prefill; a mutated conv tap
+ *      moves the output.
+ *   D. MoE block over 512 experts (an aliased pool of 12 distinct slices per
+ *      projection, gate/up K=4, down K=5; shared K=5/5/4) vs double with the
+ *      device's routing; T = 1 bit-identical; the non-finite flag stays clear.
+ *   I. L288 the head's tensor-core arm (an mxfp8_lt head is the front door's mxfp8_lt rows arm,
+ *      pulsar_qwen_mxfp8_linear_launch at decode widths; qwen-exl3-head): 1 .. 16 rows vs the same quantized
+ *      operands in double; every row of a call BIT-IDENTICAL to that row alone; a null activation refused.
+ *   H. L289 draft pick: the device's first maximum and f32 softmax probability of a draft-head row
+ *      (65812 logits) BIT-EXACT vs the host scan it replaced, over random rows, ties, an all-but-one
+ *      -inf row and a narrow row; a NaN row is flagged; the record is the same bytes run to run.
+ *
+ * usage: ./tests/qwen_s4_gate */
+#include "../src/pulsar_gpu.h"
+#include "qwen_ref.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+using namespace qref;
+
+static int g_fail;
+#define CHECK(c, ...) do { if (!(c)) { printf("  FAIL  "); g_fail = 1; } else printf("  ok    "); \
+                           printf(__VA_ARGS__); printf("\n"); } while (0)
+#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
+    printf("QWEN-S4 FAIL: %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
+
+static uint64_t g_rng = 0x51F15EEDULL;
+static uint32_t rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (uint32_t)(g_rng >> 16); }
+static double rndu(void) { return ((double)rnd() + 0.5) / 4294967296.0; }
+static double rndn(void) { return sqrt(-2.0 * log(rndu())) * cos(6.283185307179586 * rndu()); }
+
+template <typename T> static T *up(const std::vector<T> &v) {
+    T *d = nullptr;
+    CK(cudaMalloc((void **)&d, v.size() * sizeof(T) + 16));
+    CK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return d;
+}
+template <typename T> static std::vector<T> down(const T *d, size_t n) {
+    std::vector<T> v(n);
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
+    return v;
+}
+static void *dalloc(size_t n) { void *p = nullptr; CK(cudaMalloc(&p, n + 16)); CK(cudaMemset(p, 0, n + 16)); return p; }
+
+static std::vector<uint16_t> rnd_bf(size_t n, double scale) {
+    std::vector<uint16_t> v(n);
+    for (auto &b : v) b = to_bf(rndn() * scale);
+    return v;
+}
+/* activations: heavy-tailed rows with a few outlier channels */
+static std::vector<uint16_t> rnd_act(int rows, int n, double scale) {
+    std::vector<double> chan(n);
+    for (auto &c : chan) c = (rnd() % 64 == 0) ? 10.0 : 1.0;
+    std::vector<uint16_t> v((size_t)rows * n);
+    for (int r = 0; r < rows; r++)
+        for (int k = 0; k < n; k++) v[(size_t)r * n + k] = to_bf(rndn() * chan[k] * scale * (1.0 + 0.5 * (r % 3)));
+    return v;
+}
+static linear make_linear(int in, int out, int k2) {
+    linear l; l.in = in; l.out = out; l.k2 = k2;
+    uint64_t trellis = 0, stride = 0;
+    exl3t_layout(in, out, k2, &trellis, &stride);
+    l.bytes.resize(stride);
+    uint16_t *t = (uint16_t *)l.bytes.data();
+    for (uint64_t i = 0; i < trellis / 2; i++) t[i] = (uint16_t)rnd();
+    uint16_t *s = (uint16_t *)(l.bytes.data() + trellis);
+    for (int i = 0; i < in; i++) s[i] = exl3_f32_to_f16((float)((0.5 + rndu()) * 0.025 * ((rnd() & 1) ? 1.0 : -1.0)));
+    for (int i = 0; i < out; i++) s[in + i] = exl3_f32_to_f16((float)((0.75 + 0.5 * rndu()) * ((rnd() & 1) ? 1.0 : -1.0)) * 0.02f);
+    l.dequant();
+    return l;
+}
+static pulsar_rows_linear dev_linear(const linear &l) {
+    /* value-initialised: sf NULL (EXL3) and prompt false (the decode widths' GEMV).  It was `d;` -- prompt was
+     * whatever the stack held, so the shared expert took the prefill GEMM at decode width once a refactor moved
+     * the frame (L272 P4c: every T = 5 row off by ~1e-3, the one-plane GEMM's envelope). */
+    pulsar_rows_linear d{};
+    d.w = up(l.bytes); d.k2 = l.k2; d.in = l.in; d.out = l.out;
+    return d;
+}
+/* |got - want| in bf16 ulps of want (the ulp of the binade of |want|) */
+static double bf_ulps(double got, double want) {
+    const double a = fabs(want);
+    const double ulp = a > 0 ? ldexp(1.0, (int)floor(log2(a)) - 7) : ldexp(1.0, -133);
+    return fabs(got - want) / ulp;
+}
+/* L251 / ac69748f: make_dslot and its dslot wrapper are DELETED, not updated.  They built the A8
+ * slot a consumer would read; this family has no E4M3 activation slot, the MoE reads the bf16 rows
+ * directly, and the reference activation is the bf16 value rather than a decoded E4M3 code. */
+
+/* ======================================================================== */
+static void section_mxfp8_linear(void);   /* defined at the end */
+static void section_head(void);           /* defined at the end */
+
+/* H. L289: the draft head's pick on the device vs the host scan it replaced (the old qwen_mtp_argmax, verbatim:
+ * the first maximum by a strict > scan, and (float)(1.0 / sum exp((double)(row[i] - m))) in index order). */
+static int32_t host_pick(const float *row, int n, float *prob) {
+    int a = 0;
+    for (int i = 1; i < n; i++) if (row[i] > row[a]) a = i;
+    double z = 0.0;
+    const float m = row[a];
+    for (int i = 0; i < n; i++) z += exp((double)(row[i] - m));
+    *prob = (float)(1.0 / z);
+    return a;
+}
+
+static void section_draft_top(void) {
+    printf("H. draft pick (L289): device first-max + f32 confidence vs the host scan\n");
+    const int N = 65812;   /* the served draft head: ids [0, 65536) + the 276 specials */
+    const size_t wsb = pulsar_qwen_draft_top_ws_bytes();
+    float *drow = (float *)dalloc((size_t)N * 4);
+    void *ws = dalloc(wsb);
+    std::vector<float> row(N);
+    int idx_bad = 0, conf_bad = 0, rows = 0;
+    float worst_got = 0, worst_want = 0;
+    auto run = [&](int n, pulsar_qwen_draft_top *rec) {
+        CK(cudaMemcpy(drow, row.data(), (size_t)n * 4, cudaMemcpyHostToDevice));
+        const int rc = pulsar_qwen_draft_top_launch(drow, n, 1, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(rec, ws, sizeof *rec, cudaMemcpyDeviceToHost));
+        return rc;
+    };
+    auto grade = [&](int n) {
+        pulsar_qwen_draft_top rec{};
+        float want = 0;
+        const int a = host_pick(row.data(), n, &want);
+        if (run(n, &rec) != 0 || rec.nan) { idx_bad++; return; }
+        rows++;
+        idx_bad += rec.index != a;
+        if (memcmp(&rec.conf, &want, 4) != 0) { conf_bad++; worst_got = rec.conf; worst_want = want; }
+    };
+    /* logits-like rows: a heavy body, a few strong candidates (the confident and the unsure draft) */
+    for (int r = 0; r < 400; r++) {
+        const double sc = 1.0 + 6.0 * rndu();
+        for (int i = 0; i < N; i++) row[i] = (float)(sc * rndn());
+        const int peaks = 1 + (int)(rnd() % 4);
+        for (int k = 0; k < peaks; k++) row[rnd() % N] = (float)(sc * (3.0 + 4.0 * rndu()));
+        grade(N);
+    }
+    /* ties: the maximum at two and at many places -> the lowest index */
+    for (int r = 0; r < 40; r++) {
+        for (int i = 0; i < N; i++) row[i] = (float)rndn();
+        const float m = 9.5f;
+        for (int k = 0; k < 1 + r % 7; k++) row[rnd() % N] = m;
+        grade(N);
+    }
+    /* one finite logit in a row of -inf (a draft head over a masked vocabulary), and a narrow row */
+    for (int i = 0; i < N; i++) row[i] = -INFINITY;
+    row[N - 3] = 0.25f;
+    grade(N);
+    for (int i = 0; i < 37; i++) row[i] = (float)rndn();
+    grade(37);
+    CHECK(idx_bad == 0 && conf_bad == 0, "%d rows: pick %d differ, confidence %d not bit-exact%s", rows, idx_bad,
+          conf_bad, conf_bad ? " (one shown below)" : "");
+    if (conf_bad) printf("        got %.9g want %.9g\n", (double)worst_got, (double)worst_want);
+    /* run to run: the same record bytes */
+    for (int i = 0; i < N; i++) row[i] = (float)(3.0 * rndn());
+    pulsar_qwen_draft_top r1{}, r2{};
+    run(N, &r1);
+    run(N, &r2);
+    CHECK(memcmp(&r1, &r2, sizeof r1) == 0, "the record is the same bytes run to run");
+    /* L288: one launch over every bank's row of a draft step -- each record the bytes its row gives alone */
+    {
+        const int R = PULSAR_QWEN_DRAFT_TOP_ROWS_MAX;
+        std::vector<float> rows((size_t)R * N);
+        for (int r = 0; r < R; r++) {
+            const double sc = 1.0 + 6.0 * rndu();
+            for (int i = 0; i < N; i++) rows[(size_t)r * N + i] = (float)(sc * rndn());
+            rows[(size_t)r * N + rnd() % N] = (float)(sc * 6.0);
+        }
+        float *drows = (float *)dalloc(rows.size() * 4);
+        CK(cudaMemcpy(drows, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<pulsar_qwen_draft_top> all(R);
+        const int rc = pulsar_qwen_draft_top_launch(drows, N, R, ws, 0);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(all.data(), ws, R * sizeof(pulsar_qwen_draft_top), cudaMemcpyDeviceToHost));
+        int diff = rc != 0;
+        for (int r = 0; r < R; r++) {
+            pulsar_qwen_draft_top one{};
+            std::copy(rows.begin() + (size_t)r * N, rows.begin() + (size_t)(r + 1) * N, row.begin());
+            diff += run(N, &one) != 0 || memcmp(&one, &all[r], sizeof one) != 0;
+        }
+        CHECK(diff == 0, "%d rows in one launch: each record == its row alone (%d differ)", R, diff);
+        cudaFree(drows);
+    }
+    row[12345] = NAN;
+    pulsar_qwen_draft_top rn{};
+    CHECK(run(N, &rn) == 0 && rn.nan != 0, "a NaN in the row is flagged (the caller refuses the draft)");
+    CHECK(pulsar_qwen_draft_top_launch(drow, 0, 1, ws, 0) != 0 && pulsar_qwen_draft_top_launch(nullptr, N, 1, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, 0, ws, 0) != 0 &&
+              pulsar_qwen_draft_top_launch(drow, N, PULSAR_QWEN_DRAFT_TOP_ROWS_MAX + 1, ws, 0) != 0,
+          "no logits / a null row / no rows / too many rows is refused");
+    cudaFree(drow);
+    cudaFree(ws);
+}
+/* L295 F2: the family's router as the engine runs it -- the shared router's two launches with Qwen's declared cfg
+ * (pulsar_qwen_router_cfg), the shared_expert_gate row after the router's; sgate is the one gamma plane. */
+static int qwen_router(const uint16_t *x, const uint16_t *wr, const uint16_t *wsg, int T, int hidden, float *lg,
+                       int32_t *sel, float *w, float *sg, int top_k = TOPK) {
+    const pulsar_router_cfg c = pulsar_qwen_router_cfg(E, top_k);
+    const pulsar_router_layer l{};
+    int rc = pulsar_router_logits_launch(x, T, hidden, wr, c.n_expert, wsg, c.n_shared, false, lg, 0);
+    if (!rc) rc = pulsar_router_select_launch(&c, &l, lg, nullptr, T, sel, w, sg, nullptr, 0);
+    return rc;
+}
+
+static void section_router(void) {
+    printf("A. router (bf16 logits, softmax top-%d of %d, renormalised)\n", TOPK, E);
+    const int T = 37, LP = pulsar_router_logits_ld(E + 1);   /* L336: the logits' pitch */
+    std::vector<uint16_t> x = rnd_act(T, H, 0.6), wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
+    /* the tie: token 0's rows 100..108 dominate, rows 7 and 300 are identical and
+     * rank 10 / 11 -- exactly one of them makes the top-10, and it must be 7 */
+    for (int k = 0; k < H; k++) {
+        const double sgn = bf(x[k]) >= 0 ? 1.0 : -1.0;
+        for (int e = 100; e <= 108; e++) wr[(size_t)e * H + k] = to_bf(0.08 * sgn);
+        wr[(size_t)7 * H + k] = wr[(size_t)300 * H + k] = to_bf(0.05 * sgn);
+    }
+    uint16_t *dx = up(x), *dwr = up(wr), *dwsg = up(wsg);
+    float *lg = (float *)dalloc((size_t)T * LP * 4), *w = (float *)dalloc((size_t)T * TOPK * 4), *sg = (float *)dalloc(T * 4);
+    int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
+    int rc = qwen_router(dx, dwr, dwsg, T, H, lg, sel, w, sg);
+    CHECK(rc == 0, "launch T=%d", T);
+    const auto L = down(lg, (size_t)T * LP);
+    const auto Sel = down(sel, (size_t)T * TOPK);
+    const auto W = down(w, (size_t)T * TOPK);
+    const auto SG = down(sg, T);
+    double lmax = 0;
+    size_t sel_bad = 0, w_bad = 0, sg_bad = 0;
+    std::vector<double> ref(E + 1);
+    for (int t = 0; t < T; t++) {
+        router_logits(&x[(size_t)t * H], wr.data(), wsg.data(), ref.data());
+        double sc = 0;
+        for (int e = 0; e <= E; e++) sc = fmax(sc, fabs(ref[e]));
+        for (int e = 0; e <= E; e++) lmax = fmax(lmax, fabs(L[(size_t)t * LP + e] - ref[e]) / sc);
+        int32_t hs[TOPK];
+        double hw[TOPK], hsg;
+        router_select(&L[(size_t)t * LP], hs, hw, &hsg);
+        for (int k = 0; k < TOPK; k++) {
+            sel_bad += hs[k] != Sel[(size_t)t * TOPK + k];
+            w_bad += bf_ulps(W[(size_t)t * TOPK + k], hw[k]) > 1.0;
+        }
+        sg_bad += bf_ulps(SG[t], hsg) > 1.0;
+    }
+    CHECK(lmax < 1e-5, "logits vs double: max rel %.2e (f32 accumulation order)", lmax);
+    CHECK(sel_bad == 0, "decision from the device's logits: %zu of %d selections differ", sel_bad, T * TOPK);
+    CHECK(w_bad == 0 && sg_bad == 0, "weights / shared gate within 1 bf16 ulp: %zu / %zu outside", w_bad, sg_bad);
+    bool has7 = false, has300 = false, top9 = true;
+    for (int k = 0; k < TOPK; k++) { has7 |= Sel[k] == 7; has300 |= Sel[k] == 300; }
+    for (int e = 100; e <= 108; e++) { bool f = false; for (int k = 0; k < TOPK; k++) f |= Sel[k] == e; top9 &= f; }
+    CHECK(top9 && has7 && !has300 && Sel[9] == 7, "tie at the boundary: rows 7 == 300 at rank 10/11 -> 7 taken, 300 not");
+    /* neutrality */
+    size_t diff = 0;
+    for (int Tn : {1, 8}) {
+        const int t0 = 5;
+        rc = qwen_router(dx + (size_t)t0 * H, dwr, dwsg, Tn, H, lg, sel, w, sg);
+        const auto L2 = down(lg, (size_t)Tn * LP);
+        const auto S2 = down(sel, (size_t)Tn * TOPK);
+        for (int t = 0; t < Tn; t++)   /* the logit rows; the pitch's padding is not written */
+            diff += memcmp(&L2[(size_t)t * LP], &L[(size_t)(t0 + t) * LP], (size_t)(E + 1) * 4) != 0;
+        diff += memcmp(S2.data(), &Sel[(size_t)t0 * TOPK], S2.size() * 4) != 0;
+    }
+    CHECK(diff == 0, "T = 1 and T = 8 rows bit-identical to the T = %d run's (logits and selection)", T);
+    /* NaN row */
+    std::vector<uint16_t> xn(x.begin(), x.begin() + H);
+    xn[17] = 0x7fc0;
+    uint16_t *dxn = up(xn);
+    rc = qwen_router(dxn, dwr, dwsg, 1, H, lg, sel, w, sg);
+    const auto S3 = down(sel, TOPK);
+    const auto W3 = down(w, TOPK);
+    bool nan_ok = rc == 0;
+    for (int k = 0; k < TOPK; k++) nan_ok &= S3[k] == k && std::isnan(W3[k]);
+    CHECK(nan_ok, "a NaN row routes to experts 0..9 with NaN weights (the NaN reaches the output)");
+    CHECK(qwen_router(dx, dwr, dwsg, T, H - 4, lg, sel, w, sg) != 0 && qwen_router(dx, dwr, dwsg, T, H, lg, sel, w, sg, 9) != 0,
+          "a row that is not whole uint4 chunks, and a top-k the router has no instance for, are refused");
+    cudaFree(dx); cudaFree(dwr); cudaFree(dwsg); cudaFree(lg); cudaFree(w); cudaFree(sg); cudaFree(sel); cudaFree(dxn);
+}
+
+/* ======================================================================== */
+struct gr_host {
+    std::vector<uint16_t> norm, inject;
+    mx8 down_w, up_w;
+};
+static gr_host make_gr(void) {
+    gr_host g;
+    g.norm = rnd_bf(HC, 0.1);
+    g.inject = rnd_bf((size_t)S * HC, 0.01);
+    std::vector<double> wd((size_t)R * HC), wu((size_t)HC * R);
+    for (auto &v : wd) v = rndn() * 0.01;
+    for (auto &v : wu) v = rndn() * 0.08;
+    g.down_w.encode(wd, R, HC);
+    g.up_w.encode(wu, HC, R);
+    return g;
+}
+static pulsar_qwen_gr_dev dev_gr(const gr_host &g, bool with_inject) {
+    pulsar_qwen_gr_dev w;
+    w.norm_w = up(g.norm);
+    w.down = {up(g.down_w.q), up(g.down_w.sf), R, HC, false};
+    w.up = {up(g.up_w.q), up(g.up_w.sf), HC, R, false};
+    w.inject = with_inject ? up(g.inject) : nullptr;
+    w.prompt = false;   /* decode rows; the prefill-width runs below set their own */
+    return w;
+}
+
+static void section_gr(void) {
+    printf("B. Gated Residual (read, write, mixer)\n");
+    const int T = 6;
+    gr_host g = make_gr();
+    std::vector<uint16_t> st = rnd_act(T, HC, 0.8);
+    pulsar_qwen_gr_dev w = dev_gr(g, true);
+    uint16_t *dst = up(st), *xo = (uint16_t *)dalloc((size_t)T * H * 2);
+    /* L251 / ac69748f: the read emits bf16 only -- there is no E4M3 slot to allocate, arm or grade. */
+    float *inj = (float *)dalloc((size_t)T * S * 4);
+    const size_t wsb = pulsar_qwen_gr_workspace_bytes(T);
+    void *ws = dalloc(wsb);
+    int rc = pulsar_qwen_gr_read_launch(&w, dst, T, xo, inj, ws, wsb, 0);
+    CHECK(rc == 0, "read launch T=%d", T);
+    const auto X = down(xo, (size_t)T * H);
+    const auto I = down(inj, (size_t)T * S);
+    double worst_ulp = 0, inj_rel = 0;
+    size_t over1 = 0, med_n = 0;
+    double med_sum = 0;
+    for (int t = 0; t < T; t++) {
+        const gr_out o = gr_read(&st[(size_t)t * HC], g.norm.data(), g.down_w, g.up_w, g.inject.data());
+        for (int c = 0; c < H; c++) {
+            const double u = bf_ulps(bf(X[(size_t)t * H + c]), o.x[c]);
+            worst_ulp = fmax(worst_ulp, u);
+            over1 += u > 1.0;
+            med_sum += fabs(bf(X[(size_t)t * H + c]) - o.x[c]) / (fabs(o.x[c]) + 1e-30);
+            med_n++;
+        }
+        for (int j = 0; j < S; j++) inj_rel = fmax(inj_rel, fabs(I[t * S + j] - o.inj[j]) / o.inj[j]);
+    }
+    CHECK(over1 <= (size_t)(T * H) / 5000 && worst_ulp <= 4.0,
+          "block input vs double: %zu of %d beyond 1 bf16 ulp (worst %.2f ulp; the read rounds to bf16 once, "
+          "and the W8 path's internal a is still E4M3 -- see the row)",
+          over1, T * H, worst_ulp);
+    printf("        mean |rel| %.2e\n", med_sum / med_n);
+    CHECK(inj_rel < 1e-5, "inj = 2 sigmoid(W_inj xn / 4): max rel %.2e", inj_rel);
+    /* neutrality */
+    rc = pulsar_qwen_gr_read_launch(&w, dst + (size_t)3 * HC, 1, xo, inj, ws, wsb, 0);
+    const auto X1 = down(xo, H);
+    const auto I1 = down(inj, S);
+    CHECK(rc == 0 && memcmp(X1.data(), &X[(size_t)3 * H], H * 2) == 0 && memcmp(I1.data(), &I[3 * S], S * 4) == 0,
+          "T = 1 row bit-identical to the T = %d batch's row (block input + inj)", T);
+    /* L288 C2: every decode width, across the up's 8-token tile (1..16 rows, one and two tiles): each row's block
+     * input and inj are the bytes it gets launched alone */
+    {
+        const int TW = 16;
+        const std::vector<uint16_t> sw = rnd_act(TW, HC, 0.8);
+        uint16_t *dsw = up(sw), *xw = (uint16_t *)dalloc((size_t)TW * H * 2), *x1 = (uint16_t *)dalloc((size_t)H * 2);
+        float *injw = (float *)dalloc((size_t)TW * S * 4), *inj1 = (float *)dalloc((size_t)S * 4);
+        const size_t wsw = pulsar_qwen_gr_workspace_bytes(TW);
+        void *ww = dalloc(wsw);
+        std::vector<std::vector<uint16_t>> X1(TW);
+        std::vector<std::vector<float>> I1(TW);
+        for (int t = 0; t < TW; t++) {
+            rc |= pulsar_qwen_gr_read_launch(&w, dsw + (size_t)t * HC, 1, x1, inj1, ww, wsw, 0);
+            X1[t] = down(x1, H);
+            I1[t] = down(inj1, S);
+        }
+        int bad = 0;
+        for (const int Tn : {2, 4, 5, 8, 9, 12, 16}) {
+            rc |= pulsar_qwen_gr_read_launch(&w, dsw, Tn, xw, injw, ww, wsw, 0);
+            const auto XW = down(xw, (size_t)Tn * H);
+            const auto IW = down(injw, (size_t)Tn * S);
+            for (int t = 0; t < Tn; t++)
+                bad += memcmp(&XW[(size_t)t * H], X1[t].data(), H * 2) != 0 || memcmp(&IW[(size_t)t * S], I1[t].data(), S * 4) != 0;
+        }
+        CHECK(rc == 0 && bad == 0, "decode widths 2..16 (the up's 8-token tile and two): every row bit-identical to the "
+              "row alone (%d rows differ)", bad);
+        cudaFree(dsw); cudaFree(xw); cudaFree(x1); cudaFree(injw); cudaFree(inj1); cudaFree(ww);
+    }
+    /* prefill widths (a prompt chunk, T > 16): the up runs as the W8A16 GEMM (3'), graded against double like T = 6;
+     * L288 C1: the same rows as decode rows take the decode kernels, 16 rows a call -- the launch blocks them itself,
+     * so a T-row decode call is bit for bit the 16-row calls below */
+    pulsar_qwen_gr_dev wpf = w;
+    wpf.prompt = true;
+    for (const int TP : {37, 300}) {
+        const std::vector<uint16_t> sp = rnd_act(TP, HC, 0.8);
+        uint16_t *dsp = up(sp), *xp = (uint16_t *)dalloc((size_t)TP * H * 2);
+        float *injp = (float *)dalloc((size_t)TP * S * 4);
+        const size_t wsp = pulsar_qwen_gr_workspace_bytes(TP);
+        void *wp = dalloc(wsp);
+        rc = pulsar_qwen_gr_read_launch(&w, dsp, TP, xp, injp, wp, wsp, 0);
+        const auto XW = down(xp, (size_t)TP * H);   /* the whole call as decode rows */
+        rc |= pulsar_qwen_gr_read_launch(&wpf, dsp, TP, xp, injp, wp, wsp, 0);
+        const auto XP = down(xp, (size_t)TP * H);
+        const auto IP = down(injp, (size_t)TP * S);
+        /* the same rows at decode widths (16, 16, 5), graded the same way */
+        std::vector<uint16_t> XD((size_t)TP * H);
+        for (int t0 = 0; t0 < TP; t0 += 16) {
+            const int n = std::min(16, TP - t0);
+            rc |= pulsar_qwen_gr_read_launch(&w, dsp + (size_t)t0 * HC, n, xp, injp, wp, wsp, 0);
+            const auto part = down(xp, (size_t)n * H);
+            std::copy(part.begin(), part.end(), XD.begin() + (size_t)t0 * H);
+        }
+        double wu = 0, ir = 0, wd = 0, wpd = 0;
+        size_t o1 = 0, d1 = 0, pd = 0;
+        for (int t = 0; t < TP; t++) {
+            const gr_out o = gr_read(&sp[(size_t)t * HC], g.norm.data(), g.down_w, g.up_w, g.inject.data());
+            for (int c = 0; c < H; c++) {
+                const double u = bf_ulps(bf(XP[(size_t)t * H + c]), o.x[c]);
+                const double ud = bf_ulps(bf(XD[(size_t)t * H + c]), o.x[c]);
+                wu = fmax(wu, u);
+                o1 += u > 1.0;
+                wd = fmax(wd, ud);
+                d1 += ud > 1.0;
+                pd += XP[(size_t)t * H + c] != XD[(size_t)t * H + c];
+                wpd = fmax(wpd, bf_ulps(bf(XP[(size_t)t * H + c]), bf(XD[(size_t)t * H + c])));
+            }
+            for (int j = 0; j < S; j++) ir = fmax(ir, fabs(IP[t * S + j] - o.inj[j]) / o.inj[j]);
+        }
+        /* the outliers are the INPUT's (a 4-stream mean that nearly cancels, after a bf16 tie of xn or a):
+         * the decode kernels on these same rows show them too (T = 300: 212 beyond 1 ulp, worst 418), so
+         * the prefill's count and worst are graded against the decode kernels' (worst: the triangle
+         * bound through the prefill-vs-decode distance, itself graded below), whose own accuracy is the
+         * T = 6 check above */
+        CHECK(rc == 0 && o1 <= d1 + (size_t)(TP * H) / 20000 && wu <= wd + wpd + 1.0 && ir < 1e-5,
+              "prefill width T = %d (the up as a GEMM) vs double: %zu of %d beyond 1 bf16 ulp (worst %.2f; the "
+              "decode kernels on the same rows: %zu, worst %.2f), inj max rel %.2e", TP, o1, TP * H, wu, d1, wd, ir);
+        /* a bf16 tie of `a` resolved differently by the two z orders moves an output by the same
+         * cancellation that sets the decode kernels' own worst distance from double */
+        CHECK(pd <= (size_t)(TP * H) / 1000 && wpd <= wd,
+              "prefill vs decode widths on the same rows agree to rounding: %zu of %d differ, by at most %.2f ulp "
+              "(<= the decode kernels' own worst vs double, %.2f)", pd, TP * H, wpd, wd);
+        CHECK(rc == 0 && XW == XD, "decode rows T = %d in one call bit-identical to the same rows 16 at a time", TP);
+        cudaFree(dsp); cudaFree(xp); cudaFree(injp); cudaFree(wp);
+    }
+    /* the mixer: no inject */
+    pulsar_qwen_gr_dev wm = w;
+    wm.inject = nullptr;
+    rc = pulsar_qwen_gr_read_launch(&wm, dst, T, xo, nullptr, ws, wsb, 0);
+    const auto XM = down(xo, (size_t)T * H);
+    CHECK(rc == 0 && memcmp(XM.data(), X.data(), X.size() * 2) == 0, "the mixer (no inject) reads the same block input");
+    /* the mixer as the graded recipe stores it: BF16 low-rank weights (bf16
+     * activations into bf16 GEMVs), no inject */
+    {
+        const auto wdb = rnd_bf((size_t)R * HC, 0.01), wub = rnd_bf((size_t)HC * R, 0.08);
+        pulsar_qwen_gr_dev wb = w;
+        wb.inject = nullptr;
+        wb.down = {up(wdb), nullptr, R, HC, false};
+        wb.up = {up(wub), nullptr, HC, R, false};
+        rc = pulsar_qwen_gr_read_launch(&wb, dst, T, xo, nullptr, ws, wsb, 0);
+        const auto XB = down(xo, (size_t)T * H);
+        double wu_ = 0;
+        size_t ob = 0;
+        for (int t = 0; t < T; t++) {
+            const gr_out o = gr_read_bf16(&st[(size_t)t * HC], g.norm.data(), wdb.data(), wub.data(), nullptr);
+            for (int c = 0; c < H; c++) {
+                const double u = bf_ulps(bf(XB[(size_t)t * H + c]), o.x[c]);
+                wu_ = fmax(wu_, u);
+                ob += u > 1.0;
+            }
+        }
+        /* xn and a are ROUNDED TO BF16 here (the bf16 GEMVs' inputs), a 32x finer grid than
+         * E4M3's: an f32 value and the double reference straddle a bf16 tie a few times per
+         * run, and one flipped element of `a` moves every gate it feeds -- so the bar is a
+         * fraction and a bounded worst case, not zero */
+        CHECK(rc == 0 && ob <= (size_t)(T * H) / 1000 && wu_ <= 16.0,
+              "the BF16 mixer (bf16 low-rank, no E4M3 slot): %zu of %d beyond 1 bf16 ulp (worst %.2f ulp; bf16-tie flips "
+              "of xn / a allowed at 1e-3)", ob, T * H, wu_);
+        pulsar_qwen_gr_dev wmix = wb;
+        wmix.up = {up(g.up_w.q), up(g.up_w.sf), HC, R, false};
+        CHECK(pulsar_qwen_gr_read_launch(&wmix, dst, T, xo, nullptr, ws, wsb, 0) != 0,
+              "a BF16 W_down paired with an MXFP8 W_up is refused");
+    }
+    /* the write */
+    std::vector<float> out((size_t)T * H);
+    for (auto &v : out) v = (float)(rndn() * 0.5);
+    float *dout = up(out);
+    CK(cudaMemcpy(inj, I.data(), I.size() * 4, cudaMemcpyHostToDevice));   /* the T = 1 run above overwrote row 0's */
+    rc = pulsar_qwen_gr_write_launch(dst, dout, inj, T, 0);
+    const auto ST2 = down(dst, (size_t)T * HC);
+    size_t wr_bad = 0, wr_exact = 0;
+    for (int t = 0; t < T; t++)
+        for (int s = 0; s < S; s++)
+            for (int c = 0; c < H; c++) {
+                const size_t i = (size_t)t * HC + s * H + c;
+                const double want = bf(st[i]) + (double)out[(size_t)t * H + c] * (double)I[t * S + s];
+                const double u = bf_ulps(bf(ST2[i]), want);
+                wr_bad += u > 0.51 && ST2[i] != to_bf(want);   /* f32 then bf16: a double rounding stays within ~0.5 ulp */
+                wr_exact += ST2[i] == to_bf(want);
+            }
+    CHECK(wr_bad == 0, "write: streams += out * inj, one bf16 rounding: %zu of %d beyond half an ulp (%zu bit-exact)",
+          wr_bad, T * HC, wr_exact);
+    /* mutations */
+    CK(cudaMemcpy(dst, st.data(), st.size() * 2, cudaMemcpyHostToDevice));
+    size_t moved_u = 0, moved_d = 0;
+    {
+        pulsar_qwen_gr_dev wx = w;
+        /* one 32-block scale of one W_up row x 8 (a single code is below the bf16
+         * resolution of the gated mean) */
+        std::vector<uint8_t> sf = g.up_w.sf;
+        sf[pulsar_mx_sfoff(2 * H + 77, 1, pulsar_mx_kbp(R))] += 3;
+        wx.up.sf = up(sf);
+        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, inj, ws, wsb, 0);
+        const auto XX = down(xo, (size_t)T * H);
+        for (size_t i = 0; i < XX.size(); i++) moved_u += XX[i] != X[i];
+        wx = w;
+        sf = g.down_w.sf;
+        sf[pulsar_mx_sfoff(11, 125, pulsar_mx_kbp(HC))] += 4;
+        wx.down.sf = up(sf);
+        pulsar_qwen_gr_read_launch(&wx, dst, T, xo, inj, ws, wsb, 0);
+        const auto XY = down(xo, (size_t)T * H);
+        for (size_t i = 0; i < XY.size(); i++) moved_d += XY[i] != X[i];
+    }
+    CHECK(moved_u > 0 && moved_d > 0, "mutations: one W_up block scale x8 moved %zu outputs, one W_down block scale x16 moved %zu",
+          moved_u, moved_d);
+}
+
+/* ======================================================================== */
+static void section_ple(void) {
+    printf("C. PLE injection (3 sequences, 2 batches, conv state carried)\n");
+    const linear key = make_linear(H, HC, 10), value = make_linear(H, H, 8);
+    pulsar_qwen_ple_dev w;
+    const pulsar_rows_linear kp = dev_linear(key), vp = dev_linear(value);
+    /* the op's half (L284 #2: family_qwen_s4.cpp runs the projections, through its row-kind segments): key /
+     * value of the T gathered rows at the decode widths' arm, then the launcher */
+    auto ple = [&](const pulsar_qwen_ple_dev *pw, const uint16_t *de, uint16_t *ds, int T, const pulsar_qwen_rows *pr,
+                   float *state, void *ws, size_t wsb, cudaStream_t stream) {
+        float *dk = (float *)dalloc((size_t)T * HC * 4), *dv = (float *)dalloc((size_t)T * H * 4);
+        const size_t lk = pulsar_rows_linear_workspace_bytes(&kp, T), lv = pulsar_rows_linear_workspace_bytes(&vp, T);
+        const size_t lb = lk > lv ? lk : lv;
+        void *lin = dalloc(lb);
+        int rc = pulsar_rows_linear_launch(&kp, de, T, dk, lin, lb, stream);
+        if (!rc) rc = pulsar_rows_linear_launch(&vp, de, T, dv, lin, lb, stream);
+        if (!rc) rc = pulsar_qwen_ple_launch(pw, dk, dv, ds, T, pr, state, ws, wsb, stream);
+        CK(cudaDeviceSynchronize());
+        cudaFree(dk); cudaFree(dv); cudaFree(lin);
+        return rc;
+    };
+    const auto nk = rnd_bf(HC, 0.1), nq = rnd_bf(HC, 0.1), nc = rnd_bf(HC, 0.1), cw = rnd_bf((size_t)HC * 4, 0.4);
+    w.norm_key = up(nk); w.norm_query = up(nq); w.norm_conv = up(nc); w.conv_w = up(cw);
+    const int n_seq = 3;
+    const int rowsA[n_seq] = {5, 3, 12}, rowsB[n_seq] = {1, 7, 2};
+    float *state = (float *)dalloc((size_t)n_seq * PULSAR_QWEN_PLE_STATE * HC * 4);
+    std::vector<std::vector<std::vector<double>>> hist(n_seq);
+    std::vector<std::vector<uint16_t>> streams_host(n_seq);   /* per sequence, per row appended */
+    auto run_batch = [&](const int *rows, bool host, std::vector<uint16_t> &emb_out, std::vector<uint16_t> &st_out,
+                         std::vector<uint16_t> *dev_out, std::vector<uint16_t> *st_in) {
+        int T = 0;
+        for (int q = 0; q < n_seq; q++) T += rows[q];
+        emb_out = rnd_act(T, H, 0.05);
+        st_out = rnd_act(T, HC, 0.7);
+        *st_in = st_out;
+        std::vector<int32_t> rs(T), rj(T), sf(n_seq), sr(n_seq);
+        int r = 0;
+        for (int q = 0; q < n_seq; q++) {
+            sf[q] = r; sr[q] = rows[q];
+            for (int j = 0; j < rows[q]; j++, r++) { rs[r] = q; rj[r] = j; }
+        }
+        std::vector<int32_t> sb(n_seq);
+        for (int q = 0; q < n_seq; q++) sb[q] = q;
+        pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq, nullptr, 0};
+        uint16_t *de = up(emb_out), *ds = up(st_out);
+        const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
+        void *ws = dalloc(wsb);
+        const int rc = ple(&w, de, ds, T, &pr, state, ws, wsb, 0);
+        CHECK(rc == 0, "launch T=%d", T);
+        *dev_out = down(ds, (size_t)T * HC);
+        if (host) {
+            std::vector<uint16_t> st = st_out;
+            for (int i = 0; i < T; i++)
+                ple_token(&emb_out[(size_t)i * H], key, value, nk.data(), nq.data(), nc.data(), cw.data(),
+                          &st[(size_t)i * HC], hist[rs[i]]);
+            st_out = st;
+        }
+        cudaFree(ws); cudaFree(de); cudaFree(ds);
+    };
+    double worst[2] = {0, 0};
+    size_t over[2] = {0, 0}, n[2] = {0, 0};
+    std::vector<uint16_t> emb, st, dev, st_in;
+    for (int b = 0; b < 2; b++) {
+        run_batch(b ? rowsB : rowsA, true, emb, st, &dev, &st_in);
+        for (size_t i = 0; i < st.size(); i++) {
+            /* ulps at the larger of the result and the stream it updated: stream + out can
+             * cancel, and then the f32 sum's own error is many ulps of the small result */
+            const double sc = fmax(fabs(bf(st[i])), fabs(bf(st_in[i])));
+            const double u = bf_ulps(bf(dev[i]), bf(st[i])) * (bf(st[i]) != 0 ? fabs(bf(st[i])) / sc : 1.0);
+            worst[b] = fmax(worst[b], u);
+            over[b] += u > 1.0;
+            n[b]++;
+        }
+    }
+    /* Batch A (20 rows) takes the PREFILL GEMM for key / value, whose operand is one fp16 plane (2^-12 per
+     * element); batch B (10 rows, decode width) continues the conv history A wrote, so it inherits that too.
+     * The signed-sqrt gate amplifies an operand perturbation without bound where the key-query dot is near 0
+     * (the worst element, 15.5 ulp, sits there), so the worst is graded only against a format error
+     * (thousands of ulps, or the count blowing up) and the count is the check. */
+    const size_t over_all = over[0] + over[1], n_all = n[0] + n[1];
+    const double worst_all = fmax(worst[0], worst[1]);
+    CHECK(over_all <= n_all / 5000 && worst_all <= 64.0,
+          "streams vs double over both batches: %zu of %zu beyond 1 bf16 ulp (worst %.2f; prefill batch %zu / %.2f, "
+          "decode batch %zu / %.2f)", over_all, n_all, worst_all, over[0], worst[0], over[1], worst[1]);
+
+    /* decode == prefill: a third batch (batch B's shape) from the carried state, as one
+     * batch and as single-token steps from the same snapshot */
+    std::vector<float> snap = down(state, (size_t)n_seq * PULSAR_QWEN_PLE_STATE * HC);
+    int T = 0;
+    for (int q = 0; q < n_seq; q++) T += rowsB[q];
+    const auto emb2 = rnd_act(T, H, 0.05), st2 = rnd_act(T, HC, 0.7);
+    std::vector<int32_t> rs(T), rj(T), sf(n_seq), sr(n_seq);
+    for (int q = 0, r = 0; q < n_seq; q++) {
+        sf[q] = r; sr[q] = rowsB[q];
+        for (int j = 0; j < rowsB[q]; j++, r++) { rs[r] = q; rj[r] = j; }
+    }
+    std::vector<int32_t> sb(n_seq);
+    for (int q = 0; q < n_seq; q++) sb[q] = q;
+    pulsar_qwen_rows pr = {up(rs), up(rj), up(sf), up(sr), up(sb), n_seq, nullptr, 0};
+    uint16_t *de = up(emb2), *ds = up(st2);
+    const size_t wsb = pulsar_qwen_ple_workspace_bytes(T);
+    void *ws = dalloc(wsb);
+    int rc = ple(&w, de, ds, T, &pr, state, ws, wsb, 0);
+    const auto batch_out = down(ds, (size_t)T * HC);
+    const auto batch_state = down(state, snap.size());
+    CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+    /* single steps: every sequence one token at a time, interleaved round-robin */
+    std::vector<int> next(n_seq, 0);
+    for (bool any = true; any;) {
+        any = false;
+        for (int q = 0; q < n_seq; q++) {
+            if (next[q] >= rowsB[q]) continue;
+            any = true;
+            const int row = sf[q] + next[q]++;
+            /* a decode step of sequence q alone: one row, one sequence, owning slot q */
+            const std::vector<int32_t> zero = {0}, one = {1}, bank = {q};
+            pulsar_qwen_rows p1 = {up(zero), up(zero), up(zero), up(one), up(bank), 1, nullptr, 0};
+            rc |= ple(&w, de + (size_t)row * H, ds + (size_t)row * HC, 1, &p1, state, ws, wsb, 0);
+        }
+    }
+    const auto step_out = down(ds, (size_t)T * HC);
+    const auto step_state = down(state, snap.size());
+    CHECK(rc == 0 && memcmp(step_out.data(), batch_out.data(), batch_out.size() * 2) == 0 &&
+          memcmp(step_state.data(), batch_state.data(), batch_state.size() * 4) == 0,
+          "batch B re-run as %d single-token steps: streams and conv state bit-identical to the batch", T);
+    /* mutation: one conv tap */
+    CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+    std::vector<uint16_t> cw2 = cw;
+    cw2[(size_t)5000 * 4 + 1] = to_bf(bf(cw2[(size_t)5000 * 4 + 1]) + 0.5);
+    pulsar_qwen_ple_dev wm = w;
+    wm.conv_w = up(cw2);
+    rc = ple(&wm, de, ds, T, &pr, state, ws, wsb, 0);
+    const auto mut = down(ds, (size_t)T * HC);
+    size_t moved = 0;
+    for (size_t i = 0; i < mut.size(); i++) moved += mut[i] != batch_out[i];
+    CHECK(rc == 0 && moved > 0, "mutation: one conv tap moved %zu outputs", moved);
+
+    /* L272 P1 S4: the verify capture over several sequences -- batch B (runs of 1, 7 and 2 rows, one per
+     * bank) with state_rows: the state captured after row j of sequence q (at batch row sf[q] + j, every
+     * row but each sequence's last) == the state a batch of just that sequence's first j + 1 rows leaves */
+    {
+        const size_t slot_f = (size_t)PULSAR_QWEN_PLE_STATE * HC;
+        float *cap = (float *)dalloc((size_t)T * slot_f * 4);
+        CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+        pulsar_qwen_rows pc = pr;
+        pc.state_rows = cap;
+        pc.n_state_rows = T;   /* every row of the batch is a verify's */
+        rc = ple(&w, de, ds, T, &pc, state, ws, wsb, 0);
+        const auto captured = down(cap, (size_t)T * slot_f);
+        bool same_all = rc == 0;
+        int compared = 0;
+        for (int q = 0; q < n_seq; q++) {
+            for (int j = 0; j + 1 < rowsB[q]; j++) {
+                CK(cudaMemcpy(state, snap.data(), snap.size() * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(ds, st2.data(), st2.size() * 2, cudaMemcpyHostToDevice));
+                std::vector<int32_t> pj(j + 1), pz(j + 1, 0);
+                for (int i = 0; i <= j; i++) pj[i] = i;
+                const std::vector<int32_t> zero = {0}, len = {j + 1}, bank = {q};
+                pulsar_qwen_rows p1 = {up(pz), up(pj), up(zero), up(len), up(bank), 1, nullptr, 0};
+                rc |= ple(&w, de + (size_t)sf[q] * H, ds + (size_t)sf[q] * HC, j + 1, &p1, state, ws,
+                                             wsb, 0);
+                const auto after = down(state, snap.size());
+                same_all = same_all && memcmp(after.data() + (size_t)q * slot_f,
+                                              captured.data() + (size_t)(sf[q] + j) * slot_f, slot_f * 4) == 0;
+                compared++;
+            }
+        }
+        CHECK(rc == 0 && same_all, "verify capture over 3 sequences: %d captured row states == the prefix runs' states",
+              compared);
+        cudaFree(cap);
+    }
+}
+
+/* ======================================================================== */
+/* split = the MTP layer's routed experts: gate and up as separate slices (each its own suh), all three
+ * at K = 3 (turboderp's MTP rate); otherwise the trunk's fused gate_up K = 4 and down K = 5 */
+/* k2_ex: the routed experts' rate (0: fused K4 gate_up / K5 down, or split K3 -- the MTP layer);
+ * k2_sh: the shared expert's (0 = K5 / K5 / K4).  turboderp 4.05: split 8 / 12; 6.05: split 12 / 16. */
+static void section_moe_at(const int T, const bool split = false, const int k2_ex = 0, const int k2_sh = 0) {
+    const int P = 12;
+    std::vector<linear> pgu, pd, pg, pu;
+    for (int i = 0; i < P; i++) {
+        if (split) {
+            pg.push_back(make_linear(H, MID, k2_ex ? k2_ex : 6));
+            pu.push_back(make_linear(H, MID, k2_ex ? k2_ex : 6));
+            pd.push_back(make_linear(MID, H, k2_ex ? k2_ex : 6));
+        } else {
+            pgu.push_back(make_linear(H, 2 * MID, k2_ex ? k2_ex : 8));
+            pd.push_back(make_linear(MID, H, k2_ex ? k2_ex : 10));
+        }
+    }
+    std::vector<expert> ex(E);
+    for (int e = 0; e < E; e++)
+        ex[e] = split ? expert{nullptr, &pd[e % P], &pg[e % P], &pu[e % P]} : expert{&pgu[e % P], &pd[e % P]};
+    const linear sg = make_linear(H, MID, k2_sh ? k2_sh : 10), su = make_linear(H, MID, k2_sh ? k2_sh : 10),
+                 sd = make_linear(MID, H, k2_sh ? k2_sh : 8);
+    auto table = [&](std::vector<linear> &pool) {
+        std::vector<const void *> t(2 * E);
+        std::vector<const void *> base(P);
+        for (int i = 0; i < P; i++) base[i] = up(pool[i].bytes);
+        uint64_t trellis = 0, stride = 0;
+        exl3t_layout(pool[0].in, pool[0].out, pool[0].k2, &trellis, &stride);
+        for (int e = 0; e < E; e++) { t[2 * e] = base[e % P]; t[2 * e + 1] = (const uint8_t *)base[e % P] + trellis; }
+        return (const void *const *)up(t);
+    };
+    /* L272 P4c: the block as the engine composes it (pulsar_qwen_s4_moe): the router, the routed part through
+     * the front door's launch (pulsar_rows_moe_routed_launch), then the sigmoid-gated shared expert */
+    pulsar_rows_moe w{};
+    w.ex_lo = 0;
+    w.n_local = E;
+    w.n_expert = E;
+    w.top_k = TOPK;
+    w.in_dim = H;
+    w.mid_dim = MID;
+    w.out_dim = H;
+    w.prompt = T > 16;   /* the T = 37 run is a prompt chunk (the prefill GEMMs); T <= 16 decode rows */
+    const auto wr = rnd_bf((size_t)E * H, 0.02), wsg = rnd_bf(H, 0.02);
+    const uint16_t *router_w = up(wr), *shared_gate_w = up(wsg);
+    if (split) {
+        w.gate_table = table(pg); w.up_table = table(pu); w.down_table = table(pd);
+        w.k2_gate_up = k2_ex ? k2_ex : 6; w.k2_down = k2_ex ? k2_ex : 6;
+    } else {
+        w.gate_up_table = table(pgu); w.down_table = table(pd);
+        w.k2_gate_up = k2_ex ? k2_ex : 8; w.k2_down = k2_ex ? k2_ex : 10;
+    }
+    const pulsar_rows_linear shg = dev_linear(sg), shu = dev_linear(su), shd = dev_linear(sd);
+    const auto x = rnd_act(T, H, 0.7);
+    /* L251 / ac69748f: the MoE reads the bf16 rows directly -- there is no A8 slot, so the
+     * reference's activation is the bf16 VALUE, not a decoded E4M3 code. */
+    std::vector<double> xd((size_t)T * H);
+    for (size_t i = 0; i < xd.size(); i++) xd[i] = bf(x[i]);
+    uint16_t *dx = up(x);
+    float *out = (float *)dalloc((size_t)T * H * 4);
+    uint32_t *nf = (uint32_t *)dalloc(4);
+    const pulsar_moe_block_shape bs{E, TOPK, E + 1, H, MID, 1, (int)shg.out, 0};
+    const size_t wsb = pulsar_moe_block_workspace_bytes(&bs, T);
+    void *ws = dalloc(wsb);
+    /* the block's one shared expert over the carved buffers, gated by the router's gamma plane */
+    auto shared_desc = [&](const pulsar_moe_block_parts &p) {
+        pulsar_rows_moe_shared sh{};
+        sh.gate = shg; sh.up = shu; sh.down = shd;
+        sh.scale = p.gammas; sh.yg = p.yg; sh.yu = p.yu; sh.ys = p.ys; sh.h = p.h;
+        sh.ws = p.lin; sh.ws_bytes = p.lin_bytes;
+        return sh;
+    };
+    auto block = [&](const pulsar_rows_moe &rm, const uint16_t *xr, int rows, bool shared) -> int {
+        pulsar_moe_block_parts p;
+        if (pulsar_moe_block_carve(&bs, rows, ws, wsb, &p) != 0) return -1;
+        int r = qwen_router(xr, router_w, shared_gate_w, rows, H, p.logits, p.sel, p.wts, p.gammas);
+        if (!r) r = pulsar_rows_moe_routed_launch(&rm, p.sel, p.wts, xr, rows, out, p.routed, p.routed_bytes, nf,
+                                                  0x7351u, 0);
+        const pulsar_rows_moe_shared sh = shared_desc(p);
+        if (!r && shared) r = pulsar_rows_moe_shared_launch(&sh, xr, rows, out, 0);
+        return r;
+    };
+    int rc = block(w, dx, T, true);
+    CHECK(rc == 0, "launch T=%d (workspace %.1f MB)", T, wsb / 1e6);
+    const auto O = down(out, (size_t)T * H);
+    const auto NF = down(nf, 1);
+    /* task #44: the EXL3 shared expert riding the routed launches (exl3_moe.cuh) == the routed launch then the
+     * shared expert's own launches, byte for byte -- the same arithmetic, fewer launches.  L288 exl3-dense: it is
+     * forked onto its own stream first and joined at the routed sum; a riding shared expert that was not forked is
+     * refused */
+    {
+        pulsar_moe_block_parts p;
+        int r = pulsar_moe_block_carve(&bs, T, ws, wsb, &p);
+        if (!r) r = qwen_router(dx, router_w, shared_gate_w, T, H, p.logits, p.sel, p.wts, p.gammas);
+        const pulsar_rows_moe_shared sh = shared_desc(p);
+        pulsar_rows_moe wr2 = w;
+        wr2.shared = &sh;
+        wr2.n_shared = 1;
+        if (!r)
+            CHECK(pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0) != 0,
+                  "T = %d: a riding shared expert that was not forked is refused", T);
+        if (!r) r = pulsar_rows_moe_shared_fork(&sh, dx, T, 0);
+        if (!r) r = pulsar_rows_moe_routed_launch(&wr2, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        const auto OR = down(out, (size_t)T * H);
+        size_t diff = 0;
+        for (size_t i = 0; i < OR.size(); i++) diff += memcmp(&OR[i], &O[i], sizeof(float)) != 0;
+        CHECK(r == 0 && diff == 0, "T = %d%s: the riding shared expert differs from the separate launches in %zu of %zu "
+              "outputs (rc %d)", T, split ? " split experts" : "", diff, OR.size(), r);
+        printf("  T = %d%s: shared expert riding the routed launches == separate launches, byte for byte (%zu outputs)\n",
+               T, split ? " split experts" : "", OR.size());
+    }
+    /* L295 F2: N shared experts on the rows front door -- two here, each with its own gamma plane (an Inkling-style
+     * block: the router's sink gammas).  Riding (both forked, in order, joined at the routed sum) == the routed
+     * launch then each expert's own launch in order, byte for byte; and the block == the double reference */
+    if (!split) {
+        const linear sg2 = make_linear(H, MID, 10), su2 = make_linear(H, MID, 10), sd2 = make_linear(MID, H, 8);
+        const pulsar_rows_linear shg2 = dev_linear(sg2), shu2 = dev_linear(su2), shd2 = dev_linear(sd2);
+        const pulsar_moe_block_shape bs2{E, TOPK, E + 1, H, MID, 2, MID, 0};
+        const size_t wsb2 = pulsar_moe_block_workspace_bytes(&bs2, T);
+        void *ws2 = dalloc(wsb2);
+        pulsar_moe_block_parts p;
+        int r = pulsar_moe_block_carve(&bs2, T, ws2, wsb2, &p);
+        std::vector<float> gam((size_t)2 * T);
+        for (auto &g : gam) g = (float)(0.1 + 1.4 * rndu());
+        if (!r) r = qwen_router(dx, router_w, shared_gate_w, T, H, p.logits, p.sel, p.wts, p.gammas);
+        CK(cudaMemcpy(p.gammas, gam.data(), gam.size() * 4, cudaMemcpyHostToDevice));   /* this check's gammas */
+        pulsar_rows_moe_shared sh2[2]{};
+        for (int j = 0; j < 2; j++) {
+            sh2[j].gate = j ? shg2 : shg; sh2[j].up = j ? shu2 : shu; sh2[j].down = j ? shd2 : shd;
+            sh2[j].scale = p.gammas + (size_t)j * T;
+            sh2[j].yg = p.yg + (size_t)j * T * MID; sh2[j].yu = p.yu + (size_t)j * T * MID;
+            sh2[j].ys = p.ys + (size_t)j * T * H; sh2[j].h = p.h + (size_t)j * T * MID;
+            sh2[j].ws = p.lin; sh2[j].ws_bytes = p.lin_bytes;
+        }
+        pulsar_rows_moe wn = w;
+        wn.shared = sh2;
+        wn.n_shared = 2;
+        for (int j = 0; j < 2 && !r; j++) r = pulsar_rows_moe_shared_fork(&sh2[j], dx, T, 0);
+        if (!r) r = pulsar_rows_moe_routed_launch(&wn, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        const auto ORN = down(out, (size_t)T * H);
+        if (!r) r = pulsar_rows_moe_routed_launch(&w, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0);
+        for (int j = 0; j < 2 && !r; j++) r = pulsar_rows_moe_shared_launch(&sh2[j], dx, T, out, 0);
+        const auto OSN = down(out, (size_t)T * H);
+        size_t diff = 0;
+        for (size_t i = 0; i < ORN.size(); i++) diff += memcmp(&ORN[i], &OSN[i], sizeof(float)) != 0;
+        CHECK(r == 0 && diff == 0, "T = %d: two riding shared experts == the routed launch then each shared expert's own "
+              "launch, byte for byte (%zu of %zu differ, rc %d)", T, diff, ORN.size(), r);
+        const auto SelN = down(p.sel, (size_t)T * TOPK);
+        const auto RWN = down(p.wts, (size_t)T * TOPK);
+        double frob = 0;
+        std::vector<double> ref(H);
+        for (int t = 0; t < T; t++) {
+            double wk[TOPK];
+            for (int k = 0; k < TOPK; k++) wk[k] = RWN[(size_t)t * TOPK + k];
+            moe_token(&xd[(size_t)t * H], &SelN[(size_t)t * TOPK], wk, gam[t], ex, sg, su, sd, ref.data());
+            shared_token(&xd[(size_t)t * H], gam[(size_t)T + t], sg2, su2, sd2, ref.data());
+            double num = 0, den = 0;
+            for (int o = 0; o < H; o++) {
+                const double d = ORN[(size_t)t * H + o] - ref[o];
+                num += d * d; den += ref[o] * ref[o];
+            }
+            frob = fmax(frob, sqrt(num / den));
+        }
+        CHECK(frob < 2e-3, "T = %d: the block with two gamma-gated shared experts vs double: worst row rel Frobenius "
+              "%.2e (the one-shared bar)", T, frob);
+        pulsar_rows_moe wbad = w;
+        wbad.shared = sh2;
+        wbad.n_shared = PULSAR_ROUTER_SHARED_MAX + 1;
+        CHECK(pulsar_rows_moe_routed_launch(&wbad, p.sel, p.wts, dx, T, out, p.routed, p.routed_bytes, nf, 0x7351u, 0) != 0,
+              "more shared experts than the front door carries (%d) is refused", PULSAR_ROUTER_SHARED_MAX);
+        cudaFree(ws2);
+    }
+    /* L266 step 7, expert parallelism: rank r runs experts [256 r, 256 r + 256) from its half of the tables
+     * (and rank 0 the shared expert); the two partials summed in rank order -- the all-reduce -- are the
+     * one-GPU block to f32 reassociation (each rank sums its own slots in order, then the two add). */
+    {
+        std::vector<double> sum((size_t)T * H, 0.0);
+        bool ok = true;
+        for (int r = 0; r < 2; r++) {
+            pulsar_rows_moe we = w;
+            we.ex_lo = r * (E / 2);
+            we.n_local = E / 2;
+            auto half = [&](const void *const *t) { return t ? t + (size_t)2 * (E / 2) * r : t; };
+            we.gate_up_table = half(w.gate_up_table); we.gate_table = half(w.gate_table);
+            we.up_table = half(w.up_table); we.down_table = half(w.down_table);
+            ok = ok && block(we, dx, T, r == 0) == 0;
+            const auto Or = down(out, (size_t)T * H);
+            for (size_t i = 0; i < sum.size(); i++) sum[i] = (double)(float)(sum[i] + (double)Or[i]);
+        }
+        double ep_worst = 0;
+        for (int t = 0; t < T; t++) {
+            double num = 0, den = 0;
+            for (int o = 0; o < H; o++) {
+                const double d = sum[(size_t)t * H + o] - O[(size_t)t * H + o];
+                num += d * d; den += (double)O[(size_t)t * H + o] * O[(size_t)t * H + o];
+            }
+            ep_worst = fmax(ep_worst, sqrt(num / den));
+        }
+        CHECK(ok && ep_worst < 1e-5, "T = %d%s expert-parallel: rank 0 + rank 1 partials == the one-GPU block, worst row "
+              "rel Frobenius %.2e (f32 reassociation, bar 1e-5)", T, split ? " split experts" : "", ep_worst);
+    }
+    /* the device's routing, from the router alone on the same rows */
+    const int LP = pulsar_router_logits_ld(E + 1);   /* L336: the logits' pitch */
+    float *lg = (float *)dalloc((size_t)T * LP * 4), *rw = (float *)dalloc((size_t)T * TOPK * 4), *rs = (float *)dalloc(T * 4);
+    int32_t *sel = (int32_t *)dalloc((size_t)T * TOPK * 4);
+    qwen_router(dx, router_w, shared_gate_w, T, H, lg, sel, rw, rs);
+    const auto Sel = down(sel, (size_t)T * TOPK);
+    const auto RW = down(rw, (size_t)T * TOPK);
+    const auto RS = down(rs, T);
+    double worst = 0, frob_worst = 0;
+    int rows_f32 = 0;
+    std::vector<double> ref(H);
+    for (int t = 0; t < T; t++) {
+        double wk[TOPK];
+        for (int k = 0; k < TOPK; k++) wk[k] = RW[(size_t)t * TOPK + k];
+        moe_token(&xd[(size_t)t * H], &Sel[(size_t)t * TOPK], wk, RS[t], ex, sg, su, sd, ref.data());
+        double sc = 0, num = 0, den = 0;
+        for (int o = 0; o < H; o++) sc = fmax(sc, fabs(ref[o]));
+        for (int o = 0; o < H; o++) {
+            const double d = O[(size_t)t * H + o] - ref[o];
+            worst = fmax(worst, fabs(d) / sc);
+            num += d * d; den += ref[o] * ref[o];
+        }
+        frob_worst = fmax(frob_worst, sqrt(num / den));
+        rows_f32 += sqrt(num / den) < 1e-5;
+        printf("        row %d: rel Frobenius %.2e\n", t, sqrt(num / den));
+    }
+    /* Task #46: the routed experts' DECODE rows take the fp16 tensor-core decode GEMM, so every width now
+     * carries the routed arms' one-fp16-plane operand (2^-12 per element, the prefill arm's -- graded per
+     * projection in tests/exl3_moe_prefill_gate); the shared expert stays f32-class at decode widths (the dense
+     * arm's two planes) and ~4e-6 per element in its prefill GEMM.  Until #46 decode rows were graded at f32
+     * order (the CUDA-core GEMV: 5e-4 for the bf16 tie flips at the fold's mid and h); now both kinds share the
+     * prefill rows' bound and its reasoning: ONE flipped bf16 tie moves its row by up to ~2^-9 of that
+     * element's share, the fp16 plane adds ~5e-4 through the block's GEMMs in series, so 2e-3 -- 12x below
+     * the 2.5e-2 a real format error read on this line.  End to end the one-plane prefill build was graded by
+     * the per-layer local error against the container reference (code d = 2048, layers 2..47): mean 7.88e-3
+     * vs 7.90e-3 two-plane and 7.93e-3 all-GEMV -- no measurable change.  The f32-order count is reported,
+     * not graded. */
+    CHECK(frob_worst < 2e-3, "T = %d%s (%s) out vs double: worst row rel Frobenius %.2e, max |err| / "
+          "max|ref| %.2e (%d of %d rows at f32 order)", T, split ? " split experts" : "",
+          T <= 16 ? "decode GEMM" : split ? "prefill GEMMs; the pair as two rotated slices" : "prefill GEMMs",
+          frob_worst, worst, rows_f32, T);
+    CHECK(NF[0] == 0, "non-finite flag clear (0x%x)", NF[0]);
+    if (T <= 16) {
+        /* the T = 1 run reads row 2's bf16 row -- the MoE indexes the activation itself now */
+        rc = block(w, dx + (size_t)2 * H, 1, true);
+        const auto O1 = down(out, H);
+        CHECK(rc == 0 && memcmp(O1.data(), &O[(size_t)2 * H], H * 4) == 0, "T = 1 row bit-identical to the T = %d%s "
+              "batch's row", T, split ? " split-expert" : "");
+    }
+}
+
+static void section_moe(void) {
+    printf("D. MoE block (512 experts over an aliased pool of 12; fused gate_up K=4, down K=5; shared K=5/5/4)\n");
+    section_moe_at(5);    /* 50 assignments, decode rows: the decode GEMM */
+    section_moe_at(37);   /* a prompt chunk of 37 rows: the prefill GEMM */
+    section_moe_at(5, true);    /* the MTP layer's split experts (the pair in one decode launch + pair fold) */
+    section_moe_at(37, true);   /* ... and a prompt width: the prefill GEMM per slice, k2 = 6 */
+    printf("D'. MoE block at turboderp's rates: split gate / up (the pair arm), 4.05 = experts K4 + shared K6, "
+           "6.05 = experts K6 + shared K8\n");
+    section_moe_at(5, true, 8, 12);
+    section_moe_at(37, true, 8, 12);
+    section_moe_at(5, true, 12, 16);
+    section_moe_at(37, true, 12, 16);
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (!pulsar_gpu_init()) { printf("QWEN-S4 FAIL: no GPU\n"); return 2; }
+    printf("qwen-s4-gate: router / MoE / GR / PLE vs tests/qwen_ref.h (double)\n");
+    section_router();
+    section_gr();
+    section_ple();
+    section_moe();
+    section_mxfp8_linear();
+    section_head();
+    section_draft_top();
+    /* L295 F7: the pair arm at K5 (Inkling's pair build) -- run last, so the sections above keep their draws */
+    printf("D''. MoE block with split gate / up experts at K5 (the pair arm's K5, L295 F7), shared K5/5/4\n");
+    section_moe_at(5, true, 10);
+    section_moe_at(37, true, 10);
+    printf(g_fail ? "QWEN-S4 GATE FAIL\n" : "QWEN-S4 GATE PASS\n");
+    return g_fail;
+}
+
+/* ======================================================================== */
+/* G. The MXFP8 dense Linear -- the recipe's mxfp8_lt tier (GDN in_proj_a / _b
+ * and the indexer's index_qk_proj).  pulsar_qwen_mxfp8_linear_launch is a thin
+ * wrapper over the GR arm's W_down, so this grades its NUMBERS: the reference
+ * decodes the same quantized weight (mx8) and reads the SAME bf16 activation rows, so only the
+ * accumulation order can differ.  L251 / ac69748f: the activation is bf16, so there is no E4M3
+ * slot to emit and no per-32 block scale to fold in -- this is the W8A16 shape. */
+
+static void section_mxfp8_linear(void) {
+    printf("G. MXFP8 dense Linear (mxfp8_lt: in_proj_a 2560->48, index_qk_proj 2560->640)\n");
+    const struct { int in, out; } SH[2] = {{H, 48}, {H, 640}};
+    /* T = 5 is the decode GEMV; T = 97 the prefill tensor-core GEMM (two 64-token tiles, one partial) */
+    for (const int T : {5, 97})
+    for (const auto &sh : SH) {
+        std::vector<double> wd((size_t)sh.out * sh.in);
+        for (auto &v : wd) v = rndn() * 0.05;
+        mx8 w;
+        w.encode(wd, sh.out, sh.in);
+        const std::vector<uint16_t> act = rnd_act(T, sh.in, 0.7);
+        uint16_t *dx = up(act);                       /* the bf16 rows ARE the activation */
+        float *y = (float *)dalloc((size_t)T * sh.out * 4);
+        pulsar_qwen_lowrank l{up(w.q), up(w.sf), sh.out, sh.in, false};
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&l, dx, T, y, nullptr, 0, 0);
+        CHECK(rc == 0, "%d -> %d launch", sh.in, sh.out);
+        if (rc == 0) {
+            const auto Y = down(y, (size_t)T * sh.out);
+            const auto AX = down(dx, (size_t)T * sh.in);
+            double worst = 0, w_ref = 0, w_got = 0, w_l1 = 0, worst_l1n = 0;
+            int w_t = -1, w_o = -1;
+            for (int t = 0; t < T; t++)
+                for (int o = 0; o < sh.out; o++) {
+                    double ref = 0, l1 = 0;
+                    for (int k = 0; k < sh.in; k++) {
+                        const double p = w.at(o, k) * bf(AX[(size_t)t * sh.in + k]);
+                        ref += p;
+                        l1 += fabs(p);
+                    }
+                    const double got = Y[(size_t)t * sh.out + o];
+                    const double d = ref != 0 ? fabs(got - ref) / fabs(ref) : fabs(got);
+                    if (l1 > 0 && fabs(got - ref) / l1 > worst_l1n) worst_l1n = fabs(got - ref) / l1;
+                    if (d > worst) { worst = d; w_ref = ref; w_got = got; w_l1 = l1; w_t = t; w_o = o; }
+                }
+            /* Graded by |err| / sum|terms|, the bound a dot product carries.  The per-element relative
+             * error this check used to bound (< 1e-4) is undefined on a row whose terms cancel, and it
+             * passed on the RNG stream's luck: when section D began drawing a T = 37 batch, this same
+             * decode GEMV -- unchanged -- read 1.09e-03 on a new near-zero element.  The GEMV keeps a
+             * 10x tighter bar than the prefill GEMM (measured 0.9-1.5e-08 vs 5.7-8.5e-08), since it
+             * sums in f32 FMAs where the GEMM sums 16-k tensor-core fragments. */
+            /* L288: a decode-width Linear of >= 256 outputs is the tensor-core rows kernel (16-k fragments, the GEMM's bar) */
+            const bool gemv = T <= 16 && sh.out < 256;
+            CHECK(worst_l1n < (gemv ? 1e-7 : 1e-6), "%d -> %d at T = %d (%s) vs the same quantized operands in double: "
+                  "max |err|/sum|terms| %.2e (max rel %.2e at ref %.3e, sum|terms| %.3e; t=%d o=%d got %.6e)",
+                  sh.in, sh.out, T, gemv ? "decode GEMV" : T <= 16 ? "decode rows kernel" : "prefill GEMM", worst_l1n,
+                  worst, w_ref, w_l1, w_t, w_o, w_got);
+            if (gemv) {   /* L288 C2: one token a CTA -- each row is the bytes it gets alone */
+                int bad = 0;
+                float *y1 = (float *)dalloc((size_t)sh.out * 4);
+                for (int t = 0; t < T; t++) {
+                    bad += pulsar_qwen_mxfp8_linear_launch(&l, dx + (size_t)t * sh.in, 1, y1, nullptr, 0, 0) != 0;
+                    const auto Y1 = down(y1, (size_t)sh.out);
+                    bad += memcmp(Y1.data(), &Y[(size_t)t * sh.out], (size_t)sh.out * 4) != 0;
+                }
+                CHECK(bad == 0, "%d -> %d decode GEMV at T = %d: every row bit-identical to the row alone (%d differ)",
+                      sh.in, sh.out, T, bad);
+                cudaFree(y1);
+            }
+        }
+        /* a missing activation is refused, not mis-read.  The old negative control was a slot
+         * declaring the wrong kbp; with a bf16 activation there is no slot width to get wrong, so
+         * the control moves to the refusal the arm still has. */
+        CHECK(rc == 0 && pulsar_qwen_mxfp8_linear_launch(&l, nullptr, T, y, nullptr, 0, 0) != 0,
+              "a null activation is refused");
+        cudaFree(dx); cudaFree(y);
+    }
+}
+
+/* ======================================================================== */
+/* I. L288: the head (lm_head / MTP draft head) on the tensor cores.  The weight decodes exactly into bf16 and the
+ * activation is the bf16 row, so every product is exact: the grade is the summation order's alone (16-k fragments
+ * summed in f32, the prefill GEMM's bar).  A row's logits must not depend on the rows beside it -- a verify row's
+ * bytes are a one-row decode's -- so every row of a call is compared with that row alone, byte for byte. */
+static void section_head(void) {
+    printf("I. head on the tensor cores (mxfp8_lt 2560 -> 3001, a partial 16-row tile; 1 .. 16 rows)\n");
+    const int in = H, out = 3001, TM = 16;
+    std::vector<double> wd((size_t)out * in);
+    for (auto &v : wd) v = rndn() * 0.03;
+    mx8 w;
+    w.encode(wd, out, in);
+    const std::vector<uint16_t> act = rnd_act(TM, in, 0.9);
+    uint16_t *dx = up(act);
+    float *y = (float *)dalloc((size_t)TM * out * 4);
+    float *y1 = (float *)dalloc((size_t)out * 4);
+    const pulsar_qwen_lowrank l{up(w.q), up(w.sf), out, in, false};
+    for (const int T : {1, 5, 8, 9, 16}) {
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&l, dx, T, y, nullptr, 0, 0);
+        CHECK(rc == 0, "%2d rows launch", T);
+        if (rc) continue;
+        const auto Y = down(y, (size_t)T * out);
+        double worst_l1n = 0;
+        int w_t = -1, w_o = -1;
+        for (int t = 0; t < T; t++)
+            for (int o = 0; o < out; o++) {
+                double ref = 0, l1 = 0;
+                for (int k = 0; k < in; k++) {
+                    const double p = w.at(o, k) * bf(act[(size_t)t * in + k]);
+                    ref += p;
+                    l1 += fabs(p);
+                }
+                const double e = l1 > 0 ? fabs(Y[(size_t)t * out + o] - ref) / l1 : 0;
+                if (e > worst_l1n) { worst_l1n = e; w_t = t; w_o = o; }
+            }
+        CHECK(worst_l1n < 1e-6, "%2d rows vs the same quantized operands in double: max |err|/sum|terms| %.2e "
+              "(t=%d o=%d)", T, worst_l1n, w_t, w_o);
+        int differ = 0;
+        for (int t = 0; t < T; t++) {
+            CK(cudaMemset(y1, 0xFF, (size_t)out * 4));
+            if (pulsar_qwen_mxfp8_linear_launch(&l, dx + (size_t)t * in, 1, y1, nullptr, 0, 0) != 0) { differ = -1; break; }
+            const auto Y1 = down(y1, (size_t)out);
+            differ += memcmp(Y1.data(), Y.data() + (size_t)t * out, (size_t)out * 4) != 0;
+        }
+        CHECK(differ == 0, "%2d rows: every row bit-identical to that row alone (%d differ)", T, differ);
+    }
+    {
+        /* the weight decode is EXACT for every code: one-hot activations read single weights back -- every E4M3 code
+         * (subnormals and both zeros included, the NaN codes excepted) under block scales 2^-60 .. 2^10 */
+        const int R = 256;
+        mx8 wx;
+        wx.out = R; wx.in = in;
+        wx.q.assign((size_t)R * in, 0);
+        wx.sf.assign(pulsar_mx_sf_slab_bytes(R, pulsar_mx_kbp(in)), 0);
+        for (int r = 0; r < R; r++) {
+            for (int k = 0; k < in; k++) {
+                const uint8_t q = k < TM ? (uint8_t)((r * TM + k) % 256) : (uint8_t)rnd();
+                wx.q[(size_t)r * in + k] = (q & 0x7F) == 0x7F ? 0 : q;
+            }
+            for (int b = 0; b < in / 32; b++) wx.sf[pulsar_mx_sfoff(r, b, pulsar_mx_kbp(in))] = (uint8_t)(67 + (r * 7 + b) % 71);
+        }
+        std::vector<uint16_t> oh((size_t)TM * in, 0);
+        for (int t = 0; t < TM; t++) oh[(size_t)t * in + t] = 0x3F80;   /* bf16 1.0 */
+        uint16_t *dxo = up(oh);
+        float *yo = (float *)dalloc((size_t)TM * R * 4);
+        const pulsar_qwen_lowrank lx{up(wx.q), up(wx.sf), R, in, false};
+        const int rc = pulsar_qwen_mxfp8_linear_launch(&lx, dxo, TM, yo, nullptr, 0, 0);
+        const auto Y = down(yo, (size_t)TM * R);
+        int bad = 0;
+        for (int t = 0; t < TM; t++)
+            for (int r = 0; r < R; r++) bad += (double)Y[(size_t)t * R + r] != wx.at(r, t);
+        CHECK(rc == 0 && bad == 0, "every E4M3 code x scale decodes exactly (%d of %d single-weight reads differ)", bad, TM * R);
+        cudaFree(dxo); cudaFree(yo);
+    }
+    CHECK(pulsar_qwen_mxfp8_linear_launch(&l, nullptr, 1, y, nullptr, 0, 0) != 0, "a null activation refused");
+    cudaFree(dx); cudaFree(y); cudaFree(y1);
+    /* the production shape, timed (information, not graded): the lm_head 248320 x 2560 and the draft head
+     * 82196 x 2560, random codes, at 1 / 4 / 16 rows; GB/s over the weight bytes */
+    for (const int V : {248320, 82196}) {
+        const uint64_t wb = (uint64_t)V * in, sb = pulsar_mx_sf_slab_bytes(V, pulsar_mx_kbp(in));
+        uint8_t *dw = (uint8_t *)dalloc(wb + sb);
+        CK(cudaMemset(dw, 0x31, wb + sb));                    /* finite codes, scale 2^-78 */
+        uint16_t *dxv = up(act);
+        float *dy = (float *)dalloc((size_t)TM * V * 4);
+        const pulsar_qwen_lowrank lv{dw, dw + wb, V, in, false};
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        for (const int T : {1, 4, 16}) {
+            for (int i = 0; i < 3; i++) (void)pulsar_qwen_mxfp8_linear_launch(&lv, dxv, T, dy, nullptr, 0, 0);
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < 20; i++) (void)pulsar_qwen_mxfp8_linear_launch(&lv, dxv, T, dy, nullptr, 0, 0);
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            printf("  time  %6d x %d, %2d rows: %.3f ms a call, %.0f GB/s of weight\n", V, in, T, ms / 20,
+                   (double)(wb + sb) / (ms / 20 * 1e-3) / 1e9);
+        }
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaFree(dw); cudaFree(dxv); cudaFree(dy);
+    }
+}

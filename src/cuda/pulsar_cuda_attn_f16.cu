@@ -1,7 +1,10 @@
+/** @file
+ *  Attention on the tensor cores with fp16 operands and f32 accumulate. */
 /* Attention on the tensor cores, fp16 operands, f32 accumulate.
  *
  * WHY fp16 AND NOT SOMETHING SMALLER.  Measured, not assumed
- * (tests/attn_precision_fidelity.cc, real activations, f64 reference):
+ * (harness tests/attn_precision_fidelity.cc, real activations, f64 reference;
+ *  the harness itself was deleted in a71e346 -- these numbers are its record):
  *   format  rate          top-1 attention position preserved
  *   f32     14.5 TMAC/s   100%      <- what the FMA-pipe kernel does today
  *   fp16    62.9 (4.3x)   ~100%     <- this kernel
@@ -12,55 +15,171 @@
  * head-token pairs attend.  Nothing saturates in any format (max|q| 17.6,
  * max|kv| 5.65), so this is a resolution choice, not a range one.
  *
- * WHAT THIS REPLACES.  attention_static_mixed_heads8_online_kernel runs at
- * pipe_tensor 0%, pipe_fma 40%, pipe_lsu 56%: one warp per head, one KV row at
- * a time, and a 32-lane shuffle reduction to produce ONE score out of 16 FMAs
- * of useful work -- while all 8 warps in the block re-read the same 2 KB latent
- * row out of shared memory.  Both costs are structural, and both disappear when
- * the reduction becomes the MMA's k dimension and the operands are reused
- * across the MMA's m dimension.
+ * WHAT THIS REPLACED.  The f32 online-softmax kernels (the last of them, the
+ * decode kernel, deleted in L166 -- this kernel is now the ONE decode/prefill
+ * attention kernel for every production shape) ran at pipe_tensor 0%,
+ * pipe_fma 40%, pipe_lsu 56%: one warp per head, one KV row at a time, and a
+ * 32-lane shuffle reduction to produce ONE score out of 16 FMAs of useful
+ * work -- while all 8 warps in the block re-read the same 2 KB latent row out
+ * of shared memory.  Both costs are structural, and both disappear when the
+ * reduction becomes the MMA's k dimension and the operands are reused across
+ * the MMA's m dimension.
  *
  * MLA, so K AND V ARE THE SAME TENSOR.  The launcher passes raw_kv as both, and
  * there is one latent 512-wide vector per position.  The tile is therefore
  * staged ONCE and used in both orientations: as the B operand transposed for
  * the scores, and as the B operand directly for the value sum.
  *
- * DECOMPOSITION.  Block = 16 heads (the MMA's M) x 8 warps.
- *   phase 1  S[16][16] = Q[16][512] . KV[16][512]^T
- *            2 n-tiles x 32 k-steps = 64 MMAs.  With 8 warps that is 2 n-tiles
- *            x a 4-way split of k, so each warp owns 8 k-steps and the four
+ * DECOMPOSITION.  Block = AF16_HPB = 32 heads (AF16_MT = 2 M-tiles of the
+ * MMA's M = AF16_HEADS = 16) x AF16_WARPS = 16 warps.
+ *   phase 1  S[32][16] = Q[32][512] . KV[16][512]^T
+ *            2 M-tiles x 2 n-tiles x AF16_KSTEPS = 32 k-steps = 128 MMAs.
+ *            The 16 warps split as job = warp & 3 (M-tile = job >> 1, n-tile =
+ *            job & 1) x kgrp = warp >> 2 (a 4-way split of k), so each warp
+ *            owns AF16_KPW = 8 k-steps of one (M-tile, n-tile) and the four
  *            partials are summed through smem.  Splitting k (not n) is what
  *            lets every warp hold its Q fragments in REGISTERS for the whole
  *            kernel -- 8 k-steps x 4 regs = 32 -- since Q never changes.
  *   phase 2  online softmax over the tile, f32, per head.
- *   phase 3  O[16][512] += P[16][16] . KV[16][512]
- *            warp w owns dims 64w..64w+63: 8 n-tiles x 1 k-step = 8 MMAs, and
- *            its accumulator is 16 heads x 64 dims = 32 regs/lane.
+ *   phase 3  O[32][512] += P[32][16] . KV[16][512]
+ *            warp w owns dims AF16_DPW*w..+31 (AF16_DPW = 32): 4 n-tiles x
+ *            2 M-tiles x 1 k-step = 8 MMAs, and its accumulator
+ *            acc[AF16_MT][AF16_DPW/8][4] is 32 heads x 32 dims = 32 regs/lane.
  *
  * The output accumulator is what sets the shape.  O is heads x 512 in f32, so
- * splitting the 512 across the 8 warps is the only way it fits in registers at
- * all: 16x512/(8x32) = 32 per lane.  Everything else follows from that.
+ * splitting the 512 across the 16 warps is the only way it fits in registers at
+ * all: 32x512/(16x32) = 32 per lane.  Everything else follows from that.
  *
  * Fragment layout is the one verified in tests/attn_mma_probe.cu, not the one
  * remembered from the ISA doc -- the block-scaled work turned up two layout
  * details that were silent-wrong-answer traps, and a layout bug here produces
  * plausible attention, not an error.
+ *
+ * L210 SPLIT-K AT DECODE.  At one token the grid above is n_head/32 = 2 blocks
+ * on 48 SMs, each walking every key tile serially: 79 us/layer, 3.4 ms/token,
+ * 46 SMs idle (rows/L210.md, target 2).  DECODE rows therefore split the walk
+ * across gridDim.z blocks (flash-decode): each block folds a contiguous range
+ * of 16-row tiles with the SAME phases and writes an unnormalised partial
+ * {m, l, acc[512]} per head; attn_f16_combine_kernel folds the splits in fixed
+ * order and applies the sink.  Which rows split is L167's row-kind predicate
+ * (the leading pulsar_gpu_matmul_batch_decode_rows() rows), never the row
+ * count or the context length, so a mixed step's prefill rows and every
+ * prefill launch keep the classic whole-window walk byte for byte.  The
+ * reassociated softmax is a numerics change for decode steps only: the decode
+ * byte gate re-anchors; the reference gate (prefill logits) does not see it.
  */
 #include "pulsar_cuda_internal.h"
+#include "pulsar_cuda_mx.cuh"
+#include "pulsar_cuda_rope.cuh"
+#include "pulsar_cuda_arch.cuh"
 
 #include <cstdio>
+#include <cstring>
+#include <type_traits>   /* the declaration-vs-definition guard below */
+#include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 
+/// M-tiles (16 heads each) per block.
 #define AF16_MT         2u        /* M-tiles per block */
+/// Heads per M-tile (the MMA's M).
 #define AF16_HEADS     16u        /* the MMA's M */
+/// Heads per block (32).
 #define AF16_HPB      (AF16_HEADS * AF16_MT)       /* 32 heads per block */
+/// The only head_dim the kernel is built for.
 #define AF16_DIM      512u        /* head_dim this kernel is specialised for */
+/// KV rows per staged tile.
 #define AF16_ROWS      16u        /* KV rows per tile = the MMA's K in phase 3 */
+/// Warps per block.
 #define AF16_WARPS     16u
+/// Threads per block (512).
 #define AF16_THREADS  (AF16_WARPS * 32u)
+/// Output dims per warp (32).
 #define AF16_DPW      (AF16_DIM / AF16_WARPS)      /* 32 output dims per warp */
+/* THREE row families reach this kernel, and which one is a property of the
+ * LOADED PROFILE (pulsar_gpu_kv_row_style), not of the call site:
+ *
+ *   WINDOW  528 B  raw E4M3 x E8M0/32          V4.1's raw ring / chunk pack
+ *   MAIN    288 B  E2M1 nibbles x E4M3/16      V4.1's compressed pools
+ *   UNIFIED 384 B  E2M1 nibbles + E4M3/16 codes + f32 row scale + bf16 rope
+ *                                              V4's ONE row: raw ring, chunk
+ *                                              pack AND every pool
+ *
+ * The stage's pitch is the widest of the three (a row is copied at its own
+ * byte count inside it), and each staged row carries its own format id so the
+ * decode picks the matching accessor.  Before L218 s46 this file carried only
+ * the two V4.1 families, so a V4 attention staged 384-byte rows at WINDOW's
+ * 528-byte stride -- silent, because the launcher's own byte bound was computed
+ * from the same wrong constant. */
+/// Staged-row format id: WINDOW row (528 B).
+#define AF16_FMT_WINDOW  0u
+/// Staged-row format id: MAIN row (288 B).
+#define AF16_FMT_MAIN    1u
+/// Staged-row format id: UNIFIED row (384 B).
+#define AF16_FMT_UNIFIED 2u
+/// @param fmt an AF16_FMT_* id.
+/// @return that family's row bytes at head_dim 512.
+__device__ __forceinline__ static uint32_t af16_fmt_rowb(uint32_t fmt) {
+    switch (fmt) {
+    case AF16_FMT_MAIN:    return (uint32_t)PULSAR_MAINKV_ROWBYTES(AF16_DIM);   /* 288 */
+    case AF16_FMT_UNIFIED: return (uint32_t)PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);/* 384 */
+    default:               return (uint32_t)PULSAR_WINKV_ROWBYTES(AF16_DIM);    /* 528 */
+    }
+}
+/// WINDOW row bytes (528).
+#define AF16_WIN_ROWB  (PULSAR_WINKV_ROWBYTES(AF16_DIM))    /* 528 */
+/// MAIN row bytes (288).
+#define AF16_MAIN_ROWB (PULSAR_MAINKV_ROWBYTES(AF16_DIM))   /* 288 */
+/// UNIFIED row bytes (384).
+#define AF16_UNI_ROWB  (PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM))/* 384 */
+/// The tile stage's row pitch: the widest family.
+#define AF16_ROWB      AF16_WIN_ROWB                        /* the stage's row pitch */
+/* The tile stage copies whole 16-byte chunks (cp.async's maximum), so every
+ * family's row must be a whole 16-multiple: 528 = 33 chunks, 288 = 18, 384 = 24.
+ * A row shorter than the stage pitch copies only its own chunks (the _off <
+ * _rowb guard in the staging loop), which is what lets one pitch serve all
+ * three.  Say it rather than derive it. */
+static_assert((AF16_WIN_ROWB % 16u) == 0u && (AF16_MAIN_ROWB % 16u) == 0u &&
+              (AF16_UNI_ROWB % 16u) == 0u,
+              "each KV row family is a whole number of 16-byte chunks");
+static_assert(AF16_WIN_ROWB >= AF16_MAIN_ROWB && AF16_WIN_ROWB >= AF16_UNI_ROWB,
+              "the stage pitch is the widest family");
+/* The phase-2 softmax (one thread per (head,row), an 8/4/2/1 xor tree per
+ * head) stands on these; only a comment said so before (review C7). */
+static_assert(AF16_HPB * AF16_ROWS == AF16_THREADS,
+              "phase-2 softmax requires exactly one thread per (head,row)");
+static_assert(AF16_ROWS == 16u,
+              "the phase-2 xor tree reduces 16 rows, one aligned half-warp per head");
+static_assert(AF16_HEADS == 16u,
+              "the MMA's M tile is 16 heads; every phase indexes sPart by mt = h/16, hh = h%16");
+/* dynamic smem for the double-buffered raw KV tile stage (L037 lever 1) */
+/// Dynamic shared memory of the double-buffered tile stage.
+#define AF16_DYNSMEM_BYTES (2u * AF16_ROWS * AF16_ROWB)
+
+/* The loaded profile's row family, as the kernel wants it.  The engine pushes
+ * the style into this module once at load (pulsar_gpu_set_kv_row_style), which
+ * is the same authority the packers and the engine's cache sizing read -- so a
+ * profile cannot be UNIFIED for its packs and CSA2 for its attention. */
+/// @return 1 when the loaded profile's KV rows are UNIFIED, else 0.
+static int af16_unified_rows(void) {
+    return pulsar_gpu_kv_row_style() == PULSAR_KV_ROWS_UNIFIED ? 1 : 0;
+}
+/// k16 steps over a head (32).
 #define AF16_KSTEPS   (AF16_DIM / 16u)             /* 32 k-steps for the scores */
+/// k16 steps per warp of the 4-way score split (8).
 #define AF16_KPW      (AF16_KSTEPS / 4u)           /* 8 k-steps per warp (4-way) */
+
+/* Capacity of the per-query raw-row scratch (sRawRows).  A sliding-window plan
+ * never asks for more than PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP rows (the
+ * dispatcher caps `window` there), but the image-span visibility widens one
+ * query's reach to [q - left, q + right] with left <= max_image_tokens-1 and
+ * right <= max_image_tokens (vision_image_visible's clamps), i.e. at most
+ * 2*max_image_tokens + 1 rows.  The scratch must hold whichever is larger; a
+ * plan that asked for more would be clipped here, and clipping an image span is
+ * exactly the wrong answer this bound exists to make impossible. */
+/// Capacity of the per-query raw-row scratch.
+#define AF16_RAWROWS  (2u * PULSAR_VISION_MAX_N_TOKEN + 1u)
+static_assert(AF16_RAWROWS >= PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP,
+              "sRawRows must also cover the dispatcher's raw-window cap");
 
 /* WHY 2 M-TILES.  ncu on the 1-M-tile version: pipe_tensor 6-8%, pipe_lsu 33%,
  * 7.15 GB of L2 traffic in 11.9 ms -- the MMAs idle while the kernel moves KV.
@@ -78,33 +197,132 @@
 /* +8 halves of padding: the phase-1 B fragment walks DOWN a column of the tile
  * (fixed dim, varying row), so an unpadded 512-wide row stride would put every
  * lane in the same bank. */
+/// Padded KV tile row stride, halves.
 #define AF16_KVSTRIDE (AF16_DIM + 8u)
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-#define PULSAR_ATTN_F16_MMA 1
-#else
-#define PULSAR_ATTN_F16_MMA 0
-#endif
+/* L210 split-K partial record per (token, head, split): [0] the running max m,
+ * [1] the running sum l (of the fp16-ROUNDED weights, as the classic epilogue
+ * sums them), [AF16_PART_ACC, +AF16_DIM) the unnormalised value accumulator.
+ * An empty split writes m = -INFINITY, l = 0 and no accumulator; the combine
+ * folds it with weight zero and never reads the accumulator. */
+/// Offset of a split-K partial record's accumulator (after m, l and padding), floats.
+#define AF16_PART_ACC     4u
+/// Floats per split-K partial record.
+#define AF16_PART_STRIDE  (AF16_PART_ACC + AF16_DIM)
+static_assert(AF16_PART_ACC % 4u == 0u && AF16_PART_STRIDE % 4u == 0u,
+              "partial accumulators must stay 16-byte aligned: the epilogue stores float2 pairs");
+/* LOGICAL splits vs PHYSICAL blocks.  The numerics are the logical split: a
+ * row's key tiles are partitioned into AF16_SPLITS contiguous ranges of
+ * ceil(n_tiles / AF16_SPLITS) tiles, a function of the row's OWN context and
+ * never of how many rows share the launch -- a count derived from the row
+ * count would give a row a different accumulation order at 1 row than at 3,
+ * the L161 class of split the row-neutrality gates refuse.  Each logical
+ * split's partial depends on its own tiles alone, so WHICH block folds it,
+ * and whether that block folds others before or after, cannot change a byte.
+ * The launcher therefore picks the PHYSICAL block count per (row, head-group)
+ * -- gridDim.z = n_phys in [1, AF16_SPLITS] -- to put one block on every SM
+ * (one is all that fits: see af16_split_target_blocks), and a block folds
+ * logical splits z, z + n_phys, ... in turn, resetting its softmax state
+ * between them.
+ *
+ * WHY 4.  Every logical split costs a pipeline restart (its first tile's
+ * stage is not overlapped with anything) and a 64 KB partial, ~10 us,
+ * whatever block folds it -- the served-lane census read the 16-split kernel
+ * at 75 us against the classic walk's 85 at 6..12 rows with one wave AND with
+ * two (rows/L210.md): a six-row step is 192 logical splits either way.  The
+ * count trades the one-row case for the served widths: 16 splits are 25 us
+ * at one row (host-bound there, so unseen) and 75 at width; 4 splits model at
+ * ~38 at one row and ~35..70 at 6..12 rows, all under the classic 85.  Splits
+ * past a row's tile count fold as empty. */
+/// Logical split-K splits per decode row.
+#define AF16_SPLITS       4u
+/// @param partials the partial records.
+/// @param t token row.
+/// @param n_head query heads.
+/// @param h head.
+/// @param n_split splits per (row, head).
+/// @param split the split.
+/// @return the accumulator of (t, h)'s split `split`.
+__device__ __forceinline__ static float *af16_part_acc(float *partials, uint32_t t, uint32_t n_head,
+                                                       uint32_t h, uint32_t n_split, uint32_t split) {
+    return partials + ((uint64_t)t * n_head + h) * n_split * AF16_PART_STRIDE +
+           (uint64_t)split * AF16_PART_STRIDE + AF16_PART_ACC;
+}
+/// Writes a partial record's (m, l).
+/// @param partials the partial records.
+/// @param t token row.
+/// @param n_head query heads.
+/// @param h head.
+/// @param n_split splits per (row, head).
+/// @param split the split.
+/// @param m running max.
+/// @param l running sum.
+__device__ __forceinline__ static void af16_part_header(float *partials, uint32_t t, uint32_t n_head,
+                                                        uint32_t h, uint32_t n_split, uint32_t split,
+                                                        float m, float l) {
+    float *rec = af16_part_acc(partials, t, n_head, h, n_split, split) - AF16_PART_ACC;
+    rec[0] = m;
+    rec[1] = l;
+}
 
-#if PULSAR_ATTN_F16_MMA
+/// One m16n8k16 f16 MMA, f32 accumulate (traps below sm_80).
+/// @param d0 accumulator 0, in/out.
+/// @param d1 accumulator 1, in/out.
+/// @param d2 accumulator 2, in/out.
+/// @param d3 accumulator 3, in/out.
+/// @param a0 A fragment register 0.
+/// @param a1 A fragment register 1.
+/// @param a2 A fragment register 2.
+/// @param a3 A fragment register 3.
+/// @param b0 B fragment register 0.
+/// @param b1 B fragment register 1.
 __device__ __forceinline__ static void af16_mma(
         float &d0, float &d1, float &d2, float &d3,
         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
         uint32_t b0, uint32_t b1) {
+#if PULSAR_SM80
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
+#else
+    (void)d0; (void)d1; (void)d2; (void)d3; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+    __trap();
 #endif
+}
 
-#if PULSAR_ATTN_F16_MMA
+/* Load a pair of ADJACENT stored-Q elements as one packed-f16 fragment word.
+ * For __half storage the bytes are already the fragment encoding, so it is a
+ * single aligned 4-byte load -- the old path round-tripped half->float->half
+ * for nothing (L086 T7).  Alignment: callers pass even element indices off
+ * 256-aligned row bases.  (A <float> specialization that converted on load
+ * existed for the f32-Q instantiation; that instantiation's only reference was
+ * a smem grant, both deleted 2026-09-02.  A future Q width change adds its
+ * specialization here and the compiler names the site.) */
+/// @tparam QT the stored Q element type.
+/// @param p a Q row.
+/// @param i an even element index.
+/// @return elements i, i + 1 as a packed f16 fragment word.
+template <typename QT>
+__device__ __forceinline__ static uint32_t af16_load_pair(const QT *p, uint32_t i);
+/// @param p a Q row.
+/// @param i an even element index.
+/// @return the two halves as one word.
+template <>
+__device__ __forceinline__ uint32_t af16_load_pair<__half>(const __half *p, uint32_t i) {
+    return *(const uint32_t *)(p + i);
+}
+
+/* Not under PULSAR_SM80: the fused Q-prep pair builder below (L037)
+ * calls af16_pack from outside the MMA-only region. */
+/// @param lo low element.
+/// @param hi high element.
+/// @return the packed f16 pair (round to nearest).
 __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
     return (uint32_t)__half_as_ushort(__float2half(lo)) |
            ((uint32_t)__half_as_ushort(__float2half(hi)) << 16);
 }
-#endif
 
 /* 512 threads means one block already fills 65536/(512) = 128 registers worth
  * of the SM budget, so asking for 2 resident blocks caps the kernel at 64 and
@@ -112,103 +330,360 @@ __device__ __forceinline__ static uint32_t af16_pack(float lo, float hi) {
  * concession here, it is the only setting that lets the accumulators live in
  * registers at all. */
 #ifndef AF16_MINBLK
+/// Minimum resident blocks per SM for __launch_bounds__ (1: the accumulators stay in registers).
 #define AF16_MINBLK 1
 #endif
+/* Build one packed f16 pair from RAW q: apply this head's RMS scale when the
+ * profile has one, rope-rotate when the pair sits in the tail, and round to
+ * bf16 -- the reference rotates in fp32 and copies back into the bf16 tensor
+ * (apply_rotary_emb), so the attention sees bf16 values; the nope dims are bf16
+ * already (Q is stored bf16).  c0 is even and n_nope is even, so a pair never
+ * straddles the nope/rope boundary and one c0 >= n_nope test covers both
+ * elements.  The rotation is the shared core every tail-rope consumer uses
+ * (pulsar_cuda_rope.cuh) -- a transcribed copy here is how bit-exactness would
+ * die.
+ *
+ * `scale` is 1.0f for a profile whose reference has no per-head Q norm (V4.1:
+ * its q_norm is on the low-rank latent, applied before wq_b) and the head's
+ * rsqrt(mean(x^2)+eps) for one that does (0731).  The scale applies to the WHOLE
+ * head -- nope and rope dims alike, before the rotation -- because that is where
+ * the reference's `q *= ...` sits; scaling only the rotated pair would be a
+ * different function. */
+/// @tparam QT the stored Q element type.
+/// @param qrow the raw Q row of one head.
+/// @param c0 even element index.
+/// @param scale the head's RMS scale (1 without a Q norm).
+/// @param q_nope dims before the rope tail.
+/// @param qp the fused Q rope descriptor (by value).
+/// @param rope_pos the row's rope position.
+/// @param corr0 YaRN correction dim 0.
+/// @param corr1 YaRN correction dim 1.
+/// @return the packed f16 pair.
+template <typename QT>
+__device__ static inline uint32_t af16_pack_qraw(
+        const QT *qrow, uint32_t c0, float scale, uint32_t q_nope,
+        const pulsar_gpu_q_prep qp, uint32_t rope_pos,
+        float corr0, float corr1) {
+    float x0 = q_load<QT>(qrow, c0) * scale;
+    float x1 = q_load<QT>(qrow, c0 + 1u) * scale;
+    if (c0 >= q_nope) {
+        float r0, r1;
+        rope_pair_rotate_core_dev(x0, x1, c0 - q_nope, qp.n_rot, rope_pos, 0,
+                                  qp.freq_base, qp.freq_scale, qp.ext_factor,
+                                  qp.attn_factor, corr0, corr1, &r0, &r1);
+        /* f32, NOT narrowed here: the standalone arm stores this same f32
+         * rotation straight into the f16 buffer, and af16_pack below is the
+         * single narrowing.  Rounding to bf16 first cost 1-2 bf16 ULP on every
+         * rotated element, which is what made production's Q disagree with the
+         * standalone arm and with dev (2de728f3; the bare revert 683e406d put it
+         * back and this restores it). */
+        x0 = r0;
+        x1 = r1;
+    }
+    return af16_pack(x0, x1);
+}
+
+/* The raw range ONE query sees, in ABSOLUTE positions, with the image-span
+ * visibility folded in.  vis_l/vis_r are the reference's per-query `left`/
+ * `right` counts (0 outside a sentinel span); a query inside a span reaches
+ * `vis_l` back to the span's first slot and `vis_r` forward to its IMAGE_END,
+ * on top of the ordinary sliding window.  With both 0 the bounds degenerate to
+ *   lo = qpos + 1 - window   (window == 0 = unbounded -> 0)
+ *   hi = qpos
+ * which is exactly the pre-L216 window.  This is the ONE place that min/max
+ * lives: the ring plan and the dense plan both call it, so the forward reach
+ * cannot be forgotten in one of them. */
+/// @param qpos the query position.
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param vis_l image-span count to the left (0 outside a span).
+/// @param vis_r image-span count to the right.
+/// @param lo_out out: first visible raw position.
+/// @param hi_out out: last visible raw position.
+__device__ __forceinline__ static void af16_vis_bounds(
+        uint32_t qpos, uint32_t window, int32_t vis_l, int32_t vis_r,
+        uint32_t *lo_out, uint32_t *hi_out) {
+    uint32_t lo = (window != 0u && qpos + 1u > window) ? qpos + 1u - window : 0u;
+    if (vis_l > 0) {
+        const uint32_t vl = (uint32_t)vis_l;
+        const uint32_t vlo = vl <= qpos ? qpos - vl : 0u;
+        if (vlo < lo) lo = vlo;
+    }
+    uint32_t hi = qpos;
+    if (vis_r > 0) hi = qpos + (uint32_t)vis_r;
+    *lo_out = lo;
+    *hi_out = hi;
+}
+
+/// The fp16 tensor-core attention: grid (n_tokens, ceil(n_head / 32), split blocks), 512 threads,
+/// AF16_DYNSMEM_BYTES dynamic shared memory (granted by af16_dynsmem_ok).
+/// @tparam QT the stored Q element type (__half).
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param q the queries, [n_tokens][n_head][head_dim] (stored Q type; raw when q_prep is non-NULL).
+/// @param raw_kv the raw KV rows (ring, chunk pack buffer or banked pools; the profile's row family).
+/// @param comp_kv the compressed KV rows (MAIN or UNIFIED rows); unused when n_comp == 0.
+/// @param topk per-token top-k compressed row indices, i32 [n_tokens][top_k], or NULL (the visible prefix).
+/// @param n_tokens query rows.
+/// @param n_comp compressed rows (banked mode: the cross-bank superset clamp).
+/// @param window the sliding window, rows (banked mode: 1 .. PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP).
+/// @param ratio compression ratio (positions per compressed row).
+/// @param n_head query heads.
+/// @param pos0 the first row's position (scalar mode).
+/// @param n_raw raw rows visible (scalar mode; ignored in banked mode).
+/// @param raw_cap raw ring capacity per bank, rows.
+/// @param raw_start_in the ring slot of the oldest visible raw row (scalar mode).
+/// @param top_k compressed rows each query selects.
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param seq_id per-row bank ids, i32 [n_tokens], or NULL (both or neither with positions).
+/// @param comp_bank_ptrs optional per-bank compressed-pool base table (banked mode), or NULL.
+/// @param comp_cap compressed rows per bank (banked mode).
+/// @param n_banks banks in the pools (banked mode).
+/// @param vis_left image-span visibility to the left, i32 [n_tokens], or NULL (text).
+/// @param vis_right image-span visibility to the right, i32 [n_tokens], or NULL (text).
+/// @param ring nonzero: the ring / descriptor row plan.
+/// @param non_causal nonzero: every ring row up to the last is visible (the drafter's raw-window forward).
+/// @param gact_data grouped E4M3 data slots for the attn-output "a" GEMM, or NULL (no emission).
+/// @param gact_scale the grouped E8M0 scale slab.
+/// @param gact_kbp the scale slab's padded k-block pitch.
+/// @param gact_slab bytes between groups' scale slabs.
+/// @param n_groups output groups of the "a" GEMM.
+/// @param n_nope head dims before the rope tail (the epilogue encodes these).
+/// @param gact_tok0 this launch's first row in the grouped slab.
+/// @param gact_ntok the grouped slab's row count.
+/// @param qp the fused Q rope descriptor (by value).
+/// @param q_raw nonzero: q holds raw projections (rope fused).
+/// @param unified_rows nonzero: raw and comp rows are UNIFIED rows.
+/// @param partials split-K partial records for rows < n_dec, or NULL.
+/// @param n_dec rows that take the split-K walk.
+template <typename QT>
 __global__ __launch_bounds__(AF16_THREADS, AF16_MINBLK)
 static void attn_f16_kernel(
-        float *__restrict__ heads,            /* [n_tokens][n_head][512] */
+        pulsar_heads_t *__restrict__ heads,   /* [n_tokens][n_head][512], STORED width
+                                               * = PULSAR_HEADS_ELT_SIZE (L033) */
         const float *__restrict__ sinks,      /* [n_head] */
-        const float *__restrict__ q,          /* [n_tokens][n_head][512] */
-        const float *__restrict__ raw_kv,     /* [n_tokens][512], f16 or f32 */
-        const float *__restrict__ comp_kv,    /* [n_comp][512] f32, may alias raw */
+        const QT *__restrict__ q,             /* [n_tokens][n_head][512], f32 or __half */
+        const pulsar_winkv_row_t *__restrict__ raw_kv,   /* WINDOW rows */
+        const pulsar_mainkv_row_t *__restrict__ comp_kv, /* MAIN rows; unused when
+                                               * n_comp == 0.  These carried a bare
+                                               * float* until L092 -- "THE POINTER
+                                               * TYPE LIES" was this comment's
+                                               * opening line -- and a mis-strided
+                                               * read of the 584 B rows once
+                                               * produced OOB NaNs from a clean
+                                               * compile.  The opaque types make
+                                               * that unwritable now: only the row
+                                               * accessors can read these. */
         const int32_t *__restrict__ topk,     /* NULL = dense window mode */
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, int raw_f16,
+        uint32_t n_head,
         uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start_in,
         uint32_t top_k,
+        /* positions: ring mode -> per-row query position for the row plan and
+         * the fused Q rope; dense mode -> fused Q rope only (a banked
+         * zero-prefix prefill batch ropes at positions[t], not t). */
         const int32_t *__restrict__ positions, const int32_t *__restrict__ seq_id,
         const void *const *__restrict__ comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks, int comp_pack,
-        int ring) {                       /* ring/descriptor row plan; topk may
+        uint32_t comp_cap, uint32_t n_banks,
+        /* Image-span visibility: per-query counts to the left and right of the
+         * query (the reference's get_image_visible), indexed by this launch's
+         * OWN token axis, or NULL for every text-only launch.  Non-NULL widens
+         * one query's raw reach on BOTH sides -- the ring plan enlarges its
+         * span, the dense plan replaces its window -- because an image span is
+         * the one bidirectional region.  See af16_vis_bounds.  Both are NULL or
+         * both are set (the wrappers refuse a half pair). */
+        const int32_t *__restrict__ vis_left, const int32_t *__restrict__ vis_right,
+        int ring,                         /* ring/descriptor row plan; topk may
                                            * be NULL -> visible comp prefix */
-#if !PULSAR_ATTN_F16_MMA
-    (void)heads; (void)sinks; (void)q; (void)raw_kv; (void)comp_kv; (void)topk;
-    (void)n_tokens; (void)n_comp; (void)window; (void)ratio; (void)n_head; (void)raw_f16;
-    (void)pos0; (void)n_raw; (void)raw_cap; (void)raw_start_in; (void)top_k;
-    (void)positions; (void)seq_id; (void)comp_bank_ptrs; (void)comp_cap; (void)n_banks;
-    (void)comp_pack; (void)ring;
-#else
+        int non_causal,                   /* ring mode only: a query sees every
+                                           * raw row up to the ring's last one,
+                                           * not only rows at or before its own
+                                           * position (the drafter's raw-window
+                                           * forward).  Changes WHICH raw rows
+                                           * are visible, never how a visible
+                                           * row is folded; comp visibility is
+                                           * untouched. */
+        /* Grouped E4M3 activation slots for the attn-output "a" projection.
+         * NULL = f32 only.  This epilogue owns the NOPE blocks (head dims
+         * [0, n_nope)); rope_tail_kernel rewrites [n_nope, AF16_DIM) in place
+         * afterwards and owns those blocks -- see pulsar_gpu_mxfp8_gact_slot. */
+        __nv_fp8_e4m3 *__restrict__ gact_data,
+        unsigned char *__restrict__ gact_scale,
+        int gact_kbp, uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
+        /* The grouped encoding is indexed by BATCH-ABSOLUTE token, but this
+         * kernel may be launched over a VIEW covering one token (the per-token
+         * indexed prefill loop).  gact_tok0 is this launch's offset into the
+         * batch and gact_ntok the batch's total row count -- they are the row
+         * and the stride the "a" GEMM will read with, and are NOT the kernel's
+         * own n_tokens unless the launch covers the whole batch. */
+        uint32_t gact_tok0, uint32_t gact_ntok,
+        /* L037 lever 3: when q_raw != 0, `q` holds RAW head projections and
+         * this kernel applies the tail rope itself at Q-fragment build
+         * (shared rope core -- see af16_pack_qraw). */
+        pulsar_gpu_q_prep qp, int q_raw,
+        /* The loaded profile's KV row family: nonzero means BOTH `raw_kv` and
+         * `comp_kv` are the 384-byte UNIFIED row (V4); zero means the V4.1
+         * WINDOW/MAIN pair.  A launch-invariant profile fact, passed in rather
+         * than read per row. */
+        int unified_rows,
+        /* L210 split-K (see the file header).  Rows t < n_dec split their key
+         * walk across gridDim.z blocks and write partials; rows t >= n_dec run
+         * the classic whole-window walk on blockIdx.z == 0 and store heads
+         * here.  n_dec == 0 with partials == NULL is every prefill launch. */
+        float *__restrict__ partials, uint32_t n_dec) {
     const uint32_t t = blockIdx.x;
     const uint32_t hbase = blockIdx.y * AF16_HPB;
     if (t >= n_tokens || hbase >= n_head) return;
+    /* L210: a decode row's blocks share its walk (physical block z folds
+     * logical splits z, z + n_phys, ...); a prefill row's walk is blockIdx.z
+     * == 0's alone.  Block-uniform, and before every barrier. */
+    const uint32_t phys = blockIdx.z, n_phys = gridDim.z;
+    const uint32_t n_split = AF16_SPLITS;
+    const int split_mode = (t < n_dec);
+    if (!split_mode && phys != 0u) return;
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t g = lane >> 2u;          /* fragment groupID 0..7 */
     const uint32_t tg = lane & 3u;          /* thread-in-group 0..3 */
+    /* ldmatrix addressing for the phase-3 B fragment: lanes 0-7 supply the eight
+     * rows of the k0..7 tile, lanes 8-15 the k8..15 tile (16-31 are ignored for
+     * .x2 but still compute an address, harmlessly duplicating). Verified
+     * bit-identical to the scalar loads it replaces -- see the note at the load. */
+    const uint32_t ldm_row = lane & 7u;
+    const uint32_t ldm_half = (lane >> 3u) & 1u;
 
     /* Dead/evicted row: zero the heads and leave together.  This MUST precede
-     * every __syncthreads in the kernel, exactly as in the f32 twin -- a
-     * partial early return past a barrier hangs the block. */
+     * every __syncthreads in the kernel -- a partial early return past a
+     * barrier hangs the block. */
     if (seq_id && (uint32_t)seq_id[t] >= n_banks) {
+        if (split_mode) {
+            /* An empty partial from every split: the combine folds nothing and
+             * stores zero heads, as the classic path below does directly. */
+            if (tid < AF16_HPB)
+                for (uint32_t sp = phys; sp < n_split; sp += n_phys)
+                    af16_part_header(partials, t, n_head, hbase + tid, n_split, sp, -INFINITY, 0.0f);
+            return;
+        }
         for (uint32_t i = tid; i < AF16_HPB * AF16_DIM; i += AF16_THREADS) {
             const uint32_t hh = hbase + i / AF16_DIM;
-            if (hh < n_head) heads[((uint64_t)t * n_head + hh) * AF16_DIM + (i % AF16_DIM)] = 0.0f;
+            if (hh < n_head) heads_store(heads, ((uint64_t)t * n_head + hh) * AF16_DIM + (i % AF16_DIM), 0.0f);
         }
         return;
     }
 
     /* ---- row plan ------------------------------------------------------
      * Two modes.  Dense window (topk == NULL, ring == 0) is the raw/mixed
-     * launchers' contiguous causal window.  RING mode reproduces
-     * attention_indexed_mixed_heads8_online_kernel's plan verbatim: raw rows
-     * come out of a ring buffer (hence the modulo and the row table) and the
+     * prefill launchers' contiguous causal window over the batch's own
+     * tokens.  RING mode is the decode-batch and indexed plan: raw rows come
+     * out of a ring buffer (hence the modulo and the row table) and the
      * compressed rows are either a top-k SELECTION (topk != NULL) or the
-     * visible prefix (topk == NULL -- the continued-prefill sweep).  The
+     * visible prefix (topk == NULL -- the decode-batch sweep).  The
      * banked-descriptor variant (positions/seq_id/comp_bank_ptrs) and
-     * ATTN_PACK comp rows are both served: the preamble below derives the
-     * per-row qpos / raw_base / comp_src byte-for-byte as the f32 kernel
-     * does, and NULL descriptors collapse every term to the scalar
-     * pos0+t path.  Bank isolation is gated by
-     * tests/attn_f16_banked_test.cu; pack decode goes through the shared
-     * attn_comp_pack_ld. */
-    __shared__ uint32_t sRawRows[256];
+     * MAIN comp rows are both served: the preamble below derives the
+     * per-row qpos / raw_base / comp_src from the descriptors, and
+     * NULL descriptors collapse every term to the scalar pos0+t path.  Bank
+     * isolation is gated by tests/attn_f16_banked_test.cu; pack decode goes
+     * through the shared winkv_row_ld4 / mainkv_row_ld4.
+     *
+     * RAW VISIBILITY.  The ring holds positions [first_raw_pos, raw_last_pos]
+     * (per row under descriptors: the window ending at positions[t]; scalar:
+     * the n_raw rows ending at pos0 + n_tokens - 1).  A row sees
+     *   lo = max(first_raw_pos, qpos + 1 - window)      (window 0 = unbounded)
+     *   hi = non_causal ? raw_last_pos : min(qpos, raw_last_pos)
+     * so causal rows see only ring rows at or before their own position and
+     * non-causal rows see the whole ring up to its last row.  Under
+     * descriptors raw_last_pos == positions[t], so the drafter's banked
+     * launch (positions = each bank's VISIBILITY position, the bank's last
+     * draft position, window = raw_cap) derives the same window either way;
+     * the scalar launch (pos0 = the first query's position, n_raw = the
+     * visible rows) is where the two rules differ. */
+    __shared__ uint32_t sRawRows[AF16_RAWROWS];
     __shared__ uint32_t sRawCount, sRawFirst;
     __shared__ uint32_t sVisComp;
     uint32_t raw_count, raw_start = 0u, comp_count = 0u;
     uint32_t comp_base = 0u;
-    const float *comp_src = comp_kv;
+    const pulsar_mainkv_row_t *comp_src = comp_kv;
     if (ring) {
-        /* Descriptor (banked) preamble, byte-for-byte as the f32 kernel derives
-         * it; NULL descriptors collapse to the scalar pos0+t path. */
+        /* Descriptor (banked) preamble; NULL descriptors collapse to the
+         * scalar pos0+t path. */
         const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
+        /* Image-span visibility for THIS row, or 0/0 for a text launch.  The
+         * two arrays are a pair (the wrappers refuse a half pair), and the
+         * launch's token axis is this kernel's own t. */
+        const uint32_t vis_l = vis_left ? (vis_left[t] > 0 ? (uint32_t)vis_left[t] : 0u) : 0u;
+        const uint32_t vis_r = vis_right ? (vis_right[t] > 0 ? (uint32_t)vis_right[t] : 0u) : 0u;
         uint32_t eff_n_raw = n_raw, eff_raw_start = raw_start_in, first_raw_pos;
+        uint32_t vis_hi = 0u;   /* visibility path: the last raw position this query reaches */
         if (positions) {
-            eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
-            if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
-            eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
-            first_raw_pos = qpos + 1u - eff_n_raw;
+            if (vis_left) {
+                /* An image query replaces the window-derived span with the
+                 * span's own reach [qpos - left, qpos + right].  Enlarging
+                 * eff_n_raw HERE is what makes the forward rows addressable:
+                 * the plan below folds exactly [first_raw_pos, vis_hi], and a
+                 * rows table sized for the plain window would not hold them. */
+                af16_vis_bounds(qpos, window, (int32_t)vis_l, (int32_t)vis_r,
+                                &first_raw_pos, &vis_hi);
+                eff_n_raw = vis_hi - first_raw_pos + 1u;
+                eff_raw_start = first_raw_pos % raw_cap;
+            } else {
+                eff_n_raw = (window != 0u && qpos + 1u > window) ? window : qpos + 1u;
+                if (eff_n_raw > raw_cap) eff_n_raw = raw_cap;
+                eff_raw_start = (qpos + 1u - eff_n_raw) % raw_cap;
+                first_raw_pos = qpos + 1u - eff_n_raw;
+            }
+        } else if (vis_left) {
+            /* Scalar ring: n_raw says how much of the ring the launcher stored.
+             * Widen around the query but never past either end of that live
+             * range -- the HOST refuses a span needing more than the ring
+             * holds, so this clamp can only be reached by a caller that
+             * bypassed the host, and it must not address a foreign row. */
+            uint32_t lo, hi;
+            af16_vis_bounds(qpos, window, (int32_t)vis_l, (int32_t)vis_r, &lo, &hi);
+            const uint32_t first = pos0 + n_tokens - n_raw;
+            const uint32_t last = pos0 + n_tokens - 1u;
+            if (lo < first) lo = first;
+            if (hi > last) hi = last;
+            eff_n_raw = hi >= lo ? hi - lo + 1u : 0u;
+            eff_raw_start = eff_n_raw ? lo % raw_cap : 0u;
+            first_raw_pos = lo;
+            vis_hi = hi;
         } else {
             first_raw_pos = pos0 + n_tokens - n_raw;
         }
         const uint32_t sid_b = seq_id ? (uint32_t)seq_id[t] : 0u;
         const uint32_t raw_base = seq_id ? sid_b * raw_cap : 0u;
-        comp_src = comp_bank_ptrs ? (const float *)comp_bank_ptrs[sid_b] : comp_kv;
+        comp_src = comp_bank_ptrs ? (const pulsar_mainkv_row_t *)comp_bank_ptrs[sid_b] : comp_kv;
         comp_base = comp_bank_ptrs ? 0u : (seq_id ? sid_b * comp_cap : 0u);
         if (tid == 0u) {
             uint32_t rc = 0u, rf = 0u;
             if (eff_n_raw != 0u) {
                 const uint32_t raw_last_pos = first_raw_pos + eff_n_raw - 1u;
                 if (qpos >= first_raw_pos) {
-                    uint32_t lo = first_raw_pos;
-                    if (window != 0u && qpos + 1u > window) {
-                        const uint32_t wlo = qpos + 1u - window;
-                        if (wlo > lo) lo = wlo;
+                    uint32_t lo, hi;
+                    if (vis_left) {
+                        /* first_raw_pos IS the lower bound the helper chose;
+                         * re-raising it to the plain window would drop the
+                         * backward reach the span needs. */
+                        lo = first_raw_pos;
+                        hi = non_causal ? raw_last_pos
+                                        : (vis_hi < raw_last_pos ? vis_hi : raw_last_pos);
+                    } else {
+                        lo = first_raw_pos;
+                        if (window != 0u && qpos + 1u > window) {
+                            const uint32_t wlo = qpos + 1u - window;
+                            if (wlo > lo) lo = wlo;
+                        }
+                        hi = non_causal ? raw_last_pos
+                                        : (qpos < raw_last_pos ? qpos : raw_last_pos);
                     }
-                    const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
                     if (hi >= lo) { rf = lo - first_raw_pos; rc = hi - lo + 1u; }
-                    if (rc > 256u) rc = 256u;
+                    /* A text row's window is capped at RAW_SCORE_CAP by the
+                     * dispatcher, so this is the pre-L216 cap unchanged; the
+                     * image-span plan may use the whole scratch. */
+                    const uint32_t rows_cap = vis_left ? AF16_RAWROWS
+                                                       : PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP;
+                    if (rc > rows_cap) rc = rows_cap;
                 }
             }
             sRawCount = rc; sRawFirst = rf;
@@ -228,8 +703,23 @@ static void attn_f16_kernel(
         sVisComp = visible_comp;
         __syncthreads();
     } else {
-        raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
-        raw_start = t + 1u - raw_count;
+        if (vis_left) {
+            /* Dense prefill: the raw rows are the chunk's own tokens, so the
+             * helper's absolute bounds ARE row indices -- the forward reach is
+             * the whole point, since a query mid-span must see the rest of it.
+             * Clamp the top to the chunk: the host refuses a span that would
+             * reach past it. */
+            const uint32_t vis_l = vis_left[t] > 0 ? (uint32_t)vis_left[t] : 0u;
+            const uint32_t vis_r = vis_right[t] > 0 ? (uint32_t)vis_right[t] : 0u;
+            uint32_t lo, hi;
+            af16_vis_bounds((uint32_t)t, window, (int32_t)vis_l, (int32_t)vis_r, &lo, &hi);
+            if (hi >= n_tokens) hi = n_tokens - 1u;
+            raw_start = lo;
+            raw_count = hi >= lo ? hi - lo + 1u : 0u;
+        } else {
+            raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+            raw_start = t + 1u - raw_count;
+        }
         if (n_comp != 0u && ratio != 0u) {
             comp_count = (t + 1u) / ratio;
             if (comp_count > n_comp) comp_count = n_comp;
@@ -238,42 +728,223 @@ static void attn_f16_kernel(
     const uint32_t n_score = raw_count + comp_count;
     const float scale = rsqrtf((float)AF16_DIM);
 
-    __shared__ __half sKV[AF16_ROWS * AF16_KVSTRIDE];
+    /* ---- L210: the logical splits this block folds -----------------------
+     * Whole tiles, contiguous, ceil(n_tiles / AF16_SPLITS) per logical split,
+     * so the partition is a function of this row's own context and the tile
+     * boundaries -- the rows staged together -- are those of the classic
+     * walk.  The classic path is the loop run once over the whole window. */
+    const uint32_t n_tiles = (n_score + AF16_ROWS - 1u) / AF16_ROWS;
+    const uint32_t tps = split_mode ? (n_tiles + n_split - 1u) / n_split : 0u;
+    const uint32_t n_iter = split_mode ? (n_split - phys + n_phys - 1u) / n_phys : 1u;
+
+    /* __align__(16) is REQUIRED by the ldmatrix in phase 3: it loads 8 x 16 bits
+     * per lane and the address must be 16-byte aligned.  A __half array is only
+     * 2-byte aligned by default, and this one follows sRawRows[AF16_RAWROWS]
+     * plus three uint32_t -- 4*(AF16_RAWROWS + 3) bytes in, not a multiple of
+     * 16 -- so the explicit alignment is load-bearing. */
+    __shared__ __align__(16) __half sKV[AF16_ROWS * AF16_KVSTRIDE];
     __shared__ float  sPart[4][AF16_MT][AF16_HEADS][AF16_ROWS];  /* k-split partials */
     __shared__ float  sS[AF16_HPB][AF16_ROWS];
     __shared__ __half sP[AF16_HPB][AF16_ROWS];
     __shared__ float  sCorr[AF16_HPB];
+    /* Per-tile row validity for the top-k selection. An entry the indexer left
+     * invalid means "there is no k-th row here", so it must contribute NOTHING;
+     * see the mask in phase 2. Written by the d4 == 0 thread of each row during
+     * staging, so the existing post-staging __syncthreads covers it and no extra
+     * barrier is needed. Rows >= nr are never read (phase 2 masks them anyway),
+     * so a stale entry from the previous tile is harmless. */
+    __shared__ uint8_t sRowBad[AF16_ROWS];
     __shared__ float  sM[AF16_HPB], sL[AF16_HPB];
+    /* Per-head max from the parallel softmax pass, read by the lane that folds
+     * it into the running state (sM/sL/sCorr) after the sync. */
+    __shared__ float  sMx[AF16_HPB];
 
     /* ---- Q fragments, once, into registers -----------------------------
-     * Warp w owns k-steps [ (w>>1)*KPW, +KPW ) of head-block M=16.  Q is
+     * Warp w works job = w & 3 (M-tile, n-tile) and k-group kgrp = w >> 2,
+     * owning k-steps [ kgrp*AF16_KPW, +AF16_KPW ) of its M-tile.  Q is
      * constant for the whole kernel, so this is loaded once and never re-read;
      * that is the entire reason phase 1 splits k rather than n. */
     /* 4 jobs = 2 M-tiles x 2 n-tiles; 4 warps split k within each job. */
     const uint32_t job = warp & 3u;
     const uint32_t mtile = job >> 1u, ntile = job & 1u;
     const uint32_t kgrp = warp >> 2u;                   /* 0..3 */
+    /* L037 lever 3 prologue: per-head RMS scales for the block's rows when the
+     * profile has them, plus the rope's YaRN correction dims, once per block.
+     *
+     * The scale reduction replays the standalone head_rms_norm_rope_tail_kernel
+     * (blockDim 256: thread i sums x[i]^2 then x[i+256]^2, then a power-of-two
+     * tree partial[i] += partial[i + s] for s = 128, 64, ..., 1) operation for
+     * operation.  Two rows per WARP, lane L standing in for threads L + 32k,
+     * k = 0..7: the strides >= 32 pair the lane's own registers, the strides
+     * < 32 pair lanes through shuffles -- the same pairs in the same
+     * association order, so the same bits, and no block barrier.  Bit-exactness
+     * of the fusion still hangs on this matching that kernel; change either,
+     * change both. */
+    __shared__ float sQscale[AF16_HPB];
+    float q_corr0 = 0.0f, q_corr1 = 0.0f;
+    if (q_raw) {
+        #pragma unroll
+        for (uint32_t hh = 0; hh < 2u; hh++) {
+            const uint32_t r = warp * 2u + hh;
+            const QT *xr = q + ((uint64_t)t * n_head + hbase + r) * AF16_DIM;
+            float part[8];
+            #pragma unroll
+            for (uint32_t k = 0; k < 8u; k++) {
+                float sum = 0.0f;
+                for (uint32_t i = lane + 32u * k; i < AF16_DIM; i += 256u) {   /* thread (lane + 32k)'s loop */
+                    float v = q_load<QT>(xr, i);
+                    sum += v * v;
+                }
+                part[k] = sum;
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) part[k] += part[k + 4u];   /* stride 128 */
+            part[0] += part[2];                                          /* stride 64 */
+            part[1] += part[3];
+            part[0] += part[1];                                          /* stride 32 */
+            float v = part[0];
+            v += __shfl_down_sync(0xffffffffu, v, 16);                   /* stride 16: lane L takes L + 16 */
+            v += __shfl_down_sync(0xffffffffu, v, 8);
+            v += __shfl_down_sync(0xffffffffu, v, 4);
+            v += __shfl_down_sync(0xffffffffu, v, 2);
+            v += __shfl_down_sync(0xffffffffu, v, 1);
+            /* qp.eps is 0 for a profile with no per-head norm, and
+             * rsqrt(v/dim + 0) is NOT 1 -- so the profile selects the scale
+             * rather than the arithmetic, and the 1.0f below is the identity
+             * both for the no-norm case and for the store below it. */
+            if (lane == 0u)
+                sQscale[r] = qp.eps != 0.0f ? rsqrtf(v / (float)AF16_DIM + qp.eps) : 1.0f;
+        }
+        __syncthreads();
+        if (qp.ext_factor != 0.0f)
+            rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base,
+                               qp.beta_fast, qp.beta_slow, &q_corr0, &q_corr1);
+    }
+
     uint32_t qf[AF16_KPW][4];
     {
         const uint64_t qbase =
             ((uint64_t)t * n_head + hbase + mtile * AF16_HEADS) * AF16_DIM;
+        const uint32_t q_nope = AF16_DIM - qp.n_rot;
+        const uint32_t q_rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
         #pragma unroll
         for (uint32_t s = 0; s < AF16_KPW; s++) {
             const uint32_t k0 = (kgrp * AF16_KPW + s) * 16u;
             const uint32_t hA = g, hB = g + 8u;         /* the fragment's two rows */
             const uint32_t c0 = k0 + tg * 2u, c1 = k0 + tg * 2u + 8u;
-            const float *qa = q + qbase + (uint64_t)hA * AF16_DIM;
-            const float *qb = q + qbase + (uint64_t)hB * AF16_DIM;
-            qf[s][0] = af16_pack(qa[c0], qa[c0 + 1u]);
-            qf[s][1] = af16_pack(qb[c0], qb[c0 + 1u]);
-            qf[s][2] = af16_pack(qa[c1], qa[c1 + 1u]);
-            qf[s][3] = af16_pack(qb[c1], qb[c1 + 1u]);
+            const QT *qa = q + qbase + (uint64_t)hA * AF16_DIM;
+            const QT *qb = q + qbase + (uint64_t)hB * AF16_DIM;
+            if (q_raw) {
+                /* sQscale is indexed by the M-tile's head rows: hA = g and
+                 * hB = g + 8 within the tile (see the fragment's two rows). */
+                const float sa = sQscale[mtile * AF16_HEADS + g];
+                const float sb = sQscale[mtile * AF16_HEADS + g + 8u];
+                qf[s][0] = af16_pack_qraw<QT>(qa, c0, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][1] = af16_pack_qraw<QT>(qb, c0, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][2] = af16_pack_qraw<QT>(qa, c1, sa, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+                qf[s][3] = af16_pack_qraw<QT>(qb, c1, sb, q_nope, qp, q_rope_pos, q_corr0, q_corr1);
+            } else {
+                qf[s][0] = af16_load_pair<QT>(qa, c0);
+                qf[s][1] = af16_load_pair<QT>(qb, c0);
+                qf[s][2] = af16_load_pair<QT>(qa, c1);
+                qf[s][3] = af16_load_pair<QT>(qb, c1);
+            }
         }
+    }
+
+    /* ---- L037 lever 1: double-buffered RAW-byte tile staging ------------
+     * Each staged row is the LOADED PROFILE's row -- WINDOW 528 / MAIN 288 /
+     * UNIFIED 384 -- so the stage's pitch is the widest of the three while a
+     * row shorter than the pitch copies only its own chunks (the _off < _rowb
+     * guard below).  Rows move in whole 16-byte chunks, cp.async's maximum;
+     * the retired 584 B e4m3 row's 8-byte chunking is gone.  The NEXT tile's
+     * rows stream into the other buffer via cp.async while the CURRENT tile
+     * runs its MMA/softmax phases, which is what finally overlaps the
+     * load/store unit with the tensor pipe (the serial version measured
+     * pipe_tensor 6-8% vs LSU ~33%). The decode
+     * below reads the staged bytes with the SAME arithmetic the global-read
+     * version used (the shared row decoders' math, one decoder per
+     * format), so this stage is byte movement only -- bit-exact. The
+     * resolver mirrors the old per-element source logic one-for-one: raw
+     * ring rows (sRawRows/raw_start), then comp rows with the topk bad-row
+     * masking; a row outside the tile stages nothing and decodes to zero,
+     * exactly as before. */
+    /* The double buffer lives in DYNAMIC shared memory: adding its ~18.7 KB
+     * to the kernel's static declarations blew the 48 KB static cap
+     * (ptxas 0xc540 > 0xc000). The GB10 has 101 KB per SM; the launchers
+     * opt in via cudaFuncAttributeMaxDynamicSharedMemorySize and pass
+     * AF16_DYNSMEM_BYTES at launch. */
+    extern __shared__ __align__(16) uint8_t af16_dynsmem[];
+    uint8_t (*sRawB)[AF16_ROWS][AF16_ROWB] =
+        (uint8_t (*)[AF16_ROWS][AF16_ROWB])af16_dynsmem;
+    __shared__ const uint8_t *sSrc[2][AF16_ROWS];
+    __shared__ uint8_t sBadStage[2][AF16_ROWS];
+    __shared__ uint8_t sFmtStage[2][AF16_ROWS];    /* AF16_FMT_* of the staged row */
+    #define AF16_STAGE_TILE(BUF, ROW0)                                        \
+    do {                                                                      \
+        const uint32_t _nr = (ROW0) < row_hi                                  \
+            ? min(AF16_ROWS, row_hi - (ROW0)) : 0u;                           \
+        if (tid < AF16_ROWS) {                                                \
+            const uint32_t _r = tid;                                          \
+            const uint32_t _sr = (ROW0) + _r;                                 \
+            const uint8_t *_p = NULL;                                         \
+            bool _bad = false;                                                \
+            uint32_t _fmt = unified_rows ? AF16_FMT_UNIFIED : AF16_FMT_WINDOW; \
+            if (_r < _nr) {                                                   \
+                if (_sr < raw_count) {                                        \
+                    const uint32_t _rr = ring ? sRawRows[_sr]                 \
+                                              : (raw_start + _sr);            \
+                    _p = (const uint8_t *)raw_kv                              \
+                       + (uint64_t)_rr * af16_fmt_rowb(_fmt);                 \
+                } else {                                                      \
+                    uint32_t _ci = _sr - raw_count;                           \
+                    if (topk) {                                               \
+                        const int32_t _c = topk[(uint64_t)t * top_k + _ci];   \
+                        _bad = !(_c >= 0 && (uint32_t)_c < sVisComp);         \
+                        _ci = _bad ? 0u : (uint32_t)_c;                       \
+                    }                                                         \
+                    _fmt = unified_rows ? AF16_FMT_UNIFIED : AF16_FMT_MAIN;\
+                    _p = (const uint8_t *)comp_src +                          \
+                         ((uint64_t)comp_base + _ci) * af16_fmt_rowb(_fmt);   \
+                }                                                             \
+            }                                                                 \
+            sSrc[BUF][_r] = _p;                                               \
+            sBadStage[BUF][_r] = _bad ? 1u : 0u;                              \
+            sFmtStage[BUF][_r] = (uint8_t)_fmt;                               \
+        }                                                                     \
+        __syncthreads();                                                      \
+        for (uint32_t _c = tid; _c < AF16_ROWS * (AF16_ROWB / 16u);            \
+             _c += AF16_THREADS) {                                            \
+            const uint32_t _r = _c / (AF16_ROWB / 16u);                       \
+            const uint32_t _off = (_c % (AF16_ROWB / 16u)) * 16u;             \
+            const uint32_t _rowb = af16_fmt_rowb(sFmtStage[BUF][_r]);         \
+            if (sSrc[BUF][_r] && _off < _rowb)                                \
+                __pipeline_memcpy_async(&sRawB[BUF][_r][_off],                \
+                                        sSrc[BUF][_r] + _off, 16);            \
+        }                                                                     \
+        __pipeline_commit();                                                  \
+    } while (0)
+
+    float acc[AF16_MT][AF16_DPW / 8u][4];
+    for (uint32_t it = 0; it < n_iter; it++) {
+    uint32_t split = 0u, row_lo = 0u, row_hi = n_score;
+    if (split_mode) {
+        split = phys + it * n_phys;
+        const uint32_t tile_lo = split * tps;
+        if (tile_lo >= n_tiles) {
+            /* Past this row's last tile: an empty partial, nothing to fold.
+             * Block-uniform (split, n_tiles), so the continue is too. */
+            if (tid < AF16_HPB)
+                af16_part_header(partials, t, n_head, hbase + tid, n_split, split, -INFINITY, 0.0f);
+            continue;
+        }
+        const uint32_t tile_hi = min(n_tiles, tile_lo + tps);
+        row_lo = tile_lo * AF16_ROWS;
+        row_hi = min(n_score, tile_hi * AF16_ROWS);
     }
 
     /* ---- running softmax state + output accumulator --------------------- */
     if (tid < AF16_HPB) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
-    float acc[AF16_MT][AF16_DPW / 8u][4];
     #pragma unroll
     for (uint32_t m = 0; m < AF16_MT; m++)
         #pragma unroll
@@ -281,68 +952,37 @@ static void attn_f16_kernel(
             acc[m][n][0] = acc[m][n][1] = acc[m][n][2] = acc[m][n][3] = 0.0f;
     __syncthreads();
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += AF16_ROWS) {
-        const uint32_t nr = min(AF16_ROWS, n_score - row0);
+    AF16_STAGE_TILE(0u, row_lo);
+    for (uint32_t row0 = row_lo, tix = 0; row0 < row_hi; row0 += AF16_ROWS, tix++) {
+        const uint32_t nr = min(AF16_ROWS, row_hi - row0);
+        const uint32_t buf = tix & 1u;
+        const int have_next = row0 + AF16_ROWS < row_hi;
+        if (have_next) AF16_STAGE_TILE(buf ^ 1u, row0 + AF16_ROWS);
+        /* Leave the just-committed next-tile group in flight; wait only for
+         * the group that filled THIS buffer. */
+        __pipeline_wait_prior(have_next ? 1 : 0);
+        __syncthreads();
 
-        /* ---- stage the tile, converting to fp16 -------------------------
-         * FOUR elements per iteration, not two.  The packed path decodes a
-         * uint32 of four E4M3 bytes against ONE scale byte, the way the f32
-         * kernel does; reading them one element at a time through
-         * attn_comp_pack_ld costs four scattered BYTE loads where the format
-         * should have saved bandwidth, and measured 2.3x SLOWER than the f32
-         * shadow it was meant to beat.  The unpacked paths get a float4 out of
-         * the same restructuring. */
+        /* ---- decode the staged tile to fp16 -----------------------------
+         * Four dims per thread from the smem copy the cp.async stage filled,
+         * by the row's own format: WINDOW rows (E4M3 x E8M0/32), MAIN rows
+         * (E2M1 x E4M3/16) or UNIFIED rows (E2M1 x E4M3/16 x a row scale).
+         * All three decode to the bf16 values the reference stores; the f16
+         * tile holds them exactly (8 significant bits inside f16's 11,
+         * magnitudes inside its range for normalised KV). */
         for (uint32_t i = tid; i < AF16_ROWS * AF16_DIM / 4u; i += AF16_THREADS) {
             const uint32_t r = i / (AF16_DIM / 4u);
             const uint32_t d4 = (i % (AF16_DIM / 4u)) * 4u;
             float f0 = 0.f, f1 = 0.f, f2 = 0.f, f3 = 0.f;
-            if (r < nr) {
-                const uint32_t sr = row0 + r;
-                if (sr < raw_count) {
-                    const uint32_t rr = ring ? sRawRows[sr] : (raw_start + sr);
-                    const uint64_t b = (uint64_t)rr * AF16_DIM + d4;
-                    if (raw_f16) {
-                        const __half *h = (const __half *)raw_kv + b;
-                        f0 = __half2float(h[0]); f1 = __half2float(h[1]);
-                        f2 = __half2float(h[2]); f3 = __half2float(h[3]);
-                    } else {
-                        const float4 v4 = *(const float4 *)(raw_kv + b);
-                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
-                    }
-                } else {
-                    uint32_t ci = sr - raw_count;
-                    if (topk) {
-                        const int32_t c = topk[(uint64_t)t * top_k + ci];
-                        ci = (c >= 0 && (uint32_t)c < sVisComp) ? (uint32_t)c : 0u;
-                    }
-                    const uint64_t crow = (uint64_t)comp_base + ci;
-                    if (comp_pack) {
-                        const uint32_t n_nope = AF16_DIM - PULSAR_ATTN_PACK_NROT;
-                        const uint8_t *pr = (const uint8_t *)comp_src +
-                            crow * PULSAR_ATTN_PACK_ROWBYTES(AF16_DIM);
-                        if (d4 < n_nope) {
-                            const float sc = __uint_as_float(
-                                (uint32_t)pr[n_nope + (d4 / PULSAR_FP8_KV_BLOCK)] << 23);
-                            const uint32_t w = *(const uint32_t *)(pr + d4);
-                            f0 = attn_pack_e4m3(w & 0xffu, sc);
-                            f1 = attn_pack_e4m3((w >> 8) & 0xffu, sc);
-                            f2 = attn_pack_e4m3((w >> 16) & 0xffu, sc);
-                            f3 = attn_pack_e4m3(w >> 24, sc);
-                        } else {
-                            const __nv_bfloat16 *rope = (const __nv_bfloat16 *)(pr + n_nope +
-                                PULSAR_ATTN_PACK_SCALES_PAD(AF16_DIM));
-                            const uint32_t o = d4 - n_nope;
-                            f0 = __bfloat162float(rope[o]);
-                            f1 = __bfloat162float(rope[o + 1u]);
-                            f2 = __bfloat162float(rope[o + 2u]);
-                            f3 = __bfloat162float(rope[o + 3u]);
-                        }
-                    } else {
-                        const float4 v4 = *(const float4 *)(comp_src + crow * AF16_DIM + d4);
-                        f0 = v4.x; f1 = v4.y; f2 = v4.z; f3 = v4.w;
-                    }
-                }
+            if (r < nr && sSrc[buf][r]) {
+                const uint8_t *pr = sRawB[buf][r];
+                const uint32_t fmt = sFmtStage[buf][r];
+                const float4 v = fmt == AF16_FMT_MAIN    ? mainkv_row_ld4(pr, d4 >> 2, AF16_DIM)
+                               : fmt == AF16_FMT_UNIFIED ? attnkv_row_ld4(pr, d4 >> 2, AF16_DIM)
+                                                         : winkv_row_ld4(pr, d4 >> 2, AF16_DIM);
+                f0 = v.x; f1 = v.y; f2 = v.z; f3 = v.w;
             }
+            if (d4 == 0u) sRowBad[r] = (r < nr) ? sBadStage[buf][r] : 0u;
             __half2 *dst = (__half2 *)&sKV[r * AF16_KVSTRIDE + d4];
             dst[0] = make_half2(__float2half(f0), __float2half(f1));
             dst[1] = make_half2(__float2half(f2), __float2half(f3));
@@ -376,22 +1016,58 @@ static void attn_f16_kernel(
             const uint32_t mt = h / AF16_HEADS, hh = h % AF16_HEADS;
             const float v = sPart[0][mt][hh][r] + sPart[1][mt][hh][r] +
                             sPart[2][mt][hh][r] + sPart[3][mt][hh][r];
-            sS[h][r] = (r < nr) ? v * scale : -INFINITY;
+            sS[h][r] = (r < nr && !sRowBad[r]) ? v * scale : -INFINITY;
         }
         __syncthreads();
 
+        /* One thread per (head,row): AF16_HPB * AF16_ROWS == AF16_THREADS, so
+         * this is exactly one pass.  The max is a 4-step shuffle tree inside
+         * the head's 16-lane half-warp and the expf chain leaves the single
+         * softmax warp, which previously serialised 16 exps per head while 480
+         * threads waited at the barrier (attention is latency-bound, one block
+         * per SM).  The normaliser l is STILL summed by lane h from the rounded
+         * halves in ascending r, so the emitted arithmetic and its sum order are
+         * the serial version's -- bit-exact by construction. */
+        {
+            const uint32_t i = tid;
+            const uint32_t h = i / AF16_ROWS, r = i % AF16_ROWS;
+            float mx = fmaxf(sM[h], sS[h][r]);
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            /* ⚠ MASKING MAKES AN ALL--INF TILE REACHABLE, AND expf(-INF - -INF)
+             * IS NaN.  Before the row mask above, every r < nr carried a real
+             * score so mx could only be -INF when the tile was empty of rows at
+             * all; now a tile whose selections are ALL invalid produces one.
+             * Such a tile contributes nothing, so short-circuit p to zero rather
+             * than letting a NaN into sP and from there into the output.
+             * mx == -INF implies sM[h] == -INF (mx >= sM[h]), so corr is already
+             * 0 and l stays 0 -- nothing has been accumulated to rescale. */
+            const bool empty = (mx == -INFINITY);
+            const float p = (empty || r >= nr) ? 0.0f : __expf(sS[h][r] - mx);
+            sP[h][r] = __float2half(p);
+            sMx[h] = mx;
+        }
+        __syncthreads();
         if (tid < AF16_HPB) {
             const uint32_t h = tid;
-            float mx = sM[h];
-            for (uint32_t r = 0; r < nr; r++) mx = fmaxf(mx, sS[h][r]);
+            const float mx = sMx[h];
             const float corr = (sM[h] == -INFINITY) ? 0.0f : __expf(sM[h] - mx);
+            /* Sum the ROUNDED weight, not p: the MMA multiplies sP, so the
+             * normaliser has to be the sum of what it multiplies or the
+             * weights do not sum to one.  The sink term in the epilogue is
+             * deliberately NOT rounded -- it has no V row, it is denominator
+             * mass only.  Rows past nr / hidden rows are zero in sP and add
+             * exactly nothing.
+             *
+             * ⚠ `nr`, NOT `AF16_ROWS`.  With a compile-time bound the
+             * compiler unrolls this chain and --use_fast_math is then free to
+             * REASSOCIATE the adds; the serial version's runtime bound kept
+             * them sequential.  The first cut of this change used AF16_ROWS
+             * and the prefill gate caught the reassociation: every logit
+             * moved.  The loop bound is load-bearing for bit-exactness. */
             float l = sL[h] * corr;
-            for (uint32_t r = 0; r < nr; r++) {
-                const float p = __expf(sS[h][r] - mx);
-                sP[h][r] = __float2half(p);
-                l += p;
-            }
-            for (uint32_t r = nr; r < AF16_ROWS; r++) sP[h][r] = __float2half(0.f);
+            for (uint32_t r = 0; r < nr; r++) l += __half2float(sP[h][r]);
             sM[h] = mx; sL[h] = l; sCorr[h] = corr;
         }
         __syncthreads();
@@ -413,21 +1089,67 @@ static void attn_f16_kernel(
                 acc[m][n][0] *= ca; acc[m][n][1] *= ca;
                 acc[m][n][2] *= cb; acc[m][n][3] *= cb;
                 /* B[k=row][n=dim]: this lane's column is n_base+g, and its four
-                 * k values are rows 2t, 2t+1, 2t+8, 2t+9.  Already fp16 in
-                 * smem, so repack the bits rather than round-tripping f32. */
-                const __half *kc = &sKV[warp * AF16_DPW + n * 8u + g];
-                const uint32_t b0 =
-                    (uint32_t)__half_as_ushort(kc[(tg * 2u)      * AF16_KVSTRIDE]) |
-                    ((uint32_t)__half_as_ushort(kc[(tg * 2u + 1u) * AF16_KVSTRIDE]) << 16);
-                const uint32_t b1 =
-                    (uint32_t)__half_as_ushort(kc[(tg * 2u + 8u) * AF16_KVSTRIDE]) |
-                    ((uint32_t)__half_as_ushort(kc[(tg * 2u + 9u) * AF16_KVSTRIDE]) << 16);
+                 * k values are rows 2t, 2t+1, 2t+8, 2t+9 -- i.e. every lane walks
+                 * a COLUMN of a row-major tile, which is what `ldmatrix.trans`
+                 * exists for.  One instruction replaces four scalar LDS.u16 plus
+                 * the shift/or repacking, and the transpose is free in the
+                 * instruction rather than paid in address arithmetic.
+                 *
+                 * BIT-IDENTICAL, verified rather than assumed: a standalone probe
+                 * (the private notes' probes/ldm_probe.cu) filled this exact [16][520]
+                 * layout with position-encoding values, built the fragment both
+                 * ways and compared the raw registers -- 0 of 512 differed across
+                 * all warps and lanes.  Guessing an ldmatrix lane mapping is
+                 * precisely how you get a kernel that runs and is quietly wrong,
+                 * so the mapping is evidence, not derivation. */
+                const uint32_t colbase = warp * AF16_DPW + n * 8u;
+                uint32_t b0, b1;
+                {
+                    const uint32_t saddr = (uint32_t)__cvta_generic_to_shared(
+                        &sKV[(ldm_half * 8u + ldm_row) * AF16_KVSTRIDE + colbase]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+                                 "{%0,%1}, [%2];\n"
+                                 : "=r"(b0), "=r"(b1) : "r"(saddr));
+                }
                 af16_mma(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
                          pa0, pa1, pa2, pa3, b0, b1);
             }
         }
         __syncthreads();
     }
+
+    /* ---- L210 split mode: hand the unnormalised partial to the combine --
+     * sM/sL are the last tile's state (the loop's closing barrier published
+     * them); acc[] is the lane's own.  No sink here: it is denominator mass
+     * the combine adds once.  The next logical split, if this block has
+     * one, resets the state at the top of the iteration; its reset writes
+     * sM/sL from the same 32 threads that read them here, and the tile
+     * loop's closing barrier already ordered every smem read of this split
+     * before any of its staging. */
+    if (split_mode) {
+        if (tid < AF16_HPB)
+            af16_part_header(partials, t, n_head, hbase + tid, n_split, split, sM[tid], sL[tid]);
+        #pragma unroll
+        for (uint32_t m = 0; m < AF16_MT; m++) {
+            const uint32_t hb0 = m * AF16_HEADS;
+            float *pa = af16_part_acc(partials, t, n_head, hbase + hb0 + g, n_split, split);
+            float *pb = af16_part_acc(partials, t, n_head, hbase + hb0 + g + 8u, n_split, split);
+            /* The lane's two dims are adjacent (nb + 2tg, +1) and the record
+             * is 16-byte aligned (AF16_PART_ACC floats in, stride a multiple
+             * of 4), so each pair goes out as one 8-byte store: ncu read the
+             * scattered 4-byte version as lg_throttle 23% of the block's
+             * stalls (rows/L210.md). */
+            #pragma unroll
+            for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                const uint32_t nb = warp * AF16_DPW + n * 8u;
+                *(float2 *)&pa[nb + tg * 2u] = make_float2(acc[m][n][0], acc[m][n][1]);
+                *(float2 *)&pb[nb + tg * 2u] = make_float2(acc[m][n][2], acc[m][n][3]);
+            }
+        }
+        continue;
+    }
+    }   /* for it: logical splits (one iteration on the classic path) */
+    if (split_mode) return;
 
     /* ---- epilogue: fold the sink, normalise, store ---------------------- */
     if (tid < AF16_HPB) {
@@ -455,114 +1177,570 @@ static void attn_f16_kernel(
             const float ib = sCorr[hb0 + g + 8u] /
                              (sL[hb0 + g + 8u] == 0.0f ? 1.0f : sL[hb0 + g + 8u]);
             const uint32_t ha = hbase + hb0 + g, hb = hbase + hb0 + g + 8u;
-            float *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
-            float *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
+            pulsar_heads_t *oa = heads + ((uint64_t)t * n_head + ha) * AF16_DIM;
+            pulsar_heads_t *ob = heads + ((uint64_t)t * n_head + hb) * AF16_DIM;
+            /* ⚠ The E4M3 emission below takes the SAME acc[] registers, NOT a
+             * read-back of these stores -- so narrowing this buffer does not
+             * change what the attn-output GEMM multiplies on this path.  The
+             * fidelity effect of the flip arrives through rope_tail, which DOES
+             * read heads back, rotates in place, and emits the tail's share. */
             #pragma unroll
             for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
                 const uint32_t nb = warp * AF16_DPW + n * 8u;
-                oa[nb + tg * 2u]      = acc[m][n][0] * ia;
-                oa[nb + tg * 2u + 1u] = acc[m][n][1] * ia;
-                ob[nb + tg * 2u]      = acc[m][n][2] * ib;
-                ob[nb + tg * 2u + 1u] = acc[m][n][3] * ib;
+                heads_store(oa, nb + tg * 2u,      acc[m][n][0] * ia);
+                heads_store(oa, nb + tg * 2u + 1u, acc[m][n][1] * ia);
+                heads_store(ob, nb + tg * 2u,      acc[m][n][2] * ib);
+                heads_store(ob, nb + tg * 2u + 1u, acc[m][n][3] * ib);
+            }
+            /* E4M3 for the attn-output "a" GEMM, from the registers the stores
+             * above just used -- ROUNDED TO THE STORED HEADS TYPE FIRST (L195).
+             * The 'a' GEMM's operand is a function of the stored heads and of
+             * nothing else: pulsar_gpu_mxfp8_gact_emit_heads (the arms without
+             * this epilogue: indexed, ring) quantises the bf16 heads it reads
+             * back, so this epilogue must quantise the same values or the same
+             * token gets different attn-out bytes on different arms.  It did:
+             * a 4096-token chunk (indexed, > 512 compressed rows) and a
+             * 2048-token chunk (dense, this epilogue) gave byte-identical heads
+             * and different attn_low (census 11/12, 2026-09-06), and every
+             * resumed chunk (ring arm) differed from the cold prefill the same
+             * way.  One encoder now: the value heads_store wrote.
+             *
+             * WHY THE REDUCTION IS ONLY 4 LANES WIDE: warp w owns head dims
+             * [32w, 32w+32) -- exactly one MX block -- but for 16 heads at once,
+             * and any ONE head's 32 values live in the quad of lanes sharing g
+             * (lane = g*4 + tg).  So the block amax is fmaxf over this lane's 8
+             * registers then two shuffles across tg, CHEAPER than the warp-wide
+             * reduction pulsar_mx_emit_block does.  The predicate is warp-
+             * uniform, so every lane reaches the shuffles.
+             *
+             * The GEMM wants the grouped/transposed layout that
+             * mxfp8_quant_act_grouped_kernel produces: data[g][tok][group_dim]
+             * with a per-group scale slab, where group g holds n_head/n_groups
+             * consecutive heads.  group_dim % 32 == 0 and AF16_DIM % 32 == 0, so
+             * a head's blocks never straddle a group boundary. */
+            if (gact_data && (warp * AF16_DPW) < n_nope) {
+                const uint32_t hpg = n_head / n_groups;      /* heads per group */
+                const uint32_t gd  = hpg * AF16_DIM;         /* == group_dim */
+                float aa = 0.0f, ab = 0.0f;
+                #pragma unroll
+                for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                    aa = fmaxf(aa, fabsf(heads_round(acc[m][n][0] * ia)));
+                    aa = fmaxf(aa, fabsf(heads_round(acc[m][n][1] * ia)));
+                    ab = fmaxf(ab, fabsf(heads_round(acc[m][n][2] * ib)));
+                    ab = fmaxf(ab, fabsf(heads_round(acc[m][n][3] * ib)));
+                }
+                aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 1));
+                aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 2));
+                ab = fmaxf(ab, __shfl_xor_sync(0xffffffffu, ab, 1));
+                ab = fmaxf(ab, __shfl_xor_sync(0xffffffffu, ab, 2));
+                const int sea = pulsar_mx_shared_exp(aa);
+                const int seb = pulsar_mx_shared_exp(ab);
+                const uint32_t gra = ha / hpg, hha = ha % hpg;
+                const uint32_t grb = hb / hpg, hhb = hb % hpg;
+                const uint32_t arow = gact_tok0 + t;   /* batch-absolute token */
+                __nv_fp8_e4m3 *da = gact_data + ((size_t)gra * gact_ntok + arow) * gd + hha * AF16_DIM;
+                __nv_fp8_e4m3 *db = gact_data + ((size_t)grb * gact_ntok + arow) * gd + hhb * AF16_DIM;
+                #pragma unroll
+                for (uint32_t n = 0; n < AF16_DPW / 8u; n++) {
+                    const uint32_t nb = warp * AF16_DPW + n * 8u;
+                    da[nb + tg * 2u]      = pulsar_mx_encode(heads_round(acc[m][n][0] * ia), sea);
+                    da[nb + tg * 2u + 1u] = pulsar_mx_encode(heads_round(acc[m][n][1] * ia), sea);
+                    db[nb + tg * 2u]      = pulsar_mx_encode(heads_round(acc[m][n][2] * ib), seb);
+                    db[nb + tg * 2u + 1u] = pulsar_mx_encode(heads_round(acc[m][n][3] * ib), seb);
+                }
+                if (tg == 0u) {
+                    const uint32_t kba = hha * (AF16_DIM / 32u) + warp;
+                    const uint32_t kbb = hhb * (AF16_DIM / 32u) + warp;
+                    gact_scale[(size_t)gra * gact_slab +
+                               pulsar_mx_sfoff((int)arow, (int)kba, gact_kbp)] = pulsar_mx_scale_byte(sea);
+                    gact_scale[(size_t)grb * gact_slab +
+                               pulsar_mx_sfoff((int)arow, (int)kbb, gact_kbp)] = pulsar_mx_scale_byte(seb);
+                }
             }
         }
     }
-#endif
 }
+
+/* L210: fold one (token, head)'s per-split partials into normalised heads.
+ * One block per (token, head), one thread per dim; the splits fold in index
+ * order, so the result is deterministic.  The sink enters exactly as in the
+ * classic epilogue: denominator mass only, never rounded to fp16.  l is
+ * strictly positive (the sink term is exp(sink - nm) with nm >= sink), so the
+ * classic path's zero-denominator guard has no case here.
+ *
+ * With fold_rope the kernel also applies the heads' INVERSE tail rope that
+ * rope_tail_kernel (pulsar_cuda_norm_kv.cu) would otherwise apply in a
+ * launch of its own right after attention: the tail value is rounded to the
+ * stored heads type first, exactly as that kernel reads it back, then
+ * rotated with the shared YaRN core and stored -- the same two roundings in
+ * the same order, so the same bytes as the two-kernel sequence, and the
+ * decode blob is the proof.  The rope constants are Q's (one rope for the
+ * model; the engine passes the same freq/YaRN settings to both), the
+ * position is the row's, the direction is inverse -- as the engine's
+ * rope_tail call for heads has always been. */
+/// Folds the split-K partials (and the sink) into each decode row's heads.  Grid (n_dec, n_head), 512 threads.
+/// @param heads out: the attention output heads, [n_tokens][n_head][head_dim] (stored heads type).
+/// @param sinks the attention sinks, f32 [n_head], device.
+/// @param partials the split-K partial records.
+/// @param n_head query heads.
+/// @param n_split splits per (row, head).
+/// @param positions per-row absolute positions, i32 [n_tokens], or NULL.
+/// @param pos0 the first row's position (scalar mode).
+/// @param qp the fused Q rope descriptor (by value).
+/// @param fold_rope nonzero: apply the heads' inverse tail rope too.
+__global__ __launch_bounds__(AF16_DIM)
+static void attn_f16_combine_kernel(pulsar_heads_t *__restrict__ heads,
+                                    const float *__restrict__ sinks,
+                                    const float *__restrict__ partials,
+                                    uint32_t n_head, uint32_t n_split,
+                                    const int32_t *__restrict__ positions, uint32_t pos0,
+                                    pulsar_gpu_q_prep qp, int fold_rope) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const float *base = partials + ((uint64_t)t * n_head + h) * n_split * AF16_PART_STRIDE;
+    float mx = -INFINITY;
+    for (uint32_t sp = 0; sp < n_split; sp++) mx = fmaxf(mx, base[(uint64_t)sp * AF16_PART_STRIDE]);
+    const float sink = sinks[h];
+    const float nm = fmaxf(mx, sink);
+    float l = __expf(sink - nm), acc = 0.0f;
+    for (uint32_t sp = 0; sp < n_split; sp++) {
+        const float *rec = base + (uint64_t)sp * AF16_PART_STRIDE;
+        const float m_s = rec[0];
+        if (m_s == -INFINITY) continue;               /* empty split */
+        const float w = __expf(m_s - nm);
+        l = fmaf(rec[1], w, l);
+        acc = fmaf(rec[AF16_PART_ACC + d], w, acc);
+    }
+    const float v = acc / l;
+    pulsar_heads_t *row = heads + ((uint64_t)t * n_head + h) * AF16_DIM;
+    if (!fold_rope) {
+        heads_store(row, d, v);
+        return;
+    }
+    const uint32_t n_nope = AF16_DIM - qp.n_rot;
+    /* Every lane of the warp joins the shuffle (the tail is whole warps:
+     * n_rot is even and AF16_DIM a multiple of 32); the odd lane's rounded
+     * value travels to its even partner, which stores the rotated pair. */
+    const float x_next = __shfl_down_sync(0xffffffffu, heads_round(v), 1);
+    if (d < n_nope) {
+        heads_store(row, d, v);
+    } else if ((d & 1u) == 0u) {
+        const uint32_t rope_pos = positions ? (uint32_t)positions[t] : pos0 + t;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (qp.ext_factor != 0.0f)
+            rope_corr_dims_dev(qp.n_rot, qp.n_ctx_orig, qp.freq_base, qp.beta_fast, qp.beta_slow, &corr0, &corr1);
+        float r0, r1;
+        rope_pair_rotate_core_dev(heads_round(v), x_next, d - n_nope, qp.n_rot, rope_pos, 1,
+                                  qp.freq_base, qp.freq_scale, qp.ext_factor, qp.attn_factor,
+                                  corr0, corr1, &r0, &r1);
+        heads_store(row, d, r0);
+        heads_store(row, d + 1u, r1);
+    }
+}
+
+/** @def AF16_STAGE_TILE(BUF, ROW0)
+ *  attn_f16_kernel's tile stage: cp.async rows ROW0 .. ROW0 + 15 of the query's row plan (raw rows, then
+ *  compressed rows) into stage buffer BUF, each at its own family's byte count, recording its format id. */
 
 /* ---- launcher ----------------------------------------------------------- */
 
-/* PULSAR_ATTN_F16_MMA is a DEVICE-side guard -- __CUDA_ARCH__ is undefined in
- * the host pass, so testing it here would compile the launcher down to
- * "return 0" and the kernel would look like a permanent shape-gate refusal.
- * The host question is a runtime one: does this device actually have the
- * m16n8k16 tensor cores?  Ask the driver, once. */
+/* PULSAR_SM80 says what the COMPILE target has (pulsar_cuda_arch.cuh) and is
+ * true in every host pass, so it cannot answer for the device.  The host
+ * question is a runtime one: does this device actually have the m16n8k16
+ * tensor cores?  Ask the driver, once. */
+/* L189: every launcher precondition names itself and its values when it
+ * refuses.  The dispatcher prints a generic "fp16 ... FAILED" after a 0 from
+ * here; WHICH check failed was invisible, and that is what cost three days on
+ * L032 (the comp_cap check below). */
+/// Refuses the enclosing launcher (return 0) when `cond` is false, naming `what`, the predicate and the values.
+#define AF16_REQUIRE(what, cond, fmt, ...)                                              \
+    do {                                                                                \
+        if (!(cond)) {                                                                  \
+            fprintf(stderr, "pulsar: attn f16 %s rejected: !(%s) [" fmt "]\n", what,    \
+                    #cond, __VA_ARGS__);                                                \
+            return 0;                                                                   \
+        }                                                                               \
+    } while (0)
+
+/// @return 1 when the device has the m16n8k16 f16 MMA (sm_80+).
 static int af16_device_supported(void) {
-    static int ok = -1;
-    if (ok < 0) {
-        int major = 0, minor = 0, dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) { ok = 0; return ok; }
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            ok = 0; return ok;
-        }
-        ok = (major >= 8) ? 1 : 0;      /* mma.m16n8k16.f16 is sm_80+ */
-    }
-    return ok;
+    return pulsar_cuda_device_major() >= 8 ? 1 : 0;   /* mma.m16n8k16.f16 is sm_80+ */
 }
 
-/* Only the fp16 tier consumes packed comp rows on the multi-token
- * single-sequence path; the f32 indexed kernel's own gate refuses them there
- * (descr || !comp_kv_pack || n_tokens == 1 || f16_idx_ok -- the last term IS
- * this function, widening the gate for the tier that reads pack natively).
- * So this answers for the tier that is actually going to run. */
+/* Does the backend's prefill attention read packed comp rows natively?  Since
+ * L166 the fp16 tier is the ONLY attention kernel and it reads MAIN comp
+ * rows always, so the answer is the tier flag itself: packed comp is readable
+ * exactly when the tier can run, and nothing else can run. */
 int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
-    static int on = -1;
-    if (on < 0) on = pulsar_env_tier_on("PULSAR_CUDA_ATTN_F16") && af16_device_supported();
-    return on;
+    /* L106 K14: this had a body IDENTICAL to pulsar_gpu_attn_f16_tier_on and
+     * the two drifted risk was real (same predicate, two caches).  The two
+     * NAMES stay -- call sites ask two different questions ("does prefill
+     * consume packed comp rows?" vs "is the f16 tier on?") that happen to have
+     * the same answer today; if that ever stops being true, the split point is
+     * already named.  One body now. */
+    return pulsar_gpu_attn_f16_tier_on();
 }
 
-int pulsar_gpu_attention_f16_prefill(
-        float *heads, const float *sinks, const float *q,
-        const float *raw_kv, const float *comp_kv,
+/* One-time dynamic-smem opt-in for attn_f16_kernel: static shared alone is
+ * capped at 48 KB, so the tile double-buffer's bytes must be granted here.
+ * Fail-loud: a refused grant means the launch would silently get 0 dynamic
+ * bytes and fault, so the caller refuses instead. */
+/// @return 1 once the dynamic shared-memory grant for attn_f16_kernel succeeded, else 0.
+static int af16_dynsmem_ok(void) {
+    static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
+    if (state == 0) {
+        /* ⚠ THE GRANT IS PER-INSTANTIATION.  attn_f16_kernel is templated on
+         * batch_q's element type (L045), and a missing grant does not fail
+         * loudly at build time -- the launch gets 0 dynamic bytes and faults,
+         * exactly as the comment above warns.  Grant the instantiation that
+         * launches, named by the same typedef the launch sites use, so a
+         * future width change moves the grant with it.  (A second <float>
+         * grant used to sit here as a "safety net"; it was the only reference
+         * to that instantiation, i.e. a whole dead kernel kept alive by a
+         * comment -- deleted 2026-09-02.) */
+        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<pulsar_q_t>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                (int)AF16_DYNSMEM_BYTES);
+        state = (e == cudaSuccess) ? 1 : -1;
+        if (state < 0)
+            fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
+                    cudaGetErrorString(e));
+    }
+    return state > 0;
+}
+
+/* ONE block per SM -- which is all this kernel can have resident: 512 threads
+ * at 117 registers under __launch_bounds__(AF16_THREADS, AF16_MINBLK = 1).
+ * A target of two per SM (the first cut) did not overlap anything; it ran two
+ * WAVES, each paying the block's ~18 us fixed cost, and the served-lane census
+ * read the split kernel at 75 us against the classic walk's 85 at 6..12 rows
+ * (rows/L210.md).  Asked of the device once. */
+/// @return the device's SM count (the split-K block target), cached; 48 if the query fails.
+static uint32_t af16_split_target_blocks(void) {
+    static int sms = 0;
+    if (sms <= 0) {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
+            sms = n;
+        else
+            sms = 48;   /* the GB10; only reached if the attribute query fails */
+    }
+    return (uint32_t)sms;
+}
+
+/* L210: the split-K partials.  A value that must survive the combine launch
+ * cannot come from cuda_tmp_alloc -- that is one shared reservation the caller
+ * already holds for the top-k sort scratch, and a second reservation on the
+ * slot hands back the SAME bytes (pulsar_cuda_scratch.h) -- so this is
+ * dedicated storage, per thread like the CUDA streams, grown on demand and
+ * kept.  cudaFree of the outgrown block synchronises the device, so the
+ * combine that read it has finished.  It cannot grow inside a graph capture: a captured step refuses (L335) -- the
+ * warmup's eager use of each shape sizes it first. */
+/// The thread-local split-K partial buffer, grown on demand (refused inside a capture).
+/// @param n_dec split-K rows.
+/// @param n_head query heads.
+/// @param n_split splits per (row, head).
+/// @return the buffer, or NULL on an allocation failure.
+static float *af16_partials(uint32_t n_dec, uint32_t n_head, uint32_t n_split) {
+    static thread_local float   *buf = NULL;
+    static thread_local uint64_t cap = 0;
+    const uint64_t need = (uint64_t)n_dec * n_head * n_split * AF16_PART_STRIDE * sizeof(float);
+    if (need > cap) {
+        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffer */
+        if (cuda_grow_refused_under_capture("attn f16 split-K partials")) return NULL;
+        if (buf) { pulsar_gpu_seg_note_device_free("attn f16 split-K partials"); (void)cudaFree(buf); buf = NULL; cap = 0; }
+        void *p = NULL;
+        const cudaError_t e = cudaMalloc(&p, (size_t)need);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "pulsar: attn f16 split-K partials: cudaMalloc(%llu B) failed: %s -- refusing\n",
+                    (unsigned long long)need, cudaGetErrorString(e));
+            return NULL;
+        }
+        buf = (float *)p;
+        cap = need;
+    }
+    return buf;
+}
+
+int pulsar_gpu_attn_f16_tier_on(void) {
+    /* The PULSAR_CUDA_ATTN_F16=0 opt-out was retired 2026-09-02 (no caller;
+     * the cuBLAS two-GEMM arm it fell back to is gone).  The tier is a
+     * property of the device now. */
+    return af16_device_supported();
+}
+
+int pulsar_gpu_attention_f16_prefill_mx(
+        void *heads_v, const float *sinks, const void *q,
+        const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,
         uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim, int raw_f16) {
-    if (!heads || !sinks || !q || !raw_kv) return 0;
-    if (head_dim != AF16_DIM) return 0;
-    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
-    if (n_tokens == 0u) return 0;
-    if (n_comp != 0u && !comp_kv) return 0;
-    if (!af16_device_supported()) return 0;
+        uint32_t n_head, uint32_t head_dim,
+        void *gact_data, void *gact_scale, int gact_kbp,
+        uint32_t gact_slab, uint32_t n_groups, uint32_t n_nope,
+        uint32_t gact_tok0, uint32_t gact_ntok,
+        const int *positions, const pulsar_gpu_q_prep *q_prep,
+        /* vis_left/vis_right: int32 [n_tokens] DEVICE arrays of the image-span
+         * counts (the reference's get_image_visible), or NULL/NULL for a text
+         * launch.  A half pair is refused rather than guessed at. */
+        const int *vis_left, const int *vis_right) {
+    pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
+    AF16_REQUIRE("prefill", heads && sinks && q && raw_kv, "heads=%d sinks=%d q=%d raw_kv=%d",
+                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL);
+    AF16_REQUIRE("prefill", (vis_left != NULL) == (vis_right != NULL),
+                 "vis_left=%d vis_right=%d", vis_left != NULL, vis_right != NULL);
+    pulsar_gpu_q_prep qp;
+    memset(&qp, 0, sizeof qp);
+    if (q_prep) {
+        /* The fused Q load owns the whole nope/rope split: refuse shapes the
+         * fragment-pair math cannot cover rather than rope the wrong dims. */
+        if (q_prep->n_rot == 0u || (q_prep->n_rot & 1u) ||
+            q_prep->n_rot > AF16_DIM || ((AF16_DIM - q_prep->n_rot) & 1u)) {
+            fprintf(stderr, "pulsar: attn f16 cannot fuse q norm+rope for n_rot=%u\n",
+                    q_prep->n_rot);
+            return 0;
+        }
+        qp = *q_prep;
+    }
+
+    AF16_REQUIRE("prefill", head_dim == AF16_DIM, "head_dim=%u built=%u", head_dim, (unsigned)AF16_DIM);
+    AF16_REQUIRE("prefill", n_head != 0u && (n_head % AF16_HPB) == 0u, "n_head=%u heads/block=%u",
+                 n_head, (unsigned)AF16_HPB);
+    AF16_REQUIRE("prefill", n_tokens != 0u, "n_tokens=%u", n_tokens);
+    AF16_REQUIRE("prefill", n_comp == 0u || comp_kv, "n_comp=%u comp_kv=%d", n_comp, comp_kv != NULL);
+    AF16_REQUIRE("prefill", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
+    /* Every row family tiles head_dim by its scale blocks; the kernel is
+     * specialised for AF16_DIM anyway (checked above). */
+    AF16_REQUIRE("prefill", (head_dim % PULSAR_WINKV_BLOCK) == 0u && (head_dim % PULSAR_MAINKV_BLOCK) == 0u &&
+                            (head_dim % PULSAR_KV4_NV_BLOCK) == 0u,
+                 "head_dim=%u win_block=%u main_block=%u kv4_block=%u", head_dim,
+                 (unsigned)PULSAR_WINKV_BLOCK, (unsigned)PULSAR_MAINKV_BLOCK,
+                 (unsigned)PULSAR_KV4_NV_BLOCK);
+    /* The epilogue's grouped index math assumes whole heads per group and that
+     * the nope/rope split falls on an MX block boundary (so rope_tail can own
+     * the tail blocks without either side touching the other's).  Refuse the
+     * emission rather than write a partial encoding the GEMM would then read. */
+    if (gact_data && (n_groups == 0u || (n_head % n_groups) != 0u ||
+                      (n_nope % 32u) != 0u || n_nope > AF16_DIM)) {
+        fprintf(stderr, "pulsar: attn f16 cannot emit MX for n_head=%u n_groups=%u "
+                        "n_nope=%u\n", n_head, n_groups, n_nope);
+        return 0;
+    }
+    AF16_REQUIRE("prefill", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
     {
     dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv,
-                                            comp_kv ? comp_kv : raw_kv, NULL,
+    /* Dense mode: `positions` reaches the kernel for the fused Q rope only
+     * (positions[t] instead of t); the row plan stays the dense causal
+     * window.  With q_prep == NULL it is unused. */
+    /* n_comp == 0 never dereferences comp_kv; the kernel takes a typed pointer,
+     * so hand it the (unused) NULL rather than the ring under the wrong type. */
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv,
+                                            comp_kv, NULL,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_f16, 0u, 0u, 1u, 0u, 0u,
-                                            NULL, NULL, NULL, 0u, 1u, 0, 0);
+                                            n_head, 0u, 0u, 1u, 0u, 0u,
+                                            (const int32_t *)positions, NULL, NULL, 0u, 1u,
+                                            (const int32_t *)vis_left, (const int32_t *)vis_right, 0, 0,
+                                            (__nv_fp8_e4m3 *)gact_data,
+                                            (unsigned char *)gact_scale,
+                                            gact_kbp, gact_slab, n_groups, n_nope,
+                                            gact_tok0, gact_ntok,
+                                            qp, q_prep != NULL,
+                                            af16_unified_rows(),
+                                            NULL, 0u);
     return cuda_ok(cudaGetLastError(), "attention f16 mma launch");
     }
 }
 
+/* Declaration-vs-definition guard for the wrapper below.
+ *
+ * pulsar_gpu.h reaches this TU through pulsar_cuda_internal.h, so a drifted
+ * declaration does NOT produce a redefinition error -- C++ just quietly adds a
+ * second overload.  No engine translation unit references this wrapper (only
+ * tests/attn_f16_kernel_test.cu does), so the stale overload stays undefined
+ * and unreferenced and the whole engine still links clean.  That is exactly
+ * how the L033 increment-2 signature change shipped a header the compiler was
+ * happy with and the attn gate was not.
+ *
+ * So this pins the declared type against the definition's signature.  Observed
+ * behaviour, not predicted: reverting the header to `float *heads` makes this
+ * fail as a plain static assertion (nvcc resolves the decltype rather than
+ * rejecting it as ambiguous), reported at this line with the message below.
+ * Either way the build stops here -- and a build error beats a link error in a
+ * gate an hour later.
+ *
+ * If you change this function's signature you must edit BOTH the header and
+ * the definition; this assert only tells you that you forgot, it cannot tell
+ * you which one is right. */
+static_assert(std::is_same<
+        decltype(pulsar_gpu_attention_f16_prefill),
+        int(void *, const float *, const void *,
+            const pulsar_winkv_row_t *, const pulsar_mainkv_row_t *,
+            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+            const pulsar_gpu_q_prep *, const int *, const int *)>::value,
+    "pulsar_gpu.h's pulsar_gpu_attention_f16_prefill has drifted from the "
+    "definition below; update the header -- do not add an overload");
+
+int pulsar_gpu_attention_f16_prefill(
+        void *heads_v, const float *sinks, const void *q,
+        const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv,
+        uint32_t n_tokens, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim,
+        const pulsar_gpu_q_prep *q_prep,
+        const int *vis_left, const int *vis_right) {
+    return pulsar_gpu_attention_f16_prefill_mx(heads_v, sinks, q, raw_kv, comp_kv,
+                                               n_tokens, n_comp, window, ratio,
+                                               n_head, head_dim,
+                                               NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u,
+                                               NULL, q_prep, vis_left, vis_right);
+}
+
 /* Indexed variant: raw rows come from a ring buffer; compressed rows are a
  * top-k SELECTION (topk != NULL) or the visible prefix (topk == NULL).
- * Banked descriptors are all-or-nothing (positions+seq_id+comp_bank_ptrs
- * together or none -- a partial set is refused rather than guessed at), and
- * ATTN_PACK comp rows are read natively via comp_pack.  A 0 here is a real
- * failure, never a silent shape demotion. */
+ * Banked descriptors: positions and seq_id are a PAIR (one without the other
+ * is refused rather than guessed at); comp_bank_ptrs is optional under them --
+ * NULL means the scalar comp base + seq_id*comp_cap, which the dispatcher
+ * documents as bit-identical to a contiguous pool.  Comp rows are MAIN rows,
+ * always -- the format parameter is gone (see the note
+ * on the kernel).  non_causal selects the raw visibility rule (kernel note:
+ * RAW VISIBILITY); it is the drafter's raw-window forward and is passed
+ * through unchanged.  A 0 here is a real failure, never a silent shape
+ * demotion. */
 int pulsar_gpu_attention_f16_indexed(
-        float *heads, const float *sinks, const float *q,
-        const float *raw_kv, const float *comp_kv, const int *topk,
+        void *heads_v, const float *sinks, const void *q,
+        const pulsar_winkv_row_t *raw_kv, const pulsar_mainkv_row_t *comp_kv, const int *topk,
         uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
         uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim, int raw_f16,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim,
         const int *positions, const int *seq_id, const void *const *comp_bank_ptrs,
-        uint32_t comp_cap, uint32_t n_banks, int comp_pack) {
+        uint32_t comp_cap, uint32_t n_banks, uint32_t non_causal,
+        const pulsar_gpu_q_prep *q_prep,
+        /* vis_left/vis_right: see the prefill_mx entry.  Indexed by this
+         * launch's own token axis, exactly like positions. */
+        const int *vis_left, const int *vis_right,
+        void *gact_data, void *gact_scale, int gact_kbp, uint32_t gact_slab,
+        uint32_t n_groups, uint32_t n_nope, uint32_t gact_tok0, uint32_t gact_ntok) {
     /* topk may be NULL: the decode-batch/continued-prefill path sweeps the
      * visible comp prefix rather than a selection. */
-    if (!heads || !sinks || !q || !raw_kv || !comp_kv) return 0;
-    if (n_comp != 0u && !comp_kv) return 0;
-    /* Descriptors are all-or-nothing, as in the f32 launcher's own check. */
-    if ((positions != NULL) != (seq_id != NULL)) return 0;
-    if (positions && (n_banks == 0u || comp_cap == 0u)) return 0;
-    if (head_dim != AF16_DIM) return 0;
-    if (n_head == 0u || (n_head % AF16_HPB) != 0u) return 0;
-    if (n_tokens == 0u || raw_cap == 0u) return 0;
-    if (topk && top_k == 0u) return 0;      /* a table with no budget is a bug */
+    pulsar_heads_t *heads = (pulsar_heads_t *)heads_v;
+    /* comp_kv is UNUSED when n_comp == 0 (see the kernel's own note on the
+     * parameter), and this is the same rule the prefill entry above already
+     * states.  It has to be spelled out here rather than satisfied with a
+     * placeholder: the two KV row families are now DIFFERENT types (WINDOW
+     * 528 B vs MAIN 288 B, L218 2c-ii), so there is no type-correct stand-in
+     * to hand a caller that legitimately has no compressed prefix -- passing
+     * raw_kv, which is what this dispatch did while both were one 384 B
+     * PULSAR_ATTN_PACK row, would be a lie about the row being addressed.
+     * A raw-only banked batch (n_comp == 0) is normal, not a refusal. */
+    AF16_REQUIRE("indexed", heads && sinks && q && raw_kv && (n_comp == 0u || comp_kv),
+                 "heads=%d sinks=%d q=%d raw_kv=%d comp_kv=%d n_comp=%u",
+                 heads != NULL, sinks != NULL, q != NULL, raw_kv != NULL, comp_kv != NULL, n_comp);
+    AF16_REQUIRE("indexed", (vis_left != NULL) == (vis_right != NULL),
+                 "vis_left=%d vis_right=%d", vis_left != NULL, vis_right != NULL);
+    /* Vision is a PREFILL feature (the reference's window matrix) and its plan
+     * ignores non_causal; the two rules together are not a shape this kernel
+     * serves, so refuse rather than silently pick one. */
+    AF16_REQUIRE("indexed", !vis_left || non_causal == 0u, "vis with non_causal=%u", non_causal);
+    pulsar_gpu_q_prep qp;
+    memset(&qp, 0, sizeof qp);
+    if (q_prep) {
+        /* The fused Q load owns the whole nope/rope split: refuse shapes the
+         * fragment-pair math cannot cover rather than rope the wrong dims. */
+        if (q_prep->n_rot == 0u || (q_prep->n_rot & 1u) ||
+            q_prep->n_rot > AF16_DIM || ((AF16_DIM - q_prep->n_rot) & 1u)) {
+            fprintf(stderr, "pulsar: attn f16 cannot fuse q norm+rope for n_rot=%u\n",
+                    q_prep->n_rot);
+            return 0;
+        }
+        qp = *q_prep;
+    }
+
+    /* Descriptors are all-or-nothing, as in the dispatcher's own check. */
+    AF16_REQUIRE("indexed", (positions != NULL) == (seq_id != NULL), "positions=%d seq_id=%d",
+                 positions != NULL, seq_id != NULL);
+    /* comp_cap is the PER-BANK comp-row stride, so it is only meaningful when
+     * there are compressed rows to address.  Requiring it unconditionally under
+     * descriptors rejected the legitimate n_comp == 0 case -- which is what
+     * broke mixed-batch continued prefill for three days (L032): the launcher
+     * returned 0, the caller correctly refused to fall through, and the whole
+     * mixed run died with 'multiseq step_end FAILED'.  A banked batch whose
+     * visible comp prefix is empty is normal, not a bug. */
+    AF16_REQUIRE("indexed", !positions || (n_banks != 0u && (n_comp == 0u || comp_cap != 0u)),
+                 "banked: n_banks=%u n_comp=%u comp_cap=%u", n_banks, n_comp, comp_cap);
+    AF16_REQUIRE("indexed", head_dim == AF16_DIM, "head_dim=%u built=%u", head_dim, (unsigned)AF16_DIM);
+    AF16_REQUIRE("indexed", n_head != 0u && (n_head % AF16_HPB) == 0u, "n_head=%u heads/block=%u",
+                 n_head, (unsigned)AF16_HPB);
+    AF16_REQUIRE("indexed", n_tokens != 0u && raw_cap != 0u, "n_tokens=%u raw_cap=%u", n_tokens, raw_cap);
+    /* a table with no budget is a bug */
+    AF16_REQUIRE("indexed", !topk || top_k != 0u, "topk=%d top_k=%u", topk != NULL, top_k);
     /* No bound on n_raw: it is the whole raw RING, and the per-token raw_count
-     * is what sRawRows[256] must hold.  The kernel caps that at 256 exactly as
-     * attention_indexed_mixed_heads8_online_kernel does, so the behaviour
-     * matches rather than silently differing. */
-    if (!af16_device_supported()) return 0;
-    dim3 grid(n_tokens, n_head / AF16_HPB, 1);
-    attn_f16_kernel<<<grid, AF16_THREADS>>>(heads, sinks, q, raw_kv, comp_kv,
+     * is what sRawRows[AF16_RAWROWS] must hold; the kernel caps it there.  The
+     * sliding-window plans stay under the smaller dispatcher window cap
+     * (PULSAR_CUDA_ATTENTION_RAW_SCORE_CAP); the image-span reach is what needs
+     * the rest -- see the AF16_RAWROWS note. */
+    AF16_REQUIRE("indexed", af16_device_supported(), "%s", "no fp16 tensor-core tier on this device (sm_80+)");
+    AF16_REQUIRE("indexed", af16_dynsmem_ok(), "%s", "dynamic shared-memory grant refused (see the grant line above)");
+    /* L210: the leading DECODE rows of this batch split their key walk
+     * (L167's row-kind predicate, the same global the MoE dispatch reads: the
+     * batched step sets it to its decode-row count, the classic verify and
+     * drafter scopes to their row count, every prefill launch -- the per-token
+     * indexed prefill loop included -- leaves it 0).  Prefill rows in the same
+     * launch keep the classic walk on z == 0, byte for byte. */
+    const int dec_rows = pulsar_gpu_matmul_batch_decode_rows();
+    const uint32_t n_dec = dec_rows > 0 ? min((uint32_t)dec_rows, n_tokens) : 0u;
+    /* The split-K walk folds a row's raw window without the visibility plan
+     * (decode rows never carry one); a launch asking for both is a shape this
+     * kernel does not serve. */
+    AF16_REQUIRE("indexed", !vis_left || n_dec == 0u, "vis with %u split-K decode rows", n_dec);
+    /* The same emission contract as the prefill entry's epilogue; the split-K
+     * rows return before it, so only the rows past n_dec are encoded (the
+     * caller encodes the decode rows after the combine and the rope tail). */
+    AF16_REQUIRE("indexed", !gact_data || (n_groups != 0u && (n_head % n_groups) == 0u &&
+                                           (n_nope % 32u) == 0u && n_nope <= AF16_DIM &&
+                                           gact_scale && gact_tok0 + n_tokens <= gact_ntok),
+                 "gact n_head=%u n_groups=%u n_nope=%u rows %u+%u of %u", n_head, n_groups, n_nope,
+                 gact_tok0, n_tokens, gact_ntok);
+    uint32_t n_phys = 1u;
+    float *partials = NULL;
+    if (n_dec != 0u) {
+        const uint32_t groups = n_dec * (n_head / AF16_HPB);
+        n_phys = (af16_split_target_blocks() + groups - 1u) / groups;
+        if (n_phys > AF16_SPLITS) n_phys = AF16_SPLITS;
+        if (n_phys == 0u) n_phys = 1u;
+        partials = af16_partials(n_dec, n_head, AF16_SPLITS);
+        if (!partials) return 0;   /* af16_partials said why */
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "pulsar: decode attention = split-K flash-decode over the fp16 tensor-core tile "
+                            "(decode rows only; %u logical splits x %u head-groups per row, physical blocks "
+                            "sized to %u)\n",
+                    (unsigned)AF16_SPLITS, n_head / AF16_HPB, af16_split_target_blocks());
+        }
+    }
+    dim3 grid(n_tokens, n_head / AF16_HPB, n_phys);
+    attn_f16_kernel<pulsar_q_t><<<grid, AF16_THREADS, AF16_DYNSMEM_BYTES>>>(heads, sinks, (const pulsar_q_t *)q, raw_kv, comp_kv,
                                             (const int32_t *)topk,
                                             n_tokens, n_comp, window, ratio,
-                                            n_head, raw_f16, pos0, n_raw, raw_cap,
+                                            n_head, pos0, n_raw, raw_cap,
                                             raw_start, top_k,
                                             (const int32_t *)positions,
                                             (const int32_t *)seq_id,
                                             comp_bank_ptrs, comp_cap,
-                                            positions ? n_banks : 1u, comp_pack, 1);
-    return cuda_ok(cudaGetLastError(), "attention f16 indexed launch");
+                                            positions ? n_banks : 1u,
+                                            (const int32_t *)vis_left, (const int32_t *)vis_right, 1,
+                                            non_causal != 0u,
+                                            (__nv_fp8_e4m3 *)gact_data, (unsigned char *)gact_scale,
+                                            gact_kbp, gact_slab, n_groups, n_nope, gact_tok0, gact_ntok,
+                                            qp, q_prep != NULL,
+                                            af16_unified_rows(),
+                                            partials, n_dec);
+    if (!cuda_ok(cudaGetLastError(), "attention f16 indexed launch")) return 0;
+    if (n_dec != 0u) {
+        /* The heads' inverse tail rope folds in here whenever the fused Q prep
+         * is on (q_prep != NULL); the engine then ropes only the rows past
+         * n_dec.  With q_prep NULL (the Qcur dump) the engine ropes every row
+         * as before. */
+        attn_f16_combine_kernel<<<dim3(n_dec, n_head, 1), AF16_DIM>>>(heads, sinks, partials, n_head, AF16_SPLITS,
+                                                                       (const int32_t *)positions, pos0, qp, q_prep != NULL);
+        return cuda_ok(cudaGetLastError(), "attention f16 split-K combine launch");
+    }
+    return 1;
 }

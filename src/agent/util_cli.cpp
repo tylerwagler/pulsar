@@ -1,4 +1,7 @@
+/** @file
+ *  pulsar-agent: small utilities and command-line parsing. */
 #include "pulsar_agent_internal.h"
+#include "pulsar_argparse.h"
 
 
 
@@ -100,18 +103,10 @@ void agent_input_buf_free(agent_input_buf *b) {
 
 
 
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-
-
+/** @brief Whether `cmd` is the slash command `name`, alone or followed by whitespace and arguments.
+ *  @param cmd  the input line
+ *  @param name the command, e.g. "/switch"
+ *  @return true on a match */
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -136,38 +131,8 @@ bool agent_slash_command_known(const char *cmd) {
 
 
 
-static uint64_t parse_u64(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-
-
-static float parse_float_range(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar-agent: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-
-
-static pulsar_backend parse_backend(const char *s) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-agent: invalid backend: %s\n", s);
-    exit(2);
-}
-
-
-
+/** @brief The backend the agent opens when none is named.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
@@ -182,18 +147,11 @@ double agent_now_sec(void) {
 
 
 
-void usage(FILE *fp, const char *topic) {
+/// @brief Print pulsar-agent's help (PULSAR_HELP_AGENT), or one topic of it.
+/// @param fp    the stream (stdout for --help, stderr after a bad option)
+/// @param topic the topic asked (NULL: the overview)
+static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_AGENT, topic);
-}
-
-
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-agent: missing value for %s\n", opt);
-        exit(2);
-    }
-    return argv[++(*i)];
 }
 
 
@@ -201,7 +159,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 agent_config parse_options(int argc, char **argv) {
     agent_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "model",
             /* agent's per-token DSML/forcing loop can't consume speculative
              * chunks yet; disable the merged drafter until that is wired */
             .dspark_disable = true,
@@ -214,7 +172,8 @@ agent_config parse_options(int argc, char **argv) {
             .temperature = PULSAR_DEFAULT_TEMPERATURE,
             .top_p = PULSAR_DEFAULT_TOP_P,
             .min_p = PULSAR_DEFAULT_MIN_P,
-            .think_mode = PULSAR_THINK_LOW,
+            /* the loaded family's default effort, resolved after open (as pulsar's) */
+            .think_mode = PULSAR_THINK_DEFAULT,
         },
     };
 
@@ -231,6 +190,10 @@ agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--allow-outside-workspace")) {
+            c.allow_outside_workspace = true;
+        } else if (!strcmp(arg, "--allow-bash")) {
+            c.allow_bash = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -250,23 +213,27 @@ agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            /* thinking on at the LOADED family's default effort, resolved after open */
+            c.gen.think_mode = PULSAR_THINK_DEFAULT;
+            c.gen.think_mode_set = false;
+        } else if (!strcmp(arg, "--think-low")) {
             c.gen.think_mode = PULSAR_THINK_LOW;
+            c.gen.think_mode_set = true;
+        } else if (!strcmp(arg, "--think-effort")) {
+            c.gen.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
+                                               PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
-        } else if (!strcmp(arg, "--backend")) {
-            c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -274,8 +241,6 @@ agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -298,26 +263,4 @@ agent_config parse_options(int argc, char **argv) {
 
 
 
-void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
-
-
-pulsar_think_mode effective_think_mode(const agent_config *cfg) {
-    return pulsar_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
-}
 

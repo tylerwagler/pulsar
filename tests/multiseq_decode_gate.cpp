@@ -1,75 +1,80 @@
-/* Tier-2 MULTISEQ decode gate: co-scheduling neutrality + the first
- * aggregate-throughput measurement (increment 3's headline).
+/* Tier-2 MULTISEQ decode gate: co-scheduling neutrality, mixed-entry byte
+ * identity, the ALL_ROWS head mode, the stale-classic guard.
  *
- * MODEL-DEPENDENT: run manually on the GB10 via `make cuda-multiseq-gate`
- * (memory discipline in the Makefile target) — NOT part of `make test`.
+ * MODEL-DEPENDENT: run on the GB10 via `make cuda-multiseq-gate` (memory
+ * discipline in the Makefile target) -- NOT part of `make test`.
  *
- * WHAT THIS GATE ASSERTS (and what it deliberately does not)
- * ---------------------------------------------------------
- * The batched multi-session sweep (gpu_graph_encode_layer_batch) is a
- * DIFFERENT KERNEL PATH from classic single-token decode
- * (gpu_graph_encode_decode_layer): different attention/indexer tiers,
- * different GEMM shapes, different accumulation order.  The two paths are
- * NOT bit-identical, and that predates this code: the batch sweep already
- * diverged from classic decode on the increment-2 baseline (2c16d73) at the
- * same step and the same token ids the 1-row multiseq path produces
- * (control harness temp/t2i3_pathctl.c, which uses only the pre-existing
- * gpu_graph_verify_suffix_tops: "batch-sweep DIVERGES from classic decode at
- * step 18 (batch 979 vs classic 339)" — byte-identical verdict on the
- * baseline and on this tree, and the same step/tokens this gate's N=1 run
- * reports).  Greedy argmax turns any near-tie into a different token, and
- * the streams walk apart from there.
+ * WHAT THIS GATE ASSERTS
+ * ----------------------
+ *  1. CO-SCHEDULING NEUTRALITY (the reason the gate exists): a session's
+ *     emitted token stream must not depend on WHICH other sessions share its
+ *     batch, nor on how many -- bank k's stream over STEPS greedy steps at
+ *     N=2 must be token-identical to bank k's stream at N=3, AND the raw
+ *     step-1 logits of the shared banks must be byte-identical across the two
+ *     widths.  N=1 is not in the comparison: a 1-row batch dispatches the
+ *     single-row kernel tiers, so N=1 against N>=2 compares two kernel paths
+ *     rather than co-scheduling (cuda-row-neutrality-gate compares those, on
+ *     logits).  STEPS is 64 (L220), not 512: the width-keyed branch is the
+ *     per-row-count instantiation switch (pulsar_cuda_matmul.cu `switch
+ *     (n_tok) case 2: case 3:`; the MoE small-batch GEMV takes every decode
+ *     row at any width), and it is selected by n_active on the FIRST step and
+ *     re-selected identically on every later one -- steps 2..512 re-run the
+ *     same two instantiations over the same banks, so they buy repetition,
+ *     not coverage.  The position-keyed dispatch the long run was once
+ *     thought to reach (the indexer top-k buckets at n_comp 1024/2048/4096)
+ *     is not reached at STEPS=512 either: the longest bank's ratio-4 index
+ *     comp count is ~255 there and ~143 at 64, both inside the <=1024 arm.
+ *  2. MIXED-ENTRY IDENTITY: pulsar_session_decode_mixed (heap descriptors,
+ *     the server worker's entry) must equal pulsar_session_decode_multiseq
+ *     (stack descriptors) for a decode-only batch -- token streams over
+ *     GATE_MIX_STEPS steps and the step-1 logits, byte for byte, at every
+ *     width 2..MAXN.  The risk is descriptor addressing and lifetime, which
+ *     the first step exposes; the stream leg is a short walk past it.
+ *  3. ALL_ROWS HEAD MODE changes only the emission set, never the values.
+ *  4. STALE CLASSIC STATE fails loud: after a multiseq step the classic
+ *     single-bank entries must refuse, and a fresh pulsar_session_sync (the
+ *     documented recovery, available to public callers) clears the condition.
  *
- * So "multiseq stream == classic-decode stream" is NOT a property this
- * engine has, and gating on it would gate on the wrong thing.  The property
- * that matters for multi-session serving — and the HARD gate here — is
- * CO-SCHEDULING NEUTRALITY:
+ * FIXTURE.  One session for assertions 1-3 (the stale guard takes its own,
+ * see there).  Each prompt is prefilled ONCE,
+ * cold, into its bank and a snapshot of that bank is taken; the N=MAXN run
+ * decodes from those banks as populated.  Every later populate is a snapshot
+ * load into the bank (repoint, invalidate, load, bank_state_save -- the reset
+ * L160 measured byte-identical to a fresh trajectory), so the gate prefills
+ * MAXN + 1 times instead of once per bank per run.  Assertion 2 at N=MAXN
+ * compares a snapshot-loaded run against the cold-prefilled one, so it also
+ * witnesses load == cold prefill on this tree.
  *
- *   a session's emitted token stream must not depend on WHICH other sessions
- *   share its batch, nor on how many: bank k's stream at N=2 must be
- *   token-identical to bank k's stream at N=3.
- *
- * (N=1 is excluded from that comparison by construction: a 1-row batch
- * dispatches the engine's dedicated single-row kernel tiers, so N=1 vs N>=2
- * compares two kernel paths again rather than co-scheduling.)
- *
- * Bit-level bank addressing/isolation (bank-slot swap invariance,
- * populate-order invariance, idle-bank bytes untouched) is the frontier
- * gate's job (tests/multiseq_frontier_gate.c); this gate is its end-to-end
- * token-stream complement.
- *
- * WHAT THIS GATE IS BLIND TO (do not add it here — it is S6's job):
- * per-row POSITIONS.  reqs[k].pos below is a function of the bank k and the
- * step j, never of the batch width n, so bank k occupies the same rows at
- * the same positions at N=2 and at N=3.  A kernel that ignored positions[]
- * entirely would apply the SAME wrong rotation at both widths, and the
- * neutrality comparison would still pass — co-scheduling neutrality is
- * width-invariant by construction in this instantiation.  The frontier
- * gate's S6 (batchmate-position independence) is the check with teeth for
- * the position path.
+ * WHAT THIS GATE IS BLIND TO (do not add it here -- it is S6's job in the
+ * frontier gate): per-row POSITIONS.  reqs[k].pos below is a function of the
+ * bank k and the step j, never of the batch width n, so a kernel that ignored
+ * positions[] entirely would apply the same wrong rotation at both widths and
+ * the neutrality comparison would still pass.  Batched-vs-classic divergence
+ * is neither asserted nor measured here: the batch sweep and classic decode
+ * were never bit-identical (near-tie argmax flips walk the streams apart),
+ * and the single-row and multi-row tiers are compared on logits by
+ * cuda-row-neutrality-gate.
  *
  * DSPARK: `PULSAR_GATE_NO_DSPARK=1` opens the engine with speculation disabled
- * (the pulsar-bench/pulsar-eval/agent and `pulsar-server --no-dspark` config, and a
- * different allocation shape).  The driver must work there — it is plain
- * decode by contract at n >= 2 and must not depend on the speculation
+ * (the pulsar-bench/pulsar-eval/agent and `pulsar-server --no-dspark` config,
+ * and a different allocation shape).  The driver must work there -- it is
+ * plain decode by contract at n >= 2 and must not depend on the speculation
  * machinery having been initialized.  Run via `make cuda-multiseq-gate-nodspark`.
  *
- * INFORMATIONAL (reported, never fatal): each bank's stream vs the same
- * prompt decoded solo through classic decode — first divergence step and the
- * logit gap between the two candidates at that step, measured on the live
- * row of the real run.  A small gap is the near-tie signature of the
- * two-path numerics above; the gap is printed so a systematic divergence
- * (large gap, or divergence at step 1) stays visible instead of hidden.
- *
- * THROUGHPUT (informational): aggregate tokens/sec over the timed multi loop
- * = N*STEPS/elapsed, vs the timed classic baseline.  Server wiring
- * (increment 4) adds scheduling overhead on top.
+ * FAMILIES (L284): public bank API only, so it runs on every hosted model.  A
+ * family without snapshots re-prefills instead of loading (said in the log); a
+ * family whose steps carry no prompt runs skips assertion 3 by name; a family
+ * whose forward does not feed the engine's step funnel counter is said by
+ * name and its legs' widths are not asserted on it.
  *
  * usage: PULSAR_MSEQ_BANKS=3 ./tests/multiseq_decode_gate MODEL [MAXN] [STEPS]
- *        (from the repo root — reads tests/long_context_story_prompt.txt)
+ *        (from the repo root -- reads tests/long_context_story_prompt.txt;
+ *         MAXN >= 2; assertion 1 needs MAXN >= 3)
  */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "gate_util.h"
+#include "gate_entry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,10 +83,13 @@
 
 #define GATE_MAX_N 8
 #define GATE_MAX_STEPS 2048
+#define GATE_MIX_STEPS 64   /* assertion 2's stream leg (capped by STEPS) */
 
 static pulsar_engine *g_e;
 static pulsar_tokens g_toks;
 static int g_fail;
+static pulsar_session_snapshot g_snap[GATE_MAX_N];   /* prompt k, prefilled */
+static int g_first_tok[GATE_MAX_N];                  /* argmax after that prefill */
 
 /* Distinct prompts: different offsets AND different lengths so co-scheduled
  * banks sit at unrelated positions from step one. */
@@ -102,147 +110,89 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static char *read_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long n = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf || fread(buf, 1, (size_t)n, fp) != (size_t)n) { fclose(fp); free(buf); return NULL; }
-    fclose(fp);
-    buf[n] = '\0';
-    if (len_out) *len_out = (size_t)n;
-    return buf;
-}
+/* L284: whether the family snapshots sessions (pulsar_engine_has_snapshots).
+ * Without them every populate is a cold prefill of the prompt into the bank
+ * (gate_bank_sync) -- the same state by the session contract (C1: a prefill
+ * is its tokens' bytes), so the comparisons below keep their meaning. */
+static bool g_snapshots;
 
-static bool make_prompt(int k, pulsar_tokens *p) {
-    memset(p, 0, sizeof(*p));
-    const int off = g_prompt_off[k], len = g_prompt_len[k];
-    if (off + len > g_toks.len) return false;
-    p->v = (int *)malloc((size_t)len * sizeof(int));
-    if (!p->v) return false;
-    memcpy(p->v, g_toks.v + off, (size_t)len * sizeof(int));
-    p->len = p->cap = len;
+/* The cold path, once per prompt: prefill prompt k into bank k through the
+ * public bank API and snapshot the bank (where the family has snapshots). */
+static bool bank_prefill_and_snapshot(pulsar_session *s, int k) {
+    if (!gate_bank_sync(s, (uint32_t)k, g_toks.v + g_prompt_off[k], g_prompt_len[k], &g_first_tok[k], "populate"))
+        return false;
+    char err[256];
+    if (g_snapshots && pulsar_session_save_snapshot(s, &g_snap[k], err, sizeof err) != 0) {
+        fprintf(stderr, "snapshot of prompt %d failed: %s\n", k, err);
+        return false;
+    }
     return true;
 }
 
-/* Classic greedy solo reference for prompt k: prefill + STEPS plain decode
- * steps; stream[j] = argmax emitted at position len+j (stream[0] is the
- * prefill continuation).  *secs = the timed classic decode loop. */
-static bool solo_stream(int k, int steps, int *stream, double *secs) {
-    pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_tokens p;
-    bool ok = make_prompt(k, &p);
+/* Put prompt k into bank `bank` from its snapshot: repoint the device views,
+ * drop the live bookkeeping, load, persist as the bank's carry.  Without
+ * snapshots: prefill it there again. */
+static bool bank_load(pulsar_session *s, uint32_t bank, int k, const char *what) {
+    if (!g_snapshots)
+        return gate_bank_sync(s, bank, g_toks.v + g_prompt_off[k], g_prompt_len[k], NULL, what);
     char err[256];
-    if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
-        fprintf(stderr, "solo sync failed: %s\n", err);
-        ok = false;
-    }
-    if (ok) {
-        stream[0] = pulsar_session_argmax(s);
-        const double t0 = now_s();
-        for (int j = 1; ok && j <= steps; j++) {
-            if (pulsar_session_eval(s, stream[j - 1], err, sizeof(err)) != 0) {
-                fprintf(stderr, "solo eval failed at %d: %s\n", j, err);
-                ok = false;
-                break;
-            }
-            stream[j] = pulsar_session_argmax(s);
-        }
-        if (secs) *secs = now_s() - t0;
-    }
-    pulsar_tokens_free(&p);
-    pulsar_session_free(s);
-    return ok;
-}
-
-/* One multi run at batch width n: populate banks 0..n-1 through the classic
- * per-bank path, then run STEPS self-fed greedy steps through the engine
- * entry.  streams[k] gets steps+1 tokens (aligned with solo_stream).
- *
- * solo (optional): the first step at which bank k's token differs from
- * solo[k] is recorded in flip_step[k], and the LIVE logits row of that step
- * yields flip_gap[k] = logit(multi's pick) - logit(solo's pick) — measured in
- * the real run, at the real batch composition, with no re-decode. */
-/* use_mixed: route the batched step through pulsar_session_decode_mixed (the plan-34
- * heap-descriptor entry the server worker now uses) instead of
- * pulsar_session_decode_multiseq. Increment-1 refactor must be byte-identical.
- * first_logits_out (optional, n*vocab floats): the STEP-1 logits, copied out for
- * a byte-level cross-entry comparison. */
-static bool multi_run(int n, int steps, int **streams, int *const *solo,
-                      int *flip_step, float *flip_gap, double *secs,
-                      bool use_mixed, float *first_logits_out) {
-    pulsar_session *s = NULL;
-    if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
-    if ((int)gpu_graph_bank_pool_count(g) < n) {
-        fprintf(stderr, "pool too small: %u < %d (set PULSAR_MSEQ_BANKS)\n",
-                gpu_graph_bank_pool_count(g), n);
-        pulsar_session_free(s);
+    if (pulsar_session_bank_repoint(s, bank) != 0) {
+        fprintf(stderr, "%s: bank %u repoint failed\n", what, bank);
         return false;
     }
-    const int vocab = (int)PULSAR_N_VOCAB;   /* the engine's logits row width */
+    pulsar_session_invalidate(s);
+    if (pulsar_session_load_snapshot(s, &g_snap[k], err, sizeof err) != 0) {
+        fprintf(stderr, "%s: bank %u load of prompt %d failed: %s\n", what, bank, k, err);
+        return false;
+    }
+    pulsar_session_bank_state_save(s, bank);
+    return true;
+}
+
+/* One run at batch width n: banks 0..n-1 hold prompts 0..n-1 (loaded here
+ * unless banks_ready says they already do), then `steps` self-fed greedy
+ * steps through the engine entry.  streams[k] gets steps+1 tokens; [0] is the
+ * prefill continuation.  use_mixed routes the step through
+ * pulsar_session_decode_mixed instead of pulsar_session_decode_multiseq.
+ * first_logits_out (optional, n*vocab floats) receives the STEP-1 logits. */
+static bool multi_run(pulsar_session *s, int n, int steps, int **streams, double *secs,
+                      bool use_mixed, float *first_logits_out, bool banks_ready) {
+    if (!gate_bank_pool_fits(s, n)) return false;
+    const int vocab = pulsar_engine_logits_width(g_e);
     char err[256];
-    bool ok = true;
     for (int k = 0; k < n; k++) {
-        if (flip_step) flip_step[k] = -1;
-        /* Repoint the graph's views at bank k, prefill THIS bank from zero
-         * through the classic path (invalidate: no prefix reuse across
-         * banks), and capture its frontier into the bank's ms counters. */
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p;
-        ok = make_prompt(k, &p);
-        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
-            fprintf(stderr, "populate bank %d failed: %s\n", k, err);
+        if (!banks_ready && !bank_load(s, (uint32_t)k, k, "populate")) return false;
+        streams[k][0] = g_first_tok[k];
+    }
+    float *logits = (float *)malloc((size_t)n * vocab * sizeof(float));
+    if (!logits) return false;
+    bool ok = true;
+    const double t0 = now_s();
+    for (int j = 1; ok && j <= steps; j++) {
+        pulsar_multiseq_req reqs[GATE_MAX_N];
+        for (int k = 0; k < n; k++) {
+            reqs[k].bank = (uint32_t)k;
+            reqs[k].pos = TokPos{g_prompt_len[k] + (j - 1)};
+            reqs[k].token = streams[k][j - 1];
+        }
+        const int rc = use_mixed
+            ? pulsar_session_decode_mixed(s, reqs, (uint32_t)n,
+                                          logits, n * vocab, NULL, 0u, err, sizeof(err))
+            : pulsar_session_decode_multiseq(s, reqs, (uint32_t)n,
+                                             logits, n * vocab, err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "%s step %d failed (rc=%d): %s\n",
+                    use_mixed ? "mixed" : "multiseq", j, rc, err);
             ok = false;
+            break;
         }
-        if (ok) {
-            gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            streams[k][0] = pulsar_session_argmax(s);
-        }
-        pulsar_tokens_free(&p);
+        if (j == 1 && first_logits_out)
+            memcpy(first_logits_out, logits, (size_t)n * vocab * sizeof(float));
+        for (int k = 0; k < n; k++)
+            streams[k][j] = (int)argmax_f32(logits + (size_t)k * vocab, (uint64_t)vocab);
     }
-    float *logits = ok ? (float *)malloc((size_t)n * vocab * sizeof(float)) : NULL;
-    if (ok && !logits) ok = false;
-    if (ok) {
-        const double t0 = now_s();
-        for (int j = 1; ok && j <= steps; j++) {
-            pulsar_multiseq_req reqs[GATE_MAX_N];
-            for (int k = 0; k < n; k++) {
-                reqs[k].bank = (uint32_t)k;
-                reqs[k].pos = g_prompt_len[k] + (j - 1);
-                reqs[k].token = streams[k][j - 1];
-            }
-            const int rc = use_mixed
-                ? pulsar_session_decode_mixed(s, reqs, (uint32_t)n,
-                                           logits, n * vocab, NULL, 0u, err, sizeof(err))
-                : pulsar_session_decode_multiseq(s, reqs, (uint32_t)n,
-                                              logits, n * vocab, err, sizeof(err));
-            if (rc != 0) {
-                fprintf(stderr, "%s step %d failed (rc=%d): %s\n",
-                        use_mixed ? "mixed" : "multiseq", j, rc, err);
-                ok = false;
-                break;
-            }
-            if (j == 1 && first_logits_out)
-                memcpy(first_logits_out, logits, (size_t)n * vocab * sizeof(float));
-            for (int k = 0; k < n; k++) {
-                const float *row = logits + (size_t)k * vocab;
-                streams[k][j] = (int)argmax_f32(row, (uint64_t)vocab);
-                if (solo && flip_step && flip_step[k] < 0 &&
-                    streams[k][j] != solo[k][j]) {
-                    flip_step[k] = j;
-                    if (flip_gap) flip_gap[k] = row[streams[k][j]] - row[solo[k][j]];
-                }
-            }
-        }
-        if (secs) *secs = now_s() - t0;
-    }
+    if (secs) *secs = now_s() - t0;
     free(logits);
-    pulsar_session_free(s);
     return ok;
 }
 
@@ -250,24 +200,24 @@ static bool multi_run(int n, int steps, int **streams, int *const *solo,
  * step, not silently corrupt.
  *
  * After a multiseq step the graph's scalar frontier counters hold a
- * cross-bank SUPERSET, not any single bank's truth.  pulsar_session_eval decodes
- * against those scalars unconditionally (it never consulted checkpoint_valid,
- * so clearing that flag never covered this path): it would emit its
- * compressor row at the superset index and attend over the rows below it — a
- * previous tenant's bytes when the live bank's frontier is lower.  Wrong
- * logits, silently.  pulsar_session_decode_multiseq is public, so a server is
- * exactly the caller that hits this.
+ * cross-bank SUPERSET, not any single bank's truth.  pulsar_session_eval
+ * decodes against those scalars unconditionally: it would emit its
+ * compressor row at the superset index and attend over the rows below it --
+ * a previous tenant's bytes when the live bank's frontier is lower.  Wrong
+ * logits, silently.  pulsar_session_decode_multiseq is public, so a server
+ * is exactly the caller that hits this.
  *
- * Asserted here: (1) eval fails after a multiseq step, (2) the speculative
- * entries fail too (same counters), (3) a fresh pulsar_session_sync — the
- * documented escape hatch, and one available to public callers — clears the
- * condition and eval works again. */
+ * Asserted: (1) eval fails after a multiseq step, (2) the speculative entries
+ * fail too (same counters), (3) a fresh pulsar_session_sync -- the documented
+ * escape hatch, available to public callers -- clears the condition and eval
+ * works again.  On its OWN session: the pre-check needs one that has never
+ * run a multiseq step (the dirty state it asserts on later is per session and
+ * only a sync clears it), and the recovery leaves it classic. */
 static bool check_stale_classic_fails_loud(void) {
     pulsar_session *s = NULL;
     if (pulsar_session_create(&s, g_e, 4096) != 0) return false;
-    pulsar_gpu_graph *g = &s->graph;
-    if ((int)gpu_graph_bank_pool_count(g) < 2) {
-        printf("STALE-GUARD: skipped (pool %u < 2)\n", gpu_graph_bank_pool_count(g));
+    if (pulsar_session_bank_count(s) < 2) {
+        printf("STALE-GUARD: skipped (pool %d < 2)\n", pulsar_session_bank_count(s));
         pulsar_session_free(s);
         return true;
     }
@@ -276,19 +226,8 @@ static bool check_stale_classic_fails_loud(void) {
     bool ok = true;
     int last[2] = {0, 0};
     for (int k = 0; ok && k < 2; k++) {
-        if (g->banks.n_banks && !gpu_graph_bank_repoint(g, (uint32_t)k)) { ok = false; break; }
-        pulsar_session_invalidate(s);
-        pulsar_tokens p;
-        ok = make_prompt(k, &p);
-        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
-            fprintf(stderr, "stale-guard populate bank %d failed: %s\n", k, err);
-            ok = false;
-        }
-        if (ok) {
-            gpu_graph_bank_counters_capture(g, (uint32_t)k);
-            last[k] = pulsar_session_argmax(s);
-        }
-        pulsar_tokens_free(&p);
+        ok = bank_load(s, (uint32_t)k, k, "stale-guard populate");
+        last[k] = g_first_tok[k];
     }
     float *logits = ok ? (float *)malloc((size_t)2 * vocab * sizeof(float)) : NULL;
     if (ok && !logits) ok = false;
@@ -302,22 +241,18 @@ static bool check_stale_classic_fails_loud(void) {
     }
     if (ok) {
         /* Re-establish bank 1's frontier: the eval above advanced it. */
-        pulsar_tokens p;
-        ok = make_prompt(1, &p);
-        if (ok && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) ok = false;
-        if (ok) gpu_graph_bank_counters_capture(g, 1u);
-        pulsar_tokens_free(&p);
-        if (!ok) CHECK(0, "stale-guard: bank 1 re-sync failed");
+        ok = bank_load(s, 1u, 1, "stale-guard re-populate");
+        if (!ok) CHECK(0, "stale-guard: bank 1 re-load failed");
     }
     if (ok) {
         pulsar_multiseq_req reqs[2];
         for (int k = 0; k < 2; k++) {
             reqs[k].bank = (uint32_t)k;
-            reqs[k].pos = g_prompt_len[k];
+            reqs[k].pos = TokPos{g_prompt_len[k]};
             reqs[k].token = last[k];
         }
         const int rc = pulsar_session_decode_multiseq(s, reqs, 2, logits,
-                                                   2 * vocab, err, sizeof(err));
+                                                      2 * vocab, err, sizeof(err));
         if (rc != 0) {
             CHECK(0, "stale-guard: multiseq step failed (rc=%d): %s", rc, err);
             ok = false;
@@ -328,14 +263,14 @@ static bool check_stale_classic_fails_loud(void) {
         const int rc = pulsar_session_eval(s, last[0], err, sizeof(err));
         CHECK(rc != 0,
               "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval SUCCEEDED after "
-              "a multiseq step — it decoded against cross-bank superset frontier "
+              "a multiseq step -- it decoded against cross-bank superset frontier "
               "counters and silently corrupted KV");
         if (rc != 0) printf("STALE-GUARD: eval after multiseq fails loud OK (%s)\n", err);
 
         err[0] = '\0';
         int acc[4];
-        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, -1, acc,
-                                                           4, err, sizeof(err));
+        const int rcs = pulsar_session_eval_speculative_block(s, last[0], 4, acc,
+                                                              4, err, sizeof(err));
         CHECK(rcs <= 0,
               "STALE CLASSIC STATE NOT CAUGHT: pulsar_session_eval_speculative_block "
               "SUCCEEDED after a multiseq step (returned %d)", rcs);
@@ -343,242 +278,238 @@ static bool check_stale_classic_fails_loud(void) {
     }
     if (ok) {
         /* The escape hatch: a fresh sync rebuilds per-bank state (reset zeroes
-         * the counters) and classic decode must work again. */
-        pulsar_tokens p;
-        bool ok2 = make_prompt(0, &p);
-        if (ok2 && pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
+         * the counters) and classic decode must work again.  This is the one
+         * populate in the gate that MUST be a real sync -- the recovery path
+         * under test. */
+        pulsar_tokens p = { .v = g_toks.v + g_prompt_off[0], .len = g_prompt_len[0],
+                            .cap = g_prompt_len[0] };
+        if (pulsar_session_sync(s, &p, err, sizeof(err)) != 0) {
             CHECK(0, "stale-guard: re-sync after multiseq failed: %s", err);
-            ok2 = false;
-        }
-        if (ok2) {
+        } else {
             CHECK(pulsar_session_eval(s, pulsar_session_argmax(s), err, sizeof(err)) == 0,
-                  "stale-guard: eval still refused after a re-sync — the "
+                  "stale-guard: eval still refused after a re-sync -- the "
                   "documented recovery path does not clear the condition (%s)",
                   err);
             printf("STALE-GUARD: re-sync clears the condition, classic eval "
                    "works again OK\n");
         }
-        pulsar_tokens_free(&p);
     }
     free(logits);
     pulsar_session_free(s);
     return ok;
 }
 
-/* Tier-1 SPEC lane timing (the mode-switch crossover measurement — plan
- * §2.2/§2.3: "MEASURE the N=2 boundary, do NOT hardcode 3").  This is the lane
- * the scheduler picks at n<=2: n INDEPENDENT sessions (each its own graph — the
- * Tier-1 time-slice model, NOT banks), fused DSpark speculation, round-robin
- * one generate_speculative quantum per session until each has emitted >= steps
- * tokens.  Timed apples-to-apples with multi_run's batched lane (aggregate =
- * emitted/elapsed) so the crossover is measured on THIS v0.2.3 build rather
- * than assumed.  Greedy (temp=0): exact-under-argmax spec, so each session's
- * stream matches its solo reference.  Returns false (caller skips + reports)
- * if the engine has no drafter — the PULSAR_GATE_NO_DSPARK / --no-dspark config,
- * where the scheduler has no spec lane and batches at every width. */
-static bool spec_timeslice_run(int n, int steps, double *secs,
-                               uint64_t *out_emitted) {
-    if (!pulsar_engine_has_dspark(g_e)) return false;
-    pulsar_session *ss[GATE_MAX_N];
-    memset(ss, 0, sizeof(ss));
-    char err[256];
+/* HARD GATE: the ALL_ROWS head mode may change ONLY the emission set, never
+ * the values.  Two identical states (banks 0 and 1 loaded from their
+ * snapshots) run the same verify-shaped batch (bank0 = a 3-row run, bank1 =
+ * 1 row); the last-of-run call emits 2 rows, the ALL_ROWS call emits 4, and
+ * the rows both modes emit must be BYTE-identical (same forward, same hidden
+ * rows, same head -- the mode only selects which rows are headed).  This is
+ * the contract the batched speculative verify's accept walk stands on. */
+static bool check_all_rows_head_mode(pulsar_session *s) {
+    /* L284: the last-of-run call carries bank 0's 3 rows as a K-row run headed
+     * at its last row -- a prompt run inside decode_mixed.  A family whose
+     * decode_mixed carries no prompt runs (pulsar_engine_has_mixed_prefill:
+     * Qwen's prompts ride the fused step instead) has no last-of-run mode to
+     * compare ALL_ROWS against; said by name. */
+    if (!pulsar_engine_has_mixed_prefill(g_e)) {
+        printf("ALL-ROWS HEAD MODE [%s]: skipped -- the family's decode_mixed carries no prompt runs, so "
+               "there is no last-of-run emission to compare\n", pulsar_engine_family_name(g_e));
+        return true;
+    }
+    if (!gate_bank_pool_fits(s, 2)) return false;
+    const int vocab = pulsar_engine_logits_width(g_e);
+    float *rows_lor = (float *)malloc((size_t)2 * vocab * sizeof(float));
+    float *rows_all = (float *)malloc((size_t)4 * vocab * sizeof(float));
+    if (!rows_lor || !rows_all) { free(rows_lor); free(rows_all); return false; }
     bool ok = true;
-    for (int k = 0; k < n && ok; k++) {
-        if (pulsar_session_create(&ss[k], g_e, 4096) != 0) { ok = false; break; }
-        pulsar_tokens p;
-        ok = make_prompt(k, &p);
-        if (ok && pulsar_session_sync(ss[k], &p, err, sizeof(err)) != 0) {
-            fprintf(stderr, "spec populate %d failed: %s\n", k, err);
+    for (int mode = 0; ok && mode < 2; mode++) {
+        char err[256];
+        for (int k = 0; ok && k < 2; k++)
+            ok = bank_load(s, (uint32_t)k, k, "all-rows populate");
+        if (!ok) break;
+        /* bank0: 3-row teacher-forced run (draft shape); bank1: 1 row.  The
+         * token VALUES only need to be legal and identical across the two
+         * modes -- the invariant under test is emission, not quality. */
+        pulsar_multiseq_req reqs[4];
+        for (int j = 0; j < 3; j++) {
+            reqs[j].bank = 0u;
+            reqs[j].pos = TokPos{g_prompt_len[0] + j};
+            reqs[j].token = g_first_tok[0];
+        }
+        reqs[3].bank = 1u;
+        reqs[3].pos = TokPos{g_prompt_len[1]};
+        reqs[3].token = g_first_tok[1];
+        uint32_t got = 0;
+        const int rc = pulsar_session_decode_mixed(s, reqs, 4u,
+                mode == 0 ? rows_lor : rows_all,
+                (mode == 0 ? 2 : 4) * vocab, &got,
+                mode == 0 ? 0u : PULSAR_MSEQ_HEAD_ALL_ROWS,
+                err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "all-rows gate: decode_mixed mode %d failed (rc=%d): %s\n",
+                    mode, rc, err);
+            ok = false;
+        } else if (got != (mode == 0 ? 2u : 4u)) {
+            fprintf(stderr, "all-rows gate: mode %d emitted %u rows (want %u)\n",
+                    mode, got, mode == 0 ? 2u : 4u);
             ok = false;
         }
-        pulsar_tokens_free(&p);
     }
-    uint64_t emitted_total = 0;
     if (ok) {
-        int emitted[GATE_MAX_N];
-        memset(emitted, 0, sizeof(emitted));
-        int acc[32];
-        uint64_t rng = 0x2545F4914F6CDD1Dull;
-        const int eos = pulsar_token_eos(g_e);
-        const double t0 = now_s();
-        bool more = true;
-        while (ok && more) {
-            more = false;
-            for (int k = 0; k < n && ok; k++) {
-                if (emitted[k] >= steps) continue;
-                const int ntok = pulsar_session_generate_speculative(
-                        ss[k], 0.0f, 0, 1.0f, 0.0f, &rng,
-                        steps - emitted[k], eos, acc,
-                        (int)(sizeof(acc) / sizeof(acc[0])), err, sizeof(err));
-                if (ntok < 0) {
-                    fprintf(stderr, "spec %d failed: %s\n", k, err);
-                    ok = false;
-                    break;
-                }
-                if (ntok == 0) { emitted[k] = steps; continue; } /* eos/stall: retire */
-                emitted[k] += ntok;
-                emitted_total += (uint64_t)ntok;
-                if (emitted[k] < steps) more = true;
-            }
-        }
-        if (secs) *secs = now_s() - t0;
+        const size_t rb = (size_t)vocab * sizeof(float);
+        const int d_last = memcmp(rows_all + (size_t)2 * vocab, rows_lor, rb);
+        const int d_b1   = memcmp(rows_all + (size_t)3 * vocab, rows_lor + (size_t)1 * vocab, rb);
+        CHECK(d_last == 0,
+              "ALL_ROWS row 2 (bank0 run-last) != last-of-run row 0 -- the head "
+              "mode changed VALUES, not just the emission set");
+        CHECK(d_b1 == 0,
+              "ALL_ROWS row 3 (bank1) != last-of-run row 1 -- the head mode "
+              "changed VALUES, not just the emission set");
+        int finite = 1;
+        for (int j = 0; j < 2 * vocab; j += 977)
+            if (!(rows_all[j] == rows_all[j])) finite = 0;
+        CHECK(finite, "ALL_ROWS intermediate rows contain NaN");
+        if (d_last == 0 && d_b1 == 0 && finite)
+            printf("ALL-ROWS HEAD MODE: emission-only (rows byte-identical to "
+                   "last-of-run; 4 rows emitted, intermediates finite)\n");
     }
-    for (int k = 0; k < n; k++) if (ss[k]) pulsar_session_free(ss[k]);
-    if (out_emitted) *out_emitted = emitted_total;
+    free(rows_lor);
+    free(rows_all);
     return ok;
 }
 
-int main(int argc, char **argv) {
+int GATE_ENTRY(int argc, char **argv) {
+    g_e = NULL;
+    memset(&g_toks, 0, sizeof(g_toks));
+    g_fail = 0;
+    memset(g_snap, 0, sizeof(g_snap));
+    memset(g_first_tok, 0, sizeof(g_first_tok));
     if (argc < 2) {
         fprintf(stderr, "usage: %s MODEL [MAXN] [STEPS]\n", argv[0]);
         return 2;
     }
     const int maxn = argc > 2 ? atoi(argv[2]) : 3;
     const int steps = argc > 3 ? atoi(argv[3]) : 512;
-    if (maxn < 1 || maxn > GATE_MAX_N || steps < 1 || steps > GATE_MAX_STEPS) {
-        fprintf(stderr, "bad MAXN/STEPS\n");
+    if (maxn < 2 || maxn > GATE_MAX_N || steps < 1 || steps > GATE_MAX_STEPS) {
+        fprintf(stderr, "bad MAXN/STEPS (MAXN 2..%d, STEPS 1..%d)\n", GATE_MAX_N, GATE_MAX_STEPS);
         return 2;
     }
+    const int mix_steps = steps < GATE_MIX_STEPS ? steps : GATE_MIX_STEPS;
 
     pulsar_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = argv[1];
     opt.backend = PULSAR_BACKEND_CUDA;
     /* PULSAR_GATE_NO_DSPARK: run the whole gate with speculation DISABLED, the
-     * way pulsar-bench/pulsar-eval/pulsar-agent and `pulsar-server --no-dspark` open the
-     * engine.  This is a real serving config (and the one increment 4's
-     * server will plausibly run), and it is a DIFFERENT allocation shape: the
-     * DSpark graph state is never allocated.  The driver used to reject every
-     * step here because the shared multi-row logits slab was allocated only
-     * as a side effect of DSpark init — a config no gate covered, because
-     * both gates default to the drafter-merged FRONTIER_MODEL.  Read once at
-     * startup (this is the test's own config, not a hot path). */
+     * way pulsar-bench/pulsar-eval/pulsar-agent and `pulsar-server --no-dspark`
+     * open the engine.  A real serving config and a DIFFERENT allocation
+     * shape: the DSpark graph state is never allocated, and the driver once
+     * rejected every step here because the shared multi-row logits slab was
+     * allocated only as a side effect of DSpark init.  Read once at startup
+     * (the test's own config, not a hot path). */
     if (getenv("PULSAR_GATE_NO_DSPARK") != NULL) {
         opt.dspark_disable = true;
-        printf("CONFIG: DSpark DISABLED (dspark_disable=1) — the driver must "
+        printf("CONFIG: DSpark DISABLED (dspark_disable=1) -- the driver must "
                "work with no speculation machinery allocated\n");
     }
-    if (pulsar_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
-    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_dspark(g_e)) {
+    if (gate_engine_open(&g_e, &opt) != 0) { fprintf(stderr, "engine open failed\n"); return 1; }
+    if (getenv("PULSAR_GATE_NO_DSPARK") != NULL && pulsar_engine_has_spec_rounds(g_e)) {
         fprintf(stderr, "MULTISEQ GATE FAIL: PULSAR_GATE_NO_DSPARK set but the "
-                        "engine still reports a drafter — the no-dspark case "
+                        "engine still reports a drafter -- the no-dspark case "
                         "is not actually being exercised\n");
+        gate_engine_close(g_e);
         return 1;
     }
-
-    size_t text_len = 0;
-    char *text = read_file("tests/long_context_story_prompt.txt", &text_len);
-    if (!text) { fprintf(stderr, "prompt file read failed\n"); return 1; }
-    memset(&g_toks, 0, sizeof(g_toks));
-    pulsar_tokenize_text(g_e, text, &g_toks);
-    free(text);
+    pulsar_session *s = NULL;
+    int rc = 1;
+    {
     int need = 0;
     for (int k = 0; k < maxn; k++) {
         if (g_prompt_off[k] + g_prompt_len[k] > need) need = g_prompt_off[k] + g_prompt_len[k];
     }
-    if (g_toks.len < need) { fprintf(stderr, "prompt too short (%d < %d)\n", g_toks.len, need); return 1; }
+    if (!gate_load_story(g_e, &g_toks, need)) goto done;
+    g_snapshots = pulsar_engine_has_snapshots(g_e);
 
-    /* Classic-decode solo references + the single-session baseline rate. */
-    int *solo[GATE_MAX_N];
-    double solo_secs[GATE_MAX_N];
-    for (int k = 0; k < maxn; k++) {
-        solo[k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
-        if (!solo[k] || !solo_stream(k, steps, solo[k], &solo_secs[k])) {
-            fprintf(stderr, "solo reference %d failed\n", k);
-            return 1;
+    if (pulsar_session_create(&s, g_e, 4096) != 0) { fprintf(stderr, "session create failed\n"); goto done; }
+    if (!gate_bank_pool_fits(s, maxn)) goto done;
+
+    /* The cold prefills: prompt k into bank k, snapshotted.  They also say
+     * whether the family's forward feeds the engine's step funnel counter
+     * (DeepSeek's graph: the prefills move it); where it does, every leg's
+     * width is asserted on it below. */
+    bool funnel_fed;
+    {
+        pulsar_gate_shape p0; pulsar_gate_shape_read(&p0);
+        const double t0 = now_s();
+        for (int k = 0; k < maxn; k++) {
+            if (!bank_prefill_and_snapshot(s, k)) { fprintf(stderr, "prefill %d failed\n", k); goto done; }
         }
-        printf("solo[%d]: prompt off=%d len=%d, %d steps in %.1fs (%.2f tok/s classic plain)\n",
-               k, g_prompt_off[k], g_prompt_len[k], steps, solo_secs[k],
-               (double)steps / solo_secs[k]);
+        pulsar_gate_shape p1; pulsar_gate_shape_read(&p1);
+        funnel_fed = p1.prefill_calls != p0.prefill_calls;
+        printf("[%s] prefilled %d prompts (%d tokens) in %.1fs; every later populate is %s\n",
+               pulsar_engine_family_name(g_e), maxn, need, now_s() - t0,
+               g_snapshots ? "a snapshot load" : "a cold prefill (the family has no snapshots)");
+        if (!funnel_fed)
+            printf("[%s] the family's forward does not feed the step funnel counter: each leg's width stands on "
+                   "its steps' own row count (the requests)\n", pulsar_engine_family_name(g_e));
     }
 
-    /* Multi runs at N = 1..maxn; every stream is kept for the cross-N gate. */
+    /* Multiseq runs at N = MAXN..2 (the banks already hold the prompts for the
+     * first); every stream is kept for the cross-N gate. */
     int *multi[GATE_MAX_N][GATE_MAX_N];   /* [n-1][bank] */
     bool have[GATE_MAX_N];
-    const int vocab_w = (int)PULSAR_N_VOCAB;
+    const int vocab_w = pulsar_engine_logits_width(g_e);
     float *ref_l1[GATE_MAX_N];            /* [n-1] step-1 logits, multiseq entry */
     memset(multi, 0, sizeof(multi));
     memset(have, 0, sizeof(have));
     memset(ref_l1, 0, sizeof(ref_l1));
-    for (int n = 1; n <= maxn; n++) {
-        int flip_step[GATE_MAX_N];
-        float flip_gap[GATE_MAX_N];
-        memset(flip_gap, 0, sizeof(flip_gap));
+    for (int n = maxn; n >= 2; n--) {
         for (int k = 0; k < n; k++) multi[n - 1][k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
         ref_l1[n - 1] = (float *)malloc((size_t)n * vocab_w * sizeof(float));
         double secs = 0.0;
-        if (!multi_run(n, steps, multi[n - 1], solo, flip_step, flip_gap, &secs,
-                       false, ref_l1[n - 1])) {
+        pulsar_gate_shape s0; pulsar_gate_shape_read(&s0);
+        if (!multi_run(s, n, steps, multi[n - 1], &secs, false, ref_l1[n - 1], n == maxn)) {
             CHECK(0, "N=%d: multi run failed", n);
             continue;
         }
+        /* NON-VACUITY (L220): this leg must have run `steps` batched steps at
+         * EXACTLY width n -- the engine's own funnel counter, not a second
+         * copy.  A leg that silently collapsed to another width would make the
+         * cross-width comparison below vacuous while still passing. */
+        pulsar_gate_shape s1; pulsar_gate_shape_read(&s1);
+        const uint64_t dc = s1.step_calls - s0.step_calls, dr = s1.step_rows - s0.step_rows;
+        CHECK(!funnel_fed || (dc == (uint64_t)steps && dr == (uint64_t)n * (uint64_t)steps),
+              "N=%d: the leg ran %llu step call(s) / %llu row(s), want %d of %d -- the "
+              "width axis was not exercised", n, (unsigned long long)dc,
+              (unsigned long long)dr, steps, n * steps);
         have[n - 1] = true;
         printf("N=%d: %d steps x %d sessions in %.1fs -> aggregate %.2f tok/s "
-               "(%.2f tok/s/session)\n",
-               n, steps, n, secs, (double)n * steps / secs, (double)steps / secs);
-        /* INFORMATIONAL: divergence from classic decode (see the header). */
-        for (int k = 0; k < n; k++) {
-            if (flip_step[k] < 0) {
-                printf("  N=%d bank %d: vs classic-solo IDENTICAL over %d tokens\n",
-                       n, k, steps + 1);
-            } else {
-                printf("  N=%d bank %d: vs classic-solo diverges at step %d "
-                       "(batch %d vs classic %d, logit gap %.6f) — two-path "
-                       "numerics, informational\n",
-                       n, k, flip_step[k],
-                       multi[n - 1][k][flip_step[k]], solo[k][flip_step[k]],
-                       (double)flip_gap[k]);
-            }
-        }
+               "(%.2f tok/s/session) [shape: %llu calls / %llu rows]\n",
+               n, steps, n, secs, (double)n * steps / secs, (double)steps / secs,
+               (unsigned long long)dc, (unsigned long long)dr);
     }
 
-    /* Tier-1 SPEC lane vs the batched lane above: the mode-switch crossover,
-     * measured on this build (plan §2.2/§2.3 mandate — do NOT hardcode 3).
-     * Informational, like the batched throughput lines; compare SPEC N=k
-     * aggregate against the "N=k ... aggregate" batched line above.  Skipped
-     * with no drafter (the scheduler then batches at every width). */
-    if (pulsar_engine_has_dspark(g_e)) {
-        for (int n = 1; n <= maxn; n++) {
-            double secs = 0.0;
-            uint64_t emitted = 0;
-            if (spec_timeslice_run(n, steps, &secs, &emitted) && secs > 0.0) {
-                printf("SPEC N=%d: %llu tokens (%d session(s) time-sliced) in "
-                       "%.1fs -> aggregate %.2f tok/s (%.2f tok/s/session)\n",
-                       n, (unsigned long long)emitted, n, secs,
-                       (double)emitted / secs, (double)emitted / secs / n);
-            } else {
-                printf("SPEC N=%d: spec lane run failed/unavailable\n", n);
-            }
-        }
-    } else {
-        printf("SPEC lane: skipped (no drafter — scheduler batches at every "
-               "width in this config)\n");
-    }
-
-    /* HARD GATE (plan-34 inc 1): the mixed-descriptor entry
-     * (pulsar_session_decode_mixed, heap scratch) the server worker now routes
-     * through must be BYTE-IDENTICAL to pulsar_session_decode_multiseq (fixed stack
-     * scratch) for a decode-only batch. Re-run each width through the mixed entry
-     * and assert (a) the full per-bank token STREAM is identical (all steps) and
-     * (b) the STEP-1 logits are byte-identical (memcmp of the float rows). A
-     * heap-scratch addressing/lifetime bug — the stated risk — surfaces here. */
-    for (int n = 1; n <= maxn; n++) {
+    /* HARD GATE 2: the mixed-descriptor entry must be BYTE-IDENTICAL to the
+     * multiseq entry for a decode-only batch -- the per-bank token STREAM over
+     * mix_steps steps and the STEP-1 logits (memcmp of the float rows).  A
+     * heap-scratch addressing/lifetime bug surfaces here. */
+    for (int n = 2; n <= maxn; n++) {
         if (!have[n - 1]) continue;
         int *mix[GATE_MAX_N];
         memset(mix, 0, sizeof(mix));
-        for (int k = 0; k < n; k++) mix[k] = (int *)malloc((size_t)(steps + 1) * sizeof(int));
+        for (int k = 0; k < n; k++) mix[k] = (int *)malloc((size_t)(mix_steps + 1) * sizeof(int));
         float *mix_l1 = (float *)malloc((size_t)n * vocab_w * sizeof(float));
-        double secs = 0.0;
-        if (!multi_run(n, steps, mix, NULL, NULL, NULL, &secs, true, mix_l1)) {
+        if (!multi_run(s, n, mix_steps, mix, NULL, true, mix_l1, false)) {
             CHECK(0, "N=%d: mixed-entry run failed", n);
         } else {
             int sdiff = -1;
             for (int k = 0; k < n && sdiff < 0; k++)
-                for (int j = 0; j <= steps; j++)
+                for (int j = 0; j <= mix_steps; j++)
                     if (mix[k][j] != multi[n - 1][k][j]) { sdiff = j; break; }
             CHECK(sdiff < 0,
                   "MIXED ENTRY NOT byte-identical: N=%d token stream diverges from "
-                  "the multiseq entry at step %d — heap descriptor addressing is wrong",
+                  "the multiseq entry at step %d -- heap descriptor addressing is wrong",
                   n, sdiff);
             const size_t lb = (size_t)n * vocab_w * sizeof(float);
             const int ldiff = memcmp(mix_l1, ref_l1[n - 1], lb);
@@ -587,18 +518,34 @@ int main(int argc, char **argv) {
                   "the multiseq entry (memcmp != 0)", n);
             if (sdiff < 0 && ldiff == 0)
                 printf("MIXED-ENTRY EQUIV: N=%d decode_mixed == decode_multiseq "
-                       "(streams over %d tokens + step-1 logits byte-identical)\n",
-                       n, steps + 1);
+                       "(streams over %d tokens + step-1 logits byte-identical%s)\n",
+                       n, mix_steps + 1,
+                       n == maxn ? "; snapshot-loaded banks == cold-prefilled" : "");
         }
         for (int k = 0; k < n; k++) free(mix[k]);
         free(mix_l1);
     }
 
-    /* HARD GATE: co-scheduling neutrality — bank k's stream must not depend
-     * on which/how many OTHER sessions share the batch (n >= 2; N=1 excluded,
-     * it dispatches the single-row kernel tiers). */
+    /* HARD GATE 1: co-scheduling neutrality -- bank k's stream must not
+     * depend on which/how many OTHER sessions share the batch (n >= 2), and
+     * (L220) the shared banks' step-1 logits must be byte-identical across
+     * the widths.  The logits leg is the level the engine's contract is
+     * written at ("a decode row's bytes depend on neither its batchmates nor
+     * the batch width", pulsar_gpu.h); the argmax-stream leg walks it past
+     * the descriptor/head-layout risk that logits alone would not. */
     for (int n = 3; n <= maxn; n++) {
         if (!have[n - 1] || !have[1]) continue;
+        /* The reference run is N=2 (banks 0,1); both banks exist at every
+         * n >= 2, so 2*vocab floats are shared. */
+        const size_t lb = (size_t)2 * vocab_w * sizeof(float);
+        const int ldiff = memcmp(ref_l1[n - 1], ref_l1[1], lb);
+        CHECK(ldiff == 0,
+              "co-scheduling NOT neutral at the byte level: banks 0,1 step-1 "
+              "logits at N=%d differ from N=2 (memcmp != 0) -- the batch width "
+              "reached a row's numerics", n);
+        if (ldiff == 0)
+            printf("CO-SCHED NEUTRALITY: banks 0,1 step-1 logits byte-identical "
+                   "at N=2 and N=%d (2 x %d floats)\n", n, vocab_w);
         for (int k = 0; k < 2; k++) {
             int diff = -1;
             for (int j = 0; j <= steps; j++) {
@@ -606,7 +553,7 @@ int main(int argc, char **argv) {
             }
             CHECK(diff < 0,
                   "co-scheduling NOT neutral: bank %d's stream at N=%d differs "
-                  "from its stream at N=2 at step %d (%d vs %d) — a batchmate "
+                  "from its stream at N=2 at step %d (%d vs %d) -- a batchmate "
                   "changed another session's tokens",
                   k, n, diff,
                   diff >= 0 ? multi[n - 1][k][diff] : -1,
@@ -618,13 +565,21 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!check_all_rows_head_mode(s)) CHECK(0, "all-rows head-mode gate failed to run");
+
     if (!check_stale_classic_fails_loud()) CHECK(0, "stale-classic guard check failed to run");
 
-    for (int k = 0; k < maxn; k++) free(solo[k]);
     for (int n = 0; n < GATE_MAX_N; n++) free(ref_l1[n]);
     for (int n = 0; n < GATE_MAX_N; n++)
         for (int k = 0; k < GATE_MAX_N; k++) free(multi[n][k]);
-    pulsar_engine_close(g_e);
+    rc = 0;
+    }
+done:
+    for (int k = 0; k < GATE_MAX_N; k++) pulsar_session_snapshot_free(&g_snap[k]);
+    pulsar_session_free(s);
+    pulsar_tokens_free(&g_toks);
+    gate_engine_close(g_e);
+    if (rc != 0) return rc;
     if (g_fail) { fprintf(stderr, "MULTISEQ DECODE GATE: FAIL\n"); return 1; }
     printf("MULTISEQ DECODE GATE: PASS\n");
     return 0;

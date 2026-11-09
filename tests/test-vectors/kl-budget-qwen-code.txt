@@ -1,0 +1,4 @@
+# depth kl   (recorded /home/claude/work/L357/out/refcap/qwen-f48fa829/code.ref.bin)
+512 0.018404378667809577
+2048 0.0049865167022362889
+3957 0.10725232865512767

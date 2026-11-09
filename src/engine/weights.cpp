@@ -1,49 +1,65 @@
+/** @file weights.cpp
+ *  @brief DeepSeek V4 weight binding: required / optional tensor lookups and their shape and format checks. */
 #include "pulsar_engine_internal.h"
+#include "exl3_trellis.h"
 
 
 
+/// @param m the model
+/// @param key a numeric key
+/// @return its value; 0 and a counted refusal when absent
 static float required_f32(const pulsar_model *m, const char *key) {
     float v = 0.0f;
     if (!model_get_f32_compat(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0.0f;
     }
     return v;
 }
 
 
 
+/// @param m the model
+/// @param key a bool key
+/// @return its value; false and a counted refusal when absent
 static bool required_bool(const pulsar_model *m, const char *key) {
     bool v = false;
     if (!model_get_bool(m, key, &v)) {
         fprintf(stderr, "pulsar: required metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return false;
     }
     return v;
 }
 
 
 
+/* The family's binders stop at the first refusal (L272 P4a: the find / dims / format mechanics are the
+ * core's, tensor_bind.cpp). */
+/// The owner name the core's bind / admit messages carry.
+static const char *const DS4_OWNER = "deepseek4";
+/* L272: a missing required tensor binds to this inert, zeroed tensor (refused once, where it was looked
+ * up), so the binder finishes and reports every problem; the load fails at its stage boundary. */
+/// The inert tensor a missing required one binds to (see above).
+static pulsar_tensor g_ds4_absent;
+
+/// @param m the model
+/// @param name the tensor name
+/// @return the tensor, or &g_ds4_absent (refused)
 static pulsar_tensor *required_tensor(const pulsar_model *m, const char *name) {
-    pulsar_tensor *t = model_find_tensor(m, name);
-    if (!t) {
-        fprintf(stderr, "pulsar: required tensor is missing: %s\n", name);
-        exit(1);
-    }
+    pulsar_tensor *t = pulsar_tensor_bind(m, DS4_OWNER, name);
+    if (!t) { pulsar_load_refuse(); return &g_ds4_absent; }   /* inert: the checks after it skip it */
     return t;
 }
 
 
 
-static pulsar_tensor *tensor_by_namef(const pulsar_model *m, const char *fmt, uint32_t layer) {
-    char name[128];
-    int n = snprintf(name, sizeof(name), fmt, layer);
-    if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
-    return model_find_tensor(m, name);
-}
-
-
-
+/// required_tensor by a printf name.
+/// @param m the model
+/// @param fmt name format with one %u
+/// @param layer its value
+/// @return the tensor, or &g_ds4_absent
 static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
     char name[128];
     int n = snprintf(name, sizeof(name), fmt, layer);
@@ -53,6 +69,51 @@ static pulsar_tensor *required_tensorf(const pulsar_model *m, const char *fmt, u
 
 
 
+/* Formatted OPTIONAL lookup: NULL when the artifact does not carry it.  Used for
+ * the tensors a shipped checkpoint may legitimately omit -- the router's
+ * correction bias is the one that bit (see the binding site).  The caller is
+ * responsible for the "absent" arm; a silent NULL reaching a deref is the
+ * failure this naming is meant to make visible. */
+/// @param m the model
+/// @param fmt name format with one %u
+/// @param layer its value
+/// @return the tensor, or NULL
+static pulsar_tensor *optional_tensorf(const pulsar_model *m, const char *fmt, uint32_t layer) {
+    char name[128];
+    int n = snprintf(name, sizeof(name), fmt, layer);
+    if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
+    return model_find_tensor(m, name);
+}
+
+
+
+/* Shape half of the layout validators. Both callers check the TYPE their own
+ * way and then need exactly this; keeping one copy stops the two drifting, which
+ * is a live failure mode in this file (two banked emit blocks had silently
+ * stopped emitting dumps their classic twins still emitted). */
+/// @param t the tensor (g_ds4_absent: skipped, refused where bound)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
+static void tensor_expect_dims(
+        const pulsar_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (t == &g_ds4_absent) return;   /* refused where it was bound */
+    if (!pulsar_tensor_dims(t, DS4_OWNER, ndim, d0, d1, d2)) pulsar_load_refuse();
+}
+
+
+/// Refuse unless t is exactly `type` with these dims.
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param type the PULSAR_TENSOR_* id
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_layout(
         const pulsar_tensor *t,
         uint32_t          type,
@@ -61,41 +122,22 @@ static void tensor_expect_layout(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != type) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected %s\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type),
-                tensor_type_name(type));
-        exit(1);
-    }
-    if (t->ndim != ndim) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
-    }
-
-    const uint64_t want[3] = { d0, d1, d2 };
-    for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "pulsar: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
-    }
+    if (t == &g_ds4_absent) return;
+    if (!pulsar_tensor_admit(t, DS4_OWNER, t->type == type, tensor_type_name(type))) pulsar_load_refuse();
+    tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
 
 
+/* Layout check for a tensor the artifact may legitimately omit: absent is fine,
+ * present must be right.  (dev's L216 helper; the merge lost it while keeping
+ * its three callers -- the branch's side had reformatted this spot.) */
+/// @param t the tensor, or NULL (accepted)
+/// @param type the PULSAR_TENSOR_* id
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_optional(
         const pulsar_tensor *t,
         uint32_t          type,
@@ -105,9 +147,18 @@ static void tensor_expect_optional(
         uint64_t          d2) {
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
-/* MXFP8 workhorse weight: either the classic interleaved type (FP8_E4M3, 38) or
- * its pre-stored device layout (MXFP8_LT, 41). Both share dims and byte
- * accounting; the FP8 matmul resolver dispatches on the registered offset. */
+
+
+
+/* MXFP8 workhorse weight, stored in its pre-stored device layout (mxfp8_lt).
+ * The legacy interleaved form is refused by NAME when the checkpoint is read
+ * (st_layout_type), so there is no second storage to accept here; the FP8
+ * matmul resolver dispatches on the registered offset. */
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_mxfp8(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -115,13 +166,19 @@ static void tensor_expect_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_FP8_E4M3)
-        tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_MXFP8_LT)
-        tensor_expect_layout(t, PULSAR_TENSOR_MXFP8_LT, ndim, d0, d1, d2);
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the site emits the E4M3 slot -- the format registry's dense kernels for it (weight_format.cpp) */
+    if (pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3)))
+        tensor_expect_dims(t, ndim, d0, d1, d2);
     else
-        pulsar_die("tensor has unsupported weight type; expected FP8_E4M3 or MXFP8_LT");
+        pulsar_load_refuse();
 }
+/// Refuse unless the registry has a dense arm for t at the slot's bf16 or E4M3 activations.
+/// @param t the tensor (NULL dies; g_ds4_absent skipped)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_plain_or_mxfp8(
         const pulsar_tensor *t,
         uint32_t          ndim,
@@ -129,65 +186,93 @@ static void tensor_expect_plain_or_mxfp8(
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type == PULSAR_TENSOR_F16)
-        tensor_expect_layout(t, PULSAR_TENSOR_F16, ndim, d0, d1, d2);
-    else if (t->type == PULSAR_TENSOR_FP8_E4M3)
-        tensor_expect_layout(t, PULSAR_TENSOR_FP8_E4M3, ndim, d0, d1, d2);
-    else
-        /* Deliberately does NOT accept MXFP8_LT: the weights routed here
-         * (hc_attn_fn/hc_ffn_fn, ffn_gate_inp, attn/indexer compressors,
-         * output_hc_fn) take the PLAIN matmul path (gpu_graph_matmul_plain_tensor),
-         * which has no type-41 branch. Pre-storing one as MXFP8_LT would decode to
-         * garbage, so a future FP8 variant of these must fail FAST here at load,
-         * not silently pass. Only the tensor_expect_mxfp8 workhorse set (routed
-         * through cuda_fp8_mx_weight) may be MXFP8_LT. */
-        pulsar_die("tensor has unsupported weight type; expected F16 or FP8_E4M3");
-}
-
-
-
-
-static void tensor_expect_plain_layout(
-        const pulsar_tensor *t,
-        uint32_t          ndim,
-        uint64_t          d0,
-        uint64_t          d1,
-        uint64_t          d2) {
-    if (!t) pulsar_die("internal error: missing tensor while validating layout");
-    if (t->type != PULSAR_TENSOR_F16 && t->type != PULSAR_TENSOR_F32) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %s, expected F16 or F32\n",
-                (int)t->name.len,
-                t->name.ptr,
-                tensor_type_name(t->type));
-        exit(1);
+    /* Membership is the dense arm table's (pulsar_dense_arm_for, weight_format.cpp), the one the launcher runs
+     * (pulsar_linear_slot, linear.cpp): a type admitted here has an arm there by construction.  (Three parallel
+     * lists once drifted -- MXFP8_LT passed load with no dispatcher arm until 2026-08-17.) */
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the slot's bf16 plane for the F32 / BF16 arms, its E4M3 for MXFP8 -- the registry's dense kernels at
+     * those two activations */
+    if (!pulsar_tensor_admit_role(t, DS4_OWNER, PULSAR_ROLE_DENSE,
+                                  PULSAR_ACTS(PULSAR_ACT_SLOT_BF16) | PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
+        pulsar_load_refuse();
+        return;
     }
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
 
 
-/* The two routed-expert types the engine still reads.  IQ2_XXS (16),
- * IQ2_XXS_SOA (42), Q2_K (10) and FP4_E2M1 (39) were dropped: a scan of the
- * shipped artifact found only types 0/1/26/38/40/41/43 in the file, none of the
- * four is ever synthesised at load (they can only arrive FROM a gguf), and the
- * kernels behind them are gone.  Refusing here is what keeps that honest -- an
- * old artifact now fails to load with a clear message instead of dispatching
- * into a reader that no longer exists. */
-static bool tensor_is_routed_expert_type(uint32_t type) {
-    return type == PULSAR_TENSOR_IQ2_XXS_MMQ ||
-           type == PULSAR_TENSOR_CUTLASS_MXFP4;
+
+/* For weights whose consumer reads f32 OR bf16 storage, chosen per tensor at
+ * load (see pulsar_w_load in the CUDA internal header).  These are tensors the
+ * checkpoint holds in bf16 and we used to widen to f32 for no reason -- the
+ * drafter's markov head and confidence projection, and the norm weights.
+ * Accepting both keeps one binary able to load an artifact from either side of
+ * that change; every caller must pass the tensor's actual type down to the
+ * kernel, never assume. */
+/// @param t the tensor (NULL dies)
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
+static void tensor_expect_f32_or_bf16(
+        const pulsar_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) pulsar_die("internal error: missing tensor while validating layout");
+    if (t->type == PULSAR_TENSOR_BF16)
+        tensor_expect_layout(t, PULSAR_TENSOR_BF16, ndim, d0, d1, d2);
+    else
+        tensor_expect_layout(t, PULSAR_TENSOR_F32, ndim, d0, d1, d2);
+}
+
+/// Refuse unless t is F32 or BF16 with these dims.
+/// @param t the tensor
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
+static void tensor_expect_plain_layout(
+        const pulsar_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    /* Accepts the two NON-fp8 arms of pulsar_linear_slot (the slot's bf16 plane), which is
+     * what every caller here feeds. BF16 was missing until 2026-08-16 and the
+     * drafter's router is bf16 now, so an otherwise-correct artifact died at
+     * load with "expected F16 or F32". The main model's router is checked by
+     * tensor_expect_plain_or_mxfp8 and had already been extended -- the drafter
+     * goes through THIS one, and changing the type policy without walking every
+     * validator that sees it is exactly how that gets missed. */
+    if (t->type != PULSAR_TENSOR_BF16 &&
+        t->type != PULSAR_TENSOR_F32) {
+        fprintf(stderr,
+                "pulsar: tensor %.*s has type %s, expected F32 or BF16\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        pulsar_load_refuse();
+        return;
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
 
 
+
+
+/// @param type a routed-expert block type
+/// @return bytes per 256-weight block; dies on another type
 static PULSAR_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
-    /* IQ2_XXS_MMQ (43) is a pure permutation of the old raw IQ2_XXS -- llama.cpp
+    /* IQ2_XXS_MMQ_K (44) is a pure permutation of the raw IQ2_XXS blocks (L202)
      * MMQ's aligned-SoA layout.  Same 66 B/block, so row bytes, expert stride
      * and tensor size are unchanged; that is why it drops into the existing
      * offset machinery.  Only the kernel's read pattern differs. */
-    case PULSAR_TENSOR_IQ2_XXS_MMQ: return sizeof(block_iq2_xxs);
+    case PULSAR_TENSOR_IQ2_XXS_MMQ_K: return sizeof(block_iq2_xxs);
     default:                 pulsar_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -202,55 +287,43 @@ PULSAR_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const pulsar_tensor *t) {
 
 
 
-/* Computes (gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes)
- * for any supported routed-expert quant combo, centralizing the
- * dispatch-site pattern `row_bytes = routed_expert_row_bytes(t); expert_bytes =
- * t->dim[1] * row_bytes` that's repeated across gpu_prefill.c/gpu_decode.c.
- *
- * For CUTLASS_MXFP4 (type 40) "row_bytes" has no ordinary per-row meaning --
- * the tensor is expert-major ColumnMajor+swizzle with no per-row byte stride
- * at all. It instead carries the data/SF split point within each expert's
- * block: the SF blob starts *row_bytes bytes into that expert's slice, and
- * *expert_bytes is the full [data + SF] stride to the next expert. Callers
- * that dispatch on gate->type == PULSAR_TENSOR_CUTLASS_MXFP4 must read it that
- * way; only the CUTLASS MoE path does. */
-bool routed_expert_gate_down_layout(
-        const pulsar_tensor *gate,
-        const pulsar_tensor *down,
-        uint64_t         *gate_expert_bytes,
-        uint64_t         *gate_row_bytes,
-        uint64_t         *down_expert_bytes,
-        uint64_t         *down_row_bytes) {
-    /* NOTE: gate and down are NOT always the same type -- gate/up and down
-     * formats pair freely per layer by design (see
-     * tensor_expect_routed_expert_combo). Each side's layout is computed
-     * independently so MIXED layers (cutlass_mxfp4 on one side, iq2/q2k on the
-     * other) resolve correctly: the CUTLASS_MXFP4 side yields stride/split-point,
-     * the dp4a side yields ordinary expert/row byte counts. */
-    if (!gate || !down) return false;
-
-    if (gate->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
-        uint64_t gate_sf, gate_stride;
-        cutlass_mxfp4_expert_layout(gate->dim[0], gate->dim[1],
-                                     gate_row_bytes, &gate_sf, &gate_stride);
-        *gate_expert_bytes = gate_stride;
-    } else {
-        *gate_row_bytes = routed_expert_row_bytes(gate);
-        if (*gate_row_bytes == 0 || gate->dim[1] > UINT64_MAX / *gate_row_bytes) return false;
-        *gate_expert_bytes = gate->dim[1] * *gate_row_bytes;
+/* ONE side's byte model from (type, in = k, out = n): the per-expert stride
+ * and the "row bytes" value that side's consumers read -- an ordinary row
+ * stride for the IQ2 arm, the data/SF split point for CUTLASS MXFP4, the
+ * trellis/scales split point for EXL3 (exl3_expert_layout).  The routed MoE's
+ * front door (moe.cpp) and the container's expert-stack check
+ * (st_add_expert_stacks) read this, so a stack whose declared expert_bytes
+ * disagrees with the type's own layout is refused at load instead of being
+ * addressed with a guessed stride. */
+bool routed_expert_side_layout(uint32_t type, uint64_t k, uint64_t n,
+                               uint64_t *expert_bytes, uint64_t *row_bytes) {
+    if (type == PULSAR_TENSOR_CUTLASS_MXFP4) {
+        uint64_t sf, stride;
+        cutlass_mxfp4_expert_layout(k, n, row_bytes, &sf, &stride);
+        *expert_bytes = stride;
+        return true;
     }
-
-    if (down->type == PULSAR_TENSOR_CUTLASS_MXFP4) {
-        uint64_t down_sf, down_stride;
-        cutlass_mxfp4_expert_layout(down->dim[0], down->dim[1],
-                                     down_row_bytes, &down_sf, &down_stride);
-        *down_expert_bytes = down_stride;
-    } else {
-        *down_row_bytes = routed_expert_row_bytes(down);
-        if (*down_row_bytes == 0 || down->dim[1] > UINT64_MAX / *down_row_bytes) return false;
-        *down_expert_bytes = down->dim[1] * *down_row_bytes;
+    if (exl3_type_k2(type)) {
+        uint64_t scales;
+        return exl3_expert_layout(k, n, exl3_type_k2(type), row_bytes, &scales, expert_bytes);
     }
-    return true;
+    if (type == PULSAR_TENSOR_IQ2_XXS_MMQ_K) {
+        if (k % QK_K) return false;
+        *row_bytes = (k / QK_K) * routed_expert_block_bytes(type);
+        if (*row_bytes == 0 || n > UINT64_MAX / *row_bytes) return false;
+        *expert_bytes = n * *row_bytes;
+        return true;
+    }
+    if (type == PULSAR_TENSOR_BF16) {
+        /* L295 F7: an expert is its [out = n][in = k] bf16 rows (the HF orientation, ne [k, n]): a row is k * 2 bytes
+         * -- the BF16 routed arm (pulsar_cuda_bf16_rows.cuh) reads 16-byte runs, so k % 64 is its contract and this
+         * model's */
+        if (k == 0 || n == 0 || k % 64 || n > UINT64_MAX / (k * 2)) return false;
+        *row_bytes = k * 2;
+        *expert_bytes = n * *row_bytes;
+        return true;
+    }
+    return false;
 }
 
 
@@ -264,104 +337,60 @@ bool routed_expert_gate_down_layout(
  * requires cutlass down (and vice versa). Reject anything else at load with
  * one clear error instead of a silent kernel-dispatch failure at the first
  * MoE layer. */
+/// @param gate the gate stack
+/// @param up the up stack
+/// @param down the down stack
 static void tensor_expect_routed_expert_combo(
         const pulsar_tensor *gate,
         const pulsar_tensor *up,
         const pulsar_tensor *down) {
-    /* gate/up must match (the fused gate+up kernels assume one format). Each of
-     * gate/up and down is independently either IQ2_XXS_MMQ (43, read by the MMQ
-     * arms) or CUTLASS_MXFP4 (40) -- the GPU MoE path handles all-cutlass
-     * (uniform, grouped/gemv), all-MMQ, AND the two MIXED shapes via
-     * per-projection dispatch, which is what the shipped artifact needs: its 43
-     * routed layers are 9 all-40, 27 all-43 and 7 mixed.
-     *
-     * The old dp4a types (IQ2_XXS 16, IQ2_XXS_SOA 42, Q2_K 10, FP4_E2M1 39) are
-     * gone along with their kernels, so the former "bad_mix" cross (CUTLASS
-     * against a legacy type-39 side) can no longer be expressed and its check
-     * went with them. */
-    const bool gate_up_pair = gate->type == up->type;
-    const bool gate_ok = tensor_is_routed_expert_type(gate->type);
-    const bool down_ok = tensor_is_routed_expert_type(down->type);
-    if (gate_up_pair && gate_ok && down_ok) return;
-    fprintf(stderr,
-            "pulsar: unsupported routed expert quant combo at tensor %.*s: "
-            "gate=%s up=%s down=%s; gate/up must match and each of gate/up and "
-            "down must be cutlass_mxfp4 (40) or iq2_xxs_mmq (43); "
-            "combos may differ per layer\n",
-            (int)gate->name.len,
-            gate->name.ptr,
-            tensor_type_name(gate->type),
-            tensor_type_name(up->type),
-            tensor_type_name(down->type));
-    exit(1);
+    /* L272 P4: the MoE launchers' pairing rules are the format registry's (pulsar_format_moe_combo): one format
+     * per gate / up pair, and at E4M3 activations an EXL3 side pairs only with an EXL3 side.  The GPU MoE path
+     * handles all-CUTLASS, all-MMQ and the two mixed 40 / 44 shapes per projection -- the shipped artifact's
+     * 43 routed layers are 9 all-40, 27 all-44 and 7 mixed. */
+    if (gate == &g_ds4_absent || up == &g_ds4_absent || down == &g_ds4_absent) return;
+    if (!pulsar_format_moe_combo(gate, up, down, PULSAR_ACT_SLOT_E4M3, DS4_OWNER)) pulsar_load_refuse();
 }
 
 
 
+/// @param t the stack (NULL dies; g_ds4_absent skipped)
+/// @param role its weight role
+/// @param ndim dims expected
+/// @param d0 ne[0]
+/// @param d1 ne[1] (when ndim >= 2)
+/// @param d2 ne[2] (when ndim == 3)
 static void tensor_expect_routed_expert(
         const pulsar_tensor *t,
+        pulsar_weight_role role,
         uint32_t          ndim,
         uint64_t          d0,
         uint64_t          d1,
         uint64_t          d2) {
     if (!t) pulsar_die("internal error: missing routed expert tensor while validating layout");
-    if (!tensor_is_routed_expert_type(t->type)) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has type %u (%s), expected a routed expert quant type\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->type,
-                tensor_type_name(t->type));
-        exit(1);
+    if (t == &g_ds4_absent) return;
+    /* L272 P4: the stack's role at this family's E4M3 activations (the registry's routed-expert kernels) */
+    if (!pulsar_tensor_admit_role(t, DS4_OWNER, role, PULSAR_ACTS(PULSAR_ACT_SLOT_E4M3))) {
+        pulsar_load_refuse();
+        return;
     }
-    if (t->ndim != ndim) {
-        fprintf(stderr,
-                "pulsar: tensor %.*s has %u dimensions, expected %u\n",
-                (int)t->name.len,
-                t->name.ptr,
-                t->ndim,
-                ndim);
-        exit(1);
-    }
-
-    const uint64_t want[3] = { d0, d1, d2 };
-    for (uint32_t i = 0; i < ndim; i++) {
-        if (t->dim[i] == want[i]) continue;
-        fprintf(stderr,
-                "pulsar: tensor %.*s has dim[%u]=%" PRIu64 ", expected %" PRIu64 "\n",
-                (int)t->name.len,
-                t->name.ptr,
-                i,
-                t->dim[i],
-                want[i]);
-        exit(1);
-    }
+    tensor_expect_dims(t, ndim, d0, d1, d2);
 }
 
 
 
+/* V4.1 (L218): the head collapses the stream with the LAST FFN's pre-mix, so
+ * there are no output_hc_* tensors -- the head is the norm and the projection. */
 bool weights_have_output_head(const pulsar_weights *w) {
-    return w &&
-           w->output_hc_base &&
-           w->output_hc_fn &&
-           w->output_hc_scale &&
-           w->output_norm &&
-           w->output;
+    return w && w->output_norm && w->output;
 }
 
 
 
-static bool weights_have_partial_output_head(const pulsar_weights *w) {
-    return w &&
-           (w->output_hc_base ||
-            w->output_hc_fn ||
-            w->output_hc_scale ||
-            w->output_norm ||
-            w->output);
-}
 
-
-
+/// @param l the layer's tensors, or NULL
+/// @param il the layer
+/// @return true when every tensor the layer's attention mode and routing need is bound
 static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (!l->hc_attn_fn ||
@@ -390,27 +419,27 @@ static bool weights_layer_has_required(const pulsar_layer_weights *l, uint32_t i
     {
         return false;
     }
+    /* 0731: a hash-routed layer without its table cannot route at all. */
+    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
 
-    const uint32_t ratio = pulsar_layer_compress_ratio(il);
-    if (ratio != 0 &&
-        (!l->attn_compressor_ape ||
-         !l->attn_compressor_kv ||
-         !l->attn_compressor_gate ||
-         !l->attn_compressor_norm))
+    const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+    if (pulsar_attn_owns_kv(a->mode) &&
+        (!l->attn_compressor_kv ||
+         !l->attn_compressor_norm ||
+         (a->ratio > 1 && !l->attn_compressor_gate) ||
+         (g_pulsar_shape.compressor_ape && !l->attn_compressor_ape) ||
+         (!g_pulsar_shape.indexer_own_compressor && (!l->indexer_k || !l->indexer_k_norm))))
     {
         return false;
     }
-    if (ratio == 4 &&
-        (!l->indexer_attn_q_b ||
-         !l->indexer_proj ||
-         !l->indexer_compressor_ape ||
-         !l->indexer_compressor_kv ||
-         !l->indexer_compressor_gate ||
-         !l->indexer_compressor_norm))
+    if (pulsar_attn_runs_indexer(a->mode) &&
+        (!l->indexer_attn_q_b || !l->indexer_proj ||
+         (g_pulsar_shape.indexer_own_compressor &&
+          (!l->indexer_compressor_ape || !l->indexer_compressor_kv ||
+           !l->indexer_compressor_gate || !l->indexer_compressor_norm))))
     {
         return false;
     }
-    if (il < PULSAR_N_HASH_LAYER && !l->ffn_gate_tid2eid) return false;
     return true;
 }
 
@@ -428,6 +457,11 @@ const pulsar_layer_weights *weights_first_bound_layer(const pulsar_weights *w) {
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
  * Token embedding and output head are validated when present. */
+/// @param w the weights
+/// @param layer_start first layer
+/// @param layer_end last layer, inclusive (UINT32_MAX = the last)
+/// @param require_token_embd die without token_embd
+/// @param require_output die without the output head
 static void weights_validate_layout(
         const pulsar_weights *w,
         uint32_t           layer_start,
@@ -448,90 +482,141 @@ static void weights_validate_layout(
 
     if (require_token_embd && !w->token_embd) pulsar_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        tensor_expect_layout(w->token_embd, PULSAR_TENSOR_F16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        /* BF16 upstream. F16 and BF16 are both 2 bytes here, so this costs
+         * nothing to store either way -- but f16 is a LOSSY copy of a bf16
+         * source (it flushes anything under 5.96e-8 to zero) while bf16 is an
+         * exact one. There is no version of this where f16 is the better
+         * choice; it was simply never revisited. */
+        tensor_expect_layout(w->token_embd, PULSAR_TENSOR_BF16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) pulsar_die("required output head tensors are missing");
-    if (weights_have_partial_output_head(w) && !have_output) pulsar_die("partial output head in GGUF");
     if (have_output) {
-        tensor_expect_layout(w->output_hc_base,  PULSAR_TENSOR_F32,  1, PULSAR_N_HC, 0, 0);
-        tensor_expect_plain_or_mxfp8(w->output_hc_fn, 2, hc_dim, PULSAR_N_HC, 0);
-        tensor_expect_layout(w->output_hc_scale, PULSAR_TENSOR_F32,  1, 1, 0, 0);
-        tensor_expect_layout(w->output_norm,     PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
-        /* Output head is MXFP8, routed to the FP8 matmul.  The BF16 alternative
-         * (kept lossless, with its own dedicated matmul) is gone: the shipped
-         * artifact's head is MXFP8 and no BF16 tensor appears anywhere in it. */
-        tensor_expect_mxfp8(w->output,           2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        tensor_expect_f32_or_bf16(w->output_norm,  1, PULSAR_N_EMBD, 0, 0);
+        /* Output head is BF16 (source format, kept lossless by a dedicated BF16
+         * matmul) or MXFP8 (routed to the FP8 matmul).  Source ships this head
+         * bf16, so MXFP8 is BELOW source here -- the one place in the model
+         * where a dense tensor is.  Both are accepted so the two can be
+         * A/B'd against the same binary. */
+        if (w->output->type == PULSAR_TENSOR_BF16)
+            tensor_expect_layout(w->output,      PULSAR_TENSOR_BF16, 2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
+        else
+            tensor_expect_mxfp8(w->output,       2, PULSAR_N_EMBD, PULSAR_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const pulsar_layer_weights *l = &w->layer[il];
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
         if (!weights_layer_has_required(l, il)) {
             fprintf(stderr, "pulsar: required tensors for layer %u are missing\n", il);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  PULSAR_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   PULSAR_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->attn_norm,      PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_norm,  1, PULSAR_N_EMBD, 0, 0);
         tensor_expect_mxfp8(l->attn_q_a,        2, PULSAR_N_EMBD, PULSAR_N_LORA_Q, 0);
-        tensor_expect_layout(l->attn_q_a_norm,  PULSAR_TENSOR_F32,  1, PULSAR_N_LORA_Q, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_q_a_norm,  1, PULSAR_N_LORA_Q, 0, 0);
         tensor_expect_mxfp8(l->attn_q_b,        2, PULSAR_N_LORA_Q, q_dim, 0);
         tensor_expect_mxfp8(l->attn_kv,         2, PULSAR_N_EMBD, PULSAR_N_HEAD_DIM, 0);
-        tensor_expect_layout(l->attn_kv_a_norm, PULSAR_TENSOR_F32,  1, PULSAR_N_HEAD_DIM, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_kv_a_norm,  1, PULSAR_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     PULSAR_TENSOR_F32,  1, PULSAR_N_HEAD, 0, 0);
         tensor_expect_mxfp8(l->attn_output_a,   2, PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_mxfp8(l->attn_output_b,   2, out_low_dim, PULSAR_N_EMBD, 0);
 
-        if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint64_t comp_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, ratio, 0);
+        /* The compressor lives on the kv sources only, the indexer's q/score
+         * weights on every index source.  A ratio-1 compressor is a plain
+         * projection + norm (no gate).  On 0731 the compressor width is
+         * coff * head_dim (coff 2 at ratio 4, 1 at ratio 128 -- pulsar_compress_coff)
+         * and both compressors carry an ape; the index KEY comes from the
+         * indexer's own compressor instead of the kv source's latent. */
+        const pulsar_layer_attn *a = pulsar_layer_attn_layout(il);
+        if (pulsar_attn_owns_kv(a->mode)) {
+            const uint64_t comp_width = (uint64_t)pulsar_compress_coff(a->ratio) * PULSAR_N_HEAD_DIM;
+            if (g_pulsar_shape.compressor_ape) {
+                tensor_expect_plain_or_mxfp8(l->attn_compressor_ape, 2, comp_width, a->ratio, 0);
+            }
             tensor_expect_plain_or_mxfp8(l->attn_compressor_kv, 2, PULSAR_N_EMBD, comp_width, 0);
-            tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, comp_width, 0);
-            tensor_expect_layout(l->attn_compressor_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD_DIM, 0, 0);
+            if (a->ratio > 1) tensor_expect_plain_or_mxfp8(l->attn_compressor_gate, 2, PULSAR_N_EMBD, comp_width, 0);
+            tensor_expect_f32_or_bf16(l->attn_compressor_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
+            if (!g_pulsar_shape.indexer_own_compressor) {
+                tensor_expect_plain_or_mxfp8(l->indexer_k, 2, PULSAR_N_HEAD_DIM, PULSAR_N_INDEXER_HEAD_DIM, 0);
+                tensor_expect_f32_or_bf16(l->indexer_k_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            }
         }
-        if (ratio == 4) {
+        if (pulsar_attn_runs_indexer(a->mode)) {
             const uint64_t index_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
-            const uint64_t index_width = 2u * PULSAR_N_INDEXER_HEAD_DIM;
+            const uint64_t index_width = 2ull * PULSAR_N_INDEXER_HEAD_DIM;
             tensor_expect_plain_or_mxfp8(l->indexer_attn_q_b, 2, PULSAR_N_LORA_Q, index_q_dim, 0);
             tensor_expect_plain_or_mxfp8(l->indexer_proj, 2, PULSAR_N_EMBD, PULSAR_N_INDEXER_HEAD, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_ape, 2, index_width, ratio, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_kv, 2, PULSAR_N_EMBD, index_width, 0);
-            tensor_expect_plain_or_mxfp8(l->indexer_compressor_gate, 2, PULSAR_N_EMBD, index_width, 0);
-            tensor_expect_layout(l->indexer_compressor_norm,   PULSAR_TENSOR_F32, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            if (g_pulsar_shape.indexer_own_compressor) {
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_ape, 2, index_width, a->ratio, 0);
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_kv, 2, PULSAR_N_EMBD, index_width, 0);
+                tensor_expect_plain_or_mxfp8(l->indexer_compressor_gate, 2, PULSAR_N_EMBD, index_width, 0);
+                tensor_expect_f32_or_bf16(l->indexer_compressor_norm, 1, PULSAR_N_INDEXER_HEAD_DIM, 0, 0);
+            }
         }
 
         tensor_expect_plain_or_mxfp8(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale,   PULSAR_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base,    PULSAR_TENSOR_F32,  1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->ffn_norm,       PULSAR_TENSOR_F32,  1, PULSAR_N_EMBD, 0, 0);
+        tensor_expect_f32_or_bf16(l->ffn_norm,  1, PULSAR_N_EMBD, 0, 0);
         /* Router + bias stay padded to the full n_expert; only the expert
          * weight tensors are dense-trimmed to the per-layer survivor count
          * (== n_expert for un-pruned models). */
         const uint32_t n_layer_expert = pulsar_layer_n_expert(il);
         tensor_expect_plain_or_mxfp8(l->ffn_gate_inp, 2, PULSAR_N_EMBD, PULSAR_N_EXPERT, 0);
+        /* OPTIONAL: 0731's and V4.1's artifacts ship it, Vision-Exp's serving
+         * artifact does not; the router has a bias-less arm and the bind below is
+         * optional_tensorf. */
         tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
+        /* Vision-Exp only: the router adds THIS instead of the bias above for
+         * tokens whose id is >= vocab_size (image slots). */
+        tensor_expect_optional(l->ffn_exp_probs_b_vl, PULSAR_TENSOR_F32, 1, PULSAR_N_EXPERT, 0, 0);
+        if (l->ffn_gate_tid2eid) {
+            /* [n_expert_used, n_vocab]: one row of expert ids per token id. */
+            tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2,
+                                 PULSAR_N_EXPERT_USED, PULSAR_N_VOCAB, 0);
+        }
+        tensor_expect_routed_expert(l->ffn_gate_exps, PULSAR_ROLE_EXPERT_GATE_UP, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_up_exps,   PULSAR_ROLE_EXPERT_GATE_UP, 3, PULSAR_N_EMBD, PULSAR_N_FF_EXP, n_layer_expert);
+        tensor_expect_routed_expert(l->ffn_down_exps, PULSAR_ROLE_EXPERT_DOWN,    3, PULSAR_N_FF_EXP, PULSAR_N_EMBD, n_layer_expert);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
         tensor_expect_mxfp8(l->ffn_gate_shexp, 2, PULSAR_N_EMBD, PULSAR_N_FF_EXP, 0);
         tensor_expect_mxfp8(l->ffn_up_shexp,   2, PULSAR_N_EMBD, PULSAR_N_FF_EXP, 0);
         tensor_expect_mxfp8(l->ffn_down_shexp, 2, PULSAR_N_FF_EXP, PULSAR_N_EMBD, 0);
-        if (il < PULSAR_N_HASH_LAYER) {
-            tensor_expect_layout(l->ffn_gate_tid2eid, PULSAR_TENSOR_I32, 2, PULSAR_N_EXPERT_USED, PULSAR_N_VOCAB, 0);
-        }
     }
 }
 
 
 
+/// @param s a profile
+/// @param n_layer layers
+/// @param n_embd hidden width
+/// @param n_vocab vocab
+/// @param n_head attention heads
+/// @param n_head_kv KV heads
+/// @param n_head_dim head width
+/// @param n_value_dim value width
+/// @param n_rot rotary dims
+/// @param n_lora_q q LoRA rank
+/// @param n_lora_o output LoRA rank
+/// @param n_out_group output groups
+/// @param n_expert routed experts
+/// @param n_expert_used experts per token
+/// @param n_ff_exp expert FFN width
+/// @param n_expert_shared shared experts
+/// @param n_swa sliding window
+/// @param n_indexer_head indexer heads
+/// @param n_indexer_head_dim indexer head width
+/// @param n_indexer_top_k indexer top-k
+/// @param n_hc residual streams
+/// @param n_hc_sinkhorn_iter Sinkhorn iterations
+/// @return true when every field equals the profile's
 static bool pulsar_shape_matches_metadata(
         const pulsar_shape *s,
         uint32_t n_layer,
@@ -549,7 +634,6 @@ static bool pulsar_shape_matches_metadata(
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
-        uint32_t n_hash_layer,
         uint32_t n_swa,
         uint32_t n_indexer_head,
         uint32_t n_indexer_head_dim,
@@ -571,7 +655,6 @@ static bool pulsar_shape_matches_metadata(
            s->n_expert_used == n_expert_used &&
            s->n_ff_exp == n_ff_exp &&
            s->n_expert_shared == n_expert_shared &&
-           s->n_hash_layer == n_hash_layer &&
            s->n_swa == n_swa &&
            s->n_indexer_head == n_indexer_head &&
            s->n_indexer_head_dim == n_indexer_head_dim &&
@@ -582,7 +665,31 @@ static bool pulsar_shape_matches_metadata(
 
 
 
+/// Install the profile (g_pulsar_shape) the metadata matches, or refuse.
+/// @param layer_subset a layer-subset fixture: the block count is not compared
+/// @param n_layer layers
+/// @param n_embd hidden width
+/// @param n_vocab vocab
+/// @param n_head attention heads
+/// @param n_head_kv KV heads
+/// @param n_head_dim head width
+/// @param n_value_dim value width
+/// @param n_rot rotary dims
+/// @param n_lora_q q LoRA rank
+/// @param n_lora_o output LoRA rank
+/// @param n_out_group output groups
+/// @param n_expert routed experts
+/// @param n_expert_used experts per token
+/// @param n_ff_exp expert FFN width
+/// @param n_expert_shared shared experts
+/// @param n_swa sliding window
+/// @param n_indexer_head indexer heads
+/// @param n_indexer_head_dim indexer head width
+/// @param n_indexer_top_k indexer top-k
+/// @param n_hc residual streams
+/// @param n_hc_sinkhorn_iter Sinkhorn iterations
 static void pulsar_select_shape_from_metadata(
+        bool layer_subset,
         uint32_t n_layer,
         uint32_t n_embd,
         uint32_t n_vocab,
@@ -598,34 +705,39 @@ static void pulsar_select_shape_from_metadata(
         uint32_t n_expert_used,
         uint32_t n_ff_exp,
         uint32_t n_expert_shared,
-        uint32_t n_hash_layer,
         uint32_t n_swa,
         uint32_t n_indexer_head,
         uint32_t n_indexer_head_dim,
         uint32_t n_indexer_top_k,
         uint32_t n_hc,
         uint32_t n_hc_sinkhorn_iter) {
-    if (pulsar_shape_matches_metadata(&PULSAR_SHAPE_FLASH,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_pulsar_shape = PULSAR_SHAPE_FLASH;
-        return;
-    }
-    if (pulsar_shape_matches_metadata(&PULSAR_SHAPE_PRO,
-                                   n_layer, n_embd, n_vocab, n_head, n_head_kv,
-                                   n_head_dim, n_value_dim, n_rot, n_lora_q,
-                                   n_lora_o, n_out_group, n_expert,
-                                   n_expert_used, n_ff_exp, n_expert_shared,
-                                   n_hash_layer, n_swa, n_indexer_head,
-                                   n_indexer_head_dim, n_indexer_top_k, n_hc,
-                                   n_hc_sinkhorn_iter)) {
-        g_pulsar_shape = PULSAR_SHAPE_PRO;
-        return;
+    /* The ONE model-identity dispatch in the engine, and it runs once at load.
+     * The geometry alone identifies the profile: 0731 and V4.1 differ in six of
+     * these fields (layers 43/40, embd 4096/5120, experts 256/384, ff_exp
+     * 2048/2304, q_lora 1024/1280, indexer heads 64/32), so nothing downstream
+     * needs to test which model is loaded.
+     * plans/96-two-profiles-one-engine.md s4. */
+    static const pulsar_shape *const profiles[] = { &PULSAR_SHAPE_V4, &PULSAR_SHAPE_V41 };
+
+    for (size_t i = 0; i < sizeof(profiles) / sizeof(profiles[0]); i++) {
+        /* a layer-subset fixture (pulsar.fixture.source_layers) is identified by the
+         * other fields; its block count is checked against its map instead */
+        if (pulsar_shape_matches_metadata(profiles[i],
+                                       layer_subset ? profiles[i]->n_layer : n_layer, n_embd, n_vocab, n_head, n_head_kv,
+                                       n_head_dim, n_value_dim, n_rot, n_lora_q,
+                                       n_lora_o, n_out_group, n_expert,
+                                       n_expert_used, n_ff_exp, n_expert_shared,
+                                       n_swa, n_indexer_head,
+                                       n_indexer_head_dim, n_indexer_top_k, n_hc,
+                                       n_hc_sinkhorn_iter)) {
+            g_pulsar_shape = *profiles[i];
+            /* The CUDA module packs the rows, so it needs the family too.  The
+             * profile stays the authority; this is the seam's copy of one fact,
+             * pushed once, here. */
+            pulsar_gpu_set_kv_row_style(g_pulsar_shape.kv_row_style);
+            pulsar_gpu_set_hc_head_mix(g_pulsar_shape.hc_head_mix);
+            return;
+        }
     }
 
     fprintf(stderr,
@@ -639,45 +751,108 @@ static void pulsar_select_shape_from_metadata(
             n_expert,
             n_ff_exp,
             n_indexer_top_k);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
 
-static void validate_compress_ratio_metadata(const pulsar_model *m) {
-    const char *key = "deepseek4.attention.compress_ratios";
+/* Read an int32/uint32 array key into `out` (capacity `cap`), returning its
+ * length.  A key that is missing, the wrong type or longer than `cap` is refused
+ * (said, counted: pulsar_load_refuse) and reads as length 0; a short read or a
+ * negative value dies. */
+/// @param m the model
+/// @param key an int32 / uint32 array key
+/// @param[out] out [cap] values
+/// @param cap capacity
+/// @return its length; 0 and a counted refusal when missing, mistyped or too long (a negative value dies)
+static uint32_t model_read_u32_array(const pulsar_model *m, const char *key, uint32_t *out, uint32_t cap) {
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
         fprintf(stderr, "pulsar: required int32/uint32 array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return 0;
     }
-    if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+    if (arr.len > cap) {
+        fprintf(stderr, "pulsar: %s has %llu entries, at most %u are meaningful\n",
+                key, (unsigned long long)arr.len, cap);
+        pulsar_load_refuse();
+        return 0;
     }
-
-    memset(g_pulsar_compress_ratios, 0, sizeof(g_pulsar_compress_ratios));
     pulsar_cursor c = cursor_at(m, arr.data_pos);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        uint32_t got = 0;
-        if (arr.type == GGUF_VALUE_UINT32) {
-            if (!cursor_u32(&c, &got)) pulsar_die(c.error);
+    for (uint64_t i = 0; i < arr.len; i++) {
+        if (arr.type == PULSAR_META_UINT32) {
+            if (!cursor_u32(&c, &out[i])) pulsar_die(c.error);
         } else {
             int32_t v = 0;
             if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
             if (v < 0) pulsar_die("metadata array contains a negative value");
-            got = (uint32_t)v;
+            out[i] = (uint32_t)v;
         }
-
-        const uint32_t expected = pulsar_expected_layer_compress_ratio(il);
-        if (got != expected) {
-            fprintf(stderr,
-                    "pulsar: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
-                    il, PULSAR_MODEL_SHAPE_NAME, got, expected);
-            exit(1);
-        }
-        g_pulsar_compress_ratios[il] = got;
     }
+    return (uint32_t)arr.len;
+}
+
+
+
+/* The per-layer ratios and the source sets that shape the attention layout.
+ *
+ * compress_ratios is the artifact's on BOTH models and is required.  The source
+ * sets and the candidate pool are the PROFILE's: 0731 compresses every layer
+ * >= 2 on its own and has no candidate pool, so its artifact carries none of
+ * those keys, while V4.1's artifact carries all four and carries no
+ * hash_layer_count.  When a key IS present it must agree with the profile --
+ * pulsar_attn_layout_install enforces that against g_pulsar_shape.
+ * plans/96-SPIKE0-results.md S2. */
+/// @param m the model
+static void validate_attention_layout_metadata(const pulsar_model *m) {
+    uint32_t ratios[PULSAR_MAX_LAYER];
+    const uint32_t n_ratio = model_read_u32_array(m, "deepseek4.attention.compress_ratios", ratios, PULSAR_MAX_LAYER);
+    if (n_ratio < PULSAR_N_LAYER) pulsar_die("deepseek4.attention.compress_ratios is shorter than the layer count");
+
+    const pulsar_shape *sh = &g_pulsar_shape;
+    pulsar_array_ref probe;
+
+    /* Undeclared -> the profile's set (the degenerate 0731 case: every
+     * compressed layer is its own source).  Declared -> the artifact's, which
+     * the installer then checks against the profile. */
+    uint32_t kv_sources[PULSAR_MAX_ATTN_SOURCE], index_sources[PULSAR_MAX_ATTN_SOURCE];
+    uint32_t n_kv, n_index;
+    if (model_get_array(m, "deepseek4.attention.kv_source_layers", &probe)) {
+        n_kv = model_read_u32_array(m, "deepseek4.attention.kv_source_layers", kv_sources, PULSAR_MAX_ATTN_SOURCE);
+    } else {
+        n_kv = sh->n_kv_source;
+        memcpy(kv_sources, sh->kv_source_layer, sizeof(kv_sources));
+    }
+    if (model_get_array(m, "deepseek4.attention.index_source_layers", &probe)) {
+        n_index = model_read_u32_array(m, "deepseek4.attention.index_source_layers", index_sources, PULSAR_MAX_ATTN_SOURCE);
+    } else {
+        n_index = sh->n_index_source;
+        memcpy(index_sources, sh->index_source_layer, sizeof(index_sources));
+    }
+
+    /* Same rule for the candidate pool: absent means "this model has none",
+     * which is only consistent with a profile that has none (-1). */
+    int32_t candidate = sh->candidate_source_layer;
+    uint32_t declared_candidate = 0;
+    if (model_get_u32(m, "deepseek4.attention.candidate_source_layer", &declared_candidate)) {
+        if (declared_candidate > (uint32_t)INT32_MAX) {
+            pulsar_die("deepseek4.attention.candidate_source_layer is out of range");
+        }
+        candidate = (int32_t)declared_candidate;
+    }
+    uint32_t topk_blocks = sh->candidate_topk_blocks, block_size = sh->candidate_block_size;
+    (void)model_get_u32(m, "deepseek4.attention.candidate_topk_blocks", &topk_blocks);
+    (void)model_get_u32(m, "deepseek4.attention.candidate_block_size", &block_size);
+    if (topk_blocks != sh->candidate_topk_blocks || block_size != sh->candidate_block_size) {
+        fprintf(stderr, "pulsar: candidate pool is %u blocks of %u, %s expects %u of %u\n",
+                topk_blocks, block_size, PULSAR_MODEL_SHAPE_NAME,
+                sh->candidate_topk_blocks, sh->candidate_block_size);
+        pulsar_load_refuse();
+        return;
+    }
+    pulsar_attn_layout_install(ratios, kv_sources, n_kv, index_sources, n_index, candidate);
 }
 
 
@@ -691,6 +866,7 @@ static void config_expect_f32(const char *name, float got, float expected);
  * falls back to the full n_expert). When present, each entry must be in
  * [1, n_expert]; the router/bias tensors stay padded to n_expert and only the
  * expert weight tensors are dense-trimmed to keep_count. */
+/// @param m the model
 static void validate_reap_metadata(const pulsar_model *m) {
     memset(g_pulsar_layer_expert_count, 0, sizeof(g_pulsar_layer_expert_count));
 
@@ -700,29 +876,42 @@ static void validate_reap_metadata(const pulsar_model *m) {
     const char *key = "reap.layer.keep_count";
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
-        pulsar_die("reap.enabled is set but reap.layer.keep_count is missing or not an int32/uint32 array");
+        (arr.type != PULSAR_META_UINT32 && arr.type != PULSAR_META_INT32)) {
+        fprintf(stderr, "pulsar: reap.enabled is set but %s is missing or not an int32/uint32 array -- refusing\n", key);
+        pulsar_load_refuse();
+        return;
     }
     if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("reap.layer.keep_count is shorter than the layer count");
+        fprintf(stderr, "pulsar: %s has %llu entries, not one per layer (%u) -- refusing\n", key,
+                (unsigned long long)arr.len, PULSAR_N_LAYER);
+        pulsar_load_refuse();
+        return;
     }
 
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         uint32_t got = 0;
-        if (arr.type == GGUF_VALUE_UINT32) {
-            if (!cursor_u32(&c, &got)) pulsar_die(c.error);
-        } else {
-            int32_t v = 0;
-            if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
-            if (v < 0) pulsar_die("reap.layer.keep_count contains a negative value");
+        int32_t v = 0;
+        const bool read = arr.type == PULSAR_META_UINT32 ? cursor_u32(&c, &got) : cursor_read(&c, &v, sizeof(v));
+        if (!read) {
+            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, il, c.error);
+            pulsar_load_refuse();
+            return;
+        }
+        if (arr.type == PULSAR_META_INT32) {
+            if (v < 0) {
+                fprintf(stderr, "pulsar: %s[%u]=%d is negative -- refusing\n", key, il, v);
+                pulsar_load_refuse();
+                return;
+            }
             got = (uint32_t)v;
         }
         if (got == 0 || got > PULSAR_N_EXPERT) {
             fprintf(stderr,
                     "pulsar: reap.layer.keep_count[%u]=%u out of range [1, %u]\n",
                     il, got, PULSAR_N_EXPERT);
-            exit(1);
+            pulsar_load_refuse();
+            return;
         }
         g_pulsar_layer_expert_count[il] = got;
     }
@@ -730,62 +919,89 @@ static void validate_reap_metadata(const pulsar_model *m) {
 
 
 
+/// Refuse unless every layer's swiglu_clamp_exp is the profile's.
+/// @param m the model
 static void validate_swiglu_clamp_metadata(const pulsar_model *m) {
     const char *key = "deepseek4.swiglu_clamp_exp";
     pulsar_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
-        (arr.type != GGUF_VALUE_FLOAT32 && arr.type != GGUF_VALUE_FLOAT64)) {
+        (arr.type != PULSAR_META_FLOAT32 && arr.type != PULSAR_META_FLOAT64)) {
         fprintf(stderr, "pulsar: required float array metadata key is missing: %s\n", key);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     if (arr.len < PULSAR_N_LAYER) {
-        pulsar_die("deepseek4.swiglu_clamp_exp is shorter than the layer count");
+        fprintf(stderr, "pulsar: %s has %llu entries, not one per layer (%u) -- refusing\n", key,
+                (unsigned long long)arr.len, PULSAR_N_LAYER);
+        pulsar_load_refuse();
+        return;
     }
 
     pulsar_cursor c = cursor_at(m, arr.data_pos);
     for (uint32_t i = 0; i < PULSAR_N_LAYER; i++) {
         float got = 0.0f;
-        if (arr.type == GGUF_VALUE_FLOAT32) {
-            if (!cursor_read(&c, &got, sizeof(got))) pulsar_die(c.error);
-        } else {
-            double v = 0.0;
-            if (!cursor_read(&c, &v, sizeof(v))) pulsar_die(c.error);
-            got = (float)v;
+        double v = 0.0;
+        const bool read = arr.type == PULSAR_META_FLOAT32 ? cursor_read(&c, &got, sizeof(got))
+                                                          : cursor_read(&c, &v, sizeof(v));
+        if (!read) {
+            fprintf(stderr, "pulsar: %s[%u]: %s -- refusing\n", key, i, c.error);
+            pulsar_load_refuse();
+            return;
         }
+        if (arr.type == PULSAR_META_FLOAT64) got = (float)v;
         config_expect_f32("swiglu_clamp_exp", got, PULSAR_SWIGLU_CLAMP_EXP);
     }
 }
 
 
 
+/// Refuse (counted, printed) when got != expected.
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_u32(const char *name, uint32_t got, uint32_t expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%u for %s, got %u\n",
             name, expected, PULSAR_MODEL_SHAPE_NAME, got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
 
+/* Relative tolerance: the old absolute 1e-6 floor let an artifact's rms eps of
+ * 1e-20 pass against a 1e-6 profile (and vice versa) without a word -- every
+ * RMSNorm wrong, no message (L218 audit risk #1).  A value of 0 must match 0. */
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_f32(const char *name, float got, float expected) {
-    const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
-    if (fabsf(got - expected) <= scale * 1.0e-6f) return;
+    const float tol = fabsf(expected) * 1.0e-6f;
+    if (fabsf(got - expected) <= tol) return;
     fprintf(stderr, "pulsar: expected %s=%.9g for %s, got %.9g\n",
             name, (double)expected, PULSAR_MODEL_SHAPE_NAME, (double)got);
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
 
+/// Refuse (counted, printed) when got != expected.
+/// @param name the field
+/// @param got the artifact's
+/// @param expected the profile's
 static void config_expect_bool(const char *name, bool got, bool expected) {
     if (got == expected) return;
     fprintf(stderr, "pulsar: expected %s=%s for %s, got %s\n",
             name, expected ? "true" : "false", PULSAR_MODEL_SHAPE_NAME, got ? "true" : "false");
-    exit(1);
+    pulsar_load_refuse();
+    return;
 }
 
 
 
+/// Check the artifact's fixed config against the profile.
+/// @param n_layer the artifact's block count
 static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 PULSAR_N_LAYER);
 }
@@ -810,7 +1026,6 @@ void config_validate_model(const pulsar_model *m) {
     const uint32_t n_expert_used = required_u32(m, "deepseek4.expert_used_count");
     const uint32_t n_ff_exp = required_u32(m, "deepseek4.expert_feed_forward_length");
     const uint32_t n_expert_shared = required_u32(m, "deepseek4.expert_shared_count");
-    const uint32_t n_hash_layer = required_u32(m, "deepseek4.hash_layer_count");
     uint32_t n_expert_groups = 0;
     uint32_t n_group_used = 0;
     model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups);
@@ -821,8 +1036,23 @@ void config_validate_model(const pulsar_model *m) {
     const uint32_t n_indexer_top_k = required_u32(m, "deepseek4.attention.indexer.top_k");
     const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
     const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
+    /* L269 W2: a layer-subset fixture names the profile layers it keeps (model_layout.cpp) */
+    uint32_t fixture_src[PULSAR_MAX_LAYER];
+    uint32_t n_fixture = 0;
+    pulsar_array_ref fixture_probe;
+    if (model_get_array(m, "pulsar.fixture.source_layers", &fixture_probe)) {
+        n_fixture = model_read_u32_array(m, "pulsar.fixture.source_layers", fixture_src, PULSAR_MAX_LAYER);
+        if (pulsar_load_refusals()) return;
+        if (n_fixture != n_layer) {
+            fprintf(stderr, "pulsar: pulsar.fixture.source_layers names %u layers, block_count is %u -- refusing\n",
+                    n_fixture, n_layer);
+            pulsar_load_refuse();
+            return;
+        }
+    }
 
-    pulsar_select_shape_from_metadata(n_layer,
+    pulsar_select_shape_from_metadata(n_fixture != 0,
+                                   n_layer,
                                    n_embd,
                                    n_vocab,
                                    n_head,
@@ -837,13 +1067,17 @@ void config_validate_model(const pulsar_model *m) {
                                    n_expert_used,
                                    n_ff_exp,
                                    n_expert_shared,
-                                   n_hash_layer,
                                    n_swa,
                                    n_indexer_head,
                                    n_indexer_head_dim,
                                    n_indexer_top_k,
                                    n_hc,
                                    n_hc_sinkhorn_iter);
+    if (pulsar_load_refusals()) return;   /* L272: no shape was selected -- nothing below can be checked */
+    if (!pulsar_layer_subset_install(fixture_src, n_fixture)) {
+        pulsar_load_refuse();
+        return;
+    }
 
     config_expect_u32("embedding_length",            n_embd,         PULSAR_N_EMBD);
     config_expect_u32("vocab_size",                  n_vocab,        PULSAR_N_VOCAB);
@@ -859,7 +1093,6 @@ void config_validate_model(const pulsar_model *m) {
     config_expect_u32("expert_used_count",          n_expert_used,   PULSAR_N_EXPERT_USED);
     config_expect_u32("expert_feed_forward_length", n_ff_exp,        PULSAR_N_FF_EXP);
     config_expect_u32("expert_shared_count",         n_expert_shared, PULSAR_N_EXPERT_SHARED);
-    config_expect_u32("hash_layer_count",            n_hash_layer,    PULSAR_N_HASH_LAYER);
     config_expect_u32("expert_group_count",         n_expert_groups, 0);
     config_expect_u32("expert_group_used_count",    n_group_used,    0);
 
@@ -871,7 +1104,7 @@ void config_validate_model(const pulsar_model *m) {
     config_expect_u32("hyper_connection.sinkhorn_iterations", n_hc_sinkhorn_iter, PULSAR_N_HC_SINKHORN_ITER);
 
     config_validate_fixed_shape(n_layer);
-    validate_compress_ratio_metadata(m);
+    validate_attention_layout_metadata(m);
 
     validate_reap_metadata(m);
 
@@ -883,7 +1116,8 @@ void config_validate_model(const pulsar_model *m) {
         fprintf(stderr, "pulsar: expected rope.scaling.original_context_length=%" PRIu64
                 " for %s, got %" PRIu64 "\n",
                 (uint64_t)PULSAR_ROPE_ORIG_CTX, PULSAR_MODEL_SHAPE_NAME, rope_orig_ctx);
-        exit(1);
+        pulsar_load_refuse();
+        return;
     }
     const float rope_freq_base = required_f32(m, "deepseek4.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, PULSAR_ROPE_FREQ_BASE);
@@ -901,33 +1135,79 @@ void config_validate_model(const pulsar_model *m) {
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, PULSAR_EXPERT_WEIGHT_SCALE);
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
-    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, PULSAR_RMS_EPS);
+    /* THE ARTIFACT IS THE AUTHORITY, not the profile.  This is the one text
+     * config field the shipped checkpoints disagree on, and they disagree
+     * ACROSS the profile split rather than along it: 0731 declares 1e-6 while
+     * BOTH Vision-Exp and V4.1 declare 1e-20.  It is a kernel parameter
+     * (PULSAR_RMS_EPS == g_pulsar_shape.rms_eps), not a shape, so pinning it per
+     * profile made the compiled default refuse a real artifact -- Vision-Exp
+     * (v5-vexp-full256) failed to load with "expected 1e-06, got 1e-20" until
+     * this was read off the artifact instead.  Only the known pair is accepted:
+     * anything else exits rather than silently retuning the norm of every
+     * layer. */
+    if (rms_eps != PULSAR_V4_RMS_EPS && rms_eps != PULSAR_V41_RMS_EPS) {
+        fprintf(stderr, "pulsar: attention.layer_norm_rms_epsilon=%.9g is neither 0731's %.9g "
+                        "nor Vision-Exp's/V4.1's %.9g\n",
+                (double)rms_eps, (double)PULSAR_V4_RMS_EPS, (double)PULSAR_V41_RMS_EPS);
+        pulsar_load_refuse();
+        return;
+    }
+    g_pulsar_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, PULSAR_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+
+    /* The hash-routed layer count follows the same rule as the source sets: it
+     * is the PROFILE's.  The 0731 artifact declares it (3); V4.1's does not and
+     * has none.  Declared -> it must agree.  The restored hash-routing arm reads
+     * PULSAR_N_HASH_LAYER, so a wrong value here would route by id in a model
+     * that has no id table. */
+    uint32_t declared_hash = 0;
+    if (model_get_u32(m, "deepseek4.hash_layer_count", &declared_hash) &&
+        declared_hash != (uint32_t)PULSAR_N_HASH_LAYER) {
+        fprintf(stderr, "pulsar: hash_layer_count is %u, %s expects %u\n",
+                declared_hash, PULSAR_MODEL_SHAPE_NAME, (unsigned)PULSAR_N_HASH_LAYER);
+        pulsar_load_refuse();
+        return;
+    }
 }
 
 
 
 /* Weight formats the engine still decodes -- exactly the seven types present in
  * the shipped artifact (a full scan of its 1406 tensors found 0/1/26/38/40/41/43
- * and nothing else).  Q4_K, Q8_0, Q2_K (10), IQ2_XXS (16), BF16 (30),
- * FP4_E2M1 (39) and IQ2_XXS_SOA (42) have been removed along with their readers.
+ * and nothing else).  Q4_K, Q8_0, Q2_K (10), IQ2_XXS (16), FP4_E2M1 (39) and
+ * IQ2_XXS_SOA (42) have been removed along with their readers.
  * Rejecting up front gives one clear error instead of failing on the first
  * per-tensor layout check -- or, worse, dispatching into a deleted arm.
  *
- * BF16 was the alternative OUTPUT-HEAD format; the shipped head is MXFP8, so its
- * dedicated bf16 matmul and the three decode branches that chose it went too. */
+ * BF16 (30) is BACK as of 2026-08-15, after 0f6e1dd removed it as unreachable.
+ * That removal was correct at the time and is not being second-guessed: the
+ * artifact genuinely had no BF16 tensor.  It does now, because the tensors that
+ * are bf16 or f32 upstream are stored bf16 instead of f16 -- f16 was deleting
+ * ~11% of the small weights in some of them -- and because the output head goes
+ * back to bf16 to match source.  Both need this type accepted. */
+/// @param type a PULSAR_TENSOR_* id
+/// @return true for a storage type the DeepSeek pipeline reads
 static bool weights_tensor_type_supported(uint32_t type) {
     switch (type) {
     case PULSAR_TENSOR_F32:
-    case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_I32:
-    case PULSAR_TENSOR_FP8_E4M3:
+    case PULSAR_TENSOR_BF16:
+    case PULSAR_TENSOR_F16:
     case PULSAR_TENSOR_MXFP8_LT:
     case PULSAR_TENSOR_CUTLASS_MXFP4:
-    case PULSAR_TENSOR_IQ2_XXS_MMQ:
+    case PULSAR_TENSOR_IQ2_XXS_MMQ_K:
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+    case PULSAR_TENSOR_EXL3M_K2:
+    case PULSAR_TENSOR_EXL3M_K2H:
+    case PULSAR_TENSOR_EXL3M_K3:
+    case PULSAR_TENSOR_EXL3M_K4:
+    case PULSAR_TENSOR_EXL3M_K5:
+    case PULSAR_TENSOR_EXL3M_K6:
+    case PULSAR_TENSOR_EXL3M_K8:
+    case PULSAR_TENSOR_NVFP4:   /* L298: the NVFP4 W4A16 rows arm (pulsar_cuda_nvfp4.h) */
         return true;
     default:
         return false;
@@ -936,7 +1216,7 @@ static bool weights_tensor_type_supported(uint32_t type) {
 
 
 
-static void weights_reject_unsupported_types(const pulsar_model *m) {
+void weights_reject_unsupported_types(const pulsar_model *m) {
     bool seen[256] = { false };
     bool any = false;
 
@@ -953,44 +1233,198 @@ static void weights_reject_unsupported_types(const pulsar_model *m) {
         any = true;
     }
     if (any) {
-        /* Keep this list in step with weights_tensor_type_supported() above --
-         * it is the only thing the user sees when an old artifact is refused,
-         * and a list naming types the engine no longer reads sends them looking
-         * for a bug in their file instead of re-quantising it. */
-        fprintf(stderr,
-                "pulsar: supported weight tensor types: f32, f16, i32, "
-                "fp8_e4m3 (MXFP8), mxfp8_lt, cutlass_mxfp4 (40), iq2_xxs_mmq (43)\n");
-        exit(1);
-    }
-}
-
-
-
-static void weights_bind_output(pulsar_weights *w, const pulsar_model *m, bool required, bool optional) {
-    if (required) {
-        w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
-        w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
-        w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
-        w->output_norm      = required_tensor(m, "output_norm.weight");
-        w->output           = required_tensor(m, "output.weight");
+        /* DERIVED from weights_tensor_type_supported(), not a second list kept
+         * in step by hand.  This is the only thing a user sees when an artifact
+         * is refused, and a list naming types the engine no longer reads sends
+         * them looking for a bug in their file instead of repacking it -- which
+         * is exactly what it did after the reader for iq2_xxs_mmq (43) was
+         * removed and the prose still advertised it (L207). */
+        fprintf(stderr, "pulsar: supported weight tensor types:");
+        for (uint32_t t = 0; t < 256u; ++t) {
+            const char *tname = tensor_type_name(t);
+            if (tname != NULL && weights_tensor_type_supported(t)) {
+                fprintf(stderr, " %s (%u)", tname, t);
+            }
+        }
+        fprintf(stderr, "\n");
+        pulsar_load_refuse();
         return;
     }
-    if (!optional) return;
+}
 
-    w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
-    w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
-    w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
-    w->output_norm      = model_find_tensor(m, "output_norm.weight");
-    w->output           = model_find_tensor(m, "output.weight");
-    if (weights_have_partial_output_head(w) && !weights_have_output_head(w)) {
-        pulsar_die("partial output head in GGUF");
+
+
+/* ---- E8M0 scale-plane validation ----------------------------------------
+ *
+ * The custom decode GEMVs decode an E8M0 scale byte as __int_as_float(b << 23),
+ * so 0xFF is +Inf.  cuBLASLt's VEC32_UE8M0 and the CUTLASS block-scaled MMA
+ * read the same byte as NaN (OCP), and the host codec's ldexpf(1, b-127) also
+ * gives +Inf.  Producers clamp to <=254, so 0xFF can only arrive from a foreign
+ * or corrupt file -- and when it does, one artifact runs two different
+ * arithmetics on the same weight.  Scan the E8M0 planes once on the cold load
+ * path (~1/32 of the weight bytes) and refuse the tensor by name.  Data planes
+ * are not scanned: E2M1/E4M3 payload bytes have no invalid encoding.
+ *
+ * E8M0 plane geometry per accepted type (see the consumers for the authority):
+ *   41 mxfp8_lt       [E4M3 data: one byte per element][swizzled E8M0 scale]
+ *   38 fp8_e4m3       33-byte interleaved blocks [E8M0][32 x E4M3]
+ *   40 cutlass_mxfp4   expert-major [data N*K/2][swizzled E8M0 SF] per expert
+ *   46 fp8_e4m3_soa_k [E8M0 scales: E x V/32][E4M3 payload]
+ *
+ * The scan is blocks of block_len bytes every stride bytes; a contiguous plane
+ * is one block.  Sizing that does not match the type's layout is left to the
+ * consumers' own refusals -- this pass must never be the thing that rejects a
+ * shape the engine would otherwise read. */
+/// @param m the model
+/// @param t the tensor
+/// @param off first block's byte offset in t
+/// @param block_len bytes per block
+/// @param stride bytes between blocks
+/// @param nblocks blocks
+/// @param what the format, for the message
+static void e8m0_scan_blocks(
+        const pulsar_model *m,
+        const pulsar_tensor *t,
+        uint64_t         off,
+        uint64_t         block_len,
+        uint64_t         stride,
+        uint64_t         nblocks,
+        const char      *what) {
+    if (nblocks == 0 || block_len == 0) return;
+    const uint64_t base = t->abs_offset;
+    /* off + (nblocks-1)*stride + block_len, overflow-checked. */
+    if (off > t->bytes || block_len > t->bytes - off) return;
+    const uint64_t last = off + (nblocks - 1u) * stride;
+    if (last < off || last > t->bytes || block_len > t->bytes - last) return;
+    const uint8_t *map = t->ext_map ? t->ext_map : m->map;
+    const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+    if (base > map_size || last > map_size - base || block_len > map_size - base - last) return;
+
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const uint8_t *p = map + base + off + b * stride;
+        for (uint64_t i = 0; i < block_len; i++) {
+            if (p[i] != 0xFFu) continue;
+            fprintf(stderr,
+                    "pulsar: tensor %.*s: %s E8M0 scale byte 0xFF at plane offset %llu\n",
+                    (int)t->name.len, t->name.ptr, what,
+                    (unsigned long long)(off + b * stride + i));
+            fprintf(stderr,
+                    "pulsar: 0xFF never decodes consistently (custom GEMVs read +Inf, "
+                    "cuBLASLt/CUTLASS read NaN); refusing the artifact\n");
+            pulsar_load_refuse();
+            return;
+        }
     }
 }
 
 
 
+/* The EXL3 analogue: the per-expert scales plane is fp16 (suh[in] | svh[out],
+ * exl3_expert_layout), and an Inf/NaN there multiplies into every weight of
+ * its row or column -- the same "one bad byte, fluent nonsense" class as an
+ * E8M0 0xFF, and just as absent from a producer's output.  Trellis words have
+ * no invalid encoding and are not scanned. */
+/// @param m the model
+/// @param t an EXL3 tensor
+static void exl3_scan_scales(const pulsar_model *m, const pulsar_tensor *t) {
+    uint64_t trellis = 0, scales = 0, stride = 0;
+    const int k2 = exl3_type_k2(t->type);
+    if (t->ndim >= 3 ? !exl3_expert_layout(t->dim[0], t->dim[1], k2, &trellis, &scales, &stride)
+                     : !exl3_linear_layout(t->dim[0], t->dim[1], k2, &trellis, &scales, &stride))
+        return;
+    const uint64_t n_exp = t->ndim >= 3 ? t->dim[2] : 1;   /* a dense Linear is one slice (its svh stored padded) */
+    if (n_exp == 0 || stride > t->bytes / n_exp) return;
+    const uint8_t *map = t->ext_map ? t->ext_map : m->map;
+    const uint64_t map_size = t->ext_map ? t->ext_size : m->size;
+    if (t->abs_offset > map_size || t->bytes > map_size - t->abs_offset) return;
+    for (uint64_t e = 0; e < n_exp; e++) {
+        const uint16_t *p = (const uint16_t *)(map + t->abs_offset + e * stride + trellis);
+        for (uint64_t i = 0; i < scales / 2; i++) {
+            if ((p[i] & 0x7c00u) != 0x7c00u) continue;
+            fprintf(stderr,
+                    "pulsar: tensor %.*s: expert %llu %s scale %llu is %s (0x%04x); "
+                    "refusing the artifact\n",
+                    (int)t->name.len, t->name.ptr, (unsigned long long)e,
+                    i < t->dim[0] ? "suh" : "svh",
+                    (unsigned long long)(i < t->dim[0] ? i : i - t->dim[0]),
+                    (p[i] & 0x03ffu) ? "NaN" : "Inf", p[i]);
+            pulsar_load_refuse();
+            return;
+        }
+    }
+}
+
+
+
+void weights_reject_bad_e8m0(const pulsar_model *m) {
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const pulsar_tensor *t = &m->tensors[i];
+        switch (t->type) {
+        case PULSAR_TENSOR_MXFP8_LT:
+            /* One E4M3 byte per element, then the scale plane; do not restate
+             * the swizzle geometry here. */
+            if (t->elements > t->bytes) break;
+            e8m0_scan_blocks(m, t, t->elements, t->bytes - t->elements, 0, 1, "MXFP8");
+            break;
+        case PULSAR_TENSOR_CUTLASS_MXFP4: {
+            uint64_t data = 0, sf = 0, stride = 0;
+            if (t->ndim < 3) break;
+            cutlass_mxfp4_expert_layout(t->dim[0], t->dim[1], &data, &sf, &stride);
+            e8m0_scan_blocks(m, t, data, sf, stride, t->dim[2], "MXFP4");
+            break;
+        }
+        case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+            /* dims (V, E): scales E x V/32, then the E4M3 payload.  A V not
+             * divisible by 32 is refused by the consumer. */
+            if (t->ndim < 2 || (t->dim[0] & 31u)) break;
+            e8m0_scan_blocks(m, t, 0, t->dim[1] * (t->dim[0] >> 5), 0, 1, "SoA");
+            break;
+        case PULSAR_TENSOR_EXL3M_K2:
+        case PULSAR_TENSOR_EXL3M_K2H:
+        case PULSAR_TENSOR_EXL3M_K3:
+        case PULSAR_TENSOR_EXL3M_K4:
+        case PULSAR_TENSOR_EXL3M_K5:
+        case PULSAR_TENSOR_EXL3M_K6:
+        case PULSAR_TENSOR_EXL3M_K8:
+            if (t->ndim < 2) break;
+            exl3_scan_scales(m, t);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+
+
+/// Bind the output head (and 0731's HC head mix), every tensor required (a missing one is refused by name).
+/// @param[out] w the weights
+/// @param m the model
+static void weights_bind_output(pulsar_weights *w, const pulsar_model *m) {
+    /* 0731's HC head mix.  REQUIRED where the profile says the head computes its
+     * own coefficients: a 0731 artifact missing the group would otherwise
+     * collapse with V4.1's carried pre -- the wrong arithmetic for the model,
+     * and it would not fail.  V4.1 has no such tensors. */
+    if (g_pulsar_shape.hc_head_mix) {
+        w->output_hc_fn    = required_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale = required_tensor(m, "output_hc_scale.weight");
+        w->output_hc_base  = required_tensor(m, "output_hc_base.weight");
+    }
+    w->output_norm      = required_tensor(m, "output_norm.weight");
+    w->output           = required_tensor(m, "output.weight");
+}
+
+
+
+/// Bind layer il's tensors.
+/// @param[out] l the layer
+/// @param m the model
+/// @param il the layer
 static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, uint32_t il) {
-    const uint32_t compress_ratio = pulsar_layer_compress_ratio(il);
+    const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
+    l->n_expert = PULSAR_N_EXPERT;
+    l->n_expert_used = PULSAR_N_EXPERT_USED;
+    l->n_expert_present = pulsar_layer_n_expert(il);
 
     l->hc_attn_fn      = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
     l->hc_attn_scale   = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
@@ -1004,26 +1438,86 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->attn_sinks      = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
     l->attn_output_a   = required_tensorf(m, "blk.%u.attn_output_a.weight", il);
     l->attn_output_b   = required_tensorf(m, "blk.%u.attn_output_b.weight", il);
-    if (compress_ratio != 0) {
-        l->attn_compressor_ape  = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+    /* The compressor lives on every kv source; the indexer's q/score weights on
+     * every index source; a REUSE layer owns neither.  Which index-KEY family a
+     * model uses is the profile's: V4.1 projects it from the kv source's latent
+     * (indexer.attn_k / k_norm), 0731 compresses its own
+     * (indexer_compressor_*).  Any of these tensors on a layer whose mode does
+     * not own it is a wrong artifact. */
+    if (pulsar_attn_owns_kv(attn->mode)) {
+        if (g_pulsar_shape.compressor_ape) {
+            l->attn_compressor_ape = required_tensorf(m, "blk.%u.attn_compressor_ape.weight", il);
+        }
         l->attn_compressor_kv   = required_tensorf(m, "blk.%u.attn_compressor_kv.weight", il);
-        l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
+        if (attn->ratio > 1) l->attn_compressor_gate = required_tensorf(m, "blk.%u.attn_compressor_gate.weight", il);
         l->attn_compressor_norm = required_tensorf(m, "blk.%u.attn_compressor_norm.weight", il);
+        if (!g_pulsar_shape.indexer_own_compressor) {
+            l->indexer_k        = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
+            l->indexer_k_norm   = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+        }
     }
-    if (compress_ratio == 4) {
+    if (pulsar_attn_runs_indexer(attn->mode)) {
         l->indexer_attn_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
         l->indexer_proj     = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
-        l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
-        l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
-        l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
-        l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+        if (g_pulsar_shape.indexer_own_compressor) {
+            l->indexer_compressor_ape  = required_tensorf(m, "blk.%u.indexer_compressor_ape.weight", il);
+            l->indexer_compressor_kv   = required_tensorf(m, "blk.%u.indexer_compressor_kv.weight", il);
+            l->indexer_compressor_gate = required_tensorf(m, "blk.%u.indexer_compressor_gate.weight", il);
+            l->indexer_compressor_norm = required_tensorf(m, "blk.%u.indexer_compressor_norm.weight", il);
+        }
+    }
+    static const char *const attn_owned[] = {
+        "attn_compressor_ape.weight",
+        "attn_compressor_kv.weight", "attn_compressor_gate.weight", "attn_compressor_norm.weight",
+        "indexer.attn_k.weight", "indexer.k_norm.weight", "indexer.attn_q_b.weight", "indexer.proj.weight",
+        "indexer_compressor_ape.weight", "indexer_compressor_kv.weight",
+        "indexer_compressor_gate.weight", "indexer_compressor_norm.weight",
+    };
+    const pulsar_tensor *const attn_bound[] = {
+        l->attn_compressor_ape,
+        l->attn_compressor_kv, l->attn_compressor_gate, l->attn_compressor_norm,
+        l->indexer_k, l->indexer_k_norm, l->indexer_attn_q_b, l->indexer_proj,
+        l->indexer_compressor_ape, l->indexer_compressor_kv,
+        l->indexer_compressor_gate, l->indexer_compressor_norm,
+    };
+    for (size_t i = 0; i < sizeof(attn_owned) / sizeof(attn_owned[0]); i++) {
+        char name[128];
+        const int n = snprintf(name, sizeof(name), "blk.%u.%s", il, attn_owned[i]);
+        if (n < 0 || (size_t)n >= sizeof(name)) pulsar_die("tensor name is too long");
+        if (!attn_bound[i] && model_find_tensor(m, name)) {
+            fprintf(stderr, "pulsar: layer %u carries %s but its CSA2 mode does not own it -- refusing\n", il, name);
+            pulsar_load_refuse();
+            return;
+        }
     }
     l->hc_ffn_fn       = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
     l->hc_ffn_scale    = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
     l->hc_ffn_base     = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
     l->ffn_norm        = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
     l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-    l->ffn_exp_probs_b = tensor_by_namef(m, "blk.%u.exp_probs_b.bias", il);
+    /* OPTIONAL, like the drafter's: text-only artifacts do not ship it. */
+    l->ffn_exp_probs_b = optional_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    /* Vision-Exp only: the router adds THIS bias instead of ffn_exp_probs_b for
+     * tokens whose id is >= vocab_size (image slots).  Optional for the same
+     * reason as the drafter's: text-only artifacts do not ship it. */
+    l->ffn_exp_probs_b_vl = optional_tensorf(m, "blk.%u.exp_probs_b_vl.bias", il);
+    /* 0731's leading layers route by token id.  Required exactly on the hash
+     * layers and REFUSED on any other, so an artifact cannot carry a table that
+     * would silently replace the gate's routing. */
+    if (pulsar_layer_source(il) < PULSAR_N_HASH_LAYER) {
+        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+    } else {
+        char tid_name[128];
+        const int n = snprintf(tid_name, sizeof(tid_name), "blk.%u.ffn_gate_tid2eid.weight", il);
+        if (n < 0 || (size_t)n >= sizeof(tid_name)) pulsar_die("tensor name is too long");
+        if (model_find_tensor(m, tid_name)) {
+            fprintf(stderr, "pulsar: layer %u carries ffn_gate_tid2eid but only the first %u "
+                            "layers are hash-routed -- refusing\n",
+                    il, (unsigned)PULSAR_N_HASH_LAYER);
+            pulsar_load_refuse();
+            return;
+        }
+    }
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -1031,21 +1525,41 @@ static void weights_bind_layer(pulsar_layer_weights *l, const pulsar_model *m, u
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
 
-    if (il < PULSAR_N_HASH_LAYER) {
-        l->ffn_gate_tid2eid = required_tensorf(m, "blk.%u.ffn_gate_tid2eid.weight", il);
+    /* A LAYER'S TENSORS MUST ALL LIVE IN ONE MAPPING.  A safetensors checkpoint
+     * is one file per layer, and the kernels resolve a weight as
+     * tensor_map_base(model, t) + t->abs_offset, so any two of a layer's tensors
+     * in different files would resolve against the wrong base and read silently
+     * wrong bytes.  Assert it here across the storage families a layer holds,
+     * including the router's optional bias / token-id tensors: the prefill
+     * router hands the kernel ONE mapping for all three of their offsets, and
+     * that is only sound because they share the layer's mapping.  (That mapping
+     * used to be taken from ffn_exp_probs_b, which the hash-routed layers omit
+     * -- a NULL that fell back to m->map and mis-resolved their tid2eid table
+     * and VL bias against the first shard.) */
+    const void *layer_map = tensor_map_base(m, l->attn_norm);
+    const pulsar_tensor *layer_tensors[] = {
+        l->hc_attn_fn, l->attn_norm, l->attn_kv, l->ffn_down_exps,
+        l->ffn_gate_inp, l->ffn_exp_probs_b, l->ffn_exp_probs_b_vl, l->ffn_gate_tid2eid,
+    };
+    for (size_t li = 0; li < sizeof(layer_tensors) / sizeof(layer_tensors[0]); li++) {
+        if (layer_tensors[li] && tensor_map_base(m, layer_tensors[li]) != layer_map) {
+            pulsar_die("layer tensors span more than one mapping; the kernels address "
+                       "weights as base + offset and cannot span files");
+        }
     }
 }
 
 
 
 /* Bind tensor names once into the fixed DS4 layer layout.  This is the point
- * where stringly GGUF metadata becomes direct model-specific pointers. */
+ * where stringly metadata becomes direct model-specific pointers. */
 void weights_bind(pulsar_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->token_embd = required_tensor(m, "token_embd.weight");
-    weights_bind_output(w, m, true, false);
+    weights_bind_output(w, m);
 
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         weights_bind_layer(&w->layer[il], m, il);
@@ -1058,16 +1572,13 @@ void weights_bind(pulsar_weights *w, const pulsar_model *m) {
 
 
 
-void weights_free(pulsar_weights *w) {
-    memset(w, 0, sizeof(*w));
-}
-
+/// @param w the bound DSpark weights
 static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint32_t E = w->embed_dim;
     const uint32_t V = w->vocab_size;
     /*
      * The tensor-layout checks below are self-referential: they validate every
-     * DSpark tensor against E/V read from the support GGUF's own metadata.  But
+     * DSpark tensor against E/V read from the support model's own metadata.  But
      * the runtime drives DSpark with the target model's compiled constants
      * (PULSAR_N_EMBD embed buffers, PULSAR_N_VOCAB logits stride), so a support model
      * built for a different base would pass this validation and then produce
@@ -1087,19 +1598,19 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
     const uint64_t out_low_dim = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
 
     tensor_expect_mxfp8(w->main_proj, 2, 3ull * E, E, 0);
-    tensor_expect_layout(w->main_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+    tensor_expect_f32_or_bf16(w->main_norm, 1, E, 0, 0);
 
     for (int li = 0; li < 3; li++) {
         const pulsar_layer_weights *l = &w->layer[li];
         tensor_expect_plain_layout(l->hc_attn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->attn_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_norm, 1, E, 0, 0);
         tensor_expect_mxfp8(l->attn_q_a, 2, E, PULSAR_N_LORA_Q, 0);
-        tensor_expect_layout(l->attn_q_a_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_LORA_Q, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_q_a_norm, 1, PULSAR_N_LORA_Q, 0, 0);
         tensor_expect_mxfp8(l->attn_q_b, 2, PULSAR_N_LORA_Q, q_dim, 0);
         tensor_expect_mxfp8(l->attn_kv, 2, E, PULSAR_N_HEAD_DIM, 0);
-        tensor_expect_layout(l->attn_kv_a_norm, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD_DIM, 0, 0);
+        tensor_expect_f32_or_bf16(l->attn_kv_a_norm, 1, PULSAR_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks, PULSAR_TENSOR_F32, 1, PULSAR_N_HEAD, 0, 0);
         tensor_expect_mxfp8(l->attn_output_a, 2,
                              PULSAR_N_HEAD_DIM * (PULSAR_N_HEAD / PULSAR_N_OUT_GROUP), out_low_dim, 0);
@@ -1107,11 +1618,14 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_plain_layout(l->hc_ffn_fn, 2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_ffn_scale, PULSAR_TENSOR_F32, 1, 3, 0, 0);
         tensor_expect_layout(l->hc_ffn_base, PULSAR_TENSOR_F32, 1, hc_mix_dim, 0, 0);
-        tensor_expect_layout(l->ffn_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
-        tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_EXPERT, 0);
-        tensor_expect_routed_expert(l->ffn_gate_exps, 3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_up_exps,   3, E, PULSAR_N_FF_EXP, PULSAR_N_EXPERT);
-        tensor_expect_routed_expert(l->ffn_down_exps, 3, PULSAR_N_FF_EXP, E, PULSAR_N_EXPERT);
+        tensor_expect_f32_or_bf16(l->ffn_norm, 1, E, 0, 0);
+        /* The DRAFTER's router width, not the target's: 128 experts / top-3 on
+         * V4.1 against a 384 / top-6 target, and 256 / top-6 on 0731. */
+        tensor_expect_plain_layout(l->ffn_gate_inp, 2, E, PULSAR_N_DSPARK_EXPERT, 0);
+        tensor_expect_optional(l->ffn_exp_probs_b, PULSAR_TENSOR_F32, 1, PULSAR_N_DSPARK_EXPERT, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, PULSAR_ROLE_EXPERT_GATE_UP, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps,   PULSAR_ROLE_EXPERT_GATE_UP, 3, E, PULSAR_N_FF_EXP, PULSAR_N_DSPARK_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, PULSAR_ROLE_EXPERT_DOWN,    3, PULSAR_N_FF_EXP, E, PULSAR_N_DSPARK_EXPERT);
         tensor_expect_routed_expert_combo(l->ffn_gate_exps,
                                           l->ffn_up_exps,
                                           l->ffn_down_exps);
@@ -1120,25 +1634,66 @@ static void dspark_weights_validate_layout(const pulsar_dspark_weights *w) {
         tensor_expect_mxfp8(l->ffn_down_shexp, 2, PULSAR_N_FF_EXP, E, 0);
     }
 
-    tensor_expect_layout(w->markov_w1, PULSAR_TENSOR_F32, 2, 256, V, 0);
-    tensor_expect_layout(w->markov_w2, PULSAR_TENSOR_F32, 2, 256, V, 0);
-    tensor_expect_layout(w->confidence_proj, PULSAR_TENSOR_F32, 1, E + 256, 0, 0);
-    tensor_expect_layout(w->hc_head_base, PULSAR_TENSOR_F32, 1, PULSAR_N_HC, 0, 0);
-    tensor_expect_layout(w->hc_head_fn, PULSAR_TENSOR_F32, 2, (uint64_t)PULSAR_N_HC * E, PULSAR_N_HC, 0);
-    tensor_expect_layout(w->hc_head_scale, PULSAR_TENSOR_F32, 1, 1, 0, 0);
-    tensor_expect_layout(w->final_norm, PULSAR_TENSOR_F32, 1, E, 0, 0);
+    /* bf16 upstream; f32 here until 2026-08-15. markov_w2 is the single
+     * largest above-source tensor in the model (66 MB of pure width) and the
+     * markov step streams all of it every draft position.
+     *
+     * markov_w2 is K-MAJOR (L213): dims (vocab, 256), element (v, i) at
+     * i * vocab + v, so the markov kernels' warps read contiguous memory. The
+     * source and markov_w1 are (256, vocab). An artifact still carrying the
+     * v-major markov_w2 fails this dims check and refuses to load -- there is
+     * no runtime transpose; the archived GGUF-era transpose tool migrated
+     * an existing artifact in place and --verify proves the result.
+     *
+     * Its storage is one of three (L213 step 2; pulsar_markov_w2_fmt is the
+     * type -> arm mapping): f32 or bf16 (the source's widths), or
+     * FP8_E4M3_SOA_K (46: MXFP8 numerics -- E8M0 scale plane then E4M3 payload
+     * plane -- the shipped table; alpha-neutral to bf16, 289 -> 161 us).  Plain
+     * type 38 is NOT accepted anywhere in the artifact.  Any other type refuses
+     * here; the dims contract is the same for all three. */
+    tensor_expect_f32_or_bf16(w->markov_w1, 2, 256, V, 0);
+    switch (w->markov_w2->type) {
+    case PULSAR_TENSOR_F32:
+    case PULSAR_TENSOR_BF16:
+    case PULSAR_TENSOR_FP8_E4M3_SOA_K:
+        tensor_expect_layout(w->markov_w2, w->markov_w2->type, 2, V, 256, 0);
+        break;
+    default:
+        pulsar_die("dspark markov_w2: storage must be f32, bf16 or fp8_e4m3_soa_k (46)");
+    }
+    tensor_expect_f32_or_bf16(w->confidence_proj, 1, E + 256, 0, 0);
+    tensor_expect_f32_or_bf16(w->final_norm, 1, E, 0, 0);
 }
 
 void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     memset(w, 0, sizeof(*w));
     weights_reject_unsupported_types(m);
+    weights_reject_bad_e8m0(m);
 
     w->embed_dim = required_u32(m, "deepseek_v4_dspark.embedding_length");
+    /* The drafter's SHAPE is not in the artifact's metadata beyond embedding_length:
+     * the shipped file carries NO expert_count, expert_used_count, block_size,
+     * noise_token_id or markov_rank key (checked directly in the artifact's
+     * header metadata, on both the serving and the -k variant).  This block used to require all five and
+     * compare them against compiled constants -- so it made the artifact
+     * unloadable while checking nothing the tensor validation does not already
+     * check.  The facts are asserted where they actually live:
+     * dspark_weights_validate_layout pins every tensor against this engine's
+     * compiled constants -- the expert count from ffn_gate_inp and the routed
+     * expert tensors, the markov rank from markov_w1's 256 -- and the noise
+     * token needs no check at all because the runtime uses
+     * PULSAR_DSPARK_NOISE_TOKEN_ID directly rather than reading it from a file.
+     * The one fact that is no longer checked anywhere is the depth the drafter
+     * was TRAINED for; the artifact never carried it either, and the depth
+     * controller's ceiling stays the compiled one (k_dspark_depth). */
     w->main_proj = required_tensor(m, "dspark.main_proj.weight");
     w->main_norm = required_tensor(m, "dspark.main_norm.weight");
 
     for (int li = 0; li < 3; li++) {
         pulsar_layer_weights *l = &w->layer[li];
+        l->n_expert = PULSAR_N_DSPARK_EXPERT;
+        l->n_expert_used = PULSAR_N_DSPARK_EXPERT_USED;
+        l->n_expert_present = PULSAR_N_DSPARK_EXPERT;
         l->hc_attn_fn      = required_tensorf(m, "dspark.%d.hc_attn_fn.weight", li);
         l->hc_attn_scale   = required_tensorf(m, "dspark.%d.hc_attn_scale.weight", li);
         l->hc_attn_base    = required_tensorf(m, "dspark.%d.hc_attn_base.weight", li);
@@ -1156,6 +1711,17 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
         l->hc_ffn_base     = required_tensorf(m, "dspark.%d.hc_ffn_base.weight", li);
         l->ffn_norm        = required_tensorf(m, "dspark.%d.ffn_norm.weight", li);
         l->ffn_gate_inp    = required_tensorf(m, "dspark.%d.ffn_gate_inp.weight", li);
+        /* The drafter's expert routing carries the same trained correction bias
+         * as the target's layers (mtp.N.ffn.gate.bias -> dspark.N.exp_probs_b.bias,
+         * F32 [n_expert]).  OPTIONAL, like the target's blk.N.exp_probs_b.bias:
+         * the Vision-Exp artifact ships it on every drafter layer, while the
+         * shipped 0731 drafter predates the template fix and has no such tensor
+         * -- refusing it here would refuse the artifact in production today.
+         * When present the shared layer encoder threads it into the router
+         * (gpu_prefill.cpp, has_bias = ffn_exp_probs_b != NULL), which the
+         * drafter now reaches through the same gpu_graph_encode_layer_ffn_batch.
+         * 0731's drafter rebuild with the bias is a separate follow-up. */
+        l->ffn_exp_probs_b = optional_tensorf(m, "dspark.%d.exp_probs_b.bias", li);
         l->ffn_gate_exps   = required_tensorf(m, "dspark.%d.ffn_gate_exps.weight", li);
         l->ffn_up_exps     = required_tensorf(m, "dspark.%d.ffn_up_exps.weight", li);
         l->ffn_down_exps   = required_tensorf(m, "dspark.%d.ffn_down_exps.weight", li);
@@ -1167,687 +1733,112 @@ void dspark_weights_bind(pulsar_dspark_weights *w, const pulsar_model *m) {
     w->markov_w1        = required_tensor(m, "dspark.2.markov_head.markov_w1.weight");
     w->markov_w2        = required_tensor(m, "dspark.2.markov_head.markov_w2.weight");
     w->confidence_proj  = required_tensor(m, "dspark.2.confidence_head.proj.weight");
-    w->hc_head_base     = required_tensor(m, "dspark.2.hc_head_base.weight");
-    w->hc_head_fn       = required_tensor(m, "dspark.2.hc_head_fn.weight");
-    w->hc_head_scale    = required_tensor(m, "dspark.2.hc_head_scale.weight");
     w->final_norm       = required_tensor(m, "dspark.2.norm.weight");
 
     w->vocab_size = (uint32_t)w->markov_w1->dim[1];
 
-    {
-        uint32_t target_ids[3];
-        if (model_get_u32(m, "dspark.target_layer_ids.0", &target_ids[0]) &&
-            model_get_u32(m, "dspark.target_layer_ids.1", &target_ids[1]) &&
-            model_get_u32(m, "dspark.target_layer_ids.2", &target_ids[2])) {
-            memcpy(w->target_layer_ids, target_ids, sizeof(target_ids));
-        } else {
-            /*
-             * Fall back to the target model's last three layers.  Derive from
-             * the compiled target shape (PULSAR_N_LAYER), NOT the support GGUF's
-             * block_count — that field describes the 3-layer draft backbone, so
-             * using it would capture target layers {0,1,2} instead of the tail.
-             */
-            w->target_layer_ids[0] = PULSAR_N_LAYER - 3;
-            w->target_layer_ids[1] = PULSAR_N_LAYER - 2;
-            w->target_layer_ids[2] = PULSAR_N_LAYER - 1;
+    /* dspark_target_layer_ids: the artifact says which target layers' INPUT
+     * hiddens the drafter conditions on (V4.1: 37, 38, 39 of 40).  No
+     * derivation from the layer count -- a drafter trained on other anchors
+     * would run and draft garbage. */
+    w->target_layer_ids[0] = required_u32(m, "dspark.target_layer_ids.0");
+    w->target_layer_ids[1] = required_u32(m, "dspark.target_layer_ids.1");
+    w->target_layer_ids[2] = required_u32(m, "dspark.target_layer_ids.2");
+    for (int i = 0; i < 3; i++) {
+        if (w->target_layer_ids[i] >= PULSAR_N_LAYER || (i && w->target_layer_ids[i] <= w->target_layer_ids[i - 1])) {
+            pulsar_die("dspark.target_layer_ids must be ascending target layer indices");
         }
+    }
+
+    /* The DRAFTER's own HC head mix, from block 2 -- the block whose hidden
+     * feeds the head.  Required for the same reason as the main model's above:
+     * a 0731 drafter missing it would otherwise collapse with the carried pre
+     * and draft from a wrong head without failing. */
+    if (g_pulsar_shape.hc_head_mix) {
+        w->hc_head_fn    = required_tensor(m, "dspark.2.hc_head_fn.weight");
+        w->hc_head_scale = required_tensor(m, "dspark.2.hc_head_scale.weight");
+        w->hc_head_base  = required_tensor(m, "dspark.2.hc_head_base.weight");
     }
 
     dspark_weights_validate_layout(w);
 }
 
 
+/* Vision-Exp tower bind + layout validation.  The artifact carries the vision
+ * tensors but no vision metadata, so every dim is checked against the compiled
+ * PULSAR_VISION_* shape here -- a wrong or half-present tower refuses loudly
+ * rather than producing garbage image features.  Absent tower (no
+ * vision.patch_embed.proj.weight) is not an error: text-only artifacts stay
+ * loadable.  Reference: the checkpoint's inference/vision.py. */
+bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m) {
+    memset(w, 0, sizeof(*w));
+    if (!model_find_tensor(m, "vision.patch_embed.proj.weight")) return false;
 
-/* Load one token embedding row and expand it to float activations. */
-void embed_token_f16(const pulsar_model *m, const pulsar_weights *w, int token, float *out) {
-    pulsar_tensor *te = w->token_embd;
-    if (token < 0 || (uint64_t)token >= te->dim[1]) {
-        pulsar_die("token id is outside the embedding table");
+    const uint64_t D  = PULSAR_VISION_DIM;
+    const uint64_t N  = PULSAR_VISION_HEADS;
+    const uint64_t I  = PULSAR_VISION_INTER;
+    const uint64_t P  = 3ull * PULSAR_VISION_PATCH * PULSAR_VISION_PATCH;
+    const uint64_t A1 = D * PULSAR_VISION_DOWNSAMPLE * PULSAR_VISION_DOWNSAMPLE;
+    const uint64_t T  = PULSAR_N_EMBD;
+
+    w->patch_proj    = required_tensor(m, "vision.patch_embed.proj.weight");
+    w->patch_bias    = required_tensor(m, "vision.patch_embed.proj.bias");
+    w->norm          = required_tensor(m, "vision.norm.weight");
+    w->aligner_w1    = required_tensor(m, "aligner.w1.weight");
+    w->aligner_b1    = required_tensor(m, "aligner.w1.bias");
+    w->aligner_w2    = required_tensor(m, "aligner.w2.weight");
+    w->aligner_b2    = required_tensor(m, "aligner.w2.bias");
+    w->image_start   = required_tensor(m, "image_start");
+    w->image_end     = required_tensor(m, "image_end");
+    w->image_newline = required_tensor(m, "image_newline");
+    /* The pad row exists only in the padded span (pulsar_shape::image_span_padded):
+     * V4.1's checkpoint has none, and an artifact carrying one there is not V4.1's. */
+    if (g_pulsar_shape.image_span_padded) {
+        w->image_pad = required_tensor(m, "image_pad");
+    } else if (model_find_tensor(m, "image_pad")) {
+        fprintf(stderr, "pulsar: the %s tower carries image_pad, which its image span has no slot for -- refusing\n",
+                PULSAR_MODEL_SHAPE_NAME);
+        pulsar_load_refuse();
+        return false;
     }
 
-    const uint16_t *base = (const uint16_t *)tensor_data(m, te);
-    const uint64_t stride = te->dim[0];
-    const uint16_t *row = base + (uint64_t)token * stride;
-
-    for (uint64_t i = 0; i < stride; i++) {
-        out[i] = f16_to_f32(row[i]);
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        w->block[li].norm1     = required_tensorf(m, "vision.blocks.%u.norm1.weight", li);
+        w->block[li].wqkv      = required_tensorf(m, "vision.blocks.%u.attn.wqkv.weight", li);
+        w->block[li].wqkv_bias = required_tensorf(m, "vision.blocks.%u.attn.wqkv.bias", li);
+        w->block[li].wo        = required_tensorf(m, "vision.blocks.%u.attn.wo.weight", li);
+        w->block[li].wo_bias   = required_tensorf(m, "vision.blocks.%u.attn.wo.bias", li);
+        w->block[li].norm2     = required_tensorf(m, "vision.blocks.%u.norm2.weight", li);
+        w->block[li].w1        = required_tensorf(m, "vision.blocks.%u.mlp.w1.weight", li);
+        w->block[li].w2        = required_tensorf(m, "vision.blocks.%u.mlp.w2.weight", li);
     }
-}
+    w->n_layers = PULSAR_VISION_LAYERS;
 
+    tensor_expect_f32_or_bf16(w->patch_proj, 2, P, D, 0);
+    tensor_expect_f32_or_bf16(w->patch_bias, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->norm, 1, D, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w1, 2, A1, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b1, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->aligner_w2, 2, T, T, 0);
+    tensor_expect_f32_or_bf16(w->aligner_b2, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_start, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_end, 1, T, 0, 0);
+    tensor_expect_f32_or_bf16(w->image_newline, 1, T, 0, 0);
+    if (w->image_pad) tensor_expect_f32_or_bf16(w->image_pad, 1, T, 0, 0);
 
-
-/* RMSNorm without a learned scale, used by hyper-connection control vectors. */
-void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
-
-    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale;
-}
-
-
-
-/* Standard DS4 RMSNorm with learned per-channel scale. */
-void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
-
-    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
-}
-
-
-
-/* Normalize each attention head independently after Q projection. */
-void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
-    for (uint32_t h = 0; h < n_head; h++) {
-        float *head = x + (uint64_t)h * head_dim;
-        double ss = 0.0;
-        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
-
-        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
-        for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+    for (uint32_t li = 0; li < PULSAR_VISION_LAYERS; li++) {
+        tensor_expect_f32_or_bf16(w->block[li].norm1, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv, 2, D, 3u * D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wqkv_bias, 1, 3u * D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo, 2, D, D, 0);
+        tensor_expect_f32_or_bf16(w->block[li].wo_bias, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].norm2, 1, D, 0, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w1, 2, D, 2u * I, 0);
+        tensor_expect_f32_or_bf16(w->block[li].w2, 2, I, D, 0);
     }
+    /* The head count must divide the width; the tower asserts it here so the
+     * forward can assume a whole head_dim. */
+    if (D % N != 0)
+        pulsar_die("vision: dim is not a multiple of n_heads");
+    return true;
 }
-
-
-
-static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
-#if defined(__ARM_NEON)
-    uint64_t i = 0;
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    for (; i + 8 <= n; i += 8) {
-        const float16x8_t hv = vreinterpretq_f16_u16(vld1q_u16(row + i));
-        const float32x4_t h0 = vcvt_f32_f16(vget_low_f16(hv));
-        const float32x4_t h1 = vcvt_f32_f16(vget_high_f16(hv));
-        acc0 = vfmaq_f32(acc0, h0, vld1q_f32(x + i));
-        acc1 = vfmaq_f32(acc1, h1, vld1q_f32(x + i + 4));
-    }
-
-    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
-    return acc;
-#else
-    float acc = 0.0f;
-    for (uint64_t i = 0; i < n; i++) acc += f16_to_f32(row[i]) * x[i];
-    return acc;
-#endif
-}
-
-
-
-static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_f16_ctx *ctx = static_cast<matvec_f16_ctx *>(vctx);
-
-    for (uint64_t o = row0; o < row1; o++) {
-        const uint16_t *row = ctx->data + o * ctx->in_dim;
-        ctx->out[o] = dot_f16_row(row, ctx->x, ctx->in_dim);
-    }
-}
-
-
-
-/* Dense F16 matvec for small control projections such as HC and router heads. */
-void matvec_f16(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    if (w->type != 1 || w->ndim != 2) pulsar_die("expected a 2D F16 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    matvec_f16_ctx ctx = {
-        .out = out,
-        .data = (const uint16_t *)tensor_data(m, w),
-        .x = x,
-        .in_dim = in_dim,
-    };
-
-    const uint64_t ops = in_dim * out_dim;
-    const uint64_t min_rows = ops >= 262144 ? 1 : 512;
-    pulsar_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
-}
-
-
-
-void matvec_f16_serial(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    if (w->type != 1 || w->ndim != 2) pulsar_die("expected a 2D F16 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    const uint16_t *data = (const uint16_t *)tensor_data(m, w);
-    for (uint64_t o = 0; o < out_dim; o++) {
-        out[o] = dot_f16_row(data + o * in_dim, x, in_dim);
-    }
-}
-
-
-
-static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if (n == 32) {
-        int32x4_t acc = vdupq_n_s32(0);
-        acc = vdotq_s32(acc, vld1q_s8(a),      vld1q_s8(b));
-        acc = vdotq_s32(acc, vld1q_s8(a + 16), vld1q_s8(b + 16));
-        return vaddvq_s32(acc);
-    }
-#endif
-    int32_t sum = 0;
-    for (uint64_t i = 0; i < n; i++) sum += (int32_t)a[i] * (int32_t)b[i];
-    return sum;
-}
-
-
-
-static inline float dot_q8_0_row(
-        const uint8_t *row,
-        const int8_t  *xq,
-        const float   *xscale,
-        uint64_t       in_dim,
-        uint64_t       blocks) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if ((in_dim & 31u) == 0) {
-        float32x4_t accv0 = vdupq_n_f32(0.0f);
-        float32x4_t accv1 = vdupq_n_f32(0.0f);
-
-        uint64_t b = 0;
-        for (; b + 1 < blocks; b += 2) {
-            uint16_t scale_bits0;
-            uint16_t scale_bits1;
-            memcpy(&scale_bits0, row + b * 34, sizeof(scale_bits0));
-            memcpy(&scale_bits1, row + (b + 1) * 34, sizeof(scale_bits1));
-
-            const int8_t *qs0 = (const int8_t *)(row + b * 34 + 2);
-            const int8_t *qs1 = (const int8_t *)(row + (b + 1) * 34 + 2);
-            const int8_t *xq0 = xq + b * 32;
-            const int8_t *xq1 = xq + (b + 1) * 32;
-
-            int32x4_t dot0 = vdupq_n_s32(0);
-            dot0 = vdotq_s32(dot0, vld1q_s8(qs0),      vld1q_s8(xq0));
-            dot0 = vdotq_s32(dot0, vld1q_s8(qs0 + 16), vld1q_s8(xq0 + 16));
-
-            int32x4_t dot1 = vdupq_n_s32(0);
-            dot1 = vdotq_s32(dot1, vld1q_s8(qs1),      vld1q_s8(xq1));
-            dot1 = vdotq_s32(dot1, vld1q_s8(qs1 + 16), vld1q_s8(xq1 + 16));
-
-            accv0 = vfmaq_n_f32(accv0, vcvtq_f32_s32(dot0), f16_to_f32(scale_bits0) * xscale[b]);
-            accv1 = vfmaq_n_f32(accv1, vcvtq_f32_s32(dot1), f16_to_f32(scale_bits1) * xscale[b + 1]);
-        }
-
-        if (b < blocks) {
-            uint16_t scale_bits;
-            memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-            const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
-            const int8_t *xqb = xq + b * 32;
-            int32x4_t dot = vdupq_n_s32(0);
-            dot = vdotq_s32(dot, vld1q_s8(qs),      vld1q_s8(xqb));
-            dot = vdotq_s32(dot, vld1q_s8(qs + 16), vld1q_s8(xqb + 16));
-            accv0 = vfmaq_n_f32(accv0, vcvtq_f32_s32(dot), f16_to_f32(scale_bits) * xscale[b]);
-        }
-
-        return vaddvq_f32(vaddq_f32(accv0, accv1));
-    }
-#endif
-
-    float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
-
-        const uint64_t i0 = b * 32;
-        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        acc += f16_to_f32(scale_bits) * xscale[b] * (float)dot_i8_32(qs, xq + i0, n);
-    }
-    return acc;
-}
-
-
-
-static inline void dot_q8_0_row_2(
-        const uint8_t *row,
-        const int8_t  *xq0,
-        const float   *xscale0,
-        const int8_t  *xq1,
-        const float   *xscale1,
-        uint64_t       in_dim,
-        uint64_t       blocks,
-        float         *out0,
-        float         *out1) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if ((in_dim & 31u) == 0) {
-        float32x4_t acc00 = vdupq_n_f32(0.0f);
-        float32x4_t acc01 = vdupq_n_f32(0.0f);
-        float32x4_t acc10 = vdupq_n_f32(0.0f);
-        float32x4_t acc11 = vdupq_n_f32(0.0f);
-
-        uint64_t b = 0;
-        for (; b + 1 < blocks; b += 2) {
-            uint16_t scale_bits0;
-            uint16_t scale_bits1;
-            memcpy(&scale_bits0, row + b * 34, sizeof(scale_bits0));
-            memcpy(&scale_bits1, row + (b + 1) * 34, sizeof(scale_bits1));
-
-            const int8_t *qs0 = (const int8_t *)(row + b * 34 + 2);
-            const int8_t *qs1 = (const int8_t *)(row + (b + 1) * 34 + 2);
-
-            int32x4_t d00 = vdupq_n_s32(0);
-            d00 = vdotq_s32(d00, vld1q_s8(qs0),      vld1q_s8(xq0 + b * 32));
-            d00 = vdotq_s32(d00, vld1q_s8(qs0 + 16), vld1q_s8(xq0 + b * 32 + 16));
-            int32x4_t d01 = vdupq_n_s32(0);
-            d01 = vdotq_s32(d01, vld1q_s8(qs1),      vld1q_s8(xq0 + (b + 1) * 32));
-            d01 = vdotq_s32(d01, vld1q_s8(qs1 + 16), vld1q_s8(xq0 + (b + 1) * 32 + 16));
-
-            int32x4_t d10 = vdupq_n_s32(0);
-            d10 = vdotq_s32(d10, vld1q_s8(qs0),      vld1q_s8(xq1 + b * 32));
-            d10 = vdotq_s32(d10, vld1q_s8(qs0 + 16), vld1q_s8(xq1 + b * 32 + 16));
-            int32x4_t d11 = vdupq_n_s32(0);
-            d11 = vdotq_s32(d11, vld1q_s8(qs1),      vld1q_s8(xq1 + (b + 1) * 32));
-            d11 = vdotq_s32(d11, vld1q_s8(qs1 + 16), vld1q_s8(xq1 + (b + 1) * 32 + 16));
-
-            const float s0 = f16_to_f32(scale_bits0);
-            const float s1 = f16_to_f32(scale_bits1);
-            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d00), s0 * xscale0[b]);
-            acc01 = vfmaq_n_f32(acc01, vcvtq_f32_s32(d01), s1 * xscale0[b + 1]);
-            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d10), s0 * xscale1[b]);
-            acc11 = vfmaq_n_f32(acc11, vcvtq_f32_s32(d11), s1 * xscale1[b + 1]);
-        }
-
-        if (b < blocks) {
-            uint16_t scale_bits;
-            memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-            const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
-
-            int32x4_t d0 = vdupq_n_s32(0);
-            d0 = vdotq_s32(d0, vld1q_s8(qs),      vld1q_s8(xq0 + b * 32));
-            d0 = vdotq_s32(d0, vld1q_s8(qs + 16), vld1q_s8(xq0 + b * 32 + 16));
-            int32x4_t d1 = vdupq_n_s32(0);
-            d1 = vdotq_s32(d1, vld1q_s8(qs),      vld1q_s8(xq1 + b * 32));
-            d1 = vdotq_s32(d1, vld1q_s8(qs + 16), vld1q_s8(xq1 + b * 32 + 16));
-
-            const float s0 = f16_to_f32(scale_bits);
-            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d0), s0 * xscale0[b]);
-            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d1), s0 * xscale1[b]);
-        }
-
-        *out0 = vaddvq_f32(vaddq_f32(acc00, acc01));
-        *out1 = vaddvq_f32(vaddq_f32(acc10, acc11));
-        return;
-    }
-#endif
-
-    *out0 = dot_q8_0_row(row, xq0, xscale0, in_dim, blocks);
-    *out1 = dot_q8_0_row(row, xq1, xscale1, in_dim, blocks);
-}
-
-
-
-static inline PULSAR_MAYBE_UNUSED void dot_q8_0_row_pair(
-        const uint8_t *row0,
-        const uint8_t *row1,
-        const int8_t  *xq,
-        const float   *xscale,
-        uint64_t       in_dim,
-        uint64_t       blocks,
-        float         *out0,
-        float         *out1) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    if ((in_dim & 31u) == 0) {
-        float32x4_t acc00 = vdupq_n_f32(0.0f);
-        float32x4_t acc01 = vdupq_n_f32(0.0f);
-        float32x4_t acc10 = vdupq_n_f32(0.0f);
-        float32x4_t acc11 = vdupq_n_f32(0.0f);
-
-        uint64_t b = 0;
-        for (; b + 1 < blocks; b += 2) {
-            uint16_t s00, s01, s10, s11;
-            memcpy(&s00, row0 + b * 34, sizeof(s00));
-            memcpy(&s01, row0 + (b + 1) * 34, sizeof(s01));
-            memcpy(&s10, row1 + b * 34, sizeof(s10));
-            memcpy(&s11, row1 + (b + 1) * 34, sizeof(s11));
-
-            const int8_t *xq0 = xq + b * 32;
-            const int8_t *xq1 = xq + (b + 1) * 32;
-            const int8x16_t xv00 = vld1q_s8(xq0);
-            const int8x16_t xv01 = vld1q_s8(xq0 + 16);
-            const int8x16_t xv10 = vld1q_s8(xq1);
-            const int8x16_t xv11 = vld1q_s8(xq1 + 16);
-
-            const int8_t *q00 = (const int8_t *)(row0 + b * 34 + 2);
-            const int8_t *q01 = (const int8_t *)(row0 + (b + 1) * 34 + 2);
-            const int8_t *q10 = (const int8_t *)(row1 + b * 34 + 2);
-            const int8_t *q11 = (const int8_t *)(row1 + (b + 1) * 34 + 2);
-
-            int32x4_t d00 = vdupq_n_s32(0);
-            d00 = vdotq_s32(d00, vld1q_s8(q00),      xv00);
-            d00 = vdotq_s32(d00, vld1q_s8(q00 + 16), xv01);
-            int32x4_t d01 = vdupq_n_s32(0);
-            d01 = vdotq_s32(d01, vld1q_s8(q01),      xv10);
-            d01 = vdotq_s32(d01, vld1q_s8(q01 + 16), xv11);
-            int32x4_t d10 = vdupq_n_s32(0);
-            d10 = vdotq_s32(d10, vld1q_s8(q10),      xv00);
-            d10 = vdotq_s32(d10, vld1q_s8(q10 + 16), xv01);
-            int32x4_t d11 = vdupq_n_s32(0);
-            d11 = vdotq_s32(d11, vld1q_s8(q11),      xv10);
-            d11 = vdotq_s32(d11, vld1q_s8(q11 + 16), xv11);
-
-            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d00), f16_to_f32(s00) * xscale[b]);
-            acc01 = vfmaq_n_f32(acc01, vcvtq_f32_s32(d01), f16_to_f32(s01) * xscale[b + 1]);
-            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d10), f16_to_f32(s10) * xscale[b]);
-            acc11 = vfmaq_n_f32(acc11, vcvtq_f32_s32(d11), f16_to_f32(s11) * xscale[b + 1]);
-        }
-
-        if (b < blocks) {
-            uint16_t s0, s1;
-            memcpy(&s0, row0 + b * 34, sizeof(s0));
-            memcpy(&s1, row1 + b * 34, sizeof(s1));
-            const int8_t *xqb = xq + b * 32;
-            const int8x16_t xv0 = vld1q_s8(xqb);
-            const int8x16_t xv1 = vld1q_s8(xqb + 16);
-            const int8_t *q0 = (const int8_t *)(row0 + b * 34 + 2);
-            const int8_t *q1 = (const int8_t *)(row1 + b * 34 + 2);
-            int32x4_t d0 = vdupq_n_s32(0);
-            d0 = vdotq_s32(d0, vld1q_s8(q0),      xv0);
-            d0 = vdotq_s32(d0, vld1q_s8(q0 + 16), xv1);
-            int32x4_t d1 = vdupq_n_s32(0);
-            d1 = vdotq_s32(d1, vld1q_s8(q1),      xv0);
-            d1 = vdotq_s32(d1, vld1q_s8(q1 + 16), xv1);
-            acc00 = vfmaq_n_f32(acc00, vcvtq_f32_s32(d0), f16_to_f32(s0) * xscale[b]);
-            acc10 = vfmaq_n_f32(acc10, vcvtq_f32_s32(d1), f16_to_f32(s1) * xscale[b]);
-        }
-
-        *out0 = vaddvq_f32(vaddq_f32(acc00, acc01));
-        *out1 = vaddvq_f32(vaddq_f32(acc10, acc11));
-        return;
-    }
-#endif
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t s0_bits;
-        uint16_t s1_bits;
-        memcpy(&s0_bits, row0 + b * 34, sizeof(s0_bits));
-        memcpy(&s1_bits, row1 + b * 34, sizeof(s1_bits));
-        const int8_t *q0 = (const int8_t *)(row0 + b * 34 + 2);
-        const int8_t *q1 = (const int8_t *)(row1 + b * 34 + 2);
-        const uint64_t i0 = b * 32;
-        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        acc0 += f16_to_f32(s0_bits) * xscale[b] * (float)dot_i8_32(q0, xq + i0, n);
-        acc1 += f16_to_f32(s1_bits) * xscale[b] * (float)dot_i8_32(q1, xq + i0, n);
-    }
-    *out0 = acc0;
-    *out1 = acc1;
-}
-
-
-
-void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n) {
-    const uint64_t blocks = (n + 31) / 32;
-    for (uint64_t b = 0; b < blocks; b++) {
-        const uint64_t i0 = b * 32;
-        const uint64_t bn = n - i0 < 32 ? n - i0 : 32;
-        float amax = 0.0f;
-        for (uint64_t i = 0; i < bn; i++) {
-            const float ax = fabsf(x[i0 + i]);
-            if (ax > amax) amax = ax;
-        }
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        scale[b] = d;
-        for (uint64_t i = 0; i < bn; i++) {
-            int v = (int)lrintf(x[i0 + i] * id);
-            if (v > 127) v = 127;
-            if (v < -128) v = -128;
-            xq[i0 + i] = (int8_t)v;
-        }
-        for (uint64_t i = bn; i < 32 && i0 + i < blocks * 32; i++) {
-            xq[i0 + i] = 0;
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matvec_q8_0_ctx *ctx = static_cast<matvec_q8_0_ctx *>(vctx);
-
-    for (uint64_t r = r0; r < r1; r++) {
-        const uint64_t o = ctx->row0 + r;
-        const uint8_t *row = ctx->data + o * ctx->blocks * 34;
-        ctx->out[r] = dot_q8_0_row(row, ctx->xq, ctx->xscale, ctx->in_dim, ctx->blocks);
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/* Multiply selected Q8_0 rows by an activation that has already been quantized
- * once.  This avoids repeated activation quantization for paired projections. */
-static void matvec_q8_0_rows_prequant(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const int8_t    * xq,
-        const float     * xscale,
-        uint64_t          row0,
-        uint64_t          n_rows) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    if (row0 > out_dim || n_rows > out_dim - row0) pulsar_die("Q8_0 row range is outside tensor");
-    const uint64_t ctx_blocks = (in_dim + 31) / 32;
-
-    matvec_q8_0_ctx ctx = {
-        .out = out,
-        .data = (const uint8_t *)tensor_data(m, w),
-        .xq = xq,
-        .xscale = xscale,
-        .in_dim = in_dim,
-        .row0 = row0,
-        .blocks = ctx_blocks,
-    };
-    pulsar_parallel_for(n_rows, matvec_q8_0_worker, &ctx);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-static void matvec_q8_0_rows(
-        float           * out,
-        const pulsar_model * m,
-        const pulsar_tensor * w,
-        const float     * x,
-        uint64_t          row0,
-        uint64_t          n_rows) {
-    if (w->type != 8 || w->ndim != 2) pulsar_die("expected a 2D Q8_0 tensor");
-
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t ctx_blocks = (in_dim + 31) / 32;
-    int8_t *xq = (int8_t *)xmalloc((size_t)ctx_blocks * 32);
-    float *xscale = (float *)xmalloc((size_t)ctx_blocks * sizeof(xscale[0]));
-
-    quantize_q8_0_activation(x, xq, xscale, in_dim);
-    matvec_q8_0_rows_prequant(out, m, w, xq, xscale, row0, n_rows);
-
-    free(xscale);
-    free(xq);
-}
-
-
-
-/* Single-token Q8_0 matvec, used heavily in decode. */
-void matvec_q8_0(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x) {
-    matvec_q8_0_rows(out, m, w, x, 0, w->dim[1]);
-}
-
-
-
-void matvec_any(float *out, const pulsar_model *m, const pulsar_tensor *w, const float *x);
-
-
-
-/* Decode scratch owns this temporary activation quantization so generation
- * can assert that the hot path performs no malloc. */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-float tensor_1d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t i) {
-    if (i >= t->elements) pulsar_die("tensor scalar index is out of bounds");
-    if (t->type == 0) {
-        const float *p = (const float *)tensor_data(m, t);
-        return p[i];
-    }
-    if (t->type == 1) {
-        const uint16_t *p = (const uint16_t *)tensor_data(m, t);
-        return f16_to_f32(p[i]);
-    }
-    pulsar_die("unsupported tensor scalar type");
-    return 0.0f;
-}
-
-
-
-float tensor_2d_value(const pulsar_model *m, const pulsar_tensor *t, uint64_t x, uint64_t y) {
-    if (t->ndim != 2 || x >= t->dim[0] || y >= t->dim[1]) {
-        pulsar_die("tensor 2D index is out of bounds");
-    }
-    return tensor_1d_value(m, t, y * t->dim[0] + x);
-}
-
-
-
-/* Locate one expert's 2D matrix inside a 3D GGUF expert tensor. */
-const uint8_t *tensor_expert_bytes(
-        const pulsar_model  *m,
-        const pulsar_tensor *w,
-        uint32_t          expert,
-        uint64_t         *in_dim,
-        uint64_t         *out_dim,
-        uint64_t         *row_bytes) {
-    if (w->ndim != 3) pulsar_die("expected a 3D expert tensor");
-    if (expert >= w->dim[2]) pulsar_die("expert id is outside expert tensor");
-
-    *in_dim = w->dim[0];
-    *out_dim = w->dim[1];
-
-    const gguf_type_info *info = tensor_type(w->type);
-    if (!info || info->block_elems == 0) pulsar_die("unsupported expert tensor type");
-    const uint64_t blocks = (*in_dim + info->block_elems - 1) / info->block_elems;
-    *row_bytes = blocks * info->block_bytes;
-
-    const uint64_t expert_bytes = *out_dim * *row_bytes;
-    return (const uint8_t *)tensor_data(m, w) + (uint64_t)expert * expert_bytes;
-}
-
-
-
-
-
-
-
-
-
-float silu(float x);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
-    quantize_mid_pairs_ctx *ctx = static_cast<quantize_mid_pairs_ctx *>(vctx);
-    for (uint64_t p = p0; p < p1; p++) {
-        pulsar_quantize_row_q8_K(ctx->mid + p * ctx->down_in_dim,
-                              ctx->midq + p * ctx->down_blocks,
-                              (int64_t)ctx->down_in_dim);
-    }
-}
-
-
-
-
-
-
-

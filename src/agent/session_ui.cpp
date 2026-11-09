@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: session listing, history rendering and command completion. */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,10 @@
  * ============================================================================
  */
 
+/** @brief Format how long ago `when` was: "<n>s/m/h/d ago" (0 or a future time reads "0s ago").
+ *  @param when unix seconds
+ *  @param buf  destination
+ *  @param len  bytes at `buf` */
 static void agent_format_age(uint64_t when, char *buf, size_t len) {
     uint64_t now = (uint64_t)time(NULL);
     uint64_t age = when && now > when ? now - when : 0;
@@ -18,6 +24,13 @@ static void agent_format_age(uint64_t when, char *buf, size_t len) {
 
 
 
+/** @brief A one-line session title from text: trimmed, whitespace runs collapsed to one space, cut with "..." to
+ *  fit `max_bytes`.
+ *  @param p           text start
+ *  @param end         text end (exclusive)
+ *  @param max_bytes   the title's byte cap (raised to 4); 0 = no cap
+ *  @param empty_title the title when nothing is left
+ *  @return the title, malloc'd; caller frees */
 static char *agent_session_title_from_span(const char *p, const char *end,
                                            size_t max_bytes,
                                            const char *empty_title) {
@@ -64,27 +77,107 @@ char *agent_session_title_from_prompt(const char *prompt,
 
 
 
+/** @brief The text of `n` token ids, concatenated, into out[0..cap) (NUL-terminated); empty when it does not fit.
+ *  @param e    the engine
+ *  @param ids  the ids
+ *  @param n    their count
+ *  @param out  receives the text
+ *  @param cap  out's size in bytes
+ *  @param trim drop leading and trailing isspace() bytes
+ *  @return the text's length in bytes (0 = empty) */
+static size_t agent_turn_mark_text(pulsar_engine *e, const int *ids, int n, char *out, size_t cap, bool trim) {
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        size_t k = 0;
+        char *t = pulsar_token_text(e, ids[i], &k);
+        const bool fits = t && len + k < cap;
+        if (fits) memcpy(out + len, t, k);
+        free(t);
+        if (!fits) {
+            out[0] = '\0';
+            return 0;
+        }
+        len += k;
+    }
+    size_t lo = 0;
+    if (trim) {
+        while (lo < len && isspace((unsigned char)out[lo])) lo++;
+        while (len > lo && isspace((unsigned char)out[len - 1])) len--;
+        memmove(out, out + lo, len - lo);
+        len -= lo;
+    }
+    out[len] = '\0';
+    return len;
+}
+
+void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m) {
+    memset(m, 0, sizeof(*m));
+    pulsar_turn_markers tm;
+    if (pulsar_chat_turn_markers(e, &tm)) {
+        m->user_len = agent_turn_mark_text(e, tm.user, tm.n_user, m->user, sizeof m->user, false);
+        m->assistant_len = agent_turn_mark_text(e, tm.assistant, tm.n_assistant, m->assistant, sizeof m->assistant,
+                                                false);
+    }
+    pulsar_tokens end = {0};
+    pulsar_chat_end_assistant(e, &end);
+    m->end_len = agent_turn_mark_text(e, end.v, end.len, m->end, sizeof m->end, true);
+    pulsar_tokens_free(&end);
+}
+
+/** @brief Find the first occurrence of `needle` in `hay` (bytes).
+ *  @param hay        the haystack
+ *  @param hay_len    bytes at `hay`
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`; 0 matches at `hay`
+ *  @return a pointer into `hay`, or NULL */
+static const char *agent_memmem(const char *hay, size_t hay_len,
+                                const char *needle, size_t needle_len) {
+    if (!needle_len) return hay;
+    if (needle_len > hay_len) return NULL;
+    const char first = needle[0];
+    const char *end = hay + hay_len - needle_len + 1;
+    for (const char *p = hay; p < end; p++) {
+        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
+    }
+    return NULL;
+}
+
+/** @brief The first occurrence of a turn marker in [p, end); a marker the family does not spell (len 0) is never
+ *  found.
+ *  @param p   scan start
+ *  @param end scan end (exclusive)
+ *  @param s   the marker's text
+ *  @param n   its length in bytes
+ *  @return its position, or NULL */
+static const char *agent_turn_mark_find(const char *p, const char *end, const char *s, size_t n) {
+    return n ? agent_memmem(p, (size_t)(end - p), s, n) : NULL;
+}
+
 /* Extract a human-readable title from the first user turn stored in the
  * rendered transcript.  max_bytes==0 means "full normalized title"; callers
  * that render to the terminal pass an explicit display budget. */
-char *agent_session_title_from_text(const char *text, size_t text_len,
-                                           size_t max_bytes) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    const char *p = text ? strstr(text, user_mark) : NULL;
+char *agent_session_title_from_text(const agent_turn_marks *marks, const char *text, size_t text_len,
+                                    size_t max_bytes) {
+    const char *end = text ? text + text_len : NULL;
+    const char *p = text ? agent_turn_mark_find(text, end, marks->user, marks->user_len) : NULL;
     if (!p) return xstrdup("(no user prompt)");
-    p += strlen(user_mark);
-    const char *end = text + text_len;
-    const char *assistant = strstr(p, assistant_mark);
-    const char *next_user = strstr(p, user_mark);
-    if (assistant && assistant < end) end = assistant;
-    if (next_user && next_user < end) end = next_user;
+    p += marks->user_len;
+    const char *bounds[] = {agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len),
+                            agent_turn_mark_find(p, end, marks->user, marks->user_len),
+                            agent_turn_mark_find(p, end, marks->end, marks->end_len)};
+    for (const char *m : bounds)
+        if (m && m < end) end = m;
     return agent_session_title_from_span(p, end, max_bytes,
                                          "(empty user prompt)");
 }
 
 
 
+/** @brief Clip a title to `max_bytes`, ending it with "..." when cut (bytes, not UTF-8 aware).
+ *  @param title     the title; NULL = "(no user prompt)"
+ *  @param max_bytes the cap (raised to 4); 0 = no cap
+ *  @return the clipped title, malloc'd; caller frees */
 static char *agent_session_title_clip(const char *title, size_t max_bytes) {
     if (!title) return xstrdup("(no user prompt)");
     size_t len = strlen(title);
@@ -98,30 +191,10 @@ static char *agent_session_title_clip(const char *title, size_t max_bytes) {
 
 
 
-static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return xstrdup("(unreadable session)");
-    pulsar_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    char *text = NULL;
-    char *trailer_title = NULL;
-    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
-    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
-    fclose(fp);
-    char *title = ok ?
-        (trailer_title ?
-            agent_session_title_clip(trailer_title, max_bytes) :
-            agent_session_title_from_text(text, text_bytes, max_bytes)) :
-        xstrdup("(unreadable session)");
-    free(trailer_title);
-    free(text);
-    return title;
-}
-
-
-
+/** @brief Append one marker position and its kind, growing by doubling (16 first).
+ *  @param p    the list
+ *  @param s    the marker's position in the history text
+ *  @param mark its kind */
 static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
                                     agent_history_mark mark) {
     if (p->len == p->cap) {
@@ -136,50 +209,41 @@ static void agent_history_ptrs_push(agent_history_ptrs *p, const char *s,
 
 
 
-static const char *agent_memmem(const char *hay, size_t hay_len,
-                                const char *needle, size_t needle_len) {
-    if (!needle_len) return hay;
-    if (needle_len > hay_len) return NULL;
-    const char first = needle[0];
-    const char *end = hay + hay_len - needle_len + 1;
-    for (const char *p = hay; p < end; p++) {
-        if (*p == first && memcmp(p, needle, needle_len) == 0) return p;
-    }
-    return NULL;
-}
-
-
-
-static const char *agent_history_next_marker(const char *p, const char *end,
+/** @brief The next turn marker in rendered history: the loaded family's user, assistant or end-of-turn marker
+ *  (agent_turn_marks), whichever comes first.
+ *  @param marks    the family's markers
+ *  @param p        scan start
+ *  @param end      scan end (exclusive)
+ *  @param mark     receives its kind; may be NULL
+ *  @param mark_len receives its length, bytes; may be NULL
+ *  @return the marker's position, or NULL when none remains */
+static const char *agent_history_next_marker(const agent_turn_marks *marks, const char *p, const char *end,
                                              agent_history_mark *mark,
                                              size_t *mark_len) {
-    static const char user_mark[] = "<｜User｜>";
-    static const char assistant_mark[] = "<｜Assistant｜>";
-    static const char eos_mark[] = "<｜end▁of▁sentence｜>";
-    const char *u = agent_memmem(p, (size_t)(end - p),
-                                 user_mark, sizeof(user_mark) - 1);
-    const char *a = agent_memmem(p, (size_t)(end - p),
-                                 assistant_mark, sizeof(assistant_mark) - 1);
-    const char *e = agent_memmem(p, (size_t)(end - p),
-                                 eos_mark, sizeof(eos_mark) - 1);
+    const char *u = agent_turn_mark_find(p, end, marks->user, marks->user_len);
+    const char *a = agent_turn_mark_find(p, end, marks->assistant, marks->assistant_len);
+    const char *e = agent_turn_mark_find(p, end, marks->end, marks->end_len);
     if (!u && !a && !e) return NULL;
     if (u && (!a || u < a) && (!e || u < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_USER;
-        if (mark_len) *mark_len = sizeof(user_mark) - 1;
+        if (mark_len) *mark_len = marks->user_len;
         return u;
     }
     if (a && (!e || a < e)) {
         if (mark) *mark = AGENT_HISTORY_MARK_ASSISTANT;
-        if (mark_len) *mark_len = sizeof(assistant_mark) - 1;
+        if (mark_len) *mark_len = marks->assistant_len;
         return a;
     }
     if (mark) *mark = AGENT_HISTORY_MARK_EOS;
-    if (mark_len) *mark_len = sizeof(eos_mark) - 1;
+    if (mark_len) *mark_len = marks->end_len;
     return e;
 }
 
 
 
+/** @brief Trim isspace() bytes from both ends of [*p, *end).
+ *  @param p   the start, advanced
+ *  @param end the end, pulled back */
 static void agent_history_trim(const char **p, const char **end) {
     while (*p < *end && isspace((unsigned char)**p)) (*p)++;
     while (*end > *p && isspace((unsigned char)(*end)[-1])) (*end)--;
@@ -187,6 +251,11 @@ static void agent_history_trim(const char **p, const char **end) {
 
 
 
+/** @brief Whether [p, end) begins with `prefix`.
+ *  @param p      the start
+ *  @param end    the end (exclusive)
+ *  @param prefix NUL-terminated prefix
+ *  @return true on a match */
 static bool agent_history_has_prefix(const char *p, const char *end,
                                      const char *prefix) {
     size_t n = strlen(prefix);
@@ -198,6 +267,10 @@ static bool agent_history_has_prefix(const char *p, const char *end,
 /* Tool messages are rendered as user turns in the transcript.  Return the
  * inner payload for the current <tool_result> wrapper so /history skips these
  * pseudo-user turns and displays their content without leaking the wrapper. */
+/// @brief Narrow [*p, *end) to a `<tool_result>` wrapper's payload (see above).
+/// @param p   the turn's start; set to the payload's on success
+/// @param end the turn's end; set to the payload's on success
+/// @return true when the turn is a tool result
 static bool agent_history_tool_result_payload(const char **p, const char **end) {
     const char *s = *p, *e = *end;
     agent_history_trim(&s, &e);
@@ -221,6 +294,11 @@ static bool agent_history_tool_result_payload(const char **p, const char **end) 
 
 
 
+/** @brief Whether a user turn is really a tool result (a `<tool_result>` wrapper, or text starting "Tool:" /
+ *  "Tool result").
+ *  @param p   the turn's start
+ *  @param end the turn's end (exclusive)
+ *  @return true for a tool-result pseudo-user turn */
 static bool agent_history_is_tool_user(const char *p, const char *end) {
     agent_history_trim(&p, &end);
     return agent_history_tool_result_payload(&p, &end) ||
@@ -230,6 +308,8 @@ static bool agent_history_is_tool_user(const char *p, const char *end) {
 
 
 
+/** @brief Free the list's arrays and zero it.
+ *  @param p the list */
 static void agent_history_ptrs_free(agent_history_ptrs *p) {
     free(p->v);
     free(p->mark);
@@ -244,7 +324,14 @@ static void agent_history_ptrs_free(agent_history_ptrs *p) {
  * legitimately have a tail made only of tool result turns; in that case we
  * fall back to recent tool/assistant events instead of showing an empty
  * history. */
-static const char *agent_history_start_for_turns(const char *text, size_t len,
+/// @brief Where /history starts to show the last `user_turns` human turns (see above).
+/// @param tm         the loaded family's turn markers
+/// @param text       the rendered history
+/// @param len        bytes at `text`
+/// @param user_turns human turns to show
+/// @param tool_only  receives true when only tool/assistant events could be shown
+/// @return a position in `text`; text + len when there is nothing to show
+static const char *agent_history_start_for_turns(const agent_turn_marks *tm, const char *text, size_t len,
                                                  int user_turns,
                                                  bool *tool_only) {
     const char *end = text + len;
@@ -255,13 +342,13 @@ static const char *agent_history_start_for_turns(const char *text, size_t len,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         agent_history_ptrs_push(&marks, m, mark);
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         if (mark == AGENT_HISTORY_MARK_USER) {
@@ -305,6 +392,13 @@ static const char *agent_history_start_for_turns(const char *text, size_t len,
 
 
 
+/** @brief Find the last complete compaction summary in the history (between the compaction's start and end
+ *  marker lines).
+ *  @param text      the rendered history
+ *  @param len       bytes at `text`
+ *  @param sum_start receives the summary's start
+ *  @param sum_end   receives its end (exclusive)
+ *  @return true when one was found */
 static bool agent_history_latest_compaction_summary(const char *text,
                                                     size_t len,
                                                     const char **sum_start,
@@ -345,6 +439,11 @@ static void agent_history_publish_limited(agent_worker *w, const char *p,
 
 
 
+/** @brief Show the latest compaction summary, if any, under a "Compacted Summary:" heading (at most 80 lines /
+ *  12000 bytes of its tail).
+ *  @param w    the worker whose UI receives it
+ *  @param text the rendered history
+ *  @param len  bytes at `text` */
 static void agent_history_render_compaction_summary(agent_worker *w,
                                                     const char *text,
                                                     size_t len) {
@@ -363,6 +462,10 @@ static void agent_history_render_compaction_summary(agent_worker *w,
 
 
 
+/** @brief Skip UTF-8 continuation bytes, so a cut lands on a character boundary.
+ *  @param p   the position
+ *  @param end the end (exclusive)
+ *  @return the first non-continuation byte at or after `p` (or `end`) */
 static const char *agent_history_skip_utf8_continuation(const char *p,
                                                         const char *end) {
     while (p < end && (((unsigned char)*p) & 0xc0) == 0x80) p++;
@@ -371,6 +474,13 @@ static const char *agent_history_skip_utf8_continuation(const char *p,
 
 
 
+/** @brief Where the tail of [p, end) that fits `max_lines` lines and `max_bytes` bytes starts.
+ *  @param p         the text's start
+ *  @param end       its end (exclusive)
+ *  @param max_lines line cap; <= 0 = none
+ *  @param max_bytes byte cap; 0 = none
+ *  @param truncated receives true when the tail starts after `p`
+ *  @return the tail's start, on a UTF-8 character boundary */
 static const char *agent_history_tail_start(const char *p, const char *end,
                                             int max_lines, size_t max_bytes,
                                             bool *truncated) {
@@ -405,6 +515,12 @@ static const char *agent_history_tail_start(const char *p, const char *end,
 
 
 
+/** @brief Show the tail of [p, end) within the caps, with a note when earlier text was cut.
+ *  @param w         the worker whose UI receives it
+ *  @param p         the text's start
+ *  @param end       its end (exclusive)
+ *  @param max_lines line cap; <= 0 = none
+ *  @param max_bytes byte cap; 0 = none */
 static void agent_history_publish_limited(agent_worker *w, const char *p,
                                           const char *end, int max_lines,
                                           size_t max_bytes) {
@@ -414,12 +530,17 @@ static void agent_history_publish_limited(agent_worker *w, const char *p,
     if (truncated)
         agent_publish(w, "\n... earlier history truncated; showing tail ...\n",
                       strlen("\n... earlier history truncated; showing tail ...\n"));
-    agent_publish(w, start, (size_t)(end - start));
+    agent_publish_untrusted(w, start, (size_t)(end - start));
     if (end > start && end[-1] != '\n') agent_publish(w, "\n", 1);
 }
 
 
 
+/** @brief Replay one saved assistant turn through the live token renderer (markdown and dry-rendered tool calls;
+ *  never executes anything), capped at AGENT_HISTORY_ASSISTANT_MAX_LINES / _MAX_BYTES.
+ *  @param w   the worker whose UI receives it
+ *  @param p   the turn's start
+ *  @param end its end (exclusive) */
 static void agent_history_render_assistant(agent_worker *w,
                                            const char *p, const char *end) {
     agent_history_trim(&p, &end);
@@ -436,7 +557,6 @@ static void agent_history_render_assistant(agent_worker *w,
     agent_token_renderer renderer = {
         .engine = w->engine,
         .worker = w,
-        .format_thinking = true,
         /* History replay should look like the original live output: the user is
          * switching back to a session, not reading a different transcript
          * format.  Tool calls are still dry-rendered below, so replay never
@@ -452,6 +572,16 @@ static void agent_history_render_assistant(agent_worker *w,
         .parser = &dsml,
         .replay = true,
     };
+    /* L365: a non-DSML family's turn replays through its own output parser */
+    char perr[200];
+    /* a replayed turn opens where a fresh one does (Gemma's continuations after tool responses are part of it) */
+    const bool thinking = pulsar_think_mode_enabled(w->cfg->gen.think_mode) &&
+                          !pulsar_chat_calls_continue_turn(w->engine);
+    out_parser *family = agent_worker_dsml(w) ? NULL : agent_family_parser_new(w->engine, thinking, perr, sizeof perr);
+    if (family) {
+        stream.family = family;
+        renderer.think.in_think = thinking;
+    }
 
     /* Dry-run replay: the same streaming projection hides DSML and renders
      * semantic tool lines, but no tool is executed and no transcript state is
@@ -459,6 +589,7 @@ static void agent_history_render_assistant(agent_worker *w,
     agent_stream_text(&stream, p, (size_t)(end - p), true);
     renderer_finish(&renderer);
     agent_dsml_parser_free(&dsml);
+    agent_family_parser_free(family);
 
     if (source_truncated) {
         size_t tail_len = 0;
@@ -475,7 +606,7 @@ static void agent_history_render_assistant(agent_worker *w,
                       "\n... earlier assistant history truncated; showing tail ...\n",
                       strlen("\n... earlier assistant history truncated; showing tail ...\n"));
         (void)rendered_truncated;
-        agent_publish(w, tail_start, (size_t)(tail_text + tail_len - tail_start));
+        agent_publish_untrusted(w, tail_start, (size_t)(tail_text + tail_len - tail_start));
         if (tail_len && tail_text[tail_len - 1] != '\n') agent_publish(w, "\n", 1);
         if (use_color) agent_publish(w, "\x1b[0m", 4);
         free(tail_text);
@@ -487,6 +618,11 @@ static void agent_history_render_assistant(agent_worker *w,
 /* Re-render saved transcript text for /history and /switch.  It intentionally
  * uses the same assistant/token renderer as live output, so restored history
  * looks like the original terminal stream instead of raw rendered-chat text. */
+/// @brief Replay the last `user_turns` turns of saved history (see above).
+/// @param w          the worker whose UI receives it (its engine's turn markers are scanned for)
+/// @param text       the rendered history
+/// @param len        bytes at `text`
+/// @param user_turns human turns to show (capped at AGENT_HISTORY_MAX_TURNS); <= 0 shows nothing
 static void agent_history_render_text(agent_worker *w, const char *text,
                                       size_t len, int user_turns) {
     if (user_turns <= 0) return;
@@ -496,8 +632,11 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     const char *end = text + len;
     agent_history_render_compaction_summary(w, text, len);
 
+    agent_turn_marks tm_s;
+    agent_turn_marks_init(w->engine, &tm_s);
+    const agent_turn_marks *tm = &tm_s;
     bool tool_only = false;
-    const char *p = agent_history_start_for_turns(text, len, user_turns,
+    const char *p = agent_history_start_for_turns(tm, text, len, user_turns,
                                                   &tool_only);
     if (p >= end) {
         agent_publish(w, "\n(no user history)\n", strlen("\n(no user history)\n"));
@@ -518,12 +657,12 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     while (p < end) {
         agent_history_mark mark = AGENT_HISTORY_MARK_NONE;
         size_t mark_len = 0;
-        const char *m = agent_history_next_marker(p, end, &mark, &mark_len);
+        const char *m = agent_history_next_marker(tm, p, end, &mark, &mark_len);
         if (!m) break;
         const char *content = m + mark_len;
         agent_history_mark next_mark = AGENT_HISTORY_MARK_NONE;
         size_t next_len = 0;
-        const char *next = agent_history_next_marker(content, end,
+        const char *next = agent_history_next_marker(tm, content, end,
                                                      &next_mark, &next_len);
         const char *content_end = next ? next : end;
         const char *tp = content, *te = content_end;
@@ -583,7 +722,7 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
         return false;
     }
     size_t text_len = 0;
-    char *text = pulsar_kvstore_render_tokens_text(w->engine, &w->transcript,
+    char *text = pulsar_kvtext_render_tokens_text(w->engine, &w->transcript,
                                                 &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
@@ -596,84 +735,104 @@ bool agent_worker_show_history(agent_worker *w, int user_turns,
 
 
 
+/** @brief qsort order for sessions: most recently used (else created) first, then by sha.
+ *  @param a an agent_session_list_item
+ *  @param b an agent_session_list_item
+ *  @return < 0 when `a` sorts first */
 static int agent_session_list_cmp_recent(const void *a, const void *b) {
     const agent_session_list_item *sa = (const agent_session_list_item *)a;
     const agent_session_list_item *sb = (const agent_session_list_item *)b;
-    uint64_t ta = sa->entry.last_used ? sa->entry.last_used : sa->entry.created_at;
-    uint64_t tb = sb->entry.last_used ? sb->entry.last_used : sb->entry.created_at;
+    uint64_t ta = sa->f.last_used ? sa->f.last_used : sa->f.created_at;
+    uint64_t tb = sb->f.last_used ? sb->f.last_used : sb->f.created_at;
     if (ta < tb) return 1;
     if (ta > tb) return -1;
-    return strcmp(sa->entry.sha, sb->entry.sha);
+    return strcmp(sa->sha, sb->sha);
 }
 
 
 
-static void agent_session_list_free(agent_session_list_item *v, int n) {
-    for (int i = 0; i < n; i++) {
-        pulsar_kvstore_entry_free(&v[i].entry);
-        free(v[i].title);
+/* <40 hex>.session -> the sha. */
+/// @brief The sha of a session file name (see above).
+/// @param name a directory entry name
+/// @param sha  receives the 40 hex chars + NUL
+/// @return true when `name` is "<40 hex>.session"
+static bool agent_session_name_sha(const char *name, char sha[41]) {
+    if (strlen(name) != 48 || strcmp(name + 40, ".session") != 0) return false;
+    for (int i = 0; i < 40; i++)
+        if (!isxdigit((unsigned char)name[i])) return false;
+    memcpy(sha, name, 40);
+    sha[40] = '\0';
+    return true;
+}
+
+
+
+/* Every saved session of this model whose sha starts with `prefix` ("" for
+ * all), read and verified; the caller frees with agent_session_list_free. */
+/// @brief List saved sessions (see above).
+/// @param w      the worker (cache_dir, the model id)
+/// @param prefix sha prefix to match, case-insensitive; "" = all
+/// @param out    receives the array (NULL when none)
+/// @return the number of sessions in `*out`
+static int agent_session_scan(agent_worker *w, const char *prefix, agent_session_list_item **out) {
+    *out = NULL;
+    DIR *d = opendir(w->cache_dir);
+    if (!d) return 0;
+    const size_t plen = strlen(prefix);
+    const uint32_t model_id = (uint32_t)pulsar_engine_model_id(w->engine);
+    int len = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char sha[41];
+        if (!agent_session_name_sha(de->d_name, sha)) continue;
+        if (plen && strncasecmp(sha, prefix, plen) != 0) continue;
+        char *path = pulsar_kvtext_path_join(w->cache_dir, de->d_name);
+        agent_session_file f;
+        char err[96];
+        const bool ok = agent_session_file_read(path, &f, err, sizeof(err));
+        free(path);
+        if (!ok) continue;
+        if (f.model_id != model_id) {
+            agent_session_file_free(&f);
+            continue;
+        }
+        if (len == cap) {
+            cap = cap ? cap * 2 : 16;
+            *out = (agent_session_list_item *)agent_xrealloc(*out, (size_t)cap * sizeof((*out)[0]));
+        }
+        memcpy((*out)[len].sha, sha, 41);
+        (*out)[len].f = f;
+        len++;
     }
+    closedir(d);
+    return len;
+}
+
+
+
+/** @brief Free a session list from agent_session_scan.
+ *  @param v the array
+ *  @param n its length */
+static void agent_session_list_free(agent_session_list_item *v, int n) {
+    for (int i = 0; i < n; i++) agent_session_file_free(&v[i].f);
     free(v);
 }
 
 
 
-static void agent_session_list_push(agent_session_list_item **v, int *len,
-                                    int *cap, pulsar_kvstore_entry entry,
-                                    char *title) {
-    if (*len == *cap) {
-        *cap = *cap ? *cap * 2 : 16;
-        *v = (agent_session_list_item *)agent_xrealloc(*v, (size_t)*cap * sizeof((*v)[0]));
-    }
-    (*v)[(*len)++] = (agent_session_list_item){
-        .entry = entry,
-        .title = title,
-    };
-}
-
-
-
-/* Print resumable sessions from ~/.ds4/kvcache.  sysprompt.kv is intentionally
- * ignored because it is an implementation cache, not a user session. */
+/* Print resumable sessions from <cache>/<sha>.session. */
 void agent_worker_list_sessions(agent_worker *w) {
-    DIR *d = opendir(w->cache_dir);
-    if (!d) {
-        printf("no sessions: %s\n", strerror(errno));
-        return;
-    }
-
     int cols = renderer_terminal_cols();
     size_t title_budget = cols > 16 ? (size_t)(cols - 12) : 20;
     if (title_budget > 160) title_budget = 160;
 
     agent_session_list_item *sessions = NULL;
-    int sessions_len = 0, sessions_cap = 0;
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) {
-                char *title = agent_session_title_from_file(path, title_budget);
-                agent_session_list_push(&sessions, &sessions_len, &sessions_cap,
-                                        e, title);
-            } else {
-                pulsar_kvstore_entry_free(&e);
-            }
-        }
-        free(path);
-    }
-    closedir(d);
+    const int sessions_len = agent_session_scan(w, "", &sessions);
     if (!sessions_len) {
         printf("no saved sessions\n");
         return;
     }
-
-    qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]),
-          agent_session_list_cmp_recent);
+    qsort(sessions, (size_t)sessions_len, sizeof(sessions[0]), agent_session_list_cmp_recent);
 
     bool color = isatty(STDOUT_FILENO) != 0;
     const char *sha_on = color ? "\x1b[1;96m" : "";
@@ -683,47 +842,20 @@ void agent_worker_list_sessions(agent_worker *w) {
     const char *reset = color ? "\x1b[0m" : "";
 
     for (int i = 0; i < sessions_len; i++) {
-        pulsar_kvstore_entry *e = &sessions[i].entry;
+        const agent_session_file *f = &sessions[i].f;
         char age[32];
-        agent_format_age(e->last_used ? e->last_used : e->created_at,
-                         age, sizeof(age));
+        agent_format_age(f->last_used ? f->last_used : f->created_at, age, sizeof(age));
+        char *title = agent_session_title_clip(f->title, title_budget);
         printf("%s%.8s%s %s>%s %s%s%s\n",
-               sha_on, e->sha, reset, dim, reset,
-               title_on, sessions[i].title, reset);
-        printf("         %s> %s, %u tokens, %.2f MB%s%s\n\n",
-               dim, age, e->tokens,
-               (double)e->file_size / (1024.0 * 1024.0),
-               e->payload_bytes == 0 ? ", stripped" : "",
-               reset);
+               sha_on, sessions[i].sha, reset, dim, reset,
+               title_on, title, reset);
+        printf("         %s> %s, %d tokens%s\n\n", dim, age, f->tokens.len, reset);
+        free(title);
     }
     printf("%sUse /switch <id> to select a session, /del <id> to remove, "
-           "/strip <id> to strip KV cache.%s\n",
+           "/strip <id> to release its cached KV.%s\n",
            help_on, reset);
     agent_session_list_free(sessions, sessions_len);
-}
-
-
-
-static void agent_completion_sessions_push(agent_completion_sessions *s,
-                                           const char sha[41],
-                                           uint64_t last_used) {
-    if (s->len == s->cap) {
-        s->cap = s->cap ? s->cap * 2 : 16;
-        s->v = (agent_completion_session *)agent_xrealloc(s->v, (size_t)s->cap * sizeof(s->v[0]));
-    }
-    memcpy(s->v[s->len].sha, sha, 41);
-    s->v[s->len].last_used = last_used;
-    s->len++;
-}
-
-
-
-static int agent_completion_session_cmp(const void *a, const void *b) {
-    const agent_completion_session *sa = (const agent_completion_session *)a;
-    const agent_completion_session *sb = (const agent_completion_session *)b;
-    if (sa->last_used < sb->last_used) return 1;
-    if (sa->last_used > sb->last_used) return -1;
-    return strcmp(sa->sha, sb->sha);
 }
 
 
@@ -748,50 +880,31 @@ void agent_switch_completion_callback(const char *buf,
     }
     if (prefix_len > 40) return;
 
-    DIR *d = opendir(w->cache_dir);
-    if (!d) return;
-
-    agent_completion_sessions sessions = {0};
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        if (prefix_len && strncasecmp(sha, prefix, prefix_len) != 0) continue;
-
-        uint64_t last_used = 0;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        if (pulsar_kvstore_read_entry_file(path, sha, &e)) {
-            if (e.model_id == model_id) last_used = e.last_used;
-            else last_used = UINT64_MAX;
-            pulsar_kvstore_entry_free(&e);
-        } else {
-            last_used = UINT64_MAX;
-        }
-        free(path);
-        if (last_used == UINT64_MAX) continue;
-        agent_completion_sessions_push(&sessions, sha, last_used);
-    }
-    closedir(d);
-
-    qsort(sessions.v, (size_t)sessions.len, sizeof(sessions.v[0]),
-          agent_completion_session_cmp);
-    for (int i = 0; i < sessions.len; i++) {
+    agent_session_list_item *sessions = NULL;
+    const int n = agent_session_scan(w, prefix, &sessions);
+    qsort(sessions, (size_t)n, sizeof(sessions[0]), agent_session_list_cmp_recent);
+    for (int i = 0; i < n; i++) {
         char line[64];
         int sha_chars = prefix_len > 8 ? 40 : 8;
-        snprintf(line, sizeof(line), "/switch %.*s",
-                 sha_chars, sessions.v[i].sha);
+        snprintf(line, sizeof(line), "/switch %.*s", sha_chars, sessions[i].sha);
         linenoiseAddCompletion(lc, line);
     }
-    free(sessions.v);
+    agent_session_list_free(sessions, n);
 }
 
 
 
-/* Resolve a user-provided SHA prefix to exactly one saved session file. */
+/* Resolve a user-provided SHA prefix to exactly one saved session. */
+/// @brief Resolve a sha prefix to one saved session (see above).
+/// @param w       the worker
+/// @param prefix  1..40 hex chars
+/// @param sha_out receives the session's sha
+/// @param f_out   receives the session file (caller frees with agent_session_file_free)
+/// @param err     receives why it failed (invalid, no match, ambiguous)
+/// @param err_len bytes at `err`
+/// @return true on exactly one match
 static bool agent_worker_find_session(agent_worker *w, const char *prefix,
-                                      char sha_out[41], char **path_out,
+                                      char sha_out[41], agent_session_file *f_out,
                                       char *err, size_t err_len) {
     size_t plen = strlen(prefix);
     if (plen == 0 || plen > 40) {
@@ -804,51 +917,41 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
             return false;
         }
     }
-
-    DIR *d = opendir(w->cache_dir);
-    if (!d) {
-        snprintf(err, err_len, "%s", strerror(errno));
+    agent_session_list_item *sessions = NULL;
+    const int n = agent_session_scan(w, prefix, &sessions);
+    if (n != 1) {
+        if (n == 0) snprintf(err, err_len, "no saved session matches %.40s", prefix);
+        else snprintf(err, err_len, "session prefix %.40s is ambiguous", prefix);
+        agent_session_list_free(sessions, n);
         return false;
     }
-    int matches = 0;
-    char match_sha[41] = {0};
-    char *match_path = NULL;
-    const uint8_t model_id = (uint8_t)pulsar_engine_model_id(w->engine);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        char sha[41];
-        if (!pulsar_kvstore_sha_hex_name(de->d_name, sha)) continue;
-        if (strncasecmp(sha, prefix, plen) != 0) continue;
-        char *path = pulsar_kvstore_path_join(w->cache_dir, de->d_name);
-        pulsar_kvstore_entry e = {0};
-        bool same_model = pulsar_kvstore_read_entry_file(path, sha, &e) &&
-                          e.model_id == model_id;
-        pulsar_kvstore_entry_free(&e);
-        if (!same_model) {
-            free(path);
-            continue;
-        }
-        matches++;
-        if (matches == 1) {
-            memcpy(match_sha, sha, sizeof(match_sha));
-            match_path = path;
-        } else {
-            free(path);
-        }
-    }
-    closedir(d);
-    if (matches == 0) {
-        snprintf(err, err_len, "no saved session matches %.40s", prefix);
-        return false;
-    }
-    if (matches > 1) {
-        snprintf(err, err_len, "session prefix %.40s is ambiguous", prefix);
-        free(match_path);
-        return false;
-    }
-    memcpy(sha_out, match_sha, 41);
-    *path_out = match_path;
+    memcpy(sha_out, sessions[0].sha, 41);
+    *f_out = sessions[0].f;
+    memset(&sessions[0].f, 0, sizeof(sessions[0].f));
+    agent_session_list_free(sessions, n);
     return true;
+}
+
+
+
+/* Release the KV only this session's chain holds: the segments past the last
+ * one any other chain shares, never the system prompt's.  The session keeps its
+ * exact ids, so switching to it later prefills what was released. */
+/// @brief Release the KV segments only this session holds (see above).
+/// @param w the worker (its segment store)
+/// @param f the session
+/// @return bytes released (pulsar_segstore_release); 0 with no store or nothing to release
+static uint64_t agent_session_release_kv(agent_worker *w, const agent_session_file *f) {
+    if (!w->kv || f->tokens.len <= 0) return 0;
+    size_t text_len = 0;
+    char *text = pulsar_kvtext_render_tokens_text(w->engine, &f->tokens, &text_len);
+    pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
+    const int n = text ? pulsar_segstore_lookup(w->kv, text, text_len, NULL, chain, PULSAR_KVCHAIN_MAX) : 0;
+    free(text);
+    if (n == 0) return 0;
+    char sys_tip[41];
+    agent_kv_system_tip(w, sys_tip);
+    return pulsar_segstore_release(w->kv, chain[n - 1].key, sys_tip[0] ? sys_tip : NULL);
 }
 
 
@@ -856,142 +959,51 @@ static bool agent_worker_find_session(agent_worker *w, const char *prefix,
 bool agent_worker_delete_session(agent_worker *w, const char *prefix,
                                         char sha_out[41],
                                         char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
     char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
-        return false;
-    if (unlink(path) != 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(path);
-        return false;
-    }
-    if (sha_out) memcpy(sha_out, sha, 41);
-    free(path);
-    return true;
-}
-
-
-
-/* Strip the heavy backend payload from a saved session while preserving its
- * rendered transcript. Loading such a file later tokenizes the text and
- * rebuilds the live KV with a full prefill. */
-bool agent_worker_strip_session(agent_worker *w, const char *prefix,
-                                       char sha_out[41],
-                                       uint32_t *tokens_out,
-                                       char *err, size_t err_len) {
-    if (err && err_len) err[0] = '\0';
-    char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
-        return false;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(path);
-        return false;
-    }
-
-    pulsar_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    char *text = NULL;
-    char *title = NULL;
-    bool ok = pulsar_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, err, err_len);
-    if (ok && (hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
-    fclose(fp);
-    if (!ok) {
-        if (!err[0]) snprintf(err, err_len, "failed to read session");
-        free(title);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    char actual_sha[41];
-    agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
-    if (strcmp(actual_sha, sha)) {
-        snprintf(err, err_len, "cached session identity does not match file name");
-        free(title);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    pulsar_tokens stripped_tokens = {0};
-    pulsar_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
-    uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
-    pulsar_tokens_free(&stripped_tokens);
-
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    fp = fdopen(fd, "wb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        close(fd);
-        unlink(tmp);
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    uint8_t h[PULSAR_KVSTORE_FIXED_HEADER];
-    uint64_t now = (uint64_t)time(NULL);
-    pulsar_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
-    uint8_t tb[4];
-    pulsar_kvstore_le_put32(tb, text_bytes);
-
-    errno = 0;
-    ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-         fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-         fwrite(text, 1, text_bytes, fp) == text_bytes &&
-         (!(hdr.ext_flags & PULSAR_KVSTORE_EXT_SESSION_TITLE) ||
-          agent_kv_write_title_trailer(fp, title, err, err_len)) &&
-         fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
-    }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) : "failed to write stripped session");
-        unlink(tmp);
-    } else {
-        if (sha_out) memcpy(sha_out, sha, 41);
-        if (tokens_out) *tokens_out = stripped_token_count;
-    }
-
-    free(tmp);
-    free(title);
-    free(text);
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    char *path = agent_session_path_for_sha(w->cache_dir, sha);
+    const bool ok = unlink(path) == 0;
+    if (!ok) snprintf(err, err_len, "%s", strerror(errno));
+    else (void)agent_session_release_kv(w, &f);
+    if (ok && sha_out) memcpy(sha_out, sha, 41);
+    agent_session_file_free(&f);
     free(path);
     return ok;
 }
 
 
 
-/* Load a saved session KV into the live transcript and optionally replay recent
- * history for the human. */
+/* Release a saved session's cached KV while keeping the session (L264: its KV
+ * lives in the shared segment store; only the stretch no other chain uses
+ * goes).  *bytes_out: what was freed. */
+bool agent_worker_strip_session(agent_worker *w, const char *prefix,
+                                       char sha_out[41],
+                                       uint64_t *bytes_out,
+                                       char *err, size_t err_len) {
+    if (!worker_is_idle(w)) {
+        snprintf(err, err_len, "model is busy");
+        return false;
+    }
+    char sha[41];
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    const uint64_t freed = agent_session_release_kv(w, &f);
+    if (sha_out) memcpy(sha_out, sha, 41);
+    if (bytes_out) *bytes_out = freed;
+    agent_session_file_free(&f);
+    return true;
+}
+
+
+
+/* Load a saved session into the live transcript -- the deepest chain the store
+ * holds for it, then the rest by prefill from its exact ids -- and optionally
+ * replay recent history for the human. */
 bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,
                                         char *err, size_t err_len) {
@@ -1000,34 +1012,29 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         return false;
     }
     char sha[41];
-    char *path = NULL;
-    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+    agent_session_file f;
+    if (!agent_worker_find_session(w, prefix, sha, &f, err, err_len)) return false;
+    if (f.tokens.len <= 0) {
+        snprintf(err, err_len, "saved session %.8s holds no tokens", sha);
+        agent_session_file_free(&f);
         return false;
-
-    bool stripped = false;
-    pulsar_kvstore_entry entry = {0};
-    if (pulsar_kvstore_read_entry_file(path, sha, &entry)) {
-        stripped = entry.payload_bytes == 0;
-        pulsar_kvstore_entry_free(&entry);
     }
-    if (stripped) {
-        printf("rebuilding stripped session %.8s from rendered text...\n", sha);
+    const int cached = agent_kv_load(w, &f.tokens);
+    if (cached < f.tokens.len) {
+        printf("restoring session %.8s: %d of %d tokens cached, prefilling the rest...\n",
+               sha, cached, f.tokens.len);
         fflush(stdout);
     }
-
-    pulsar_tokens loaded = {0};
-    agent_kv_session_meta meta = {0};
-    bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
-                                 err, err_len);
+    const bool ok = agent_worker_sync_tokens(w, &f.tokens, true, err, err_len) == 0;
     if (ok) {
         pulsar_tokens_free(&w->transcript);
-        w->transcript = loaded;
+        w->transcript = f.tokens;
+        agent_turn_clear(w);
+        memset(&f.tokens, 0, sizeof(f.tokens));
         free(w->session_title);
-        w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
-        w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
+        w->session_title = f.title && f.title[0] ? xstrdup(f.title) : xstrdup("(no user prompt)");
+        w->session_created_at = f.created_at ? f.created_at : (uint64_t)time(NULL);
         memcpy(w->session_sha, sha, sizeof(w->session_sha));
-        free(w->legacy_session_path_to_delete);
-        w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
         w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
@@ -1041,15 +1048,10 @@ bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->status.error[0] = '\0';
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
-        printf("switched to session %.8s (%d tokens%s)\n",
-               sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+        printf("switched to session %.8s (%d tokens)\n", sha, w->transcript.len);
         if (history_turns > 0)
             (void)agent_worker_show_history(w, history_turns, err, err_len);
-    } else {
-        pulsar_tokens_free(&loaded);
     }
-    agent_kv_session_meta_free(&meta);
-    free(path);
+    agent_session_file_free(&f);
     return ok;
 }
-

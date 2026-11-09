@@ -1,0 +1,206 @@
+/** @file
+ *  Producer-side MX (E4M3 data + E8M0 block scale) emission and the MX slab geometry helpers. */
+#ifndef PULSAR_CUDA_MX_CUH
+#define PULSAR_CUDA_MX_CUH
+
+#include <cuda_fp8.h>
+#include <stdint.h>
+
+/* Producer-side MX (E4M3 data + shared E8M0 block scale) emission.
+ *
+ * A8 -- every activation reaching a GEMM as E4M3 -- is a PRODUCER-side
+ * property.  The kernel that computes an activation already holds it in a
+ * register, and with a 256-thread block whose epilogue walks columns as
+ * `i = threadIdx.x; i += blockDim.x`, warp w covers columns 32w..32w+31 of each
+ * pass: exactly one aligned 32-element MX block.  So the block amax is a warp
+ * shuffle the producer can do for free, and the standalone quantize pass that
+ * would otherwise read the f32 back is not moved but DELETED.
+ *
+ * ⚠ A divergence in the swizzle or in the exponent arithmetic is a SILENT
+ * WRONG-OPERAND bug, not a rounding difference -- the GEMM reads a well-formed
+ * value from the wrong slot.  This warning used to say "MUST MATCH
+ * pulsar_cuda_matmul.cu's mx_sfoff / mxfp8_quant_act_kernel EXACTLY", which
+ * described the state BEFORE the extraction below: every TU that touches the
+ * layout now includes THIS header, and as of 2026-08-23 the quantise kernels
+ * in matmul.cu and mxfp4_cutlass.cu call pulsar_mx_shared_exp/_scale_byte
+ * instead of carrying their own copies of the formula.  There is nothing left
+ * to keep in step -- keep it that way: new producers CALL these, never
+ * re-derive them.  It was extracted from
+ * pulsar_cuda_hc_router.cu (b7ba56b), verified inert by SASS compare.
+ *
+ * CALLER CONTRACT, and it is easy to get wrong:
+ *   - ALL 32 LANES of the warp must call this, including lanes whose column is
+ *     out of range -- the shuffle reduction is warp-wide.  Pass v = 0.0f for a
+ *     dead lane and skip only the data store, exactly as the hc epilogue does.
+ *   - The warp's 32 columns must be one ALIGNED block (col % 32 == 0 for lane
+ *     0), or the amax belongs to a block this warp does not own.
+ *   - The scale slab must be zeroed first: mx_sfoff leaves holes when rows or
+ *     blocks are not multiples of 128/4, and a producer that fills only the
+ *     live (row, kb) pairs leaves stale swizzle slots for the GEMM to read.
+ *     pulsar_gpu_mxfp8_act_cache_e4m3_slot() does that memset. */
+
+/* Round UP to a multiple of n.  Lives here rather than in one .cu because the
+ * MX scale slab's geometry (blocks-per-row padded to 4, rows padded to 128) is
+ * shared by the producers, the GEMV arms and the packers -- and a second copy
+ * of a layout constant is how the swizzle/linear mix-up nearly shipped. */
+/// @param x the value (>= 0)
+/// @param n the multiple (> 0)
+/// @return x rounded up to a multiple of n
+__host__ __device__ __forceinline__ static int pulsar_mx_rup(int x, int n) {
+    return (x + n - 1) / n * n;
+}
+
+/* The slab geometry as two functions, so no call site spells it (L159 inc 5):
+ * blocks-per-row padded to 4, rows padded to 128, one E8M0 byte per (row, kb). */
+/// @param in_dim row width in elements (a multiple of 32)
+/// @return MX blocks per row, padded to a multiple of 4 (the scale slab's KBp)
+__host__ __device__ __forceinline__ static int pulsar_mx_kbp(int in_dim) {
+    return pulsar_mx_rup(in_dim / 32, 4);
+}
+/// @param rows activation / weight rows
+/// @param KBp  blocks per row, padded (pulsar_mx_kbp)
+/// @return bytes of the E8M0 scale slab: rows padded to 128, one byte per (row, block)
+__host__ __device__ __forceinline__ static size_t pulsar_mx_sf_slab_bytes(int rows, int KBp) {
+    return (size_t)pulsar_mx_rup(rows, 128) * (size_t)KBp;
+}
+
+/// Byte offset of (row, kb)'s E8M0 scale in the 128x4-tiled (cuBLASLt / CUTLASS) swizzled slab.
+/// @param row the row
+/// @param kb  the 32-element block within the row
+/// @param KBp blocks per row, padded to 4
+/// @return the scale's byte offset in the slab
+__host__ __device__ __forceinline__ static int pulsar_mx_sfoff(int row, int kb, int KBp) {
+    return ((row / 128) * (KBp / 4) + (kb / 4)) * 512
+           + (row % 32) * 16 + ((row % 128) / 32) * 4 + (kb % 4);
+}
+
+/* One warp owns one 32-element MX block: shuffle-max |v| to the block amax, then
+ * the shared power-of-two exponent, then each lane stores its E4M3 value and
+ * lane 0 the E8M0 byte.  Bit-exact against the standalone quantiser -- fmaxf is
+ * exact and max is order-independent, so the amax, se and E4M3 bytes are
+ * identical however the reduction is ordered.
+ *
+ * `stride` is the row pitch in ELEMENTS (the GEMM's in_dim), not bytes. */
+/* The shared power-of-two exponent for a block whose amax is already reduced.
+ * Split out because producers reduce over DIFFERENT lane groups -- a full warp
+ * when one warp owns the block, a 4-lane quad in the attention epilogue where
+ * one head's 32 values live in four lanes, a half-warp in the rope tail -- but
+ * the exponent arithmetic must stay identical to the standalone quantiser in
+ * every one of them. */
+/// @param amax the block's reduced max |v| (>= 0)
+/// @return the shared exponent se = floor(log2(amax)) - 7 (E4M3's max exponent), clamped to [-127, 127]; -127 for amax 0
+__device__ __forceinline__ static int pulsar_mx_shared_exp(float amax) {
+    int se = -127;
+    if (amax > 0.f) {
+        /* frexpf gives floor(log2(amax)) EXACTLY: amax = m * 2^e with m in [0.5,1), so the
+         * floor is e - 1.  This used to be `(int)floorf(log2f(amax))`, and --use_fast_math
+         * turns log2f into the approximate lg2.approx.f32, which returns one binade TOO HIGH
+         * when amax is a float just below a power of two -- measured on this GPU: 10 of 63
+         * such values disagree with the exact floor, and frexpf-1 disagrees on 0 of 63.  One
+         * binade is a 2x block scale, and it is exactly what held the MoE K4 dev-vs-emu gate
+         * at 7.08e-05 while every all-K5 configuration sat at 1.40e-07 (the reference emu
+         * derives the exponent in fp64, correctly, so the DEVICE was the outlier).  It also
+         * restores the bit-exactness with the standalone quantiser claimed above. */
+        int e = 0;
+        frexpf(amax, &e);
+        se = (e - 1) - 7;
+    }
+    if (se < -127) se = -127;
+    if (se >  127) se =  127;
+    return se;
+}
+
+/// @param v  the value
+/// @param se the block's shared exponent
+/// @return v * 2^-se as E4M3 (saturating cast)
+__device__ __forceinline__ static __nv_fp8_e4m3 pulsar_mx_encode(float v, int se) {
+    return (__nv_fp8_e4m3)(v * exp2f((float)-se));
+}
+
+/// @param se the block's shared exponent
+/// @return its E8M0 byte (se + 127)
+__device__ __forceinline__ static unsigned char pulsar_mx_scale_byte(int se) {
+    return (unsigned char)(se + 127);
+}
+
+/** Emits one 32-element MX block from a warp (contract above): all 32 lanes call, lanes past the row store nothing.
+ *  @param v      this lane's value (0 for a dead lane)
+ *  @param col    this lane's column (lane 0's is a multiple of 32)
+ *  @param row    the row
+ *  @param stride row pitch in elements (the GEMM's in_dim)
+ *  @param KBp    blocks per row, padded to 4
+ *  @param data   E4M3 rows [.][stride]
+ *  @param scale  the zeroed E8M0 scale slab (pulsar_mx_sfoff layout) */
+__device__ __forceinline__ static void pulsar_mx_emit_block(
+        float v, uint32_t col, uint32_t row, uint32_t stride, int KBp,
+        __nv_fp8_e4m3 *data, unsigned char *scale) {
+    float a = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    const int se = pulsar_mx_shared_exp(a);
+    /* A lane past the row must JOIN the reduction -- the shuffle is warp-wide --
+     * and then STORE NOTHING.  That half of the contract above was written down
+     * and not implemented: this stored unconditionally, so a producer whose
+     * BLK*VEC exceeds in_dim wrote its dead lanes past the row's end and into
+     * the NEXT row's leading bytes.  With v = 0 for those lanes that is a ZERO
+     * CODE, so it silently erased them.
+     *
+     * Measured (L218 s50): the hc fused norm launches 256 x VEC columns, VEC was
+     * raised 16 -> 20 for V4.1's 5120-wide embedding, and at V4's n_embd = 4096
+     * the four dead column groups zeroed cols 0..1023 of every row but the
+     * first -- a quarter of the activation, which is precisely the 0.759x
+     * magnitude and 0.935 correlation every MXFP8 projection then showed.
+     *
+     * `stride` is the row pitch, so `col >= stride` is exactly "past this row".
+     * Dead lanes are whole warps here (columns are consecutive within a warp),
+     * so a partial-warp store cannot occur. */
+    if (col >= stride) return;
+    data[(size_t)row * stride + col] = pulsar_mx_encode(v, se);
+    if ((threadIdx.x & 31u) == 0u) {
+        scale[pulsar_mx_sfoff((int)row, (int)(col >> 5), KBp)] = pulsar_mx_scale_byte(se);
+    }
+}
+
+/* ONE SwiGLU element for every gate/up path (L159 inc 2): the hc-router
+ * shared-expert kernel, the CUTLASS grouped/GEMV packers and the routed MoE's
+ * gathered and MMQ-fold kernels each carried their own copy, and two forms had
+ * already drifted on NaN (fminf/fmaxf returns the finite operand, an if-chain
+ * keeps the NaN).  Identical on every finite input to all five copies:
+ * clamp g from above and u both ways, s = g / (1 + exp(-g)), s * u * w in that
+ * order -- the multiply order is part of the definition. */
+/// @param g     gate value
+/// @param u     up value
+/// @param wv    the row's routing weight (1 for an unweighted path)
+/// @param clamp clamp bound (<= 1e-6: no clamp)
+/// @return silu(min(g, clamp)) * clamp(u, -clamp, clamp) * wv
+__device__ __forceinline__ static float pulsar_swiglu_elem(float g, float u, float wv, float clamp) {
+    if (clamp > 1.0e-6f) { g = fminf(g, clamp); u = fminf(fmaxf(u, -clamp), clamp); }
+    const float s = g / (1.0f + expf(-g));
+    return s * u * wv;
+}
+
+/* ONE squared-ReLU element for every non-gated (up-only) path (L296 N4: Nemotron-H's experts and shared expert,
+ * `relu2`): r = max(u, 0) -- written so a NaN u stays NaN (rule 9; fmaxf would return the 0) -- then r * r * w in
+ * that order. */
+/// @param u  up value
+/// @param wv the row's routing weight
+/// @return max(u, 0)^2 * wv (NaN stays NaN)
+__device__ __forceinline__ static float pulsar_relu2_elem(float u, float wv) {
+    const float r = u <= 0.0f ? 0.0f : u;
+    return r * r * wv;
+}
+
+/* ONE GeGLU element with the tanh GELU for every gated path that names it (L338: Gemma 4's `gelu_pytorch_tanh`, its
+ * experts and its dense MLP): gelu(g) = 0.5 g (1 + tanh(sqrt(2/pi) (g + 0.044715 g^3))) -- torch's tanh approximation,
+ * the formula HF runs -- then gelu(g) * u * w in that order.  No clamp (Gemma has none). */
+/// @param g  gate value
+/// @param u  up value
+/// @param wv the row's routing weight (1 for an unweighted path)
+/// @return gelu_tanh(g) * u * wv
+__device__ __forceinline__ static float pulsar_geglu_tanh_elem(float g, float u, float wv) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;   /* sqrt(2 / pi), torch's cubic coefficient */
+    const float s = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+    return s * u * wv;
+}
+
+#endif /* PULSAR_CUDA_MX_CUH */

@@ -1,40 +1,35 @@
-/* Job lifecycle around ONE request (split move-only from generate.c):
+/* Job lifecycle around ONE request (split move-only from generate.cpp):
  * the resumable gen_state machine (prefill -> decode -> finish), its
  * prefill-progress/keepalive plumbing, tool-checkpoint canonicalization
  * and thinking-checkpoint remembering, protocol stream emission glue,
  * and the generate_job_* driver stepped by the scheduler
- * (server_sched.c). gen_state/gen_phase live in pulsar_server_internal.h
+ * (server_sched.cpp). gen_state/gen_phase live in pulsar_server_internal.h
  * because the scheduler TU steps jobs by phase and drives the batched
  * lanes through the batch_* fields. */
+/** @file
+ *  The job lifecycle around one request: the resumable gen_state machine (prefill, decode, finish) and the
+ *  generate_job_* driver the scheduler steps.
+ */
 #include "pulsar_server_internal.h"
+#include "pulsar_lock.hpp"
 
-
-
-/* A completed tool block inside unclosed reasoning can be recovered without
- * predicting what the model will emit after an injected close marker
- * (upstream ds4 51a1c14; replaces the forced-</think> injection recovery,
- * which sometimes made the model read the call as already issued and end the
- * turn without it). Keep a short overlap until the opening appears, then wait
- * for its matching end — a lone "<" or partial marker keeps decoding
- * untouched. */
-bool complete_tool_call_inside_thinking(const char *text, size_t len,
-                                        size_t *scan_from) {
-    if (!text || !scan_from) return false;
-    if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
-    if (!start) {
-        const size_t hold = 80; /* > longest stanza opening */
-        *scan_from = len > hold ? len - hold : 0;
-        return false;
+TokPos server_live_continuation_start(TokCount common, TokPos live_pos) {
+    if (common < TokCount{0} || TokPos::after(common) > live_pos) {
+        fprintf(stderr, "pulsar-server: a live continuation keeps %d tokens of a %d-token history -- no prefix of it\n",
+                common.raw(), live_pos.raw());
+        abort();
     }
-    *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
+    return TokPos::after(common);
 }
+
+
 
 
 
 bool server::append_rendered_suffix_to_live_session(session_slot *sl,
                                                    const char *suffix,
+                                                   const pulsar_text_span *spans,
+                                                   uint32_t n_spans,
                                                    int *tokens_appended,
                                                    char *err, size_t errlen) {
     auto *s = this;
@@ -48,11 +43,11 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
     }
 
     pulsar_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
-    const int before = pulsar_session_pos(s->sess);
+    (void)build_live_continuation_prompt(s->engine, live, suffix, spans, n_spans, &target);
+    const TokPos before = pulsar_session_pos(s->sess);
     bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
-        int delta = pulsar_session_pos(s->sess) - before;
+        int delta = (pulsar_session_pos(s->sess) - before).raw();
         *tokens_appended = delta > 0 ? delta : 0;
     }
     pulsar_tokens_free(&target);
@@ -61,146 +56,56 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
 
 
 
-bool server::continue_after_invalid_dsml(session_slot *sl,
+bool server::continue_after_tool_error(session_slot *sl,
                                         const request *r,
                                         const thinking_state *thinking,
                                         const char *detail,
                                         int *tokens_appended,
                                         char *err, size_t errlen) {
     auto *s = this;
-    char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
+    chat_text_span *spans = NULL;
+    uint32_t n_spans = 0;
+    if (!r->family->tool_error_suffix) {
+        snprintf(err, errlen, "%s has no tool-error suffix: no model-visible retry", r->family->name);
+        return false;
+    }
+    char *suffix = r->family->tool_error_suffix(r, thinking, detail, &spans, &n_spans);
+    if (r->force_tool_call && suffix) {
+        /* L284 P4: a forced call's retry is forced too -- the tail's generation prompt re-opens the call the
+         * way the prompt did (the family's forced_call_prefill), so the next attempt's seed is what the KV holds */
+        size_t keep = strlen(suffix);
+        buf add = {0};
+        r->family->forced_call_prefill(r, suffix, &keep, &add);
+        buf re = {0};
+        buf_append(&re, suffix, keep);
+        if (add.len) buf_append(&re, add.ptr, add.len);
+        buf_free(&add);
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n_spans; i++) {
+            if (spans[i].lo >= keep) continue;
+            spans[k] = spans[i];
+            if (spans[k].hi > keep) spans[k].hi = (uint32_t)keep;
+            k++;
+        }
+        n_spans = k;
+        free(suffix);
+        suffix = buf_take(&re);
+    }
     bool ok = s->append_rendered_suffix_to_live_session(sl, suffix,
+                                                     spans, n_spans,
                                                      tokens_appended,
                                                      err, errlen);
     free(suffix);
+    free(spans);
     return ok;
 }
 
 
 
-/* Execute one server-side web_search round: run the query against the
- * configured SearXNG backend, surface the result to the client as
- * server_tool_use/web_search_tool_result content, splice the result text into
- * the live session as an ordinary tool_result turn, and re-enter decode within
- * the same request.  Returns false when this call is not server-executed (or
- * the splice failed) — the caller then finishes the turn as a normal
- * client-visible tool_use. */
-bool server::gen_web_search_round(session_slot *sl, const tool_calls *calls,
-                                  const char *pre_content,
-                                  const char *pre_reasoning) {
-    auto *s = this;
-    gen_state *g = sl->gen;
-    job *j = g->j;
-    if (!s->web_search_url || j->req.api != API_ANTHROPIC ||
-        j->req.web_search_max_uses <= 0 || !calls || calls->len != 1)
-    {
-        return false;
-    }
-    const tool_call *tc = &calls->v[0];
-    const tool_schema_order *ord = tool_schema_orders_find(&j->req.tool_orders, tc->name);
-    if (!ord || !ord->server_web_search) return false;
-
-    buf model_text = {0};
-    buf client_content = {0};
-    if (g->web_search_uses >= j->req.web_search_max_uses) {
-        web_search_run_exhausted(&model_text, &client_content);
-        server_log(PULSAR_LOG_TOOL,
-                   "pulsar-server: web_search ctx=%s max_uses=%d exhausted",
-                   g->ctx_span, j->req.web_search_max_uses);
-    } else {
-        char *query = web_search_query_from_arguments(tc->arguments);
-        char logerr[160] = {0};
-        double t0 = server_now_sec();
-        bool ok = web_search_run(s->web_search_url, query ? query : "",
-                                 &model_text, &client_content,
-                                 logerr, sizeof(logerr));
-        server_log(PULSAR_LOG_TOOL,
-                   "pulsar-server: web_search ctx=%s use=%d/%d q=\"%.80s\" -> %s%s%s (%.0f ms, %zu result bytes)",
-                   g->ctx_span, g->web_search_uses + 1, j->req.web_search_max_uses,
-                   query ? query : "",
-                   ok ? "ok" : "error",
-                   ok ? "" : ": ",
-                   ok ? "" : logerr,
-                   (server_now_sec() - t0) * 1000.0,
-                   model_text.len);
-        s->trace_event(g->trace_id, "web_search %s (%zu result bytes)",
-                       ok ? "ok" : "error", model_text.len);
-        free(query);
-    }
-    g->web_search_uses++;
-
-    if (j->req.stream) {
-        /* Flush any held projection of this attempt, then emit the result
-         * block; a dead client fails the normal finish path instead. */
-        if (!anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
-                                         &g->anthropic_live,
-                                         g->text.ptr ? g->text.ptr : "",
-                                         g->text.len, false) ||
-            !anthropic_sse_web_search_result_live(j->fd, &g->anthropic_live,
-                                                  tc->id, client_content.ptr))
-        {
-            buf_free(&model_text);
-            buf_free(&client_content);
-            return false;
-        }
-    } else {
-        buf *wb = &g->web_rounds_json;
-        if (pre_reasoning && pre_reasoning[0]) {
-            buf_puts(wb, "{\"type\":\"thinking\",\"thinking\":");
-            json_escape(wb, pre_reasoning);
-            buf_puts(wb, ",\"signature\":");
-            json_escape(wb, g->id);
-            buf_puts(wb, "},");
-        }
-        if (pre_content && pre_content[0]) {
-            buf_puts(wb, "{\"type\":\"text\",\"text\":");
-            json_escape(wb, pre_content);
-            buf_puts(wb, "},");
-        }
-        buf_puts(wb, "{\"type\":\"server_tool_use\",\"id\":");
-        json_escape(wb, tc->id ? tc->id : "");
-        buf_puts(wb, ",\"name\":");
-        json_escape(wb, tc->name ? tc->name : "web_search");
-        buf_puts(wb, ",\"input\":");
-        append_json_object_or_empty(wb, tc->arguments);
-        buf_puts(wb, "},{\"type\":\"web_search_tool_result\",\"tool_use_id\":");
-        json_escape(wb, tc->id ? tc->id : "");
-        buf_puts(wb, ",\"content\":");
-        buf_puts(wb, client_content.ptr && client_content.ptr[0] ? client_content.ptr : "[]");
-        buf_puts(wb, "},");
-    }
-
-    char suffix_err[160] = {0};
-    int appended = 0;
-    char *suffix = build_web_search_result_suffix(&j->req, &g->thinking,
-                                                  model_text.ptr ? model_text.ptr : "");
-    bool spliced = s->append_rendered_suffix_to_live_session(sl, suffix, &appended,
-                                                             suffix_err,
-                                                             sizeof(suffix_err));
-    free(suffix);
-    buf_free(&model_text);
-    buf_free(&client_content);
-    if (!spliced) {
-        server_log(PULSAR_LOG_WARNING,
-                   "pulsar-server: web_search ctx=%s result splice failed: %s",
-                   g->ctx_span, suffix_err);
-        return false;
-    }
-    server_log(PULSAR_LOG_GENERATION,
-               "pulsar-server: web_search ctx=%s continuation appended %d tokens",
-               g->ctx_span, appended);
-    if (j->req.stream) {
-        anthropic_sse_round_reset(&g->anthropic_live,
-                                  pulsar_think_mode_enabled(j->req.think_mode));
-    }
-    g->completion_total += g->completion;
-    buf_free(&g->text);
-    g->phase = GEN_DECODE_INIT;
-    return true;
-}
-
-
-
+/// @brief One TOOL log line naming a turn's calls (ids, names, whether their raw bytes were kept).
+/// @param ctx                 the context-span label
+/// @param calls               the calls (none: no line)
+/// @param responses_protocol  a Responses request (its flag)
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -215,12 +120,12 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     char flags[32];
     log_flags(flags, sizeof(flags), responses_protocol, false, false, false, false);
     server_log(PULSAR_LOG_TOOL,
-               "pulsar-server: tool calls ctx=%s%s%s n=%d raw_dsml=%d ids=[%s] names=[%s]",
+               "pulsar-server: tool calls ctx=%s%s%s n=%d raw_calls=%d ids=[%s] names=[%s]",
                ctx,
                flags[0] ? " " : "",
                flags,
                calls->len,
-               calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0,
+               calls->raw_calls && calls->raw_calls[0] ? 1 : 0,
                ids.ptr ? ids.ptr : "",
                names.ptr ? names.ptr : "");
     buf_free(&ids);
@@ -229,6 +134,13 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 
 
+/// @brief The session's prefill progress callback (worker thread, inside the sync): SSE headers and a ": prefill"
+///        keepalive every 5 s for a streaming client; on a repeated position a "continued" disk store; otherwise
+///        the prefill progress log and display.
+/// @param ud       the job's server_prefill_progress
+/// @param event    "prefill_chunk" or "prefill_display" (others ignored)
+/// @param current  the prefill position reached, tokens
+/// @param total    the prefill's target, tokens
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = (server_prefill_progress *)ud;
     if (!p || !event) return;
@@ -246,7 +158,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->stream && p->fd >= 0 && !p->stream_failed) {
         if (!p->headers_sent) {
             p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
+            if (sse_headers(p->fd)) {
                 p->last_keepalive = now;
             } else {
                 p->stream_failed = true;
@@ -264,7 +176,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            p->srv->kv_cache_maybe_store_continued(p->slot);
+            p->srv->kv_cache_persist(p->slot, KV_PERSIST_CONTINUED);
         }
         return;
     }
@@ -280,9 +192,24 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
-    int interval_tokens = p->seen ? current - p->last_current : 0;
+    /* First callback fires AFTER the first chunk completes, so the chunk has
+     * a real rate: its tokens over the elapsed-since-start. The old !seen arm
+     * zeroed the interval instead, printing "chunk=0.00 t/s" on the first
+     * chunk of every prefill -- which read as a stall on any monitor
+     * (pulsar-tui showed alternating dead samples through the 08-25 perf
+     * run). Subsequent chunks are unchanged: delta tokens over delta time. */
+    int interval_tokens = p->seen ? current - p->last_current : display_current;
     if (interval_tokens < 0) interval_tokens = 0;
-    double interval_s = p->seen ? now - p->last_t : 0.0;
+    /* L114: chunk-granular prefill accounting via the per-slot watermark
+     * (see session_slot.prefill_counted) — NOT interval_tokens, because the
+     * mixed lane's fused sub-chunks also advance the watermark and an
+     * interval here would recount them. Computed rows only. */
+    if (p->srv && p->slot && current > p->slot->prefill_counted) {
+        p->srv->w_prefill_chunk_tokens +=
+            (uint64_t)(current - p->slot->prefill_counted);
+        p->slot->prefill_counted = current;
+    }
+    double interval_s = p->seen ? now - p->last_t : elapsed;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
     p->last_t = now;
@@ -305,17 +232,72 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        p->srv->kv_cache_maybe_store_continued(p->slot);
+        p->srv->kv_cache_persist(p->slot, KV_PERSIST_CONTINUED);
     }
 }
 
 
 
+/* ---- L249 D: the early stream ---------------------------------------------------------------------------------
+ * A streaming request answers nothing until the worker writes its first byte -- at the first prefill chunk, or at
+ * decode start for a cached prompt.  Queued behind other work (a slot, a bank, a prefill it shares), it sends
+ * nothing at all, and a gateway in front gives up first: Cloudflare answers 524 after ~100 s of an origin's silence,
+ * and Claude Code's idle watchdog aborts after 300 s.  So once a streaming request has waited one heartbeat
+ * interval, its client thread opens the stream (the SSE head) and sends the protocol's keepalive every interval
+ * until the worker claims the socket; from the bind on, the worker's heartbeat sweep (gen_stream_heartbeat) keeps
+ * the same cadence.  An error after the stream opened goes out as an error event with the type the HTTP status
+ * would have had (job_reply_error), so a capacity refusal still reads overloaded_error. */
+
+/// One write from the client thread to a job's (non-blocking) socket: all of it now or a failure.  Never waits: the
+/// client thread holds the job's mutex, which the worker takes to claim the socket.
+/// @param fd  the socket
+/// @param p   the bytes
+/// @return false when the bytes did not all go out
+static bool job_early_send(int fd, const char *p) {
+    const size_t n = strlen(p);
+    ssize_t w;
+    do {
+        w = send(fd, p, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+    } while (w < 0 && errno == EINTR);
+    return w == (ssize_t)n;
+}
+
+void job_early_keepalive(job *j, double now) {
+    if (!j->req.stream || j->done || j->worker_writes || j->sse_early_dead) return;
+    const double interval = PULSAR_SERVER_HEARTBEAT_MS / 1000.0;
+    if (now - (j->sse_early ? j->early_last : j->accepted_at) < interval) return;
+    bool ok = true;
+    if (!j->sse_early) {
+        ok = job_early_send(j->fd, k_sse_head);
+        j->sse_early = true;   /* even a partial head has opened (and broken) the stream */
+        if (ok) server_log(PULSAR_LOG_GENERATION, "pulsar-server: stream opened early: queued %.1f s with nothing sent",
+                           now - j->accepted_at);
+    }
+    if (ok) ok = job_early_send(j->fd, stream_keepalive_beat(&j->req));
+    j->early_last = now;
+    if (!ok) j->sse_early_dead = true;
+}
+
+bool job_claim_writes(job *j, bool *dead) {
+    pthread_mutex_lock(&j->mu);
+    j->worker_writes = true;
+    const bool open = j->sse_early;
+    *dead = j->sse_early_dead;
+    pthread_mutex_unlock(&j->mu);
+    return open;
+}
+
+bool job_reply_error(const job *j, bool sse_open, int code, const char *msg) {
+    if (sse_open) return sse_error_event(j->fd, &j->req, code, msg);
+    if (j->req.api == API_ANTHROPIC) return http_error_anthropic(j->fd, code, msg);
+    if (code == 503) return http_error_retry(j->fd, code, msg, HTTP_RETRY_GOING_AWAY_S);
+    return http_error(j->fd, code, msg);
+}
+
 void server::send_prefill_failure_response(const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
                                           const char *err) {
-    auto *s = this;
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -325,7 +307,7 @@ void server::send_prefill_failure_response(const job *j,
                        flags && flags[0] ? flags : "", err);
             return;
         }
-        if (!sse_error_event(j->fd, &j->req, err)) {
+        if (!sse_error_event(j->fd, &j->req, j->req.n_images > 0 ? 400 : 500, err)) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
@@ -333,95 +315,11 @@ void server::send_prefill_failure_response(const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
-}
-
-
-
-void server::remember_thinking_checkpoint(session_slot *sl,
-                                         const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    auto *s = this;
-    /* The key must byte-match what render_chat_prompt_text emits for this turn
-     * once it becomes historical on the next request.  With tools advertised
-     * (tool_context) a stripped historical assistant turn renders
-     * "<think></think>{content}<eos>", so keep prompt_text's trailing "<think>"
-     * and append the empty-reasoning, no-calls suffix.  Without tools the turn
-     * renders "</think>{content}<eos>" (no "<think>") — the toolless form. */
-    char *visible = NULL;
-    if (j->req.has_tools) {
-        if (!j->req.prompt_text || !pulsar_think_mode_enabled(j->req.think_mode))
-            return;
-        char *suffix = build_tool_checkpoint_suffix(&j->req, content, "", NULL);
-        buf b = {0};
-        buf_puts(&b, j->req.prompt_text);
-        buf_puts(&b, suffix);
-        free(suffix);
-        visible = buf_take(&b);
-    } else {
-        visible = build_toolless_thinking_visible_text(&j->req, content);
-    }
-    if (!visible) return;
-
-    s->thinking_live_remember(sl, visible);
-    server_log(PULSAR_LOG_KVCACHE,
-               "pulsar-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, pulsar_session_pos(s->sess), strlen(visible));
-    s->trace_event(trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                pulsar_session_pos(s->sess), strlen(visible));
-    free(visible);
-}
-
-/* Tool-call finish WITH thinking on: the model emitted <think>reasoning</think>
- * before the DSML tool call, so the reasoning tokens sit in the live KV.  We
- * remember the exact bytes the NEXT request will render for this turn as a visible
- * key, keeping the live tokens (reasoning included) as the sampled frontier.  The
- * next request byte-matches the key and continues from live KV — no rewrite, no
- * rebuild — and, critically, an evicted-then-reloaded checkpoint is keyed by that
- * same visible transcript on disk (kv_cache_store_current).
- *
- * render_chat_prompt_text ALWAYS re-renders the reasoning inside <think>…</think>
- * for a tool-context turn (prompt_render.c: `tool_context || i > last_user_idx`),
- * because agentic clients (opencode et al.) replay reasoning_content verbatim so
- * the model keeps its chain of thought across tool rounds.  So the key MUST carry
- * the reasoning too — an earlier version dropped it (<think></think>), which byte-
- * diverges from every reasoning-preserving replay at the first reasoning byte and
- * made the live alias AND the disk key miss, forcing a full cold re-prefill of the
- * whole conversation on eviction (opencode's ~4-minute-per-message symptom).  The
- * toolless thinking path (remember_thinking_checkpoint) still strips: it only fires
- * for non-tool-context requests (should_remember_thinking_checkpoint bails when
- * prompt_preserves_reasoning), i.e. clients that DO drop reasoning on replay. */
-void server::remember_tool_thinking_checkpoint(session_slot *sl,
-                                              const job *j, const char *ctx,
-                                              uint64_t trace_id, const char *content,
-                                              const char *reasoning,
-                                              const tool_calls *calls) {
-    auto *s = this;
-    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
-    if (!pulsar_think_mode_enabled(j->req.think_mode)) return;
-
-    /* Visible key = prompt_text (ends "<｜Assistant｜><think>") + reasoning-preserved
-     * suffix "{reasoning}</think>{content}{DSML}<EOS>" — byte-identical to what
-     * render_chat_prompt_text emits for this tool turn on the next request (DSML from
-     * the id-keyed raw sample via tool_memory, reasoning replayed verbatim) and to
-     * the sampled bytes already in the live KV. */
-    char *suffix = build_tool_checkpoint_suffix(&j->req, content,
-                                                reasoning ? reasoning : "", calls);
-    buf visible = {0};
-    buf_puts(&visible, j->req.prompt_text);
-    buf_puts(&visible, suffix);
-    if (visible.ptr) {
-        s->thinking_live_remember(sl, visible.ptr);
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool thinking checkpoint remembered ctx=%s live=%d visible=%zu",
-                   ctx, pulsar_session_pos(s->sess), visible.len);
-        s->trace_event(trace_id,
-                    "tool thinking checkpoint remembered: live=%d visible=%zu",
-                    pulsar_session_pos(s->sess), visible.len);
-    }
-    free(suffix);
-    buf_free(&visible);
+    /* An image request that reaches the worker has already had its data: URL,
+     * tower and block count validated by the parser, so a prefill refusal here
+     * is about the client's image context (an image the tower cannot accept, a
+     * span that will not fit a chunk) -- a 400, not a server fault. */
+    http_error(j->fd, j->req.n_images > 0 ? 400 : 500, err);
 }
 
 
@@ -438,16 +336,27 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     auto *s = this;
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
-    char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    chat_text_span *suffix_spans = NULL;
+    uint32_t suffix_n_spans = 0;
+    char *suffix_text = build_tool_checkpoint_suffix_spans(&j->req, content, reasoning, calls,
+                                                          &suffix_spans, &suffix_n_spans);
 
+    /* L223: BOTH halves carry client-replayed bytes -- the request prompt and
+     * the sampled assistant turn -- so tokenising either with the plain matcher
+     * would put a control token back into the LIVE session for a spelling a
+     * client wrote.  The suffix's DSML framing is the server's own text and
+     * stays control text (it is not inside any range). */
     buf rendered = {0};
-    buf_puts(&rendered, j->req.prompt_text);
-    buf_puts(&rendered, suffix_text);
+    buf_puts_spanned(&rendered, j->req.prompt_text, j->req.prompt_spans,
+                     j->req.prompt_n_spans);
+    buf_puts_spanned(&rendered, suffix_text, suffix_spans, suffix_n_spans);
+    free(suffix_spans);
 
     pulsar_tokens canonical = {0};
-    pulsar_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = pulsar_session_pos(s->sess);
-    const int common = pulsar_session_common_prefix(s->sess, &canonical);
+    pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "",
+                                        rendered.spans, rendered.n_spans, &canonical);
+    const int live_len = pulsar_session_pos(s->sess).raw();
+    const int common = pulsar_session_common_prefix(s->sess, &canonical).raw();
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len;
@@ -472,111 +381,66 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
         goto done;
     }
 
-    char err[160];
-    memset(err, 0, sizeof(err));
-    pulsar_session_rewrite_result rr;
-    rr = pulsar_session_rewrite_from_common(s->sess, &canonical, common,
-                                         err, sizeof(err));
-    if (rr == PULSAR_SESSION_REWRITE_OK) {
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
-                   ctx, common, live_len, canonical.len);
-        s->trace_event(trace_id,
-                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
-                    common, live_len, canonical.len);
-    } else if (rr == PULSAR_SESSION_REWRITE_REBUILD_NEEDED) {
-        /* The generated DSML suffix and the canonical prompt share a prefix,
-         * but the generated tail is too large to overwrite safely inside the
-         * live raw-window ring.  Prefer an older disk checkpoint over replaying
-         * a very long conversation from token zero. */
+    /* L284: the canonical rewrite is a SYNC of the canonical prompt -- every family's one path.  The sync keeps
+     * the live tokens up to the deepest byte the canonical spelling shares (the token-seam stitch) and resumes
+     * from the grid checkpoint the resume rule picks, so the generated tail is evaluated again in its canonical
+     * spelling.  Before, a rewrite behind the live end needed REWIND (Qwen refused it and logged
+     * "canonicalization failed" every thinking-off tool turn) and DeepSeek rebuilt it from a disk checkpoint or
+     * from 0 even with a grid checkpoint below the cut.  L318: a disk chain deeper than the bank's own resume loads
+     * when L310 prices the read under the prefill it saves, as a request's does. */
+    {
+        const pulsar_bank_resume own = pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &canonical, NULL, 0);   /* its sync is text */
+        const int resume = own.served.raw();
         char *path = NULL;
         pulsar_tokens effective = {0};
-        int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
-        if (loaded == 0) pulsar_session_invalidate(s->sess);
-
-        char sync_err[160] = {0};
+        const int loaded = s->kv_cache_try_load_text(sl, rendered.ptr ? rendered.ptr : "", rendered.spans,
+                                                     rendered.n_spans, NULL, 0, resume, &effective, &path, false);
         const pulsar_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
-        char rebuild_ctx[48];
-        request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
-        int replay_tokens = sync_prompt->len - loaded;
-        if (replay_tokens < 0) replay_tokens = sync_prompt->len;
-        int canonical_tail_tokens = canonical.len - common;
-        if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
-        int discarded_live_tokens = live_len - common;
-        if (discarded_live_tokens < 0) discarded_live_tokens = 0;
-        const char *source = loaded > 0 ? "disk" : "full";
-        const double rebuild_t0 = server_now_sec();
+        const int cached = loaded > 0 ? loaded : resume;
+        const char *source = loaded > 0 ? "disk" : cached > 0 ? "memory" : "full";
+        char sync_ctx[48];
+        request_ctx_span(sync_ctx, sizeof(sync_ctx), cached, sync_prompt->len);
         server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
-                   replay_tokens,
-                   rebuild_ctx,
-                   ctx,
-                   canonical_tail_tokens,
-                   discarded_live_tokens,
-                   common,
-                   live_len,
-                   canonical.len,
-                   loaded,
-                   source,
-                   path ? " file=" : "",
-                   path ? path : "");
-        server_prefill_progress rebuild_progress = {
+                   "pulsar-server: tool checkpoint canonicalization syncs %d tokens ctx=%s request_ctx=%s common=%d "
+                   "live=%d target=%d cached=%d source=%s%s%s",
+                   sync_prompt->len - cached, sync_ctx, ctx, common, live_len, canonical.len, cached, source,
+                   path ? " file=" : "", path ? path : "");
+        server_prefill_progress progress = {
             .srv = s,
             .slot = sl,
             .kind = j->req.kind,
             .prompt_tokens = sync_prompt->len,
-            .cached_tokens = loaded,
-            .phase = "tool checkpoint rebuild",
+            .cached_tokens = loaded > 0 ? loaded : own.at.raw(),   /* L334: where the computed rows start */
+            .phase = "tool checkpoint canonicalization",
             .has_tools = j->req.has_tools,
-            .t0 = rebuild_t0,
+            .t0 = server_now_sec(),
             .fd = j->fd,
             .stream = j->req.stream,
-            .enable_cors = s->enable_cors,
-            /* Tool checkpoint rebuild only runs after the response stream is
-             * already in flight, so the SSE headers were sent long ago.
-             * Pre-arm the flag so the progress callback only emits keepalive
-             * comments and never tries to write a second set of headers. */
+            /* this runs after the response stream is in flight, so the SSE headers were sent long ago:
+             * the progress callback emits keepalive comments only */
             .headers_sent = true,
         };
-        snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
-        pulsar_session_set_progress(s->sess, server_progress_cb, &rebuild_progress);
-        pulsar_session_set_display_progress(s->sess, server_progress_cb, &rebuild_progress);
-        if (pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
-            pulsar_session_set_progress(s->sess, NULL, NULL);
-            pulsar_session_set_display_progress(s->sess, NULL, NULL);
-            const double rebuild_sec = server_now_sec() - rebuild_t0;
-            if (loaded > 0) {
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
-                s->trace_event(trace_id,
-                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
-                            common, live_len, canonical.len, loaded, path ? path : "");
-            } else {
-                server_log(PULSAR_LOG_KVCACHE,
-                           "pulsar-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, replay_tokens, canonical.len, rebuild_sec);
-                s->trace_event(trace_id,
-                            "tool checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
-                            common, live_len, canonical.len, err);
-            }
-        } else {
-            pulsar_session_set_progress(s->sess, NULL, NULL);
-            pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        snprintf(progress.ctx, sizeof(progress.ctx), "%s", sync_ctx);
+        pulsar_session_set_progress(s->sess, server_progress_cb, &progress);
+        pulsar_session_set_display_progress(s->sess, server_progress_cb, &progress);
+        char sync_err[160] = {0};
+        const int rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
+        pulsar_session_set_progress(s->sess, NULL, NULL);
+        pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        if (rc == 0) {
             server_log(PULSAR_LOG_KVCACHE,
-                       "pulsar-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
-                       rebuild_ctx, ctx, source, loaded, replay_tokens,
-                       canonical.len, sync_err);
-            s->trace_event(trace_id, "tool checkpoint canonicalization failed after rebuild request: %s", sync_err);
+                       "pulsar-server: tool checkpoint canonicalized ctx=%s source=%s cached=%d target=%d %.3fs",
+                       ctx, source, cached, canonical.len, server_now_sec() - progress.t0);
+            s->trace_event(trace_id, "tool checkpoint canonicalized: source=%s common=%d live=%d canonical=%d cached=%d",
+                           source, common, live_len, canonical.len, cached);
+        } else {
+            server_log(PULSAR_LOG_KVCACHE,
+                       "pulsar-server: tool checkpoint canonicalization failed ctx=%s source=%s cached=%d target=%d "
+                       "error=\"%s\"", ctx, source, cached, canonical.len, sync_err);
+            s->trace_event(trace_id, "tool checkpoint canonicalization failed: %s", sync_err);
         }
         pulsar_tokens_free(&effective);
         free(path);
-    } else {
-        server_log(PULSAR_LOG_KVCACHE,
-                   "pulsar-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
-                   ctx, common, live_len, canonical.len, err);
-        s->trace_event(trace_id, "tool checkpoint canonicalization failed: %s", err);
     }
 
 done:
@@ -610,7 +474,7 @@ done:
  * the next quantum re-issues the sync, which resumes from the checkpoint.
  * A decode quantum runs the sampling loop for at most
  * PULSAR_SERVER_DECODE_QUANTUM_TOKENS tokens. Between quanta the session is not
- * touched, so the spec-decode carry (spec_carry_* in session.c) and sampling
+ * touched, so the spec-decode carry (spec_carry_* in session.cpp) and sampling
  * rng stay valid; with one slot the quanta run back-to-back and the output is
  * byte-identical to the old function.
  *
@@ -636,8 +500,11 @@ done:
 
 /* Chunk-note wrapper around server_progress_cb: counts completed prefill
  * chunks in the CURRENT pulsar_session_sync call so the cancel callback can
- * interrupt after exactly one chunk. Counters are reset before each sync. */
-static void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
+ * interrupt after exactly one chunk. Counters are reset before each sync.
+ * The fused lane calls it too, once per recorded chunk (server_sched.cpp), so a
+ * prompt riding fused rounds reports progress, keeps its SSE stream alive and
+ * logs its rate exactly like a classic sync. */
+void gen_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     gen_state *g = (gen_state *)ud;
     if (event && strcmp(event, "prefill_chunk") == 0) {
         if (g->prefill_last_current >= 0 && current > g->prefill_last_current) {
@@ -645,6 +512,13 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
         }
         if (current > g->prefill_last_current) g->prefill_last_current = current;
         g->prefill_total = total;
+        /* L281: publish the snapshot here as well as per quantum.  An image prompt's mm sync
+         * yields only at the planner's exact resume points (its cancel hook is armed like any
+         * prefill's, gen_arm_prefill_callbacks), so the worker can stay inside one sync for a
+         * long stretch, and the per-slot gauges (/metrics slot_prefill_*, slot_position; the
+         * TUI's bar) stood still for minutes while the chunk lines logged.  One mutex + copy
+         * per chunk (~3 s apart) is host noise. */
+        if (g->progress.srv) g->progress.srv->publish_metrics_snapshot();
     }
     server_progress_cb(&g->progress, event, current, total);
 }
@@ -673,14 +547,10 @@ static void gen_prefill_progress_cb(void *ud, const char *event, int current, in
  * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
  * run-to-completion behavior without a rebuild if some client ever misbehaves.
  * The env is read ONCE (project rule: no per-token getenv). */
+/// @param fd  the client socket (< 0: never disconnected)
+/// @return true when the peer has closed or half-closed (POLLRDHUP) or the socket errored; a non-blocking poll
 bool gen_client_disconnected(int fd) {
     if (fd < 0) return false;
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("PULSAR_ABORT_ON_DISCONNECT");
-        enabled = (e && e[0] == '0') ? 0 : 1;
-    }
-    if (!enabled) return false;
     struct pollfd p;
     p.fd = fd;
     p.events = POLLRDHUP;
@@ -690,6 +560,10 @@ bool gen_client_disconnected(int fd) {
 }
 
 
+/// @brief The session's cancel callback, polled between prefill chunks: stop on a gone client, or (with
+///        prefill_min_suffix set) once a chunk is done and at least that many prompt tokens remain, to yield the worker.
+/// @param ud  the job's gen_state
+/// @return true to stop the prefill after this chunk
 static bool gen_prefill_cancel_cb(void *ud) {
     const gen_state *g = (const gen_state *)ud;
     /* A client that cancelled or hung up during a long prefill must stop the
@@ -703,6 +577,21 @@ static bool gen_prefill_cancel_cb(void *ud) {
     return (uint32_t)(g->prefill_total - g->prefill_last_current) >= g->prefill_min_suffix;
 }
 
+/* Bind THIS slot's prefill callbacks to the shared pool session.  Every slot
+ * shares s->sess and the callbacks are per-session, so any other slot's
+ * begin (which binds its own) or stream begin (which clears them) replaces
+ * them: armed once per job, a long prefill lost its progress callback to the
+ * next request, never counted a chunk, and the cancel callback never yielded
+ * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
+ * before every sync this slot issues. */
+/// @param sess  the pool session
+/// @param g     the slot's generation state the callbacks read
+static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
+    pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
+    pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
+    pulsar_session_set_cancel(sess, gen_prefill_cancel_cb, g);
+}
+
 
 
 /* Shared failure epilogue for both prefill phases (the old duplicated blocks
@@ -714,18 +603,294 @@ void server::gen_prefill_fail(session_slot *sl) {
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_tracker_bind(sl);
-    kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                          g->cold_store_len);
-    s->kv_cache_tracker_flush(sl);
-    s->kv_cache_discard_failed_disk_entry(sl, g->disk_cache_path);
+    if (g->disk_cache_path) {
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept segment=%s (prefill ended: %s)",
+                   g->disk_cache_path, g->err);
+    }
+    /* pulsar_session_invalidate acts on the LIVE bank.  A fused round abandons a
+     * rider while another conversation's bank is live (L261 2026-10-02: a client
+     * that disconnected during a fused prefill wiped a decoding bank's KV, its next
+     * step failed on both ranks and the pair was marked failed), so install the
+     * slot's own bank first.  A bank that cannot be installed is left alone, and so
+     * is every other bank. */
+    if (s->bank_switch(sl->bank))
+        pulsar_session_invalidate(s->sess);
+    else
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: bank %d not installed after a failed prefill; left as is "
+                   "(no other bank is invalidated)", sl->bank);
     s->trace_event(g->trace_id, "prefill failed: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
     g->phase = GEN_DONE;
 }
 
+void server::gen_prefill_abandon(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during prefill, abandoning");
+    snprintf(g->err, sizeof g->err, "client disconnected");
+    /* L318: the rows computed so far are the re-send's own prefix (a Stop and re-send, measured 2026-10-21: 24k of
+     * 28k tokens thrown away, then prefilled again).  The bank's grid checkpoints up to where the prefill stopped are
+     * the same ones a "continued" store writes on progress; this store closes the chain at the deepest of them. */
+    if (s->kv.enabled && s->bank_switch(sl->bank)) {
+        int end = 0;
+        s->kv_cache_persist(sl, KV_PERSIST_ABANDONED, &end);
+        const int kept = end - g->progress.cached_tokens;
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: abandoned prefill of bank %u: chain stored to %d (resumed at %d, prompt %d)",
+                   sl->bank, end, g->progress.cached_tokens, g->prompt_tokens);
+        if (kept > 0) {
+            pthread_mutex_lock(&s->mu);
+            s->kv.meter.abandon_persisted_tokens += (uint64_t)kept;
+            pthread_mutex_unlock(&s->mu);
+        }
+    }
+    /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
+     * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
+     * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
+    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
+    g->phase = GEN_DONE;
+}
 
+
+
+/* L261: place an image request's images on a live-continuation effective prompt
+ * (the live tokens [0, live_len) + freshly tokenized request text).  The images
+ * arrive in prompt order; the first ones are HELD -- the live history already
+ * carries their blocks, so their start_pos is where those blocks begin -- and
+ * the rest are NEW -- their placeholders sit in the suffix and the one producer
+ * of sentinel blocks expands them at their positions in the effective prompt
+ * (a block's length depends on its position).  Any disagreement (a live block
+ * that does not parse, more blocks than images, a placeholder count that does
+ * not match) is refused by name; the engine's fingerprint check then decides
+ * whether the held images are really the live ones. */
+/// @param e         the engine
+/// @param eff       the effective prompt; replaced with the placeholders expanded
+/// @param live_len  tokens of `eff` that are the live history
+/// @param images    the request's images in prompt order; their start_pos is set
+/// @param n_images  images in `images`
+/// @param why       receives the refusal
+/// @param whylen    size of `why`
+/// @return false on any disagreement between the live blocks, the images and the placeholders
+static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int live_len,
+                                     pulsar_image_ref *images, int n_images,
+                                     char *why, size_t whylen) {
+    enum { HELD_MAX = 64 };
+    int starts[HELD_MAX];
+    const int held = pulsar_image_block_starts(e, eff, live_len, starts, HELD_MAX);
+    if (held < 0 || held > HELD_MAX || held > n_images) {
+        snprintf(why, whylen, "the live history carries %d image block(s) for %d image(s)", held, n_images);
+        return false;
+    }
+    for (int i = 0; i < held; i++) images[i].start_pos = starts[i];
+    pulsar_tokens out = {0};
+    if (!pulsar_expand_image_placeholders(e, eff, live_len, images + held, n_images - held, &out, why, whylen))
+        return false;
+    pulsar_tokens_free(eff);
+    *eff = out;
+    return true;
+}
+
+
+
+/// @brief The cold-store cut for an image request: none (0) when an image starts below it, else `cut` unchanged.
+/// @param cut       the proposed cut, tokens
+/// @param images    the request's images (start_pos placed)
+/// @param n_images  images in `images`
+/// @param inside    receives the first image starting below the cut, -1 for none
+/// @return the cut to use, 0 for none
+int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside) {
+    *inside = -1;
+    for (int i = 0; cut > 0 && i < n_images; i++)
+        if (images[i].start_pos < cut) {
+            *inside = i;
+            return 0;
+        }
+    return cut;
+}
+
+/* ===== L330: a disk chain restore, a slice of segments per worker turn ====================================
+ *
+ * A request whose resume pick is the disk chain (L318), and a job bound to a guard-spilled bank (its own history), no
+ * longer read the chain inside one worker turn: the job sits in GEN_RESTORE and each of its quanta reads the next
+ * slice (server::kv_restore_slice, sized by server_restore_slice_segments: one prefill chunk's priced time at the
+ * restore's depth), so the decoders beside it step between slices.  The bank is this job's for the whole restore (a
+ * bound bank is never a spill victim, routing skips it, an adopt never copies from it), and every quantum installs
+ * it first (generate_job_step), so each slice continues the bank exactly where the last one left it.  The job's KV
+ * reservation runs from bind (server_slot_reserves): the chain's rows not yet loaded are reserved room.
+ * A read failure, or the client gone, ends the restore at a slice boundary with the bank invalid -- what a failed
+ * one-shot load leaves -- and the plan continues from that, as it does after a failed load: the sync recomputes the
+ * prompt (and for a client that has gone, the prefill's own disconnect check abandons it). */
+
+/// @brief Put the slot's job into GEN_RESTORE on `gr` (ownership passes to the gen_state) and log the chain.
+/// @param sl  the slot
+/// @param gr  the restore, already begun (kv_restore_begin)
+static void gen_restore_start(session_slot *sl, gen_restore *gr) {
+    gen_state *g = sl->gen;
+    g->restore = gr;
+    g->phase = GEN_RESTORE;
+    sl->state = SLOT_PREFILLING;
+    const kv_chain_hit *h = &gr->hit;
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: bank %u restores %s chain of %d segments to %u (%.1f MiB, %.1f MiB cached) a slice "
+               "per worker turn", sl->bank, gr->kind == GEN_RESTORE_SPILLED ? "its spilled history's" : "the request's",
+               h->n, h->chain[h->n - 1].G, (double)h->bytes / (1024.0 * 1024.0),
+               (double)h->cached / (1024.0 * 1024.0));
+}
+
+bool spilled_history_serves(const spilled_history *was, const char *prompt_text, bool live_turn) {
+    if (live_turn) return true;
+    return prompt_text && !strncmp(prompt_text, was->text, strlen(was->text));
+}
+
+/* The spilled bank's own history: the deepest stored chain it reproduces, when L310 prices its read under the prefill
+ * it saves -- what bank_switch read at once before L330.  false: nothing to restore (the bank stays empty, its job
+ * resolves cold). */
+/// @param s    the server
+/// @param sl   the slot bound to the spilled bank
+/// @param was  the bank's history as spilled; its text moves into the restore on success
+/// @return true when a sliced restore started
+static bool gen_restore_spilled_start(server *s, session_slot *sl, spilled_history *was) {
+    gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
+    memset(gr, 0, sizeof(*gr));
+    /* L353 no. 21: the spill's own files may still be in the writer's queue: the chain ends short without them */
+    (void)kv_cache_wait_written(&s->kv);
+    const int G = s->kv_cache_find(was->text, was->hashes, was->n_img, &gr->hit);
+    if (G <= 0 || s->kv_cache_price(&gr->hit, 0) == KV_RESTORE_RECOMPUTE) {
+        free(gr);
+        return false;
+    }
+    gr->kind = GEN_RESTORE_SPILLED;
+    gr->text = was->text;
+    was->text = NULL;
+    gr->adopt_src = -1;
+    s->kv_restore_begin(&gr->r, &gr->hit, 0, true, false);   /* the bank came back empty: nothing to keep */
+    gen_restore_start(sl, gr);
+    return true;
+}
+
+void server::gen_step_restore(session_slot *sl) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    gen_restore *gr = g->restore;
+    kv_restore *r = &gr->r;
+    int rc;
+    if (gen_client_disconnected(j->fd)) {
+        /* a cancel: the slices read so far describe no state (only the chain's last segment carries one); L347 I3b: a
+         * bank only checked against is as it was */
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: client disconnected during bank %u's disk restore (%d of %d "
+                   "segments read): the restore stops%s", sl->bank, r->next, gr->hit.n,
+                   r->touched ? ", the bank is invalidated" : "");
+        if (r->touched) pulsar_session_invalidate(s->sess);   /* the installed bank is this slot's (generate_job_step) */
+        rc = -1;
+    } else {
+        rc = s->kv_restore_next(r);
+    }
+    if (rc == 0) return;   /* the next slice is the next quantum's */
+    g->restore = NULL;
+    if (gr->kind == GEN_RESTORE_SPILLED) {
+        const int G = rc > 0 ? s->kv_restore_finish(r, gr->text, NULL, 0, NULL, NULL, false) : 0;
+        s->kv_restore_end(r);
+        pulsar_session_bank_state_save(s->sess, sl->bank);
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: guard RESTORED bank %u from its segment chain to %d in %d slice%s (%.1f ms read, "
+                   "longest slice %.1f ms)", sl->bank, G, r->slices, r->slices == 1 ? "" : "s", r->read_ms,
+                   r->slice_max_ms);
+        free(gr->text);
+        free(gr);
+        s->gen_begin(sl);   /* the job resolves on the history it is back to (or on nothing) */
+        return;
+    }
+    gen_resolution res = gr->res;
+    const int G = rc > 0 ? s->kv_restore_finish(r, j->req.prompt_text, j->req.prompt_spans, j->req.prompt_n_spans,
+                                                &g->effective_prompt, &g->disk_cache_path,
+                                                j->req.api == API_RESPONSES)
+                         : 0;
+    s->kv_restore_end(r);
+    /* L347 I3b (D7): a failed restore costs at most a miss -- the pick's best in-memory source: the bank's own history
+     * while the restore wrote nothing into it (it checked the chain first), else another bank's adopt, else 0 */
+    const bool bank_kept = !r->touched;
+    const int own = gr->own, adopt_src = gr->adopt_src;
+    free(gr);
+    if (G <= 0) {
+        const int adopt_at = s->gen_adopt_depth(sl, adopt_src);   /* again: slices ran since the pick */
+        const resume_pick fb = server_failed_restore_pick(own, adopt_at, bank_kept);
+        if (!bank_kept) {
+            res.cached = 0;
+            res.resumed_at = TokPos{0};
+            res.cache_source = "none";
+        }
+        res.disk_cached = 0;
+        if (fb == RESUME_ADOPT) (void)s->gen_resume_adopt(sl, adopt_src, &res);
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u's disk restore failed: resumes from %s at %d (own %d%s, "
+                   "adopt %d)", sl->bank, fb == RESUME_ADOPT ? "an adopt" : res.cached > 0 ? "its own history" : "0",
+                   res.cached, own, bank_kept ? ", kept: the chain was checked before the load"
+                                              : ", lost: the load had written it", adopt_at);
+        s->gen_begin_plan(sl, &res);
+        return;
+    }
+    res.cached = G;
+    res.resumed_at = TokPos{G};   /* the chain ends at G on the bank's own tokens */
+    res.disk_cached = G;
+    res.cache_source = "disk-text";
+    /* The chain's tokens are usually the request's own up to its end: then the sync runs the request's
+     * tokens, exactly what a cold server prefills (reuse == cold), instead of the suffix re-tokenized from
+     * the chain's byte boundary -- which is mid-text wherever a grid point falls.  Only a byte-only match
+     * (another spelling of the same bytes) syncs the stitched prompt. */
+    const pulsar_tokens *loaded = pulsar_session_tokens(s->sess);
+    bool own_tokens = loaded && loaded->len == G && G <= j->req.prompt.len;
+    for (int i = 0; own_tokens && i < G; i++) own_tokens = loaded->v[i] == j->req.prompt.v[i];
+    if (own_tokens) pulsar_tokens_free(&g->effective_prompt);
+    else res.prompt_for_sync = &g->effective_prompt;
+    s->gen_begin_plan(sl, &res);
+}
+
+int server::gen_adopt_depth(const session_slot *sl, int src) {
+    auto *s = this;
+    const session_slot *o = NULL;
+    for (int i = 0; src >= 0 && i < s->n_slots; i++)
+        if ((int)s->slots[i].bank == src) o = &s->slots[i];
+    /* L330: nor a bank mid-restore -- its rows describe no state until its chain's last segment */
+    if (!o || o == sl || !o->provisioned || o->spilled || o->preempted || (o->gen && o->gen->phase == GEN_RESTORE))
+        return 0;
+    /* L334: ranked by the request's tokens o's history to its T holds (`served`), the currency of `own` and the
+     * prompt's length -- T itself is a position on o's history */
+    return pulsar_session_bank_adopt_score(s->sess, o->bank, &sl->gen->j->req.prompt).served.raw();
+}
+
+bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    char aerr[192] = "";
+    const double t_a = server_now_sec();
+    const pulsar_bank_adopt_result ad =
+        pulsar_session_bank_adopt(s->sess, (uint32_t)src, &j->req.prompt, aerr, sizeof(aerr));
+    if (ad.status == PULSAR_ADOPT_ADOPTED) {
+        /* L334: the bank stands at T on src's tokens; the cache read is what they hold of the request */
+        res->cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, ad.at).raw();
+        res->resumed_at = ad.at;
+        res->cache_source = "bank-adopt";
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
+                   sl->bank, src, ad.at.raw(), j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
+        return true;
+    }
+    if (ad.status == PULSAR_ADOPT_REFUSED) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u could not adopt bank %d's state: %s", sl->bank, src,
+                   aerr);
+        pulsar_session_invalidate(s->sess);   /* the bank describes no position: the sync rebuilds it */
+        res->cached = 0;
+        res->resumed_at = TokPos{0};
+        res->cache_source = "none";
+    }
+    return false;
+}
 
 /* Resolve the prompt against every cache layer and decide the prefill plan.
  *
@@ -743,45 +908,83 @@ void server::gen_begin(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
+    /* An image request rides the LIVE and DISK resolvers like any other (L261,
+     * L273): a live continuation keeps the bank's history, a chain restores the
+     * text prefix below the conversation's first image block (a chain never holds
+     * an image row: pulsar_kvchain_persist ends at the first block), and in both
+     * cases image_continuation_place re-derives every image's start_pos on the
+     * effective prompt -- the held ones at their live blocks, the rest expanded
+     * from their placeholders in the suffix -- so the engine merges them where
+     * their blocks fall.  Before L273 the disk resolver was off for it: the pair
+     * 2026-10-06 20:21, an image turn routed to a fresh bank prefilled 150k
+     * tokens cold past the anchor cut where a text turn loads the chain. */
+    const bool image_request = j->req.n_images > 0;
+    sl->terminal_pending = false;   /* L311: this job's own sync resumes the bank's last turn */
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
-     * bank). No-op in classic mode / when already live. Finding 1: a failed spill
-     * restore (KV unrecoverable) must fail the request, not run against another
-     * bank's KV. */
-    if (!s->bank_switch(sl->bank)) {
+     * bank). No-op in classic mode / when already live. Finding 1: a bank that
+     * cannot be installed must fail the request, not run against another bank's
+     * KV. */
+    spilled_history was = {};
+    if (!s->bank_switch(sl->bank, &was)) {
         snprintf(g->err, sizeof g->err,
                  "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         s->gen_prefill_fail(sl);
         return;
     }
-    const int old_pos = pulsar_session_pos(s->sess);
+    /* L330: a guard-spilled bank comes back EMPTY (bank_switch); its own history -- what a live continuation of it
+     * reads, a Responses/Anthropic tool turn among them -- restores from its chain a slice per worker turn, and this
+     * job resolves once it is in (gen_step_restore calls gen_begin again).  Before, bank_switch read the whole chain
+     * inside this bind. */
+    /* L353 no. 8: only for a request that continues that history, or a live tool turn that needs it.  One that diverges
+     * below its end read the whole chain (up to 34 GiB) for a state it can't use; empty, the bank takes the normal pick,
+     * which finds the deepest chain the request does share. */
+    if (was.text && spilled_history_serves(&was, j->req.prompt_text, j->req.anthropic_live_call_ids.len > 0 ||
+                                                                         j->req.responses_live_call_ids.len > 0) &&
+        gen_restore_spilled_start(s, sl, &was))
+        return;
+    free(was.text);
+    const int old_pos = pulsar_session_pos(s->sess).raw();
     /* EVAL PIN: report no live common prefix, so every request re-prefills
      * from position 0 regardless of what this bank served before.  The
      * choke-point twins live in slot_common_prefix (routing) and the live
      * resolvers below. */
-    const int common = s->eval_pin ? 0
-                     : pulsar_session_common_prefix(s->sess, &j->req.prompt);
+    /* L115: one authority, both currencies (see pulsar_prefix_match). */
+    pulsar_prefix_match pm;
+    s->slot_prefix_match(sl, &j->req.prompt, &pm);
+    const int common = pm.live_cut.raw();    /* live/bank side: KV rows */
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
-    pulsar_tokens effective_prompt = {0};
+    pulsar_tokens &effective_prompt = g->effective_prompt;   /* L330: the plan may run after a sliced restore */
     const pulsar_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
-    bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int cached = 0;
+    const char *cache_source = "none";
+    int disk_cached = 0;
+    int memory_resume = 0;   /* L310: where the bank's own state resumes this prompt, kept or declined as shallow */
+    /* L334: where the sync's computed rows start (the live side): a live continuation's kept prefix, the bank's own
+     * resume, an adopt's T (the cache read `cached` counts the request's tokens -- across a seam, fewer) */
+    TokPos resumed_at{0};
+    if (image_request) {
+        server_log(PULSAR_LOG_PREFILL,
+                   "pulsar-server: image request (%d image%s): live and disk resolvers apply, "
+                   "cold phase covers the anchor only", j->req.n_images, j->req.n_images == 1 ? "" : "s");
+    }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = s->responses_live_visible_prefix_prompt(sl, &j->req, old_pos,
+    cached = s->responses_live_visible_prefix_prompt(sl, &j->req, old_pos,
                                                       &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
+    cache_source = cached > 0 ? "responses-visible" : "none";
     if (cached > 0) {
         responses_live_match = "visible-prefix";
         if (s->responses_live_matches_request(sl, &j->req.responses_live_call_ids,
@@ -810,6 +1013,8 @@ void server::gen_begin(session_slot *sl) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* a live continuation keeps a prefix of the live history: it serves and computes from the same place */
+    if (cached > 0) resumed_at = server_live_continuation_start(TokCount{cached}, TokPos{old_pos});
     if (cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
     {
@@ -818,42 +1023,63 @@ void server::gen_begin(session_slot *sl) {
          * the prior assistant call, there is no stateless prefix to match and
          * no disk key to search by. */
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Responses continuation state is not available; retry by replaying the full input history");
+        job_reply_error(j, g->progress.headers_sent, 409,
+                        "Responses continuation state is not available; retry by replaying the full input history");
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
     {
         pulsar_tokens_free(&effective_prompt);
-        http_error(j->fd, s->enable_cors, 409,
-                   "Anthropic continuation state is not available; retry by replaying the full messages history");
+        job_reply_error(j, g->progress.headers_sent, 409,
+                        "Anthropic continuation state is not available; retry by replaying the full messages history");
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0) {
-        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
-        cache_source = cached > 0 ? "memory-token" : "none";
-    }
-    if (cached == 0) {
-        int thinking_cached =
-            s->thinking_live_visible_prefix_prompt(sl, &j->req, old_pos,
-                                                &effective_prompt);
-        if (thinking_cached > 0) {
-            cached = thinking_cached;
-            cache_source = "thinking-visible";
-            thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
-        }
-    }
-    int disk_cached = 0;
-    uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0) {
-        int text_cached = s->live_text_prefix_prompt(sl, &j->req, &effective_prompt);
-        if (text_cached > 0) {
-            cached = text_cached;
-            cache_source = "memory-text";
-            prompt_for_sync = &effective_prompt;
-        }
+        /* L115 increment 2: the live KV serves any prompt whose BYTES are a
+         * prefix of the live history — not only an exact extension.  The
+         * shape that kept recurring is a SHORTER echo: the client strips
+         * generated reasoning, so live carries a tail the prompt does not
+         * (measured 2026-08-28: live 390,258 vs echo 390,018, plus seams),
+         * and the old `common == old_pos` gate could never pass it.
+         * Falling through is expensive, not merely slower: the disk path
+         * below REPLACES the live session with a snapshot — that day a 390k
+         * live history was discarded for a 281k one and 108,360 tokens were
+         * re-prefilled.  Serving it is safe because sync rewinds to the
+         * byte-matched live token and stitches, and rewind is position-true
+         * and value-true since L120/L124.
+         * The half-of-prompt guard keeps a genuinely different conversation
+         * (sharing only a system preamble) on its own disk snapshot. */
+        /* Reuse the live KV whenever the prompt's BYTES are a prefix of it —
+         * exact extension, seam-shifted echo, shorter echo (stripped
+         * reasoning), or a client rollback.  The one case to decline is a
+         * match so shallow it is just the shared header, where a fresh
+         * slot or a disk snapshot serves better: that is exactly
+         * server_slot_match_is_trivial, the SAME predicate routing uses to
+         * protect warm state.  Reusing it rather than inventing a second
+         * threshold keeps one authority for "is this match worth keeping".
+         * Accounting takes the PROMPT-side count. */
+        const bool trivial =
+            server_slot_match_is_trivial(common, old_pos,
+                                         s->slot_trivial_common_tokens,
+                                         s->slot_trivial_common_tokens);
+        /* L266/L284: the byte match is what the bank's tokens re-spell; the count is where the sync actually
+         * starts -- the match itself when the sync continues the bank where it stands, else the grid
+         * checkpoint it resumes from (every family: decode rows past the prefill are recomputed) */
+        /* L350: with the request's images, so an image follow-up's cache read is the record the sync resumes from */
+        const pulsar_bank_resume own =
+            pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt, j->req.images, j->req.n_images);
+        const PromptToks resume = own.served;
+        memory_resume = resume.raw();
+        /* L289: a bank that serves the WHOLE prompt (its prompt end, or a history it continues) is never declined
+         * as shallow -- nothing serves that prompt better (a short repeated prompt sat under the trivial line and
+         * was counted cold, and with the disk on, persisted and searched for nothing) */
+        const bool serves = pm.prompt_cut > PromptToks{0} && (!trivial || resume == PromptToks{j->req.prompt.len});
+        cached = serves ? resume.raw() : 0;
+        resumed_at = serves ? own.at : TokPos{0};
+        cache_source = !serves || resume <= PromptToks{0} ? "none"
+                       : resume == pm.prompt_cut           ? "memory-token"
+                                                           : "memory-checkpoint";
     }
     if (cached == 0 && old_pos > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -862,29 +1088,149 @@ void server::gen_begin(session_slot *sl) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) sl->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live GPU session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        s->kv_cache_store_current(sl, "evict");
+    /* L318: ONE resume decision -- the deepest valid state among the bank's own (memory_resume: its grid checkpoint,
+     * record or the history it continues), another resident bank's published checkpoint (L313: a busy main
+     * conversation's prompt end or message endpoint, the bank a side request just prefilled the same tool result on;
+     * copied in when it starts the sync more than PULSAR_SERVER_ADOPT_MIN_GAIN tokens deeper, the copy being the
+     * shared prefix's rows + one state, milliseconds), and the disk chain (L310: loaded when reading it beats half the
+     * prefill of what it adds past the deeper of the other two).  Every candidate is measured before any is applied.
+     * Before, the adopt ran first and the disk was searched only when nothing at all served the prompt: an adopt at a
+     * thinned grid point (8192) hid a chain one segment below the divergence (31482) and 28k tokens were re-prefilled
+     * per Open WebUI turn.  A live tool/visible continuation (prompt_for_sync is its effective prompt) is the bank's
+     * exact frontier; nothing serves it deeper. */
+    kv_chain_hit *disk_hit = NULL;   /* heap: PULSAR_KVCHAIN_MAX segments */
+    resume_pick pick = RESUME_OWN;
+    int adopt_src = -1, adopt_at = 0, disk_at = 0, mem = 0, own = 0;
+    if (prompt_for_sync == &j->req.prompt) {
+        own = cached > memory_resume ? cached : memory_resume;
+        if (s->pool_banks > 1 && !image_request) {
+            for (int i = 0; i < s->n_slots; i++) {
+                const int T = s->gen_adopt_depth(sl, (int)s->slots[i].bank);
+                if (T > adopt_at) { adopt_at = T; adopt_src = (int)s->slots[i].bank; }
+            }
+        }
+        mem = server_resume_memory_depth(own, adopt_at);
+        kv_restore_verdict disk_v = KV_RESTORE_RECOMPUTE;
+        if (s->kv.enabled && mem < j->req.prompt.len) {
+            disk_hit = (kv_chain_hit *)server_xmalloc(sizeof(kv_chain_hit));
+            disk_at = s->kv_cache_find_req(&j->req, disk_hit);
+            if (disk_at > mem) disk_v = s->kv_cache_price(disk_hit, mem);
+        }
+        pick = server_resume_pick(own, adopt_at, disk_at, disk_v);
+        pthread_mutex_lock(&s->mu);
+        s->kv.meter.picks[pick]++;
+        pthread_mutex_unlock(&s->mu);
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: resume: bank %u own %d adopt %d%s disk %d of %d (match %d) -> %s", sl->bank, own,
+                   adopt_at, adopt_src >= 0 ? "" : " (none)", disk_at, j->req.prompt.len, pm.prompt_cut.raw(),
+                   resume_pick_names[pick]);
     }
-    if (cached == 0) {
-        disk_cached = s->kv_cache_try_load(sl, &j->req, &effective_prompt,
-                                        &g->disk_cache_path,
-                                        &disk_cache_ext_flags);
-        if (disk_cached > 0) {
-            cached = disk_cached;
-            cache_source = "disk-text";
-            prompt_for_sync = &effective_prompt;
+    /* L334: a miss is a sync from token 0 -- the live side (`cached` counts the request's tokens) */
+    const bool sync_from_zero = resumed_at == TokPos{0};
+    if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens && (sync_from_zero || pick != RESUME_OWN)) {
+        /* The sync from a miss, an adopt and a chain load each replace the bank's history.  Persist it first (only
+         * the segments the store lacks), so the newer conversation state outlives them; the chain about to load is
+         * pinned across it, so making room for the persist can't evict what was just picked (L353: touching it only
+         * reordered it, and a full store took its restore point; kv_restore_begin pins it for the load). */
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, true);
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT);
+        if (pick == RESUME_DISK) pulsar_kvchain_pin(s->kv.st, disk_hit->chain, disk_hit->n, false);
+    }
+    /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
+     * every later persist of the bank reads its X-Pulsar-KV tokens */
+    sl->kv_flags = j->req.kv_flags;
+    /* L249 D: the bank's history is this job's from here -- a replaced dead prefix is gone (its bank reused), a
+     * continued one revived -- and so is its session */
+    if (sl->hint_dead && (sync_from_zero || pick != RESUME_OWN)) s->count_metric(&s->m_hint_dead_reuse);
+    sl->hint_dead = false;
+    snprintf(sl->hint_session, sizeof sl->hint_session, "%s", j->req.hints.session);
+    if (pick == RESUME_ADOPT) {
+        gen_resolution ar = {};
+        ar.cached = cached;
+        ar.resumed_at = resumed_at;
+        ar.cache_source = cache_source;
+        (void)s->gen_resume_adopt(sl, adopt_src, &ar);
+        cached = ar.cached;
+        resumed_at = ar.resumed_at;
+        cache_source = ar.cache_source;
+    } else if (pick == RESUME_DISK) {
+        /* L330: the chain loads a slice of segments a worker turn (GEN_RESTORE), and the plan below runs once it is
+         * in (gen_step_restore) */
+        gen_restore *gr = (gen_restore *)server_xmalloc(sizeof(gen_restore));
+        memset(gr, 0, sizeof(*gr));
+        gr->kind = GEN_RESTORE_RESUME;
+        gr->hit = *disk_hit;
+        free(disk_hit);
+        /* L347 I3b (D7): what the request resumes from if the restore fails -- the bank's own resolution (checked
+         * before the load writes the bank, so a content fault keeps it), and the adopt the pick weighed */
+        s->kv_restore_begin(&gr->r, &gr->hit, mem, true, own > 0);
+        gr->own = own;
+        gr->adopt_src = adopt_src;
+        gr->res.prompt_for_sync = prompt_for_sync;
+        gr->res.cached = cached;
+        gr->res.resumed_at = resumed_at;
+        gr->res.cache_source = cache_source;
+        gr->res.cache_diag = cache_diag;
+        gen_restore_start(sl, gr);
+        return;
+    }
+    free(disk_hit);
+    gen_resolution res = {};
+    res.prompt_for_sync = prompt_for_sync;
+    res.cached = cached;
+    res.resumed_at = resumed_at;
+    res.cache_source = cache_source;
+    res.disk_cached = disk_cached;
+    res.responses_live_continuation = responses_live_continuation;
+    res.anthropic_live_continuation = anthropic_live_continuation;
+    res.responses_live_match = responses_live_match;
+    res.responses_live_match_ids = responses_live_match_ids;
+    res.anthropic_live_match_ids = anthropic_live_match_ids;
+    res.cache_diag = cache_diag;
+    s->gen_begin_plan(sl, &res);
+}
+
+void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
+    auto *s = this;
+    gen_state *g = sl->gen;
+    job *j = g->j;
+    const bool image_request = j->req.n_images > 0;
+    const bool responses_protocol = j->req.api == API_RESPONSES;
+    pulsar_tokens &effective_prompt = g->effective_prompt;
+    const pulsar_tokens *prompt_for_sync = r->prompt_for_sync;
+    int cached = r->cached;
+    TokPos resumed_at = r->resumed_at;
+    const char *cache_source = r->cache_source;
+    int disk_cached = r->disk_cached;
+    bool responses_live_continuation = r->responses_live_continuation;
+    bool anthropic_live_continuation = r->anthropic_live_continuation;
+    /* An effective prompt is the live (or chain-restored) tokens plus freshly
+     * tokenized request text: place the images on it -- the held ones where
+     * that history already carries their blocks, the new ones expanded from
+     * their placeholders at their positions there.  A request whose images do
+     * not line up with the history prefills the rendered prompt instead, said
+     * by name. */
+    if (image_request && cached > 0 && prompt_for_sync == &effective_prompt) {
+        char why[256];
+        if (!image_continuation_place(s->engine, &effective_prompt, cached, j->req.images,
+                                      j->req.n_images, why, sizeof(why))) {
+            server_log(PULSAR_LOG_WARNING,
+                       "pulsar-server: image request: the %s continuation cannot place its images "
+                       "(%s) -- prefilling the rendered prompt", cache_source, why);
+            pulsar_tokens_free(&effective_prompt);
+            prompt_for_sync = &j->req.prompt;
+            cached = 0;
+            resumed_at = TokPos{0};
+            disk_cached = 0;
+            cache_source = "none";
+            responses_live_continuation = false;
+            anthropic_live_continuation = false;
         }
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
-         (!strcmp(cache_source, "disk-text") &&
-          (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
+        (!strcmp(cache_source, "responses-visible") ||
+         !strcmp(cache_source, "responses-tool-output"));
     const bool responses_visible_replay_without_reasoning =
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
@@ -905,21 +1251,26 @@ void server::gen_begin(session_slot *sl) {
 
     g->prompt_tokens = prompt_tokens;
     g->t0 = server_now_sec();
-    g->trace_id = s->trace_begin(j, cached, prompt_tokens, &cache_diag,
+    g->trace_id = s->trace_begin(j, cached, prompt_tokens, &r->cache_diag,
                               cache_source, disk_cached, g->disk_cache_path);
     request_ctx_span(g->ctx_span, sizeof(g->ctx_span), cached, prompt_tokens);
+    sl->prefill_counted = resumed_at.raw();   /* L114 counter watermark: computed rows start here (L334: the live side) */
+    /* L249 D: a stream already open (early, or by the heartbeat while the job restored) stays open */
+    const bool headers_sent = g->progress.headers_sent, stream_failed = g->progress.stream_failed;
     g->progress = (server_prefill_progress){
         .srv = s,
         .slot = sl,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
-        .cached_tokens = cached,
+        .cached_tokens = resumed_at.raw(),   /* L334: the progress line and its persist gate count computed rows */
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
         .t0 = g->t0,
         .fd = j->fd,
         .stream = j->req.stream,
-        .enable_cors = s->enable_cors,
+        .headers_sent = headers_sent,
+        .stream_failed = stream_failed,
+        .last_keepalive = headers_sent ? server_now_sec() : 0.0,
     };
     snprintf(g->progress.ctx, sizeof(g->progress.ctx), "%s", g->ctx_span);
     log_flags(g->req_flags, sizeof(g->req_flags), responses_protocol,
@@ -927,19 +1278,14 @@ void server::gen_begin(session_slot *sl) {
     if (responses_live_continuation) {
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
-                   responses_live_match ? responses_live_match : "unknown",
-                   responses_live_match_ids,
+                   r->responses_live_match ? r->responses_live_match : "unknown",
+                   r->responses_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(PULSAR_LOG_PREFILL,
                    "pulsar-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
-                   anthropic_live_match_ids,
-                   cached,
-                   prompt_tokens);
-    } else if (thinking_live_continuation) {
-        server_log(PULSAR_LOG_PREFILL,
-                   "pulsar-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
+                   r->anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
     }
@@ -969,52 +1315,74 @@ void server::gen_begin(session_slot *sl) {
     pulsar_session_set_progress(s->sess, gen_prefill_progress_cb, g);
     pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
+    /* The one cold checkpoint is the shared preamble (system prompt + tools,
+     * before the task message): worth a separate prefill phase however long
+     * the conversation has grown behind it, because every new conversation
+     * can text-prefix restore from it.  The whole-prompt cold cut is gone
+     * (L260): it split every fresh prompt into an aligned prefix and a tail
+     * forward -- on the pair ~300 ms for a 61-token tail (the grouped MoE at
+     * small M reads ~every expert) plus ~167 ms of staging, ~24% of a 2K
+     * prompt -- for entries L261's baseline shows rarely hit.  A long
+     * conversation still checkpoints through the continued store.
+     * L347 I2: the cut is the chat anchor aligned down to the resume grid (no
+     * 2048-token margin and alignment, so a ~2K preamble has one too), and the
+     * phase runs only on the preamble's SECOND sighting: an earlier request's
+     * rows cover it and no restore point stands at the cut
+     * (kv_cache_anchor_due) -- a one-shot prompt never pays for it.  L353: at the
+     * preamble (kv_cache_preamble_pos), from any resume below the cut: a request
+     * that adopted a shallower grid point from a bank passes the cut too, and a
+     * request a restore point at the cut serves loads it (the resume pick, L318)
+     * and resumes at or past the cut.
+     * L347 I3b (D10, X-Pulsar-KV): a read-only request writes no anchor unless it says pin-anchor; a pin-anchor
+     * request pins the restore point the store holds at its cut (whatever it resumed from), else writes it on this,
+     * its FIRST sighting -- a read-only caller trickles no rows, so it could never see a second -- pinned. */
+    const unsigned kvf = j->req.kv_flags;
+    const bool pin_anchor = (kvf & KV_HDR_PIN_ANCHOR) != 0u;
     int cold_store_len = 0;
-    g->cold_store_is_anchor = false;
-    if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0)
+    if (s->kv.enabled && prompt_for_sync->len >= s->kv.opt.min_tokens &&
+        (!(kvf & KV_HDR_READ_ONLY) || pin_anchor))
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    pulsar_token_user(s->engine),
-                                                    pulsar_token_assistant(s->engine));
-        const int cut = kv_cache_sys_prefix_cut(&s->kv, anchor);
-        /* The shared preamble is worth checkpointing however long the
-         * conversation has grown behind it — that is exactly when a cold
-         * re-prefill is most expensive. Only a whole-prompt cold cut is bounded
-         * by cold_max_tokens, because that one is consumed on load. */
-        if (cut > 0) {
-            cold_store_len = cut;
-            g->cold_store_is_anchor = true;
-        } else if (prompt_for_sync->len <= s->kv.opt.cold_max_tokens) {
-            cold_store_len = kv_cache_store_len(&s->kv, prompt_for_sync->len);
-        }
+        /* L353: a pin-anchor's place is its caller's prompt shape (the judge: one user message), as L347 pinned it */
+        const int anchor = pin_anchor ? kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync, &s->turn_markers)
+                                      : kv_cache_preamble_pos(&s->kv, prompt_for_sync, &s->turn_markers);
+        int cut = kv_cache_anchor_cut(&s->kv, anchor, (int)pulsar_session_resume_grid(s->sess));
+        if (cut >= prompt_for_sync->len) cut = 0;
+        if (pin_anchor && cut > 0 && s->kv_cache_pin_anchor(prompt_for_sync, cut)) cut = 0;   /* stored: pinned now */
+        /* L334: the live side (what is computed, not what is counted).  A pin-anchor: from token 0, as L347 pinned it */
+        cold_store_len = (pin_anchor ? resumed_at == TokPos{0} : resumed_at < TokPos{cut}) ? cut : 0;
     }
+    /* An image request's cold phase covers the shared preamble only, and the
+     * cut sits at or below the first user turn, so no image block begins
+     * inside it: that phase is the PLAIN text sync (gen_step_prefill), and the
+     * main sync then merges every image on top of the checkpoint it leaves --
+     * L261 reuse with 0 held images and all of them new, the text-turn-then-
+     * image-turn shape.  A block that does begin inside the cut would be split
+     * from its merge, so such a cut is dropped (no anchor) and the main pass
+     * merges from token 0.  (l264t, 2026-10-05: with the !image_request gate
+     * gone, the cut itself was handed to sync_mm with every start_pos past its
+     * end -> HTTP 400 "image 0 at N is not a sentinel block" for any prompt
+     * whose first user turn sat past ~4k tokens, i.e. every Claude Code
+     * request.) */
+    if (image_request) {
+        int inside = -1;
+        const int cut = server_image_cold_cut(cold_store_len, j->req.images, j->req.n_images, &inside);
+        if (inside >= 0)
+            server_log(PULSAR_LOG_PREFILL,
+                       "pulsar-server: image request: image %d at %d begins inside the "
+                       "anchor cut %d -- no cold phase, the main pass merges it",
+                       inside, j->req.images[inside].start_pos, cold_store_len);
+        cold_store_len = cut;
+    }
+    /* L347 I2: the second sighting, last -- it renders the cut's text and walks the store (L347 I3b: a pin-anchor's
+     * first sighting writes: kv_cache_pin_anchor found no restore point at the cut) */
+    if (cold_store_len > 0 && !pin_anchor && !s->kv_cache_anchor_due(prompt_for_sync, cold_store_len))
+        cold_store_len = 0;
     g->cold_store_len = cold_store_len;
-    g->suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
-        /* A cold checkpoint can land exactly on the continued-checkpoint
-         * frontier.  The prefill progress callback would then write the same
-         * prefix as "continued" while we are intentionally stopping there to
-         * write it as "cold".  Mark the frontier as already handled before the
-         * sync reaches it; if the cold write fails, restore the old schedule so
-         * a later continued write can still try. */
-        s->kv_cache_tracker_bind(sl);
-        g->suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
-        s->kv_cache_tracker_flush(sl);
-    }
-
-    /* Transfer prompt ownership into the slot state; the prefill phases run in
-     * later quanta. */
-    g->effective_prompt = effective_prompt;
-    g->prompt_for_sync = prompt_for_sync == &effective_prompt ?
-                         &g->effective_prompt : prompt_for_sync;
+    /* The prompt the prefill phases sync, in later quanta (effective_prompt is g's own). */
+    g->prompt_for_sync = prompt_for_sync;
     g->responses_protocol = responses_protocol;
     g->responses_live_continuation = responses_live_continuation;
     g->anthropic_live_continuation = anthropic_live_continuation;
-    g->thinking_live_continuation = thinking_live_continuation;
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
      * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
@@ -1045,29 +1413,59 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
-    /* Arm the cancel callback on THIS slot's gen_state right before the sync.
+    /* Arm the callbacks on THIS slot's gen_state right before the sync.
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
      * jobs (each of which would set the callback) before prefilling any of them,
      * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
      * the shared session. An earlier slot's prefill would then yield on ANOTHER
      * slot's progress and, interrupted before its own first chunk, be misread as a
      * fatal error ("interrupted", HTTP 500). The worker prefills serially, so
-     * setting it here binds the correct callback for this exact sync. */
-    pulsar_session_set_cancel(s->sess, gen_prefill_cancel_cb, g);
+     * setting it here binds the correct callback for this exact sync.
+     *
+     * L281 (b): an IMAGE prefill is interruptible too.  Every quantum re-enters
+     * through sync_mm with the same images (the job owns them), the engine records
+     * the blocks an interrupted quantum completed (pulsar_session::live_images), and
+     * the planner honours a stop only at a grid point outside every block -- where
+     * the resume is exact.  So a client that hangs up stops the prefill within a
+     * chunk (it ran 379 s to the end on the pair, 2026-10-07), and another slot can
+     * interleave with a long image prompt as with a text one. */
+    /* The cold phase's target is the shared preamble, which carries no image
+     * block (gen_begin drops a cut that any block begins inside), so it is the
+     * plain text sync -- interruptible like any text prefill -- and the
+     * checkpoint it leaves is one the main image sync extends. */
+    const int n_images = cold ? 0 : g->j->req.n_images;
+    if (!s->prefill_headroom_ok(sl)) return;   /* refused loudly (503); the bank keeps what it prefilled */
+    gen_arm_prefill_callbacks(s->sess, g);
+    /* L329 (a): a queued request waits for this prefill to stand at share_mark (a resume-grid point inside the
+     * target): the sync goes to it first, so its last chunk ends there and captures the grid checkpoint the waiter
+     * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
+     * names an image prompt's). */
+    pulsar_tokens to_cut = {0};
+    const bool cut = n_images == 0 && g->share_mark > server_bank_pos(s->sess, (uint32_t)sl->bank).raw() &&
+                     g->share_mark < target->len;
+    if (cut) {
+        tokens_copy_prefix(&to_cut, target, g->share_mark);
+        target = &to_cut;
+    }
 
     g->prefill_chunks_done = 0;
     g->prefill_last_current = -1;
     g->prefill_total = 0;
-    const int rc = pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
+     * share_mark cut too (the chunk after the cut is the next sync's first) */
+    pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
+    const int rc = n_images > 0
+        ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
+                                 g->err, sizeof(g->err))
+        : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    pulsar_session_set_prefill_ahead(s->sess, NULL);
+    pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {
             /* Client cancelled mid-prefill: abandon rather than resume or fail, so
              * a long deep-context prefill stops promptly on disconnect instead of
              * running to completion (the decode loop already abandons this way). */
-            server_log(PULSAR_LOG_DEFAULT,
-                       "pulsar-server: client disconnected during prefill, abandoning");
-            snprintf(g->err, sizeof(g->err), "client disconnected");
-            s->gen_prefill_fail(sl);
+            s->gen_prefill_abandon(sl);
             return;
         }
         if (g->prefill_chunks_done > 0) return; /* voluntary yield; resume next quantum */
@@ -1081,17 +1479,19 @@ void server::gen_step_prefill(session_slot *sl) {
         return;
     }
 
+    if (cut) {
+        /* rule 5: the cut the prefill stopped at, and the checkpoint the waiters adopt (the next pass binds them) */
+        server_log(PULSAR_LOG_PREFILL, "pulsar-server: bank %u stands at %d, the shared cut a queued request "
+                   "waits for (prompt %d; grid checkpoint %d)", sl->bank, g->share_mark, g->prompt_for_sync->len,
+                   pulsar_session_checkpoint_best(s->sess, TokPos{g->share_mark}).raw());
+        return;   /* a quantum boundary: the waiters bind before this prompt's next chunk */
+    }
+
     if (cold) {
-        s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
-            kv_cache_note_store(&s->kv, g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                                  g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        }
-        s->kv_cache_tracker_flush(sl);
+        /* The cold prefill ended on the anchor cut, a resume-grid point, so the
+         * shared preamble is a checkpoint now: persist it as its own chain, its
+         * end an anchor restore point (L347 I2). */
+        s->kv_cache_persist(sl, KV_PERSIST_ANCHOR);
         pulsar_tokens_free(&g->cold_prefix);
         g->phase = GEN_PREFILL_MAIN;
         return; /* the cold store is a quantum boundary of its own */
@@ -1114,10 +1514,9 @@ void server::gen_stream_begin(session_slot *sl) {
      * a binding only when this request explicitly continued from it. */
     if (!g->responses_live_continuation) s->responses_live_clear(sl);
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
-    if (!g->thinking_live_continuation) s->thinking_live_clear(sl);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    s->kv_cache_maybe_store_continued(sl);
+    s->kv_cache_persist(sl, KV_PERSIST_PROMPT);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -1125,20 +1524,10 @@ void server::gen_stream_begin(session_slot *sl) {
                g->req_flags[0] ? " " : "",
                g->req_flags,
                server_now_sec() - g->t0);
-    if (g->cold_store_len == g->prompt_for_sync->len) {
-        s->kv_cache_tracker_bind(sl);
-        if (s->kv_cache_store_live_prefix(sl, g->prompt_for_sync, g->cold_store_len, g->cold_store_is_anchor ? "sys-prefix" : "cold")) {
-            kv_cache_note_store(&s->kv, g->cold_store_len);
-            g->suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, g->suppressed_continued_last,
-                                                  g->cold_store_len);
-        }
-        s->kv_cache_tracker_flush(sl);
-    }
-    snprintf(g->id, sizeof(g->id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)++s->seq);
+    /* Random ids, like the tool-call and Responses ids (L192 item 7): a
+     * counter leaked request ordering and made the unseeded sampler seed
+     * below guessable. */
+    random_prefixed_id(g->id, sizeof(g->id), j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-", 12);
 
     g->structured_stream = request_uses_structured_stream(&j->req);
     g->openai_live_chat = request_uses_openai_live_stream(&j->req);
@@ -1158,7 +1547,7 @@ void server::gen_stream_begin(session_slot *sl) {
         /* The prefill progress callback may have already sent the SSE headers
          * to keep the connection alive during a long prefill. Only emit them
          * here when prefill never fired (e.g. fully cached prompt). */
-        if (!g->progress.headers_sent && !sse_headers(j->fd, s->enable_cors)) {
+        if (!g->progress.headers_sent && !sse_headers(j->fd)) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -1182,7 +1571,12 @@ void server::gen_stream_begin(session_slot *sl) {
             g->phase = GEN_DONE;
             return;
         }
-        if (g->openai_live_chat) openai_stream_start(&j->req, &g->openai_live);
+        if (g->openai_live_chat) {
+            openai_stream_start(&j->req, &g->openai_live);
+            /* Borrowed for the job's lifetime: the delta emitters attach the
+             * entries their bytes release (see append_openai_logprobs_delta). */
+            g->openai_live.lp = &g->logprobs;
+        }
         if (g->responses_live_chat) {
             responses_stream_init(&j->req, &g->responses_live);
             g->responses_live.active = true;
@@ -1196,11 +1590,25 @@ void server::gen_stream_begin(session_slot *sl) {
                 return;
             }
         }
+        /* L267: the protocol sink this response streams into; the family's output
+         * parser drives it (gen_emit_token). */
+        if (j->req.api == API_ANTHROPIC)
+            anthropic_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->anthropic_live);
+        else if (g->openai_live_chat)
+            openai_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->openai_live);
+        else if (g->responses_live_chat)
+            responses_sink_init(&g->sink, j->fd, s, &j->req, g->id, &g->responses_live);
     }
 
-    g->dsml_recovery_attempted = false;
-    g->rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+    g->recovery_attempted = false;
+    if (j->req.seed) {
+        g->rng = j->req.seed;
+    } else {
+        uint64_t r = 0;
+        if (!random_bytes(&r, sizeof(r)) || r == 0)
+            pulsar_die("random_bytes failed; cannot seed an unseeded request");
+        g->rng = r;
+    }
     g->phase = GEN_DECODE_INIT;
 }
 
@@ -1218,49 +1626,67 @@ void server::gen_decode_init(session_slot *sl) {
     g->stop_scan_from = 0;
     g->finish = "length";
     g->completion = 0;
-    /* Continued attempts (tool-error recovery, server web_search rounds) spend
-     * the request's ONE max_tokens budget: completion_total holds what earlier
-     * attempts already generated. */
+    /* Continued attempts (tool-error recovery) spend the request's ONE
+     * max_tokens budget: completion_total holds what earlier attempts already
+     * generated. */
     g->max_tokens = j->req.max_tokens - g->completion_total;
-    int room = pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess);
-    g->saw_tool_start = false;
-    g->saw_tool_end = false;
-    g->saw_orphan_tool_end = false;
-    g->tool_scan_from = 0;
-    g->next_tool_progress = 128;
+    int room = (pulsar_session_ctx(s->sess) - pulsar_session_pos(s->sess).before()).raw();
     g->next_decode_log = 50;
     if (g->max_tokens < 0) g->max_tokens = 0;
     if (g->max_tokens > room) g->max_tokens = room;
     s->trace_event(g->trace_id, "prefill done; decode_max=%d ctx_room=%d", g->max_tokens, room);
     g->decode_t0 = server_now_sec();
-    /* Snapshot the session's cumulative DSpark counters so gen_step_finish can
-     * diff them into this request's accept-rate/tokens-per-step. Re-snapshotting
-     * here (decode_again also lands here) keeps the diff consistent with the
-     * reset completion/decode_t0 for the attempt that actually finishes. */
-    pulsar_session_spec_metrics(s->sess, &g->spec_start);
+    /* L119: reset the request-scoped DSpark accumulators (decode_again also
+     * lands here, keeping them consistent with the reset completion/decode_t0
+     * for the attempt that actually finishes). The spec-batched lane fills
+     * them per round. */
+    g->req_spec_draft = 0;
+    g->req_spec_accepted = 0;
+    g->req_spec_rounds = 0;
+    g->req_spec_gen = 0;
     g->last_decode_log_t = g->decode_t0;
     g->last_decode_log_completion = 0;
     g->thinking = thinking_state_from_prompt(&j->req);
-    g->thinking_gates_tool_markers = pulsar_think_mode_enabled(j->req.think_mode);
-    g->tool_scan_waiting_for_think_close =
-        g->thinking_gates_tool_markers && g->thinking.inside;
-    g->think_recovery_scan_from = 0;
-    g->dspark_spec_enabled = getenv("PULSAR_DSPARK_DISABLE") == NULL;
-    dsml_decode_tracker_init(&g->dsml_tracker);
+    g->think_closed = false;   /* L344: the attempt's own block (think_tokens spans attempts) */
+    /* A logprobs request decodes WITHOUT speculation.  The fused DSpark step
+     * verifies K drafts in one batch and keeps each position's target row only
+     * inside that batch; by the time pulsar_session_generate_speculative
+     * returns, the session's logits describe the position AFTER the last
+     * committed token and the per-draft rows are gone.  There is no correct
+     * distribution left to report for an accepted draft token, and the
+     * drafter's own is a different model — so the choice is fewer tokens per
+     * second, never a number from the wrong distribution. */
+    g->spec_enabled = !j->req.logprobs;
+    /* Entries from a superseded attempt (tool-error recovery) go with the
+     * text they described: gen_decode_init discards g->text, so the ledger
+     * restarts with it. */
+    logprob_ledger_reset(&g->logprobs);
+    g->logprobs.enabled = j->req.logprobs;
+    g->logprobs.top_k = j->req.top_logprobs;
 
-    /* tool_choice="required": the prompt was prefilled into an open DSML
-     * tool_calls block (thinking skipped: prompt ends "</think>\n\n<tool_calls>").
-     * Seed the output with that exact prefix — including the closing </think> so
-     * the (thinking-mode) parser sees reasoning end and a complete tool block —
-     * and prime the trackers to "inside tool call"; the model now generates only
-     * the invoke body. */
-    if (j->req.kind == REQ_CHAT && j->req.force_tool_call) {
-        request_forced_tool_seed(&j->req, &g->text);
-        g->saw_tool_start = true;
-        g->tool_scan_waiting_for_think_close = false;
-        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
-        g->tool_scan_from = g->text.len;
+    /* L272 P3: the family's output parser for this attempt (a retry attempt starts a fresh one) */
+    g->parser = j->req.family->output;
+    if (g->parser_st) g->parser->destroy(g->parser_st);
+    g->parser_st = g->parser->create(s, g, g->err, sizeof(g->err));
+    if (!g->parser_st) {
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
+    }
+    /* tool_choice="required": the prompt was prefilled into an open tool-call block (thinking
+     * skipped).  Seed the output with that exact prefix and let the parser read it as emitted; the
+     * model now generates only the call's body. */
+    if (j->req.kind == REQ_CHAT && j->req.force_tool_call && j->req.family->forced_call_seed) {
+        j->req.family->forced_call_seed(&j->req, &g->text);
+        if (g->parser->seed) g->parser->seed(g->parser_st, g);
         g->plain_stream_pos = g->text.len;
+    }
+    /* L303: the turn's grammar gate, past the seed (an unnamed forced call's name and arguments are the
+     * grammar's from here: the seed ends before the name's opener) */
+    if (!gen_constrain_begin(s, g)) {
+        g->finish = "error";
+        g->phase = GEN_FINISH;
+        return;
     }
     g->phase = GEN_DECODE;
 }
@@ -1270,12 +1696,21 @@ void server::gen_decode_init(session_slot *sl) {
 /* Sampling contract: request_init() pre-fills the engine defaults, so the
  * request values are already correct for non-thinking requests. In thinking
  * mode the engine defaults are re-asserted, but ONLY for parameters the
- * client left absent (per-param has_* flags set in api_parse.c); anything the
+ * client left absent (per-param has_* flags set in api_parse.cpp); anything the
  * client sent explicitly is respected as-is. That includes an explicit
- * temperature==0, which selects greedy decode so DSpark speculative decode
- * (greedy-only) can engage. Tool-call payload forcing (temperature=0 while
- * decoding structured tool output, in gen_step_decode) is a separate,
+ * temperature==0, which selects greedy decode -- and nothing more: it does NOT
+ * decide whether DSpark runs. Speculative decode is gated on one condition,
+ * `spec_enabled = !req.logprobs` above, and the accept walk (session_spec.cpp,
+ * on the device since L302) draws every verify row the plain sampler's way --
+ * greedy argmax at temperature 0, THE sampler's keyed draw otherwise -- so one
+ * rule serves both. Tool-call payload forcing (temperature=0 while
+ * decoding structured tool output, in gen_resolve_sampling_decode) is a separate,
  * deliberate override applied on top of this. */
+/// @param req          the request
+/// @param temperature  receives the temperature
+/// @param top_k        receives top-k (0 = off)
+/// @param top_p        receives top-p
+/// @param min_p        receives min-p
 void gen_resolve_sampling(const request *req, float *temperature,
                                  int *top_k, float *top_p, float *min_p) {
     *temperature = req->temperature;
@@ -1292,6 +1727,148 @@ void gen_resolve_sampling(const request *req, float *temperature,
 
 
 
+/* Decode-lane sampling resolution: gen_resolve_sampling plus the tool-call
+ * greedy override (temperature=0 while the decode sits on a call's structure;
+ * its payload -- a string-typed value or a JSON string inside another value --
+ * samples normally: the DSML tracker's payload spans for DeepSeek, the Qwen
+ * parser's in_payload for Qwen -- L284 P6, one rule). L116: ONE authority for
+ * every decode lane — classic, plain-batched, spec-batched, mixed — so a tool
+ * request samples the same wherever the scheduler routes it.  Granularity is
+ * one resolution per TOKEN in every lane: the plain lanes resolve before each
+ * draw, and a speculative round takes the override at each of its positions
+ * (gen_spec_greedy_rows; L296 toolsample -- it was once per round, so a round
+ * that crossed from a call's structure into its payload drew the payload's
+ * first tokens greedy, and spec != plain at T > 0). */
+/// @param g            the generation state (its request and output parser)
+/// @param temperature  receives the temperature (0 on a tool call's structure)
+/// @param top_k        receives top-k
+/// @param top_p        receives top-p
+/// @param min_p        receives min-p
+void gen_resolve_sampling_decode(const gen_state *g, float *temperature,
+                                 int *top_k, float *top_p, float *min_p) {
+    const request *req = &g->j->req;
+    gen_resolve_sampling(req, temperature, top_k, top_p, min_p);
+    if (req->kind != REQ_CHAT || !req->has_tools) return;
+    if (g->parser_st && g->parser->in_tool_call(g->parser_st, g)) *temperature = 0.0f;
+}
+
+
+
+/* The emit path's byte release -- gen_emit_token's, and (L296) the spec lane's per-position probe's on copies of the
+ * same state: `text` (len bytes) just grew by `piece`, its last piece_len bytes.  The reasoning tracker and the stop
+ * scan's resume point advance, and the return is how many bytes of `text` the stop-string scan releases (what the
+ * client stream and the output parser are given).  A client stop sequence that matched sets *hit_stop, *stop_pos and
+ * *stop_len. */
+size_t gen_release(const stop_list *stops, const char *text, size_t len, const char *piece, size_t piece_len,
+                   size_t plain_stream_pos, thinking_state *thinking, size_t *stop_scan_from,
+                   bool *hit_stop, size_t *stop_pos, size_t *stop_len) {
+    const bool was_thinking = thinking->inside;
+    thinking->feed(piece, piece_len);
+    /* L077 (stop-in-reasoning): client stop sequences describe the VISIBLE
+     * answer, not the reasoning stream -- matching them inside <think>
+     * truncates mid-block and, with no </think> ever emitted, the finish
+     * parse routes everything to reasoning_content and the client gets an
+     * empty answer. Suppress matching while inside, and on the close jump
+     * the scan to the start of the closing piece (the tracker reports no
+     * byte offset, so at most the think-tail bytes of that one piece stay
+     * scannable -- the conservative side of the boundary). */
+    if (was_thinking && !thinking->inside) {
+        const size_t close_base = len - piece_len;
+        if (*stop_scan_from < close_base) *stop_scan_from = close_base;
+    }
+    *hit_stop = !thinking->inside && stop_list_find_from(stops, text, *stop_scan_from, stop_pos, stop_len);
+    size_t stream_len = *hit_stop ? *stop_pos : stop_list_stream_safe_len(stops, len);
+    if (stream_len > len) stream_len = len;
+    stream_len = utf8_stream_safe_len(text, plain_stream_pos, stream_len, *hit_stop);
+    if (!*hit_stop && stops->max_len > 1) {
+        const size_t hold = stops->max_len - 1;
+        *stop_scan_from = len > hold ? len - hold : 0;
+    }
+    return stream_len;
+}
+
+/* The request streams g->text as it is released (plain_stream_pos follows the release). */
+bool gen_streams_plain(const gen_state *g) {
+    return g->j->req.stream && !g->structured_stream;
+}
+
+/// @brief Whether the tool-call greedy override can change a draw: a chat with tools, a parser, temperature > 0.
+/// @param g  the generation state
+/// @return true when the per-position override must be computed (gen_spec_greedy_rows_text)
+static bool gen_tool_override_varies(const gen_state *g) {
+    const request *req = &g->j->req;
+    float temperature, top_p, min_p;
+    int top_k;
+    gen_resolve_sampling(req, &temperature, &top_k, &top_p, &min_p);
+    return req->kind == REQ_CHAT && req->has_tools && g->parser_st && temperature > 0.0f;
+}
+
+/* L296 toolsample: gen_resolve_sampling_decode's tool-call override at EVERY position of a speculative round, as the
+ * plain lane evaluates it token by token (emit a token, resolve, draw the next).  pieces[0..n) are the texts of the
+ * round's tokens the stream has not taken yet, in order -- the base unless it was streamed before the forward
+ * (`base_emitted`), then the drafts; NULL = a stop token.  Bit i of the result = the token after the base and drafts
+ * 0..i-1 (verify row i; row K is a full accept's carry) sits in a call's STRUCTURE, which the plain lane draws greedy.
+ *
+ * The positions are read off a SCRATCH copy of the decode-time state -- the output parser's tracking (its probe),
+ * the reasoning tracker, the stop scan's resume point, the streamed prefix and the text -- advanced by the emit
+ * path's own release rule (gen_release) and the parser's own reading, so each bit is what in_tool_call says once the
+ * tokens before it are emitted.  Past a token that ends the stream (a stop token, a stop sequence) nothing is
+ * emitted: those bits repeat the last, and the server never streams the rows they govern.  0 for a request the
+ * override never touches (not a chat with tools) or that is greedy throughout. */
+uint32_t gen_spec_greedy_rows_text(const gen_state *g, const char *const *pieces, const size_t *piece_lens, int n,
+                                   bool base_emitted) {
+    if (!gen_tool_override_varies(g)) return 0u;
+    const request *req = &g->j->req;
+    void *probe = g->parser->probe_new(g->parser_st);
+    buf text;
+    memset(&text, 0, sizeof text);
+    if (g->text.len) buf_append(&text, g->text.ptr, g->text.len);
+    thinking_state thinking = g->thinking;
+    size_t stop_scan_from = g->stop_scan_from;
+    size_t plain_stream_pos = g->plain_stream_pos;
+    bool greedy = g->parser->in_tool_call(probe, g);
+    uint32_t bits = base_emitted && greedy ? 1u : 0u;   /* row 0 follows a streamed base: the state as it stands */
+    int row = base_emitted ? 1 : 0;
+    bool live = true;
+    for (int i = 0; i < n && row < 32; i++, row++) {
+        if (live && !pieces[i]) live = false;
+        if (live) {
+            buf_append(&text, pieces[i], piece_lens[i]);
+            size_t stop_pos = 0, stop_len = 0;
+            bool hit_stop = false;
+            const size_t upto = gen_release(&req->stops, text.ptr, text.len, pieces[i], piece_lens[i],
+                                            plain_stream_pos, &thinking, &stop_scan_from, &hit_stop, &stop_pos,
+                                            &stop_len);
+            if (hit_stop) {
+                live = false;
+            } else {
+                if (gen_streams_plain(g) && upto > plain_stream_pos) plain_stream_pos = upto;
+                g->parser->probe_feed(probe, g, text.ptr, text.len, upto);
+                greedy = g->parser->in_tool_call(probe, g);
+            }
+        }
+        if (greedy) bits |= 1u << row;
+    }
+    buf_free(&text);
+    g->parser->probe_free(probe);
+    return bits;
+}
+
+/* gen_spec_greedy_rows_text over the round's token ids (the engine's texts and stop set). */
+uint32_t gen_spec_greedy_rows(server *s, const gen_state *g, const int *toks, int n, bool base_emitted) {
+    if (!gen_tool_override_varies(g)) return 0u;
+    char *pieces[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    size_t lens[PULSAR_SPEC_LOGITS_ROWS + 1] = {};
+    if (n > (int)PULSAR_SPEC_LOGITS_ROWS + 1) pulsar_die("gen_spec_greedy_rows: more tokens than a round's rows");
+    for (int i = 0; i < n; i++) {
+        pieces[i] = pulsar_token_is_stop(s->engine, toks[i]) ? NULL : pulsar_token_text(s->engine, toks[i], &lens[i]);
+    }
+    const uint32_t bits = gen_spec_greedy_rows_text(g, pieces, lens, n, base_emitted);
+    for (int i = 0; i < n; i++) free(pieces[i]);
+    return bits;
+}
+
+
 /* Emit one already-decoded token into the response stream: append it to the
  * accumulated text, feed the thinking/DSML trackers, run stop-string and
  * tool-marker detection, and drive every active protocol stream projection
@@ -1299,21 +1876,27 @@ void gen_resolve_sampling(const request *req, float *temperature,
  * loop must STOP after this token (EOS, a stop string, a completed tool_calls
  * block, or a client write error), with g->finish (and g->err on error) set.
  *
- * Factored out of gen_step_decode's per-token inner loop (plan Tier-2 Step 5)
- * so both drivers share ONE emit path: the classic spec/plain decode loop
- * below AND the batched multi-session scatter (which samples each live bank's
- * row on the host, then calls this to stream that bank's slot). It touches
+ * Factored out of the classic decode loop's per-token inner loop (Tier-2 Step 5)
+ * so every driver shares ONE emit path: the classic spec/plain decode loop
+ * below AND the batched multi-session lanes (which sample each live bank's
+ * row on the host, then call this to stream that bank's slot). It touches
  * ONLY host state hung off sl->gen + j->req + the client fd — no engine/CUDA
- * call except pulsar_token_text and the tool-recovery sync (chat_think_tool_
- * recovery, which the batched path never reaches because n>=2 is plain,
- * tool-gated decode by contract). Behavior for the single-session path is
- * byte-identical to the pre-factoring inner loop. */
+ * call except pulsar_token_text. That host-only property is what makes the
+ * L116 tool admission to the batched lanes sound: all tool-marker tracking,
+ * thinking-recovery, and stop handling here runs identically in every lane.
+ * Behavior for the single-session path is byte-identical to the
+ * pre-factoring inner loop. */
 bool server::gen_emit_token(session_slot *sl, int token) {
     auto *s = this;
     gen_state *g = sl->gen;
     job *j = g->j;
-    if (token == pulsar_token_eos(s->engine)) {
+    if (pulsar_token_is_stop(s->engine, token)) {
         g->finish = "stop";
+        return true;
+    }
+    /* L303: the gate follows every emitted token (a stop never reaches it: the turn ends there) */
+    if (!gen_constrain_accept(s, g, token)) {
+        g->finish = "error";
         return true;
     }
 
@@ -1327,27 +1910,26 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
     s->trace_piece(g->trace_id, piece, piece_len);
     buf_append(&g->text, piece, piece_len);
-    g->thinking.feed(piece, piece_len);
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        dsml_decode_tracker_update(&g->dsml_tracker, g->text.ptr, g->text.len);
+    if (!logprob_commit(&g->logprobs, s->engine, token, piece, piece_len, g->text.len)) {
+        server_log(PULSAR_LOG_WARNING,
+                   "pulsar-server: chat ctx=%s emitted a token with no captured "
+                   "distribution after %d tokens; logprobs dropped for this request",
+                   g->ctx_span, g->completion);
     }
-
     size_t stop_pos = 0, stop_len = 0;
-    bool hit_stop = stop_list_find_from(&j->req.stops, g->text.ptr,
-                                        g->stop_scan_from,
-                                        &stop_pos, &stop_len);
-    size_t stream_len = hit_stop ?
-        stop_pos : stop_list_stream_safe_len(&j->req.stops, g->text.len);
-    if (stream_len > g->text.len) stream_len = g->text.len;
-    stream_len = utf8_stream_safe_len(g->text.ptr, g->plain_stream_pos,
-                                      stream_len, hit_stop);
-    if (!hit_stop && j->req.stops.max_len > 1) {
-        const size_t hold = j->req.stops.max_len - 1;
-        g->stop_scan_from = g->text.len > hold ? g->text.len - hold : 0;
+    bool hit_stop = false;
+    const bool was_inside = g->thinking.inside;   /* L344: the token's side of the block */
+    const size_t stream_len = gen_release(&j->req.stops, g->text.ptr, g->text.len, piece, piece_len,
+                                          g->plain_stream_pos, &g->thinking, &g->stop_scan_from,
+                                          &hit_stop, &stop_pos, &stop_len);
+    /* L344: a token inside the block spends the budget; the one that closes it latches the block closed */
+    if (was_inside && !g->think_closed) {
+        if (g->thinking.inside) g->think_tokens++;
+        else g->think_closed = true;
     }
 
-    if (j->req.stream && !g->structured_stream && stream_len > g->plain_stream_pos) {
-        char *delta = xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
+    if (gen_streams_plain(g) && stream_len > g->plain_stream_pos) {
+        char *delta = server_xstrndup(g->text.ptr + g->plain_stream_pos, stream_len - g->plain_stream_pos);
         bool ok = sse_chunk(j->fd, &j->req, g->id, delta, NULL);
         free(delta);
         if (!ok) {
@@ -1358,28 +1940,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         }
         g->plain_stream_pos = stream_len;
     }
-    if (j->req.stream && j->req.api == API_ANTHROPIC &&
-        !anthropic_sse_stream_update(j->fd, s, &j->req, g->id,
-                                     &g->anthropic_live, g->text.ptr, stream_len,
-                                     false)) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
-        return true;
-    }
-    if (g->openai_live_chat &&
-        !openai_sse_stream_update(j->fd, s, &j->req, g->id,
-                                  &g->openai_live, g->text.ptr, stream_len,
-                                  false)) {
-        g->finish = "error";
-        snprintf(g->err, sizeof(g->err), "client stream write failed");
-        free(piece);
-        return true;
-    }
-    if (g->responses_live_chat &&
-        !responses_sse_stream_update(j->fd, &j->req,
-                                     &g->responses_live, g->text.ptr, stream_len,
-                                     false)) {
+    /* the family's output parser: its decode-time tracking, and the released bytes into the sink */
+    if (!g->parser->feed(g->parser_st, s, g, stream_len, false)) {
         g->finish = "error";
         snprintf(g->err, sizeof(g->err), "client stream write failed");
         free(piece);
@@ -1387,81 +1949,15 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
     free(piece);
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        if (g->thinking_gates_tool_markers && g->thinking.inside) {
-            /* A DSML block inside reasoning is not executable, and an opening
-             * marker alone can be quoted protocol text. A COMPLETE block is
-             * unambiguous enough to recover: stop with finish=tool_calls and
-             * let the parse-side recovery return the call structurally
-             * (upstream ds4 51a1c14). */
-            if (complete_tool_call_inside_thinking(
-                    g->text.ptr, g->text.len, &g->think_recovery_scan_from)) {
-                g->saw_tool_start = true;
-                g->saw_tool_end = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s recovered a complete tool call "
-                           "from unclosed reasoning after %d generated tokens",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           g->completion);
-                s->trace_event(g->trace_id,
-                            "recovered complete tool call from unclosed reasoning after %d generated tokens",
-                            g->completion);
-            } else {
-                g->tool_scan_waiting_for_think_close = true;
-                g->tool_scan_from = g->text.len;
-            }
-        } else {
-            if (g->tool_scan_waiting_for_think_close) {
-                const char *think_end = find_last_substr(g->text.ptr, "</think>");
-                g->tool_scan_from = think_end ? (size_t)((think_end + 8) - g->text.ptr) : g->text.len;
-                if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-                g->tool_scan_waiting_for_think_close = false;
-            }
-            if (g->tool_scan_from > g->text.len) g->tool_scan_from = g->text.len;
-            const char *tool_scan = g->text.ptr ? g->text.ptr + g->tool_scan_from : "";
-            bool orphan_end = false;
-            bool old_start = g->saw_tool_start;
-            bool old_end = g->saw_tool_end;
-            observe_tool_markers(tool_scan, &g->saw_tool_start, &g->saw_tool_end, &orphan_end);
-            if (orphan_end && !g->saw_orphan_tool_end) {
-                g->saw_orphan_tool_end = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s ignored orphan tool-call end marker after %d generated tokens",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           g->completion);
-                s->trace_event(g->trace_id,
-                            "ignored orphan tool-call end marker after %d generated tokens",
-                            g->completion);
-            }
-            if (g->saw_tool_start && !old_start) {
-                s->trace_event(g->trace_id, "entered tool-call block after %d generated tokens", g->completion);
-            }
-            if (g->saw_tool_end && !old_end) {
-                s->trace_event(g->trace_id, "closed tool-call block after %d generated tokens", g->completion);
-            }
-            const size_t marker_hold = 80;
-            size_t hold_from = g->text.len > marker_hold ? g->text.len - marker_hold : 0;
-            if (hold_from > g->tool_scan_from) g->tool_scan_from = hold_from;
-            if (s->trace && g->completion >= g->next_tool_progress) {
-                s->trace_event(g->trace_id,
-                            "progress gen=%d dsml_start=%d dsml_end=%d",
-                            g->completion, g->saw_tool_start ? 1 : 0, g->saw_tool_end ? 1 : 0);
-                g->next_tool_progress += 128;
-            }
-        }
-    }
-
     if (g->completion >= g->next_decode_log) {
+        bool tool_open = false, tool_closed = false;
+        if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
         log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
                             g->responses_protocol,
                             j->req.has_tools,
                             g->thinking.inside,
-                            g->saw_tool_start,
-                            g->saw_tool_end,
+                            tool_open,
+                            tool_closed,
                             g->decode_t0,
                             &g->last_decode_log_t,
                             &g->last_decode_log_completion);
@@ -1469,7 +1965,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
     }
 
     if (hit_stop) {
-        (void)stop_len;
+        free(g->stop_sequence);
+        g->stop_sequence = server_xstrndup(g->text.ptr + stop_pos, stop_len);
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
@@ -1477,7 +1974,8 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         return true;
     }
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->saw_tool_end) {
+    /* the family's turn ends before the stop token (DeepSeek: a closed DSML block) */
+    if (j->req.kind == REQ_CHAT && j->req.has_tools && g->parser->turn_complete(g->parser_st, g)) {
         g->finish = "tool_calls";
         return true;
     }
@@ -1486,106 +1984,16 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 
 
-/* One decode quantum: run the sampling loop for at most
- * PULSAR_SERVER_DECODE_QUANTUM_TOKENS generated tokens, then yield with all loop
- * state parked in gen_state. The session is untouched between quanta, so
- * resuming is exactly the next iteration of the old run-to-completion loop. */
-void server::gen_step_decode(session_slot *sl) {
-    auto *s = this;
-    gen_state *g = sl->gen;
-    job *j = g->j;
-    const int quantum_start = g->completion;
-    bool stop_decode = false;
-
-    /* Once per quantum (~1/s): stop generating for a client that has gone away.
-     * Falls through the normal GEN_FINISH epilogue so the slot, KV checkpoint and
-     * metrics are released exactly as on a natural stop; the final write simply
-     * fails harmlessly on the dead fd. */
-    if (gen_client_disconnected(j->fd)) {
-        server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: client disconnected, abandoning generation after %d tokens",
-                   g->completion);
-        g->phase = GEN_FINISH;
-        return;
-    }
-
-    while (!g_stop_requested && g->completion < g->max_tokens &&
-           pulsar_session_pos(s->sess) < pulsar_session_ctx(s->sess)) {
-        if (g->completion - quantum_start >= PULSAR_SERVER_DECODE_QUANTUM_TOKENS) {
-            sl->tokens_emitted += (uint64_t)(g->completion - quantum_start);
-            return; /* quantum exhausted; phase stays GEN_DECODE */
-        }
-        dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
-            g->dsml_tracker.decode : DSML_DECODE_OUTSIDE;
-        const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (g->saw_tool_start || in_tool_call))) {
-            s->kv_cache_maybe_store_continued(sl);
-        }
-        float temperature, top_p, min_p;
-        int top_k;
-        gen_resolve_sampling(&j->req, &temperature, &top_k, &top_p, &min_p);
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
-            temperature = 0.0f;
-        }
-        int token;
-        int toks[17];
-        int ntok = 0;
-        if (pulsar_engine_has_dspark(s->engine) && g->dspark_spec_enabled) {
-            /* the speculative block owns sampling (exact sampled acceptance at
-             * any temperature; greedy degenerates to the argmax rule) */
-            ntok = pulsar_session_generate_speculative(s->sess,
-                                                    temperature, top_k, top_p, min_p,
-                                                    &g->rng,
-                                                    g->max_tokens - g->completion,
-                                                    pulsar_token_eos(s->engine),
-                                                    toks,
-                                                    (int)(sizeof(toks) / sizeof(toks[0])),
-                                                    g->err,
-                                                    sizeof(g->err));
-            if (ntok < 0) {
-                g->finish = "error";
-                break;
-            }
-        } else {
-            token = pulsar_session_sample(s->sess, temperature, top_k, top_p, min_p, &g->rng);
-            if (token == pulsar_token_eos(s->engine)) {
-                g->finish = "stop";
-                break;
-            }
-            if (pulsar_session_eval(s->sess, token, g->err, sizeof(g->err)) != 0) {
-                g->finish = "error";
-                break;
-            }
-            toks[0] = token;
-            ntok = 1;
-        }
-
-        /* TTFT: stamp the moment the first output token is available. One guarded
-         * clock read for the whole request (branch is predictably not-taken after
-         * the first token), so no meaningful decode-loop overhead. */
-        if (g->first_token_t == 0.0 && ntok > 0) g->first_token_t = server_now_sec();
-
-        for (int ti = 0; ti < ntok && g->completion < g->max_tokens; ti++) {
-            if (s->gen_emit_token(sl, toks[ti])) {
-                /* A speculative block can stop mid-block (tool-call end, stop
-                 * string): tokens ti+1..ntok-1 are already committed to the
-                 * bank's history but never emitted. Leaving them makes the
-                 * live KV frontier disagree with every client-visible byte —
-                 * the thinking-tool checkpoint binds on exactly that identity
-                 * and the next turn would continue over ghost tokens.
-                 * Invalidate, matching the stop-string precedent (a fresh
-                 * prefill rebuilds from the emitted text). */
-                if (ti + 1 < ntok) pulsar_session_invalidate(s->sess);
-                stop_decode = true;
-                break;
-            }
-        }
-        if (stop_decode) break;
-    }
-
-    sl->tokens_emitted += (uint64_t)(g->completion - quantum_start);
-    g->phase = GEN_FINISH;
-}
+/* L118 tombstone (2026-08-26): the classic per-slot decode loop
+ * (gen_step_decode) lived here. Deleted: every GEN_DECODE slot is serviced
+ * by the batched quanta at n >= 1 (worker_spec_batched_quantum /
+ * worker_batched_decode_quantum / worker_mixed_batch_quantum), a solo
+ * session being a batch of one. Parity evidence: rows/L118.md (solo 6x6
+ * A/B unified median 19.32 vs classic 18.95 t/s; decode-floor/sse/coherence
+ * green on the unified lane; disconnect + continued-store + accounting
+ * ported). The engine-level classic API (pulsar_session_eval /
+ * generate_speculative) is unaffected — pulsar-bench/eval/agent and the
+ * gate fixtures still drive it. */
 
 
 
@@ -1602,226 +2010,49 @@ void server::gen_step_finish(session_slot *sl) {
         snprintf(g->err, sizeof(g->err), "shutdown requested");
     }
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        g->saw_tool_start && !g->saw_tool_end && strcmp(g->finish, "error") != 0)
-    {
-        /* Deterministically complete a simple truncation.  Anything more than
-         * missing closing tags stays model-owned: for non-streaming requests,
-         * append a tool error plus prompt reminder to the live session and let
-         * the model issue a fresh call. */
-        bool completed_truncation = false;
-        buf repaired = {0};
-        if (try_repair_dsml(g->text.ptr, g->text.len, &repaired)) {
-            /* Parse repaired text to verify it produces valid tool calls */
-            tool_calls test_calls = {0};
-            char *test_content = NULL;
-            char *test_reasoning = NULL;
-            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
-            free(test_content);
-            free(test_reasoning);
-            if (repair_ok && test_calls.len > 0) {
-                /* Repair succeeded - replace text with repaired version */
-                free(g->text.ptr);
-                g->text.ptr = buf_take(&repaired);
-                g->text.len = strlen(g->text.ptr);
-                g->text.cap = g->text.len ? g->text.len + 1 : 0;
-                g->saw_tool_end = true;
-                completed_truncation = true;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           test_calls.len);
-                s->trace_event(g->trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
-            }
-            tool_calls_free(&test_calls);
-        }
-        if (!completed_truncation) {
-            if (!j->req.stream && !g->dsml_recovery_attempted) {
-                int recovery_tokens = 0;
-                char recovery_err[160] = {0};
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags);
-                s->trace_event(g->trace_id,
-                            "unterminated tool call; continuing with model-visible tool error");
-                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
-                                                "unterminated tool call",
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
-                {
-                    g->dsml_recovery_attempted = true;
-                    server_log(PULSAR_LOG_GENERATION,
-                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               g->ctx_span,
-                               g->req_flags[0] ? " " : "",
-                               g->req_flags,
-                               recovery_tokens);
-                    s->trace_event(g->trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    buf_free(&repaired);
-                    g->completion_total += g->completion;
-                    buf_free(&g->text);
-                    g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
-                    return;
-                }
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
-            } else {
-                g->finish = "error";
-                snprintf(g->err, sizeof(g->err), "unterminated tool call");
-            }
-        }
-        buf_free(&repaired);
+    /* L272 P3: the family's final reading of the turn -- its parse, the shared broken-call rule (L284 P4),
+     * its model-visible retry (the generation loops to a fresh attempt), the stream's ids onto the
+     * calls, its memory, the finish label. */
+    server_turn turn;
+    memset(&turn, 0, sizeof turn);
+    turn.finish = g->finish;
+    const bool stream_ok = g->parser->finish(g->parser_st, s, sl, g, &turn);
+    if (turn.retry) {
+        g->recovery_attempted = true;
+        g->completion_total += g->completion;
+        buf_free(&g->text);
+        free(turn.content);
+        free(turn.reasoning);
+        tool_calls_free(&turn.calls);
+        g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
+        return;
     }
 
     if (g->completion > g->last_decode_log_completion) {
+        bool tool_open = false, tool_closed = false;
+        if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
         log_decode_progress(j->req.kind, g->prompt_tokens, g->completion,
                             g->responses_protocol,
                             j->req.has_tools,
                             g->thinking.inside,
-                            g->saw_tool_start,
-                            g->saw_tool_end,
+                            tool_open,
+                            tool_closed,
                             g->decode_t0,
                             &g->last_decode_log_t,
                             &g->last_decode_log_completion);
     }
 
     if (j->req.stream && !g->structured_stream && g->text.len > g->plain_stream_pos) {
-        char *tail = xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
+        char *tail = server_xstrndup(g->text.ptr + g->plain_stream_pos, g->text.len - g->plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, g->id, tail, NULL)) g->finish = "error";
         free(tail);
     }
 
-    tool_calls parsed_calls = {0};
-    char *parsed_content = NULL;
-    char *parsed_reasoning = NULL;
-    const char *final_finish = g->finish;
-    bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
-        bool parsed_ok = parse_generated_message_for_response(
-            g->text.ptr ? g->text.ptr : "",
-            j->req.has_tools,
-            g->saw_tool_start,
-            pulsar_think_mode_enabled(j->req.think_mode),
-            &final_finish,
-            g->err,
-            sizeof(g->err),
-            &parsed_content,
-            &parsed_reasoning,
-            &parsed_calls,
-            &recovered_tool_parse_failure);
-        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && g->saw_tool_start) {
-            /* parse_generated_message failed even though DSML was present.
-             * Semantic repair is intentionally avoided: if the parser cannot
-             * execute the block, feed the model a tool error and the protocol
-             * reminder so it owns the corrected next action. */
-            if (!j->req.stream && !g->dsml_recovery_attempted) {
-                int recovery_tokens = 0;
-                char recovery_err[160] = {0};
-                const char *detail = g->err[0] ? g->err : "invalid tool call";
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags);
-                s->trace_event(g->trace_id,
-                            "invalid tool call; continuing with model-visible tool error");
-                if (s->continue_after_invalid_dsml(sl, &j->req, &g->thinking,
-                                                detail,
-                                                &recovery_tokens,
-                                                recovery_err,
-                                                sizeof(recovery_err)))
-                {
-                    g->dsml_recovery_attempted = true;
-                    server_log(PULSAR_LOG_GENERATION,
-                               "pulsar-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
-                               g->ctx_span,
-                               g->req_flags[0] ? " " : "",
-                               g->req_flags,
-                               recovery_tokens);
-                    s->trace_event(g->trace_id,
-                                "tool-error continuation appended %d tokens",
-                                recovery_tokens);
-                    free(parsed_content);
-                    free(parsed_reasoning);
-                    tool_calls_free(&parsed_calls);
-                    g->completion_total += g->completion;
-                    buf_free(&g->text);
-                    g->phase = GEN_DECODE_INIT; /* the old goto decode_again */
-                    return;
-                }
-                final_finish = "error";
-                snprintf(g->err, sizeof(g->err), "invalid tool call recovery failed: %s",
-                         recovery_err[0] ? recovery_err : "unknown error");
-            }
-            if (!parsed_ok) {
-                /* Print raw DSML snippet for debugging */
-                size_t dsml_snippet_len = 0;
-                const char *dsml_start = NULL;
-                const char *p;
-                for (p = g->text.ptr; p && (size_t)(p - g->text.ptr) < g->text.len - 20; p++) {
-                    if ((strncmp(p, PULSAR_TOOL_CALLS_START, strlen(PULSAR_TOOL_CALLS_START)) == 0) ||
-                        (strncmp(p, PULSAR_TOOL_CALLS_START_SHORT, strlen(PULSAR_TOOL_CALLS_START_SHORT)) == 0) ||
-                        (strncmp(p, "<tool_calls>", 12) == 0)) {
-                        dsml_start = p;
-                        break;
-                    }
-                }
-                if (dsml_start) {
-                    dsml_snippet_len = g->text.len - (dsml_start - g->text.ptr);
-                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
-                }
-                /* Also log a snippet of the full text to see what the model output */
-                size_t text_snippet_len = g->text.len > 300 ? 300 : g->text.len;
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           final_finish,
-                           g->text.len,
-                           g->saw_tool_start,
-                           g->saw_tool_end,
-                           (int)text_snippet_len,
-                           g->text.ptr ? g->text.ptr : "(null)");
-                server_log(PULSAR_LOG_WARNING,
-                           "pulsar-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
-                           g->ctx_span,
-                           g->req_flags[0] ? " " : "",
-                           g->req_flags,
-                           (int)dsml_snippet_len,
-                           dsml_start ? dsml_start : "(none)");
-                s->trace_event(g->trace_id,
-                            "invalid tool call returned as assistant text finish=%s",
-                            final_finish);
-            }
-        }
-        if (parsed_calls.len) {
-            if (g->openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &g->openai_live);
-            if (j->req.api == API_ANTHROPIC && j->req.stream)
-                apply_anthropic_stream_tool_ids(&parsed_calls, &g->anthropic_live);
-            s->assign_tool_call_ids(&parsed_calls, j->req.api);
-            s->tool_memory_remember(&parsed_calls);
-            if (s->gen_web_search_round(sl, &parsed_calls,
-                                        parsed_content, parsed_reasoning))
-            {
-                free(parsed_content);
-                free(parsed_reasoning);
-                tool_calls_free(&parsed_calls);
-                return; /* result spliced; phase reset to GEN_DECODE_INIT */
-            }
-            final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
-            s->responses_live_clear(sl);
-        }
-    }
+    tool_calls parsed_calls = turn.calls;
+    char *parsed_content = turn.content;
+    char *parsed_reasoning = turn.reasoning;
+    const char *final_finish = !strcmp(g->finish, "error") ? g->finish : turn.finish;
+    if (j->req.kind == REQ_CHAT && !parsed_calls.len && j->req.api == API_RESPONSES) s->responses_live_clear(sl);
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
                            g->responses_protocol);
 
@@ -1837,27 +2068,34 @@ void server::gen_step_finish(session_slot *sl) {
         t->prompt_n = g->prompt_tokens;
         t->cached_n = j->req.cache_read_tokens;
         t->decode_n = g->completion_total + g->completion;
-        pulsar_spec_metrics spec_end;
-        pulsar_session_spec_metrics(s->sess, &spec_end);
-        t->spec_gen = spec_end.gen_tokens - g->spec_start.gen_tokens;
-        t->spec_accepted = spec_end.accepted_tokens - g->spec_start.accepted_tokens;
-        t->spec_draft = spec_end.draft_tokens - g->spec_start.draft_tokens;
-        t->spec_drafts = spec_end.num_drafts - g->spec_start.num_drafts;
-        t->spec_active = t->spec_gen > 0; /* the fused spec loop ran this request */
+        /* L119: request-scoped accumulators from the spec-batched lane — NOT
+         * shared-session counter deltas, which bank save/restore rolls and
+         * concurrent banks mix (the response reported impossible values). */
+        t->spec_gen = g->req_spec_gen;
+        t->spec_accepted = g->req_spec_accepted;
+        t->spec_draft = g->req_spec_draft;
+        t->spec_drafts = g->req_spec_rounds;
+        t->spec_active = t->spec_gen > 0; /* the spec lane ran this request */
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
          * without scraping every response. */
         s->observe_request_timings(t, finish_t - g->t0);
     }
+    /* L324: the pool's duplicate-prefix census at each request's end (host carries only, off the decode path) */
+    s->kv_dup_census_update();
 
+    bool tool_open = false, tool_closed = false;
+    if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
     s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,
-                 g->saw_tool_start, g->saw_tool_end,
+                 tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        /* the visible suffix is the family's sampled-turn render; a family without one keeps no
+         * visible memory (its renderer refuses a request that needs the live state) */
+        if (j->req.family->assistant_turn_sampled && strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -1879,8 +2117,12 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
+        /* a family without a tool-result tail keeps no live tool state (its renderer refuses a
+         * continuation that would need it), so nothing is remembered for it */
+        /* L337: nor after an edited prompt -- the KV is the edited history, and the client's next request renders
+         * as sent unless its own edits clear the same parts, so only a prefix match can tell */
+        if (parsed_calls.len && j->req.family->tool_result_tail && !j->req.ctx_edited &&
+            strcmp(final_finish, "error") && strcmp(final_finish, "length"))
         {
             s->anthropic_live_remember(sl, &parsed_calls);
         } else {
@@ -1888,21 +2130,20 @@ void server::gen_step_finish(session_slot *sl) {
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    if (!j->req.family->assistant_turn_sampled) {
+        /* the family has no sampled-turn render, so no canonical rewrite: the next request resolves
+         * by exact token / rendered-text prefix only (L264 retired the binding there was to clear) */
+    } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         pulsar_think_mode_enabled(j->req.think_mode) &&
         !j->req.force_tool_call)
     {
-        /* Tool call with thinking on: the reasoning is in the live KV, and the
-         * client replays this turn with the reasoning preserved (agentic clients
-         * echo reasoning_content so the model keeps its chain of thought), so we
-         * remember the reasoning-PRESERVED bytes the next request will render as a
-         * key and keep the live tokens — the next request byte-matches the key and
-         * continues from live KV (or a disk-reloaded checkpoint keyed by the same
-         * visible transcript) with no rebuild. */
-        s->remember_tool_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
-                                          parsed_content ? parsed_content : "",
-                                          parsed_reasoning, &parsed_calls);
+        /* Tool call with thinking on: nothing to remember or rewrite (L264).  A
+         * client that replays the reasoning byte-matches the live KV through it;
+         * one that strips it resumes from this turn's prompt-end grid checkpoint.
+         * Either way the next request's sync finds its own resume point, so the
+         * canonical rewrite below -- which would re-render hidden reasoning --
+         * stays out of this turn. */
     } else if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         s->should_canonicalize_tool_checkpoint(&parsed_calls))
@@ -1916,51 +2157,38 @@ void server::gen_step_finish(session_slot *sl) {
         s->canonicalize_tool_checkpoint(sl, j, g->ctx_span, g->trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        s->thinking_live_clear(sl);
-    } else if (parsed_calls.len) {
-        s->thinking_live_clear(sl);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &g->thinking, final_finish)) {
-        s->remember_thinking_checkpoint(sl, j, g->ctx_span, g->trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        s->thinking_live_clear(sl);
     }
 
-    if (j->req.stream) {
+    if (!strcmp(final_finish, "error")) {
+        /* Internal generation failure (decode / bank-restore / etc.). Do NOT
+         * put finish_reason:"error" on the wire -- it is not a valid enum
+         * value and strict SDKs reject the chunk -- nor return HTTP 200 with
+         * empty content (which reads as a blank successful answer). Streaming:
+         * the 200 event-stream headers are already sent, so emit an SSE error
+         * event, matching the pre-generation failure path. Non-streaming: a
+         * real 500 with the protocol's error envelope. */
+        const char *emsg = g->err[0] ? g->err : "internal generation error";
+        job_reply_error(j, j->req.stream, 500, emsg);
+    } else if (j->req.stream) {
         bool response_ok = true;
-        if (j->req.api == API_ANTHROPIC) {
-            response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, g->id, &g->anthropic_live,
-                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    &parsed_calls, final_finish,
-                                                    g->completion_total + g->completion);
-        } else if (g->openai_live_chat) {
-            response_ok = openai_sse_finish_live(j->fd, s, &j->req, g->id, &g->openai_live,
-                                                 g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                 &parsed_calls, final_finish,
-                                                 g->prompt_tokens,
-                                                 g->completion_total + g->completion);
-        } else if (g->responses_live_chat) {
-            /* If parse recovered a malformed tool call back to plain text,
-             * pass parsed_content so the streaming tail can be flushed; in
-             * the normal path parsed_content is the assistant text we already
-             * streamed and the diff is empty. */
-            const char *recover =
-                recovered_tool_parse_failure ? parsed_content : NULL;
-            response_ok = responses_sse_finish_live(j->fd, &j->req, &g->responses_live,
-                                                    g->text.ptr ? g->text.ptr : "", g->text.len,
-                                                    recover,
-                                                    &parsed_calls, final_finish,
-                                                    g->prompt_tokens,
-                                                    g->completion_total + g->completion,
-                                                    g->responses_created_at);
-        } else if (g->structured_stream) {
-            response_ok = sse_chat_finish(j->fd, &j->req, g->id,
-                                          parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
-                                          parsed_reasoning,
-                                          &parsed_calls, final_finish,
-                                          g->prompt_tokens,
-                                          g->completion_total + g->completion);
+        if (g->sink.text) {
+            /* L267: the family's last text into the sink -- DeepSeek's walk
+             * flushes what it held back; a Qwen turn's parser already did -- then
+             * the protocol's finish, which sends any calls not yet streamed. */
+            const int completion = g->completion_total + g->completion;
+            response_ok = stream_ok && g->parser->feed(g->parser_st, s, g, g->text.len, true);
+            if (response_ok && j->req.api == API_ANTHROPIC) {
+                response_ok = anthropic_sse_finish(&g->sink, &parsed_calls, final_finish, g->stop_sequence, completion);
+            } else if (response_ok && j->req.api == API_RESPONSES) {
+                /* A malformed tool call the final reading turned back into text:
+                 * the stream stopped at its marker, so the rest goes out now. */
+                response_ok = responses_sse_finish(j->fd, &j->req, &g->responses_live,
+                                                   turn.tail, turn.tail_len, &parsed_calls,
+                                                   final_finish, g->prompt_tokens, completion,
+                                                   g->responses_created_at);
+            } else if (response_ok) {
+                response_ok = openai_sse_finish(&g->sink, &parsed_calls, final_finish, g->prompt_tokens, completion);
+            }
         } else {
             response_ok = sse_chunk(j->fd, &j->req, g->id, NULL, final_finish) &&
                           sse_done(j->fd, &j->req, g->id, g->prompt_tokens,
@@ -1975,27 +2203,27 @@ void server::gen_step_finish(session_slot *sl) {
                        g->req_flags);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, s->enable_cors, &j->req, g->id,
+        anthropic_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
-                                 &parsed_calls, final_finish,
+                                 &parsed_calls, final_finish, g->stop_sequence,
                                  g->prompt_tokens,
-                                 g->completion_total + g->completion,
-                                 g->web_rounds_json.ptr);
+                                 g->completion_total + g->completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, g->id,
+        responses_final_response(j->fd, &j->req, g->id,
                                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  g->prompt_tokens,
                                  g->completion_total + g->completion);
     } else {
-        final_response(j->fd, s->enable_cors, &j->req, g->id,
+        final_response(j->fd, &j->req, g->id,
                        parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        g->prompt_tokens,
-                       g->completion_total + g->completion);
+                       g->completion_total + g->completion,
+                       &g->logprobs);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -2003,8 +2231,8 @@ void server::gen_step_finish(session_slot *sl) {
                   g->responses_protocol,
                   true,
                   g->thinking.inside,
-                  g->saw_tool_start,
-                  g->saw_tool_end);
+                  tool_open,
+                  tool_closed);
         if (!strcmp(final_finish, "error") && g->err[0]) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
@@ -2059,7 +2287,78 @@ void server::gen_step_finish(session_slot *sl) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
+    /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
+    sl->terminal_pending = strcmp(final_finish, "error") != 0 && g->completion_total + g->completion > 0;
     g->phase = GEN_DONE;
+}
+
+bool server::terminal_checkpoint_step() {
+    auto *s = this;
+    if (s->pool_banks <= 0) return false;
+    session_slot *pick = NULL;
+    for (int i = 0; i < s->n_slots; i++) {
+        session_slot *sl = &s->slots[i];
+        if (!sl->terminal_pending) continue;
+        /* a slot evicted, spilled (its rows are on disk) or bound since no longer has the turn to complete; L353 no. 20: a
+         * dead prefix won't be resumed, so its reply isn't worth an uncancellable sync */
+        if (!sl->provisioned || sl->spilled || sl->active_job || sl->hint_dead) {
+            sl->terminal_pending = false;
+            continue;
+        }
+        if (!pick || sl->last_serviced_us > pick->last_serviced_us) pick = sl;
+    }
+    if (!pick) return false;
+    pick->terminal_pending = false;
+    /* a Responses visible binding keys its replay on the live history's last token (L196): left as decoded */
+    {
+        pulsar::ScopedLock lk(&s->tool_mu);
+        if (pick->responses_live.valid) return true;
+    }
+    const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, pick->bank);
+    const int pf = pulsar_session_bank_prefill_frontier(s->sess, pick->bank).raw();
+    if (!h || h->len <= 0) return true;
+    int C = h->len;
+    if (pulsar_token_is_stop(s->engine, h->v[C - 1])) C--;   /* the render re-spells the stop (L290's join) */
+    if (C <= pf) return true;                                /* nothing decoded past the prefill */
+    if (!s->bank_switch((int)pick->bank)) return true;
+    /* the records keep no image identity: a history holding an image block stays as decoded */
+    if (pulsar_session_image_hashes(s->sess, NULL, 0) > 0) return true;
+    pulsar_tokens target = {0};
+    tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
+    const int old_len = pulsar_session_pos(s->sess).raw();
+    pulsar_session_set_cancel(s->sess, NULL, NULL);
+    pulsar_session_set_progress(s->sess, NULL, NULL);
+    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    const double t0 = server_now_sec();
+    char err[192] = "";
+    /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
+     * its last token first (that sync resumes below the decode rows), then the token */
+    int rc = 0;
+    TokPos origin = TokPos::none();
+    if (C == old_len) {
+        target.len = C - 1;
+        rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+        origin = pulsar_session_resume_origin(s->sess);
+        target.len = C;
+    }
+    if (rc == 0) rc = pulsar_session_sync(s->sess, &target, err, sizeof(err));
+    if (origin.is_none()) origin = pulsar_session_resume_origin(s->sess);
+    pick->committed_pos = pulsar_session_pos(s->sess);
+    if (rc == 0) {
+        /* the bank's frontier moved from the decoded end to C: a live tool binding at the old end describes C now
+         * (the continuation's tail re-spells a dropped stop) */
+        pulsar::ScopedLock lk(&s->tool_mu);
+        if (pick->anthropic_live.valid && pick->anthropic_live.live_tokens == old_len)
+            pick->anthropic_live.live_tokens = C;
+    }
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: terminal checkpoint: bank %u prefilled [%d, %d) of its turn (prefill frontier was %d) "
+               "in %.1f ms%s%s",
+               pick->bank, origin.raw(), C, pf, (server_now_sec() - t0) * 1e3, rc == 0 ? "" : " -- FAILED: ", err);
+    if (rc == 0) s->kv_cache_persist(pick, KV_PERSIST_TERMINAL);
+    else pulsar_session_invalidate(s->sess);   /* the bank's state is no position's; its next turn rebuilds it */
+    pulsar_tokens_free(&target);
+    return true;
 }
 
 
@@ -2070,20 +2369,26 @@ void server::gen_state_free(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     if (!g) return;
-    (void)s;
     /* Callback safety: no gen_state pointer may remain installed anywhere. */
     pulsar_session_set_cancel(s->sess, NULL, NULL);
     pulsar_session_set_progress(s->sess, NULL, NULL);
     pulsar_session_set_display_progress(s->sess, NULL, NULL);
-    anthropic_stream_free(&g->anthropic_live);
-    openai_stream_free(&g->openai_live);
+    if (g->parser_st) g->parser->destroy(g->parser_st);
+    gen_constrain_end(g);
     responses_stream_free(&g->responses_live);
     buf_free(&g->text);
-    buf_free(&g->web_rounds_json);
+    logprob_ledger_free(&g->logprobs);
     pulsar_tokens_free(&g->effective_prompt);
     pulsar_tokens_free(&g->cold_prefix);
     pulsar_tokens_free(&g->batch_pending);
+    if (g->restore) {   /* a job torn down mid-restore: the chain's pin goes with it (L347 I3b) */
+        s->kv_restore_end(&g->restore->r);
+        free(g->restore->text);
+    }
+    free(g->restore);
     free(g->disk_cache_path);
+    free(g->stop_sequence);
+    free(g->think_rows);
     slot_writer_free(&g->writer);
     free(g);
     sl->gen = NULL;
@@ -2099,7 +2404,6 @@ void server::generate_job_begin(session_slot *sl, job *j) {
     g->j = j;
     g->prompt_for_sync = &j->req.prompt;
     g->finish = "length";
-    g->suppressed_continued_last = -1;
     sl->gen = g;
     sl->active_job = j;
     sl->state = SLOT_PREFILLING;
@@ -2107,6 +2411,14 @@ void server::generate_job_begin(session_slot *sl, job *j) {
      * and deferred; drained in generate_job_end. */
     slot_writer_init(&g->writer, j->fd);
     slot_writer_install(&g->writer);
+    /* L249 D: the socket is the worker's from here; a stream the client thread opened stays open, its keepalive
+     * clock continuing in the slot's writer (the heartbeat sweep beats it from here) */
+    bool dead = false;
+    if (job_claim_writes(j, &dead)) {
+        g->progress.headers_sent = true;
+        slot_writer_mark_written(&g->writer);
+    }
+    g->progress.stream_failed = dead;
     s->gen_begin(sl);
 }
 
@@ -2122,8 +2434,14 @@ void server::generate_job_step(session_slot *sl) {
      * mode / when already live. Finding 1: fail the request on a failed spill
      * restore rather than run engine work against the wrong bank's KV. */
     if (!s->bank_switch(sl->bank)) {
-        snprintf(g->err, sizeof g->err,
-                 "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        /* The FIRST error wins: a slot already finishing on an error (a
+         * refused forward, a failed tensor-parallel step -- after which every
+         * bank switch refuses too) must report that cause, not this echo of
+         * it.  Overwriting it here hid the pair's real refusal behind "bank 0
+         * state restore failed" (L241). */
+        if (!g->err[0])
+            snprintf(g->err, sizeof g->err,
+                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
         g->finish = "error";
         if (g->phase == GEN_FINISH) {
             /* Already finishing and the restore STILL fails: run the finish
@@ -2158,6 +2476,10 @@ void server::generate_job_step(session_slot *sl) {
     /* Push any bytes a slow client deferred before spending GPU time. */
     slot_writer_flush(&g->writer);
     switch (g->phase) {
+    case GEN_RESTORE:
+        sl->state = SLOT_PREFILLING;
+        s->gen_step_restore(sl);
+        break;
     case GEN_PREFILL_COLD:
     case GEN_PREFILL_MAIN:
         sl->state = SLOT_PREFILLING;
@@ -2166,13 +2488,13 @@ void server::generate_job_step(session_slot *sl) {
     case GEN_DECODE_INIT:
         sl->state = SLOT_DECODING;
         s->gen_decode_init(sl);
-        if (g->phase != GEN_DECODE) break;
-        /* fall through into the first decode quantum */
-        s->gen_step_decode(sl);
+        /* L118: GEN_DECODE is serviced exclusively by the batched quanta —
+         * the worker's next pass gathers this slot into the batch (a solo
+         * session is a batch of one). The classic per-slot decode loop and
+         * its first-quantum fall-through are deleted; plan 118. */
         break;
     case GEN_DECODE:
         sl->state = SLOT_DECODING;
-        s->gen_step_decode(sl);
         break;
     case GEN_FINISH:
         s->gen_step_finish(sl);
@@ -2187,7 +2509,21 @@ void server::generate_job_step(session_slot *sl) {
 /* Unbind: drain deferred client bytes, free the resumable state. */
 void server::generate_job_end(session_slot *sl) {
     auto *s = this;
-    if (sl->gen) slot_writer_drain(&sl->gen->writer);
+    if (sl->gen) {
+        /* A writer that failed EARLIER already ended the job (lane_should_abandon
+         * / the emit path) and logged why; a drain that fails HERE is the one
+         * failure nothing else reports -- the final response never reached the
+         * client (L190 C3). */
+        slot_writer *w = &sl->gen->writer;
+        const bool failed_before = w->failed;
+        if (!slot_writer_drain(w) && !failed_before)
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: ctx=%s%s%s client stream failed at drain: "
+                       "%zu final bytes undelivered",
+                       sl->gen->ctx_span,
+                       sl->gen->req_flags[0] ? " " : "", sl->gen->req_flags,
+                       w->pending.len - w->off);
+    }
     s->gen_state_free(sl);
     sl->active_job = NULL;
     sl->state = SLOT_IDLE;

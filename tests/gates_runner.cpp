@@ -1,0 +1,913 @@
+/* The model-dependent gates in ONE process (L163).
+ *
+ * `make gates` used to run every model gate as its own program, and every
+ * program streamed the 86 GB model into the device cache: 28 opens at 18.6 s
+ * each, a third of the battery, bounded by the NVMe the weights come from
+ * (the page cache cannot hold the file beside an 86 GB device copy on a 121 GB
+ * box, so each new process re-reads it).  Here the gates are functions
+ * (tests/gate_entry.h: each source builds standalone as before, or into this
+ * binary with -DPULSAR_GATE_RUNNER -DGATE_ENTRY=gate_<stem>_main) and the
+ * engine they open is the broker's below -- one open per engine
+ * CONFIGURATION, kept alive across every gate that asks for the same one.
+ *
+ * Order is part of the design, not a preference:
+ *   - the instance lock allows one live engine per process, so configurations
+ *     run as groups and a change of configuration closes the live engine;
+ *   - the prefill/reference gate scrubs every PULSAR_* variable from the
+ *     environment before it opens (numerics hygiene), so it and the other
+ *     drafter-off configurations run LAST;
+ *   - a gate on the default configuration never follows a drafter-off one
+ *     (each such change is a model load: two per hosted model since
+ *     2026-10-14; the draft depth is shared, see spec_depth_shareable);
+ *   - the GPU-only kernel tests, the unit tests (their own engine dance is part
+ *     of what they assert) and the CLI chat smoke stay separate `make` targets.
+ *
+ * Every gate keeps its argv convention, its assertions and its prints; the
+ * runner supplies exactly the arguments and the one-knob environment the
+ * Makefile targets supplied, then unsets that knob.  Bank-pool size is set
+ * through pulsar_engine_set_bank_pool before each gate (the engine parses
+ * PULSAR_MSEQ_BANKS once per process, so the variable cannot do it here).
+ *
+ * A family host (L278).  MODEL is the primary model, the one the fixture blobs
+ * on the command line belong to; each `--model PATH` adds a hosted model of any
+ * family, run after it through the same table.  Every gate declares what it
+ * needs of the model (gate_spec::needs); the runner reads each model's
+ * capabilities through the public queries and a gate whose need is missing is
+ * reported N/A BY NAME ("N/A  <gate> [<family>]: needs <what>"), never run to fail
+ * on a capability and never passed silently.
+ *
+ * usage: tests/gates_runner MODEL --prefill-baseline BLOB --prefill-ref SHORT
+ *          --decode-baseline BLOB --decode-ref SHORT [ANCHORS] [--model PATH [ANCHORS]]...
+ *          [--only=a,b | --only a,b] [--except=a,b] [--shape]
+ *   ANCHORS = [--ref-dir DIR] [--ref-tol TOL] [--kl-story FILE] [--kl-code FILE]
+ *             [--story-known-high D,..] [--story-known-flip D,..] [--code-known-high D,..] [--code-known-flip D,..]
+ * The reference anchors are a MODEL's data: ANCHORS after `--model X` are X's, before any --model the primary's.
+ * Each model's documented depths (a known-high KL row, a known argmax flip) come from the Makefile beside its
+ * capture, never from this file.
+ * Exit 0 only when every gate passed.  Prints a per-gate time table (all of
+ * them, slowest first) and the number of engine opens.  --shape adds the work
+ * shape each gate actually ran (prefill chunks, step calls/rows, deepest
+ * position), read from the graph funnels; it changes nothing else.  --only /
+ * --except select sub-gates by name for the iteration tier (`make gates-dev`):
+ * an unknown name is refused, the selection is announced, and a selection that
+ * leaves nothing to run FAILS.
+ *
+ * Two tiers in one table (L317).  An entry marked DEV is a gates-dev sub-gate: the battery lists it by name and does
+ * not run it; `--only` naming it runs it (gates-dev's path triggers do).  The battery keeps one depth of each probe and
+ * a seeded sample of the chunk-neutrality schedules; the deeper variants and the exhaustive sweep are DEV entries of
+ * the same gates, so they keep their code, their argv and their owner.
+ *
+ * A model's battery (L317): `--gates=a,b` after a `--model PATH` restricts that hosted model to those table entries
+ * (each one still subject to its needs), announced at its hosting.  A hosted model brought in to share its engine with
+ * the gates that used to load it themselves (the Nemotron LiLiCorr drafter, spec, scratch and adopt legs) runs those,
+ * not the whole table.
+ *
+ * `--needs=a,b` (L278) restricts a model -- the primary too, before any `--model` -- to the table entries whose needs
+ * include at least one of those (tokenizer, spec, fixtures, vision, block, graphs).  The table's needs column stays the
+ * one authority; no list of gate names.
+ *
+ * PULSAR_GATES_SECTIONS=FILE (make gates): one line `cuda-runner-gate [<family>] SECONDS` per hosted model is
+ * appended to FILE -- the per-model sections of the battery's wall-time budget (docs/QA_BEFORE_RELEASES.md).
+ */
+#include "pulsar.h"
+#include "pulsar_engine_internal.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define PULSAR_GATE_RUNNER 1
+#define GATE_ENTRY gates_runner_has_its_own_main
+#include "gate_entry.h"
+#include "gate_util.h"
+
+/* One entry per gate source, named by the Makefile from the file stem. */
+int gate_token_seam_gate_main(int, char **);
+int gate_multiseq_decode_gate_main(int, char **);
+int gate_payload_frontier_gate_main(int, char **);
+int gate_bank_residency_gate_main(int, char **);
+int gate_algo_stability_gate_main(int, char **);
+int gate_spec_sampling_gate_main(int, char **);
+int gate_mseq_short_ctx_probe_main(int, char **);
+int gate_chunk_neutrality_gate_main(int, char **);
+int gate_vision_chunk_gate_main(int, char **);
+int gate_prefill_bitexact_gate_main(int, char **);
+int gate_decode_reference_gate_main(int, char **);
+int gate_session_contract_gate_main(int, char **);
+int gate_chat_decode_smoke_main(int, char **);
+int gate_scratch_poison_gate_main(int, char **);
+int gate_sync_budget_gate_main(int, char **);
+int gate_mtp_spec_gate_main(int, char **);
+int gate_bank_adopt_gate_main(int, char **);
+int gate_bank_isolation_gate_main(int, char **);
+int gate_kv_accounting_gate_main(int, char **);
+int gate_graph_eager_gate_main(int, char **);
+
+/* ---- the engine broker ------------------------------------------------- */
+
+static pulsar_engine *g_live;
+static pulsar_engine_options g_live_opt;
+static char g_live_model[4096];
+static int g_engine_opens;
+
+static bool same_str(const char *a, const char *b) {
+    if (!a || !b) return a == b;
+    return strcmp(a, b) == 0;
+}
+
+/* prefill_chunk 0 IS PULSAR_PREFILL_CHUNK_DEFAULT (main() refuses to run with
+ * PULSAR_CUDA_PREFILL_CHUNK set, so the engine cannot resolve 0 to anything
+ * else), so a gate that leaves it 0 and one that pins the production grid ask
+ * for the same engine -- comparing the raw field cost one model load per
+ * battery (the drafter-off multiseq gate vs the prefill gates, L194). */
+static uint32_t prefill_chunk_resolved(uint32_t v) { return v ? v : PULSAR_PREFILL_CHUNK_DEFAULT; }
+
+/* The draft depth a session STARTS at is not part of the engine's shape: it is
+ * one engine field (pulsar_engine::spec_depth) read when a session drafts its
+ * first round (pulsar_spec_depth_start), never at open.  So a gate that pins
+ * the depth (block-spec-gate's depths 1..5) runs on the live engine with that
+ * field set, instead of paying a model load per depth (three per battery until
+ * 2026-10-14; the block drafter's lane pins its depths the same way).  main() refuses PULSAR_SPEC_DEPTH in the environment, so an
+ * option of 0 resolves to 0 (the drafter's own depth) here exactly as it does
+ * in pulsar_engine_open; a depth outside [0, 16] -- which the engine would
+ * clamp -- is not shared. */
+static bool spec_depth_shareable(int v) { return v >= 0 && v <= 16; }
+
+/* The fields a gate may set.  Anything else non-zero is a configuration this
+ * runner does not know how to share, so it is treated as different. */
+static bool same_config(const pulsar_engine_options *a, const pulsar_engine_options *b) {
+    return same_str(a->model_path, b->model_path) &&
+           same_str(a->drafter, b->drafter) &&
+           a->dspark_disable == b->dspark_disable &&
+           a->rope_yarn_factor == b->rope_yarn_factor &&   /* L280: another rope is another model */
+           same_str(a->expert_overlay, b->expert_overlay) &&
+           a->backend == b->backend &&
+           prefill_chunk_resolved(a->prefill_chunk) == prefill_chunk_resolved(b->prefill_chunk) &&
+           (a->spec_depth == b->spec_depth ||
+            (spec_depth_shareable(a->spec_depth) && spec_depth_shareable(b->spec_depth))) &&
+           a->spec_tau == b->spec_tau &&
+           same_str(a->directional_steering_file, b->directional_steering_file) &&
+           a->directional_steering_attn == b->directional_steering_attn &&
+           a->directional_steering_ffn == b->directional_steering_ffn &&
+           a->inspect_only == b->inspect_only &&
+           a->tp_role == b->tp_role && a->tp_port == b->tp_port &&
+           a->tp_rank == b->tp_rank && a->tp_nranks == b->tp_nranks &&
+           same_str(a->tp_peer, b->tp_peer) && same_str(a->tp_peers, b->tp_peers);
+}
+
+int gate_engine_open(pulsar_engine **e, const pulsar_engine_options *want) {
+    if (!e || !want || !want->model_path) return 1;
+    /* The group, if any, joins the gate's options here (gate_entry.h): the
+     * broker compares and opens the configuration the process will actually
+     * run, so two gates asking for the same engine on the same group share it. */
+    pulsar_engine_options o = *want;
+    if (gate_tp_options_from_env(&o)) return 1;
+    const pulsar_engine_options *opt = &o;
+    if (g_live && same_config(&g_live_opt, opt)) {
+        if (g_live->spec_depth != opt->spec_depth) {
+            /* announce it: the log must show which depth the gate ran on the shared engine */
+            fprintf(stderr, "gates_runner: draft depth %d -> %d on the live engine (no reload)\n", g_live->spec_depth,
+                    opt->spec_depth);
+            g_live->spec_depth = opt->spec_depth;
+            g_live_opt.spec_depth = opt->spec_depth;
+        }
+        *e = g_live;
+        return 0;
+    }
+    if (g_live) {
+        fprintf(stderr, "gates_runner: engine configuration changes -- closing the live engine\n");
+        pulsar_engine_close(g_live);
+        g_live = NULL;
+    }
+    pulsar_engine *fresh = NULL;
+    const int rc = pulsar_engine_open(&fresh, opt);
+    if (rc != 0) return rc;
+    gate_tp_worker_or_continue(fresh);   /* a worker rank never returns from here */
+    g_engine_opens++;
+    g_live = fresh;
+    g_live_opt = *opt;
+    snprintf(g_live_model, sizeof g_live_model, "%s", opt->model_path);
+    g_live_opt.model_path = g_live_model;   /* the gate's argv pointer outlives nothing */
+    *e = fresh;
+    return 0;
+}
+
+void gate_engine_close(pulsar_engine *e) {
+    /* The broker owns the engine; a gate closing it is a request, not an act.
+     * A gate handing back an engine that is not the live one is a bug worth
+     * knowing about. */
+    if (e && e != g_live)
+        fprintf(stderr, "gates_runner: a gate closed an engine the broker does not hold\n");
+}
+
+/* ---- the gate table ---------------------------------------------------- */
+
+typedef int (*gate_entry_fn)(int, char **);
+
+/* What a gate needs of the model it runs on (L278).  Each is read from the opened model through a public query,
+ * never from its family's name.  NEED_STEP_GRAPHS (L357) is read from the family's driver ops, there being no public
+ * query for it.  (L357, 2026-11-07: DeepSeek V4 left the runner, and its mechanism gates -- NEED_DS4_INTERNALS,
+ * NEED_DSPARK, NEED_REWIND -- with it.) */
+enum {
+    NEED_TOKENIZER     = 1u << 0,   /* chat text: pulsar_engine_has_tokenizer */
+    NEED_SPEC          = 1u << 1,   /* speculative rounds: pulsar_engine_has_spec_rounds */
+    NEED_FIXTURES      = 1u << 2,   /* the blobs on the command line, which are the PRIMARY model's */
+    NEED_VISION        = 1u << 3,   /* images: pulsar_engine_has_vision */
+    NEED_BLOCK         = 1u << 4,   /* a block drafter (L298 LiLiCorr, L299 DFlash2): pulsar_engine_drafter == BLOCK */
+    NEED_STEP_GRAPHS   = 1u << 5,   /* L357: the core driver graphs its decode / verify steps (the family's driver ops
+                                     * stage them, step_driver.cpp graphable) -- read from pulsar_driver_ops::stage,
+                                     * the second reach past the public queries (there is no query for it) */
+};
+
+static const char *need_name(uint32_t bit) {
+    switch (bit) {
+    case NEED_TOKENIZER:     return "a tokenizer and chat renderer";
+    case NEED_SPEC:          return "speculative rounds";
+    case NEED_FIXTURES:      return "the command line's fixture blobs (captured from the primary model)";
+    case NEED_VISION:        return "a vision tower (images)";
+    case NEED_BLOCK:         return "a block drafter (LiLiCorr, DFlash2)";
+    case NEED_STEP_GRAPHS:   return "graphed driver steps (the family's driver ops stage its decode / verify steps)";
+    }
+    return "?";
+}
+
+typedef struct {
+    const char   *name;      /* the make target name it replaces */
+    gate_entry_fn entry;
+    uint32_t      banks;     /* bank pool the gate needs (1 = classic layout) */
+    const char   *env_name;  /* the one knob the Makefile target exported, or NULL */
+    const char   *env_val;
+    const char   *args[12];  /* argv after the model path, NULL-terminated */
+    uint32_t      needs;     /* NEED_* the model must have, or the gate is skipped by name */
+    bool          dev;       /* L317: a gates-dev sub-gate -- runs only when --only names it (see the header) */
+} gate_spec;
+#define DEV true
+
+/* A model's command-line data: its path and its reference anchors (see the header). */
+typedef struct {
+    const char *path, *ref_dir, *ref_tol, *kl_story, *kl_code;
+    const char *story_high, *story_flip, *code_high, *code_flip;
+    const char *gates;   /* L317 --gates: the table entries this model runs (NULL = all) */
+    uint32_t    needs_any;   /* --needs: only entries needing one of these NEED_* (0 = all) */
+} model_args;
+
+/* `--needs=` names to NEED_* bits: false (and the bad name in *bad) on a name the table does not use. */
+static bool parse_needs(const char *list, uint32_t *out, const char **bad) {
+    static const struct { const char *name; uint32_t bit; } k[] = {
+        {"tokenizer", NEED_TOKENIZER}, {"spec", NEED_SPEC}, {"fixtures", NEED_FIXTURES}, {"vision", NEED_VISION},
+        {"block", NEED_BLOCK}, {"graphs", NEED_STEP_GRAPHS},
+    };
+    *out = 0;
+    for (const char *p = list; *p;) {
+        const char *e = strchr(p, ',');
+        const size_t n = e ? (size_t)(e - p) : strlen(p);
+        bool found = false;
+        for (const auto &x : k)
+            if (strlen(x.name) == n && !strncmp(x.name, p, n)) { *out |= x.bit; found = true; }
+        if (!found) { *bad = p; return false; }
+        p += n + (e ? 1 : 0);
+    }
+    return *out != 0;
+}
+
+/* Append `flag value` to a spec's argv when the value is given. */
+/* L357: a reference capture grades only the container it was made from.  `ref_dir`/capture.json
+ * (tools/reference/capture.py) names the container's revision; the hosted model is an HF cache snapshot,
+ * models--ORG--NAME/snapshots/<rev> (resolved through links).  true when they match; else `why` says what is off --
+ * a capture with no record, a model path that is not a snapshot, or another revision. */
+static bool ref_revision_ok(const char *ref_dir, const char *model_path, char *why, size_t n) {
+    char path[4096], real[4096];
+    snprintf(path, sizeof path, "%s/capture.json", ref_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(why, n, "%.400s has no capture.json: nothing says which container it was made from", ref_dir);
+        return false;
+    }
+    char buf[65536];
+    const size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = 0;
+    const char *k = strstr(buf, "\"revision\"");
+    char cap[41] = "";
+    if (k && (k = strchr(k + 10, '"')) && sscanf(k + 1, "%40[0-9a-f]", cap) != 1) cap[0] = 0;
+    if (strlen(cap) != 40) {
+        snprintf(why, n, "%.400s names no 40-hex container revision", path);
+        return false;
+    }
+    if (!realpath(model_path, real)) snprintf(real, sizeof real, "%s", model_path);
+    const char *sn = strstr(real, "/snapshots/");
+    char rev[41] = "";
+    if (!sn || sscanf(sn + 11, "%40[0-9a-f]", rev) != 1 || strlen(rev) != 40) {
+        snprintf(why, n, "the model %.400s is not an HF cache snapshot: its revision is unknown", real);
+        return false;
+    }
+    if (strcmp(cap, rev) != 0) {
+        snprintf(why, n, "the capture was made from revision %.12s, the cached model is %.12s: recapture it", cap, rev);
+        return false;
+    }
+    return true;
+}
+
+static void spec_append(gate_spec *g, const char *flag, const char *value) {
+    if (!value || !value[0]) return;
+    int n = 0;
+    while (g->args[n]) n++;
+    if (n + 2 >= (int)(sizeof g->args / sizeof g->args[0])) {
+        fprintf(stderr, "gates_runner: %s: no argv room for %s\n", g->name, flag);
+        return;
+    }
+    g->args[n++] = flag;
+    g->args[n++] = value;
+    g->args[n] = NULL;
+}
+
+/* The model the table is running on: its path, its family's name, what it has. */
+typedef struct {
+    const char *path;
+    char        family[64];
+    uint32_t    has;         /* NEED_* bits this model satisfies */
+    bool        primary;
+} hosted_model;
+
+
+typedef struct {
+    char name[128];   /* the gate's name; a hosted (non-primary) model's results carry " [<family>]" */
+    int rc;
+    bool skipped;
+    double secs;
+    pulsar_gate_shape shape;
+    uint64_t drafts;
+} gate_result;
+
+static bool g_shape_report;
+
+static int run_gate(const gate_spec *g, const hosted_model *hm, gate_result *out) {
+    memset(out, 0, sizeof *out);
+    snprintf(out->name, sizeof out->name, hm->primary ? "%s" : "%s [%s]", g->name, hm->family);
+    const uint32_t missing = g->needs & ~hm->has;
+    if (missing) {
+        const uint32_t bit = missing & (0u - missing);
+        printf("\n  N/A   %s [%s]: needs %s\n", g->name, hm->family, need_name(bit));
+        fflush(stdout);
+        out->skipped = true;
+        return 0;
+    }
+    char *argv[20];
+    int argc = 0;
+    argv[argc++] = (char *)g->name;
+    argv[argc++] = (char *)hm->path;
+    for (int i = 0; g->args[i] && argc < 19; i++) argv[argc++] = (char *)g->args[i];
+    argv[argc] = NULL;
+
+    printf("\n\033[1m=== %s ===\033[0m\n", out->name);
+    for (int i = 1; i < argc; i++) printf("%s%s", i > 1 ? " " : "  argv:", argv[i]);
+    printf("%s%s%s\n", g->env_name ? "  " : "", g->env_name ? g->env_name : "",
+           g->env_name ? "=set" : "");
+    fflush(stdout);
+
+    if (g->env_name) setenv(g->env_name, g->env_val, 1);
+    pulsar_engine_set_bank_pool(g->banks);
+    const int opens_before = g_engine_opens;
+    pulsar_gate_shape_reset();   /* only this gate's work is counted, even on a reused engine */
+    /* Spec rounds are a fact the engine already carries (the /metrics counters),
+     * not a second copy: the spec lane's draft/verify forwards do not ride the
+     * decode funnel, so a gate like bank-spec shows few step_calls and its real
+     * repetition would be invisible without this. */
+    pulsar_spec_metrics m0;
+    const bool have_m0 = g_live != NULL;
+    if (have_m0) pulsar_engine_spec_metrics(g_live, &m0);
+    const double t0 = gate_now_s();
+    const int rc = g->entry(argc, argv);
+    const double secs = gate_now_s() - t0;
+    pulsar_gate_shape shape1;
+    pulsar_gate_shape_read(&shape1);
+    uint64_t drafts = 0;
+    if (g_live) {
+        pulsar_spec_metrics m1;
+        pulsar_engine_spec_metrics(g_live, &m1);
+        /* A gate that opened its own engine starts those counters at 0. */
+        drafts = (g_engine_opens > opens_before || !have_m0) ? m1.num_drafts
+                                                             : m1.num_drafts - m0.num_drafts;
+    }
+    if (g->env_name) unsetenv(g->env_name);
+    fflush(stdout); fflush(stderr);
+    printf("--- %s: %s (rc=%d, %.1f s, engine %s)", out->name, rc == 0 ? "PASS" : "FAIL", rc, secs,
+           g_engine_opens > opens_before ? "opened" : "reused");
+    if (g_shape_report)
+        printf("  [prefill %llu/%llutok, steps %llu/%llurows, draftrounds %llu, maxpos %llu]",
+               (unsigned long long)shape1.prefill_calls,
+               (unsigned long long)shape1.prefill_tokens,
+               (unsigned long long)shape1.step_calls,
+               (unsigned long long)shape1.step_rows,
+               (unsigned long long)drafts,
+               (unsigned long long)shape1.max_pos);
+    printf("\n");
+    fflush(stdout);
+    out->rc = rc; out->secs = secs;
+    out->shape = shape1;
+    out->drafts = drafts;
+    return rc;
+}
+
+/* Open MODEL on the default configuration (the first gate of the default group asks for the same one, so the
+ * broker reuses it) and read what it has.  The fixture blobs are the primary's. */
+static int host_model(hosted_model *hm, const char *path, bool primary) {
+    memset(hm, 0, sizeof *hm);
+    hm->path = path;
+    hm->primary = primary;
+    pulsar_engine_options opt;
+    memset(&opt, 0, sizeof opt);
+    opt.model_path = path;
+    opt.backend = PULSAR_BACKEND_CUDA;
+    pulsar_engine *e = NULL;
+    if (gate_engine_open(&e, &opt) != 0) {
+        fprintf(stderr, "gates_runner: %s did not open\n", path);
+        return 1;
+    }
+    snprintf(hm->family, sizeof hm->family, "%s", pulsar_engine_family_name(e));
+    if (pulsar_engine_has_tokenizer(e)) hm->has |= NEED_TOKENIZER;
+    if (pulsar_engine_has_spec_rounds(e)) hm->has |= NEED_SPEC;
+    if (pulsar_engine_has_vision(e)) hm->has |= NEED_VISION;
+    if (pulsar_engine_drafter(e) == PULSAR_DRAFTER_BLOCK) hm->has |= NEED_BLOCK;
+    if (e->family->driver && e->family->driver->stage) hm->has |= NEED_STEP_GRAPHS;
+    if (primary) hm->has |= NEED_FIXTURES;
+    printf("\ngates_runner: hosting %s (%s%s):%s%s%s%s%s\n", path, hm->family, primary ? ", primary" : "",
+           hm->has & NEED_TOKENIZER ? " tokenizer" : "", hm->has & NEED_SPEC ? " spec" : "",
+           hm->has & NEED_BLOCK ? " block" : "", hm->has & NEED_VISION ? " vision" : "",
+           hm->has & NEED_STEP_GRAPHS ? " step-graphs" : "");
+    fflush(stdout);
+    return 0;
+}
+
+static int cmp_secs_desc(const void *a, const void *b) {
+    const double da = ((const gate_result *)a)->secs, db = ((const gate_result *)b)->secs;
+    return da < db ? 1 : da > db ? -1 : 0;
+}
+
+static bool only_wants(const char *only, const char *name) {
+    if (!only) return true;
+    const size_t n = strlen(name);
+    for (const char *p = only; *p;) {
+        const char *q = strchr(p, ',');
+        const size_t len = q ? (size_t)(q - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return true;
+        if (!q) break;
+        p = q + 1;
+    }
+    return false;
+}
+
+/* ---- selection (--only / --except) --------------------------------------
+ * The iteration tier (make gates-dev) drives these.  Three rules, all of them
+ * fail-closed:
+ *   - an UNKNOWN name is refused (exit 2), never ignored: a typo must not look
+ *     like a tier that ran and passed;
+ *   - the remaining sub-gates are announced (selected and skipped) so the log
+ *     says what the run covered;
+ *   - a selection that leaves NO sub-gate to run FAILS the runner, because a
+ *     tier that ran nothing is not a green tier.
+ * --only also keeps its historical space form (`--only a,b`); `=` is accepted
+ * for both. */
+static const char *g_only, *g_except;
+
+static bool name_in_list(const char *list, const char *name) {
+    return list && only_wants(list, name);
+}
+
+static bool gate_selected(const char *name, bool dev) {
+    if (dev && !name_in_list(g_only, name)) return false;   /* a DEV entry runs only when --only names it */
+    if (g_only && !name_in_list(g_only, name)) return false;
+    if (g_except && name_in_list(g_except, name)) return false;
+    return true;
+}
+
+/* Refuse any name in `list` that is not a sub-gate the runner knows. */
+static int validate_names(const char *list, const char *what,
+                          const char *const *known, int n_known) {
+    if (!list) return 0;
+    for (const char *p = list; *p;) {
+        const char *q = strchr(p, ',');
+        const size_t len = q ? (size_t)(q - p) : strlen(p);
+        bool found = false;
+        for (int i = 0; i < n_known && !found; i++)
+            found = strlen(known[i]) == len && strncmp(known[i], p, len) == 0;
+        if (!found) {
+            fprintf(stderr, "gates_runner: %s names '%.*s', which is not a sub-gate; known names:\n", what,
+                    (int)len, p);
+            for (int i = 0; i < n_known; i++) fprintf(stderr, "    %s\n", known[i]);
+            return 1;
+        }
+        if (!q) break;
+        p = q + 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    /* The engine resolves prefill_chunk 0 through this variable; the runner's
+     * engine-sharing rule (same_config) assumes the default grid.  Refuse
+     * rather than share an engine opened on some other chunk. */
+    if (getenv("PULSAR_CUDA_PREFILL_CHUNK")) {
+        fprintf(stderr, "gates_runner: PULSAR_CUDA_PREFILL_CHUNK is set; the gate configurations assume the "
+                        "default prefill grid -- unset it and rerun\n");
+        return 2;
+    }
+    /* The same for the draft depth: the broker sets it on the live engine per gate (spec_depth_shareable), which is
+     * the engine's own resolution only while the environment cannot override an option of 0. */
+    if (getenv("PULSAR_SPEC_DEPTH")) {
+        fprintf(stderr, "gates_runner: PULSAR_SPEC_DEPTH is set; the gates pin their own draft depth -- unset it and "
+                        "rerun\n");
+        return 2;
+    }
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s MODEL --prefill-baseline BLOB --prefill-ref SHORT [--ref-dir DIR] "
+                        "[--model PATH [ANCHORS]]... [--only=a,b] [--except=a,b] [--shape]  (see the header)\n", argv[0]);
+        return 2;
+    }
+    const char *prefill_baseline = NULL, *prefill_ref = NULL;
+    const char *decode_baseline = NULL, *decode_ref = NULL;
+    enum { HOSTED_MAX = 4 };
+    model_args models[1 + HOSTED_MAX], ignored;
+    memset(models, 0, sizeof models);
+    memset(&ignored, 0, sizeof ignored);
+    int n_models = 1;
+    models[0].path = argv[1];
+    model_args *cur = &models[0];
+    for (int i = 2; i < argc; ) {
+        if (!strcmp(argv[i], "--shape")) { g_shape_report = true; i += 1; continue; }
+        /* `--only=X` / `--except=X` take their value inline; the historical
+         * `--only X` / `--except X` forms take the next argv. */
+        if (!strncmp(argv[i], "--only=", 7)) { g_only = argv[i] + 7; i += 1; continue; }
+        if (!strncmp(argv[i], "--except=", 9)) { g_except = argv[i] + 9; i += 1; continue; }
+        if (!strncmp(argv[i], "--gates=", 8)) { cur->gates = argv[i][8] ? argv[i] + 8 : NULL; i += 1; continue; }
+        if (!strncmp(argv[i], "--needs=", 8)) {
+            const char *bad = argv[i] + 8;
+            if (!parse_needs(argv[i] + 8, &cur->needs_any, &bad)) {
+                fprintf(stderr, "gates_runner: --needs=%s: '%s' is not a need (tokenizer, spec, fixtures, vision, block, "
+                                "graphs)\n", argv[i] + 8, bad);
+                return 2;
+            }
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= argc) { fprintf(stderr, "gates_runner: option %s needs a value\n", argv[i]); return 2; }
+        const char *v = argv[i + 1];
+        if (!strcmp(argv[i], "--prefill-baseline")) prefill_baseline = v;
+        else if (!strcmp(argv[i], "--prefill-ref")) prefill_ref = v;
+        else if (!strcmp(argv[i], "--decode-baseline")) decode_baseline = v;
+        else if (!strcmp(argv[i], "--decode-ref")) decode_ref = v;
+        else if (!strcmp(argv[i], "--model")) {
+            if (!v[0]) {
+                cur = &ignored;   /* an empty value hosts nothing (a make default), and its anchors go with it */
+            } else if (n_models == 1 + HOSTED_MAX) {
+                fprintf(stderr, "gates_runner: at most %d --model\n", HOSTED_MAX);
+                return 2;
+            } else {
+                cur = &models[n_models++];
+                cur->path = v;
+            }
+        }
+        else if (!strcmp(argv[i], "--ref-dir")) cur->ref_dir = v[0] ? v : NULL;
+        else if (!strcmp(argv[i], "--ref-tol")) cur->ref_tol = v;
+        else if (!strcmp(argv[i], "--kl-story")) cur->kl_story = v;
+        else if (!strcmp(argv[i], "--kl-code")) cur->kl_code = v;
+        else if (!strcmp(argv[i], "--story-known-high")) cur->story_high = v;
+        else if (!strcmp(argv[i], "--story-known-flip")) cur->story_flip = v;
+        else if (!strcmp(argv[i], "--code-known-high")) cur->code_high = v;
+        else if (!strcmp(argv[i], "--code-known-flip")) cur->code_flip = v;
+        else if (!strcmp(argv[i], "--gates")) cur->gates = v[0] ? v : NULL;
+        else if (!strcmp(argv[i], "--only")) g_only = v;
+        else if (!strcmp(argv[i], "--except")) g_except = v;
+        else { fprintf(stderr, "gates_runner: unknown option %s\n", argv[i]); return 2; }
+        i += 2;
+    }
+    if (!prefill_baseline || !prefill_ref || !decode_baseline || !decode_ref) {
+        fprintf(stderr, "gates_runner: --prefill-baseline/--prefill-ref and --decode-baseline/--decode-ref "
+                        "are required (the byte gates refuse to run without their blobs)\n");
+        return 2;
+    }
+
+    /* Configuration A: the drafter-merged model, default options.  The spec
+     * oracle runs 1250 trajectories per mode (L163: half the historical 2500;
+     * alpha converges in a few hundred rounds, the chi-square keeps its
+     * critical values and loses sensitivity accordingly). */
+    const gate_spec group_default[] = {
+        /* L357: the family-neutral payload round trip and bank free / reload */
+        {"payload-frontier-gate",     gate_payload_frontier_gate_main,  2, NULL, NULL, {NULL}, 0},
+        {"bank-residency-gate",       gate_bank_residency_gate_main,    4, NULL, NULL, {NULL}, 0},
+        {"cuda-seam-gate",            gate_token_seam_gate_main,        3, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        {"cuda-multiseq-gate",        gate_multiseq_decode_gate_main,   3, NULL, NULL, {"3", "64", NULL}, NEED_TOKENIZER},
+        {"cuda-algo-stability-gate",  gate_algo_stability_gate_main,   16, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        /* L175: the same 1..16 width sweep with bank 0 at ~2200 tokens, so the
+         * indexed lane is engaged while the row-count-keyed dispatches vary.
+         * L317: a gates-dev depth (cuda / matmul / indexer paths); the battery keeps the short sweep above. */
+        {"cuda-algo-stability-gate-deep", gate_algo_stability_gate_main, 16, NULL, NULL, {"deep", NULL}, NEED_TOKENIZER, DEV},
+        {"cuda-spec-sampling-gate",   gate_spec_sampling_gate_main,    16, NULL, NULL, {"0.95", "0", "1250", NULL}, NEED_SPEC | NEED_TOKENIZER},
+        {"cuda-row-neutrality-gate",  gate_mseq_short_ctx_probe_main,   2, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        /* L170: the same probe past 2048 tokens, where the top-k selection is
+         * engaged and the indexed fold order is what 1-row and N-row steps
+         * must share (filler 1100 -> ~2217 tokens).  Mutation-validated: the
+         * n_tokens > 1 sort condition fails it on all 129280 logits.
+         * L317: this and -deeper are gates-dev depths (attention / indexer / cuda paths); the battery keeps the
+         * short probe above. */
+        {"cuda-row-neutrality-gate-deep", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"1100", NULL}, NEED_TOKENIZER, DEV},
+        /* L175: the same at ~10k tokens (n_comp ~2600, the pow2<4096> ranking
+         * bucket): the 1-row indexer scorer vs the N-row tier (L173) and the
+         * ranking kernel past the 2048 boundary, on logits. */
+        {"cuda-row-neutrality-gate-deeper", gate_mseq_short_ctx_probe_main, 2, NULL, NULL, {"4200", NULL}, NEED_TOKENIZER, DEV},
+        /* L272 P5 / L278: the session contract every family meets (chunks C1-C5, banks B1-B6), public API only --
+         * it runs on every hosted model, on the default configuration's engine. */
+        {"session-contract-gate",     gate_session_contract_gate_main,  4, NULL, NULL, {NULL}, 0},
+        /* L278 contract 6: one greedy chat answer, graded on content -- every hosted model's semantic smoke */
+        {"chat-smoke-gate",           gate_chat_decode_smoke_main,      1, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        /* (L305: the chained-MTP drafter's mtp-spec-gate left the battery -- no production family drafts with MTP;
+         * `make mtp-spec-gate` runs it by hand and gates-dev on an MTP path change) */
+        /* L302: the host<->device syncs a speculative round pays, by phase, against the budget (DeepInfer's
+         * forbid_cuda_sync) -- every drafter's lane, 1 and 4 banks, greedy and seeded T0.7 */
+        {"sync-budget-gate",          gate_sync_budget_gate_main,       4, NULL, NULL, {"24", NULL},
+         NEED_SPEC | NEED_TOKENIZER},
+        /* L307: poisoned disposable scratch changes no output -- the batched speculative lane, its bank subsets and
+         * verify widths alternating every tick, poisoned == unpoisoned byte for byte; 32 tokens a stream (the three
+         * graphed lanes' fixtures: make scratch-poison-gate) */
+        {"scratch-poison-gate",       gate_scratch_poison_gate_main,    4, NULL, NULL, {"32", NULL},
+         NEED_SPEC | NEED_TOKENIZER},
+        /* L298 / L299 (L317: on the hosted engines, no load of its own -- it was lilicorr-spec-gate and
+         * dflash2-spec-gate, each a process and a model load): the block drafter's lane -- greedy spec == plain at
+         * depths 1..5 and the drafter's own numbers, seeded T0.7, the forced-reject stress (every state byte back to
+         * the plain twin's), the batched lane over 4 banks, the prefix-cache must-pass.  M0 names the drafter it
+         * graded.  128 tokens a stream; the make targets' MTP_GATE_TOKENS (256) is the gates-dev depth. */
+        {"block-spec-gate",           gate_mtp_spec_gate_main,          4, NULL, NULL, {"128", NULL},
+         NEED_BLOCK | NEED_TOKENIZER},
+        /* L313 (L317: on the hosted engines; it was bank-adopt-gate-{ds,qwen,nemotron}, by hand): a bank that adopts
+         * another bank's published state and prefills the rest is the cold prefill byte for byte -- EXT, SIDE, SAME,
+         * and the lender still resumes its own */
+        {"bank-adopt-gate",           gate_bank_adopt_gate_main,        4, NULL, NULL, {NULL}, NEED_TOKENIZER},
+        /* L357: the family-neutral ports of three retired DeepSeek mechanism gates (bank frontier isolation, KV
+         * accounting, head graph replay), on the declared state and the core step driver: an idle
+         * bank untouched by its neighbours' batched steps, batch order and a batchmate's position invisible to a row;
+         * touched KV == the physical a fill takes and a bank free returns; a replayed decode / verify step graph ==
+         * the eager step at the same row count */
+        {"bank-isolation-gate",       gate_bank_isolation_gate_main,    3, NULL, NULL, {NULL}, 0},
+        {"kv-accounting-gate",        gate_kv_accounting_gate_main,     2, NULL, NULL, {NULL}, 0},
+        {"graph-eager-gate",          gate_graph_eager_gate_main,       4, NULL, NULL, {NULL},
+         NEED_SPEC | NEED_STEP_GRAPHS},
+    };
+    /* Configuration B: drafter off -- the prefill gates below pin the chunk
+     * to the default grid, so they share this engine (two opens per hosted
+     * model: A, B). */
+    const gate_spec group_nodspark[] = {
+        {"cuda-multiseq-gate-nodspark", gate_multiseq_decode_gate_main, 2, "PULSAR_GATE_NO_DSPARK", "1", {"2", "64", NULL}, NEED_TOKENIZER},
+    };
+    const gate_spec prefill = {"cuda-prefill-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
+                               {"--check", prefill_baseline, prefill_ref, NULL}, NEED_FIXTURES};
+    /* L181: one classic decode step after each unaligned prefill, byte-compared
+     * -- the state class (compressor state, ring, seed) the prefill gate is
+     * blind to.  Same binary, same env scrub, so it runs beside the prefill gate. */
+    const gate_spec prefill_decode = {"cuda-prefill-decode-gate", gate_prefill_bitexact_gate_main, 1, NULL, NULL,
+                                      {"--check-decode", decode_baseline, decode_ref, NULL}, NEED_FIXTURES};
+    /* L183: the same tokens under four chunkings (cold, 6-row first chunk, two
+     * mid-size chunks, off-grid warm resume) give byte-identical frontier and
+     * next-step logits.  Same engine config as the prefill gate (chunk 4096,
+     * drafter off), so it runs beside it. */
+    /* L317: the battery runs a seeded sample -- one schedule of each boundary class, seeded by the build's sha so
+     * successive batteries rotate through every schedule (tests/chunk_neutrality_gate.cpp); the exhaustive sweep is
+     * the gates-dev entry beside it (prefill / chunk / kv_state / checkpoint paths).  The seed is read HERE, at the
+     * runner's start, and handed over in argv: the prefill gate scrubs PULSAR_* from the environment before the chunk
+     * gate runs (#440 refused for want of it). */
+    static char chunk_sample[96];
+    const char *chunk_seed = getenv("PULSAR_GATE_CHUNK_SEED");
+    snprintf(chunk_sample, sizeof chunk_sample, "sample=%s", chunk_seed ? chunk_seed : "");
+    const gate_spec chunk_neutrality = {"cuda-chunk-neutrality-gate", gate_chunk_neutrality_gate_main, 1, NULL, NULL,
+                                        {chunk_sample, NULL}, NEED_TOKENIZER};
+    const gate_spec chunk_neutrality_full = {"cuda-chunk-neutrality-gate-full", gate_chunk_neutrality_gate_main, 1,
+                                             NULL, NULL, {NULL}, NEED_TOKENIZER, DEV};
+    /* L283: the same for an image block -- its logits do not depend on where its chunk starts.  The chunk-neutrality
+     * gate's engine (chunk 4096, drafter off), so it runs beside it on every model that serves images. */
+    const gate_spec vision_chunk = {"cuda-vision-chunk-gate", gate_vision_chunk_gate_main, 1, NULL, NULL,
+                                    {"tests/test-vectors/vision-image-goldens.bin", NULL}, NEED_VISION};
+    /* The reference gates are built per model, from its anchors (the hosted-model loop below); their names are
+     * fixed here for the selection. */
+    static const char *const ref_names[4] = {"cuda-reference-gate-story", "cuda-reference-gate-code",
+                                             "cuda-decode-reference-gate-story", "cuda-decode-reference-gate-code"};
+
+    /* The known sub-gate set, in run order.  The validator and the selection
+     * report both read it, so --only/--except can never name a gate that does
+     * not exist here.  A name that is expected but missing is a bug in the
+     * caller's list, and it is refused rather than silently skipped. */
+    const char *known[64];
+    bool known_dev[64] = {false};
+    int n_known = 0;
+#define KNOWN(spec) do { if (n_known < (int)(sizeof known / sizeof known[0])) { known_dev[n_known] = (spec).dev; \
+        known[n_known++] = (spec).name; } } while (0)
+    for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) KNOWN(group_default[i]);
+    for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) KNOWN(group_nodspark[i]);
+    KNOWN(prefill); KNOWN(prefill_decode); KNOWN(chunk_neutrality); KNOWN(chunk_neutrality_full); KNOWN(vision_chunk);
+#undef KNOWN
+    for (int i = 0; i < 4; i++) known[n_known++] = ref_names[i];
+    if (validate_names(g_only, "--only", known, n_known) ||
+        validate_names(g_except, "--except", known, n_known)) return 2;
+    for (int h = 0; h < n_models; h++)
+        if (validate_names(models[h].gates, "--gates", known, n_known)) return 2;
+    /* rule 5: the log says what this run does NOT run, and who owns it */
+    printf("gates_runner: gates-dev sub-gates (path-triggered; they run only when --only names them):");
+    for (int i = 0; i < n_known; i++) if (known_dev[i]) printf(" %s", known[i]);
+    printf("\n");
+    if (g_only || g_except) {
+        printf("gates_runner: selection");
+        if (g_only) printf(" --only=%s", g_only);
+        if (g_except) printf(" --except=%s", g_except);
+        int n_sel = 0;
+        for (int i = 0; i < n_known; i++) n_sel += gate_selected(known[i], known_dev[i]);
+        printf("\n  selected (%d):", n_sel);
+        for (int i = 0; i < n_known; i++) if (gate_selected(known[i], known_dev[i])) printf(" %s", known[i]);
+        printf("\n  skipped (%d):", n_known - n_sel);
+        for (int i = 0; i < n_known; i++) if (!gate_selected(known[i], known_dev[i])) printf(" %s", known[i]);
+        printf("\n");
+        bool any_ref = false;
+        for (int i = 0; i < 4; i++) any_ref = any_ref || gate_selected(ref_names[i], false);
+        if (any_ref && !models[0].ref_dir)
+            printf("  note: cuda-reference-gate-* / cuda-decode-reference-gate-* selected but the primary has no "
+                   "--ref-dir (PULSAR_REF_DIR) -- they will SKIP\n");
+        fflush(stdout);
+    }
+
+    enum { RESULTS_MAX = 192 };
+    static gate_result results[RESULTS_MAX];
+    int n_results = 0, rc_all = 0;
+    const double suite0 = gate_now_s();
+    hosted_model hm;
+    /* copied now: the prefill gate scrubs PULSAR_* from the environment mid-run */
+    static char sections_path[4096];
+    const char *sections_env = getenv("PULSAR_GATES_SECTIONS");
+    if (sections_env) snprintf(sections_path, sizeof sections_path, "%s", sections_env);
+    const char *sections = sections_env ? sections_path : NULL;
+    const model_args *ma = NULL;
+    /* a table entry runs when the selection takes it and the hosted model's own --gates list (if any) names it */
+#define WANTED(name, dev) (gate_selected((name), (dev)) && (!ma->gates || name_in_list(ma->gates, (name))))
+#define RUN(spec) do { if (WANTED((spec).name, (spec).dev) && (!ma->needs_any || ((spec).needs & ma->needs_any)) && \
+                              n_results < RESULTS_MAX) { \
+        if (run_gate(&(spec), &hm, &results[n_results++]) != 0) rc_all = 1; } } while (0)
+
+    /* The primary model runs the whole table, its configurations in the order the header gives; each hosted model
+     * after it runs the same table, where its needs allow -- one engine open per hosted model (its gates share the
+     * default configuration's engine; a gate on another configuration of it would open its own). */
+    for (int h = 0; h < n_models; h++) {
+        const bool primary = h == 0;
+        ma = &models[h];
+        /* a model none of whose entries the selection takes is not opened (gates-dev hosts every model, L317) */
+        bool any = false;
+        for (int i = 0; i < n_known && !any; i++) any = WANTED(known[i], known_dev[i]);
+        if (!any) {
+            printf("\ngates_runner: %s: no selected sub-gate is this model's -- not hosted\n", ma->path);
+            continue;
+        }
+        const double model0 = gate_now_s();
+        if (host_model(&hm, ma->path, primary) != 0) { rc_all = 1; continue; }
+        if (ma->gates) printf("gates_runner: %s [%s] runs its own legs only: --gates=%s\n", ma->path, hm.family, ma->gates);
+        if (ma->needs_any)
+            printf("gates_runner: %s [%s] runs only the entries needing one of --needs (0x%x; the rest run on the hosted "
+                   "families)\n", ma->path, hm.family, ma->needs_any);
+
+        /* This model's reference gates, from its anchors.  Absent blobs SKIP LOUDLY: a gate that passes without its
+         * fixture grades nothing.  The KL budgets grade direction and are passed only when present. */
+        char story_ref[4096] = "", story_tok[4096] = "", code_ref[4096] = "", code_tok[4096] = "";
+        bool have_ref = false;
+        if (ma->ref_dir) {
+            snprintf(story_ref, sizeof story_ref, "%s/story.ref.bin", ma->ref_dir);
+            snprintf(story_tok, sizeof story_tok, "%s/story.tokens.bin", ma->ref_dir);
+            snprintf(code_ref, sizeof code_ref, "%s/code.ref.bin", ma->ref_dir);
+            snprintf(code_tok, sizeof code_tok, "%s/code.tokens.bin", ma->ref_dir);
+            have_ref = access(story_ref, R_OK) == 0;
+        }
+        /* L357: the capture must be this container's (capture.json's revision == the snapshot's) */
+        bool ref_stale = false;
+        char ref_why[512] = "";
+        if (have_ref && !ref_revision_ok(ma->ref_dir, ma->path, ref_why, sizeof ref_why)) {
+            have_ref = false;
+            ref_stale = true;
+        }
+        const char *tol = ma->ref_tol ? ma->ref_tol : "1e-4";
+        gate_spec ref_story = {ref_names[0], gate_prefill_bitexact_gate_main, 1, NULL, NULL,
+                               {"--check-reference", story_ref, story_tok, tol, NULL}, 0};
+        spec_append(&ref_story, "--known-high", ma->story_high);
+        spec_append(&ref_story, "--known-flip", ma->story_flip);
+        if (ma->kl_story && access(ma->kl_story, R_OK) == 0) spec_append(&ref_story, "--kl-baseline", ma->kl_story);
+        gate_spec ref_code = {ref_names[1], gate_prefill_bitexact_gate_main, 1, NULL, NULL,
+                              {"--check-reference", code_ref, code_tok, tol, NULL}, 0};
+        spec_append(&ref_code, "--known-high", ma->code_high);
+        spec_append(&ref_code, "--known-flip", ma->code_flip);
+        if (ma->kl_code && access(ma->kl_code, R_OK) == 0) spec_append(&ref_code, "--kl-baseline", ma->kl_code);
+        /* L262: decode rows at every served width (1..32) against the same blobs -- the fidelity grade for
+         * width-dependent decode arithmetic.  A blob's near-tie row is the prefill reference gate's known flip too. */
+        gate_spec dref_story = {ref_names[2], gate_decode_reference_gate_main, 2, NULL, NULL,
+                                {story_ref, story_tok, NULL}, 0, DEV};   /* L360: manual until Qwen's wide rows are understood */
+        spec_append(&dref_story, "--known-flip", ma->story_flip);
+        gate_spec dref_code = {ref_names[3], gate_decode_reference_gate_main, 2, NULL, NULL,
+                               {code_ref, code_tok, NULL}, 0, DEV};
+        spec_append(&dref_code, "--known-flip", ma->code_flip);
+
+        for (size_t i = 0; i < sizeof group_default / sizeof group_default[0]; i++) RUN(group_default[i]);
+        /* L278 (battery time): the decode-reference gates open the drafter-on, chunk-4096 configuration -- the default
+         * group's -- so they run on its engine here rather than after the drafter-off prefill / reference gates, where
+         * they cost a full model reload. */
+        if (have_ref) {
+            RUN(dref_story);
+            RUN(dref_code);
+        }
+        for (size_t i = 0; i < sizeof group_nodspark / sizeof group_nodspark[0]; i++) RUN(group_nodspark[i]);
+        RUN(prefill); RUN(prefill_decode); RUN(chunk_neutrality); RUN(chunk_neutrality_full); RUN(vision_chunk);
+        bool ref_selected = false;
+        for (int i = 0; i < 4; i++) ref_selected = ref_selected || WANTED(ref_names[i], false);
+        if (have_ref) {
+            RUN(ref_story);
+            RUN(ref_code);
+        } else if (ref_stale && ref_selected) {
+            printf("\n  FAIL  cuda-reference-gate [%s]: %s\n", hm.family, ref_why);
+            rc_all = 1;
+        } else if (ma->ref_dir && ref_selected) {
+            /* The caller ASKED for the reference grade (--ref-dir was passed) and the
+             * blob is not readable: that is a misconfiguration, not "not
+             * configured", and it must not leave the battery green.  This is how
+             * the landing script's PULSAR_REF_DIR pointed at a directory that did
+             * not exist while every run still printed ALL GATES PASS -- the grade
+             * was silently absent.  Fail. */
+            printf("\n  FAIL  cuda-reference-gate [%s]: --ref-dir '%s' has no readable %s\n"
+                   "        (blobs live outside the repo; stage them or pass an empty --ref-dir)\n",
+                   hm.family, ma->ref_dir, story_ref);
+            rc_all = 1;
+        } else if (ref_selected) {
+            printf("\n  SKIP  cuda-reference-gate, cuda-decode-reference-gate [%s]: no --ref-dir for this model\n"
+                   "        (blobs live outside the repo; without them these gates grade nothing)\n", hm.family);
+        }
+        if (sections) {
+            /* the battery's per-model section (make gates' budget table); the model's engine opens are in it */
+            FILE *sf = fopen(sections, "a");
+            if (sf) {
+                fprintf(sf, "%.0f\tcuda-runner-gate [%s]\n", gate_now_s() - model0, hm.family);
+                fclose(sf);
+            } else {
+                fprintf(stderr, "gates_runner: PULSAR_GATES_SECTIONS=%s: cannot append\n", sections);
+            }
+        }
+    }
+#undef RUN
+#undef WANTED
+
+    int n_ran = 0;
+    for (int i = 0; i < n_results; i++) n_ran += !results[i].skipped;
+    if (n_ran == 0) {
+        printf("\n  FAIL  the selection ran no sub-gate -- a tier that runs nothing "
+               "is not a pass\n");
+        rc_all = 1;
+    }
+    if (g_live) { pulsar_engine_close(g_live); g_live = NULL; }
+
+    printf("\n===================== RUNNER SUMMARY =====================\n");
+    for (int i = 0; i < n_results; i++)
+        if (results[i].rc == 0 && !results[i].skipped) printf("  PASS  %s\n", results[i].name);
+    int n_skipped = 0;
+    for (int i = 0; i < n_results; i++) n_skipped += results[i].skipped;
+    if (n_skipped) {
+        /* one line per hosted model: which gates its capabilities skipped (each was said by name above) */
+        printf("  N/A   %d gate(s) whose needs the model lacks:", n_skipped);
+        for (int i = 0; i < n_results; i++)
+            if (results[i].skipped) printf(" %s;", results[i].name);
+        printf("\n");
+    }
+    for (int i = 0; i < n_results; i++)
+        if (results[i].rc != 0) printf("  FAIL  %s (rc=%d)\n", results[i].name, results[i].rc);
+    /* the timing tables list what ran */
+    int n_timed = 0;
+    for (int i = 0; i < n_results; i++)
+        if (!results[i].skipped) results[n_timed++] = results[i];
+    n_results = n_timed;
+    qsort(results, (size_t)n_results, sizeof results[0], cmp_secs_desc);
+    printf("\n  seconds per gate (slowest first):\n");
+    for (int i = 0; i < n_results; i++) printf("    %6.0f  %s\n", results[i].secs, results[i].name);
+    if (g_shape_report) {
+        /* PHASE-0 work shape: what each gate actually ran, so the cut list is
+         * argued from prefill chunks / step rows / depth instead of its name.
+         * prefill = gpu_graph_prefill_layer_major calls and tokens (chunks and
+         * L195 state-only warm-ups); steps = gpu_graph_decode_multiseq_batch
+         * calls and rows (decode tokens, mixed K-row runs, verify batches);
+         * maxpos = the deepest position the gate reached. */
+        printf("\n  work shape per gate (slowest first):\n");
+        printf("    %6s  %8s %9s  %8s %9s  %6s  %7s  %s\n",
+               "secs", "prefill", "tok", "steps", "rows", "drafts", "maxpos", "gate");
+        for (int i = 0; i < n_results; i++)
+            printf("    %6.0f  %8llu %9llu  %8llu %9llu  %6llu  %7llu  %s\n",
+                   results[i].secs,
+                   (unsigned long long)results[i].shape.prefill_calls,
+                   (unsigned long long)results[i].shape.prefill_tokens,
+                   (unsigned long long)results[i].shape.step_calls,
+                   (unsigned long long)results[i].shape.step_rows,
+                   (unsigned long long)results[i].drafts,
+                   (unsigned long long)results[i].shape.max_pos,
+                   results[i].name);
+    }
+    printf("\n  %d gates in %.0f s, %d engine open(s)\n", n_results, gate_now_s() - suite0, g_engine_opens);
+    printf(rc_all == 0 ? "RUNNER GATES: PASS\n" : "RUNNER GATES: FAIL\n");
+    return rc_all;
+}

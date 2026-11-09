@@ -45,6 +45,21 @@
  *   /tmp/attnbk
  */
 #include "../src/cuda/pulsar_cuda_attn_f16.cu"
+/* The launcher reads the engine's row-kind global (pulsar_gpu_matmul_batch_decode_rows,
+ * defined in pulsar_cuda_matmul.cu, not linked here): the leading rows under that count
+ * take the L210 split-K path, the rest the classic walk.  This test owns the value and
+ * drives every indexed case through BOTH paths against the same oracle. */
+static int g_decode_rows = 0;
+int pulsar_gpu_matmul_batch_decode_rows(void) { return g_decode_rows; }
+/* The split-K partials regrow drops the captured segment graphs (pulsar_gpu_seg_note_device_free,
+ * defined in pulsar_cuda_runtime.cu, not linked here); this test captures none. */
+void pulsar_gpu_seg_note_device_free(const char *) {}
+/* The KV row family is the loaded profile's (pulsar_gpu_kv_row_style, defined in
+ * pulsar_cuda_norm_kv.cu, not linked here).  This gate drives V4.1's CSA2 pair;
+ * the UNIFIED family V4 uses is driven by attn_f16_kernel_test's `unified`
+ * argument. */
+static pulsar_kv_row_style g_row_style = PULSAR_KV_ROWS_CSA2;
+pulsar_kv_row_style pulsar_gpu_kv_row_style(void) { return g_row_style; }
 
 int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
@@ -57,33 +72,30 @@ int cuda_ok(cudaError_t err, const char *what) {
 #include <cmath>
 #include <vector>
 #include <random>
+#include "kv_row_fixture.h"
 
-/* Encode a CONSTANT row in ATTN_PACK layout.  0.25/0.5/0.75/1.0 are all exact
- * in E4M3 with a unit block scale, so the packed row decodes to exactly the
- * same constant and the isolation assertion below is unchanged -- it now also
- * exercises packed row ADDRESSING (row stride, scale offset, rope offset).
- * The FORMAT itself is not at risk here: the kernel decodes through the same
- * attn_comp_pack_ld the f32 kernel uses, so there is one implementation. */
-static void pack_const_row(uint8_t *dst, float v, uint32_t head_dim) {
-    const uint32_t n_nope = head_dim - PULSAR_ATTN_PACK_NROT;
-    uint32_t e = 0, m = 0;
-    for (uint32_t be = 1; be < 15u && !e; be++)
-        for (uint32_t mm = 0; mm < 8u; mm++) {
-            const float cand = ldexpf(1.0f + (float)mm / 8.0f, (int)be - 7);
-            if (cand == v) { e = be; m = mm; break; }
-        }
-    if (!e) { fprintf(stderr, "pack_const_row: %.4f not exact in e4m3\n", v); exit(2); }
-    for (uint32_t d = 0; d < n_nope; d++) dst[d] = (uint8_t)((e << 3) | m);
-    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_SCALES_PAD(head_dim); i++)
-        dst[n_nope + i] = 127u;                       /* scale = 2^0 */
-    /* v is exact in e4m3 (3 mantissa bits) and therefore exact in bf16 (7), so
-     * the narrowed rope tail still decodes to precisely v. */
-    __nv_bfloat16 *rope = (__nv_bfloat16 *)(dst + n_nope + PULSAR_ATTN_PACK_SCALES_PAD(head_dim));
-    for (uint32_t i = 0; i < PULSAR_ATTN_PACK_NROT; i++) rope[i] = __float2bfloat16(v);
+/* Encode a CONSTANT row in each layout.  0.25/0.5/0.75/1.0 are exact in E4M3,
+ * so the packed rows decode to exactly the constant and the isolation
+ * assertion below is unchanged -- it also exercises packed row ADDRESSING
+ * (row stride, scale offset) in both formats.  The FORMATS themselves are not
+ * at risk here: the kernel decodes through the shared row accessors
+ * (pulsar_cuda_internal.h), so there is one implementation of each. */
+static void pack_const_window_row(uint8_t *dst, float v, uint32_t head_dim) {
+    /* unit block scale (E8M0 byte 127), every code = e4m3(v) */
+    for (uint32_t d = 0; d < head_dim; d++) dst[d] = host_e4m3_encode(v);
+    for (uint32_t b = 0; b < head_dim / 32u; b++) dst[head_dim + b] = 127u;
+}
+static void pack_const_main_row(uint8_t *dst, float v, uint32_t head_dim) {
+    /* block scale = e4m3(v) exactly, every nibble = e2m1(1.0) -> 1.0 * v */
+    for (uint32_t i = 0; i < head_dim / 2u; i++) dst[i] = (uint8_t)(2u | (2u << 4));
+    for (uint32_t b = 0; b < head_dim / 16u; b++) dst[head_dim / 2u + b] = host_e4m3_encode(v);
 }
 
 int main(int argc, char **argv) {
-    const int packed = (argc > 1 && argv[1][0] == 'p');
+    /* Comp banks are MAIN rows, the ring WINDOW rows -- the shipped formats,
+     * no mode argument (the old 'p' packed/f32 selector is gone with the f32
+     * arm; L106 K10). */
+    (void)argc; (void)argv;
     const uint32_t D = AF16_DIM, n_head = 32u;
     const uint32_t n_banks = 4u, raw_cap = 64u, comp_cap = 32u;
     const uint32_t n_tokens = 16u, top_k = 8u, window = 24u, ratio = 2u;
@@ -91,20 +103,16 @@ int main(int argc, char **argv) {
 
     printf("attn f16 BANK ISOLATION test: %u banks, raw_cap=%u comp_cap=%u,"
            " %u tokens x %u heads, comp=%s\n\n", n_banks, raw_cap, comp_cap,
-           n_tokens, n_head, packed ? "ATTN_PACK" : "f32");
+           n_tokens, n_head, "MAIN (ring WINDOW)");
 
     /* bank b is the constant v_b, everywhere: raw ring slice AND comp slice */
     auto vb = [](uint32_t b) { return 0.25f * (float)(b + 1u); };
 
-    std::vector<float> raw((size_t)n_banks * raw_cap * D);
-    std::vector<float> comp((size_t)n_banks * comp_cap * D);
+    const size_t win_row_b = (size_t)PULSAR_WINKV_ROWBYTES(D);
+    std::vector<uint8_t> rawp((size_t)n_banks * raw_cap * win_row_b);
     for (uint32_t b = 0; b < n_banks; b++) {
         for (uint32_t r = 0; r < raw_cap; r++)
-            for (uint32_t d = 0; d < D; d++)
-                raw[((size_t)b * raw_cap + r) * D + d] = vb(b);
-        for (uint32_t r = 0; r < comp_cap; r++)
-            for (uint32_t d = 0; d < D; d++)
-                comp[((size_t)b * comp_cap + r) * D + d] = vb(b);
+            pack_const_window_row(&rawp[((size_t)b * raw_cap + r) * win_row_b], vb(b), D);
     }
 
     std::mt19937_64 rng(20260808);
@@ -123,51 +131,82 @@ int main(int argc, char **argv) {
             tk[(size_t)t * top_k + i] = (int32_t)((t * 5u + i * 3u) % comp_cap);
     }
 
-    /* packed comp banks: same constants, ATTN_PACK layout */
-    const uint64_t prow = PULSAR_ATTN_PACK_ROWBYTES(D);
+    /* packed comp banks: same constants, MAIN layout */
+    const uint64_t prow = PULSAR_MAINKV_ROWBYTES(D);
     std::vector<uint8_t> pcomp((size_t)n_banks * comp_cap * prow, 0);
-    if (packed)
-        for (uint32_t b = 0; b < n_banks; b++)
-            for (uint32_t r = 0; r < comp_cap; r++)
-                pack_const_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
+    for (uint32_t b = 0; b < n_banks; b++)
+        for (uint32_t r = 0; r < comp_cap; r++)
+            pack_const_main_row(&pcomp[((size_t)b * comp_cap + r) * prow], vb(b), D);
 
-    float *dq, *draw, *dcomp, *ds, *dout; int32_t *dtk, *dpos, *dseq;
-    cudaMalloc(&dq, q.size()*4); cudaMalloc(&draw, raw.size()*4);
-    cudaMalloc(&dcomp, comp.size()*4); cudaMalloc(&ds, sinks.size()*4);
-    cudaMalloc(&dout, out.size()*4); cudaMalloc(&dtk, tk.size()*4);
+    pulsar_q_t *dq;
+    float *draw, *ds; int32_t *dtk, *dpos, *dseq;
+    /* dout carries the STORED heads type (L033); the sentinel below must
+     * round-trip through it, or a bf16 width turns every never-written slot
+     * into a false "written garbage" (-12345 is not representable in bf16). */
+    pulsar_heads_t *dout;
+    std::vector<pulsar_heads_t> out_h(out.size());
+    const float kSent = (float)(pulsar_heads_t)(-12345.f);
+    dq = fixture_upload_q(q); cudaMalloc(&draw, rawp.size()); cudaMalloc(&ds, sinks.size()*4);
+    cudaMalloc(&dout, out.size()*sizeof(pulsar_heads_t)); cudaMalloc(&dtk, tk.size()*4);
     cudaMalloc(&dpos, pos.size()*4); cudaMalloc(&dseq, seq.size()*4);
-    cudaMemcpy(dq, q.data(), q.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(draw, raw.data(), raw.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dcomp, comp.data(), comp.size()*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(draw, rawp.data(), rawp.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(ds, sinks.data(), sinks.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dout, out.data(), out.size()*4, cudaMemcpyHostToDevice);
+    for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+    cudaMemcpy(dout, out_h.data(), out_h.size()*sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
     cudaMemcpy(dtk, tk.data(), tk.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dpos, pos.data(), pos.size()*4, cudaMemcpyHostToDevice);
     cudaMemcpy(dseq, seq.data(), seq.size()*4, cudaMemcpyHostToDevice);
 
     /* comp_bank_ptrs: one base pointer per bank, the shape the engine passes */
     uint8_t *dpk = NULL;
-    if (packed) {
-        cudaMalloc(&dpk, pcomp.size());
-        cudaMemcpy(dpk, pcomp.data(), pcomp.size(), cudaMemcpyHostToDevice);
-    }
+    cudaMalloc(&dpk, pcomp.size());
+    cudaMemcpy(dpk, pcomp.data(), pcomp.size(), cudaMemcpyHostToDevice);
     std::vector<const void *> hbp(n_banks);
     for (uint32_t b = 0; b < n_banks; b++)
-        hbp[b] = packed ? (const void *)(dpk + (size_t)b * comp_cap * prow)
-                        : (const void *)(dcomp + (size_t)b * comp_cap * D);
+        hbp[b] = (const void *)(dpk + (size_t)b * comp_cap * prow);
     const void **dbp = NULL;
     cudaMalloc(&dbp, n_banks * sizeof(void *));
     cudaMemcpy(dbp, hbp.data(), n_banks * sizeof(void *), cudaMemcpyHostToDevice);
 
+    /* Two selection modes share this kernel and BOTH must be bank-isolated:
+     *   topk != NULL  a top-k selection      (the indexed prefill/decode path)
+     *   topk == NULL  visible-prefix sweep   (attention_decode_batch_launch's
+     *                                         continued-prefill call)
+     * Only the first was covered until 2026-08-15; the second is the mode a
+     * banked continued-prefill batch actually takes.  Every comp row in bank b
+     * holds v_b, so both modes must return v_b for a correctly isolated read. */
+    /* L210: each selection mode also runs on both walks -- classic (no decode
+     * rows) and split-K (every row a decode row) -- so bank isolation and the
+     * evicted row's zero heads (an empty partial from every split) are checked
+     * on the path the decode batch takes. */
+    int overall = 1;
+    for (int mode = 0; mode < 4; mode++) {
+        const int sel = mode & 1, split = mode >> 1;
+        g_decode_rows = split ? (int)n_tokens : 0;
+        const int32_t *use_tk = sel ? NULL : dtk;
+        const uint32_t use_topk = sel ? 0u : top_k;
+        char label[96];
+        snprintf(label, sizeof label, "%s, %s", sel ? "visible-prefix sweep (topk=NULL)" : "top-k selection",
+                 split ? "split-K walk" : "classic walk");
+        printf("---- %s ----\n", label);
+        cudaMemset(dout, 0, out.size() * sizeof(pulsar_heads_t));
+        std::fill(out.begin(), out.end(), kSent);
+        for (size_t i = 0; i < out.size(); i++) out_h[i] = (pulsar_heads_t)out[i];
+        cudaMemcpy(dout, out_h.data(), out_h.size() * sizeof(pulsar_heads_t), cudaMemcpyHostToDevice);
+
     const int rc = pulsar_gpu_attention_f16_indexed(
-        dout, ds, dq, draw, packed ? (const float *)dpk : dcomp, dtk, n_tokens,
-        /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, top_k, window, ratio,
-        n_head, D, /*raw_f16*/0, dpos, dseq, dbp, comp_cap, n_banks, packed);
+        dout, ds, dq, (const pulsar_winkv_row_t *)draw,
+        (const pulsar_mainkv_row_t *)dpk, use_tk, n_tokens,
+        /*pos0*/0u, n_raw, raw_cap, /*raw_start*/0u, n_comp, use_topk, window, ratio,
+        n_head, D, dpos, dseq, dbp, comp_cap, n_banks, 0u /* causal */, NULL,
+        NULL, NULL /* no image-span visibility: banked rows are decode rows */,
+        NULL, NULL, 0, 0u, 0u, 0u, 0u, 0u);
     if (!rc) { printf("LAUNCH REFUSED\n"); return 1; }
     if (cudaDeviceSynchronize() != cudaSuccess) {
         printf("EXEC FAILED: %s\n", cudaGetErrorString(cudaGetLastError())); return 1;
     }
-    cudaMemcpy(out.data(), dout, out.size()*4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_h.data(), dout, out_h.size()*sizeof(pulsar_heads_t), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < out.size(); i++) out[i] = (float)out_h[i];
 
     double worst_leak = 0.0; uint32_t leak_tok = 0, leak_head = 0;
     size_t evict_bad = 0, untouched = 0, nan = 0;
@@ -178,7 +217,7 @@ int main(int argc, char **argv) {
             for (uint32_t d = 0; d < D; d++) {
                 const float g = out[((size_t)t * n_head + h) * D + d];
                 if (std::isnan(g)) { nan++; continue; }
-                if (g == -12345.f) { untouched++; continue; }
+                if (g == kSent) { untouched++; continue; }
                 const double e = std::fabs((double)g - want);
                 if (ev) { if (e > 0.0) evict_bad++; continue; }
                 if (e > worst_leak) { worst_leak = e; leak_tok = t; leak_head = h; }
@@ -190,9 +229,13 @@ int main(int argc, char **argv) {
     printf("NaN = %zu, never-written = %zu\n", nan, untouched);
     printf("  bank constants: ");
     for (uint32_t b = 0; b < n_banks; b++) printf("v%u=%.2f ", b, vb(b));
-    printf("\n  a cross-bank read moves the answer by >= %.2f\n", 0.25f);
+    printf("  a cross-bank read moves the answer by >= %.2f\n", 0.25f);
 
     const int pass = (nan == 0 && untouched == 0 && evict_bad == 0 && worst_leak < 1e-2);
-    printf("\nATTN F16 BANK ISOLATION: %s\n", pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+    printf("  %s: %s\n\n", label, pass ? "PASS" : "FAIL");
+    if (!pass) overall = 0;
+    }
+
+    printf("ATTN F16 BANK ISOLATION: %s\n", overall ? "PASS" : "FAIL");
+    return overall ? 0 : 1;
 }

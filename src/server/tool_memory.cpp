@@ -1,8 +1,14 @@
+/** @file
+ *  Tool memory (call bodies by id and block bytes, LRU) and the protocols' live tool-state bindings; also
+ *  server_now_sec and server_log.
+ */
 #include "pulsar_server_internal.h"
 #include "pulsar_lock.hpp"
 
 
 
+/// @brief The monotonic clock (CLOCK_MONOTONIC), in seconds; for intervals, not wall time.
+/// @return seconds since an arbitrary fixed point
 double server_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -11,6 +17,9 @@ double server_now_sec(void) {
 
 
 
+/// @brief One timestamped ("MMDD HH:MM:SS") log line to stderr, through pulsar_log's type filter; any thread.
+/// @param type  the log category (pulsar_log decides whether it prints)
+/// @param fmt   printf format, then its arguments; the newline is added
 void server_log(pulsar_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -40,33 +49,45 @@ void server_log(pulsar_log_type type, const char *fmt, ...) {
 
 
 
-bool id_list_contains(const stop_list *ids, const char *id);
 
 
 void id_list_push_unique(stop_list *ids, const char *id);
 
 
+/// @brief The entry ceiling: m->max_entries, or PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS when unset (<= 0).
+/// @param m  the tool memory (NULL: the default)
+/// @return the maximum number of entries
 int tool_memory_max_entries(const tool_memory *m) {
     return m && m->max_entries > 0 ? m->max_entries : PULSAR_TOOL_MEMORY_DEFAULT_MAX_IDS;
 }
 
 
 
+/// @brief The byte ceiling: m->max_bytes, or PULSAR_TOOL_MEMORY_MAX_BYTES when unset (0).
+/// @param m  the tool memory (NULL: the default)
+/// @return the maximum accounted bytes
 static size_t tool_memory_max_bytes(const tool_memory *m) {
     return m && m->max_bytes > 0 ? m->max_bytes : PULSAR_TOOL_MEMORY_MAX_BYTES;
 }
 
 
 
+/// @brief Allocate the two index maps on first use (dies on allocation failure).  Caller holds server::tool_mu.
+/// @param m  the tool memory
 static void tool_memory_init_locked(tool_memory *m) {
     if (m->by_id && m->by_block) return;
-    m->by_id = raxNew();
-    m->by_block = raxNew();
+    /* nothrow, because the established contract here is die() on allocation
+     * failure rather than an exception unwinding out of a locked region. */
+    m->by_id    = new (std::nothrow) tool_memory_id_map();
+    m->by_block = new (std::nothrow) tool_memory_block_map();
     if (!m->by_id || !m->by_block) die("out of memory");
 }
 
 
 
+/// @brief Link `e` at the LRU list's head (most recently used).  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry not on the list
 static void tool_memory_link_head(tool_memory *m, tool_memory_entry *e) {
     e->prev = NULL;
     e->next = m->head;
@@ -77,6 +98,9 @@ static void tool_memory_link_head(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Unlink `e` from the LRU list.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry on the list
 static void tool_memory_unlink(tool_memory *m, tool_memory_entry *e) {
     if (e->prev) e->prev->next = e->next;
     else m->head = e->next;
@@ -87,6 +111,9 @@ static void tool_memory_unlink(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Mark `e` used: stamp it with the next clock value and move it to the LRU head.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  an entry on the list
 static void tool_memory_touch(tool_memory *m, tool_memory_entry *e) {
     e->stamp = ++m->clock;
     if (m->head == e) return;
@@ -96,6 +123,9 @@ static void tool_memory_touch(tool_memory *m, tool_memory_entry *e) {
 
 
 
+/// @brief Remove `e` from the block's list of entries sharing it (no refcount change).
+/// @param b  the block
+/// @param e  the entry (absent: nothing happens)
 static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) {
     tool_memory_entry **p = &b->entries;
     while (*p) {
@@ -110,29 +140,39 @@ static void tool_block_unlink_entry(tool_memory_block *b, tool_memory_entry *e) 
 
 
 
+/// @brief The block with exactly these bytes, if remembered.  Caller holds server::tool_mu.
+/// @param m    the tool memory
+/// @param raw  the block bytes
+/// @param len  bytes at `raw` (0: none)
+/// @return the block, or NULL
 tool_memory_block *tool_memory_find_block_locked(tool_memory *m,
-                                                        const char *dsml,
+                                                        const char *raw,
                                                         size_t len) {
-    if (!m->by_block || !dsml || len == 0) return NULL;
-    void *v = raxFind(m->by_block, (unsigned char *)dsml, len);
-    return v == raxNotFound ? NULL : (tool_memory_block *)v;
+    if (!m->by_block || !raw || len == 0) return NULL;
+    auto it = m->by_block->find(std::string(raw, len));
+    return it == m->by_block->end() ? NULL : it->second;
 }
 
 
 
+/// @brief The block with these bytes, created (refs 0, its bytes charged) when absent.  Caller holds server::tool_mu.
+/// @param m    the tool memory (maps initialised)
+/// @param raw  the block bytes
+/// @param len  bytes at `raw`
+/// @return the block (never NULL: dies on allocation failure)
 static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
-                                                       const char *dsml,
+                                                       const char *raw,
                                                        size_t len) {
-    tool_memory_block *b = tool_memory_find_block_locked(m, dsml, len);
+    tool_memory_block *b = tool_memory_find_block_locked(m, raw, len);
     if (b) return b;
 
     b = (tool_memory_block *)server_xmalloc(sizeof(*b));
     memset(b, 0, sizeof(*b));
-    b->dsml = xstrndup(dsml, len);
+    b->raw = server_xstrndup(raw, len);
     b->len = len;
     b->bytes = len + 1 + sizeof(*b);
-    if (!raxInsert(m->by_block, (unsigned char *)b->dsml, b->len, b, NULL)) {
-        free(b->dsml);
+    if (!m->by_block->emplace(std::string(b->raw, b->len), b).second) {
+        free(b->raw);
         free(b);
         die("out of memory");
     }
@@ -142,27 +182,27 @@ static tool_memory_block *tool_memory_get_block_locked(tool_memory *m,
 
 
 
+/// @brief Drop one reference to `b`; at zero it is unindexed, uncharged and freed.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param b  the block (NULL: nothing)
 static void tool_memory_release_block_locked(tool_memory *m, tool_memory_block *b) {
     if (!b) return;
     if (--b->refs > 0) return;
-    if (m->by_block) {
-        void *old = NULL;
-        (void)raxRemove(m->by_block, (unsigned char *)b->dsml, b->len, &old);
-    }
+    if (m->by_block) m->by_block->erase(std::string(b->raw, b->len));
     if (m->bytes >= b->bytes) m->bytes -= b->bytes;
     else m->bytes = 0;
-    free(b->dsml);
+    free(b->raw);
     free(b);
 }
 
 
 
+/// @brief Remove and free one entry: unindex, unlink, uncharge, release its block.  Caller holds server::tool_mu.
+/// @param m  the tool memory
+/// @param e  the entry (NULL: nothing)
 static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e) {
     if (!e) return;
-    if (m->by_id && e->id) {
-        void *old = NULL;
-        (void)raxRemove(m->by_id, (unsigned char *)e->id, strlen(e->id), &old);
-    }
+    if (m->by_id && e->id) m->by_id->erase(std::string(e->id));
     tool_memory_unlink(m, e);
     if (e->block) tool_block_unlink_entry(e->block, e);
     if (m->bytes >= e->bytes) m->bytes -= e->bytes;
@@ -175,6 +215,8 @@ static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e
 
 
 
+/// @brief Evict least-recently-used entries until both ceilings hold.  Caller holds server::tool_mu.
+/// @param m  the tool memory
 static void tool_memory_prune_locked(tool_memory *m) {
     while ((m->entries > tool_memory_max_entries(m) ||
             m->bytes > tool_memory_max_bytes(m)) && m->tail)
@@ -185,24 +227,34 @@ static void tool_memory_prune_locked(tool_memory *m) {
 
 
 
+/// @brief The entry for call id `id` (no LRU touch).  Caller holds server::tool_mu.
+/// @param m   the tool memory
+/// @param id  the call id (NULL or empty: none)
+/// @return the entry, or NULL
 static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
                                                         const char *id) {
     if (!m->by_id || !id || !id[0]) return NULL;
-    void *v = raxFind(m->by_id, (unsigned char *)id, strlen(id));
-    return v == raxNotFound ? NULL : (tool_memory_entry *)v;
+    auto it = m->by_id->find(std::string(id));
+    return it == m->by_id->end() ? NULL : it->second;
 }
 
 
 
+/// @brief Remember `raw` as call `id`'s block: an identical entry is only touched (and upgraded to RAM when
+///        `source` is), a different one replaced; then prune.  Caller holds server::tool_mu.
+/// @param m       the tool memory
+/// @param id      the call id (NULL or empty: ignored)
+/// @param raw     the block's exact bytes, NUL-terminated (NULL or empty: ignored)
+/// @param source  where the entry came from
 static void tool_memory_put_locked(tool_memory *m, const char *id,
-                                   const char *dsml, tool_memory_source source) {
-    if (!id || !id[0] || !dsml || !dsml[0]) return;
+                                   const char *raw, tool_memory_source source) {
+    if (!id || !id[0] || !raw || !raw[0]) return;
     tool_memory_init_locked(m);
 
-    size_t dsml_len = strlen(dsml);
+    size_t raw_len = strlen(raw);
     tool_memory_entry *old = tool_memory_find_entry_locked(m, id);
-    if (old && old->block && old->block->len == dsml_len &&
-        !memcmp(old->block->dsml, dsml, dsml_len))
+    if (old && old->block && old->block->len == raw_len &&
+        !memcmp(old->block->raw, raw, raw_len))
     {
         if (source == TOOL_MEMORY_RAM) old->source = TOOL_MEMORY_RAM;
         tool_memory_touch(m, old);
@@ -211,10 +263,10 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     }
     if (old) tool_memory_remove_entry_locked(m, old);
 
-    tool_memory_block *b = tool_memory_get_block_locked(m, dsml, dsml_len);
+    tool_memory_block *b = tool_memory_get_block_locked(m, raw, raw_len);
     tool_memory_entry *e = (tool_memory_entry *)server_xmalloc(sizeof(*e));
     memset(e, 0, sizeof(*e));
-    e->id = xstrdup(id);
+    e->id = server_xstrdup(id);
     e->block = b;
     e->bytes = strlen(id) + 1 + sizeof(*e);
     e->stamp = ++m->clock;
@@ -223,7 +275,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     b->entries = e;
     b->refs++;
 
-    if (!raxInsert(m->by_id, (unsigned char *)e->id, strlen(e->id), e, NULL)) {
+    if (!m->by_id->emplace(std::string(e->id), e).second) {
         tool_block_unlink_entry(b, e);
         free(e->id);
         free(e);
@@ -238,10 +290,12 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
 
 
 
+/// @brief Free every entry, block and index, and zero the struct.  Shutdown (or tests): no lock taken.
+/// @param m  the tool memory
 void tool_memory_free(tool_memory *m) {
     while (m->tail) tool_memory_remove_entry_locked(m, m->tail);
-    if (m->by_id) raxFree(m->by_id);
-    if (m->by_block) raxFree(m->by_block);
+    delete m->by_id;
+    delete m->by_block;
     memset(m, 0, sizeof(*m));
 }
 
@@ -257,6 +311,9 @@ void tool_memory_free(tool_memory *m) {
  * live on the session_slot (they describe that session, and move with it);
  * server.tool_mu guards them all because request parsing reads call-ids on
  * client threads before a job is bound to a slot. */
+/// @brief Invalidate a binding: drop its ids and visible text (the id array's storage is kept).  Caller holds
+///        server::tool_mu.
+/// @param st  the binding (NULL: nothing)
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
@@ -269,6 +326,8 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
 
 
 
+/// @brief Free a binding's storage and zero it.
+/// @param st  the binding (NULL: nothing)
 void live_tool_state_free(live_tool_state *st) {
     if (!st) return;
     live_tool_state_clear_locked(st);
@@ -278,6 +337,8 @@ void live_tool_state_free(live_tool_state *st) {
 
 
 
+/// @brief Invalidate a visible-transcript binding and free its text.  Caller holds server::tool_mu.
+/// @param st  the binding (NULL: nothing)
 static void visible_live_clear_locked(visible_live_state *st) {
     if (!st) return;
     free(st->visible_text);
@@ -289,32 +350,12 @@ static void visible_live_clear_locked(visible_live_state *st) {
 
 
 
+/// @brief Free a visible-transcript binding's storage and zero it.
+/// @param st  the binding (NULL: nothing)
 void visible_live_free(visible_live_state *st) {
     if (!st) return;
     visible_live_clear_locked(st);
     memset(st, 0, sizeof(*st));
-}
-
-
-
-void server::thinking_live_clear(session_slot *sl) {
-    auto *s = this;
-    if (!s || !sl) return;
-    pulsar::ScopedLock lk(&s->tool_mu);
-    visible_live_clear_locked(&sl->thinking_live);
-}
-
-
-
-void server::thinking_live_remember(session_slot *sl, const char *visible_text) {
-    auto *s = this;
-    if (!s || !sl || !visible_text || !visible_text[0]) return;
-    pulsar::ScopedLock lk(&s->tool_mu);
-    visible_live_clear_locked(&sl->thinking_live);
-    sl->thinking_live.visible_text = xstrdup(visible_text);
-    sl->thinking_live.visible_len = strlen(visible_text);
-    sl->thinking_live.live_tokens = s->slot_frontier_pos(sl);
-    sl->thinking_live.valid = true;
 }
 
 
@@ -325,14 +366,14 @@ void server::responses_live_remember(session_slot *sl, const char *visible_text,
     if (!s || !sl || !visible_text || !visible_text[0]) return;
     pulsar::ScopedLock lk(&s->tool_mu);
     live_tool_state_clear_locked(&sl->responses_live);
-    sl->responses_live.visible_text = xstrdup(visible_text);
+    sl->responses_live.visible_text = server_xstrdup(visible_text);
     sl->responses_live.visible_len = strlen(visible_text);
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
             id_list_push_unique(&sl->responses_live.call_ids, calls->v[i].id);
         }
     }
-    sl->responses_live.live_tokens = s->slot_frontier_pos(sl);
+    sl->responses_live.live_tokens = s->slot_frontier_pos(sl).raw();
     sl->responses_live.valid = true;
 }
 
@@ -346,7 +387,7 @@ void server::anthropic_live_remember(session_slot *sl, const tool_calls *calls) 
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&sl->anthropic_live.call_ids, calls->v[i].id);
     }
-    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl);
+    sl->anthropic_live.live_tokens = s->slot_frontier_pos(sl).raw();
     sl->anthropic_live.valid = sl->anthropic_live.call_ids.len > 0;
 }
 
@@ -414,6 +455,12 @@ bool server::anthropic_live_has_call_id(const char *id) {
 
 
 
+/// @brief A binding matches when it is valid, stands at `live_tokens` and holds exactly the set `ids`.  Caller
+///        holds server::tool_mu.
+/// @param st           the binding
+/// @param ids          the request's ids
+/// @param live_tokens  the frontier, in tokens, it must stand at (-1: never matches a valid binding at >= 0)
+/// @return true on a match
 static bool live_state_matches_ids_locked(const live_tool_state *st,
                                           const stop_list *ids,
                                           int live_tokens) {
@@ -469,7 +516,7 @@ session_slot *server::live_slot_for_ids(const stop_list *ids,
                                               : &sl->responses_live;
         /* Bank-aware: match against THIS slot's bank frontier, not the pool's
          * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
-        const int pos = sl->provisioned ? s->slot_frontier_pos(sl) : -1;
+        const int pos = sl->provisioned ? s->slot_frontier_pos(sl).raw() : -1;
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -494,7 +541,7 @@ session_slot *server::anthropic_live_slot_for_ids(const stop_list *ids) {
 
 bool server::tool_memory_has_id(const char *id) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
+    if (!s || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
     bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
     pthread_mutex_unlock(&s->tool_mu);
@@ -503,6 +550,12 @@ bool server::tool_memory_has_id(const char *id) {
 
 
 
+/// @brief Call `id`'s remembered block bytes, touching the entry.  Caller holds server::tool_mu.
+/// @param m       the tool memory
+/// @param id      the call id
+/// @param source  receives where the entry came from (may be NULL)
+/// @param block   receives the block (may be NULL)
+/// @return the block bytes (owned by the memory; valid while tool_mu is held), or NULL
 static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
                                              tool_memory_source *source,
                                              tool_memory_block **block) {
@@ -511,18 +564,17 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
     tool_memory_touch(m, e);
     if (source) *source = e->source;
     if (block) *block = e->block;
-    return e->block->dsml;
+    return e->block->raw;
 }
 
 
 
 void server::tool_memory_remember(const tool_calls *calls) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay ||
-        !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
+    if (!s || !calls || !calls->raw_calls || !calls->raw_calls[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
-        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
+        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_calls,
                                TOOL_MEMORY_RAM);
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -530,13 +582,12 @@ void server::tool_memory_remember(const tool_calls *calls) {
 
 
 
-void server::tool_memory_put_source(const char *id, const char *dsml,
+void server::tool_memory_put_source(const char *id, const char *raw,
                                    tool_memory_source source) {
     auto *s = this;
-    if (!s || s->disable_exact_dsml_tool_replay ||
-        !id || !id[0] || !dsml || !dsml[0]) return;
+    if (!s || !id || !id[0] || !raw || !raw[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    tool_memory_put_locked(&s->tool_mem, id, dsml, source);
+    tool_memory_put_locked(&s->tool_mem, id, raw, source);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -544,9 +595,9 @@ void server::tool_memory_put_source(const char *id, const char *dsml,
 
 #ifdef PULSAR_SERVER_TEST
 
-void server::tool_memory_put(const char *id, const char *dsml) {
+void server::tool_memory_put(const char *id, const char *raw) {
     auto *s = this;
-    s->tool_memory_put_source(id, dsml, TOOL_MEMORY_RAM);
+    s->tool_memory_put_source(id, raw, TOOL_MEMORY_RAM);
 }
 
 
@@ -557,11 +608,11 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
                                            tool_replay_stats *stats) {
     auto *s = this;
     if (!msgs) return;
-    if (!s || s->disable_exact_dsml_tool_replay) {
+    if (!s) {
         if (stats) {
             for (int i = 0; i < msgs->len; i++) {
                 tool_calls *calls = &msgs->v[i].calls;
-                if (calls->len == 0 || calls->raw_dsml) continue;
+                if (calls->len == 0 || calls->raw_calls) continue;
                 stats->canonical++;
                 stats->missing_ids += calls->len;
             }
@@ -571,7 +622,8 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
-        if (calls->len == 0 || calls->raw_dsml) continue;
+        /* L337: a call whose input context editing cleared renders from its edited arguments, not the sampled bytes */
+        if (calls->len == 0 || calls->raw_calls || calls->inputs_cleared) continue;
         tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
         bool exact = true;
@@ -579,10 +631,10 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
         for (int j = 0; j < calls->len; j++) {
             tool_memory_source source = TOOL_MEMORY_DISK;
             tool_memory_block *block = NULL;
-            const char *dsml =
+            const char *raw =
                 tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id,
                                           &source, &block);
-            if (!dsml) {
+            if (!raw) {
                 exact = false;
                 missing++;
                 continue;
@@ -596,7 +648,7 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
             if (source == TOOL_MEMORY_RAM) matched_source = TOOL_MEMORY_RAM;
         }
         if (exact && matched) {
-            calls->raw_dsml = xstrdup(matched->dsml);
+            calls->raw_calls = server_xstrdup(matched->raw);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -611,6 +663,11 @@ void server::tool_memory_attach_to_messages(chat_msgs *msgs,
 
 
 
+/// @brief Whether one of the first `upto` calls already carries id `id`.
+/// @param calls  the calls
+/// @param id     the id (NULL or empty: false)
+/// @param upto   how many leading calls to check (capped at calls->len)
+/// @return true when found
 static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int upto) {
     if (!calls || !id || !id[0]) return false;
     if (upto > calls->len) upto = calls->len;
@@ -632,35 +689,10 @@ void server::assign_tool_call_ids(tool_calls *calls, api_style api) {
             random_tool_id(id, sizeof(id), api);
             if (!tool_calls_contains_id(calls, id, i) && !s->tool_memory_has_id(id)) break;
         }
-        calls->v[i].id = xstrdup(id);
+        calls->v[i].id = server_xstrdup(id);
     }
 }
 
 
 
-void apply_openai_stream_tool_ids(tool_calls *calls,
-                                         const openai_stream *st) {
-    if (!calls || !st) return;
-    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
-    for (int i = 0; i < n; i++) {
-        if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
-    }
-}
-
-
-
-void apply_anthropic_stream_tool_ids(tool_calls *calls,
-                                            const anthropic_stream *st) {
-    if (!calls || !st) return;
-    /* The SSE stream may have exposed tool ids before final DSML parsing.  The
-     * parsed calls must inherit those ids before assign_tool_call_ids() and
-     * tool_memory_remember(), otherwise the client returns a tool_result for an
-     * id that the continuation fast path does not know. */
-    int n = calls->len < st->tool.ids_cap ? calls->len : st->tool.ids_cap;
-    for (int i = 0; i < n; i++) {
-        if (calls->v[i].id && calls->v[i].id[0]) continue;
-        if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
-    }
-}
 

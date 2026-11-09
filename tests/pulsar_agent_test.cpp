@@ -1,5 +1,4 @@
 #define PULSAR_AGENT_TEST
-#define PULSAR_AGENT_TEST_NO_MAIN
 #include "../src/agent/config_types.cpp"
 #include "../src/agent/util_cli.cpp"
 #include "../src/agent/prompt_queue.cpp"
@@ -12,13 +11,13 @@
 #include "../src/agent/session_ui.cpp"
 #include "../src/agent/file_tools.cpp"
 #include "../src/agent/edit_tools.cpp"
+#include "../src/agent/family_tools.cpp"
 #include "../src/agent/bash_jobs.cpp"
 #include "../src/agent/tool_dispatch.cpp"
 #include "../src/agent/compaction.cpp"
 #include "../src/agent/worker.cpp"
 #include "../src/agent/worker_sync.cpp"
 #include "../src/agent/terminal_ui.cpp"
-#include "../src/agent/runtime.cpp"
 
 int main(void) {
     pulsar_agent_unit_tests_run();

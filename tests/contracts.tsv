@@ -1,0 +1,106 @@
+# L278: every gate's CONTRACT and FAMILY -- the coverage matrix's one source (tools/coverage_matrix.py checks it
+# against the Makefile in host-checks).  A gate is a make target (or a runner sub-gate, `runner:<name>`).
+#
+#   contract   session | loader | spec (greedy == spec, multi-bank verify) | spec-dist (the sampled distribution)
+#              | reference | chat | server | tp | kernel:<name>; a gate checking several lists them, comma-separated
+#   family     deepseek4 | qwen4_exp | nemotron_h | gemma4 | all (family-neutral: runs for every family, or needs no model)
+#   tier       battery (make gates) | dev (gates-dev only) | manual (neither; say why in the note)
+#
+# A family in the registry (src/engine/family.cpp) that this matrix does not track is an `untracked` row, naming the
+# ledger row that closes it: untracked, family, Lnnn, note.
+#
+# A contract x family cell with no battery gate must appear as a `gap` row naming the ledger row that closes it --
+# the check fails on an undeclared hole, so a gap is written down, not remembered.
+#
+# L284: a gate listed for ONE family (a kernel: gate excepted) is a decision for every other family, written down
+# below the table as one of
+#   na   <target> <family> <reason>          the contract does not apply there: the family lacks, by design, the
+#                                            mechanism the gate grades (and what grades the family's own instead)
+#   gap  <target> <family> <Lnnn> <note>     it applies and is owed; the ledger row that closes it
+# and the check fails on a one-family gate with neither, or on such a row for a gate that already runs there.
+#
+# target	contract	family	tier	note
+runner:session-contract-gate	session,spec	all	battery	every hosted model; B6: multi-bank verify == single
+runner:cuda-row-neutrality-gate	session	all	battery	1-row == N-row decode, ~100 / ~2.2k / ~10k tokens, every hosted model
+runner:cuda-chunk-neutrality-gate	session	all	battery	schedules A-P/X at 8600 tokens, chunk 4096; payload (H I M P) / rewind (J K) / standalone restore (L N) schedules skip by name where the family lacks them; origins per sync planner, F G from the prefill grid on both (L284)
+runner:cuda-algo-stability-gate	session	all	battery	width neutrality: bank 0's decode row byte-identical at widths 1/2/4/5/8/16 (KL past the exact range), every hosted model (L284)
+runner:cuda-algo-stability-gate-deep	session	all	dev	the same with bank 0 at 2200 tokens (L284)
+runner:cuda-seam-gate	session	all	battery	a re-tokenized echo keeps the live KV; leg 3 (shorter echo) needs rewind, skipped by name without it (L284)
+runner:cuda-multiseq-gate	session	all	battery	co-scheduling neutrality N=2 vs 3, mixed == multiseq entry, stale-classic guard; ALL_ROWS leg needs prompt runs in a step (L284)
+runner:cuda-multiseq-gate-nodspark	session	all	battery	the same with speculation disabled at open (L284)
+runner:payload-frontier-gate	session	all	battery	L357: the payload round trip through the public API, every family with payloads
+runner:bank-residency-gate	session	all	battery	L357: free, re-allocate, reload a bank: byte-identical decode
+runner:bank-isolation-gate	session	all	battery	L357: an idle installed bank's declared state untouched by its neighbours' batched steps; batch order and a batchmate's position invisible to a row (the retired DeepSeek frontier gate's intent, every driver family)
+runner:kv-accounting-gate	session	all	battery	L357: touched KV growth == the device's physical growth over a fill, and a bank free returns its trunk pools (the retired DeepSeek accounting gate's intent, no rewind leg)
+runner:graph-eager-gate	session	all	battery	L357: replayed decode / verify step graphs == the eager steps at the same row count; needs graphed driver steps (SKIP on Qwen, whose driver stages none; runs on the hosted Nemotron)
+loader-contract-gate	loader	all	battery	header clones + named mutants, both families
+runner:cuda-spec-sampling-gate	spec,spec-dist	all	battery	greedy: emissions == committed, no decisive flip; sampled arms (chi-square informational); every hosted model
+spec-depth-gate	spec	all	battery	the depth rule both drafters share
+runner:cuda-reference-gate-story	reference	all	battery	each hosted model's anchors (Qwen: the published container's capture); manual (DEV) pending L360; KL budgets
+runner:cuda-decode-reference-gate-story	reference	qwen4_exp	manual	L360: out of the battery until Qwen's wide decode rows, which disagree decisively with one-row decode, are understood
+na	runner:cuda-decode-reference-gate-story	deepseek4	DeepSeek is smoke only (Tyler 2026-11-07): its reference gates left the runner
+qwen-chat-gate	chat	qwen4_exp	battery	tokenize / render / parser vs HF goldens
+unit-test-gate	server	all	battery	pulsar_test incl. --server (Qwen hooks: 4 tests)
+api-golden-gate	server	all	battery	DeepSeek and Qwen request rows
+sse-golden-gate	server	all	battery	DeepSeek walk + the Qwen leg through the family parser ops, 4 protocol shapes
+cuda-chat-smoke-gate	server	deepseek4	battery	through the CLI binary (the primary model)
+server-live-gate	server	all	manual	a live pulsar-server per family over HTTP (tool contract); one server load each, so not in the battery
+runner:chat-smoke-gate	server	all	battery	greedy chat answer on the public text API, every hosted model
+model-smoke	server	all	battery	L357: every published model (chat, embed, rerank, parse) starts on its own pulsar-server and answers one request of its kind; DeepSeek V4's release check
+cuda-regression	kernel:gdn,exl3,exl3-half,qsa,s4,moe-route,expert-table	all	battery
+cuda-attn-gates	kernel:attn-f16,hc,vision,rope	deepseek4	battery
+vision-qwen-pixel-gate	kernel:vision-preprocess	qwen4_exp	battery	bit-exact vs HF's Qwen2VLImageProcessorPil (host)
+vision-qwen-tower-gate	kernel:vision-tower	qwen4_exp	battery	vs HF stage dumps, the reference's bf16 floor (L268)
+qwen-image-smoke-gate	server	qwen4_exp	manual	one image question end to end; a model load of its own
+#
+# gaps: a contract x family cell with no battery gate, and the row that closes it
+gap	tp	qwen4_exp	L278	contract 7: the pair (tools/tp2-l272); tp-plan host-side
+gap	tp	deepseek4	L357	DeepSeek V4 is smoke-only since 2026-11-07: it left the runner, and cuda-tp-head-split-gate (its row slices) with it
+#
+# one-family gates (L284): na = by design, gap = owed
+na	qwen-chat-gate	deepseek4	Qwen's template / tokenizer vs HF goldens; DeepSeek's template is render-gate
+na	cuda-chat-smoke-gate	qwen4_exp	the CLI binary on the primary model; every hosted model's chat answer is runner:chat-smoke-gate
+na	qwen-image-smoke-gate	deepseek4	Qwen's image path end to end (manual); DeepSeek's images are cuda-attn-gates' vision and the vision image gates
+# L354: the two other served families.  What they run in the battery is what the log shows; the rest is written down here.
+nemotron-chat-gate	chat	nemotron_h	battery	tokenize / render / parser vs HF goldens
+na	nemotron-chat-gate	deepseek4	Nemotron's template and tokenizer; DeepSeek's template is render-gate
+na	nemotron-chat-gate	qwen4_exp	Nemotron's template and tokenizer; Qwen's is qwen-chat-gate
+na	nemotron-chat-gate	gemma4	Nemotron's template and tokenizer; Gemma's chat is a gap below
+gap	runner:cuda-decode-reference-gate-story	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	cuda-chat-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+gap	qwen-image-smoke-gate	nemotron_h	L354	applies to Nemotron; no battery run on a Nemotron fixture yet
+na	qwen-chat-gate	nemotron_h	Qwen's template and tokenizer vs HF goldens
+gap	tp	nemotron_h	L354	TP is on demand; no gate until one is served
+gap	runner:cuda-decode-reference-gate-story	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	cuda-chat-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+gap	qwen-image-smoke-gate	gemma4	L354	applies to Gemma; no battery run on a Gemma fixture yet
+na	qwen-chat-gate	gemma4	Qwen's template and tokenizer vs HF goldens
+gap	tp	gemma4	L354	TP is on demand; no gate until one is served
+gap	chat	gemma4	L354	no chat gate vs HF goldens in the battery for Gemma
+note	gemma4	no Gemma model in the battery: its counts are family-neutral (all) gates, none has run a Gemma fixture
+# L354: the families no battery model runs.
+gap	chat	inkling	L354	parked: its forward is not wired, so no session can run
+gap	chat	nemotron_enc	L354	an encoder: no chat, no decode, no session contract of its own
+gap	chat	nemotron_parse	L354	the OCR parser: its own decoder loop, no chat lane
+gap	tp	inkling	L354	parked: its forward is not wired, so no session can run
+gap	tp	nemotron_enc	L354	an encoder: no chat, no decode, no session contract of its own
+gap	tp	nemotron_parse	L354	the OCR parser: its own decoder loop, no chat lane
+na	cuda-chat-smoke-gate	inkling	parked: its forward is not wired, so no session can run
+na	cuda-chat-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	cuda-chat-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	nemotron-chat-gate	inkling	parked: its forward is not wired, so no session can run
+na	nemotron-chat-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	nemotron-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-chat-gate	inkling	parked: its forward is not wired, so no session can run
+na	qwen-chat-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-chat-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	qwen-image-smoke-gate	inkling	parked: its forward is not wired, so no session can run
+na	qwen-image-smoke-gate	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	qwen-image-smoke-gate	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+na	runner:cuda-decode-reference-gate-story	inkling	parked: its forward is not wired, so no session can run
+na	runner:cuda-decode-reference-gate-story	nemotron_enc	an encoder: no chat, no decode, no session contract of its own
+na	runner:cuda-decode-reference-gate-story	nemotron_parse	the OCR parser: its own decoder loop, no chat lane
+note	nemotron_enc	no nemotron_enc model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+note	nemotron_parse	no nemotron_parse model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+note	inkling	no inkling model in the battery: its counts are family-neutral (all) gates, none has run a fixture of it
+gap	chat	deepseek4	L355	no reference render check: render-gate read the removed V4.1 encoder, and V4's own encoder differs from this renderer (<｜System｜>)

@@ -1,5 +1,11 @@
+/** @file
+ *  pulsar-eval: built-in benchmark integration test -- real model, chat prompts, graded answers,
+ *  with a small ANSI terminal UI. */
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
+#include "pulsar_argparse.h"
+#include "pulsar_think_scan.hpp"
 
 /* pulsar-eval: small built-in benchmark integration test.
  *
@@ -44,29 +50,49 @@
 #include <time.h>
 #include <unistd.h>
 
+/** SGR: reset every attribute. */
 #define ANSI_RESET "\x1b[0m"
+/** SGR: bright black (grey), used for dim / thinking text. */
 #define ANSI_DIM "\x1b[90m"
+/** SGR: red foreground. */
 #define ANSI_RED "\x1b[31m"
+/** SGR: green foreground. */
 #define ANSI_GREEN "\x1b[32m"
+/** SGR: yellow foreground. */
 #define ANSI_YELLOW "\x1b[33m"
+/** SGR: blue foreground. */
 #define ANSI_BLUE "\x1b[34m"
+/** SGR: cyan foreground. */
 #define ANSI_CYAN "\x1b[36m"
+/** SGR: bold. */
 #define ANSI_BOLD "\x1b[1m"
 
+/** Most multiple-choice options a case carries (eval_case::choice). */
 #define EVAL_MAX_CHOICES 10
+/** Bytes of an extracted answer buffer, NUL included. */
 #define EVAL_ANSWER_MAX 32
+/** Ceiling on --max-tokens, --ctx and the auto-sized context, tokens. */
 #define EVAL_MAX_CONTEXT 1000000
 
+/** A case's state in the run, from pending through its graded outcome. */
 typedef enum {
     EVAL_PENDING,
     EVAL_PREFILL,
     EVAL_THINKING,
     EVAL_SKIPPED,
     EVAL_STOPPED,
+    /** The response ended without its answer line (the budget ran out, or the
+     * model kept writing after it).  Counted on its own: neither a pass nor a
+     * fail, because nothing was graded. */
+    EVAL_INCOMPLETE,
     EVAL_PASSED,
     EVAL_FAILED,
 } eval_status;
 
+/* The one spelling of a status in traces and reports (defined with the report). */
+static const char *report_status_name(eval_status st);
+
+/** How run_one_case returned: done, failed, or the user switched case / quit mid-run. */
 typedef enum {
     EVAL_RUN_OK,
     EVAL_RUN_ERROR,
@@ -74,6 +100,8 @@ typedef enum {
     EVAL_RUN_QUIT,
 } eval_run_result;
 
+/** How a case's reasoning block closed: not at all, by the model (natural), or forced by the soft limit
+ *  (`</think>` near the top under the soft reply budget) or the hard limit (the hard reply budget reached). */
 typedef enum {
     EVAL_THINK_CLOSE_NONE,
     EVAL_THINK_CLOSE_NATURAL,
@@ -81,16 +109,18 @@ typedef enum {
     EVAL_THINK_CLOSE_HARD,
 } eval_think_close_kind;
 
+/** One benchmark question. */
 typedef struct {
-    const char *source;
-    const char *id;
-    const char *domain;
-    const char *title;
-    const char *question;
-    const char *choice[EVAL_MAX_CHOICES];
-    const char *answer;
+    const char *source;    ///< benchmark the case comes from
+    const char *id;        ///< case id within that benchmark
+    const char *domain;    ///< subject area, for per-domain scoring
+    const char *title;     ///< short human-readable label
+    const char *question;  ///< the prompt text
+    const char *choice[EVAL_MAX_CHOICES];  ///< multiple-choice options; NULL-terminated
+    const char *answer;    ///< the correct choice
 } eval_case;
 
+/** The built-in benchmark cases, in run order. */
 static const eval_case eval_cases[] = {
     {
         .source = "GPQA Diamond",
@@ -1277,124 +1307,182 @@ static const eval_case eval_cases[] = {
     },
 };
 
+/** Growable byte buffer for generated text. */
 typedef struct {
-    char *v;
-    size_t len;
-    size_t cap;
+    char *v;      ///< bytes, owned
+    size_t len;   ///< bytes used
+    size_t cap;   ///< bytes allocated
 } byte_buf;
 
+/** Per-byte style codes running parallel to a ::byte_buf, so the TUI can
+ * repaint text without re-deciding how each byte should look. */
 typedef struct {
-    unsigned char *v;
-    size_t len;
-    size_t cap;
+    unsigned char *v;  ///< one style code per byte of the paired buffer
+    size_t len;        ///< entries used
+    size_t cap;        ///< entries allocated
 } style_buf;
 
+/** Everything the eval run was configured with. */
 typedef struct {
-    const char *model_path;
-    const char *trace_path;
+    const char *model_path;   ///< model to evaluate
+    const char *trace_path;   ///< write a full generation trace here; NULL = none
+    /** Re-grade an existing trace instead of generating. Lets a scoring change
+     * be applied to a completed run without spending GPU time again. */
     const char *regrade_trace_path;
-    const char *case_sequence;
-    pulsar_backend backend;
-    int threads;
-    int ctx_size;
-    int max_tokens;
-    int question_limit;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    int pause_ms;
-    uint32_t prefill_chunk;
+    const char *case_sequence;///< explicit case ids to run, in order; NULL = all
+    pulsar_backend backend;   ///< CPU or CUDA
+    int ctx_size;             ///< session context size
+    int max_tokens;           ///< generation cap per case
+    int question_limit;       ///< stop after this many cases; 0 = no limit
+    float temperature;        ///< sampling temperature
+    float top_p;              ///< nucleus cutoff
+    float min_p;              ///< relative probability floor
+    uint64_t seed;            ///< RNG seed
+    int pause_ms;             ///< delay between cases, for watching a run live
+    uint32_t prefill_chunk;   ///< prefill chunk size in rows
+
+    /** @name Thinking-budget controller
+     *  A reasoning model can spend an entire generation budget inside `<think>`
+     *  and fail a case with no visible answer at all. These bound that without
+     *  changing what is being measured.
+     *  @{
+     */
+    /** Below this many remaining tokens, ACCEPT the model's own intent to stop
+     * thinking: close the block if `</think>` is already ranked within
+     * soft_limit_think_close_rank. Conservative -- it only agrees with a
+     * decision the model was close to making. */
     int soft_limit_reply_budget;
+    /** Below this many remaining tokens, FORCE the block closed regardless of
+     * the distribution. A uniform benchmark rule reserving a fixed answer
+     * budget, rather than failing the case outright. */
     int hard_limit_reply_budget;
+    /** How near the top `</think>` must be for the soft limit to accept it. */
     int soft_limit_think_close_rank;
-    pulsar_think_mode think_mode;
-    bool plain;
-    bool warm_weights;
-    bool quality;
-    bool self_test_extractors;
+    /** @} */
+
+    pulsar_think_mode think_mode;  ///< reasoning mode for the run
+    bool think_mode_set;           ///< an explicit --think-* flag chose it (else the loaded family's default, after open)
+    bool plain;                    ///< plain output, no TUI
+    bool self_test_extractors;     ///< run the answer-extractor self-tests and exit
+    bool retry_incomplete;         ///< re-run an INCOMPLETE case once with twice the budget
 } eval_config;
 
+/** How a case's reasoning block ended, recorded for the trace: a forced close
+ * is a property of the RUN, not of the model, and scoring has to be able to
+ * tell them apart. */
 typedef struct {
-    eval_think_close_kind kind;
-    int token_index;
-    int remaining_budget;
-    int rank;
+    eval_think_close_kind kind;  ///< natural, soft-forced, or hard-forced
+    int token_index;             ///< token at which the block closed
+    int remaining_budget;        ///< tokens left at that point
+    int rank;                    ///< rank of `</think>` when a soft close accepted it
 } eval_think_close_info;
 
+/** The eval run's terminal UI: a case list on the left, the live generation on
+ * the right, and the run clock.
+ *
+ * Holds BORROWED pointers into the run's own arrays (`cases`, `status`,
+ * `guess`, the token counts) rather than copies, so what is drawn is always
+ * what the run currently believes. It frees none of them.
+ */
 typedef struct {
-    int cols;
-    int rows;
-    int left_w;
-    int right_x;
-    int right_w;
-    int body_y;
-    int body_h;
-    bool active;
-    bool enabled;
-    const eval_case *cases;
-    int ncases;
-    eval_status *status;
-    char (*guess)[EVAL_ANSWER_MAX];
-    int *prompt_tokens;
-    int *generated_tokens;
-    int active_case;
-    int generated;
-    int max_tokens;
-    int think_max_tokens;
-    int prefill_current;
-    int prefill_total;
-    double phase_start_sec;
-    double speed_tps;
+    int cols;    ///< terminal width
+    int rows;    ///< terminal height
+    int left_w;  ///< width of the case-list column
+    int right_x; ///< column the generation pane starts at
+    int right_w; ///< width of the generation pane
+    int body_y;  ///< first row of the scrolling body
+    int body_h;  ///< height of the scrolling body
+
+    bool active;  ///< the UI is currently drawing
+    bool enabled; ///< the UI was requested at all (false under --plain)
+
+    const eval_case *cases;   ///< borrowed: the case table
+    int ncases;               ///< cases in the run
+    eval_status *status;      ///< borrowed: per-case status
+    char (*guess)[EVAL_ANSWER_MAX];  ///< borrowed: per-case extracted answer
+    int *prompt_tokens;       ///< borrowed: per-case prompt length
+    int *generated_tokens;    ///< borrowed: per-case generated length
+
+    int active_case;      ///< case currently running
+    int generated;        ///< tokens generated in it so far
+    int max_tokens;       ///< its generation cap
+    int think_max_tokens; ///< its thinking budget
+    int prefill_current;  ///< prefill rows done
+    int prefill_total;    ///< prefill rows total
+
+    double phase_start_sec;   ///< wall-clock the current phase began
+    double speed_tps;         ///< current tokens/s
+    /** Accumulated run time EXCLUDING paused stretches. Accumulated rather than
+     * derived from a start timestamp, so pausing does not inflate it. */
     double run_elapsed_sec;
-    double run_last_sec;
-    bool run_clock_active;
-    bool selection_active;
-    int selected_case;
-    int requested_case;
-    bool paused;
-    bool quit_requested;
-    byte_buf stream;
-    style_buf styles;
-    bool in_think;
-    char pending_tag[16];
-    size_t pending_tag_len;
+    double run_last_sec;      ///< wall-clock at the last tick, for the next delta
+    bool run_clock_active;    ///< the clock is running (not paused)
+
+    bool selection_active;  ///< the user is browsing the case list
+    int selected_case;      ///< case under the cursor
+    int requested_case;     ///< case the user asked to jump to; -1 = none
+    bool paused;            ///< the run is paused
+    bool quit_requested;    ///< the user asked to stop
+
+    byte_buf stream;        ///< generated text of the active case
+    style_buf styles;       ///< per-byte style codes for `stream`
+    pulsar_think_scanner think; ///< `<think>` tag state: in_think styles `stream`, held tag prefix
 } eval_ui;
 
+/** The run's UI, for tui_restore (atexit) and the signal handler's terminal repair; NULL until tui_start. */
 static eval_ui *global_ui;
 
-static double run_clock_sec(void);
+/** @brief Monotonic wall clock: the run clock's and every phase timer's one time source.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
 
+/** @brief Fold the time since the last tick into run_elapsed_sec (only while the clock runs).
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_tick(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
-    double now = run_clock_sec();
+    double now = now_sec();
     double delta = now - ui->run_last_sec;
     if (delta > 0.0) ui->run_elapsed_sec += delta;
     ui->run_last_sec = now;
 }
 
+/** @brief Start (or resume) the run clock.
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_start(eval_ui *ui) {
     if (!ui || ui->run_clock_active) return;
-    ui->run_last_sec = run_clock_sec();
+    ui->run_last_sec = now_sec();
     ui->run_clock_active = true;
 }
 
+/** @brief Stop (pause) the run clock, folding in the time since the last tick.
+ *  @param ui the UI; NULL is a no-op */
 static void tui_run_clock_stop(eval_ui *ui) {
     if (!ui || !ui->run_clock_active) return;
     tui_run_clock_tick(ui);
     ui->run_clock_active = false;
 }
 
+/** @brief The run time to display: the accumulated time plus the running stretch, paused time excluded.
+ *  @param ui the UI, or NULL
+ *  @return seconds; 0 for NULL */
 static double tui_run_clock_visible_sec(const eval_ui *ui) {
     if (!ui) return 0.0;
     double elapsed = ui->run_elapsed_sec;
     if (ui->run_clock_active) {
-        double delta = run_clock_sec() - ui->run_last_sec;
+        double delta = now_sec() - ui->run_last_sec;
         if (delta > 0.0) elapsed += delta;
     }
     return elapsed;
 }
 
+/** @brief Format a duration as "HHh:MMm".
+ *  @param dst    receives the text
+ *  @param dstlen capacity of dst, bytes
+ *  @param sec    the duration, seconds (negative = 0) */
 static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
     if (sec < 0.0) sec = 0.0;
     unsigned long long minutes = (unsigned long long)(sec / 60.0);
@@ -1403,24 +1491,35 @@ static void format_run_elapsed(char *dst, size_t dstlen, double sec) {
     snprintf(dst, dstlen, "%02lluh:%02llum", hours, minutes);
 }
 
+/** Keyboard input for the eval TUI, read on its own thread.
+ *
+ * The reader thread only RECORDS what was pressed; the run loop consumes the
+ * flags at a safe point. Nothing here touches the engine, so a keypress can
+ * never interleave with a generation step.
+ */
 typedef struct {
-    bool enabled;
-    bool raw_mode;
-    bool thread_started;
-    volatile sig_atomic_t running;
-    pthread_t thread;
-    pthread_mutex_t mu;
-    struct termios orig_termios;
-    int move_delta;
-    bool enter_pressed;
-    bool pause_pressed;
-    bool quit_pressed;
+    bool enabled;        ///< input handling was requested
+    bool raw_mode;       ///< the terminal is in raw mode and must be restored
+    bool thread_started; ///< the reader thread is running and must be joined
+    volatile sig_atomic_t running;  ///< clear to ask the reader thread to exit
+    pthread_t thread;    ///< the reader thread
+    pthread_mutex_t mu;  ///< guards the pressed flags below
+    struct termios orig_termios;  ///< saved terminal settings, restored on exit
+    int move_delta;      ///< accumulated cursor movement, +1 per down, -1 per up
+    bool enter_pressed;  ///< select the case under the cursor
+    bool pause_pressed;  ///< toggle pause
+    bool quit_pressed;   ///< stop the run
 } eval_input;
 
+/** The keyboard reader's state (one per process). */
 static eval_input global_input = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
 };
 
+/** @brief Append bytes, keeping the buffer NUL-terminated; exits on allocation failure.
+ *  @param b the buffer
+ *  @param p bytes
+ *  @param n byte count */
 static void buf_append(byte_buf *b, const char *p, size_t n) {
     if (n == 0) return;
     if (b->len + n + 1 > b->cap) {
@@ -1439,6 +1538,9 @@ static void buf_append(byte_buf *b, const char *p, size_t n) {
     b->v[b->len] = '\0';
 }
 
+/** @brief Append printf-formatted text; exits on allocation failure, ignores a formatting error.
+ *  @param b   the buffer
+ *  @param fmt printf format, then its arguments */
 static void buf_appendf(byte_buf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -1461,20 +1563,33 @@ static void buf_appendf(byte_buf *b, const char *fmt, ...) {
     free(tmp);
 }
 
+/** @brief Count a case's multiple-choice options.
+ *  @param tc the case
+ *  @return options before the first NULL (0 = not multiple choice) */
 static int eval_case_nchoices(const eval_case *tc) {
     int n = 0;
     while (n < EVAL_MAX_CHOICES && tc->choice[n]) n++;
     return n;
 }
 
+/** @brief Whether a case is multiple choice (has options).
+ *  @param tc the case
+ *  @return true when it has at least one option */
 static bool eval_case_is_multiple_choice(const eval_case *tc) {
     return eval_case_nchoices(tc) > 0;
 }
 
+/** @brief Whether a case comes from the COMPSEC set (answered by a line spec).
+ *  @param tc the case
+ *  @return true when its source is "COMPSEC" */
 static bool eval_case_is_compsec(const eval_case *tc) {
     return tc->source && !strcmp(tc->source, "COMPSEC");
 }
 
+/** @brief Append n copies of a style code (one per byte appended to the stream); exits on allocation failure.
+ *  @param b     the style buffer
+ *  @param style the style code (0 = reply, 1 = thinking)
+ *  @param n     bytes the code covers */
 static void style_append(style_buf *b, unsigned char style, size_t n) {
     if (n == 0) return;
     if (b->len + n > b->cap) {
@@ -1492,84 +1607,41 @@ static void style_append(style_buf *b, unsigned char style, size_t n) {
     b->len += n;
 }
 
+/** @brief Free a byte buffer and zero it.
+ *  @param b the buffer */
 static void buf_free(byte_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
 }
 
+/** @brief Free a style buffer and zero it.
+ *  @param b the buffer */
 static void style_free(style_buf *b) {
     free(b->v);
     memset(b, 0, sizeof(*b));
 }
 
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
-
-static double run_clock_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
-}
-
-static int parse_int_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT_MAX) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static uint64_t parse_u64_arg(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-static float parse_float_arg(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar-eval: %s requires an argument\n", opt);
-        exit(2);
-    }
-    return argv[++*i];
-}
-
-static pulsar_backend parse_backend(const char *s, const char *opt) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar-eval: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "pulsar-eval: valid backends are: cuda\n");
-    exit(2);
-}
-
+/** @brief The backend selected when none is given.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
 
+/** @brief Print pulsar-eval's help text.
+ *  @param fp    the stream to print to
+ *  @param topic help topic, or NULL for the overview */
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_EVAL, topic);
 }
 
+/** @brief Parse the command line into a run configuration; --help prints usage and exits 0, a bad argument
+ *  exits 2.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the resolved configuration */
 static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
-        .model_path = "ds4flash.gguf",
+        .model_path = "model",
         .backend = default_backend(),
         .max_tokens = 16000,
         .top_p = PULSAR_DEFAULT_TOP_P,
@@ -1578,7 +1650,7 @@ static eval_config parse_options(int argc, char **argv) {
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
         .soft_limit_think_close_rank = 3,
-        .think_mode = PULSAR_THINK_LOW,
+        .think_mode = PULSAR_THINK_DEFAULT,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -1592,62 +1664,65 @@ static eval_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
-            c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
-            c.max_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--questions")) {
-            c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.question_limit = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--case-sequence")) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
-            c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
-            c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
-            c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
-            c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
+            c.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--regrade-trace")) {
             c.regrade_trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
-            c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.soft_limit_reply_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
-            c.hard_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.hard_limit_reply_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--soft-limit-think-close-rank")) {
-            c.soft_limit_think_close_rank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.soft_limit_think_close_rank = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--pause-ms")) {
-            c.pause_ms = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--cuda")) {
-            c.backend = PULSAR_BACKEND_CUDA;
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
+            c.pause_ms = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--prefill-chunk")) {
-            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
                 fprintf(stderr, "pulsar-eval: --prefill-chunk must be positive\n");
                 exit(2);
             }
             c.prefill_chunk = (uint32_t)v;
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
+            c.think_mode = PULSAR_THINK_DEFAULT;   /* the loaded family's default, resolved after open */
+            c.think_mode_set = false;
+        } else if (!strcmp(arg, "--think-low")) {
             c.think_mode = PULSAR_THINK_LOW;
+            c.think_mode_set = true;
+        } else if (!strcmp(arg, "--think-effort")) {
+            c.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
+                                           PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.think_mode = PULSAR_THINK_HIGH;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.think_mode = PULSAR_THINK_MAX;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = PULSAR_THINK_NONE;
+            c.think_mode_set = true;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
         } else if (!strcmp(arg, "--self-test-extractors")) {
             c.self_test_extractors = true;
+        } else if (!strcmp(arg, "--retry-incomplete")) {
+            c.retry_incomplete = true;
         } else {
             fprintf(stderr, "pulsar-eval: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -1685,6 +1760,10 @@ static eval_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/** @brief The terminal's size (80 x 24 when stdout is not a terminal).
+ *  @param cols receives the width, columns
+ *  @param rows receives the height, rows
+ *  @return 0, or -1 when the size is unknown (the defaults were written) */
 static int terminal_size(int *cols, int *rows) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
@@ -1697,21 +1776,31 @@ static int terminal_size(int *cols, int *rows) {
     return 0;
 }
 
+/** @brief Move the cursor (1-based).
+ *  @param row the row
+ *  @param col the column */
 static void term_move(int row, int col) {
     printf("\x1b[%d;%dH", row, col);
 }
 
+/** @brief Clear from the cursor to the end of the line. */
 static void term_clear_to_eol(void) {
     fputs("\x1b[K", stdout);
 }
 
+/** @brief Usable text width of the right pane (one less than its width; see the note inside).
+ *  @param ui the UI
+ *  @return columns */
 static int tui_right_text_w(const eval_ui *ui) {
-    /* Avoid writing the physical last column.  Many terminals defer wrapping
+    /** Avoid writing the physical last column.  Many terminals defer wrapping
      * until the next byte after the last column, which would spill right-pane
      * status text into the next row's left pane. */
     return ui->right_w > 1 ? ui->right_w - 1 : ui->right_w;
 }
 
+/** @brief Blank one row of the left pane, redraw its divider and leave the cursor at its start.
+ *  @param ui the UI
+ *  @param row the row (1-based) */
 static void tui_clear_left_line(eval_ui *ui, int row) {
     term_move(row, 1);
     for (int i = 0; i < ui->left_w; i++) fputc(' ', stdout);
@@ -1720,6 +1809,8 @@ static void tui_clear_left_line(eval_ui *ui, int row) {
     term_move(row, 1);
 }
 
+/** @brief Emit the SGR colour a status is drawn in.
+ *  @param st the status */
 static void term_set_color_for_status(eval_status st) {
     switch (st) {
     case EVAL_PENDING:  fputs(ANSI_DIM, stdout); break;
@@ -1727,11 +1818,15 @@ static void term_set_color_for_status(eval_status st) {
     case EVAL_THINKING: fputs(ANSI_YELLOW, stdout); break;
     case EVAL_SKIPPED:  fputs(ANSI_DIM, stdout); break;
     case EVAL_STOPPED:  fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
+    case EVAL_INCOMPLETE: fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
     case EVAL_PASSED:   fputs(ANSI_GREEN ANSI_BOLD, stdout); break;
     case EVAL_FAILED:   fputs(ANSI_RED ANSI_BOLD, stdout); break;
     }
 }
 
+/** @brief A status's short UI label (PEND, FILL, RUN, ...).
+ *  @param st the status
+ *  @return a static string; "?" for an unknown value */
 static const char *status_name(eval_status st) {
     switch (st) {
     case EVAL_PENDING: return "PEND";
@@ -1739,16 +1834,23 @@ static const char *status_name(eval_status st) {
     case EVAL_THINKING: return "RUN";
     case EVAL_SKIPPED: return "SKIP";
     case EVAL_STOPPED: return "STOP";
+    case EVAL_INCOMPLETE: return "INC";
     case EVAL_PASSED: return "PASS";
     case EVAL_FAILED: return "FAIL";
     }
     return "?";
 }
 
+/** @brief Whether a status means the case is in flight (prefill or generation).
+ *  @param st the status
+ *  @return true for EVAL_PREFILL and EVAL_THINKING */
 static bool eval_status_running(eval_status st) {
     return st == EVAL_PREFILL || st == EVAL_THINKING;
 }
 
+/** @brief Print a string cut to width columns, ending in "..." when cut.
+ *  @param s     the string
+ *  @param width columns available; <= 0 prints nothing */
 static void print_trimmed(const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
@@ -1764,6 +1866,9 @@ static void print_trimmed(const char *s, int width) {
     fputs("...", stdout);
 }
 
+/** @brief Draw the first three rows of the case's question (whitespace collapsed) in the right pane.
+ *  @param ui the UI
+ *  @param tc the case */
 static void tui_draw_question_preview(eval_ui *ui, const eval_case *tc) {
     const char *q = tc->question;
     size_t pos = 0;
@@ -1804,6 +1909,9 @@ static void tui_draw_question_preview(eval_ui *ui, const eval_case *tc) {
     term_clear_to_eol();
 }
 
+/** @brief Record a key press for the run loop (under global_input.mu): 'A' / 'B' (the arrow keys' final
+ *  bytes) move the cursor, Enter selects, p pauses, q quits; other keys are ignored.
+ *  @param key the key */
 static void input_queue_key(int key) {
     pthread_mutex_lock(&global_input.mu);
     if (key == 'A') {
@@ -1820,6 +1928,10 @@ static void input_queue_key(int key) {
     pthread_mutex_unlock(&global_input.mu);
 }
 
+/** @brief The keyboard reader thread: polls stdin until global_input.running clears, decoding arrow-key
+ *  escape sequences, and queues each key with input_queue_key.
+ *  @param arg unused
+ *  @return NULL */
 static void *input_thread_main(void *arg) {
     (void)arg;
     int esc_state = 0;
@@ -1852,7 +1964,7 @@ static void tui_start_input(void) {
     if (!isatty(STDIN_FILENO)) return;
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
-    /* The input thread is intentionally boring: it never writes to the terminal,
+    /** The input thread is intentionally boring: it never writes to the terminal,
      * it only queues navigation/control state.  Rendering remains owned by the
      * main thread and follows the same full-frame redraw path as the
      * noninteractive UI. Keep ISIG set so Ctrl-C still restores the alternate
@@ -1883,6 +1995,7 @@ static void tui_start_input(void) {
     }
 }
 
+/** @brief Stop and join the reader thread and restore the saved terminal mode. */
 static void tui_stop_input(void) {
     if (global_input.thread_started) {
         global_input.running = 0;
@@ -1896,6 +2009,9 @@ static void tui_stop_input(void) {
     global_input.enabled = false;
 }
 
+/** @brief Apply the keys pressed since the last call: quit, pause toggle, cursor movement, and a case
+ *  request on Enter (unless it names the case already running).
+ *  @param ui the UI */
 static void tui_consume_input(eval_ui *ui) {
     if (!ui->enabled || !global_input.enabled) return;
 
@@ -1942,6 +2058,7 @@ static void tui_consume_input(eval_ui *ui) {
     }
 }
 
+/** @brief Stop keyboard input and leave the alternate screen (registered with atexit). */
 static void tui_restore(void) {
     eval_ui *ui = global_ui;
     tui_stop_input();
@@ -1951,8 +2068,10 @@ static void tui_restore(void) {
     ui->active = false;
 }
 
+/** @brief Signal handler: minimal terminal repair, then re-raise with the default action (see the note inside).
+ *  @param sig the signal */
 static void tui_signal_restore(int sig) {
-    /* Signal handlers cannot safely run the full tui_restore() path: that path
+    /** Signal handlers cannot safely run the full tui_restore() path: that path
      * joins the input thread and uses stdio.  For Ctrl-C / termination, do the
      * minimal terminal repair directly, then re-raise the signal with its
      * default action so the process status remains correct. */
@@ -1971,6 +2090,8 @@ static void tui_signal_restore(int sig) {
     raise(sig);
 }
 
+/** @brief Draw the title row: key hints, the run clock and the PAUSED flag.
+ *  @param ui the UI */
 static void tui_draw_title(eval_ui *ui) {
     term_move(1, 1);
     tui_clear_left_line(ui, 1);
@@ -1983,6 +2104,8 @@ static void tui_draw_title(eval_ui *ui) {
     }
 }
 
+/** @brief Clear the screen and draw the static frame (title, right-pane heading, divider).
+ *  @param ui the UI */
 static void tui_draw_frame(eval_ui *ui) {
     fputs("\x1b[2J", stdout);
     tui_draw_title(ui);
@@ -1995,29 +2118,34 @@ static void tui_draw_frame(eval_ui *ui) {
     }
 }
 
+/** @brief Draw the left pane: the score line and the case list around the selection cursor.
+ *  @param ui the UI */
 static void tui_draw_left(eval_ui *ui) {
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ui->ncases; i++) {
         if (ui->status[i] == EVAL_PASSED) passed++;
         else if (ui->status[i] == EVAL_FAILED) failed++;
+        else if (ui->status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     tui_draw_title(ui);
 
     term_move(2, 1);
     tui_clear_left_line(ui, 2);
-    printf("score %s%d%s/%d  failed %s%d%s",
+    printf("score %s%d%s/%d  failed %s%d%s  incomplete %s%d%s",
            ANSI_GREEN, passed, ANSI_RESET,
            ui->ncases,
-           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET);
+           failed ? ANSI_RED : ANSI_DIM, failed, ANSI_RESET,
+           incomplete ? ANSI_YELLOW : ANSI_DIM, incomplete, ANSI_RESET);
 
     const int first_row = 4;
     const int visible_rows = ui->rows >= first_row ? ui->rows - first_row + 1 : 0;
     const int shown = ui->ncases < visible_rows ? ui->ncases : visible_rows;
     int first = 0;
     if (shown > 0 && ui->ncases > shown) {
-        /* The list follows the selection cursor, not the running test.  This
+        /** The list follows the selection cursor, not the running test.  This
          * makes arrow navigation visible immediately.  When normal execution
          * advances, main() moves the selection to the new active case so the
          * viewport naturally follows the work again. */
@@ -2052,7 +2180,8 @@ static void tui_draw_left(eval_ui *ui) {
                      ui->cases[i].source, ui->cases[i].title);
             print_trimmed(title, title_w);
         }
-        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED) {
+        if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED ||
+            ui->status[i] == EVAL_INCOMPLETE) {
             char answers[64];
             snprintf(answers, sizeof(answers), "%s/%s",
                      ui->guess[i][0] ? ui->guess[i] : "?",
@@ -2064,12 +2193,16 @@ static void tui_draw_left(eval_ui *ui) {
     }
 }
 
+/** @brief Start a new case's stream: clear the buffers, counters and right pane, then draw its question.
+ *  @param ui the UI
+ *  @param tc       the case
+ *  @param in_think the generation starts inside a reasoning block */
 static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     ui->stream.len = 0;
     if (ui->stream.v) ui->stream.v[0] = '\0';
     ui->styles.len = 0;
-    ui->in_think = in_think;
-    ui->pending_tag_len = 0;
+    ui->think = {};
+    ui->think.in_think = in_think;
     ui->generated = 0;
     ui->prefill_current = 0;
     ui->prefill_total = 0;
@@ -2083,70 +2216,56 @@ static void tui_reset_stream(eval_ui *ui, const eval_case *tc, bool in_think) {
     tui_draw_question_preview(ui, tc);
 }
 
-static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
-}
-
-static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
-
+/** @brief Append bytes to the stream with the current style (thinking or reply).
+ *  @param ui the UI
+ *  @param p  bytes
+ *  @param n  byte count */
 static void stream_append_visible(eval_ui *ui, const char *p, size_t n) {
     buf_append(&ui->stream, p, n);
-    style_append(&ui->styles, ui->in_think ? 1 : 0, n);
+    style_append(&ui->styles, ui->think.in_think ? 1 : 0, n);
 }
 
+/** The eval TUI's sink for pulsar_think_scan: bytes land in `stream` with a
+ * per-byte style, the reply starts on the line after `</think>`. */
+struct eval_think_sink {
+    eval_ui *ui;    ///< the TUI whose stream buffer receives the bytes
+    /** No DSML lane here: tags are always prose markers. */
+    /** @return always true */
+    bool tags_enabled() const { return true; }
+    /** Nothing to do at `<think>`: the next byte takes the thinking style. */
+    void think_open_tag() {}
+    /** Nothing to undo at `</think>`: styles are per byte. */
+    void think_close_tag() {}
+    /** Whether the stream buffer is empty or ends in '\n'. */
+    /** @return true at the start of a line */
+    bool at_line_start() const {
+        return ui->stream.len == 0 || ui->stream.v[ui->stream.len - 1] == '\n';
+    }
+    /** Newline in the reply style. */
+    void newline() { stream_append_visible(ui, "\n", 1); }
+    /** One byte in the current style. */
+    /** @param c the byte */
+    void text(char c) { stream_append_visible(ui, &c, 1); }
+};
+
+/** @brief Run generated text through the think-tag scanner into the stream.
+ *  @param ui the UI
+ *  @param text   generated text (may be NULL with len 0)
+ *  @param len    bytes in text
+ *  @param finish flush a held tag prefix (end of output) */
 static void stream_append_token_text(eval_ui *ui, const char *text, size_t len, bool finish) {
-    const char *open = "<think>";
-    const char *close = "</think>";
-    size_t total = ui->pending_tag_len + len;
-    char *tmp = (char *)malloc(total ? total : 1);
-    if (!tmp) {
-        fprintf(stderr, "pulsar-eval: out of memory\n");
-        exit(1);
-    }
-    if (ui->pending_tag_len) memcpy(tmp, ui->pending_tag, ui->pending_tag_len);
-    if (len) memcpy(tmp + ui->pending_tag_len, text, len);
-    ui->pending_tag_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = tmp + i;
-        size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, open)) {
-            ui->in_think = true;
-            i += strlen(open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, close)) {
-            ui->in_think = false;
-            stream_append_visible(ui, "\n", 1);
-            i += strlen(close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, open) ||
-             bytes_is_partial_prefix(cur, rem, close)))
-        {
-            if (rem < sizeof(ui->pending_tag)) {
-                memcpy(ui->pending_tag, cur, rem);
-                ui->pending_tag_len = rem;
-            }
-            break;
-        }
-        stream_append_visible(ui, cur, 1);
-        i++;
-    }
-    free(tmp);
+    eval_think_sink sink = { ui };
+    pulsar_think_scan(&ui->think, text, len, finish, 0, sink);
 }
 
+/** A line located in a buffer, as byte offsets. */
 typedef struct {
-    size_t start;
-    size_t end;
+    size_t start;  ///< offset of the line's first byte
+    size_t end;    ///< offset just past its last byte
 } line_span;
 
+/** @brief Draw the stream's last body_h wrapped lines in the right pane, styled per byte.
+ *  @param ui the UI */
 static void tui_draw_stream(eval_ui *ui) {
     if (!ui->enabled) return;
     const int width = tui_right_text_w(ui);
@@ -2224,6 +2343,10 @@ static void tui_draw_stream(eval_ui *ui) {
     free(lines);
 }
 
+/** @brief Format a count compactly: n, then "Nk" from 10000, "Nm" from a million (rounded).
+ *  @param dst    receives the text
+ *  @param dstlen capacity of dst, bytes
+ *  @param n      the count */
 static void format_short_count(char *dst, size_t dstlen, int n) {
     if (n >= 1000000) {
         snprintf(dst, dstlen, "%dm", (n + 500000) / 1000000);
@@ -2234,15 +2357,22 @@ static void format_short_count(char *dst, size_t dstlen, int n) {
     }
 }
 
+/** @brief A phase name's short status-line label.
+ *  @param phase the phase ("prefill", "thinking", "answer", ...)
+ *  @return a static string; "RUN" for any other phase */
 static const char *short_phase_name(const char *phase) {
     if (!strcmp(phase, "prefill")) return "FILL";
     if (!strcmp(phase, "thinking")) return "THINK";
     if (!strcmp(phase, "answer")) return "ANS";
     if (!strcmp(phase, "passed")) return "PASS";
     if (!strcmp(phase, "failed")) return "FAIL";
+    if (!strcmp(phase, "incomplete")) return "INC";
     return "RUN";
 }
 
+/** @brief Draw the right pane's status line: speed, the phase's progress and the case id.
+ *  @param ui the UI
+ *  @param phase the current phase name */
 static void tui_draw_right_status(eval_ui *ui, const char *phase) {
     term_move(1, ui->right_x);
     term_clear_to_eol();
@@ -2274,6 +2404,9 @@ static void tui_draw_right_status(eval_ui *ui, const char *phase) {
     print_trimmed(line, tui_right_text_w(ui));
 }
 
+/** @brief Redraw the left pane, the status line and the stream (when the UI is enabled).
+ *  @param ui the UI
+ *  @param phase the current phase name */
 static void tui_refresh(eval_ui *ui, const char *phase) {
     if (!ui->enabled) return;
     tui_draw_left(ui);
@@ -2282,6 +2415,13 @@ static void tui_refresh(eval_ui *ui, const char *phase) {
     fflush(stdout);
 }
 
+/** @brief Set up the run's UI state (per-case arrays, owned by ui) and, when enabled and the terminal is at
+ *  least 90 x 18, enter the alternate screen, install the restore handlers and start keyboard input.
+ *  @param ui the UI
+ *  @param cases      the case table (borrowed)
+ *  @param ncases     cases in the run
+ *  @param max_tokens the generation cap shown in the status line
+ *  @param enabled    draw the TUI (false = plain output) */
 static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_tokens,
                       bool enabled) {
     memset(ui, 0, sizeof(*ui));
@@ -2293,7 +2433,7 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->requested_case = -1;
     ui->quit_requested = false;
     ui->status = (eval_status *)calloc((size_t)ncases, sizeof(*ui->status));
-    ui->guess = (char (*)[32])calloc((size_t)ncases, sizeof(*ui->guess));
+    ui->guess = (char (*)[EVAL_ANSWER_MAX])calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
     ui->generated_tokens = (int *)calloc((size_t)ncases, sizeof(*ui->generated_tokens));
     if (!ui->status || !ui->guess || !ui->prompt_tokens || !ui->generated_tokens) {
@@ -2333,6 +2473,8 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     tui_refresh(ui, "idle");
 }
 
+/** @brief Restore the terminal if active, free the UI's arrays and buffers and zero it.
+ *  @param ui the UI */
 static void tui_free(eval_ui *ui) {
     if (ui->active) tui_restore();
     free(ui->status);
@@ -2344,19 +2486,29 @@ static void tui_free(eval_ui *ui) {
     memset(ui, 0, sizeof(*ui));
 }
 
+/** @brief Plain mode: start the dim style used for thinking text.
+ *  @param use_color stdout takes ANSI colour */
 static void plain_set_thinking_color(bool use_color) {
     if (use_color) fputs(ANSI_DIM, stdout);
 }
 
+/** @brief Plain mode: reset the text style.
+ *  @param use_color stdout takes ANSI colour */
 static void plain_reset_color(bool use_color) {
     if (use_color) fputs(ANSI_RESET, stdout);
 }
 
+/** @brief The system prompt every case runs under.
+ *  @return a static string */
 static const char *eval_system_prompt(void) {
     return "You are solving a hard benchmark question. Reason carefully. "
            "The final answer must follow the requested format exactly.";
 }
 
+/** @brief The user prompt for a case: the question, its lettered choices if any, and the required final
+ *  "Answer: ..." line format (letter, line numbers for COMPSEC, else integer).
+ *  @param tc the case
+ *  @return a malloc'd string (caller frees); NULL only if even the empty fallback cannot be allocated */
 static char *build_question_prompt(const eval_case *tc) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
@@ -2396,17 +2548,22 @@ static char *build_question_prompt(const eval_case *tc) {
     return empty;
 }
 
+/** @brief The longest rendered prompt over the cases, in tokens.
+ *  @param engine       the loaded engine (renders and tokenizes)
+ *  @param cfg          the configuration (think mode)
+ *  @param cases        the cases
+ *  @param ncases       how many
+ *  @param max_case_out receives the longest case's index (-1 when ncases is 0); may be NULL
+ *  @return the longest prompt's length, tokens */
 static int eval_max_prompt_tokens(pulsar_engine *engine,
                                   const eval_config *cfg,
                                   const eval_case *cases,
                                   int ncases,
-                                  int ctx_for_think_mode,
                                   int *max_case_out)
 {
     int max_prompt = 0;
     int max_case = -1;
-    const pulsar_think_mode think_mode =
-        pulsar_think_mode_for_context(cfg->think_mode, ctx_for_think_mode);
+    const pulsar_think_mode think_mode = cfg->think_mode;
 
     for (int i = 0; i < ncases; i++) {
         char *question = build_question_prompt(&cases[i]);
@@ -2427,54 +2584,63 @@ static int eval_max_prompt_tokens(pulsar_engine *engine,
     return max_prompt;
 }
 
+/** Generation budget for one attempt at a case.  A retry of an INCOMPLETE case
+ * (--retry-incomplete) gets twice the budget, once; both are capped at the
+ * context ceiling.  Upstream antirez/ds4 29aa7267's rule. */
+/// @param cfg   the configuration (max_tokens)
+/// @param retry the attempt is the retry of an INCOMPLETE case
+/// @return the budget, tokens
+static int eval_generation_budget(const eval_config *cfg, bool retry) {
+    long long budget = cfg->max_tokens;
+    if (retry) budget *= 2;
+    if (budget > EVAL_MAX_CONTEXT) budget = EVAL_MAX_CONTEXT;
+    return (int)budget;
+}
+
+/** @brief The context the run needs: the longest prompt plus the generation budget; exits 2 past
+ *  EVAL_MAX_CONTEXT.
+ *  @param engine                the loaded engine
+ *  @param cfg                   the configuration
+ *  @param cases                 the cases
+ *  @param ncases                how many
+ *  @param max_generation_tokens the generation budget, tokens
+ *  @param max_prompt_out        receives the longest prompt, tokens; may be NULL
+ *  @param max_case_out          receives its case index; may be NULL
+ *  @return the context size, tokens */
 static int eval_auto_context_size(pulsar_engine *engine,
                                   eval_config *cfg,
                                   const eval_case *cases,
                                   int ncases,
+                                  int max_generation_tokens,
                                   int *max_prompt_out,
                                   int *max_case_out)
 {
-    int ctx = EVAL_MAX_CONTEXT;
     int max_prompt = 0;
     int max_case = -1;
-    const int min_ctx = pulsar_think_effort_prefix(cfg->think_mode)[0] ?
-                        (int)pulsar_think_max_min_context() : 1;
-
-    /* High/max effort downgrades to normal thinking under its minimum context.  Size
-     * the prompts iteratively so the prompt tokenizer sees the same effective
-     * thinking mode that the actual run will use. */
-    for (int iter = 0; iter < 3; iter++) {
-        max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
-        long long required = (long long)max_prompt + (long long)cfg->max_tokens;
-        if (required < min_ctx) required = min_ctx;
-        if (required > EVAL_MAX_CONTEXT) {
-            fprintf(stderr,
-                    "pulsar-eval: largest prompt (%d tokens, case %d) + --tokens (%d) exceeds the %d token context cap\n",
-                    max_prompt, max_case + 1, cfg->max_tokens, EVAL_MAX_CONTEXT);
-            exit(2);
-        }
-        if ((int)required == ctx) break;
-        ctx = (int)required;
+    max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, &max_case);
+    long long required = (long long)max_prompt + (long long)max_generation_tokens;
+    if (required < 1) required = 1;
+    if (required > EVAL_MAX_CONTEXT) {
+        fprintf(stderr,
+                "pulsar-eval: largest prompt (%d tokens, case %d) + generation budget (%d) exceeds the %d token context cap\n",
+                max_prompt, max_case + 1, max_generation_tokens, EVAL_MAX_CONTEXT);
+        exit(2);
     }
+    const int ctx = (int)required;
 
     if (max_prompt_out) *max_prompt_out = max_prompt;
     if (max_case_out) *max_case_out = max_case;
     return ctx;
 }
 
-static void eval_warn_think_effort_downgraded(const eval_config *cfg) {
-    if (!pulsar_think_effort_prefix(cfg->think_mode)[0] ||
-        pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == cfg->think_mode) {
-        return;
-    }
-    fprintf(stderr,
-            "pulsar-eval: warning: --think-%s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
-            pulsar_think_mode_name(cfg->think_mode),
-            pulsar_think_max_min_context(),
-            cfg->ctx_size);
-}
-
-static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens, int max_prompt_case) {
+/** @brief Warn on stderr when the largest prompt does not fit ctx_size or leaves less than the requested
+ *  generation room.
+ *  @param cfg                   the configuration (ctx_size)
+ *  @param max_prompt_tokens     the longest prompt, tokens
+ *  @param max_prompt_case       its case index
+ *  @param max_generation_tokens the requested generation budget, tokens */
+static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens,
+                                     int max_prompt_case, int max_generation_tokens) {
     if (max_prompt_tokens >= cfg->ctx_size) {
         fprintf(stderr,
                 "pulsar-eval: warning: largest prompt (%d tokens, case=%d) does not fit ctx=%d\n",
@@ -2485,21 +2651,26 @@ static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_toke
     }
 
     const int room = cfg->ctx_size - max_prompt_tokens;
-    if (room < cfg->max_tokens) {
+    if (room < max_generation_tokens) {
         fprintf(stderr,
                 "pulsar-eval: warning: largest prompt (%d tokens, case=%d) leaves %d generation tokens in ctx=%d; requested %d\n",
                 max_prompt_tokens,
                 max_prompt_case + 1,
                 room,
                 cfg->ctx_size,
-                cfg->max_tokens);
+                max_generation_tokens);
     }
 }
 
+/** @brief Write a counted block to the trace: "<label>_BEGIN bytes=N", the text (newline-terminated),
+ *  "<label>_END".
+ *  @param trace the trace file; NULL is a no-op
+ *  @param label the block's label
+ *  @param text  the content; NULL = empty */
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
-    /* Counted blocks make regrading robust against model output that happens
+    /** Counted blocks make regrading robust against model output that happens
      * to contain trace-looking delimiters or embedded CASE headers. */
     fprintf(trace, "%s_BEGIN bytes=%zu\n", label, len);
     if (len) {
@@ -2509,6 +2680,9 @@ static void trace_write_block(FILE *trace, const char *label, const char *text) 
     fprintf(trace, "%s_END\n", label);
 }
 
+/** @brief A think-close kind's trace spelling.
+ *  @param kind the kind
+ *  @return "natural", "soft_forced", "hard_forced" or "none" */
 static const char *think_close_kind_name(eval_think_close_kind kind) {
     switch (kind) {
     case EVAL_THINK_CLOSE_NATURAL: return "natural";
@@ -2519,6 +2693,11 @@ static const char *think_close_kind_name(eval_think_close_kind kind) {
     }
 }
 
+/** @brief The token's 1-based rank among the session's top max_rank logprobs.
+ *  @param session  the session (its live logits)
+ *  @param token    the token
+ *  @param max_rank how deep to look
+ *  @return the rank, or 0 when it is not in the top max_rank (or on bad input / allocation failure) */
 static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
     if (token < 0 || max_rank <= 0) return 0;
     pulsar_token_score *top = (pulsar_token_score *)malloc((size_t)max_rank * sizeof(*top));
@@ -2535,10 +2714,18 @@ static int token_rank_in_top(pulsar_session *session, int token, int max_rank) {
     return rank;
 }
 
+/** @brief Write the trace file's header: the run's model, sampling settings and budgets.
+ *  @param trace                 the trace file; NULL is a no-op
+ *  @param cfg                   the configuration
+ *  @param model_name            the model's display name
+ *  @param ncases                cases in the run
+ *  @param max_prompt_tokens     the longest prompt, tokens
+ *  @param max_generation_tokens the generation budget, tokens */
 static void trace_write_header(FILE *trace, const eval_config *cfg,
                                const char *model_name,
                                int ncases,
-                               int max_prompt_tokens) {
+                               int max_prompt_tokens,
+                               int max_generation_tokens) {
     if (!trace) return;
     fprintf(trace,
             "# pulsar-eval trace\n"
@@ -2548,6 +2735,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "backend: %s\n"
             "ctx: %d\n"
             "max_tokens: %d\n"
+            "max_generation_tokens: %d\n"
             "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
@@ -2565,6 +2753,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             pulsar_backend_name(cfg->backend),
             cfg->ctx_size,
             cfg->max_tokens,
+            max_generation_tokens,
             max_prompt_tokens,
             ncases,
             cfg->temperature,
@@ -2578,6 +2767,26 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
     fflush(trace);
 }
 
+/** @brief Write one case's trace record: a "===== CASE i/n =====" header of key: value fields (status, picked
+ *  and expected answers, token counts, sampling, the think close), then the counted SYSTEM_PROMPT,
+ *  QUESTION_PROMPT and MODEL_OUTPUT blocks.  --regrade-trace reads this format back.
+ *  @param trace                the trace file; NULL is a no-op
+ *  @param cfg                  the configuration (sampling knobs)
+ *  @param tc                   the case
+ *  @param idx                  its index in the run (0-based; written 1-based)
+ *  @param ncases               cases in the run
+ *  @param status               the status spelling (report_status_name)
+ *  @param error                an error message, or NULL / empty
+ *  @param system_prompt        the system prompt sent
+ *  @param question_prompt      the user prompt sent
+ *  @param model_output         the generated text
+ *  @param effective_think_mode the think mode the case ran under
+ *  @param prompt_tokens        prompt length, tokens
+ *  @param generated_tokens     tokens generated
+ *  @param generation_budget    the attempt's budget, tokens
+ *  @param elapsed_sec          the case's wall time, seconds
+ *  @param picked               the extracted answer, or NULL / empty ("?")
+ *  @param think_close          how the reasoning block closed; NULL = none */
 static void trace_write_case(FILE *trace,
                              const eval_config *cfg,
                              const eval_case *tc,
@@ -2591,6 +2800,7 @@ static void trace_write_case(FILE *trace,
                              pulsar_think_mode effective_think_mode,
                              int prompt_tokens,
                              int generated_tokens,
+                             int generation_budget,
                              double elapsed_sec,
                              const char *picked,
                              const eval_think_close_info *think_close) {
@@ -2608,6 +2818,7 @@ static void trace_write_case(FILE *trace,
             "expected: %s\n"
             "prompt_tokens: %d\n"
             "generated_tokens: %d\n"
+            "generation_budget: %d\n"
             "elapsed_sec: %.3f\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
@@ -2624,6 +2835,7 @@ static void trace_write_case(FILE *trace,
             tc->answer,
             prompt_tokens,
             generated_tokens,
+            generation_budget,
             elapsed_sec,
             cfg->temperature,
             cfg->top_p,
@@ -2650,7 +2862,8 @@ static void trace_write_case(FILE *trace,
             fprintf(trace, "  %c. %s\n", 'A' + i, tc->choice[i]);
         }
     } else {
-        fprintf(trace, "answer_kind: exact_integer\n");
+        /* COMPSEC answers a line spec ("17-20", "0"), every other open case an integer (build_question_prompt) */
+        fprintf(trace, "answer_kind: %s\n", eval_case_is_compsec(tc) ? "line_spec" : "exact_integer");
     }
     trace_write_block(trace, "SYSTEM_PROMPT", system_prompt);
     trace_write_block(trace, "QUESTION_PROMPT", question_prompt);
@@ -2659,24 +2872,23 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
-/* Model outputs can contain provisional "answer" text after a forced
- * </think> and then a later final line.  A strict final Answer: marker is the
- * best grading target; outputs without one keep the original loose fallback. */
-static char *strcasestr_local(const char *hay, const char *needle) {
-    size_t nlen = strlen(needle);
-    if (nlen == 0) return (char *)hay;
-    for (; *hay; hay++) {
-        if (tolower((unsigned char)*hay) == tolower((unsigned char)needle[0]) &&
-            strncasecmp(hay, needle, nlen) == 0)
-            return (char *)hay;
-    }
-    return NULL;
-}
-
+/// @brief Whether the characters on both sides of a span are non-letters (a word boundary).
+/// @param before the character before the span
+/// @param after  the character after it
+/// @return true when neither is alphabetic
 static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
 
+/* The LAST "Answer:" marker in `visible` (case-insensitive, optional space
+ * before the colon, word-bounded), or NULL.  There is no looser form: the
+ * grading contract (grade_model_output) requires this marker on the last
+ * line, so an extractor is only ever handed text that carries it.  The old
+ * bare-"answer" fallback was reachable from nothing but its own self-tests
+ * (L192). */
+/** @brief The last "Answer:" marker in visible (the rule in the comment above).
+ *  @param visible the text to search
+ *  @return a pointer to the marker's "a" inside visible, or NULL */
 static char *find_last_answer_marker(const char *visible) {
     char *last = NULL;
     const size_t nlen = strlen("answer");
@@ -2692,7 +2904,7 @@ static char *find_last_answer_marker(const char *visible) {
         while (*q && isspace((unsigned char)*q)) q++;
         if (*q == ':') last = (char *)p;
     }
-    return last ? last : strcasestr_local(visible, "answer");
+    return last;
 }
 
 /* True when the in-range capital at `letter` is the object of an explicit
@@ -2704,6 +2916,9 @@ static char *find_last_answer_marker(const char *visible) {
  * selection-vs-rejection sentence parsing (issue #321).  It never looks before
  * `start` or across a newline, so "D, not B" still grades D: the pick is
  * reached and accepted before the rejected distractor is ever inspected. */
+/// @param start  the start of the answer line (the scan never goes before it)
+/// @param letter the candidate capital, inside the line
+/// @return true when the word (or "rule out") before it rejects it
 static bool mc_letter_is_negated(const char *start, const char *letter) {
     const char *p = letter;
     /* Step back over the gap to the previous word: spaces and light separating
@@ -2714,7 +2929,7 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
         if (c == ' ' || c == '\t' || c == ',' || c == ';') p--;
         else break;
     }
-    /* Read the immediately preceding word (letters/apostrophe), lowercased. */
+    /** Read the immediately preceding word (letters/apostrophe), lowercased. */
     const char *wend = p;
     while (p > start && (isalpha((unsigned char)p[-1]) || p[-1] == '\'')) p--;
     size_t wlen = (size_t)(wend - p);
@@ -2723,7 +2938,7 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
     for (size_t i = 0; i < wlen; i++) w[i] = (char)tolower((unsigned char)p[i]);
     w[wlen] = '\0';
 
-    /* Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
+    /** Contraction form: isn't / aren't / wasn't / doesn't / won't / can't. */
     if (wlen >= 3 && strcmp(w + wlen - 3, "n't") == 0) return true;
 
     static const char *cues[] = {
@@ -2751,6 +2966,11 @@ static bool mc_letter_is_negated(const char *start, const char *letter) {
     return false;
 }
 
+/** @brief Extract a multiple-choice pick from the visible reply (after `</think>`): the first standalone,
+ *  non-prose, non-rejected letter in range on the last "Answer:" line, else the last standalone letter in range.
+ *  @param generated the generated text
+ *  @param nchoices  options in the case (letters A .. A + nchoices - 1)
+ *  @return the letter, or '?' when none is found */
 static char find_answer_letter(const char *generated, int nchoices) {
     if (nchoices <= 0) return '?';
     const char *visible = strstr(generated, "</think>");
@@ -2767,7 +2987,7 @@ static char find_answer_letter(const char *generated, int nchoices) {
                 char before = p == visible ? ' ' : p[-1];
                 char after = p[1];
                 if (!is_letter_boundary(before, after)) continue;
-                /* A standalone capital that begins a same-line English word
+                /** A standalone capital that begins a same-line English word
                  * ("A careful ...") or a contraction ("I'll ...") is prose,
                  * not the model's pick: the real letter comes later on the
                  * line. Skip it; the reverse scan below still recovers it if
@@ -2778,7 +2998,7 @@ static char find_answer_letter(const char *generated, int nchoices) {
                     while (*w == ' ' || *w == '\t') w++;
                     if (islower((unsigned char)*w)) continue;
                 }
-                /* A distractor explicitly rejected before the pick on the same
+                /** A distractor explicitly rejected before the pick on the same
                  * line ("not B, ... D") must not win over the real choice. */
                 if (mc_letter_is_negated(answer, p)) continue;
                 return c;
@@ -2797,6 +3017,11 @@ static char find_answer_letter(const char *generated, int nchoices) {
     return '?';
 }
 
+/** @brief Copy an integer's digits with leading zeros dropped (one zero kept for 0), truncated to dstlen.
+ *  @param p      the digits
+ *  @param len    digit count
+ *  @param dst    receives the NUL-terminated digits
+ *  @param dstlen capacity of dst, bytes; 0 writes nothing */
 static void normalize_integer_answer(const char *p, size_t len,
                                      char *dst, size_t dstlen) {
     while (len > 1 && *p == '0') {
@@ -2809,6 +3034,12 @@ static void normalize_integer_answer(const char *p, size_t len,
     dst[n] = '\0';
 }
 
+/** @brief Find the first run of digits in [start, end) and normalize it into dst.
+ *  @param start  the range's start
+ *  @param end    the range's end (a NUL also stops the scan)
+ *  @param dst    receives the normalized integer
+ *  @param dstlen capacity of dst, bytes
+ *  @return true when an integer was found */
 static bool scan_first_integer(const char *start, const char *end,
                                char *dst, size_t dstlen) {
     const char *p = start;
@@ -2824,6 +3055,11 @@ static bool scan_first_integer(const char *start, const char *end,
     return false;
 }
 
+/** @brief Extract an integer answer from the visible reply: on the last "Answer:" line, the first integer after
+ *  its last '=' (else its first integer); without such a line, the last integer in the reply.
+ *  @param generated the generated text
+ *  @param dst       receives the normalized integer, or "?"
+ *  @param dstlen    capacity of dst, bytes */
 static void find_integer_answer(const char *generated, char *dst, size_t dstlen) {
     if (dstlen == 0) return;
     snprintf(dst, dstlen, "?");
@@ -2834,11 +3070,11 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
-        /* Restrict to the final answer line: digits after it (continued
+        /** Restrict to the final answer line: digits after it (continued
          * reasoning, footnotes, years) must not override the answer. */
         const char *nl = (const char *)memchr(answer, '\n', (size_t)(end - answer));
         if (nl) end = nl;
-        /* When the line shows arithmetic ("m+n = 256+37 = 293") the stated
+        /** When the line shows arithmetic ("m+n = 256+37 = 293") the stated
          * result is the right-hand side of the LAST '='. Otherwise the first
          * integer on the line is the answer (keeps "Final answer: 082"). */
         const char *eq = NULL;
@@ -2864,6 +3100,11 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     }
 }
 
+/// @brief Normalize answer-line text into the compact line spec ("9,15", "20-22").
+/// @param p      the text's start
+/// @param end    its end (a NUL also stops the scan)
+/// @param dst    receives the spec, or "?" when no number was found
+/// @param dstlen capacity of dst, bytes; 0 writes nothing
 static void normalize_compsec_line_spec(const char *p, const char *end,
                                         char *dst, size_t dstlen) {
     if (dstlen == 0) return;
@@ -2904,6 +3145,11 @@ static void normalize_compsec_line_spec(const char *p, const char *end,
     if (n == 0) snprintf(dst, dstlen, "?");
 }
 
+/** @brief Extract a COMPSEC line-spec answer from the last "Answer:" line of the visible reply, falling back to
+ *  find_integer_answer.
+ *  @param generated the generated text
+ *  @param dst       receives the spec, or "?"
+ *  @param dstlen    capacity of dst, bytes */
 static void find_compsec_answer(const char *generated, char *dst, size_t dstlen) {
     if (dstlen == 0) return;
     snprintf(dst, dstlen, "?");
@@ -2922,6 +3168,12 @@ static void find_compsec_answer(const char *generated, char *dst, size_t dstlen)
     find_integer_answer(generated, dst, dstlen);
 }
 
+/** @brief Mark the lines a spec names ("9", "9,15", "20-22"; a reversed range is swapped) in a set, clamped to
+ *  [0, setlen).
+ *  @param spec   the spec; NULL = empty
+ *  @param set    the set, setlen flags (only set, never cleared)
+ *  @param setlen flags in set
+ *  @return true when at least one line was marked */
 static bool parse_line_spec(const char *spec, bool *set, size_t setlen) {
     bool any = false;
     const char *p = spec;
@@ -2952,6 +3204,11 @@ static bool parse_line_spec(const char *spec, bool *set, size_t setlen) {
     return any;
 }
 
+/** @brief Whether a COMPSEC answer is acceptable: every line it names is in the expected set and it names at
+ *  least one (lines 0..255; see the note inside).
+ *  @param expected_spec the case's key
+ *  @param got_spec      the extracted answer
+ *  @return true on a match */
 static bool compsec_answer_matches(const char *expected_spec, const char *got_spec) {
     bool expected[256] = {0};
     bool got[256] = {0};
@@ -2964,7 +3221,7 @@ static bool compsec_answer_matches(const char *expected_spec, const char *got_sp
         if (!expected[i]) return false;
         hit = true;
     }
-    /* The prompt asks the model for the single best line, or the smallest exact
+    /** The prompt asks the model for the single best line, or the smallest exact
      * set when the bug cannot be localized to one line.  The hidden expected
      * answer may be a small audited range when adjacent lines are equivalent
      * locations for the same bug.  Any model-supplied line must be inside that
@@ -2972,6 +3229,11 @@ static bool compsec_answer_matches(const char *expected_spec, const char *got_sp
     return hit;
 }
 
+/** @brief Extract the case's answer by its kind: a letter, a COMPSEC line spec, or an integer.
+ *  @param tc        the case
+ *  @param generated the text to extract from
+ *  @param dst       receives the answer ("?" when none)
+ *  @param dstlen    capacity of dst, bytes; 0 writes nothing */
 static void find_case_answer(const eval_case *tc, const char *generated,
                              char *dst, size_t dstlen) {
     if (dstlen == 0) return;
@@ -2985,6 +3247,11 @@ static void find_case_answer(const eval_case *tc, const char *generated,
     }
 }
 
+/** @brief Whether an extracted answer is the case's key (letter equality, COMPSEC set rule, or integer equality
+ *  after normalization).
+ *  @param tc  the case
+ *  @param got the extracted answer, or NULL
+ *  @return true on a match */
 static bool answer_matches(const eval_case *tc, const char *got) {
     if (eval_case_is_multiple_choice(tc)) {
         return got && got[0] && tc->answer && got[0] == tc->answer[0];
@@ -2997,6 +3264,60 @@ static bool answer_matches(const eval_case *tc, const char *got) {
     return got && strcmp(got, expected) == 0;
 }
 
+/* The grading contract (upstream antirez/ds4 29aa7267): the LAST non-empty
+ * line of the visible reply must carry the "Answer:" marker the prompt asked
+ * for.  Only that line reaches the extractors, so a provisional "Answer:"
+ * earlier in the reply is never graded by mistake. */
+/// @param line the reply's last non-empty line
+/// @return true when it carries an "Answer:" marker
+static bool line_has_answer_marker(const char *line) {
+    return find_last_answer_marker(line) != NULL;
+}
+
+/** ONE authority for a completed response's outcome: the live run and
+ * --regrade-trace both grade through here.  A reply whose last line is not an
+ * answer line ended before its answer -- the budget ran out, or the model kept
+ * writing -- and is EVAL_INCOMPLETE: nothing was graded, so it is neither a
+ * pass nor a fail.  Otherwise EVAL_PASSED or EVAL_FAILED; `got` receives the
+ * extracted answer ("?" when incomplete). */
+/** @param tc        the case
+ *  @param generated the whole generated text (graded after `</think>`)
+ *  @param got       receives the extracted answer
+ *  @param gotlen    capacity of got, bytes
+ *  @return EVAL_PASSED, EVAL_FAILED or EVAL_INCOMPLETE */
+static eval_status grade_model_output(const eval_case *tc, const char *generated,
+                                      char *got, size_t gotlen) {
+    if (gotlen) snprintf(got, gotlen, "?");
+    const char *visible = strstr(generated, "</think>");
+    visible = visible ? visible + 8 : generated;
+
+    const char *end = visible + strlen(visible);
+    while (end > visible && isspace((unsigned char)end[-1])) end--;
+    if (end == visible) return EVAL_INCOMPLETE;
+    const char *start = end;
+    while (start > visible && start[-1] != '\n' && start[-1] != '\r') start--;
+
+    size_t len = (size_t)(end - start);
+    char *line = (char *)malloc(len + 1);
+    if (!line) {
+        fprintf(stderr, "pulsar-eval: out of memory while grading answer\n");
+        exit(1);
+    }
+    memcpy(line, start, len);
+    line[len] = '\0';
+    eval_status st = EVAL_INCOMPLETE;
+    if (line_has_answer_marker(line)) {
+        find_case_answer(tc, line, got, gotlen);
+        st = answer_matches(tc, got) ? EVAL_PASSED : EVAL_FAILED;
+    }
+    free(line);
+    return st;
+}
+
+/** @brief Read a whole file (a trace) into a NUL-terminated buffer.
+ *  @param path    the file
+ *  @param len_out receives its length, bytes; may be NULL
+ *  @return a malloc'd buffer (caller frees), or NULL on failure (said on stderr) */
 static char *read_text_file(const char *path, size_t *len_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -3039,6 +3360,11 @@ static char *read_text_file(const char *path, size_t *len_out) {
     return buf;
 }
 
+/** @brief strstr within [start, end).
+ *  @param start  the range's start
+ *  @param end    its end
+ *  @param needle the NUL-terminated string to find
+ *  @return the first match, start for an empty needle, or NULL */
 static const char *bounded_strstr(const char *start, const char *end,
                                   const char *needle) {
     size_t nlen = strlen(needle);
@@ -3050,6 +3376,11 @@ static const char *bounded_strstr(const char *start, const char *end,
     return NULL;
 }
 
+/** @brief Copy [start, end) without its trailing CR / LF, truncated to dstlen.
+ *  @param dst    receives the NUL-terminated copy
+ *  @param dstlen capacity of dst, bytes; 0 writes nothing
+ *  @param start  the span's start
+ *  @param end    its end */
 static void copy_span(char *dst, size_t dstlen, const char *start, const char *end) {
     if (dstlen == 0) return;
     while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
@@ -3059,14 +3390,17 @@ static void copy_span(char *dst, size_t dstlen, const char *start, const char *e
     dst[n] = '\0';
 }
 
+/// @brief If `line` opens a well-formed counted block ("<label>_BEGIN bytes=N", N bytes, "<label>_END"), skip it.
+/// @param line     the line's start
+/// @param line_end the line's end (its newline, or end)
+/// @param end      the end of the trace
+/// @return the start of the line after the block's END marker, or NULL when it is not a valid counted block
 static const char *trace_skip_counted_block(const char *line,
                                             const char *line_end,
                                             const char *end) {
     /*
      * Trace regrading must scan metadata lines without being confused by model
-     * output.  Prefer the byte count written by trace_write_block(); the older
-     * delimiter-only parser is still accepted in trace_copy_model_output for
-     * compatibility with existing trace files.
+     * output: the byte count trace_write_block() writes is what bounds a block.
      */
     const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
     if (!begin || begin == line) return NULL;
@@ -3098,6 +3432,11 @@ static const char *trace_skip_counted_block(const char *line,
     return after_line ? after_line + 1 : end;
 }
 
+/** @brief The next "===== CASE " line at or after start, skipping counted blocks (so a header inside a
+ *  model's output is not taken for one).
+ *  @param start where to search from
+ *  @param end   the end of the trace
+ *  @return the header line's start, or NULL */
 static const char *trace_find_next_case(const char *start, const char *end) {
     const char *p = start;
     while (p < end) {
@@ -3121,6 +3460,11 @@ static const char *trace_find_next_case(const char *start, const char *end) {
     return NULL;
 }
 
+/** @brief The first line in [start, end) beginning with label, skipping other counted blocks.
+ *  @param start where to search from
+ *  @param end   the end of the case
+ *  @param label the line prefix (e.g. "MODEL_OUTPUT_BEGIN")
+ *  @return the line's start, or NULL */
 static const char *trace_find_block_begin(const char *start, const char *end,
                                           const char *label) {
     size_t label_len = strlen(label);
@@ -3144,6 +3488,13 @@ static const char *trace_find_block_begin(const char *start, const char *end,
     return NULL;
 }
 
+/** @brief Copy the value of the first line in [start, end) beginning with key (e.g. "status: ").
+ *  @param start  the case's start
+ *  @param end    its end
+ *  @param key    the line prefix, separator included
+ *  @param dst    receives the rest of the line ("" when absent)
+ *  @param dstlen capacity of dst, bytes
+ *  @return true when the key was found */
 static bool trace_get_line_field(const char *start, const char *end,
                                  const char *key, char *dst, size_t dstlen) {
     size_t keylen = strlen(key);
@@ -3162,6 +3513,10 @@ static bool trace_get_line_field(const char *start, const char *end,
     return false;
 }
 
+/** @brief Look up a built-in case by its source and id.
+ *  @param source the benchmark name
+ *  @param id     the case id
+ *  @return the case, or NULL */
 static const eval_case *find_eval_case_by_source_id(const char *source,
                                                     const char *id) {
     size_t ncases = sizeof(eval_cases) / sizeof(eval_cases[0]);
@@ -3174,6 +3529,11 @@ static const eval_case *find_eval_case_by_source_id(const char *source,
     return NULL;
 }
 
+/** @brief Copy a trace case's MODEL_OUTPUT block by its byte count ("MODEL_OUTPUT_BEGIN bytes=N"; a block without
+ *  the count, from before counted blocks, is malformed).
+ *  @param case_start the case's start
+ *  @param case_end   its end
+ *  @return a malloc'd copy (caller frees), or NULL when the block is missing or malformed */
 static char *trace_copy_model_output(const char *case_start, const char *case_end) {
     const char *begin = trace_find_block_begin(case_start, case_end, "MODEL_OUTPUT_BEGIN");
     if (!begin) return NULL;
@@ -3181,25 +3541,19 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     if (!line_end) return NULL;
     const char *content = line_end + 1;
 
-    size_t len = 0;
     const char *bytes = bounded_strstr(begin, line_end, "bytes=");
-    if (bytes) {
-        char *endptr = NULL;
-        unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
-        if (endptr == bytes + 6 || endptr > line_end ||
-            declared > (unsigned long long)(case_end - content))
-            return NULL;
-        len = (size_t)declared;
-        const char *marker = content + len;
-        if (marker < case_end && *marker == '\n') marker++;
-        if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
-            memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
-            return NULL;
-    } else {
-        const char *finish = bounded_strstr(content, case_end, "\nMODEL_OUTPUT_END");
-        if (!finish) return NULL;
-        len = (size_t)(finish - content);
-    }
+    if (!bytes) return NULL;
+    char *endptr = NULL;
+    unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
+    if (endptr == bytes + 6 || endptr > line_end ||
+        declared > (unsigned long long)(case_end - content))
+        return NULL;
+    const size_t len = (size_t)declared;
+    const char *marker = content + len;
+    if (marker < case_end && *marker == '\n') marker++;
+    if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
+        memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
+        return NULL;
 
     char *out = (char *)malloc(len + 1);
     if (!out) {
@@ -3211,32 +3565,42 @@ static char *trace_copy_model_output(const char *case_start, const char *case_en
     return out;
 }
 
-typedef enum {
-    REGRADE_NOT_GRADED,
-    REGRADE_PASSED,
-    REGRADE_FAILED,
-} regrade_outcome;
-
-/* Decide how one trace case regrades. Only PASSED/FAILED traces were graded by
- * a completed run; STOPPED/SKIPPED/SWITCHED/ERROR cases carry partial or no
- * model output and must be reported as not-graded rather than counted, since
- * grading them inflates the totals and raises spurious "changed" drift. An
- * empty status keeps legacy traces (written before the status line) working. */
-static regrade_outcome regrade_case_outcome(const eval_case *tc,
-                                            const char *traced_status,
-                                            const char *model_output,
-                                            char *got, size_t gotlen) {
+/* Decide whether one trace case regrades.  Only cases a completed run graded
+ * (PASSED/FAILED/INCOMPLETE) regrade; STOPPED/SKIPPED/SWITCHED/ERROR cases
+ * carry partial or no model output and are reported as not-graded rather than
+ * counted, since grading them inflates the totals and raises spurious
+ * "changed" drift.  An empty status keeps legacy traces (written before the
+ * status line) working.  Returns false when not graded; otherwise *outcome is
+ * the status grade_model_output() gives the traced output TODAY, which may
+ * differ from the traced one -- that difference is what --regrade-trace is
+ * for. */
+/// @param tc            the case
+/// @param traced_status the trace's status line value ("" for a legacy trace)
+/// @param model_output  the traced output
+/// @param got           receives the extracted answer ("" when not graded)
+/// @param gotlen        capacity of got, bytes
+/// @param outcome       receives today's grade when graded
+/// @return true when the case is gradeable
+static bool regrade_case_outcome(const eval_case *tc,
+                                 const char *traced_status,
+                                 const char *model_output,
+                                 char *got, size_t gotlen,
+                                 eval_status *outcome) {
     bool gradeable = traced_status[0] == '\0' ||
-                     !strcmp(traced_status, "PASSED") ||
-                     !strcmp(traced_status, "FAILED");
+                     !strcmp(traced_status, report_status_name(EVAL_PASSED)) ||
+                     !strcmp(traced_status, report_status_name(EVAL_FAILED)) ||
+                     !strcmp(traced_status, report_status_name(EVAL_INCOMPLETE));
     if (!gradeable) {
         if (gotlen) got[0] = '\0';
-        return REGRADE_NOT_GRADED;
+        return false;
     }
-    find_case_answer(tc, model_output, got, gotlen);
-    return answer_matches(tc, got) ? REGRADE_PASSED : REGRADE_FAILED;
+    *outcome = grade_model_output(tc, model_output, got, gotlen);
+    return true;
 }
 
+/** @brief --regrade-trace: re-grade every case of a trace with today's grader and print the drift and totals.
+ *  @param path the trace file
+ *  @return 0; 1 when a case was unknown or malformed or the trace had none; 2 when it could not be read */
 static int regrade_trace_file(const char *path) {
     size_t len = 0;
     char *text = read_text_file(path, &len);
@@ -3247,6 +3611,7 @@ static int regrade_trace_file(const char *path) {
     int total = 0;
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     int changed = 0;
     int unknown = 0;
     int parse_errors = 0;
@@ -3285,43 +3650,49 @@ static int regrade_trace_file(const char *path) {
 
         char *model_output = trace_copy_model_output(case_start, case_end);
         if (!model_output) {
-            fprintf(stderr, "pulsar-eval: trace case %d is missing MODEL_OUTPUT block: %s/%s\n",
+            fprintf(stderr, "pulsar-eval: trace case %d has no counted MODEL_OUTPUT block (bytes=N): %s/%s\n",
                     total, source, id);
             parse_errors++;
             continue;
         }
 
         char got[EVAL_ANSWER_MAX];
-        regrade_outcome outcome =
-            regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got));
-        if (outcome == REGRADE_NOT_GRADED) {
+        eval_status outcome = EVAL_PENDING;
+        if (!regrade_case_outcome(tc, traced_status, model_output, got, sizeof(got), &outcome)) {
             not_graded++;
             free(model_output);
             continue;
         }
-        bool ok = (outcome == REGRADE_PASSED);
-        if (ok) passed++;
-        else failed++;
+        if (outcome == EVAL_PASSED) passed++;
+        else if (outcome == EVAL_FAILED) failed++;
+        else incomplete++;
 
-        bool traced_ok = !strcmp(traced_status, "PASSED");
-        if ((traced_status[0] && ok != traced_ok) ||
+        const char *regraded_name = report_status_name(outcome);
+        if ((traced_status[0] && strcmp(traced_status, regraded_name) != 0) ||
             (traced_pick[0] && strcmp(got, traced_pick) != 0)) {
             changed++;
             printf("case %d %s/%s: trace %s picked=%s -> regrade %s picked=%s expected=%s\n",
                    total, source, id,
                    traced_status[0] ? traced_status : "?",
                    traced_pick[0] ? traced_pick : "?",
-                   ok ? "PASSED" : "FAILED", got, tc->answer ? tc->answer : "?");
+                   regraded_name, got, tc->answer ? tc->answer : "?");
         }
         free(model_output);
     }
 
-    printf("pulsar-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
-           total, path, passed, failed, changed, not_graded, unknown, parse_errors);
+    printf("pulsar-eval: regraded %d cases from %s: passed=%d failed=%d incomplete=%d changed=%d not_graded=%d unknown=%d parse_errors=%d\n",
+           total, path, passed, failed, incomplete, changed, not_graded, unknown, parse_errors);
     free(text);
     return (unknown || parse_errors || total == 0) ? 1 : 0;
 }
 
+/** @brief One extractor self-test: extract from generated and check it equals expected_extract and grades as
+ *  the case's key.
+ *  @param name             the test's label (printed on failure)
+ *  @param tc               the case (its kind and key)
+ *  @param generated        the model text
+ *  @param expected_extract the answer the extractor must return
+ *  @return 0 on pass, 1 on failure (said on stderr) */
 static int extractor_self_test_case(const char *name, const eval_case *tc,
                                     const char *generated,
                                     const char *expected_extract) {
@@ -3335,6 +3706,9 @@ static int extractor_self_test_case(const char *name, const eval_case *tc,
     return 1;
 }
 
+/** @brief Self-test: a CASE header and MODEL_OUTPUT_BEGIN inside counted blocks do not split a case, and
+ *  the model output is copied byte for byte.
+ *  @return 0 on pass, 1 on failure */
 static int trace_copy_self_test_case(void) {
     const char *prompt_output =
         "Prompt text may mention\n"
@@ -3385,37 +3759,116 @@ static int trace_copy_self_test_case(void) {
     return 0;
 }
 
+/* The grading contract, exercised through the ONE grading entry the live run
+ * and the regrade share.  expected_extract is checked only when the outcome is
+ * graded (an INCOMPLETE reply extracts nothing). */
+/// @param name             the test's label (printed on failure)
+/// @param tc               the case
+/// @param generated        the model text
+/// @param expected_status  the outcome grade_model_output must give
+/// @param expected_extract the extracted answer when graded (unused for EVAL_INCOMPLETE)
+/// @return 0 on pass, 1 on failure (said on stderr)
+static int grading_self_test_case(const char *name, const eval_case *tc,
+                                  const char *generated,
+                                  eval_status expected_status,
+                                  const char *expected_extract) {
+    char got[EVAL_ANSWER_MAX];
+    eval_status st = grade_model_output(tc, generated, got, sizeof(got));
+    bool ok = st == expected_status;
+    if (ok && expected_status != EVAL_INCOMPLETE) ok = !strcmp(got, expected_extract);
+    if (ok) return 0;
+
+    fprintf(stderr,
+            "pulsar-eval: grading self-test failed: %s (status %s/%s, got %s, expected %s)\n",
+            name, report_status_name(st), report_status_name(expected_status), got,
+            expected_extract ? expected_extract : "-");
+    return 1;
+}
+
+/** @brief Self-tests of regrade_case_outcome's gradeable-status rule.
+ *  @return the number of failed checks */
 static int regrade_status_self_test_case(void) {
     int failed = 0;
     const eval_case integer = {.source = "AIME2025", .answer = "82"};
     char got[EVAL_ANSWER_MAX];
+    eval_status st = EVAL_PENDING;
 
-    if (regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_PASSED) {
+    if (!regrade_case_outcome(&integer, "PASSED", "</think>Answer: 82",
+                              got, sizeof(got), &st) || st != EVAL_PASSED) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: PASSED trace not regraded\n");
         failed++;
     }
     /* An interrupted run whose partial output happens to look correct must not
      * be counted or flagged as drift. */
     if (regrade_case_outcome(&integer, "STOPPED", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_NOT_GRADED) {
+                             got, sizeof(got), &st)) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: STOPPED trace was graded\n");
         failed++;
     }
     /* Legacy traces without a status line stay gradeable. */
-    if (regrade_case_outcome(&integer, "", "</think>Answer: 82",
-                             got, sizeof(got)) != REGRADE_PASSED) {
+    if (!regrade_case_outcome(&integer, "", "</think>Answer: 82",
+                              got, sizeof(got), &st) || st != EVAL_PASSED) {
         fprintf(stderr, "pulsar-eval: regrade self-test failed: legacy empty status not graded\n");
+        failed++;
+    }
+    /* An INCOMPLETE case was a completed run: it regrades, and stays INCOMPLETE
+     * while its output still has no answer line. */
+    if (!regrade_case_outcome(&integer, "INCOMPLETE", "</think>The answer is 82, but",
+                              got, sizeof(got), &st) || st != EVAL_INCOMPLETE) {
+        fprintf(stderr, "pulsar-eval: regrade self-test failed: INCOMPLETE trace not regraded as INCOMPLETE\n");
+        failed++;
+    }
+    /* A trace graded PASSED under a looser contract regrades under this one. */
+    if (!regrade_case_outcome(&integer, "PASSED", "</think>The answer is 82.",
+                              got, sizeof(got), &st) || st != EVAL_INCOMPLETE) {
+        fprintf(stderr, "pulsar-eval: regrade self-test failed: answer-less PASSED trace did not regrade INCOMPLETE\n");
         failed++;
     }
     return failed;
 }
 
+/** @brief --self-test-extractors: run every grading, extractor and trace self-test.
+ *  @return 0 when all pass (printed), else 1 */
 static int run_extractor_self_tests(void) {
     int failed = 0;
 
     failed += trace_copy_self_test_case();
     failed += regrade_status_self_test_case();
+
+    /* --- The grading contract: last visible line decides INCOMPLETE vs graded. */
+    const eval_case graded_int = {.source = "AIME2025", .answer = "82"};
+    failed += grading_self_test_case(
+        "grading: a final answer line is graded",
+        &graded_int, "</think>The result is 82.\n**Answer:** 082\n", EVAL_PASSED, "82");
+    failed += grading_self_test_case(
+        "grading: a wrong final answer line is FAILED, not INCOMPLETE",
+        &graded_int, "</think>Answer: 81", EVAL_FAILED, "81");
+    failed += grading_self_test_case(
+        "grading: no answer line is INCOMPLETE",
+        &graded_int, "</think>The answer is 82, but the generation was truncated.",
+        EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: text after the answer line is INCOMPLETE",
+        &graded_int, "</think>Answer: 82\nA later unfinished sentence", EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: an empty reply is INCOMPLETE",
+        &graded_int, "", EVAL_INCOMPLETE, NULL);
+    failed += grading_self_test_case(
+        "grading: an answer line inside the thinking block does not count",
+        &graded_int, "Answer: 82</think>Let me reconsider.", EVAL_INCOMPLETE, NULL);
+    const eval_case graded_mc = {
+        .source = "SuperGPQA",
+        .choice = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J" },
+        .answer = "F",
+    };
+    failed += grading_self_test_case(
+        "grading: multiple-choice final line",
+        &graded_mc, "</think>Option H is tempting.\nAnswer: F", EVAL_PASSED, "F");
+    const eval_case graded_compsec = {.source = "COMPSEC", .answer = "9-10"};
+    failed += grading_self_test_case(
+        "grading: COMPSEC final line",
+        &graded_compsec, "**Answer:** 10</think>The primary write is at line 10.\nAnswer: 10",
+        EVAL_PASSED, "10");
 
     const eval_case mc = {
         .source = "SuperGPQA",
@@ -3445,11 +3898,6 @@ static int run_extractor_self_tests(void) {
         &mc,
         "</think>Answer: F\nThis answer is final; option H is a tempting distractor.",
         "F");
-    failed += extractor_self_test_case(
-        "multiple-choice preserves loose-answer fallback",
-        &mc,
-        "</think>The answer is F. This answer is final; option H is tempting.",
-        "F");
 
     const eval_case integer = {
         .source = "AIME2025",
@@ -3459,11 +3907,6 @@ static int run_extractor_self_tests(void) {
         "integer prefers final answer marker",
         &integer,
         "</think>I first thought the answer was 80.\nFinal answer: 082",
-        "82");
-    failed += extractor_self_test_case(
-        "integer preserves loose-answer fallback",
-        &integer,
-        "</think>The answer is 082. This answer comes from AIME 2025.",
         "82");
 
     const eval_case compsec = {
@@ -3544,7 +3987,7 @@ static int run_extractor_self_tests(void) {
         "MC: a leading pick followed by 'not B' is still graded as the pick",
         &mc_d, "</think>Answer: D, not B", "D");
 
-    /* Integer: when the answer line shows the arithmetic, the graded value
+    /** Integer: when the answer line shows the arithmetic, the graded value
      * must be the stated result (right of the last '='), not the first
      * summand/factor; digits on later lines must not leak in either. Many
      * embedded AIME2025 cases ask for a derived sum (m+n, a+b+c, ...). */
@@ -3570,6 +4013,10 @@ static int run_extractor_self_tests(void) {
     return 0;
 }
 
+/** @brief Whether the user asked (Enter on the case list) to jump to a case other than the running one.
+ *  @param ui          the UI
+ *  @param running_idx the running case's index
+ *  @return true when a valid other case is requested */
 static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
     return ui->enabled &&
            ui->requested_case >= 0 &&
@@ -3577,15 +4024,25 @@ static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
            ui->requested_case != running_idx;
 }
 
+/** @brief Whether the user pressed q.
+ *  @param ui the UI
+ *  @return true when the TUI is enabled and a quit was requested */
 static bool tui_has_quit_request(eval_ui *ui) {
     return ui->enabled && ui->quit_requested;
 }
 
+/** @brief Return a case to PENDING and clear its extracted answer (a switched-away case runs again later).
+ *  @param ui  the UI
+ *  @param idx the case's index */
 static void mark_case_pending(eval_ui *ui, int idx) {
     ui->status[idx] = EVAL_PENDING;
     ui->guess[idx][0] = '\0';
 }
 
+/** @brief While the run is paused, stop the run clock and poll input every 50 ms until it resumes.
+ *  @param ui    the UI
+ *  @param phase the phase name shown while waiting
+ *  @return the seconds spent paused (0 when not paused) */
 static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     if (!ui->enabled || !ui->paused) return 0.0;
     bool was_running = ui->run_clock_active;
@@ -3602,6 +4059,12 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
     return now_sec() - start;
 }
 
+/** @brief Session progress callback during a case's prefill: updates the counts and speed, redraws, and
+ *  honours a pause (the paused time is taken out of the phase's speed).
+ *  @param ud      the eval_ui
+ *  @param event   the event name; only "prefill_chunk" and "prefill_display" are handled
+ *  @param current prefill rows done
+ *  @param total   prefill rows total */
 static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = (eval_ui *)ud;
     if (!ui || !event) return;
@@ -3618,13 +4081,26 @@ static void eval_prefill_progress(void *ud, const char *event, int current, int 
     if (paused_sec > 0.0) ui->phase_start_sec += paused_sec;
 }
 
+/** @brief Run one case: render and prefill its prompt, generate under the budget (forcing `</think>` by the
+ *  soft / hard reply limits), grade the reply, update the UI and write its trace record.  A prompt that does
+ *  not fit the context is SKIPPED.
+ *  @param engine            the loaded engine
+ *  @param session           the run's session
+ *  @param cfg               the configuration
+ *  @param ui                the UI (per-case arrays updated)
+ *  @param trace             the trace file, or NULL
+ *  @param idx               the case's index in eval_cases
+ *  @param generation_budget the attempt's generation budget, tokens
+ *  @param rng               the sampler stream (stepped)
+ *  @return EVAL_RUN_OK, EVAL_RUN_ERROR, or EVAL_RUN_SWITCH / EVAL_RUN_QUIT when the user interrupted it */
 static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *session,
                                     const eval_config *cfg, eval_ui *ui,
-                                    FILE *trace, int idx, uint64_t *rng) {
+                                    FILE *trace, int idx, int generation_budget,
+                                    uint64_t *rng) {
     const eval_case *tc = &eval_cases[idx];
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
-    const pulsar_think_mode think_mode = pulsar_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
+    const pulsar_think_mode think_mode = cfg->think_mode;
     const char *system = eval_system_prompt();
 
     char *question = build_question_prompt(tc);
@@ -3646,7 +4122,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt does not fit context", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_budget, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3656,7 +4132,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         return EVAL_RUN_OK;
     }
 
-    int generation_limit = cfg->max_tokens;
+    int generation_limit = generation_budget;
     int ctx_generation_limit = cfg->ctx_size - prompt.len;
     if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
     if (generation_limit < 1) {
@@ -3667,7 +4143,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt leaves no generation room", system, question, "",
-                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         think_mode, prompt.len, 0, generation_budget, 0.0, "?", NULL);
         if (!tty) {
             printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
                    idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
@@ -3710,7 +4186,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         fprintf(stderr, "pulsar-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
-                         system, question, "", think_mode, prompt.len, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt.len, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         pulsar_tokens_free(&prompt);
         return EVAL_RUN_ERROR;
@@ -3729,7 +4206,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_QUIT;
     }
@@ -3738,7 +4216,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         tui_run_clock_stop(ui);
         tui_refresh(ui, "idle");
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
-                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+                         system, question, "", think_mode, prompt_tokens, 0,
+                         generation_limit, 0.0, "?", NULL);
         free(question);
         return EVAL_RUN_SWITCH;
     }
@@ -3752,7 +4231,17 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     bool generation_in_think = pulsar_think_mode_enabled(think_mode);
     eval_think_close_info think_close = {};
     pulsar_tokens think_close_tokens = {0};
-    if (generation_in_think) pulsar_tokenize_text(engine, "</think>", &think_close_tokens);
+    /* the tokenizer's ONE think-close id (L272 B11: re-tokenizing the text gave BPE pieces on Qwen) */
+    if (generation_in_think) {
+        const int close_id = pulsar_token_think_close(engine);
+        if (close_id < 0) {
+            fprintf(stderr, "pulsar-eval: the tokenizer has no </think> token to force a close with\n");
+            free(raw.v);
+            free(question);
+            return EVAL_RUN_ERROR;
+        }
+        pulsar_tokens_push(&think_close_tokens, close_id);
+    }
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
@@ -3769,7 +4258,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3783,14 +4273,15 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
-            double paused_sec = tui_wait_if_paused(ui, ui->in_think ? "thinking" : "answer");
+            double paused_sec = tui_wait_if_paused(ui, ui->think.in_think ? "thinking" : "answer");
             if (paused_sec > 0.0) {
                 ui->phase_start_sec += paused_sec;
                 t0 += paused_sec;
@@ -3802,7 +4293,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3816,7 +4308,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
                 tui_refresh(ui, "idle");
                 trace_write_case(trace, cfg, tc, idx, ui->ncases, "SWITCHED", NULL,
                                  system, question, raw.v ? raw.v : "", think_mode,
-                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                                  &think_close);
                 free(question);
                 pulsar_tokens_free(&think_close_tokens);
@@ -3858,6 +4351,24 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
         if (token < 0)
             token = pulsar_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
+        if (token < 0) {
+            /* The sampler refused a degenerate row (L188): same exit as a
+             * failed eval -- the case is an ERROR, not a shorter answer. */
+            snprintf(err, sizeof err, "sampler refused a degenerate logits row");
+            plain_reset_color(use_plain_color);
+            ui->generated_tokens[idx] = ui->generated;
+            tui_run_clock_stop(ui);
+            fprintf(stderr, "pulsar-eval: decode failed for %s: %s\n", tc->id, err);
+            trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
+                             system, question, raw.v ? raw.v : "", think_mode,
+                             prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
+                             &think_close);
+            free(question);
+            pulsar_tokens_free(&think_close_tokens);
+            buf_free(&raw);
+            return EVAL_RUN_ERROR;
+        }
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -3873,7 +4384,8 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
             fprintf(stderr, "pulsar-eval: decode failed for %s: %s\n", tc->id, err);
             trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
                              system, question, raw.v ? raw.v : "", think_mode,
-                             prompt_tokens, ui->generated, now_sec() - t0, "?",
+                             prompt_tokens, ui->generated, generation_limit,
+                                 now_sec() - t0, "?",
                              &think_close);
             free(question);
             pulsar_tokens_free(&think_close_tokens);
@@ -3901,7 +4413,7 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
 
         if (tty) {
             stream_append_token_text(ui, text, len, false);
-            tui_refresh(ui, ui->in_think ? "thinking" : "answer");
+            tui_refresh(ui, ui->think.in_think ? "thinking" : "answer");
         } else {
             if (plain_in_think && strstr(raw.v ? raw.v : "", "</think>")) {
                 plain_in_think = false;
@@ -3921,24 +4433,26 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     }
 
     char got[EVAL_ANSWER_MAX];
-    find_case_answer(tc, raw.v ? raw.v : "", got, sizeof(got));
+    const eval_status outcome = grade_model_output(tc, raw.v ? raw.v : "", got, sizeof(got));
     snprintf(ui->guess[idx], EVAL_ANSWER_MAX, "%s", got);
-    bool pass = answer_matches(tc, got);
-    ui->status[idx] = pass ? EVAL_PASSED : EVAL_FAILED;
+    ui->status[idx] = outcome;
     ui->generated_tokens[idx] = ui->generated;
     tui_run_clock_stop(ui);
     double sec = now_sec() - t0;
-    tui_refresh(ui, pass ? "passed" : "failed");
-    trace_write_case(trace, cfg, tc, idx, ui->ncases, pass ? "PASSED" : "FAILED", NULL,
+    const char *outcome_name = report_status_name(outcome);
+    tui_refresh(ui, outcome == EVAL_PASSED ? "passed" :
+                    outcome == EVAL_FAILED ? "failed" : "incomplete");
+    trace_write_case(trace, cfg, tc, idx, ui->ncases, outcome_name, NULL,
                      system, question, raw.v ? raw.v : "", think_mode, prompt_tokens,
-                     ui->generated, sec, got, &think_close);
+                     ui->generated, generation_limit, sec, got, &think_close);
 
     if (!tty) {
-        printf("%s%s%s got %s expected %s (%.1fs, %d tokens)\n",
-               use_plain_color ? (pass ? ANSI_GREEN : ANSI_RED) : "",
-               pass ? "PASSED" : "FAIL",
+        printf("%s%s%s got %s expected %s (%.1fs, %d tokens of %d)\n",
+               use_plain_color ? (outcome == EVAL_PASSED ? ANSI_GREEN :
+                                  outcome == EVAL_FAILED ? ANSI_RED : ANSI_YELLOW) : "",
+               outcome_name,
                use_plain_color ? ANSI_RESET : "",
-               got, tc->answer, sec, ui->generated);
+               got, tc->answer, sec, ui->generated, generation_limit);
     }
 
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
@@ -3948,6 +4462,10 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     return EVAL_RUN_OK;
 }
 
+/** @brief The first PENDING case at or after start, wrapping around.
+ *  @param ui    the UI
+ *  @param start where to start looking
+ *  @return the case's index, or -1 when none is pending */
 static int next_pending_case(eval_ui *ui, int start) {
     if (ui->ncases <= 0) return -1;
     for (int off = 0; off < ui->ncases; off++) {
@@ -3957,6 +4475,12 @@ static int next_pending_case(eval_ui *ui, int start) {
     return -1;
 }
 
+/** @brief Parse --case-sequence: comma-separated 1-based case numbers in [1, ncases].
+ *  @param arg     the option's value
+ *  @param ncases  cases in the run
+ *  @param seq_out receives a malloc'd array of 0-based indices (caller frees)
+ *  @param len_out receives its length
+ *  @return 0, or -1 on an empty, malformed or out-of-range list (said on stderr; nothing returned) */
 static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *len_out) {
     int cap = 8;
     int len = 0;
@@ -4014,27 +4538,13 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
     return 0;
 }
 
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
+/// @param st the status
+/// @return its spelling ("PASSED", "RUNNING", ...); "PENDING" for an unknown value
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
     case EVAL_FAILED: return "FAILED";
+    case EVAL_INCOMPLETE: return "INCOMPLETE";
     case EVAL_SKIPPED: return "SKIPPED";
     case EVAL_STOPPED: return "STOPPED";
     case EVAL_PREFILL: return "PREFILL";
@@ -4044,21 +4554,29 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
-static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
+/** @brief Print the end-of-run summary and a per-case table (state, token counts, given and correct answers).
+ *  @param ui         the UI (per-case arrays)
+ *  @param ncases     cases in the run
+ *  @param passed     cases passed
+ *  @param failed     cases failed
+ *  @param incomplete cases incomplete */
+static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed,
+                              int incomplete) {
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
     printf("pulsar-eval: %d/%d passed", passed, ncases);
     if (failed) printf(", %d failed", failed);
+    if (incomplete) printf(", %d incomplete", incomplete);
     printf(", runtime %s\n", elapsed);
-    printf("%-3s %-8s %8s %8s %8s %-8s %-8s %s\n",
+    printf("%-3s %-10s %8s %8s %8s %-8s %-8s %s\n",
            "#", "state", "prompt", "gen", "total", "given", "correct", "test");
     for (int i = 0; i < ncases; i++) {
         int prompt_tokens = ui->prompt_tokens ? ui->prompt_tokens[i] : 0;
         int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
         int total_tokens = prompt_tokens + generated_tokens;
         const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
-        printf("%3d %-8s %8d %8d %8d %-8s %-8s %s/%s\n",
+        printf("%3d %-10s %8d %8d %8d %-8s %-8s %s/%s\n",
                i + 1,
                report_status_name(ui->status[i]),
                prompt_tokens,
@@ -4071,6 +4589,11 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
     }
 }
 
+/** @brief pulsar-eval's entry point: self-tests or a trace regrade when asked, else open the engine and run the
+ *  cases.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit status (2 on bad arguments) */
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
     if (cfg.self_test_extractors) return run_extractor_self_tests();
@@ -4111,10 +4634,7 @@ int main(int argc, char **argv) {
         /* keep KL/quality probes on plain decode with max memory headroom */
         .dspark_disable = true,
         .backend = cfg.backend,
-        .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
-        .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
     };
     pulsar_engine *engine = NULL;
     if (pulsar_engine_open(&engine, &opt) != 0) {
@@ -4122,30 +4642,55 @@ int main(int argc, char **argv) {
         free(case_sequence);
         return 1;
     }
+    /* the eval renders chats: a family whose tokenizer and chat front this build lacks is refused here, by name */
+    if (!pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar-eval: the %s family has no tokenizer or chat renderer in this build -- refusing\n",
+                pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 1;
+    }
 
+    /* The default effort is the loaded family's (L239); an effort the 0731
+     * encoder cannot spell is refused by name. */
+    if (!cfg.think_mode_set) cfg.think_mode = pulsar_engine_think_default(engine);
+    char think_why[200];
+    if (!pulsar_engine_think_mode_supported(engine, cfg.think_mode, think_why, sizeof think_why)) {
+        fprintf(stderr, "pulsar-eval: thinking effort %d: %s\n", (int)cfg.think_mode, think_why);
+        return 2;
+    }
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
+    /* The context has to hold the largest budget any attempt can use: the
+     * doubled retry budget when --retry-incomplete is armed. */
+    const int max_generation_tokens = eval_generation_budget(&cfg, cfg.retry_incomplete);
     const bool auto_ctx = cfg.ctx_size <= 0;
     if (auto_ctx) {
         cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+                                              max_generation_tokens,
                                               &max_prompt_tokens, &max_prompt_case);
         fprintf(stderr,
                 "pulsar-eval: context auto-sized to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, max_generation_tokens);
     } else {
         max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
-                                                   cfg.ctx_size, &max_prompt_case);
+                                                   &max_prompt_case);
         fprintf(stderr,
                 "pulsar-eval: context set to %d tokens "
                 "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
-                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
-        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case);
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, max_generation_tokens);
+        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case,
+                                 max_generation_tokens);
     }
     fprintf(stderr, "pulsar-eval: model shape %s\n", pulsar_engine_model_name(engine));
-    eval_warn_think_effort_downgraded(&cfg);
-    trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases, max_prompt_tokens);
-    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
+    trace_write_header(trace, &cfg, pulsar_engine_model_name(engine), ncases,
+                       max_prompt_tokens, max_generation_tokens);
+    char ctxmem_line[256];
+    fprintf(stderr, "%s\n",
+            pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar-eval",
+                                       cfg.backend, cfg.ctx_size, cfg.prefill_chunk));
 
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg.ctx_size) != 0) {
@@ -4158,7 +4703,7 @@ int main(int argc, char **argv) {
 
     eval_ui ui;
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
-    tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
+    tui_start(&ui, eval_cases, ncases, max_generation_tokens, split_ui);
 
     uint64_t rng = cfg.seed;
     int rc = 0;
@@ -4181,13 +4726,21 @@ int main(int argc, char **argv) {
             ui.selected_case = next;
         }
 
-        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next, &rng);
+        eval_run_result result = run_one_case(engine, session, &cfg, &ui, trace, next,
+                                              eval_generation_budget(&cfg, false), &rng);
+        if (result == EVAL_RUN_OK && ui.status[next] == EVAL_INCOMPLETE &&
+            cfg.retry_incomplete) {
+            const int retry_budget = eval_generation_budget(&cfg, true);
+            fprintf(stderr, "pulsar-eval: retrying incomplete case %s/%s with %d tokens\n",
+                    eval_cases[next].source, eval_cases[next].id, retry_budget);
+            result = run_one_case(engine, session, &cfg, &ui, trace, next, retry_budget, &rng);
+        }
         if (result == EVAL_RUN_ERROR) {
             rc = 1;
             break;
         }
         if (result == EVAL_RUN_QUIT) break;
-        /* A successful case should advance to the next pending benchmark.  If a
+        /** A successful case should advance to the next pending benchmark.  If a
          * stale quit flag ever survives here, clear it; real q handling either
          * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
          * the next idle iteration. */
@@ -4209,20 +4762,23 @@ int main(int argc, char **argv) {
 
     int passed = 0;
     int failed = 0;
+    int incomplete = 0;
     for (int i = 0; i < ncases; i++) {
         if (ui.status[i] == EVAL_PASSED) passed++;
         else if (ui.status[i] == EVAL_FAILED) failed++;
+        else if (ui.status[i] == EVAL_INCOMPLETE) incomplete++;
     }
 
     if (ui.active) tui_restore();
-    print_eval_report(&ui, ncases, passed, failed);
+    print_eval_report(&ui, ncases, passed, failed, incomplete);
     if (trace) {
         fprintf(trace,
                 "===== SUMMARY =====\n"
                 "passed: %d\n"
                 "failed: %d\n"
+                "incomplete: %d\n"
                 "total: %d\n",
-                passed, failed, ncases);
+                passed, failed, incomplete, ncases);
         fflush(trace);
     }
 
@@ -4231,5 +4787,5 @@ int main(int argc, char **argv) {
     pulsar_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);
-    return rc || failed ? 1 : 0;
+    return rc || failed || incomplete ? 1 : 0;
 }

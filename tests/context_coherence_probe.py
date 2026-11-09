@@ -19,8 +19,9 @@ this replaces:
     all three values at once (their sum), so it cannot be answered from a
     partial retrieval.  It is scored separately and is the honest headline.
 
-The planted facts are deterministic in --seed, so a run is reproducible, and
-they are lexically unlike the filler so a hit cannot come from the padding.
+The planted facts are deterministic in --seed and the answer is decoded
+GREEDILY (temperature 0), so a run is reproducible end to end; the facts are
+lexically unlike the filler, so a hit cannot come from the padding.
 
     ./tests/context_coherence_probe.py --port 8080 --depths 2048,8192,32768
 
@@ -127,6 +128,17 @@ def run_depth(args, filler_words, depth_words, rng):
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": args.max_tokens,
+        # GREEDY, deliberately.  The docstring above promises a reproducible
+        # run, but only the PROMPT was ever deterministic: without a
+        # temperature the server sampled at its default 1.0, so the answer
+        # was a dice roll and this gate could fail on sampling alone --
+        # measured 2026-08-28, one failure in three identical runs on a
+        # build whose other two runs scored 3/3 at every depth.  A release
+        # gate that fails randomly teaches people to re-run it until green,
+        # which is how a real regression gets waved through.  Greedy removes
+        # the noise WITHOUT weakening the test: the probe's point is free
+        # prose with no grammar mask, and temperature is not a mask.
+        "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
     }

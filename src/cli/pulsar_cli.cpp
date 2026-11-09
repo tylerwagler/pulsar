@@ -1,5 +1,11 @@
+/** @file
+ *  pulsar: the command-line client -- one-shot prompts and an interactive chat REPL. */
 #include "pulsar.h"
 #include "pulsar_help.h"
+#include "pulsar_ctxmem.h"
+#include "pulsar_argparse.h"
+#include "pulsar_utf8.h"
+#include "pulsar_think_scan.hpp"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -24,21 +30,23 @@
 #include <time.h>
 #include <unistd.h>
 
+/** What the CLI was asked to do: generate, or run one of the diagnostic modes
+ * (logit dump, perplexity, KL divergence, importance matrix). */
 typedef struct {
-    const char *prompt;
-    const char *system;
-    int n_predict;
-    int ctx_size;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    bool dump_tokens;
-    const char *dump_logits_path;
-    const char *dump_logprobs_path;
-    int dump_logprobs_top_k;
-    const char *perplexity_file_path;
-    const char *kl_file_path;
+    const char *prompt;       ///< the prompt text, or NULL for stdin/interactive
+    const char *system;       ///< system prompt
+    int n_predict;            ///< generation cap in tokens
+    int ctx_size;             ///< session context size
+    float temperature;        ///< sampling temperature; 0 selects argmax
+    float top_p;              ///< nucleus cutoff
+    float min_p;              ///< relative probability floor
+    uint64_t seed;            ///< RNG seed
+    bool dump_tokens;         ///< print the tokenization and exit
+    const char *dump_logits_path;    ///< write raw logits here
+    const char *dump_logprobs_path;  ///< write per-position logprobs here
+    int dump_logprobs_top_k;         ///< alternatives to record per position
+    const char *perplexity_file_path;///< corpus to measure perplexity over
+    const char *kl_file_path;        ///< corpus for the KL-divergence walk
     /* Pre-tokenized ids for the KL walk. Cross-rig KL pairs position p on both
      * sides, so the two engines must score the SAME id sequence -- and they do
      * not agree on text: measured 2026-08-05, pulsar and vLLM produced
@@ -46,121 +54,66 @@ typedef struct {
      * pulsar_tokenize_rendered_chat folds <think>/DSML markers into single
      * special ids the way the served model does. Feeding ids bypasses both
      * tokenizers so the comparison is exact by construction. */
-    const char *kl_tokens_path;
-    const char *kl_ref_dump_path;
-    const char *kl_score_path;
-    int kl_stride;
-    int kl_prefix;
-    const char *imatrix_dataset_path;
-    const char *imatrix_output_path;
-    int imatrix_max_prompts;
-    int imatrix_max_tokens;
-    pulsar_think_mode think_mode;
+    const char *kl_tokens_path;      ///< pre-tokenized ids for the KL walk (see the note above)
+    const char *kl_ref_dump_path;    ///< reference distributions to compare against
+    const char *kl_score_path;       ///< write per-position KL scores here
+    int kl_stride;                   ///< score every Nth position
+    int kl_prefix;                   ///< positions to prefill before scoring begins
+    const char *imatrix_dataset_path;///< corpus for importance-matrix collection
+    const char *imatrix_output_path; ///< write the importance matrix here
+    int imatrix_max_prompts;         ///< cap on prompts consumed
+    int imatrix_max_tokens;          ///< cap on tokens consumed
+    pulsar_think_mode think_mode;    ///< reasoning mode for generation
+    bool think_mode_set;             ///< an explicit --think-* flag chose it (else the loaded family's default, after open)
 } cli_generation_options;
 
+/** The fully-resolved CLI configuration. */
 typedef struct {
-    pulsar_engine_options engine;
-    cli_generation_options gen;
+    pulsar_engine_options engine;  ///< model/runtime options
+    cli_generation_options gen;    ///< what to generate or measure
+    /** Prompt text the CLI allocated itself (read from a file or stdin), which
+     * `gen.prompt` then points into. Held separately because gen.prompt may
+     * instead point at an argv string the CLI does not own. */
     char *prompt_owned;
-    bool inspect;
+    bool inspect;                  ///< print model/tensor information and exit
 } cli_config;
 
+/** Set by the SIGINT handler during the REPL; polled between generated tokens. */
 static volatile sig_atomic_t cli_interrupted;
 
+/** @brief SIGINT handler (installed by run_repl): requests that the current generation stop.
+ *  @param sig the signal number (unused) */
 static void cli_sigint_handler(int sig) {
     (void)sig;
     cli_interrupted = 1;
 }
 
+/** @brief Whether Ctrl+C was pressed since the last cli_interrupt_clear.
+ *  @return true when an interrupt is pending */
 static bool cli_interrupt_requested(void) {
     return cli_interrupted != 0;
 }
 
+/** @brief Clear a pending interrupt. */
 static void cli_interrupt_clear(void) {
     cli_interrupted = 0;
 }
 
+/** @brief Print the CLI's help text.
+ *  @param fp    the stream to print to
+ *  @param topic help topic, or NULL for the overview */
 static void usage(FILE *fp, const char *topic) {
     pulsar_help_print(fp, PULSAR_HELP_DS4, topic);
 }
 
-static int parse_int(const char *s, const char *opt) {
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (int)v;
-}
-
-static uint64_t parse_u64(const char *s, const char *opt) {
-    char *end = NULL;
-    unsigned long long v = strtoull(s, &end, 10);
-    if (s[0] == '\0' || *end != '\0' || v == 0) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return (uint64_t)v;
-}
-
-static float parse_float_range(const char *s, const char *opt, float min, float max) {
-    char *end = NULL;
-    float v = strtof(s, &end);
-    if (s[0] == '\0' || *end != '\0' || !isfinite(v) || v < min || v > max) {
-        fprintf(stderr, "pulsar: invalid value for %s: %s\n", opt, s);
-        exit(2);
-    }
-    return v;
-}
-
-static pulsar_backend parse_backend(const char *s) {
-    if (!strcmp(s, "cuda")) return PULSAR_BACKEND_CUDA;
-    fprintf(stderr, "pulsar: invalid backend: %s\n", s);
-    fprintf(stderr, "pulsar: valid backends are: cuda\n");
-    exit(2);
-}
-
+/** @brief The backend the CLI selects when none is given.
+ *  @return PULSAR_BACKEND_CUDA */
 static pulsar_backend default_backend(void) {
     return PULSAR_BACKEND_CUDA;
 }
 
-static void log_context_memory(pulsar_backend backend,
-                               int         ctx_size,
-                               uint32_t    prefill_chunk) {
-    pulsar_context_memory m =
-        pulsar_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
-    fprintf(stderr,
-            "pulsar: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            pulsar_backend_name(backend),
-            m.prefill_cap,
-            m.raw_cap,
-            m.comp_cap);
-}
-
-static pulsar_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
-    return pulsar_think_mode_for_context(gen->think_mode, gen->ctx_size);
-}
-
-static bool cli_think_effort_downgraded(const cli_generation_options *gen) {
-    return pulsar_think_effort_prefix(gen->think_mode)[0] &&
-           cli_effective_think_mode(gen) != gen->think_mode;
-}
-
-static void cli_warn_think_effort_downgraded(const cli_generation_options *gen, const char *name) {
-    if (!cli_think_effort_downgraded(gen)) return;
-    pulsar_log(stderr,
-        PULSAR_LOG_WARNING,
-        "pulsar: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
-        name,
-        pulsar_think_max_min_context(),
-        gen->ctx_size);
-}
-
+/** @brief Monotonic wall clock.
+ *  @return seconds since an arbitrary epoch (CLOCK_MONOTONIC) */
 static double cli_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -169,13 +122,22 @@ static double cli_now_sec(void) {
 
 static char *read_prompt_file(const char *path, bool fatal);
 
+/** Userdata for the CLI's prefill progress line. */
 typedef struct {
+    /** Engine position where this prefill began. Progress is reported as
+     * `current - base_tokens`, subtracting any reused prefix so the percentage
+     * measures new work. */
     int base_tokens;
-    int input_tokens;
-    bool use_color;
-    bool finished;
+    int input_tokens;  ///< tokens this prefill will process; the denominator
+    bool use_color;    ///< redraw in place with ANSI, instead of one line per update
+    bool finished;     ///< the 100% line has been printed; suppresses a duplicate
 } cli_prefill_progress;
 
+/** @brief Session progress callback: draws the "processing N input tokens" line for prefill events.
+ *  @param ud      the cli_prefill_progress
+ *  @param event   the event name; only "prefill_chunk" and (on a TTY) "prefill_display" are drawn
+ *  @param current the engine position reached, tokens (base_tokens is subtracted)
+ *  @param total   unused */
 static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
     (void)total;
     cli_prefill_progress *p = (cli_prefill_progress *)ud;
@@ -216,33 +178,32 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     fflush(stderr);
 }
 
+/** @brief Whether the prompt is already a rendered DeepSeek chat (starts with the BOS marker text).
+ *  @param prompt the prompt text, or NULL
+ *  @return true when it begins with `<｜begin▁of▁sentence｜>` */
 static bool is_rendered_chat_prompt(const char *prompt) {
     const char *bos = "<｜begin▁of▁sentence｜>";
     return prompt && strncmp(prompt, bos, strlen(bos)) == 0;
 }
 
+/** Streams generated tokens to a FILE, optionally styling reasoning blocks.
+ *
+ * The CLI's much smaller cousin of the agent's renderer: it still needs the
+ * hold-back buffer, because a `<think>` tag can arrive split across token
+ * boundaries and must not be printed as literal text.
+ */
 typedef struct {
-    pulsar_engine *engine;
-    FILE *fp;
-    bool format_thinking;
-    bool in_think;
-    bool color_open;
-    bool use_color;
-    bool last_output_newline;
-    char pending[16];
-    size_t pending_len;
+    pulsar_engine *engine;      ///< for detokenising
+    FILE *fp;                   ///< output sink
+    bool format_thinking;       ///< style reasoning blocks distinctly
+    pulsar_think_scanner think; ///< `<think>` tag state: in_think styles text, held tag prefix
+    bool color_open;            ///< an SGR sequence is open and must be closed
+    bool use_color;             ///< the sink accepts ANSI colour
+    bool last_output_newline;   ///< last byte written was '\n'
 } token_printer;
 
-static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n >= plen && memcmp(p, prefix, plen) == 0;
-}
-
-static bool bytes_is_partial_prefix(const char *p, size_t n, const char *prefix) {
-    size_t plen = strlen(prefix);
-    return n < plen && memcmp(prefix, p, n) == 0;
-}
-
+/** @brief Open the grey SGR run used for thinking text (colour sinks only, once per run).
+ *  @param p the printer */
 static void token_printer_set_grey(token_printer *p) {
     if (p->use_color && !p->color_open) {
         fputs("\x1b[90m", p->fp);
@@ -250,6 +211,8 @@ static void token_printer_set_grey(token_printer *p) {
     }
 }
 
+/** @brief Close an open SGR run.
+ *  @param p the printer */
 static void token_printer_reset_color(token_printer *p) {
     if (p->use_color && p->color_open) {
         fputs("\x1b[0m", p->fp);
@@ -257,58 +220,48 @@ static void token_printer_reset_color(token_printer *p) {
     }
 }
 
+/** @brief Write one byte, grey while inside `<think>`, and track the line start.
+ *  @param p the printer
+ *  @param c the byte */
 static void token_printer_write_char(token_printer *p, char c) {
-    if (p->in_think) token_printer_set_grey(p);
+    if (p->think.in_think) token_printer_set_grey(p);
     fputc((unsigned char)c, p->fp);
     p->last_output_newline = c == '\n';
 }
 
+/** The CLI's sink for pulsar_think_scan: grey thinking text, the reply starts
+ * on the line after `</think>` (no blank line). */
+struct token_printer_think_sink {
+    token_printer *p;   ///< the printer being driven
+    /** The CLI has no DSML lane: tags are always prose markers. */
+    /** @return always true */
+    bool tags_enabled() const { return true; }
+    /** Nothing to do at `<think>`: the next text byte turns grey. */
+    void think_open_tag() {}
+    /** Close the grey SGR run. */
+    void think_close_tag() { token_printer_reset_color(p); }
+    /** Whether the last byte printed was '\n'. */
+    /** @return true at the start of a line */
+    bool at_line_start() const { return p->last_output_newline; }
+    /** Raw newline. */
+    void newline() { token_printer_write_char(p, '\n'); }
+    /** One byte of prose or thinking text. */
+    /** @param c the byte */
+    void text(char c) { token_printer_write_char(p, c); }
+};
+
+/** @brief Run text through the think-tag scanner into the printer.
+ *  @param p      the printer
+ *  @param text   generated text (may be NULL with len 0)
+ *  @param len    bytes in text
+ *  @param finish flush a held tag prefix (end of output) */
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
-    const char *think_open = "<think>";
-    const char *think_close = "</think>";
-    size_t total = p->pending_len + len;
-    char *buf = (char *)malloc(total ? total : 1);
-    if (!buf) return;
-    if (p->pending_len) memcpy(buf, p->pending, p->pending_len);
-    if (len) memcpy(buf + p->pending_len, text, len);
-    p->pending_len = 0;
-
-    size_t i = 0;
-    while (i < total) {
-        const char *cur = buf + i;
-        const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
-            p->in_think = true;
-            i += strlen(think_open);
-            continue;
-        }
-        if (bytes_has_prefix(cur, rem, think_close)) {
-            p->in_think = false;
-            token_printer_reset_color(p);
-            if (!p->last_output_newline) {
-                fputc('\n', p->fp);
-                p->last_output_newline = true;
-            }
-            i += strlen(think_close);
-            continue;
-        }
-        if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
-        {
-            if (rem < sizeof(p->pending)) {
-                memcpy(p->pending, cur, rem);
-                p->pending_len = rem;
-            }
-            break;
-        }
-        token_printer_write_char(p, cur[0]);
-        i++;
-    }
-
-    free(buf);
+    token_printer_think_sink sink = { p };
+    pulsar_think_scan(&p->think, text, len, finish, 0, sink);
 }
 
+/** @brief Flush the scanner's held bytes, close colour and flush the stream.
+ *  @param p the printer */
 static void token_printer_finish(token_printer *p) {
     if (p->format_thinking) {
         token_printer_process(p, NULL, 0, true);
@@ -317,6 +270,8 @@ static void token_printer_finish(token_printer *p) {
     fflush(p->fp);
 }
 
+/** @brief End of a generation: finish the printer and make sure the output ends with a newline.
+ *  @param ud the token_printer */
 static void generation_done(void *ud) {
     token_printer *p = (token_printer *)ud;
     token_printer_finish(p);
@@ -327,6 +282,10 @@ static void generation_done(void *ud) {
     fflush(p->fp);
 }
 
+/** @brief Write a generated piece: through the think scanner when formatting thinking, else raw.
+ *  @param p    the printer
+ *  @param text the piece's bytes
+ *  @param len  bytes in text */
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
     if (p->format_thinking) {
         token_printer_process(p, text, len, false);
@@ -336,38 +295,40 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
     }
 }
 
-static void print_generated_token(void *ud, int token) {
-    token_printer *p = (token_printer *)ud;
-    size_t len = 0;
-    char *text = pulsar_token_text(p->engine, token, &len);
-    token_printer_write_text(p, text, len);
-    fflush(p->fp);
-    free(text);
-}
 
+/** @brief Tokenize the prompt: a pre-rendered chat as is, else the system + user prompt in the family's template.
+ *  @param engine the loaded engine
+ *  @param gen    the prompt, system prompt and think mode
+ *  @param out    receives the tokens (appended) */
 static void build_prompt(pulsar_engine *engine, const cli_generation_options *gen, pulsar_tokens *out) {
     if (is_rendered_chat_prompt(gen->prompt)) {
         pulsar_tokenize_rendered_chat(engine, gen->prompt, out);
     } else {
         pulsar_encode_chat_prompt(engine, gen->system, gen->prompt,
-                               cli_effective_think_mode(gen), out);
+                               gen->think_mode, out);
     }
 }
 
-static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
+/** @brief Prefill the prompt in a new session and stream up to n_predict tokens (speculative when the engine
+ *  drafts) to stdout, then log prefill / generation rates.  Stops at a stop token, the context end or Ctrl+C.
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration (ctx size, sampling knobs, seed; seed 0 = time-derived)
+ *  @param prompt the prompt tokens
+ *  @return 0, or 1 on a session, prefill or decode failure (said on stderr) */
+static int run_session_generation(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "pulsar: sampled CLI generation requires a session backend\n");
+        fprintf(stderr, "pulsar: CLI generation requires a session backend\n");
         return 1;
     }
 
     char err[160];
-    pulsar_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+    pulsar_think_mode think_mode = cfg->gen.think_mode;
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
         .format_thinking = pulsar_think_mode_enabled(think_mode),
-        .in_think = pulsar_think_mode_enabled(think_mode),
+        .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
@@ -395,7 +356,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
     const double t_prefill1 = cli_now_sec();
 
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(session) - pulsar_session_pos(session);
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -406,12 +367,11 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int toks[17];
         int ntok = 0;
-        if (pulsar_engine_has_dspark(engine)) {
+        if (pulsar_engine_has_spec_rounds(engine)) {
             ntok = pulsar_session_generate_speculative(session,
                                                     cfg->gen.temperature, 0,
                                                     cfg->gen.top_p, cfg->gen.min_p, &rng,
                                                     max_tokens - generated,
-                                                    pulsar_token_eos(engine),
                                                     toks,
                                                     (int)(sizeof(toks) / sizeof(toks[0])),
                                                     err,
@@ -421,11 +381,16 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
                 pulsar_session_free(session);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(session, cfg->gen.temperature, 0,
                                            cfg->gen.top_p, cfg->gen.min_p, &rng);
-            if (token == pulsar_token_eos(engine)) break;
+            if (token < 0) {
+                fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
+                pulsar_session_free(session);
+                return 1;
+            }
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -438,7 +403,7 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -451,6 +416,15 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
             if (generated >= max_tokens) break;
         }
         if (stop) break;
+    }
+    /* A pair pipelines its identity check one eval (pulsar_session_eval): the
+     * last step's -- the one whose logits drew the EOS, or that no token was
+     * drawn from -- is read here, so a divergence still fails the run. */
+    if (pulsar_session_settle(session, err, sizeof(err)) != 0) {
+        generation_done(&printer);
+        fprintf(stderr, "pulsar: decode failed: %s\n", err);
+        pulsar_session_free(session);
+        return 1;
     }
     const double t_decode1 = cli_now_sec();
     generation_done(&printer);
@@ -468,31 +442,25 @@ static int run_sampled_generation(pulsar_engine *engine, const cli_config *cfg, 
     return 0;
 }
 
+/** @brief Whether the bytes are well-formed UTF-8.
+ *  @param s bytes
+ *  @param n byte count
+ *  @return true when every sequence is valid */
 static bool json_utf8_valid(const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
-        unsigned char c = (unsigned char)s[i++];
-        if (c < 0x80) continue;
-        int need = 0;
-        if (c >= 0xc2 && c <= 0xdf) need = 1;
-        else if (c >= 0xe0 && c <= 0xef) need = 2;
-        else if (c >= 0xf0 && c <= 0xf4) need = 3;
-        else return false;
-        if (i + (size_t)need > n) return false;
-        unsigned char c1 = (unsigned char)s[i];
-        if (c == 0xe0 && c1 < 0xa0) return false;
-        if (c == 0xed && c1 >= 0xa0) return false;
-        if (c == 0xf0 && c1 < 0x90) return false;
-        if (c == 0xf4 && c1 >= 0x90) return false;
-        for (int j = 0; j < need; j++) {
-            unsigned char cc = (unsigned char)s[i + (size_t)j];
-            if ((cc & 0xc0) != 0x80) return false;
-        }
-        i += (size_t)need;
+        const int k = utf8_seq_ok((const unsigned char *)s + i, n - i);
+        if (k == 0) return false;
+        i += (size_t)k;
     }
     return true;
 }
 
+/** @brief Write bytes as a JSON string literal; when they are not valid UTF-8, bytes >= 0x80 are escaped as
+ *  \\u00XX so the JSON stays valid (the caller's "bytes" array is authoritative).
+ *  @param fp the stream
+ *  @param s  bytes
+ *  @param n  byte count */
 static void json_write_string(FILE *fp, const char *s, size_t n) {
     bool valid_utf8 = json_utf8_valid(s, n);
     fputc('"', fp);
@@ -520,6 +488,10 @@ static void json_write_string(FILE *fp, const char *s, size_t n) {
     fputc('"', fp);
 }
 
+/** @brief Write a token as JSON: {"id", "text", "bytes": [...]}.
+ *  @param fp     the stream
+ *  @param engine the engine (detokenises)
+ *  @param token  the token id */
 static void json_write_token(FILE *fp, pulsar_engine *engine, int token) {
     size_t n = 0;
     char *text = pulsar_token_text(engine, token, &n);
@@ -535,6 +507,12 @@ static void json_write_token(FILE *fp, pulsar_engine *engine, int token) {
     free(text);
 }
 
+/** @brief --dump-logits: prefill the prompt and write the frontier's full logits row (non-finite as null) and
+ *  its argmax as JSON to gen.dump_logits_path.
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration
+ *  @param prompt the prompt tokens
+ *  @return 0, or 1 on failure (said on stderr; a row with no finite logit has no argmax and refuses) */
 static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -562,7 +540,7 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
     pulsar_session_set_progress(session, NULL, NULL);
     pulsar_session_set_display_progress(session, NULL, NULL);
 
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
     float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
         pulsar_session_free(session);
@@ -575,6 +553,13 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
         return 1;
     }
 
+    const int argmax = pulsar_session_argmax(session);
+    if (argmax < 0) {   /* -1: no finite logit -- there is no argmax to write (and logits[-1] is out of bounds) */
+        fprintf(stderr, "pulsar: --dump-logits: no finite logit at the prompt's end; refusing the dump\n");
+        free(logits);
+        pulsar_session_free(session);
+        return 1;
+    }
     FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
     if (!fp) {
         fprintf(stderr, "pulsar: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);
@@ -593,7 +578,6 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
             prompt->len,
             cfg->gen.ctx_size,
             vocab);
-    const int argmax = pulsar_session_argmax(session);
     fputs("  \"argmax_token\":", fp);
     json_write_token(fp, engine, argmax);
     fprintf(fp, ",\n  \"argmax_logit\":%.9g,\n  \"logits\":[", logits[argmax]);
@@ -619,6 +603,12 @@ static int run_logits_dump(pulsar_engine *engine, const cli_config *cfg, const p
     return 0;
 }
 
+/** @brief --dump-logprobs: prefill, then decode greedily for up to n_predict steps, writing each step's argmax
+ *  and top-k logprobs (k = dump_logprobs_top_k, default 20, at most 128) as JSON to gen.dump_logprobs_path.
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration
+ *  @param prompt the prompt tokens
+ *  @return 0, or 1 on failure (said on stderr) */
 static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const pulsar_tokens *prompt) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
@@ -666,7 +656,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
             prompt->len, cfg->gen.ctx_size, k);
     int generated = 0;
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(session) - pulsar_session_pos(session);
+    int room = (pulsar_session_ctx(session) - pulsar_session_pos(session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
     for (; generated < max_tokens; generated++) {
@@ -684,7 +674,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
         }
         fputs("]}", fp);
 
-        if (token == pulsar_token_eos(engine)) break;
+        if (pulsar_token_is_stop(engine, token)) break;
         if (pulsar_session_eval(session, token, err, sizeof(err)) != 0) {
             fprintf(stderr, "pulsar: decode failed while dumping logprobs: %s\n", err);
             free(scores);
@@ -705,6 +695,11 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
     return 0;
 }
 
+/** @brief --perplexity-file: teacher-force the file's tokens after a 32-token prefix and print nll / ppl
+ *  over the scored tokens (capped by n_predict when > 0 and by the context).
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration
+ *  @return 0, or 1 on failure (an unreadable file exits 2) */
 static int run_perplexity_file(pulsar_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     pulsar_tokens tokens = {0};
@@ -789,9 +784,15 @@ static int run_perplexity_file(pulsar_engine *engine, const cli_config *cfg) {
  * mean KL(ref || candidate) with a block-bootstrap stderr (--kl-score).
  * Dump format: magic "DS4KLRF1", u32 vocab, u32 stride, u32 prefix_len,
  * u32 n_positions, then n_positions * vocab float32 logits. */
+/** The 8-byte magic opening a --kl-ref-dump file. */
 #define PULSAR_KL_MAGIC "DS4KLRF1"
+/** Positions per block in the KL score's block-bootstrap standard error. */
 #define PULSAR_KL_BLOCK 64
 
+/// @brief --kl-file: write a reference logits dump (--kl-ref-dump) or score KL against one (--kl-score); see above.
+/// @param engine the loaded engine
+/// @param cfg    the configuration (exactly one of kl_ref_dump_path / kl_score_path set)
+/// @return 0, or 1 on failure (said on stderr)
 static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
     const bool dumping = cfg->gen.kl_ref_dump_path != NULL;
     const bool scoring = cfg->gen.kl_score_path != NULL;
@@ -800,7 +801,7 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
         return 1;
     }
     const int stride = cfg->gen.kl_stride > 0 ? cfg->gen.kl_stride : 4;
-    const int vocab = pulsar_engine_vocab_size(engine);
+    const int vocab = pulsar_engine_logits_width(engine);   /* the logits ROW width (L272 B3) */
 
     pulsar_tokens tokens = {0};
     if (cfg->gen.kl_tokens_path) {
@@ -1083,6 +1084,11 @@ done:
     return rc;
 }
 
+/** @brief One-shot mode: build the prompt and run the selected mode (logits dump, logprob dump, token dump,
+ *  else a session generation).
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration
+ *  @return the mode's exit status (0 = success) */
 static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
     pulsar_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1099,45 +1105,24 @@ static int run_generation(pulsar_engine *engine, const cli_config *cfg) {
         return rc;
     }
 
-    const bool diagnostic = cfg->gen.dump_tokens;
     if (cfg->gen.dump_tokens) {
         pulsar_engine_dump_tokens(engine, &prompt);
-    }
-
-    if (diagnostic) {
-        if (rc == 0) {
-            fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
-                    pulsar_backend_name(cfg->engine.backend));
-        }
-    } else if (cfg->gen.temperature > 0.0f || pulsar_engine_has_dspark(engine)) {
-        rc = run_sampled_generation(engine, cfg, &prompt);
+        fprintf(stderr, "pulsar: diagnostic run completed on the native %s path.\n",
+                pulsar_backend_name(cfg->engine.backend));
     } else {
-        token_printer printer = {
-            .engine = engine,
-            .fp = stdout,
-            .format_thinking = pulsar_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .in_think = pulsar_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .use_color = isatty(fileno(stdout)) != 0,
-            .last_output_newline = true,
-        };
-        cli_prefill_progress progress = {
-            .base_tokens = 0,
-            .input_tokens = prompt.len,
-            .use_color = pulsar_log_is_tty(stderr),
-        };
-        rc = pulsar_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
-                                        cfg->gen.ctx_size,
-                                        print_generated_token,
-                                        generation_done,
-                                        &printer,
-                                        cli_prefill_progress_cb,
-                                        &progress);
+        /* Every generation rides the session lane -- greedy (temperature 0), sampled, drafted and
+         * tensor-parallel alike, on every family (L284 P15: the session-less whole-graph argmax path
+         * and its family cap were a second lane giving the same tokens, deleted). */
+        rc = run_session_generation(engine, cfg, &prompt);
     }
 
     pulsar_tokens_free(&prompt);
     return rc;
 }
 
+/** @brief Trim leading and trailing whitespace in place (writes a NUL over the trailing run).
+ *  @param s a writable NUL-terminated string
+ *  @return a pointer into s at its first non-space byte */
 static char *trim_inplace(char *s) {
     while (*s && isspace((unsigned char)*s)) s++;
     char *end = s + strlen(s);
@@ -1146,11 +1131,11 @@ static char *trim_inplace(char *s) {
     return s;
 }
 
+/** @brief Print the REPL's slash commands to stdout. */
 static void print_repl_help(void) {
     puts("Commands:");
     puts("  /help          Show this help.");
-    puts("  /think         Use normal thinking mode.");
-    puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
+    puts("  /think [N]     Thinking on at effort N (1-100; default 75). /think-low, /think-high, /think-max are 50/75/100.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
@@ -1158,20 +1143,35 @@ static void print_repl_help(void) {
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
 
+/** @brief The REPL history file: $HOME/.ds4_history (. when HOME is unset).
+ *  @param buf receives the path
+ *  @param len capacity of buf, bytes */
 static void history_file_path(char *buf, size_t len) {
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
     snprintf(buf, len, "%s/.ds4_history", home);
 }
 
+/** State of an interactive REPL conversation. */
 typedef struct {
-    pulsar_session *session;
-    pulsar_tokens transcript;
-    int ctx_size;
-    int effort_prefix_tokens;
-    pulsar_think_mode effort_prefix_mode; /* mode whose prefix is in the transcript */
+    pulsar_session *session;    ///< KV session backing the transcript
+    pulsar_tokens transcript;   ///< the conversation so far, as tokens
+    int ctx_size;               ///< context positions available
+    const char *system;         ///< the system prompt the head carries (NULL = none)
+    /** The head (pulsar_chat_open) sits at transcript[0, head_len) and carries the think mode where the
+     *  family's template puts it (DeepSeek's effort line, Qwen's system block); a mode change swaps exactly
+     *  it instead of rebuilding the whole transcript. */
+    int head_len;
+    pulsar_think_mode head_mode;  ///< the mode the head in the transcript was rendered for
+    /** A head has been rendered into the transcript (head_len / head_mode are valid); false until the first
+     *  repl_chat_apply_head. */
+    bool head_applied;
 } repl_chat;
 
+/** @brief Insert src's tokens into dst at pos (clamped to [0, len]); exits on allocation failure.
+ *  @param dst the owned vector to grow
+ *  @param pos insertion index, tokens
+ *  @param src tokens to insert; NULL or empty = no-op */
 static void tokens_insert(pulsar_tokens *dst, int pos, const pulsar_tokens *src) {
     if (!src || src->len <= 0) return;
     if (pos < 0) pos = 0;
@@ -1191,6 +1191,10 @@ static void tokens_insert(pulsar_tokens *dst, int pos, const pulsar_tokens *src)
     dst->len += src->len;
 }
 
+/** @brief Remove n tokens at pos (clamped to the vector; an out-of-range pos is a no-op).
+ *  @param dst the vector
+ *  @param pos first index removed
+ *  @param n   tokens to remove */
 static void tokens_remove(pulsar_tokens *dst, int pos, int n) {
     if (n <= 0 || pos < 0 || pos >= dst->len) return;
     if (pos + n > dst->len) n = dst->len - pos;
@@ -1199,28 +1203,30 @@ static void tokens_remove(pulsar_tokens *dst, int pos, int n) {
     dst->len -= n;
 }
 
-/* Insert/remove/swap the reasoning-effort prefix inside the existing
- * transcript.  The prefix lives after BOS, before any system/developer text,
- * which mirrors the API rendering path.  Changing it invalidates the session
- * because every later token position would otherwise refer to the wrong
- * prefix. */
-static void repl_chat_apply_effort_prefix(pulsar_engine *engine, repl_chat *chat,
-                                          pulsar_think_mode mode) {
-    if (!pulsar_think_effort_prefix(mode)[0]) mode = PULSAR_THINK_LOW;
-    if (mode == chat->effort_prefix_mode) return;
-    if (chat->effort_prefix_tokens > 0) {
-        tokens_remove(&chat->transcript, 1, chat->effort_prefix_tokens);
-        chat->effort_prefix_tokens = 0;
-    }
-    pulsar_tokens prefix = {0};
-    pulsar_chat_append_effort_prefix(engine, &prefix, mode);
-    tokens_insert(&chat->transcript, 1, &prefix);
-    chat->effort_prefix_tokens = prefix.len;
-    chat->effort_prefix_mode = mode;
-    pulsar_tokens_free(&prefix);
+/* Swap the head (pulsar_chat_open) at the front of the transcript for the one `mode` renders.  Changing it
+ * invalidates the session because every later token position would otherwise refer to the wrong prefix. */
+/// @brief Render the head for `mode` into the transcript (no-op when it is already that mode's).
+/// @param engine the loaded engine
+/// @param chat   the REPL conversation
+/// @param mode   the think mode the head carries
+static void repl_chat_apply_head(pulsar_engine *engine, repl_chat *chat, pulsar_think_mode mode) {
+    if (chat->head_applied && mode == chat->head_mode) return;
+    tokens_remove(&chat->transcript, 0, chat->head_len);
+    pulsar_tokens head = {0};
+    pulsar_chat_open(engine, &head, NULL, chat->system, mode);
+    tokens_insert(&chat->transcript, 0, &head);
+    chat->head_len = head.len;
+    chat->head_mode = mode;
+    chat->head_applied = true;
+    pulsar_tokens_free(&head);
     if (chat->session) pulsar_session_invalidate(chat->session);
 }
 
+/** @brief Create a session of ctx_size positions and install it in chat, freeing the old one on success.
+ *  @param engine   the loaded engine
+ *  @param chat     the REPL conversation
+ *  @param ctx_size context positions
+ *  @return 0, or 1 when the session could not be created (the old session is kept) */
 static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int ctx_size) {
     pulsar_session *session = NULL;
     if (pulsar_session_create(&session, engine, ctx_size) != 0) {
@@ -1233,16 +1239,20 @@ static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int 
     return 0;
 }
 
+/** @brief Zero chat, render the head (system prompt, think mode) and create its session.
+ *  @param engine the loaded engine
+ *  @param chat   the conversation to initialise
+ *  @param cfg    the configuration (system prompt, think mode, ctx size)
+ *  @return 0, or 1 when no session could be created */
 static int repl_chat_init(pulsar_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
-    pulsar_chat_begin(engine, &chat->transcript);
-    repl_chat_apply_effort_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
-    if (cfg->gen.system && cfg->gen.system[0]) {
-        pulsar_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
-    }
+    chat->system = cfg->gen.system && cfg->gen.system[0] ? cfg->gen.system : NULL;
+    repl_chat_apply_head(engine, chat, cfg->gen.think_mode);
     return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
 }
 
+/** @brief Free the conversation's session and transcript and zero it.
+ *  @param chat the conversation; NULL is a no-op */
 static void repl_chat_free(repl_chat *chat) {
     if (!chat) return;
     pulsar_session_free(chat->session);
@@ -1250,6 +1260,11 @@ static void repl_chat_free(repl_chat *chat) {
     memset(chat, 0, sizeof(*chat));
 }
 
+/** @brief Replace the session with one of ctx_size positions (the KV is rebuilt on the next turn).
+ *  @param engine   the loaded engine
+ *  @param chat     the conversation
+ *  @param ctx_size context positions
+ *  @return 0, or 1 when the new session could not be created (chat then has no session) */
 static int repl_chat_set_ctx(pulsar_engine *engine, repl_chat *chat, int ctx_size) {
     pulsar_session_free(chat->session);
     chat->session = NULL;
@@ -1257,26 +1272,32 @@ static int repl_chat_set_ctx(pulsar_engine *engine, repl_chat *chat, int ctx_siz
     return repl_chat_create_session(engine, chat, ctx_size);
 }
 
-/* Run one interactive turn.  The transcript is tentatively extended with user
- * and assistant markers, then pulsar_session_sync() decides whether this is a KV
- * continuation.  If prompt processing fails, the transcript rolls back before
- * returning to the prompt. */
+/* Run one interactive turn.  The transcript is tentatively extended with the
+ * family's turn -- the user message and the opened assistant turn, rendered whole
+ * -- then pulsar_session_sync() decides whether this is a KV continuation.  If
+ * prompt processing fails, the transcript rolls back before returning to the
+ * prompt. */
+/// @brief One REPL turn (see above): extend the transcript, sync the session, stream the reply.
+/// @param engine    the loaded engine
+/// @param cfg       the configuration (sampling knobs, think mode)
+/// @param chat      the conversation
+/// @param user_text the user's message
+/// @return 0, or 1 on failure (the transcript rolled back)
 static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
     if (!chat->session) {
         fprintf(stderr, "pulsar: no active interactive KV cache\n");
         return 1;
     }
 
-    pulsar_think_mode think_mode = pulsar_think_mode_for_context(cfg->gen.think_mode,
-                                                           chat->ctx_size);
-    repl_chat_apply_effort_prefix(engine, chat, think_mode);
+    const pulsar_think_mode think_mode = cfg->gen.think_mode;
+    repl_chat_apply_head(engine, chat, think_mode);
     const int rollback_len = chat->transcript.len;
-    pulsar_chat_append_message(engine, &chat->transcript, "user", user_text);
-    pulsar_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
+    const pulsar_chat_message user = {"user", user_text, false};
+    pulsar_chat_append_turn(engine, &chat->transcript, &user, 1, true, think_mode);
 
-    const int old_pos = pulsar_session_pos(chat->session);
-    const int common = pulsar_session_common_prefix(chat->session, &chat->transcript);
-    const int cached = common == old_pos && chat->transcript.len >= old_pos ? common : 0;
+    const TokPos old_pos = pulsar_session_pos(chat->session);
+    const TokCount common = pulsar_session_common_prefix(chat->session, &chat->transcript);
+    const int cached = TokPos::after(common) == old_pos && TokPos{chat->transcript.len} >= old_pos ? common.raw() : 0;
     const int suffix = chat->transcript.len - cached;
 
     char err[160];
@@ -1306,13 +1327,13 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         .engine = engine,
         .fp = stdout,
         .format_thinking = pulsar_think_mode_enabled(think_mode),
-        .in_think = pulsar_think_mode_enabled(think_mode),
+        .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
     };
 
     int max_tokens = cfg->gen.n_predict;
-    int room = pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session);
+    int room = (pulsar_session_ctx(chat->session) - pulsar_session_pos(chat->session).before()).raw();
     if (room <= 1) max_tokens = 0;
     else if (max_tokens > room - 1) max_tokens = room - 1;
 
@@ -1323,12 +1344,11 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int toks[17];
         int ntok = 0;
-        if (pulsar_engine_has_dspark(engine)) {
+        if (pulsar_engine_has_spec_rounds(engine)) {
             ntok = pulsar_session_generate_speculative(chat->session,
                                                     cfg->gen.temperature, 0,
                                                     cfg->gen.top_p, cfg->gen.min_p, &rng,
                                                     max_tokens - generated,
-                                                    pulsar_token_eos(engine),
                                                     toks,
                                                     (int)(sizeof(toks) / sizeof(toks[0])),
                                                     err,
@@ -1337,7 +1357,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
                 return 1;
             }
-            if (ntok == 1 && toks[0] == pulsar_token_eos(engine)) break;
+            if (ntok == 1 && pulsar_token_is_stop(engine, toks[0])) break;
         } else {
             int token = pulsar_session_sample(chat->session,
                                            cfg->gen.temperature,
@@ -1345,7 +1365,11 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
                                            cfg->gen.top_p,
                                            cfg->gen.min_p,
                                            &rng);
-            if (token == pulsar_token_eos(engine)) break;
+            if (token < 0) {
+                fprintf(stderr, "pulsar: decode failed: sampler refused a degenerate logits row\n");
+                return 1;
+            }
+            if (pulsar_token_is_stop(engine, token)) break;
             int eval_rc = pulsar_session_eval(chat->session, token, err, sizeof(err));
             if (eval_rc != 0) {
                 fprintf(stderr, "pulsar: decode failed: %s\n", err);
@@ -1357,7 +1381,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
 
         bool stop = false;
         for (int j = 0; j < ntok; j++) {
-            if (toks[j] == pulsar_token_eos(engine)) {
+            if (pulsar_token_is_stop(engine, toks[j])) {
                 stop = true;
                 break;
             }
@@ -1380,7 +1404,7 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
         chat->transcript.len = rollback_len;
         pulsar_session_invalidate(chat->session);
     } else {
-        pulsar_tokens_push(&chat->transcript, pulsar_token_eos(engine));
+        pulsar_chat_end_assistant(engine, &chat->transcript);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1388,12 +1412,17 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     if (interrupted) cli_interrupt_clear();
     pulsar_log(stderr,
             PULSAR_LOG_TIMING,
-            "pulsar: prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
+            "pulsar: prompt %d tokens (%d continued from the KV), prefill: %.2f t/s, generation: %.2f t/s\n",
+            cached + suffix, cached, prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
 
+/** @brief The interactive chat loop: linenoise prompt with history, slash commands, one run_chat_turn per
+ *  message; Ctrl+C stops a generation and returns to the prompt.
+ *  @param engine the loaded engine
+ *  @param cfg    the configuration (/think, /nothink and /ctx change it)
+ *  @return the last turn's status, or 1 when the conversation could not be set up */
 static int run_repl(pulsar_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
@@ -1434,22 +1463,39 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
-        } else if (!strcmp(cmd, "/think")) {
-            cfg->gen.think_mode = PULSAR_THINK_LOW;
-            repl_chat_apply_effort_prefix(engine, &chat, PULSAR_THINK_LOW);
-            puts("Thinking mode: low.");
-        } else if (!strcmp(cmd, "/think-high") || !strcmp(cmd, "/think-max")) {
-            cfg->gen.think_mode = !strcmp(cmd, "/think-max") ? PULSAR_THINK_MAX
-                                                             : PULSAR_THINK_HIGH;
-            pulsar_think_mode active = pulsar_think_mode_for_context(cfg->gen.think_mode,
-                                                                     chat.ctx_size);
-            repl_chat_apply_effort_prefix(engine, &chat, active);
-            cli_warn_think_effort_downgraded(&cfg->gen, cmd);
-            printf("Thinking mode: %s%s.\n", pulsar_think_mode_name(active),
-                   active != cfg->gen.think_mode ? " (ctx below 393216)" : "");
+        } else if (!strncmp(cmd, "/think", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]) || cmd[6] == '-')) {
+            /* /think            -> the loaded family's default (V4.1 high 75, 0731 low)
+             * /think N          -> effort N in [1, 100] (V4.1 only)
+             * /think-high, /think-max, /think-low -> the named presets */
+            pulsar_think_mode mode = pulsar_engine_think_default(engine);
+            bool ok = true;
+            if (cmd[6] == '-') {
+                if (!strcmp(cmd, "/think-low")) mode = PULSAR_THINK_LOW;
+                else if (!strcmp(cmd, "/think-high")) mode = PULSAR_THINK_HIGH;
+                else if (!strcmp(cmd, "/think-max")) mode = PULSAR_THINK_MAX;
+                else ok = false;
+            } else {
+                char *arg = trim_inplace(cmd + 6);
+                if (arg[0]) {
+                    mode = parse_int(arg, "/think");
+                    ok = mode >= PULSAR_THINK_EFFORT_MIN && mode <= PULSAR_THINK_EFFORT_MAX;
+                }
+            }
+            char why[200];
+            if (ok && !pulsar_engine_think_mode_supported(engine, mode, why, sizeof why)) {
+                fprintf(stderr, "pulsar: /think %d: %s\n", (int)mode, why);
+                ok = false;
+            }
+            if (!ok) {
+                fprintf(stderr, "pulsar: /think takes an effort in [1, 100] or -low/-high/-max\n");
+            } else {
+                cfg->gen.think_mode = mode;
+                repl_chat_apply_head(engine, &chat, mode);
+                printf("Thinking mode: %s (effort %d).\n", pulsar_think_mode_name(mode), mode);
+            }
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = PULSAR_THINK_NONE;
-            repl_chat_apply_effort_prefix(engine, &chat, PULSAR_THINK_NONE);
+            repl_chat_apply_head(engine, &chat, PULSAR_THINK_NONE);
             puts("Thinking mode: none.");
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
@@ -1457,17 +1503,16 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "pulsar: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend,
-                                   cfg->gen.ctx_size,
-                                   cfg->engine.prefill_chunk);
+                char ctxmem_line[256];
+                fprintf(stderr, "%s\n",
+                        pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar",
+                                                   cfg->engine.backend, cfg->gen.ctx_size,
+                                                   cfg->engine.prefill_chunk));
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
                     break;
                 }
-                repl_chat_apply_effort_prefix(engine, &chat,
-                    pulsar_think_mode_for_context(cfg->gen.think_mode, chat.ctx_size));
-                cli_warn_think_effort_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
@@ -1496,14 +1541,10 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
     return rc;
 }
 
-static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
-    if (*i + 1 >= argc) {
-        fprintf(stderr, "pulsar: missing value for %s\n", opt);
-        exit(2);
-    }
-    return argv[++(*i)];
-}
-
+/** @brief Read a whole file into a NUL-terminated buffer.
+ *  @param path  the file
+ *  @param fatal exit(2) on failure instead of returning NULL
+ *  @return a malloc'd buffer (caller frees), or NULL on failure (said on stderr) */
 static char *read_prompt_file(const char *path, bool fatal) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -1551,10 +1592,14 @@ static char *read_prompt_file(const char *path, bool fatal) {
     return buf;
 }
 
+/** @brief Parse the command line into a configuration; --help prints usage and exits 0, a bad argument exits 2.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the resolved configuration */
 static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
-            .model_path = "ds4flash.gguf",
+            .model_path = "model",
             .backend = default_backend(),
         },
         .gen = {
@@ -1566,7 +1611,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = PULSAR_DEFAULT_TOP_P,
             .min_p = PULSAR_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = PULSAR_THINK_LOW,
+            .think_mode = PULSAR_THINK_DEFAULT,
         },
     };
 
@@ -1598,15 +1643,35 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--no-dspark")) {
             c.engine.dspark_disable = true;
-        } else if (!strcmp(arg, "--dspark-draft")) {
-            /* Draft depth. The server CLI has always had this; the plain CLI
-             * did not, which made a draft-width sweep impossible from here --
-             * and the width sweep is what sets the expert-cost break-even for
-             * speculative decoding on a MoE decode. Same name and semantics as
-             * the server flag; engine clamps to 16. */
-            c.engine.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--drafter")) {
+            c.engine.drafter = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--rope-yarn")) {
+            c.engine.rope_yarn_factor = parse_float_range(need_arg(&i, argc, argv, arg), arg, 1.0f, 64.0f);
+        } else if (!strcmp(arg, "--spec-depth")) {
+            c.engine.spec_depth = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--spec-tau")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            const float t = strcmp(v, "off") ? parse_float_range(v, arg, 0.0f, 1.0f) : 0.0f;
+            c.engine.spec_tau = t > 0.0f ? t : -1.0f;   /* 0 / off: no stop */
         } else if (!strcmp(arg, "--expert-overlay")) {
             c.engine.expert_overlay = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tp-role")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "leader")) c.engine.tp_role = 1;
+            else if (!strcmp(v, "worker")) c.engine.tp_role = 2;
+            else c.engine.tp_role = parse_int(v, arg) != 0 ? 1 : 0;
+        } else if (!strcmp(arg, "--tp-peer")) {
+            c.engine.tp_peer = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tp-port")) {
+            c.engine.tp_port = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-rank")) {
+            /* A rank index: 0 is the leader, so the strictly-positive parse_int
+             * cannot be used here; the engine checks 0 <= R < N at open. */
+            c.engine.tp_rank = parse_int_range(need_arg(&i, argc, argv, arg), arg, 0, INT_MAX);
+        } else if (!strcmp(arg, "--tp-nranks")) {
+            c.engine.tp_nranks = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--tp-peers")) {
+            c.engine.tp_peers = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -1619,8 +1684,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -1636,12 +1699,6 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
-        } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
-            c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--backend")) {
-            c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--cuda")) {
-            c.engine.backend = PULSAR_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -1674,17 +1731,27 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            /* thinking on at the LOADED family's default effort, resolved after open */
+            c.gen.think_mode = PULSAR_THINK_DEFAULT;
+            c.gen.think_mode_set = false;
+        } else if (!strcmp(arg, "--think-low")) {
             c.gen.think_mode = PULSAR_THINK_LOW;
+            c.gen.think_mode_set = true;
+        } else if (!strcmp(arg, "--think-effort")) {
+            c.gen.think_mode = parse_int_range(need_arg(&i, argc, argv, arg), arg,
+                                               PULSAR_THINK_EFFORT_MIN, PULSAR_THINK_EFFORT_MAX);
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = PULSAR_THINK_HIGH;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = PULSAR_THINK_MAX;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = PULSAR_THINK_NONE;
+            c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
-        } else if (!strcmp(arg, "--warm-weights")) {
-            c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "pulsar: use pulsar-server for the HTTP server\n");
             exit(2);
@@ -1713,6 +1780,10 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/** @brief pulsar's entry point: parse options, open the engine, run the selected mode or the REPL.
+ *  @param argc argument count
+ *  @param argv arguments
+ *  @return the process exit status */
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
@@ -1733,12 +1804,44 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
+    /* The default effort is the loaded family's (V4.1 high, 0731 low -- no
+     * effort line), known only now; an explicit --think-* flag stands.  An
+     * effort the 0731 encoder cannot spell is refused here by name rather than
+     * rendered (L239). */
+    if (!cfg.gen.think_mode_set) cfg.gen.think_mode = pulsar_engine_think_default(engine);
+    char think_why[200];
+    if (!pulsar_engine_think_mode_supported(engine, cfg.gen.think_mode, think_why, sizeof think_why)) {
+        fprintf(stderr, "pulsar: thinking effort %d: %s\n", (int)cfg.gen.think_mode, think_why);
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return 2;
+    }
+    /* Slice 4e (L238): a TP worker rank drives nothing of its own -- not the
+     * prompt on its command line, not a session.  It applies the leader's
+     * frames until the leader stops it, then exits with the loop's verdict. */
+    if (pulsar_engine_is_tp_worker(engine)) {
+        char werr[512];
+        const int wrc = pulsar_tp_worker_run(engine, werr, sizeof(werr));
+        if (wrc != 0) fprintf(stderr, "pulsar: TP worker stopped on a failure: %s\n", werr);
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return wrc;
+    }
+    /* Everything but --inspect takes text; a family whose tokenizer this build
+     * does not carry is refused here, by name (L251). */
+    if (!cfg.inspect && !pulsar_engine_has_tokenizer(engine)) {
+        fprintf(stderr, "pulsar: the %s family has no tokenizer or chat renderer in this build; "
+                        "only --inspect runs -- refusing\n", pulsar_engine_family_name(engine));
+        pulsar_engine_close(engine);
+        free(cfg.prompt_owned);
+        return 1;
+    }
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend,
-                           cfg.gen.ctx_size,
-                           cfg.engine.prefill_chunk);
-        cli_warn_think_effort_downgraded(&cfg.gen,
-            cfg.gen.think_mode == PULSAR_THINK_MAX ? "--think-max" : "--think-high");
+        char ctxmem_line[256];
+        fprintf(stderr, "%s\n",
+                pulsar_context_memory_line(ctxmem_line, sizeof ctxmem_line, "pulsar",
+                                           cfg.engine.backend, cfg.gen.ctx_size,
+                                           cfg.engine.prefill_chunk));
     }
     int rc = 0;
     if (cfg.inspect) {

@@ -1,12 +1,15 @@
+/** @file
+ *  CUTLASS MXFP4 tensor-core expert FFN for the DeepSeek MoE (sm_120f, W4A8). */
 // pulsar_mxfp4_cutlass.cu — CUTLASS MXFP4 tensor-core expert FFN for the ds4 MoE (sm_120f).
 // Weights arrive pre-packed in CUTLASS B layout (from the offline converter); activations are
-// packed to MXFP4 on-device at runtime. Path: pack(x) -> gate/up GEMM -> SwiGLU -> pack(mid) -> down GEMM.
-// Build (standalone test):  nvcc -std=c++17 -arch=sm_120f --expt-relaxed-constexpr --expt-extended-lambda
-//                           -DPULSAR_MXFP4_STANDALONE -I cutlass/include -I cutlass/tools/util/include ...
+// E4M3 (+ue8m0 block scales) -- W4A8, matching the source model's activation format.
+// Path: gather the producer's E4M3 x -> gate/up GEMM -> fused SwiGLU + E4M3 pack -> down GEMM.
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
 #include "pulsar_gpu.h"
+#include "pulsar_cuda_internal.h"   /* cuda_ok: every launch and memset on the hot path is checked here (L189) */
+#include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -17,6 +20,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#include "pulsar_cuda_arch.cuh"
 
 using namespace cute;
 
@@ -27,17 +31,31 @@ using namespace cute;
 // The weight-side SF (SFB) swizzle is BYTE-IDENTICAL to the former all-fp4 (mxf4nvf4) config
 // (verified: same tile_atom_to_shape_SFB shape/stride/size), so the type-40 weight repack and the
 // shipped blk 0-2 stay valid unchanged; only the activation element (fp4->fp8) and its packer change. ----
+/// A operand: MX E4M3 activations (UE8M0 per-32 block scales).
 using ElementA   = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+/// B operand: MX E2M1 weights (UE8M0 per-32 block scales).
 using ElementB   = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+/// D (output) element: f32.
 using ElementD   = float;
+/// C element: f32 (beta = 0, unused).
 using ElementC   = float;
+/// Accumulator element: f32.
 using ElementAcc = float;
+/// A is row-major [M][K].
 using LayoutA    = cutlass::layout::RowMajor;
+/// B is column-major [K][N], i.e. weight rows [N][K] K-contiguous.
 using LayoutB    = cutlass::layout::ColumnMajor;
+/// C is row-major [M][N].
 using LayoutC    = cutlass::layout::RowMajor;
+/// D is row-major [M][N].
 using LayoutD    = cutlass::layout::RowMajor;
+/// A alignment in elements (32 E4M3 = 32 B).
 constexpr int AlignA = 32, AlignB = 32;
+/** @var AlignB
+ *  B alignment in elements (32 E2M1 = 16 B) */
+/// C alignment in elements (one 128-bit access).
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+/// D alignment in elements (one 128-bit access).
 constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
 /* Occupancy sweep knob (2026-08-07).  ncu says both CUTLASS MXFP4 kernels run
  * 168 registers x 384 threads = 64512 regs/block against 65536 per SM, i.e.
@@ -49,33 +67,44 @@ constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
  * re-reads) for residency, so it must be MEASURED, not assumed.
  * Override: -DPULSAR_MXFP4_TILE_M=64 etc. */
 #ifndef PULSAR_MXFP4_TILE_M
+/// CTA tile M (rows of A / D); override at build time for occupancy sweeps.
 #define PULSAR_MXFP4_TILE_M 128
 #endif
 #ifndef PULSAR_MXFP4_TILE_N
+/// CTA tile N (output columns).
 #define PULSAR_MXFP4_TILE_N 128
 #endif
 #ifndef PULSAR_MXFP4_TILE_K
+/// CTA tile K (reduction depth).
 #define PULSAR_MXFP4_TILE_K 128
 #endif
+/// The CTA tile (M, N, K).
 using TileShape    = Shape<cute::Int<PULSAR_MXFP4_TILE_M>,
                            cute::Int<PULSAR_MXFP4_TILE_N>,
                            cute::Int<PULSAR_MXFP4_TILE_K>>;
+/// No clusters (1 x 1 x 1).
 using ClusterShape = Shape<_1,_1,_1>;
 
+/// The SM120 block-scaled epilogue for the single-GEMM kernel (f32 D, alpha 1, beta 0).
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementAcc, ElementC, LayoutC, AlignC, ElementD, LayoutD, AlignD,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+/// The SM120 block-scaled mainloop (kind::f8f6f4, E4M3 x E2M1), stages auto-carved around the epilogue.
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     ElementA, LayoutA, AlignA, ElementB, LayoutB, AlignB, ElementAcc,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+/// The single (non-grouped) block-scaled GEMM kernel, problem shape (M, N, K, L).
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, CollectiveMainloop, CollectiveEpilogue, void>;
+/// Device adapter of GemmKernel.
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+/// Scale-factor tile-atom layout helper of the single GEMM (tile_atom_to_shape_SFA / SFB).
 using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+/// Scale-factor element: UE8M0.
 using ElementSF = cutlass::float_ue8m0_t;
 
 // ---- GROUPED (ptr-array) MXFP4 GEMM: one launch runs every active expert's GEMM. ----
@@ -85,33 +114,51 @@ using ElementSF = cutlass::float_ue8m0_t;
 // for grouped; verified accepted by sm120_blockscaled_mma_builder.inl:226-230). Per-group
 // {M,N,K}, A/B/D + SFA/SFB pointer arrays, and per-group strides/SF-layouts are all built on
 // DEVICE from the sorted-pairs/offsets buffers -- no host readback, zero host sync.
+/// Grouped problem shape: per-group (M, N, K).
 using GProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>;
+/// The grouped (ptr-array) epilogue.
 using GCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAcc, ElementAcc, ElementC, LayoutC*, AlignC, ElementD, LayoutD*, AlignD,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+/// The grouped (ptr-array) block-scaled mainloop.
 using GCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
     ElementA, LayoutA*, AlignA, ElementB, LayoutB*, AlignB, ElementAcc,
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename GCollectiveEpilogue::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+/// The grouped block-scaled GEMM kernel.
 using GGemmKernel = cutlass::gemm::kernel::GemmUniversal<GProblemShape, GCollectiveMainloop, GCollectiveEpilogue>;
+/// Device adapter of GGemmKernel.
 using GGemm = cutlass::gemm::device::GemmUniversalAdapter<GGemmKernel>;
 
+/// One group's problem shape, Shape of (M, N, K).
 using GProbElem  = typename GProblemShape::UnderlyingProblemShape;   // Shape<int,int,int>
+/// Per-group A stride.
 using GStrideA   = typename GGemmKernel::InternalStrideA;
+/// Per-group B stride.
 using GStrideB   = typename GGemmKernel::InternalStrideB;
+/// Per-group C stride.
 using GStrideC   = typename GGemmKernel::InternalStrideC;
+/// Per-group D stride.
 using GStrideD   = typename GGemmKernel::InternalStrideD;
+/// Per-group A scale-factor layout.
 using GLayoutSFA = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFA;
+/// Per-group B scale-factor layout.
 using GLayoutSFB = typename GGemmKernel::CollectiveMainloop::InternalLayoutSFB;
+/// Scale-factor tile-atom layout helper of the grouped GEMM.
 using GSm1xxBlkScaledConfig = typename GGemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+/// Grouped A element (E4M3 data type).
 using GElemA  = typename GGemm::ElementA;
+/// Grouped B element (E2M1 data type).
 using GElemB  = typename GGemm::ElementB;
+/// Grouped scale-factor element (UE8M0).
 using GElemSF = typename GGemmKernel::CollectiveMainloop::ElementSF;
+/// Grouped C element (f32).
 using GElemC  = typename GGemm::ElementC;
+/// Grouped D element (f32).
 using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 
 // ---- device activation packer: f32 [M,K] RowMajor -> A data (E4M3, 1 byte/elem) + SF (swizzled UE8M0).
@@ -121,149 +168,189 @@ using GElemD  = typename GGemm::EpilogueOutputOp::ElementOutput;
 // floor(log2(amax)) - 7, data = v * 2^-se, SF byte = se+127; CUTLASS reconstructs v = data*2^(se-127+127-... )
 // i.e. data * 2^(SF-127) = v exactly. The SF is written through the CUTLASS tile-atom SFA layout object
 // (identical swizzle to the weight SFB), NOT the cuBLASLt VEC32 swizzle. ----
-template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
-  int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
-  int m=(int)(idx/nblk), kb=(int)(idx%nblk);
-  const float *x=act+(size_t)m*K+(size_t)kb*32;
-  float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(x[i]));
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
-  float inv=exp2f((float)-se);
-  cutlass::float_e4m3_t *outb=reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32;
-  for(int i=0;i<32;i++) outb[i]=cutlass::float_e4m3_t(x[i]*inv);
-  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
-}
 
-/* Vectorized twin (2026-07-26): the scalar kernel above is one thread per 32-block
- * doing 32 serial scalar LDG.32 for the amax + 32 scalar STG.8 — issue/latency
- * bound (the roofline named it 444 ms = 6.6% of prefill, the biggest dense/MLA
- * sub-cost). This reads the block as 8x float4 (LDG.128) and writes as 2x int4
- * (STG.128). BIT-EXACT to the scalar kernel: one thread still owns the whole
- * 32-block, the amax folds in the SAME sequential order 0..31 (.x/.y/.z/.w per
- * float4), and each element's `cutlass::float_e4m3_t(v*inv)` encode is byte-for-
- * byte the same conversion on the same float. Only the load/store WIDTH changes.
- * Alignment: per-expert K is a 128-multiple, kb*32 floats = 128 B, so
- * act+m*K+kb*32 is 16-B aligned (float4) and the e4m3 out is 16-B aligned (int4).
- * PULSAR_ACT_PACK_SCALAR=1 selects the scalar path for the bit-exact A/B. */
+
+/* SwiGLU with the E4M3+E8M0 epilogue: one warp = four consecutive 32-blocks
+ * of one row of `mid`; the gate/up products are combined in registers,
+ * xor-shuffle amax within each block, then encoded straight into the down
+ * GEMM's A operand (data + tile-atom SFA).  `mid` never touches memory as f32.
+ * Same per-block amax, same shared exponent and the same
+ * cutlass::float_e4m3_t(v*inv) encode as the other E4M3 producers. */
+/** SwiGLU + E4M3 pack into the down GEMM's A operand: one warp = 4 consecutive 32-blocks of one row.  Grid
+ *  ceil(M * K / 32 / 4 * 32 / 128); block 128 (from swiglu_pack_activation); no smem.  Needs K % 128 == 0 and
+ *  16-byte aligned gate / up rows.
+ *  @tparam TSFA the cute tensor type of the A scale-factor view
+ *  @param A_data E4M3 [M][K] output
+ *  @param tSFA   A scale-factor tensor (CUTLASS tile-atom SFA layout), written by lanes 0, 8, 16, 24
+ *  @param gate   f32 [M][K] gate GEMM output
+ *  @param up     f32 [M][K] up GEMM output
+ *  @param w      f32 [M] routing weight per row
+ *  @param clamp  SwiGLU clamp
+ *  @param M      rows (padded)
+ *  @param K      row width (mid_dim) */
 template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor_vec(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
-  int nblk=K/32; long idx=(long)blockIdx.x*blockDim.x+threadIdx.x; if(idx>=(long)M*nblk) return;
-  int m=(int)(idx/nblk), kb=(int)(idx%nblk);
-  const float4 *x4=reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb*32);
-  float4 v[8];
-  #pragma unroll
-  for(int i=0;i<8;i++) v[i]=x4[i];
-  float mx=0.f;
-  #pragma unroll
-  for(int i=0;i<8;i++){ mx=fmaxf(mx,fabsf(v[i].x)); mx=fmaxf(mx,fabsf(v[i].y));
-                        mx=fmaxf(mx,fabsf(v[i].z)); mx=fmaxf(mx,fabsf(v[i].w)); }
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
-  float inv=exp2f((float)-se);
-  cutlass::float_e4m3_t ob[32];
-  #pragma unroll
-  for(int i=0;i<8;i++){ ob[i*4+0]=cutlass::float_e4m3_t(v[i].x*inv);
-                        ob[i*4+1]=cutlass::float_e4m3_t(v[i].y*inv);
-                        ob[i*4+2]=cutlass::float_e4m3_t(v[i].z*inv);
-                        ob[i*4+3]=cutlass::float_e4m3_t(v[i].w*inv); }
-  int4 *outp=reinterpret_cast<int4*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+(size_t)m*K+(size_t)kb*32);
-  const int4 *obp=reinterpret_cast<const int4*>(ob);
-  outp[0]=obp[0]; outp[1]=obp[1];
-  tSFA(m, kb*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
-}
-/* Warp-per-4-blocks twin (2026-08-08).  The vec kernel above still gives one
- * THREAD the whole 32-block, so a lane reads 128 contiguous bytes while its
- * neighbour starts 128 B away: each of its 8 LDG.128 spans 4 KB across the warp
- * and lands in 32 separate sectors, and every sector gets requested twice (a
- * 32 B sector holds two of the thread's consecutive float4).  Measured on a
- * real prefill: 57344 blocks x 128 threads x 32 elem = 235 M elements, 1.18 GB
- * moved in 7.72 ms = 154 GB/s against ~273 GB/s of bandwidth.
- *
- * Here a WARP owns four consecutive 32-blocks: lane L takes elements 4L..4L+3
- * as one float4, so the warp's load is 512 B of contiguous memory in a single
- * coalesced access, and the store is 128 B the same way.  The amax for a block
- * is then a shuffle across the eight lanes that span it rather than a serial
- * scan.  (Same restructuring as idx_pack_q_kernel in the indexer scorer, which
- * this pattern came from.)
- *
- * STILL BIT-EXACT to both twins.  fmaxf is associative AND commutative on this
- * data, so folding the amax by shuffle instead of in index order 0..31 cannot
- * change it -- unlike a sum, a max reassociates exactly.  NaN does not break
- * that either: fabsf(NaN) is NaN and fmaxf(x, NaN) returns x, so a NaN is
- * skipped in any order.  Each element's encode is the same
- * cutlass::float_e4m3_t(v*inv) on the same float; only the load/store width and
- * the reduction order change.
- *
- * Requires K/32 divisible by 4 (i.e. K a 128-multiple) so a warp's four blocks
- * never straddle a row; pack_activation checks that and falls back if not. */
-template<class TSFA>
-__global__ void pack_act_e4m3_rowmajor_warp(uint8_t *A_data, TSFA tSFA, const float *act, int M, int K){
+__global__ void swiglu_pack_e4m3_warp_kernel(uint8_t *A_data, TSFA tSFA,
+                                             const float *gate, const float *up,
+                                             const float *w, float clamp, int M, int K){
   const int nblk = K/32;
   const long total_blk = (long)M*nblk;
   const int lane = threadIdx.x & 31;
-  const long grp = ((long)blockIdx.x*blockDim.x + threadIdx.x) >> 5;  // group of 4 blocks
+  const long grp = ((long)blockIdx.x*blockDim.x + threadIdx.x) >> 5;
   const long blk0 = grp*4;
   if (blk0 >= total_blk) return;
   const int m = (int)(blk0 / nblk), kb0 = (int)(blk0 % nblk);
+  const size_t base = (size_t)m*K + (size_t)kb0*32;
 
-  const float4 v = reinterpret_cast<const float4*>(act+(size_t)m*K+(size_t)kb0*32)[lane];
+  const float4 g = reinterpret_cast<const float4*>(gate+base)[lane];
+  const float4 u = reinterpret_cast<const float4*>(up+base)[lane];
+  const float wv = w[m];              /* row weight: i/mid_dim == m when K==mid_dim */
+  float4 v;
+  v.x = pulsar_swiglu_elem(g.x,u.x,wv,clamp);
+  v.y = pulsar_swiglu_elem(g.y,u.y,wv,clamp);
+  v.z = pulsar_swiglu_elem(g.z,u.z,wv,clamp);
+  v.w = pulsar_swiglu_elem(g.w,u.w,wv,clamp);
+
   float mx = fmaxf(fmaxf(fabsf(v.x),fabsf(v.y)), fmaxf(fabsf(v.z),fabsf(v.w)));
-  // lanes 8b..8b+7 span block b: xor over the low three lane bits reduces within it
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
   mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
 
-  int se=-127; if(mx>0.f){ int e=(int)floorf(log2f(mx)); se=e-7; }
-  if(se<-127)se=-127; if(se>127)se=127;
+  /* The one exponent authority (pulsar_cuda_mx.cuh): frexpf, exact.  This kernel used to spell
+   * floorf(log2f(mx)) itself, which --use_fast_math lowers to lg2.approx -- one binade (a 2x block
+   * scale) too high for an amax just below a power of two (L335). */
+  const int se = pulsar_mx_shared_exp(mx);
   const float inv=exp2f((float)-se);
 
   cutlass::float_e4m3_t ob[4];
   ob[0]=cutlass::float_e4m3_t(v.x*inv); ob[1]=cutlass::float_e4m3_t(v.y*inv);
   ob[2]=cutlass::float_e4m3_t(v.z*inv); ob[3]=cutlass::float_e4m3_t(v.w*inv);
-  reinterpret_cast<uint32_t*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)
-                              +(size_t)m*K+(size_t)kb0*32)[lane]
+  reinterpret_cast<uint32_t*>(reinterpret_cast<cutlass::float_e4m3_t*>(A_data)+base)[lane]
       = *reinterpret_cast<const uint32_t*>(ob);
   if((lane & 7)==0) tSFA(m, (kb0+(lane>>3))*32, 0)=ElementSF::bitcast((uint8_t)(se+127));
 }
 
-// LOSSY dequant->fp4 weight packer still needs the E2M1 nearest-value helper (below); keep it.
-__device__ __constant__ float d_kE2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-__device__ __forceinline__ uint8_t d_to_e2m1(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){ float d=fabsf(v-d_kE2M1[n]); if(d<best){best=d;bn=n;} } return bn; }
-// mid = silu(clamp(gate)) * clamp(up) * routing_weight  — matches engine pulsar_cuda.cu:10827-10835
-__global__ void swiglu_kernel(float *mid, const float *gate, const float *up, const float *w, float clamp, int mid_dim, long n){
-  long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
-  float g=gate[i], u=up[i];
-  if(clamp>1.0e-6f){ if(g>clamp)g=clamp; if(u>clamp)u=clamp; if(u<-clamp)u=-clamp; }
-  float s=g/(1.f+expf(-g));
-  mid[i]=s*u*w[i/mid_dim];
-}
 
-// A_data is E4M3: M*K bytes (1 byte/elem), NOT M*K/2. SFA via the CUTLASS tile-atom layout.
-static void pack_activation(uint8_t *A_data, ElementSF *A_sf, const float *x, int M, int K){
+/* SwiGLU straight into the E4M3 staging the down GEMM reads.  The warp packer
+ * needs K a 128-multiple and 16-byte-aligned gate/up rows; any other shape is
+ * refused -- there is no unfused pair behind it. */
+/** Launches swiglu_pack_e4m3_warp_kernel (refuses K % 128 != 0 or unaligned gate / up).
+ *  @param A_data E4M3 [M][K] output
+ *  @param A_sf   A scale factors (tile-atom SFA layout, zeroed by the caller)
+ *  @param gate   f32 [M][K]
+ *  @param up     f32 [M][K]
+ *  @param w      f32 [M] routing weights
+ *  @param clamp  SwiGLU clamp
+ *  @param M      rows
+ *  @param K      row width
+ *  @return 0 on success, 1 refused / launch failed */
+static int swiglu_pack_activation(uint8_t *A_data, ElementSF *A_sf,
+                                  const float *gate, const float *up, const float *w,
+                                  float clamp, int M, int K){
+  const bool shape_ok = ((K/32) % 4) == 0;
+  const bool align_ok = ((uintptr_t)gate % 16)==0 && ((uintptr_t)up % 16)==0;
+  if (!shape_ok || !align_ok) {
+    fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3: K=%d not a 128-multiple or operands unaligned -- refusing\n", K);
+    return 1;
+  }
   auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
   auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
-  int nb=M*(K/32), t=128, b=(nb+t-1)/t;
-  /* Warp-per-4-blocks is default; PULSAR_ACT_PACK_SCALAR=1 forces the scalar
-   * twin and =2 the thread-per-block vec twin, both bit-exact, for the A/B.
-   * Env read ONCE (init-time static), not per launch. */
-  static int mode = -1;
-  if (mode < 0) { const char *e = getenv("PULSAR_ACT_PACK_SCALAR");
-                  mode = (e && e[0]=='1') ? 1 : (e && e[0]=='2') ? 2 : 0; }
-  /* The warp kernel gives a warp four consecutive 32-blocks, so they must not
-   * straddle a row.  Fall back rather than mis-index if K is ever not a
-   * 128-multiple (per-expert K is, but this is the only thing guaranteeing it). */
-  const int can_warp = ((K/32) % 4) == 0;
-  if (mode == 1)            pack_act_e4m3_rowmajor<<<b,t>>>(A_data, tSFA, x, M, K);
-  else if (mode == 2 || !can_warp)
-                            pack_act_e4m3_rowmajor_vec<<<b,t>>>(A_data, tSFA, x, M, K);
-  else {
-    const long groups = (long)M*(K/32)/4;          /* one warp per group */
-    const long thr = groups*32, bw = (thr+t-1)/t;
-    pack_act_e4m3_rowmajor_warp<<<(unsigned)bw,t>>>(A_data, tSFA, x, M, K);
+  const int t = 128;
+  const long groups = (long)M*(K/32)/4;
+  const long thr = groups*32, bw = (thr+t-1)/t;
+  static int announced = 0;
+  if (!announced) {
+    announced = 1;
+    fprintf(stderr, "pulsar: grouped MoE swiglu->E4M3 fused (M=%d K=%d)\n", M, K);
   }
+  swiglu_pack_e4m3_warp_kernel<<<(unsigned)bw,t>>>(A_data, tSFA, gate, up, w, clamp, M, K);
+  return cuda_ok(cudaGetLastError(), "grouped MoE swiglu->E4M3 pack launch") ? 0 : 1;
 }
 
+/* Where the ENGINE's activation cache keeps the E8M0 byte for (row, kb): the
+ * 128x4 SF atom swizzle, pulsar_mx_sfoff from pulsar_cuda_mx.cuh -- the one
+ * authority, shared with every producer and reader of that plane. */
+
+/* Gather ALREADY-E4M3 activations straight into the grouped GEMM's A operand.
+ *
+ * The norm that produced this activation emitted E4M3 + ue8m0 into the engine's
+ * activation cache, in exactly the scheme pack_act_e4m3_rowmajor_* uses --
+ * se = floor(log2(amax)) - 7, byte se+127, payload v * 2^-se -- and the two
+ * encoders were verified byte-identical over a 4M-value conversion sweep and a
+ * full 512x4096 block encode.  So there is nothing to recompute: move the codes.
+ *
+ * That turns the activation half of the gather from a 4-byte copy plus a
+ * re-encode pass into a 1-byte copy, on the layers where the routed experts are
+ * CUTLASS MXFP4.
+ *
+ * The two sides disagree only on WHERE the scale byte lives -- the cache uses
+ * mx_sfoff, CUTLASS its own tile atom -- so read through one and write through
+ * the other.  The byte is never recomputed.
+ *
+ * Padding rows carry row_src < 0 and get zero payload and a zero scale, which is
+ * what the f32 path produced from its pre-zeroed rows. */
+/** Copies producer E4M3 codes into the grouped A operand, re-addressing each scale byte.  Grid
+ *  ceil(M * K / 32 / 128); block 128; one 32-element block a thread.
+ *  @tparam TSFA the cute tensor type of the A scale-factor view
+ *  @param A_data  E4M3 [M][K] A operand
+ *  @param tSFA    A scale-factor tensor (tile-atom SFA layout)
+ *  @param src_q   producer E4M3 rows [tokens][K]
+ *  @param src_sf  producer E8M0 plane (pulsar_mx_sfoff layout)
+ *  @param src_kbp its padded blocks per row
+ *  @param row_src [M] source token per row, < 0 a padding row (zero payload and scale)
+ *  @param M       rows (padded)
+ *  @param K       row width (a multiple of 32) */
+template<class TSFA>
+__global__ void gather_act_e4m3_kernel(uint8_t *A_data, TSFA tSFA,
+                                       const uint8_t *src_q, const uint8_t *src_sf, int src_kbp,
+                                       const int32_t *row_src, int M, int K){
+  const int nblk = K / 32;
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)M * nblk) return;
+  const int m = (int)(idx / nblk), kb = (int)(idx % nblk);
+  const int src = row_src[m];
+  int4 *d = reinterpret_cast<int4*>(A_data + (size_t)m * K + (size_t)kb * 32);
+  if (src < 0) {
+    const int4 z = make_int4(0, 0, 0, 0);
+    d[0] = z; d[1] = z;
+    tSFA(m, kb * 32, 0) = ElementSF::bitcast((uint8_t)0);
+    return;
+  }
+  const int4 *s = reinterpret_cast<const int4*>(src_q + (size_t)src * K + (size_t)kb * 32);
+  d[0] = s[0]; d[1] = s[1];
+  tSFA(m, kb * 32, 0) = ElementSF::bitcast(src_sf[pulsar_mx_sfoff(src, kb, src_kbp)]);
+}
+
+/* Returns 0 on success, 1 when the gather launch failed (named; L189). */
+/** @param A_data  E4M3 [M][K] A operand
+ *  @param A_sf    A scale factors (tile-atom SFA layout)
+ *  @param src_q   producer E4M3 rows
+ *  @param src_sf  producer E8M0 plane (pulsar_mx_sfoff layout)
+ *  @param src_kbp its padded blocks per row
+ *  @param row_src [M] source token per row (< 0: padding)
+ *  @param M       rows
+ *  @param K       row width
+ *  @return 0 on success, 1 when the launch failed */
+static int gather_activation_e4m3(uint8_t *A_data, ElementSF *A_sf,
+                                  const void *src_q, const void *src_sf, int src_kbp,
+                                  const int32_t *row_src, int M, int K){
+  auto layoutSF = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, 0, K, 1));
+  auto tSFA = make_tensor(make_gmem_ptr(A_sf), layoutSF);
+  const int nb = M * (K / 32), t = 128, b = (nb + t - 1) / t;
+  gather_act_e4m3_kernel<<<b,t>>>(A_data, tSFA, (const uint8_t*)src_q, (const uint8_t*)src_sf,
+                                  src_kbp, row_src, M, K);
+  return cuda_ok(cudaGetLastError(), "grouped MoE E4M3 activation gather launch") ? 0 : 1;
+}
+
+/** Arguments of the single block-scaled GEMM D[M][N] = A[M][K] . B[N][K]^T (alpha 1, beta 0, C = D).
+ *  @param D      f32 [M][N] output
+ *  @param A_data E4M3 [M][K]
+ *  @param A_sf   A scale factors (tile-atom SFA)
+ *  @param B_data E2M1 weight data
+ *  @param B_sf   B scale factors (tile-atom SFB)
+ *  @param M      rows
+ *  @param N      output columns
+ *  @param K      reduction depth
+ *  @return the Gemm::Arguments */
 static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, const ElementSF *A_sf,
                     const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K){
   auto strideA = cutlass::make_cute_packed_stride(typename GemmKernel::StrideA{}, {M,K,1});
@@ -283,131 +370,20 @@ static typename Gemm::Arguments make_gemm_args(float *D, const uint8_t *A_data, 
 // Workspace bytes CUTLASS needs for a GEMM of this shape (queried once per distinct
 // (M,N,K) at scratch-sizing time; NOT malloc'd here -- caller folds this into one
 // scratch allocation so the hot path never touches the CUDA allocator).
+/** @param M rows
+ *  @param N output columns
+ *  @param K reduction depth
+ *  @return CUTLASS workspace bytes the single GEMM needs at that shape */
 static size_t gemm_workspace_bytes(int M, int N, int K){
   auto args = make_gemm_args(nullptr,nullptr,nullptr,nullptr,nullptr,M,N,K);
   return Gemm::get_workspace_size(args);
 }
 
-// One MXFP4 GEMM: D[M,N] = A[M,K](act,packed) . B[N,K](weight,packed). A_sf/B_sf = swizzled SF
-// buffers. workspace must be at least gemm_workspace_bytes(M,N,K) bytes, caller-owned.
-static int run_gemm(float *D, const uint8_t *A_data, const ElementSF *A_sf,
-                    const uint8_t *B_data, const ElementSF *B_sf, int M, int N, int K,
-                    void *workspace){
-  auto args = make_gemm_args(D,A_data,A_sf,B_data,B_sf,M,N,K);
-  Gemm gemm;
-  /* can_implement is pure host-side argument validation and is deterministic
-   * per (M,N,K); the expert loop re-ran it for every expert's every GEMM. Cache
-   * validated shapes (single-threaded GPU submission thread; the shape set is
-   * tiny -- a few (T,mid,in)/(T,out,mid) combos). */
-  {
-    static uint64_t seen[64];
-    static int n_seen = 0;
-    const uint64_t key = ((uint64_t)(uint32_t)M << 42) ^ ((uint64_t)(uint32_t)N << 21) ^ (uint32_t)K;
-    bool hit = false;
-    for (int i = 0; i < n_seen; i++) if (seen[i] == key) { hit = true; break; }
-    if (!hit) {
-      if (gemm.can_implement(args)!=cutlass::Status::kSuccess) return 1;
-      if (n_seen < 64) seen[n_seen++] = key;
-    }
-  }
-  if (gemm.initialize(args, workspace)!=cutlass::Status::kSuccess) return 2;
-  auto st = gemm.run();
-  return st==cutlass::Status::kSuccess ? 0 : 3;
-}
 
-// ---- Scratch layout shared by the sizing and execution paths (must stay in lock-step). ----
-// Everything the FFN needs beyond the weight/activation pointers it's called with: packed
-// activation buffers, their SF tables, the three GEMMs' float outputs, and the three GEMMs'
-// (usually zero-size, but not guaranteed) CUTLASS workspaces.
-struct pulsar_cutlass_ffn_scratch_layout {
-  size_t xA_off, xSF_off, midA_off, midSF_off, gate_off, up_off, mid_off;
-  size_t ws_gate_off, ws_up_off, ws_down_off;
-  size_t xSF_n, midSF_n;
-  size_t ws_gate_bytes, ws_up_bytes, ws_down_bytes;
-  size_t total_bytes;
-};
-
+/** @param n bytes
+ *  @param a alignment (> 0)
+ *  @return n rounded up to a multiple of a */
 static size_t align_up_bytes(size_t n, size_t a){ return (n + a - 1) / a * a; }
-
-static pulsar_cutlass_ffn_scratch_layout cutlass_ffn_scratch_layout(int T, int in_dim, int mid_dim, int out_dim){
-  pulsar_cutlass_ffn_scratch_layout L{};
-  const size_t align = 256;
-  size_t off = 0;
-  L.xA_off = off; off = align_up_bytes(off + (size_t)T*in_dim, align);   /* E4M3: 1 byte/elem */
-  L.xSF_n = (size_t)((T+127)/128*128)*((in_dim/32+3)/4*4);
-  L.xSF_off = off; off = align_up_bytes(off + L.xSF_n*sizeof(ElementSF), align);
-  L.midA_off = off; off = align_up_bytes(off + (size_t)T*mid_dim, align);  /* E4M3: 1 byte/elem */
-  L.midSF_n = (size_t)((T+127)/128*128)*((mid_dim/32+3)/4*4);
-  L.midSF_off = off; off = align_up_bytes(off + L.midSF_n*sizeof(ElementSF), align);
-  L.gate_off = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
-  L.up_off   = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
-  L.mid_off  = off; off = align_up_bytes(off + (size_t)T*mid_dim*sizeof(float), align);
-  L.ws_gate_bytes = gemm_workspace_bytes(T, mid_dim, in_dim);
-  L.ws_up_bytes   = L.ws_gate_bytes;   // identical (M,N,K) shape to gate
-  L.ws_down_bytes = gemm_workspace_bytes(T, out_dim, mid_dim);
-  L.ws_gate_off = off; off = align_up_bytes(off + L.ws_gate_bytes, align);
-  L.ws_up_off   = off; off = align_up_bytes(off + L.ws_up_bytes, align);
-  L.ws_down_off = off; off = align_up_bytes(off + L.ws_down_bytes, align);
-  L.total_bytes = off;
-  return L;
-}
-
-// Scratch bytes pulsar_cutlass_expert_ffn_scratch() needs for the worst case of T tokens routed
-// to a single expert. Callers size one buffer for their layer's (in_dim,mid_dim,out_dim) shape
-// at T=max_tokens_per_expert once (e.g. via cuda_tmp_alloc) and reuse it across every expert
-// and every layer that shares that shape -- this is deliberately NOT malloc'd per call.
-size_t pulsar_cutlass_expert_ffn_scratch_bytes(int T, int in_dim, int mid_dim, int out_dim){
-  return cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim).total_bytes;
-}
-
-// Core FFN, no allocation and no synchronization: out[T,out_dim] = down(swiglu(x.Wg^T, x.Wu^T)).Wd^T.
-// Weights pre-packed (data+sf) in B layout; x is f32 [T,in_dim]. `scratch` must be at least
-// pulsar_cutlass_expert_ffn_scratch_bytes(T,in_dim,mid_dim,out_dim) bytes, 256-byte aligned.
-// Launches into the caller's current stream (legacy default stream); the caller is responsible
-// for ordering/synchronizing against its own subsequent work, same as every other kernel in
-// this engine's decode/prefill graphs.
-// SF weight pointers are typed as raw bytes at this extern "C" boundary (not ElementSF*) so
-// callers outside this TU -- e.g. pulsar_cuda_moe.cu, which has no CUTLASS header visibility --
-// can call this without depending on CUTLASS types. ElementSF (cutlass::float_ue8m0_t) is a
-// 1-byte POD; the reinterpret below is exact.
-int pulsar_cutlass_expert_ffn_scratch(
-    float *out, const float *x,
-    const uint8_t *Wg_d, const uint8_t *Wg_sf,
-    const uint8_t *Wu_d, const uint8_t *Wu_sf,
-    const uint8_t *Wd_d, const uint8_t *Wd_sf,
-    const float *weights, float clamp,
-    int T, int in_dim, int mid_dim, int out_dim,
-    uint8_t *scratch, size_t scratch_bytes){
-  pulsar_cutlass_ffn_scratch_layout L = cutlass_ffn_scratch_layout(T, in_dim, mid_dim, out_dim);
-  if (!scratch || scratch_bytes < L.total_bytes) return -1;
-  const ElementSF *Wg_sf_e = reinterpret_cast<const ElementSF*>(Wg_sf);
-  const ElementSF *Wu_sf_e = reinterpret_cast<const ElementSF*>(Wu_sf);
-  const ElementSF *Wd_sf_e = reinterpret_cast<const ElementSF*>(Wd_sf);
-  uint8_t *xA = scratch + L.xA_off;
-  ElementSF *xSF = reinterpret_cast<ElementSF*>(scratch + L.xSF_off);
-  uint8_t *midA = scratch + L.midA_off;
-  ElementSF *midSF = reinterpret_cast<ElementSF*>(scratch + L.midSF_off);
-  float *gate = reinterpret_cast<float*>(scratch + L.gate_off);
-  float *up   = reinterpret_cast<float*>(scratch + L.up_off);
-  float *mid  = reinterpret_cast<float*>(scratch + L.mid_off);
-  void *ws_gate = L.ws_gate_bytes ? scratch + L.ws_gate_off : nullptr;
-  void *ws_up   = L.ws_up_bytes   ? scratch + L.ws_up_off   : nullptr;
-  void *ws_down = L.ws_down_bytes ? scratch + L.ws_down_off : nullptr;
-  /* Async: blocking cudaMemset serializes the host against ALL in-flight device
-   * work -- in the per-expert FFN loop that was 2 full device syncs per expert
-   * per rich layer, dominating small-batch verify encode time. The null-stream
-   * async memset is still ordered before the pack/GEMM launches below. */
-  if (L.xSF_n) cudaMemsetAsync(xSF,0,L.xSF_n*sizeof(ElementSF));
-  if (L.midSF_n) cudaMemsetAsync(midSF,0,L.midSF_n*sizeof(ElementSF));
-  int rc=0;
-  pack_activation(xA,xSF,x,T,in_dim);
-  rc|=run_gemm(gate,xA,xSF,Wg_d,Wg_sf_e,T,mid_dim,in_dim,ws_gate);
-  rc|=run_gemm(up,  xA,xSF,Wu_d,Wu_sf_e,T,mid_dim,in_dim,ws_up);
-  { long n=(long)T*mid_dim; int t=256,b=(int)((n+t-1)/t); swiglu_kernel<<<b,t>>>(mid,gate,up,weights,clamp,mid_dim,n); }
-  pack_activation(midA,midSF,mid,T,mid_dim);
-  rc|=run_gemm(out, midA,midSF,Wd_d,Wd_sf_e,T,out_dim,mid_dim,ws_down);
-  return rc;
-}
 
 // ---- Single-projection W4A8 GEMM (for MIXED type-40 + iq2 layers). One logical matmul:
 // out[T,out_dim] = x[T,in_dim] . W[out_dim,in_dim]^T, where W is a type-40 CUTLASS-packed MXFP4
@@ -416,6 +392,16 @@ int pulsar_cutlass_expert_ffn_scratch(
 // E4M3 (dynamic UE8M0) exactly as the full FFN's projections -- so this projection is bit-for-bit
 // the same function the uniform grouped path computes for a single GEMM. No allocation, no sync;
 // launches into the caller's current stream. SF pointer typed as raw bytes at the boundary. ----
+/** Carves the single-projection scratch: E4M3 activations, their SF, the GEMM workspace (256-byte aligned).
+ *  @param T        rows
+ *  @param in_dim   input width
+ *  @param out_dim  output width
+ *  @param xA_off   out: offset of the E4M3 activations
+ *  @param xSF_off  out: offset of their scale factors
+ *  @param xSF_n    out: scale-factor elements (rows padded to 128, blocks to 4)
+ *  @param ws_off   out: offset of the workspace
+ *  @param ws_bytes out: workspace bytes
+ *  @return total scratch bytes */
 static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
                                   size_t *xA_off, size_t *xSF_off, size_t *xSF_n, size_t *ws_off, size_t *ws_bytes){
   const size_t a=256; size_t off=0;
@@ -428,43 +414,6 @@ static size_t proj_scratch_layout(int T, int in_dim, int out_dim,
 }
 size_t pulsar_cutlass_proj_scratch_bytes(int T, int in_dim, int out_dim){
   size_t a,b,c,d,e; return proj_scratch_layout(T,in_dim,out_dim,&a,&b,&c,&d,&e);
-}
-int pulsar_cutlass_proj_scratch(float *out, const float *x,
-    const uint8_t *W_d, const uint8_t *W_sf, int T, int in_dim, int out_dim,
-    uint8_t *scratch, size_t scratch_bytes){
-  size_t xA_off,xSF_off,xSF_n,ws_off,ws_bytes;
-  size_t need=proj_scratch_layout(T,in_dim,out_dim,&xA_off,&xSF_off,&xSF_n,&ws_off,&ws_bytes);
-  if(!scratch || scratch_bytes<need) return -1;
-  uint8_t *xA=scratch+xA_off;
-  ElementSF *xSF=reinterpret_cast<ElementSF*>(scratch+xSF_off);
-  void *ws=ws_bytes?(void*)(scratch+ws_off):nullptr;
-  if(xSF_n) cudaMemsetAsync(xSF,0,xSF_n*sizeof(ElementSF));
-  pack_activation(xA,xSF,x,T,in_dim);
-  return run_gemm(out, xA, xSF, W_d, reinterpret_cast<const ElementSF*>(W_sf), T, out_dim, in_dim, ws);
-}
-
-// ---- extern-C expert FFN (standalone/test convenience): allocates+frees its own scratch and
-// synchronizes before returning. The engine never calls this -- it calls the scratch variant
-// above with a pre-sized, reused buffer, since a per-call cudaMalloc/cudaFree/cudaDeviceSynchronize
-// here is exactly the hot-path cost the engine path exists to avoid. ----
-int pulsar_cutlass_expert_ffn(
-    float *out, const float *x,
-    const uint8_t *Wg_d, const ElementSF *Wg_sf,
-    const uint8_t *Wu_d, const ElementSF *Wu_sf,
-    const uint8_t *Wd_d, const ElementSF *Wd_sf,
-    const float *weights, float clamp,
-    int T, int in_dim, int mid_dim, int out_dim){
-  size_t scratch_bytes = pulsar_cutlass_expert_ffn_scratch_bytes(T, in_dim, mid_dim, out_dim);
-  uint8_t *scratch=nullptr;
-  cudaMalloc(&scratch, scratch_bytes);
-  int rc = pulsar_cutlass_expert_ffn_scratch(out,x,Wg_d,reinterpret_cast<const uint8_t*>(Wg_sf),
-                                          Wu_d,reinterpret_cast<const uint8_t*>(Wu_sf),
-                                          Wd_d,reinterpret_cast<const uint8_t*>(Wd_sf),
-                                          weights,clamp,
-                                          T,in_dim,mid_dim,out_dim,scratch,scratch_bytes);
-  cudaDeviceSynchronize();
-  cudaFree(scratch);
-  return rc;
 }
 
 // ============================================================================================
@@ -486,13 +435,31 @@ int pulsar_cutlass_expert_ffn(
 // exercises a multi-expert problem list against the same double-precision oracle to catch it.
 // ============================================================================================
 
+/* L335: per device, for the device the call runs on -- this cached DEVICE 0's count for the process, and the
+ * grouped GEMM's hardware info named device 0 whatever the current one was (a TP rank on device 1 sized its
+ * persistent grid and its workspace for device 0). */
+/// @return the current device's SM count (cached per device; at least 1)
 static int grouped_sm_count(){
-  static int sc = -1;
-  if (sc < 0){ int v = 0; cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0); sc = v > 0 ? v : 1; }
-  return sc;
+  static int sc[PULSAR_CUDA_DEVICE_SLOTS] = {};
+  const int d = pulsar_cuda_device_slot();
+  if (d < 0) return 1;
+  if (sc[d] <= 0){
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, d) != cudaSuccess) { (void)cudaGetLastError(); v = 0; }
+    sc[d] = v > 0 ? v : 1;
+  }
+  return sc[d];
+}
+
+/// @return the current device's ordinal for the grouped GEMM's KernelHardwareInfo (0 when it cannot be read: said)
+static int grouped_device_id(){
+  const int d = pulsar_cuda_device_slot();
+  return d < 0 ? 0 : d;
 }
 
 // Physical SF-A element count for exactly one 128-row M-tile at inner dim K (host + device).
+/** @param K inner dimension
+ *  @return physical SF-A elements of one 128-row M-tile */
 static __host__ __device__ long grouped_per_mtile_sfA(int K){
   return (long)cute::size(cute::filter_zeros(GSm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(128, 0, K, 1))));
 }
@@ -501,6 +468,32 @@ static __host__ __device__ long grouped_per_mtile_sfA(int K){
 // ONE logical matmul of constant (N,K) across groups (M_g = counts[e]). ptr_A/ptr_SFA index the
 // shared packed-activation buffer at the group's 128-padded row; ptr_B/ptr_SFB index the model
 // weight block for expert e; ptr_D indexes the padded output at the same padded row.
+/** Builds one grouped GEMM's per-group arrays for constant (N, K), group e = expert e with M = counts[e].  Grid
+ *  ceil(n_total / 128); block 128 (one thread per expert).
+ *  @param prob          out: per-group (M, N, K)
+ *  @param ptrA          out: A at the group's padded row
+ *  @param dA            out: A strides
+ *  @param ptrSFA        out: A scale factors at the group's 128-row M-tile
+ *  @param lSFA          out: A scale-factor layouts
+ *  @param ptrB          out: B = the expert's weight data
+ *  @param dB            out: B strides
+ *  @param ptrSFB        out: B scale factors (at data + B_data_bytes)
+ *  @param lSFB          out: B scale-factor layouts
+ *  @param ptrC          out: C (NULL: beta 0)
+ *  @param dC            out: C strides
+ *  @param ptrD          out: D at the group's padded row
+ *  @param dD            out: D strides
+ *  @param counts        [n_total] rows per expert
+ *  @param padded_off    [n_total] 128-padded row base per expert
+ *  @param A_data        packed E4M3 activations [padded][K]
+ *  @param A_sf          their scale factors (one SFA layout over the padded rows)
+ *  @param per_mtile_sfA SF elements per 128-row M-tile (grouped_per_mtile_sfA)
+ *  @param B_tab         [n_total] per-expert weight pointers
+ *  @param B_data_bytes  data-plane bytes per expert (the SF follows)
+ *  @param D_base        f32 output [padded][N]
+ *  @param N             output columns
+ *  @param K             reduction depth
+ *  @param n_total       experts (groups) */
 __global__ static void g_build_arrays(
     GProbElem *prob,
     const GElemA **ptrA, GStrideA *dA, const GElemSF **ptrSFA, GLayoutSFA *lSFA,
@@ -508,7 +501,7 @@ __global__ static void g_build_arrays(
     const GElemC **ptrC, GStrideC *dC, GElemD **ptrD, GStrideD *dD,
     const uint32_t *counts, const uint32_t *padded_off,
     const uint8_t *A_data, const uint8_t *A_sf, long per_mtile_sfA,
-    const uint8_t *B_base, uint64_t B_stride, uint64_t B_data_bytes,
+    const uint8_t *const *B_tab, uint64_t B_data_bytes,
     GElemD *D_base, int N, int K, int n_total){
   int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n_total) return;
@@ -523,23 +516,37 @@ __global__ static void g_build_arrays(
   lSFB[e] = GSm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
   ptrA[e]   = reinterpret_cast<const GElemA*>(A_data + (size_t)roff * K);   /* E4M3 A: K bytes/row */
   ptrSFA[e] = reinterpret_cast<const GElemSF*>(A_sf + (size_t)(roff / 128u) * per_mtile_sfA);
-  ptrB[e]   = reinterpret_cast<const GElemB*>(B_base + (size_t)e * B_stride);
-  ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_base + (size_t)e * B_stride + B_data_bytes);
+  ptrB[e]   = reinterpret_cast<const GElemB*>(B_tab[e]);
+  ptrSFB[e] = reinterpret_cast<const GElemSF*>(B_tab[e] + B_data_bytes);
   ptrC[e]   = nullptr;                                    // beta = 0, C unused
   ptrD[e]   = D_base + (size_t)roff * N;
 }
 
-// Per-group device array set for one logical GEMM shape.
+/** Per-group device arrays for one logical GEMM shape in a grouped launch.
+ *
+ * A grouped GEMM runs many independent problems in one kernel, so every
+ * operand becomes an ARRAY indexed by group: one problem shape, one pointer,
+ * and one stride or scale-factor layout per group. All of these live in device
+ * memory and are filled by a setup kernel.
+ */
 struct GArrays {
-  GProbElem   *prob;
-  const GElemA **ptrA;  GStrideA *dA;
-  const GElemB **ptrB;  GStrideB *dB;
-  const GElemSF **ptrSFA; GLayoutSFA *lSFA;
-  const GElemSF **ptrSFB; GLayoutSFB *lSFB;
-  const GElemC **ptrC;  GStrideC *dC;
-  GElemD      **ptrD;   GStrideD *dD;
+  GProbElem   *prob;      ///< per-group problem shape (M, N, K)
+  const GElemA **ptrA;    ///< per-group A operand (packed activations)
+  GStrideA *dA;           ///< per-group A stride
+  const GElemB **ptrB;    ///< per-group B operand (expert weights)
+  GStrideB *dB;           ///< per-group B stride
+  const GElemSF **ptrSFA; ///< per-group A scale factors
+  GLayoutSFA *lSFA;       ///< per-group A scale-factor layout
+  const GElemSF **ptrSFB; ///< per-group B scale factors
+  GLayoutSFB *lSFB;       ///< per-group B scale-factor layout
+  const GElemC **ptrC;    ///< per-group C operand (accumulator source)
+  GStrideC *dC;           ///< per-group C stride
+  GElemD      **ptrD;     ///< per-group D operand (output)
+  GStrideD *dD;           ///< per-group D stride
 };
 
+/** @param n_total groups
+ *  @return bytes of one GArrays table (13 arrays, 256-byte aligned each) */
 static size_t g_arrays_bytes(int n_total){
   size_t a = 256, off = 0;
   auto add = [&](size_t n){ size_t r = off; off = align_up_bytes(off + n, a); (void)r; return r; };
@@ -553,6 +560,9 @@ static size_t g_arrays_bytes(int n_total){
   return off;
 }
 
+/** @param base    the table's scratch base
+ *  @param n_total groups
+ *  @return the GArrays pointers carved from base (same order as g_arrays_bytes) */
 static GArrays g_arrays_place(uint8_t *base, int n_total){
   GArrays g{}; size_t a = 256, off = 0;
   auto add = [&](size_t n)->uint8_t*{ uint8_t *p = base + off; off = align_up_bytes(off + n, a); return p; };
@@ -566,8 +576,11 @@ static GArrays g_arrays_place(uint8_t *base, int n_total){
   return g;
 }
 
+/** @param n_total  groups
+ *  @param sm_count SMs the launch uses
+ *  @return CUTLASS workspace bytes of the grouped GEMM */
 static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
-  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  cutlass::KernelHardwareInfo hw; hw.device_id = grouped_device_id(); hw.sm_count = sm_count;
   typename GGemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
   args.problem_shape = {n_total, nullptr, nullptr};
@@ -579,8 +592,13 @@ static size_t grouped_gemm_workspace_bytes(int n_total, int sm_count){
 
 // Launch one grouped blockscaled MXFP4 GEMM over n_total groups (inactive experts carry M=0 and
 // contribute zero M-tiles). Deterministic per problem list; caller owns ordering.
+/** @param n_total   groups
+ *  @param g         the device-built per-group arrays
+ *  @param workspace CUTLASS workspace (grouped_gemm_workspace_bytes)
+ *  @param sm_count  SMs
+ *  @return 0, or 1 can_implement / 2 initialize / 3 run / 4 launch error (each named on stderr) */
 static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int sm_count){
-  cutlass::KernelHardwareInfo hw; hw.device_id = 0; hw.sm_count = sm_count;
+  cutlass::KernelHardwareInfo hw; hw.device_id = grouped_device_id(); hw.sm_count = sm_count;
   typename GGemm::Arguments args{
     cutlass::gemm::GemmUniversalMode::kGrouped,
     {n_total, g.prob, nullptr},
@@ -590,20 +608,66 @@ static int run_grouped_gemm(int n_total, const GArrays &g, void *workspace, int 
   args.epilogue.thread.alpha = 1.0f;
   args.epilogue.thread.beta  = 0.0f;
   GGemm gemm;
-  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return 1;
-  if (gemm.initialize(args, workspace) != cutlass::Status::kSuccess) return 2;
-  return gemm.run() == cutlass::Status::kSuccess ? 0 : 3;
+  /* Each failure is named (L189): the callers fold every non-zero into "grouped
+   * GEMM failed", and an unchecked launch error used to surface under the NEXT
+   * kernel's cuda_ok. */
+  cutlass::Status st = gemm.can_implement(args);
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM can_implement refused (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 1;
+  }
+  st = gemm.initialize(args, workspace);
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM initialize failed (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 2;
+  }
+  st = gemm.run();
+  if (st != cutlass::Status::kSuccess) {
+    fprintf(stderr, "pulsar: grouped CUTLASS GEMM run failed (n_groups=%d): %s\n",
+            n_total, cutlass::cutlassGetStatusString(st));
+    return 3;
+  }
+  return cuda_ok(cudaGetLastError(), "grouped CUTLASS GEMM launch") ? 0 : 4;
 }
 
-// ---- Scratch layout for the grouped FFN (sizing and execution stay in lock-step). ----
+/** Byte offsets carving one scratch allocation for the GROUPED (MoE) FFN.
+ *
+ * Same contract as the per-expert scratch layout had (deleted with the per-expert loop, L158), with two additions:
+ * buffers are sized to `padded_total` rows rather than the token count, since
+ * each expert's rows are padded up to a tile boundary, and the per-group
+ * ::GArrays tables need space of their own.
+ *
+ * @warning Sizing and execution both go through grouped_scratch_layout(); that
+ * shared function is the only thing keeping them consistent.
+ */
 struct pulsar_grouped_scratch_layout {
-  size_t xA_off, xSF_off, gate_off, up_off, mid_off, midA_off, midSF_off;
-  size_t gu_arr_off, dn_arr_off, ws_gu_off, ws_dn_off;
-  size_t xSF_bytes, midSF_bytes, ws_bytes, total_bytes;
+  size_t xA_off,       ///< packed E4M3 activations, padded_total rows
+         xSF_off,      ///< scale factors for xA
+         gate_off,     ///< gate GEMM float output
+         up_off,       ///< up GEMM float output
+         midA_off,     ///< packed E4M3 SwiGLU product, input to the down GEMM
+         midSF_off;    ///< scale factors for midA
+  size_t gu_arr_off,   ///< GArrays table for the fused gate/up grouped GEMM
+         dn_arr_off,   ///< GArrays table for the down grouped GEMM
+         ws_gu_off,    ///< CUTLASS workspace for the gate/up grouped GEMM
+         ws_dn_off;    ///< CUTLASS workspace for the down grouped GEMM
+  size_t xSF_bytes,    ///< size of the xA scale-factor table
+         midSF_bytes,  ///< size of the midA scale-factor table
+         ws_bytes,     ///< size of one grouped workspace (both are equal)
+         total_bytes;  ///< allocation size the whole layout requires
 };
 
+/** @param padded_total padded rows (a multiple of 128)
+ *  @param n_total      experts
+ *  @param in_dim       input width
+ *  @param mid_dim      intermediate width
+ *  @param out_dim      output width (unused: the caller owns ffn_out)
+ *  @return the grouped FFN's scratch layout */
 static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, int n_total,
                                                          int in_dim, int mid_dim, int out_dim){
+  (void)out_dim;
   pulsar_grouped_scratch_layout L{};
   const size_t a = 256; size_t off = 0;
   int sm = grouped_sm_count();
@@ -613,7 +677,6 @@ static pulsar_grouped_scratch_layout grouped_scratch_layout(int padded_total, in
   L.xSF_off = off; off = align_up_bytes(off + L.xSF_bytes, a);
   L.gate_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.up_off   = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
-  L.mid_off  = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim*sizeof(float), a);
   L.midA_off = off; off = align_up_bytes(off + (size_t)padded_total*mid_dim, a);   /* E4M3: 1 byte/elem */
   L.midSF_bytes = (size_t)tiles * grouped_per_mtile_sfA(mid_dim) * sizeof(ElementSF);
   L.midSF_off = off; off = align_up_bytes(off + L.midSF_bytes, a);
@@ -636,13 +699,14 @@ size_t pulsar_cutlass_grouped_moe_scratch_bytes(
 // (the caller scatters the real rows into the flat down buffer, then moe_sum reduces). No host sync.
 int pulsar_cutlass_grouped_moe(
     float *ffn_out, const float *x_gathered, const float *w_gathered,
-    const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
-    uint64_t gate_stride, uint64_t gate_data_bytes,
-    uint64_t down_stride, uint64_t down_data_bytes,
+    const uint8_t *const *gate_tab, const uint8_t *const *up_tab, const uint8_t *const *down_tab,
+    uint64_t gate_data_bytes,
+    uint64_t down_data_bytes,
     float clamp, int n_total_expert,
     int in_dim, int mid_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-    uint8_t *scratch, size_t scratch_bytes){
+    uint8_t *scratch, size_t scratch_bytes,
+    const void *act_q, const void *act_sf, int act_kbp, const int32_t *row_src_tok){
   pulsar_grouped_scratch_layout L = grouped_scratch_layout(padded_total, n_total_expert, in_dim, mid_dim, out_dim);
   if (!scratch || scratch_bytes < L.total_bytes) return -1;
   int sm = grouped_sm_count();
@@ -650,7 +714,6 @@ int pulsar_cutlass_grouped_moe(
   ElementSF *xSF  = reinterpret_cast<ElementSF*>(scratch + L.xSF_off);
   float     *gate = reinterpret_cast<float*>(scratch + L.gate_off);
   float     *up   = reinterpret_cast<float*>(scratch + L.up_off);
-  float     *mid  = reinterpret_cast<float*>(scratch + L.mid_off);
   uint8_t   *midA = scratch + L.midA_off;
   ElementSF *midSF= reinterpret_cast<ElementSF*>(scratch + L.midSF_off);
   GArrays gu = g_arrays_place(scratch + L.gu_arr_off, n_total_expert);
@@ -658,11 +721,21 @@ int pulsar_cutlass_grouped_moe(
   void *ws_gu = L.ws_bytes ? (void*)(scratch + L.ws_gu_off) : nullptr;
   void *ws_dn = L.ws_bytes ? (void*)(scratch + L.ws_dn_off) : nullptr;
 
-  cudaMemsetAsync(xSF, 0, L.xSF_bytes);
-  cudaMemsetAsync(midSF, 0, L.midSF_bytes);
+  /* A missed zeroing here reads stale swizzle slots in the GEMM (see the E4M3
+   * slot note in pulsar_cuda_matmul.cu) -- so the memsets are checked (L189). */
+  if (!cuda_ok(cudaMemsetAsync(xSF, 0, L.xSF_bytes), "grouped MoE xSF memset")) return 3;
+  if (!cuda_ok(cudaMemsetAsync(midSF, 0, L.midSF_bytes), "grouped MoE midSF memset")) return 3;
 
-  // Pack the whole padded activation buffer once (one global SF layout; per-group slices below).
-  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  // Fill the whole padded A operand once (one global SF layout; per-group slices below).
+  // The A operand is the E4M3 the producing norm emitted, permuted into the
+  // padded layout; without a producer encoding the call refuses.
+  if (!(act_q && act_sf && row_src_tok)) {
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar: grouped MoE: no producer E4M3 for x (in_dim=%d padded=%d; act_q=%d act_sf=%d row_src=%d) -- refusing\n", in_dim, padded_total, act_q != nullptr, act_sf != nullptr, row_src_tok != nullptr); }
+    return -2;
+  }
+  (void)x_gathered;
+  if (gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim) != 0) return 3;
 
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   long pmt_in  = grouped_per_mtile_sfA(in_dim);
@@ -671,21 +744,21 @@ int pulsar_cutlass_grouped_moe(
   // gate arrays (D = gate) and up arrays (share A/SFA, D = up) — built as two calls.
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
-      gate_w,gate_stride,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
+      gate_tab,gate_data_bytes, gate, mid_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (gate)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
   g_build_arrays<<<bb,bt>>>(gu.prob, gu.ptrA,gu.dA,gu.ptrSFA,gu.lSFA, gu.ptrB,gu.dB,gu.ptrSFB,gu.lSFB,
       gu.ptrC,gu.dC,gu.ptrD,gu.dD, counts,padded_offsets, xA,(const uint8_t*)xSF,pmt_in,
-      up_w,gate_stride,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
+      up_tab,gate_data_bytes, up, mid_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (up)")) return 3;
   if (run_grouped_gemm(n_total_expert, gu, ws_gu, sm) != 0) return 3;
 
-  { long n = (long)padded_total*mid_dim; int t = 256, b = (int)((n+t-1)/t);
-    swiglu_kernel<<<b,t>>>(mid, gate, up, w_gathered, clamp, mid_dim, n); }
-
-  pack_activation(midA, midSF, mid, padded_total, mid_dim);
+  if (swiglu_pack_activation(midA, midSF, gate, up, w_gathered, clamp, padded_total, mid_dim) != 0) return 3;
   g_build_arrays<<<bb,bt>>>(dn.prob, dn.ptrA,dn.dA,dn.ptrSFA,dn.lSFA, dn.ptrB,dn.dB,dn.ptrSFB,dn.lSFB,
       dn.ptrC,dn.dC,dn.ptrD,dn.dD, counts,padded_offsets, midA,(const uint8_t*)midSF,pmt_mid,
-      down_w,down_stride,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
+      down_tab,down_data_bytes, ffn_out, out_dim, mid_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped MoE g_build_arrays (down)")) return 3;
   if (run_grouped_gemm(n_total_expert, dn, ws_dn, sm) != 0) return 3;
   return 0;
 }
@@ -698,6 +771,16 @@ int pulsar_cutlass_grouped_moe(
 // run_grouped_gemm, so it is bit-identical to the per-expert single-projection path it replaces,
 // with NO host readback and NO per-expert sync. Padding rows (padded_offsets leave <128-row gaps)
 // must be pre-zeroed by the caller. `ws` is folded into scratch (shape-independent grouped WS). ----
+/** @param padded_total   padded rows
+ *  @param n_total_expert experts
+ *  @param in_dim         input width
+ *  @param xA_off         out: offset of the E4M3 activations
+ *  @param xSF_off        out: offset of their scale factors
+ *  @param xSF_bytes      out: scale-factor bytes
+ *  @param arr_off        out: offset of the GArrays table
+ *  @param ws_off         out: offset of the workspace
+ *  @param ws_bytes       out: workspace bytes
+ *  @return total scratch bytes */
 static size_t grouped_proj_layout(int padded_total, int n_total_expert, int in_dim,
                                   size_t *xA_off, size_t *xSF_off, size_t *xSF_bytes,
                                   size_t *arr_off, size_t *ws_off, size_t *ws_bytes) {
@@ -717,10 +800,11 @@ size_t pulsar_cutlass_grouped_proj_scratch_bytes(int padded_total, int n_total_e
 }
 int pulsar_cutlass_grouped_proj(
     float *out, const float *x_gathered,
-    const uint8_t *W_base, uint64_t W_stride, uint64_t W_data_bytes,
+    const uint8_t *const *W_tab, uint64_t W_data_bytes,
     int n_total_expert, int in_dim, int out_dim,
     const uint32_t *counts, const uint32_t *padded_offsets, int padded_total,
-    uint8_t *scratch, size_t scratch_bytes){
+    uint8_t *scratch, size_t scratch_bytes, int reuse_packed_a,
+    const void *act_q, const void *act_sf, int act_kbp, const int32_t *row_src_tok){
   size_t xA_off,xSF_off,xSF_bytes,arr_off,ws_off,ws_bytes;
   size_t need = grouped_proj_layout(padded_total, n_total_expert, in_dim,
                                     &xA_off,&xSF_off,&xSF_bytes,&arr_off,&ws_off,&ws_bytes);
@@ -730,13 +814,34 @@ int pulsar_cutlass_grouped_proj(
   ElementSF *xSF = reinterpret_cast<ElementSF*>(scratch + xSF_off);
   GArrays g = g_arrays_place(scratch + arr_off, n_total_expert);
   void *ws = ws_bytes ? (void*)(scratch + ws_off) : nullptr;
-  cudaMemsetAsync(xSF, 0, xSF_bytes);
-  pack_activation(xA, xSF, x_gathered, padded_total, in_dim);
+  /* The gate/up pair runs this GEMM twice on ONE gathered activation; the
+   * layout above is a pure function of (padded_total, in_dim), so the second
+   * call finds the first call's xA/xSF at the same offsets and skips the
+   * whole encode (it used to pack the identical values twice). g_build_arrays
+   * only READS xA/xSF, so nothing between the calls can have touched them. */
+  if (!reuse_packed_a) {
+    if (!cuda_ok(cudaMemsetAsync(xSF, 0, xSF_bytes), "grouped projection xSF memset")) return 3;
+    /* Producer handover (L089): when the norm already emitted these rows as
+     * E4M3, permute THOSE bytes into the CUTLASS layout instead of gathering
+     * f32 and re-encoding it.  Identical shape to pulsar_cutlass_grouped_moe's
+     * entry -- this is the one that the mixed-type (gate type != down type)
+     * layers lacked, which is why they alone kept gathering raw f32 and were
+     * the last tier holding the ffn f32 store on.  The transcode rides the row
+     * permutation that has to happen regardless, so it costs ~nothing. */
+    if (!(act_q && act_sf && row_src_tok)) {
+      static int said = 0;
+      if (!said) { said = 1; fprintf(stderr, "pulsar: grouped projection: no producer E4M3 for the activation (in_dim=%d padded=%d) -- refusing\n", in_dim, padded_total); }
+      return -2;
+    }
+    (void)x_gathered;
+    if (gather_activation_e4m3(xA, xSF, act_q, act_sf, act_kbp, row_src_tok, padded_total, in_dim) != 0) return 3;
+  }
   long pmt = grouped_per_mtile_sfA(in_dim);
   const int bt = 128, bb = (n_total_expert + bt - 1) / bt;
   g_build_arrays<<<bb,bt>>>(g.prob, g.ptrA,g.dA,g.ptrSFA,g.lSFA, g.ptrB,g.dB,g.ptrSFB,g.lSFB,
       g.ptrC,g.dC,g.ptrD,g.dD, counts, padded_offsets, xA,(const uint8_t*)xSF, pmt,
-      W_base, W_stride, W_data_bytes, out, out_dim, in_dim, n_total_expert);
+      W_tab, W_data_bytes, out, out_dim, in_dim, n_total_expert);
+  if (!cuda_ok(cudaGetLastError(), "grouped projection g_build_arrays")) return 3;
   return run_grouped_gemm(n_total_expert, g, ws, sm) == 0 ? 0 : 3;
 }
 
@@ -744,24 +849,28 @@ int pulsar_cutlass_grouped_proj(
 // The grouped CUTLASS path costs ~2.8 ms per rich layer at n_tokens=3: per-expert GEMM
 // launches at M<=3 run far off roofline, behind a blocking per-layer offsets readback.
 // These GEMVs read the packed weights directly: one launch for gate+up+swiglu, one for
-// down, no readback, no sort, and f32 activations (no fp4 activation quant -- tighter
-// numerics than the GEMM path's fp4 x fp4).
-// Data layout (see pulsar_cutlass_pack_source): B is ColumnMajor packed E2M1 -- logical
+// down, no readback, no sort.  Activations are the producer's E4M3 + swizzled E8M0 -- the
+// SAME operand format the GEMM path reads, so the two paths differ in launch shape, not
+// operand numerics.
+// Data layout (the converter's pack step): B is ColumnMajor packed E2M1 -- logical
 // (n,k) lives at nibble n + k*N, so byte (n + k*N)/2. A thread owning row-pair
 // (2p, 2p+1) owns whole bytes, and a warp reads 32 consecutive bytes at each k ->
 // coalesced. SF is the swizzled tile-atom layout, indexed with the same layout object
 // the packers use (callable on device).
 
+/// E2M1 code -> value (codes 8..15 negative), for the GEMV / MMA decoders.
 __device__ __constant__ static float kE2M1_GEMV[16] =
     {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
      -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
 
+/** @param b an E8M0 scale byte
+ *  @return 2^(b - 127) */
 __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
   return __int_as_float((uint32_t)b << 23);   /* 2^(e-127) */
 }
 
 // v3: the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles --
-// verified empirically (temp/fp4gemv_test.cu): pulsar_cutlass_pack_source's data
+// verified empirically (temp/fp4gemv_test.cu): the converter's pack step's data
 // section is an IDENTITY COPY of the source's row-major e2m1 bytes, i.e. logical
 // (n,k) lives at nibble k + n*K, byte n*(K/2) + k/2. (pack_weight_f32's manual
 // "n + k*N" math -- and its byte-for-byte comment -- does NOT match pack_source;
@@ -773,138 +882,669 @@ __device__ __forceinline__ static float gemv_sf_val(uint8_t b) {
 // indexed with the same layout object the packers use (SF sections of both
 // packers agree byte-for-byte).
 
-template <class SFL>
+/* One CTA = one slot x 32 consecutive output columns (one MX block of mid).
+ * 8 warps; warp w owns columns n0+w, n0+w+8, n0+w+16, n0+w+24 in turn.  Within
+ * a column the lane->k mapping (lane l takes k = l*8 + 256*t, 8 at a time) and
+ * the xor-shuffle tree are the dot product; the column loop only sequences
+ * them, so a column's f32 result does not depend on which columns share its
+ * CTA.
+ *
+ * Reads the activation as the E4M3 + swizzled-E8M0 pair the producing norm
+ * emitted: (float)e4m3 * s with s the block's shared scale.  A lane's 8
+ * consecutive k start at a multiple of 8 and so never straddle a 32-element
+ * block, which is what lets one scale serve the inner unroll.
+ *
+ * Epilogue, chosen by the consumer's format:
+ *   EMIT_E4M3 -- the 32 SwiGLU results are deposited in shared memory and
+ *     warp 0 encodes the block with pulsar_mx_emit_block into (midq, midsf) at
+ *     pulsar_mx_sfoff(slot, n0/32, mid_kbp): the small FFN's down GEMV reads
+ *     that pair.  Requires N % 32 == 0 (every CTA is a whole block).
+ *   !EMIT_E4M3 -- lane 0 stores the f32 to mid[slot][n]; the MoE stage encodes
+ *     it (pulsar_cutlass_gemv_gateup).  Tolerates N % 8 == 0. */
+/* L214 cross-row expert dedupe (the gate/up GEMV; the down GEMV stays one slot per
+ * CTA: one output row per warp with the mid read dominating, sharing its 1 KB of
+ * weight bytes across rows measured +45..65% slower).  Slot s owns the up-to-
+ * GEMV_DEDUPE_MAX slots naming its expert that start at s when s's rank among
+ * those slots is a multiple of GEMV_DEDUPE_MAX; every other slot's CTA exits.
+ * CTA-uniform: every thread scans the same sel[] and reaches the same answer.
+ * n_tokens <= PULSAR_GPU_MNEUTRAL_ROWS_MAX (16) bounds a duplicate count at 16,
+ * so at most two owners per expert per step.  Returns the owned count (0 = exit). */
+enum { GEMV_DEDUPE_MAX = 8 };
+/* L241 4g-2: both expert GEMVs issue a row's weight (and scale) loads a GROUP
+ * of GEMV_PREFETCH k chunks at a time, then run the unchanged FMA sequence over
+ * that group in the unchanged order -- bit-identical arithmetic with
+ * GEMV_PREFETCH loads in flight per lane instead of one.  One 32-bit word per
+ * lane per chunk was latency-bound (~160 GB/s at decode; under TP half the
+ * grid's slots exit, leaving fewer loads in flight).  A whole row prefetched
+ * at once (16 chunks) took the kernels from 64/56/80 to 148/124/155 registers
+ * and one CTA per SM, and ran SLOWER; the group keeps occupancy. */
+enum { GEMV_PREFETCH = 4 };
+enum { GEMV_DOWN_TILE_N = 64 };      /* down GEMV: outputs per CTA (8 warps x 8) */
+enum { GEMV_DOWN_MAX_K  = 2304 };    /* down GEMV: mid rows staged in shared memory, K <= this (expert_mid_dim; V4.1 2304 = 9 x 256, L218) */
+/** @param sel     [n_slots] expert ids
+ *  @param n_slots slots
+ *  @param slot    this CTA's slot
+ *  @param e       its expert
+ *  @param valid   e is in range
+ *  @param owned   out: the slots this CTA serves
+ *  @return the owned count (0: another CTA owns this expert's slots) */
+__device__ __forceinline__ static int gemv_dedupe_owned(const int32_t *sel, unsigned n_slots, int slot,
+                                                        int e, bool valid, int owned[GEMV_DEDUPE_MAX]) {
+  if (!valid) { owned[0] = slot; return 1; }   /* an invalid expert is its own slot's business */
+  int rank = 0;
+  for (int t = 0; t < slot; t++) rank += (sel[t] == e);
+  if (rank % GEMV_DEDUPE_MAX) return 0;
+  int m = 0;
+  for (unsigned t = (unsigned)slot; t < n_slots && m < GEMV_DEDUPE_MAX; t++)
+    if (sel[t] == e) owned[m++] = (int)t;
+  return m;
+}
+
+/* MAXR: the most deduplicated rows one CTA carries.  A slot dedupes with at
+ * most one slot per ROW, so a step of n_tokens rows never needs more than
+ * n_tokens: the small FFN instantiates MAXR = n_tokens for 1..4 rows (the
+ * decode and DSpark-verify widths) and GEMV_DEDUPE_MAX above that.  Fewer
+ * per-row accumulators is fewer registers, more CTAs per SM; the one-row
+ * instance also prefetches its activation.  Arithmetic is identical for every
+ * r either way. */
+/** Gate + up GEMV + SwiGLU for one (slot, 32 mid columns).  Grid (ceil(N / 32), n_slots); block 256 (8 warps);
+ *  static smem lut[16] + vblk[MAXR][32] f32.
+ *  @tparam SFL       the cute SFB layout type
+ *  @tparam EMIT_E4M3 write E4M3 + E8M0 (else f32 mid)
+ *  @tparam MAXR      the most deduplicated rows a CTA carries (traps when exceeded)
+ *  @param mid        f32 [n_slots][N] (!EMIT_E4M3)
+ *  @param midq       E4M3 [n_slots][N] (EMIT_E4M3)
+ *  @param midsf      E8M0 plane, pulsar_mx_sfoff (EMIT_E4M3)
+ *  @param mid_kbp    its padded blocks per row
+ *  @param xq8        E4M3 activations [n_tokens][K]
+ *  @param xsf        their E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param sel        [n_slots] expert ids
+ *  @param rw         [n_slots] routing weights
+ *  @param gate_tab   [n_total] gate weight pointers
+ *  @param up_tab     [n_total] up weight pointers
+ *  @param data_bytes data-plane bytes per expert (the SF follows)
+ *  @param sfl        the SFB layout object
+ *  @param clampv     SwiGLU clamp
+ *  @param n_expert   slots per token (slot / n_expert = the token row)
+ *  @param n_total    experts
+ *  @param n_slots    slots
+ *  @param K          input width
+ *  @param N          mid width */
+template <class SFL, bool EMIT_E4M3, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_gu_swiglu_kernel(
-    float *mid,               // [n_slots, N]
-    const float *xq,          // [n_tokens, K] fp4-roundtripped activations
+    float *mid,               // [n_slots, N] f32 out            (!EMIT_E4M3)
+    uint8_t *midq,            // [n_slots, N] E4M3 out            (EMIT_E4M3)
+    uint8_t *midsf,           // ue8m0 plane, pulsar_mx_sfoff     (EMIT_E4M3)
+    int mid_kbp,              // its blocks-per-row pitch         (EMIT_E4M3)
+    const __nv_fp8_e4m3 *xq8, // [n_tokens, K] E4M3 activations
+    const uint8_t *xsf, int xkbp,
     const int32_t *sel,       // [n_slots] expert ids
     const float *rw,          // [n_slots] routing weights
-    const uint8_t *gate_base, const uint8_t *up_base,
-    uint64_t stride, uint64_t data_bytes, SFL sfl, float clampv,
-    int n_expert, unsigned n_total, int K, int N) {
+    const uint8_t *const *gate_tab, const uint8_t *const *up_tab,
+    uint64_t data_bytes, SFL sfl, float clampv,
+    int n_expert, unsigned n_total, unsigned n_slots, int K, int N) {
   __shared__ float lut[16];
+  __shared__ float vblk[MAXR][32];
+  constexpr int PF = GEMV_PREFETCH;
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
   __syncthreads();
   const int slot = (int)blockIdx.y;
   const int lane = (int)(threadIdx.x & 31u);
-  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
-  if (n >= N) return;
+  const int warp = (int)(threadIdx.x >> 5);
+  const int n0 = (int)(blockIdx.x * 32u);
   const int e = sel[slot];
-  float *m = mid + (size_t)slot * N;
-  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) m[n] = 0.f; return; }
-  const uint8_t *ge = gate_base + (size_t)e * stride;
-  const uint8_t *ue = up_base + (size_t)e * stride;
-  const uint8_t *gd = ge + (size_t)n * (K / 2);
-  const uint8_t *ud = ue + (size_t)n * (K / 2);
-  const uint8_t *gsf = ge + data_bytes;
-  const uint8_t *usf = ue + data_bytes;
-  const float *xt = xq + (size_t)(slot / n_expert) * K;
-  float g = 0.f, u = 0.f;
-  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
-    const uint32_t wg = *(const uint32_t *)(gd + (k0 >> 1));
-    const uint32_t wu = *(const uint32_t *)(ud + (k0 >> 1));
-    const float sg = gemv_sf_val(gsf[sfl(n, k0 & ~31, 0)]);
-    const float su = gemv_sf_val(usf[sfl(n, k0 & ~31, 0)]);
+  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  int owned[GEMV_DEDUPE_MAX];
+  const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
+  if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
+  if (m > MAXR) __trap();              /* launch contract: MAXR >= the step's row count */
+  /* the table is indexed only when `valid`: an id past n_total must not
+   * reach it (PLAN 94 phase 1's route-bounds rule, enforced at the producer). */
+  const uint8_t *ge = valid ? gate_tab[e] : nullptr;
+  const uint8_t *ue = valid ? up_tab[e] : nullptr;
+  for (int i = 0; i < 4; i++) {
+    const int n = n0 + i * 8 + warp;
+    if (n >= N) break;                 /* N % 8 == 0: uniform across the CTA */
+    float v[MAXR];
     #pragma unroll
-    for (int j = 0; j < 8; j++) {
-      const float xv = xt[k0 + j];
-      g += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
-      u += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+    for (int r = 0; r < MAXR; r++) v[r] = 0.f;   /* an invalid expert contributes zero */
+    if (valid) {
+      const uint8_t *gd = ge + (size_t)n * (K / 2);
+      const uint8_t *ud = ue + (size_t)n * (K / 2);
+      const uint8_t *gsf = ge + data_bytes;
+      const uint8_t *usf = ue + data_bytes;
+      float g[MAXR], u[MAXR];
+      #pragma unroll
+      for (int r = 0; r < MAXR; r++) { g[r] = 0.f; u[r] = 0.f; }
+      for (int kc = lane * 8; kc < K; kc += PF * 32 * 8) {
+      uint32_t pwg[PF], pwu[PF];
+      uint8_t psg[PF], psu[PF];
+      /* one row: the activation bytes and scale join the prefetch batch too
+       * (the loop below would otherwise stall on each chunk's L1 hit) */
+      uint2 pxw[MAXR == 1 ? PF : 1];
+      uint8_t pxs[MAXR == 1 ? PF : 1];
+      #pragma unroll
+      for (int c = 0; c < PF; c++) {
+        const int k0 = kc + c * 32 * 8;
+        if (k0 < K) {
+          pwg[c] = *(const uint32_t *)(gd + (k0 >> 1));
+          pwu[c] = *(const uint32_t *)(ud + (k0 >> 1));
+          psg[c] = gsf[sfl(n, k0 & ~31, 0)];
+          psu[c] = usf[sfl(n, k0 & ~31, 0)];
+          if constexpr (MAXR == 1) {
+            const int xrow = owned[0] / n_expert;
+            pxw[c] = *(const uint2 *)(xq8 + (size_t)xrow * K + k0);
+            pxs[c] = xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)];
+          }
+        }
+      }
+      #pragma unroll
+      for (int c = 0; c < PF; c++) {
+        const int k0 = kc + c * 32 * 8;
+        if (k0 >= K) break;
+        /* the expert's bytes: once per k chunk for every owned row */
+        const uint32_t wg = pwg[c];
+        const uint32_t wu = pwu[c];
+        const float sg = gemv_sf_val(psg[c]);
+        const float su = gemv_sf_val(psu[c]);
+        #pragma unroll
+        for (int r = 0; r < MAXR; r++) {
+          if (r < m) {
+            const int xrow = owned[r] / n_expert;
+            const __nv_fp8_e4m3 *xt8 = xq8 + (size_t)xrow * K;
+            float sa;
+            uint2 xw;
+            if constexpr (MAXR == 1) {
+              sa = gemv_sf_val(pxs[c]);
+              xw = pxw[c];
+            } else {
+              sa = gemv_sf_val(xsf[pulsar_mx_sfoff(xrow, k0 >> 5, xkbp)]);
+              /* the chunk's 8 activation bytes in ONE load (k0 % 8 == 0), the
+               * same values the per-byte loads returned */
+              xw = *(const uint2 *)(xt8 + k0);
+            }
+            const __nv_fp8_e4m3 *xb = (const __nv_fp8_e4m3 *)&xw;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+              const float xv = __half2float((__half)xb[j]) * sa;
+              g[r] += lut[(wg >> (4 * j)) & 0xFu] * sg * xv;
+              u[r] += lut[(wu >> (4 * j)) & 0xFu] * su * xv;
+            }
+          }
+        }
+      }
+      }   /* the k-chunk group */
+      #pragma unroll
+      for (int r = 0; r < MAXR; r++) {
+        if (r < m) {
+          for (int sh = 16; sh > 0; sh >>= 1) {
+            g[r] += __shfl_xor_sync(0xffffffffu, g[r], sh);
+            u[r] += __shfl_xor_sync(0xffffffffu, u[r], sh);
+          }
+          /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
+          float gg = g[r], uu = u[r];
+          if (clampv > 1.0e-6f) {
+            if (gg > clampv) gg = clampv;
+            if (uu > clampv) uu = clampv;
+            if (uu < -clampv) uu = -clampv;
+          }
+          v[r] = (gg / (1.f + expf(-gg))) * uu * rw[owned[r]];
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < MAXR; r++) {
+      if (r < m && lane == 0) {
+        if constexpr (EMIT_E4M3) vblk[r][n - n0] = v[r];
+        else                     mid[(size_t)owned[r] * N + n] = v[r];
+      }
     }
   }
-  for (int sh = 16; sh > 0; sh >>= 1) {
-    g += __shfl_xor_sync(0xffffffffu, g, sh);
-    u += __shfl_xor_sync(0xffffffffu, u, sh);
-  }
-  if (lane == 0) {
-    /* swiglu identical to swiglu_kernel above (clamp then silu(gate)*up*rweight) */
-    if (clampv > 1.0e-6f) {
-      if (g > clampv) g = clampv;
-      if (u > clampv) u = clampv;
-      if (u < -clampv) u = -clampv;
+  if constexpr (EMIT_E4M3) {
+    __syncthreads();
+    if (warp == 0) {
+      for (int r = 0; r < m; r++)
+        pulsar_mx_emit_block(vblk[r][lane], (uint32_t)(n0 + lane), (uint32_t)owned[r], (uint32_t)N,
+                             mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
     }
-    m[n] = (g / (1.f + expf(-g))) * u * rw[slot];
   }
 }
 
-template <class SFL>
+/* Reads mid as the E4M3 + swizzled-E8M0 pair the SwiGLU stage emitted
+ * (pulsar_gpu_mxfp8_act_cache_encode_f32 in the MoE, or the gate/up epilogue
+ * above in the small FFN): 1 byte read per element, the source's own format. */
+/** Down GEMV for one expert-owner slot and GEMV_DOWN_TILE_N outputs.  Grid (ceil(N / GEMV_DOWN_TILE_N), n_slots);
+ *  block 256; static smem MAXR x (GEMV_DOWN_MAX_K bytes + GEMV_DOWN_MAX_K / 32 floats) + lut.
+ *  @tparam SFL  the cute SFB layout type
+ *  @tparam MAXR the most deduplicated rows a CTA carries
+ *  @param down_out   f32 [n_slots][N]
+ *  @param midq8      E4M3 mid [n_slots][K]
+ *  @param midsf      its E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param sel        [n_slots] expert ids
+ *  @param down_tab   [n_total] down weight pointers
+ *  @param data_bytes data-plane bytes per expert
+ *  @param sfl        the SFB layout object
+ *  @param n_total    experts
+ *  @param n_slots    slots
+ *  @param K          mid width (<= GEMV_DOWN_MAX_K)
+ *  @param N          output width */
+template <class SFL, int MAXR = GEMV_DEDUPE_MAX>
 __global__ static void expert_gemv_down_kernel(
     float *down_out,          // [n_slots, N]
-    const float *midq,        // [n_slots, K] fp4-roundtripped mid
+    const uint8_t *midq8,     // [n_slots, K] E4M3 mid
+    const uint8_t *midsf,     // E8M0 in the VEC32 swizzle (pulsar_mx_sfoff(slot, kb, xkbp))
+    int xkbp,                 // blocks-per-row pitch of that swizzle
     const int32_t *sel,       // [n_slots] expert ids
-    const uint8_t *down_base,
-    uint64_t stride, uint64_t data_bytes, SFL sfl,
-    unsigned n_total, int K, int N) {
+    const uint8_t *const *down_tab,
+    uint64_t data_bytes, SFL sfl,
+    unsigned n_total, unsigned n_slots, int K, int N) {
+  /* L214: the CTA owns GEMV_DOWN_TILE_N outputs (8 per warp) for one expert-owner slot
+   * and every slot naming that expert (gemv_dedupe_owned): each owned slot's mid row and
+   * its decoded scales are staged in shared memory once, the expert's down rows stream
+   * from DRAM once per CTA, and the lanes read activations from shared memory -- so
+   * sharing the weights across rows costs no L2 latency chain (the per-warp-one-row
+   * variant measured +45..65%).  Per-row arithmetic is the per-slot kernel's exactly. */
   __shared__ float lut[16];
+  __shared__ __align__(16) uint8_t s_x[MAXR][GEMV_DOWN_MAX_K];
+  __shared__ float s_sa[MAXR][GEMV_DOWN_MAX_K / 32];
   if (threadIdx.x < 16) lut[threadIdx.x] = kE2M1_GEMV[threadIdx.x];
-  __syncthreads();
   const int slot = (int)blockIdx.y;
   const int lane = (int)(threadIdx.x & 31u);
-  const int n = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
-  if (n >= N) return;
+  const int warp = (int)(threadIdx.x >> 5);
+  const int tid  = (int)threadIdx.x;
   const int e = sel[slot];
-  float *o = down_out + (size_t)slot * N;
-  if (e < 0 || (unsigned)e >= n_total) { if (lane == 0) o[n] = 0.f; return; }
-  const uint8_t *de = down_base + (size_t)e * stride;
-  const uint8_t *dd = de + (size_t)n * (K / 2);
-  const uint8_t *dsf = de + data_bytes;
-  const float *xt = midq + (size_t)slot * K;
-  float a = 0.f;
-  for (int k0 = lane * 8; k0 < K; k0 += 32 * 8) {
-    const uint32_t w = *(const uint32_t *)(dd + (k0 >> 1));
-    const float sc = gemv_sf_val(dsf[sfl(n, k0 & ~31, 0)]);
-    #pragma unroll
-    for (int j = 0; j < 8; j++)
-      a += lut[(w >> (4 * j)) & 0xFu] * sc * xt[k0 + j];
+  const bool valid = !(e < 0 || (unsigned)e >= n_total);
+  int owned[GEMV_DEDUPE_MAX];
+  const int m = gemv_dedupe_owned(sel, n_slots, slot, e, valid, owned);
+  if (m == 0) return;                  /* CTA-uniform: another slot owns this expert */
+  if (m > MAXR) __trap();              /* launch contract: MAXR >= the step's row count */
+  const int n_base = (int)(blockIdx.x * GEMV_DOWN_TILE_N) + warp * 8;
+  if (!valid) {                        /* an invalid expert contributes zero to its own slot */
+    if (lane == 0) for (int i = 0; i < 8 && n_base + i < N; i++) down_out[(size_t)slot * N + n_base + i] = 0.f;
+    return;
   }
-  for (int sh = 16; sh > 0; sh >>= 1) a += __shfl_xor_sync(0xffffffffu, a, sh);
-  if (lane == 0) o[n] = a;
+  /* stage: K bytes of E4M3 per owned slot (one uint2 per thread per pass) and K/32 scales */
+  for (int r = 0; r < m; r++) {
+    const uint2 *src = (const uint2 *)(midq8 + (size_t)owned[r] * K);
+    uint2 *dst = (uint2 *)s_x[r];
+    for (int idx = tid; idx < K / 8; idx += 256) dst[idx] = src[idx];
+    for (int kb = tid; kb < K / 32; kb += 256) s_sa[r][kb] = gemv_sf_val(midsf[pulsar_mx_sfoff(owned[r], kb, xkbp)]);
+  }
+  __syncthreads();
+  const uint8_t *de = down_tab[e];   /* !valid already returned above */
+  const uint8_t *dsf = de + data_bytes;
+  for (int i = 0; i < 8; i++) {
+    const int n = n_base + i;
+    if (n >= N) break;                 /* N % 8 == 0: uniform across the warp */
+    const uint8_t *dd = de + (size_t)n * (K / 2);
+    float a[MAXR];
+    #pragma unroll
+    for (int r = 0; r < MAXR; r++) a[r] = 0.f;
+    for (int kc = lane * 8; kc < K; kc += GEMV_PREFETCH * 32 * 8) {
+    uint32_t pw[GEMV_PREFETCH];
+    uint8_t psc[GEMV_PREFETCH];
+    #pragma unroll
+    for (int c = 0; c < GEMV_PREFETCH; c++) {
+      const int k0 = kc + c * 32 * 8;
+      if (k0 < K) {
+        pw[c] = *(const uint32_t *)(dd + (k0 >> 1));
+        psc[c] = dsf[sfl(n, k0 & ~31, 0)];
+      }
+    }
+    #pragma unroll
+    for (int c = 0; c < GEMV_PREFETCH; c++) {
+      const int k0 = kc + c * 32 * 8;
+      if (k0 >= K) break;
+      const uint32_t w = pw[c];   /* the expert's bytes, once for every owned row */
+      const float sc = gemv_sf_val(psc[c]);
+      #pragma unroll
+      for (int r = 0; r < MAXR; r++) {
+        if (r < m) {
+          const float sa = s_sa[r][k0 >> 5];
+          const uint8_t *xt8 = s_x[r] + k0;
+          #pragma unroll
+          for (int j = 0; j < 8; j++) {
+            const float xv = __half2float((__half)*(const __nv_fp8_e4m3 *)&xt8[j]) * sa;
+            a[r] += lut[(w >> (4 * j)) & 0xFu] * sc * xv;
+          }
+        }
+      }
+    }
+    }   /* the k-chunk group */
+    #pragma unroll
+    for (int r = 0; r < MAXR; r++) {
+      if (r < m) {
+        for (int sh = 16; sh > 0; sh >>= 1) a[r] += __shfl_xor_sync(0xffffffffu, a[r], sh);
+        if (lane == 0) down_out[(size_t)owned[r] * N + n] = a[r];
+      }
+    }
+  }
 }
 
 
-/* W4A8 activation round-trip for the decode/small-batch GEMV: quantize f32 -> E4M3 (per-32 dynamic
- * UE8M0 block scale, EXACTLY as pack_act_e4m3_rowmajor) then dequantize back to f32, so the GEMV
- * (f32 act . fp4 weight dot) computes the SAME function as the prefill W4A8 grouped GEMM
- * (E4M3 act x MXFP4 weight). Keeps decode numerics consistent with prefill -- no fp4-vs-E4M3 drift
- * across the prefill/decode boundary, fully source-faithful. */
-__global__ static void e4m3_act_roundtrip_kernel(float *xq, const float *x, long nblk32) {
-  const long b = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= nblk32) return;
-  const float *src = x + b * 32;
-  float *dst = xq + b * 32;
-  float mx = 0.f;
-  for (int i = 0; i < 32; i++) mx = fmaxf(mx, fabsf(src[i]));
-  int se = -127; if (mx > 0.f) { int e = (int)floorf(log2f(mx)); se = e - 7; }
-  if (se < -127) se = -127; if (se > 127) se = 127;
-  const float inv = exp2f((float)-se), s = exp2f((float)se);
-  for (int i = 0; i < 32; i++) dst[i] = (float)((cutlass::float_e4m3_t)(src[i] * inv)) * s;
+/* L262: DECODE rows past pulsar_gpu_matmul_decode_exact_rows() run the small FFN as
+ * e4m3 tensor-core MMAs over expert groups.  At the spec-on widths (drafter and
+ * verify steps of 32-37 rows: ~200 slots, ~68 distinct experts) the GEMVs above
+ * read the distinct experts at ~50% of peak.  Here:
+ *  - ffn_group_slots_kernel sorts the slots by expert (ascending expert, then slot)
+ *    into groups of at most FFN_MMA_GROUP; an invalid id is its own group and
+ *    writes zeros, as the GEMVs do;
+ *  - one CTA per (group, FFN_MMA_R x 32 output rows): each warp streams its 32
+ *    weight rows once for all of the group's slots (MMA rows; the e2m1 nibbles
+ *    expand exactly to e4m3, so the e4m3 MMA serves both operands), one MMA per
+ *    32-wide block, the two block scales applied to its partial in f32;
+ *  - weights are read 16 B per lane (one whole block of one row) and handed to
+ *    the fragment layout by a 4-round rotation inside each lane quad: 4 B per
+ *    lane flooded the global-load queue (ncu: lg_throttle + long_scoreboard,
+ *    ~115 GB/s whatever the shape; rows/L262.md).
+ * Gate/up applies SwiGLU (the clamp of swiglu_kernel) and the routing weight
+ * and emits the E4M3 mid through pulsar_mx_emit_block; down reads that mid.
+ * A slot's value depends only on its own rows, so it is the same at every width
+ * this arm serves; it differs from the GEMVs (width-dependent decode arithmetic
+ * is the rule since Tyler 2026-10-01). */
+enum { FFN_MMA_GROUP = 16, FFN_MMA_R = 4, FFN_MMA_U = 4 };
+
+/* One block: sel[n_slots] -> groups {expert or -1, m, first index into list, 0},
+ * list[n_slots] (slots in group order), *n_groups.  smem: n_slots + 2 (n_total + 1) ints. */
+/** Groups the slots by expert (see above).  Grid 1; block 256; dynamic smem (n_slots + 2 (n_total + 1)) ints.
+ *  @param sel      [n_slots] expert ids
+ *  @param n_slots  slots
+ *  @param n_total  experts (an id outside [0, n_total) is the invalid bucket)
+ *  @param groups   out: [n_slots] {expert or -1, rows, first list index, 0}
+ *  @param list     out: [n_slots] slots in group order
+ *  @param n_groups out: groups written */
+__global__ static void ffn_group_slots_kernel(const int32_t *sel, unsigned n_slots, unsigned n_total,
+                                              int4 *groups, int32_t *list, int32_t *n_groups) {
+  extern __shared__ int32_t g_sm[];
+  int32_t *bk = g_sm;                       /* [n_slots] bucket per slot (n_total = invalid) */
+  int32_t *cnt = bk + n_slots;              /* [n_total + 1] */
+  int32_t *off = cnt + n_total + 1;         /* [n_total + 1] slot offset; group offset reuses cnt after */
+  for (unsigned i = threadIdx.x; i <= n_total; i += blockDim.x) cnt[i] = 0;
+  __syncthreads();
+  for (unsigned t = threadIdx.x; t < n_slots; t += blockDim.x) {
+    const int e = sel[t];
+    const int b = (e < 0 || (unsigned)e >= n_total) ? (int)n_total : e;
+    bk[t] = b;
+    atomicAdd(&cnt[b], 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int so = 0, go = 0;
+    for (unsigned b = 0; b <= n_total; b++) {
+      const int c = cnt[b];
+      off[b] = so;
+      cnt[b] = go;                            /* from here: the bucket's first group */
+      so += c;
+      go += (c + FFN_MMA_GROUP - 1) / FFN_MMA_GROUP;
+    }
+    *n_groups = go;
+  }
+  __syncthreads();
+  for (unsigned t = threadIdx.x; t < n_slots; t += blockDim.x) {
+    const int b = bk[t];
+    int rank = 0, total = 0;
+    for (unsigned u = 0; u < n_slots; u++) { const bool same = bk[u] == b; total += same; rank += same && u < t; }
+    const int pos = off[b] + rank;
+    list[pos] = (int32_t)t;
+    if (rank % FFN_MMA_GROUP == 0) {
+      const int m = total - rank < FFN_MMA_GROUP ? total - rank : FFN_MMA_GROUP;
+      groups[cnt[b] + rank / FFN_MMA_GROUP] = make_int4(b == (int)n_total ? -1 : b, m, pos, 0);
+    }
+  }
 }
 
-/* Persistent activation round-trip buffers, grown on demand and reused across
- * layers/calls -- single GPU-submission thread, same convention as the other
- * static caches. */
-static float *g_fp4_gemv_actbuf = nullptr;
-static size_t g_fp4_gemv_actbuf_floats = 0;
+/** One mma.sync m16n8k32 e4m3 x e4m3 -> f32 with C = 0 (d is overwritten); traps below sm_89.
+ *  @param d  out: the thread's four f32 results
+ *  @param a0 A fragment register 0
+ *  @param a1 A fragment register 1
+ *  @param a2 A fragment register 2
+ *  @param a3 A fragment register 3
+ *  @param b0 B fragment register 0
+ *  @param b1 B fragment register 1 */
+__device__ __forceinline__ static void ffn_mma_e4m3(float d[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                    uint32_t b0, uint32_t b1) {
+#if PULSAR_SM89
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+               : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
+#else
+  __trap();
+#endif
+}
+/* 4 e2m1 nibbles (low 16 bits, nibble j = value j) -> 4 e4m3 bytes, exact:
+ * magnitudes {0,.5,1,1.5,2,3,4,6} = e4m3 0x00 0x30 0x38 0x3C 0x40 0x44 0x48 0x4C. */
+/** @param w four E2M1 nibbles in the low 16 bits
+ *  @return the four values as E4M3 bytes (exact) */
+__device__ __forceinline__ static uint32_t ffn_e2m1x4_to_e4m3(uint32_t w) {
+  const uint32_t mag = __byte_perm(0x3C383000u, 0x4C484440u, w & 0x7777u);
+  const uint32_t s = w & 0x8888u;
+  return mag | ((s & 0x8u) << 4) | ((s & 0x80u) << 8) | ((s & 0x800u) << 12) | ((s & 0x8000u) << 16);
+}
+/** @param v four words
+ *  @param i which (0..3)
+ *  @return word i of v */
+__device__ __forceinline__ static uint32_t ffn_sel4(uint4 v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+/* The quad rotation: lane q holds block (4*kb4 + q) of its row as 16 B; afterwards
+ * w[b] is word q of block b -- the 8 values the m16n8k32 fragment wants. */
+/** @param W    this lane's 16-byte block
+ *  @param lane the lane
+ *  @param q    lane within its quad
+ *  @param w    out: word q of each of the quad's four blocks */
+__device__ __forceinline__ static void ffn_quad_rotate(uint4 W, int lane, int q, uint32_t w[4]) {
+  uint32_t r[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++)
+    r[k] = __shfl_sync(0xffffffffu, ffn_sel4(W, (q + k) & 3), (lane & ~3) | ((q - k) & 3));
+  const uint4 R = make_uint4(r[0], r[1], r[2], r[3]);
+#pragma unroll
+  for (int b = 0; b < 4; b++) w[b] = ffn_sel4(R, (q - b) & 3);
+}
+
+/* NMAT 2: gate + up -> SwiGLU -> E4M3 mid.  NMAT 1: down -> f32 out.  xrow_div maps a
+ * slot to its activation row (n_expert for gate/up: the token; 1 for down: the slot). */
+/** E4M3 MMA FFN over expert groups.  Grid (N / (32 * FFN_MMA_R), n_slots) (blockIdx.y = group; past n_groups
+ *  exits); block FFN_MMA_R * 32; static smem s_v[FFN_MMA_R][FFN_MMA_GROUP][32] f32.
+ *  @tparam SFL  the cute SFB layout type
+ *  @tparam NMAT 2: gate + up -> SwiGLU -> E4M3 mid; 1: down -> f32 out
+ *  @param groups     [n_slots] groups from ffn_group_slots_kernel
+ *  @param list       [n_slots] slots in group order
+ *  @param n_groups   groups in use (device)
+ *  @param xq8        E4M3 activation rows
+ *  @param xsf        their E8M0 plane (pulsar_mx_sfoff)
+ *  @param xkbp       its padded blocks per row
+ *  @param xrow_div   slot to activation row divisor (n_expert for gate/up, 1 for down)
+ *  @param tab0       [n_total] gate (or down) weight pointers
+ *  @param tab1       [n_total] up weight pointers (NMAT 2)
+ *  @param data_bytes data-plane bytes per expert
+ *  @param sfl        the SFB layout object
+ *  @param rw         [n_slots] routing weights (NMAT 2)
+ *  @param clampv     SwiGLU clamp (NMAT 2)
+ *  @param midq       E4M3 mid out (NMAT 2)
+ *  @param midsf      its E8M0 plane (NMAT 2)
+ *  @param mid_kbp    its padded blocks per row (NMAT 2)
+ *  @param out        f32 [n_slots][N] (NMAT 1)
+ *  @param K          input width
+ *  @param N          output width */
+template <class SFL, int NMAT>
+__global__ static void __launch_bounds__(FFN_MMA_R * 32) ffn_mma_kernel(
+    const int4 *groups, const int32_t *list, const int32_t *n_groups,
+    const uint8_t *xq8, const uint8_t *xsf, int xkbp, int xrow_div,
+    const uint8_t *const *tab0, const uint8_t *const *tab1, uint64_t data_bytes, SFL sfl,
+    const float *rw, float clampv,
+    uint8_t *midq, uint8_t *midsf, int mid_kbp,      /* NMAT 2 out */
+    float *out,                                       /* NMAT 1 out */
+    int K, int N) {
+  __shared__ float s_v[FFN_MMA_R][FFN_MMA_GROUP][32];
+  if ((int)blockIdx.y >= *n_groups) return;
+  const int4 gi = groups[blockIdx.y];
+  const int e = gi.x, m = gi.y;
+  const int32_t *slots = list + gi.z;
+  const int lane = (int)(threadIdx.x & 31u), warp = (int)(threadIdx.x >> 5), grp = lane >> 2, q = lane & 3;
+  const int row0 = ((int)blockIdx.x * FFN_MMA_R + warp) * 32;
+  if (e < 0) {   /* invalid expert: its slots contribute zero, as in the GEMVs */
+    for (int t = 0; t < m; t++) {
+      if constexpr (NMAT == 2) pulsar_mx_emit_block(0.f, (uint32_t)(row0 + lane), (uint32_t)slots[t], (uint32_t)N,
+                                                    mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
+      else out[(size_t)slots[t] * N + row0 + lane] = 0.f;
+    }
+    return;
+  }
+  const uint8_t *w0 = tab0[e];
+  const uint8_t *w1 = NMAT == 2 ? tab1[e] : w0;
+  const uint8_t *sf0 = w0 + data_bytes, *sf1 = w1 + data_bytes;
+  const uint8_t *xr[2];
+  int xrow[2];
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const int t = h * 8 + grp;
+    xrow[h] = t < m ? slots[t] / xrow_div : -1;
+    xr[h] = t < m ? xq8 + (size_t)xrow[h] * K : nullptr;
+  }
+  float acc[NMAT][4][4];
+#pragma unroll
+  for (int a = 0; a < NMAT; a++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) acc[a][j][i] = 0.f;
+  constexpr int U = FFN_MMA_U;
+  for (int c = 0; c < K / (32 * U); c++) {
+    uint32_t wv[NMAT][4][U];
+    uint32_t sw[NMAT][4][2];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int n = row0 + j * 8 + grp;
+      const size_t off = (size_t)n * (K / 2) + (size_t)c * U * 16 + q * 16;
+      ffn_quad_rotate(__ldcs((const uint4 *)(w0 + off)), lane, q, wv[0][j]);
+      if constexpr (NMAT == 2) ffn_quad_rotate(__ldcs((const uint4 *)(w1 + off)), lane, q, wv[1][j]);
+      const int nr = row0 + j * 8 + q * 2, kw = c * U * 32;
+      sw[0][j][0] = *(const uint32_t *)(sf0 + sfl(nr, kw, 0));
+      sw[0][j][1] = *(const uint32_t *)(sf0 + sfl(nr + 1, kw, 0));
+      if constexpr (NMAT == 2) {
+        sw[1][j][0] = *(const uint32_t *)(sf1 + sfl(nr, kw, 0));
+        sw[1][j][1] = *(const uint32_t *)(sf1 + sfl(nr + 1, kw, 0));
+      }
+    }
+    uint2 av[2][U];
+    uint32_t sa[2];
+#pragma unroll
+    for (int h = 0; h < 2; h++) {
+#pragma unroll
+      for (int kb = 0; kb < U; kb++)
+        av[h][kb] = xr[h] ? *(const uint2 *)(xr[h] + (c * U + kb) * 32 + q * 8) : make_uint2(0u, 0u);
+      sa[h] = xr[h] ? *(const uint32_t *)(xsf + pulsar_mx_sfoff(xrow[h], c * U, xkbp)) : 0u;
+    }
+#pragma unroll
+    for (int kb = 0; kb < U; kb++) {
+      const int sh = 8 * kb;
+      const float sa0 = gemv_sf_val((uint8_t)(sa[0] >> sh)), sa1 = gemv_sf_val((uint8_t)(sa[1] >> sh));
+#pragma unroll
+      for (int a = 0; a < NMAT; a++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const uint32_t b0 = ffn_e2m1x4_to_e4m3(wv[a][j][kb] & 0xFFFFu), b1 = ffn_e2m1x4_to_e4m3(wv[a][j][kb] >> 16);
+          const float s0 = gemv_sf_val((uint8_t)(sw[a][j][0] >> sh)), s1 = gemv_sf_val((uint8_t)(sw[a][j][1] >> sh));
+          float d[4];
+          ffn_mma_e4m3(d, av[0][kb].x, av[1][kb].x, av[0][kb].y, av[1][kb].y, b0, b1);
+          acc[a][j][0] += d[0] * (sa0 * s0);
+          acc[a][j][1] += d[1] * (sa0 * s1);
+          acc[a][j][2] += d[2] * (sa1 * s0);
+          acc[a][j][3] += d[3] * (sa1 * s1);
+        }
+    }
+  }
+#pragma unroll
+  for (int h = 0; h < 2; h++) {
+    const int t = h * 8 + grp;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        const int col = j * 8 + q * 2 + i;
+        if constexpr (NMAT == 2) {
+          if (t < m) {
+            /* swiglu_kernel's clamp, then silu(gate) * up * rweight */
+            float gg = acc[0][j][h * 2 + i], uu = acc[1][j][h * 2 + i];
+            if (clampv > 1.0e-6f) {
+              if (gg > clampv) gg = clampv;
+              if (uu > clampv) uu = clampv;
+              if (uu < -clampv) uu = -clampv;
+            }
+            s_v[warp][t][col] = (gg / (1.f + expf(-gg))) * uu * rw[slots[t]];
+          }
+        } else if (t < m) {
+          out[(size_t)slots[t] * N + row0 + col] = acc[0][j][h * 2 + i];
+        }
+      }
+  }
+  if constexpr (NMAT == 2) {
+    __syncwarp();
+    for (int t = 0; t < m; t++)
+      pulsar_mx_emit_block(s_v[warp][t][lane], (uint32_t)(row0 + lane), (uint32_t)slots[t], (uint32_t)N,
+                           mid_kbp, (__nv_fp8_e4m3 *)midq, midsf);
+  }
+}
+
+/* Grouping scratch: [n_slots] int4 groups, [n_slots] list, one count. */
+/// The MMA arm's grouping scratch (this thread's; grown on demand).
+static thread_local void *g_ffn_grp = nullptr;
+/// Its bytes.
+static thread_local size_t g_ffn_grp_bytes = 0;
+
+
+
+
+/* Persistent E4M3 staging for the small FFN's mid, grown on demand and reused
+ * across layers/calls. */
+/* thread_local: one GPU-submitting thread owns its own scratch; a second
+ * decode thread must not share this grow/free/realloc buffer (double-free +
+ * silent overwrite). Matches the g_act_slots / DsparkReduceBufs convention. */
+/// The small FFN's E4M3 mid staging (payload + E8M0 plane), this thread's.
+static thread_local float *g_fp4_gemv_actbuf = nullptr;
+/// Its size, in floats.
+static thread_local size_t g_fp4_gemv_actbuf_floats = 0;
 
 // Small-batch (n_tokens 2..4) rich-expert FFN over the packed CUTLASS weights.
-// down_out gets one pre-weighted FFN result per (token, slot); the caller sums the
-// n_expert slices per token (moe_sum_kernel). mid_scratch: [n_tokens*n_expert, mid_dim].
+// gate/up GEMV emits mid as E4M3 + ue8m0 from its epilogue; the down GEMV reads that
+// pair.  down_out gets one pre-weighted FFN result per (token, slot); the caller sums
+// the n_expert slices per token (moe_sum_kernel).
 int pulsar_cutlass_expert_ffn_gemv_small(
-    float *down_out, float *mid_scratch, const float *x,
+    float *down_out,
     const int32_t *selected, const float *rweights,
-    const uint8_t *gate_w, const uint8_t *up_w, const uint8_t *down_w,
+    const uint8_t *const *gate_tab, const uint8_t *const *up_tab, const uint8_t *const *down_tab,
     uint64_t gate_stride, uint64_t gate_data_bytes,
     uint64_t down_stride, uint64_t down_data_bytes,
     float clamp, int n_tokens, int n_expert, unsigned n_total_expert,
-    int in_dim, int mid_dim, int out_dim) {
-  if (in_dim % 256 || mid_dim % 256 || out_dim % 8) return 1;
+    int in_dim, int mid_dim, int out_dim,
+    const void *act_q, const void *act_sf, int act_kbp) {
+  if (in_dim % 256 || mid_dim % 128 || out_dim % 8) return 1;   /* mid % 128: V4.1 under TP halves 2304 to 1152 = 9 x 128 (L269 W1); the kernels need mid % 32 and the kbp identity below */
   if ((gate_stride & 3u) || (down_stride & 3u)) return 1;   /* uint32 row loads */
+  if (mid_dim > GEMV_DOWN_MAX_K) return 1;                    /* the down GEMV stages mid rows in shared memory */
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  const size_t xq_floats = (size_t)n_tokens * in_dim;
-  const size_t midq_floats = (size_t)n_slots * mid_dim;
-  const size_t need = xq_floats + midq_floats;
+  /* Both legs read their scale plane through pulsar_mx_sfoff's swizzle: the
+   * gate/up leg from the producer's plane, the down leg from the one the
+   * gate/up epilogue writes.  Staging sizes are in BYTES (payload + scales)
+   * expressed in the buffer's float units.
+   *
+   * The swizzled plane is NOT nblk bytes: mx_sfoff tiles it 128 rows x 4 blocks
+   * into 512-byte groups, so it is sized ceil(rows/128) * (kbp/4) * 512.  The
+   * tiling leaves holes past n_slots rows, and they are never read: the down
+   * GEMV indexes (slot < n_slots, kb < mid_dim/32) only, and mid_dim % 128 == 0
+   * makes mid_kbp == mid_dim/32, so the epilogue writes every position it
+   * reads.  No memset. */
+  const int   x_kbp      = pulsar_mx_kbp((int)in_dim);
+  const size_t midq_elems = (size_t)n_slots * mid_dim;
+  const int   mid_kbp      = pulsar_mx_kbp((int)mid_dim);
+  const size_t midsf_bytes = pulsar_mx_sf_slab_bytes(n_slots, mid_kbp);
+  const size_t midq_bytes = midq_elems + midsf_bytes;
+  const size_t need = (midq_bytes + 3u) / 4u;
   if (need > g_fp4_gemv_actbuf_floats) {
-    if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
+    if (g_fp4_gemv_actbuf) { pulsar_gpu_seg_note_device_free("the fp4 gemv activation buffer"); cudaFree(g_fp4_gemv_actbuf); }
     g_fp4_gemv_actbuf = nullptr;
     if (cudaMalloc(&g_fp4_gemv_actbuf, need * sizeof(float)) != cudaSuccess) {
       g_fp4_gemv_actbuf_floats = 0;
@@ -912,82 +1552,200 @@ int pulsar_cutlass_expert_ffn_gemv_small(
     }
     g_fp4_gemv_actbuf_floats = need;
   }
-  float *xq = g_fp4_gemv_actbuf;
-  float *midq = xq + xq_floats;
+  uint8_t *midq8 = (uint8_t *)g_fp4_gemv_actbuf;
+  uint8_t *midsf = midq8 + midq_elems;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  {
-    const long nb = (long)(xq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb);   /* W4A8: E4M3 acts */
+  /* x is the producer's E4M3 + ue8m0 or nothing.  Both sides are the
+   * pulsar_mx_sfoff swizzle: the producer writes through pulsar_mx_emit_block,
+   * expert_gemv_gu_swiglu_kernel reads through pulsar_mx_sfoff, and the
+   * producer's act_kbp must equal the x_kbp computed here -- a swizzled reader
+   * handed a linear plane computes a well-formed WRONG answer, so a pitch
+   * mismatch refuses like a missing encoding does. */
+  if (act_q == nullptr || act_sf == nullptr || act_kbp != x_kbp) {
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar: small-batch FFN GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d kbp %d vs %d) -- refusing\n", in_dim, n_tokens, act_kbp, x_kbp); }
+    return 1;
+  }
+  static int announced = 0;
+  if (!announced) {
+    announced = 1;
+    fprintf(stderr, "pulsar: fp4 small-batch FFN: gate/up emits E4M3 mid from the epilogue "
+                    "(mid_dim=%d n_slots=%u)\n", mid_dim, n_slots);
+  }
+  if (pulsar_gpu_matmul_batch_decode_rows() > 0 && n_tokens > pulsar_gpu_matmul_decode_exact_rows()) {
+    /* L262: the MMA arm.  Its loads need 16-B rows of whole blocks, 32-row warps
+     * and 4-block scale words (the SF atom keeps a row's 4 consecutive blocks in
+     * one word -- checked here against the layout object, not assumed). */
+    if (in_dim % (32 * FFN_MMA_U) || mid_dim % (32 * FFN_MMA_U) || mid_dim % (32 * FFN_MMA_R) ||
+        out_dim % (32 * FFN_MMA_R) || (gate_stride & 15u) || (down_stride & 15u) ||
+        (int)sfl_gu(0, 32, 0) != (int)sfl_gu(0, 0, 0) + 1 || (int)sfl_gu(0, 96, 0) != (int)sfl_gu(0, 0, 0) + 3 ||
+        (int)sfl_dn(0, 32, 0) != (int)sfl_dn(0, 0, 0) + 1 || (int)sfl_dn(0, 96, 0) != (int)sfl_dn(0, 0, 0) + 3) {
+      static int said_shape = 0;
+      if (!said_shape) {
+        said_shape = 1;
+        fprintf(stderr, "pulsar: small-batch FFN MMA arm: shape (in %d mid %d out %d) or layout unsupported -- refusing\n",
+                in_dim, mid_dim, out_dim);
+      }
+      return 1;
+    }
+    const size_t grp_bytes = (size_t)n_slots * (sizeof(int4) + sizeof(int32_t)) + 16;
+    if (grp_bytes > g_ffn_grp_bytes) {
+      if (g_ffn_grp) { pulsar_gpu_seg_note_device_free("the fp4 ffn group table"); cudaFree(g_ffn_grp); }
+      g_ffn_grp = nullptr;
+      if (cudaMalloc(&g_ffn_grp, grp_bytes) != cudaSuccess) { g_ffn_grp_bytes = 0; return 1; }
+      g_ffn_grp_bytes = grp_bytes;
+    }
+    int4 *groups = (int4 *)g_ffn_grp;
+    int32_t *list = (int32_t *)(groups + n_slots);
+    int32_t *n_groups = list + n_slots;
+    static int said_mma = 0;
+    if (!said_mma) {
+      said_mma = 1;
+      fprintf(stderr, "pulsar: small-batch FFN decode rows past %d = e4m3 MMA over expert groups of %d (16-B loads)\n",
+              pulsar_gpu_matmul_decode_exact_rows(), (int)FFN_MMA_GROUP);
+    }
+    ffn_group_slots_kernel<<<1, 256, (size_t)(n_slots + 2 * (n_total_expert + 1)) * sizeof(int32_t)>>>(
+        selected, n_slots, n_total_expert, groups, list, n_groups);
+    ffn_mma_kernel<decltype(sfl_gu), 2><<<dim3((unsigned)(mid_dim / (32 * FFN_MMA_R)), n_slots), FFN_MMA_R * 32>>>(
+        groups, list, n_groups, (const uint8_t *)act_q, (const uint8_t *)act_sf, x_kbp, n_expert,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, rweights, clamp, midq8, midsf, mid_kbp, nullptr,
+        in_dim, mid_dim);
+    ffn_mma_kernel<decltype(sfl_dn), 1><<<dim3((unsigned)(out_dim / (32 * FFN_MMA_R)), n_slots), FFN_MMA_R * 32>>>(
+        groups, list, n_groups, midq8, midsf, mid_kbp, 1,
+        down_tab, nullptr, down_data_bytes, sfl_dn, nullptr, 0.f, nullptr, nullptr, 0, down_out,
+        mid_dim, out_dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
   }
   {
-    dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-    expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid_scratch, xq, selected, rweights,
-        gate_w, up_w, gate_stride, gate_data_bytes, sfl_gu, clamp,
-        n_expert, n_total_expert, in_dim, mid_dim);
+    dim3 g((unsigned)(mid_dim / 32), n_slots);
+    switch (n_tokens) {
+    case 1: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 1><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim); break;
+    case 2: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 2><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim); break;
+    case 3: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 3><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim); break;
+    case 4: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true, 4><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim); break;
+    default: expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        nullptr, midq8, midsf, mid_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, x_kbp, selected, rweights,
+        gate_tab, up_tab, gate_data_bytes, sfl_gu, clamp,
+        n_expert, n_total_expert, n_slots, in_dim, mid_dim); break;
+    }
+
   }
   {
-    const long nb = (long)(midq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid_scratch, nb);   /* W4A8: E4M3 acts */
-  }
-  {
-    dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-    expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected,
-        down_w, down_stride, down_data_bytes, sfl_dn,
-        n_total_expert, mid_dim, out_dim);
+    dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
+    switch (n_tokens) {
+    case 1: expert_gemv_down_kernel<decltype(sfl_dn), 1><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim); break;
+    case 2: expert_gemv_down_kernel<decltype(sfl_dn), 2><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim); break;
+    case 3: expert_gemv_down_kernel<decltype(sfl_dn), 3><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim); break;
+    case 4: expert_gemv_down_kernel<decltype(sfl_dn), 4><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim); break;
+    default: expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+        down_out, midq8, midsf, mid_kbp, selected,
+        down_tab, down_data_bytes, sfl_dn,
+        n_total_expert, n_slots, mid_dim, out_dim); break;
+    }
+
   }
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
 
-/* ---- Single-projection W4A8 GEMV for MIXED type-40 layers at DECODE/small-batch (n<=4). ----
- * Decode is memory-bound; the M=1 CUTLASS tensor-core GEMM wastes launch + pack + TC-underfill
- * overhead. These reuse the lean expert_gemv_* kernels (fp4 weight read directly, dequant via LUT,
- * E4M3-roundtripped f32 activations = same function as the prefill grouped GEMM). One launch over
- * all (token,expert) slots, no per-expert loop, no host sync. `mid`/`down_out` are the pair-layout
- * f32 accumulators the caller composes with the dp4a side. Persistent actbuf grown on demand. */
-static int gemv_actbuf_ensure(size_t need_floats) {
-  if (need_floats <= g_fp4_gemv_actbuf_floats) return 1;
-  if (g_fp4_gemv_actbuf) cudaFree(g_fp4_gemv_actbuf);
-  g_fp4_gemv_actbuf = nullptr;
-  if (cudaMalloc(&g_fp4_gemv_actbuf, need_floats * sizeof(float)) != cudaSuccess) { g_fp4_gemv_actbuf_floats = 0; return 0; }
-  g_fp4_gemv_actbuf_floats = need_floats;
-  return 1;
-}
-/* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout). */
+/* gate/up W4A8 GEMV -> mid[n_slots,mid_dim] = silu(clamp(gate))*clamp(up)*rw (pair layout).
+ *
+ * L219: emit_q non-NULL selects the E4M3 epilogue -- the same template arm the
+ * small-batch FFN path uses -- and `mid` is not written.  The caller (mixed
+ * case A at decode) then hands those bytes to the MMQ down, exactly like the
+ * fold-emitted slot the other arms produce. */
 int pulsar_cutlass_gemv_gateup(
-    float *mid, const float *x, const int32_t *selected, const float *rweights,
-    const uint8_t *gate_w, const uint8_t *up_w, uint64_t gate_stride, uint64_t gate_data_bytes,
-    float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim) {
+    float *mid, const int32_t *selected, const float *rweights,
+    const uint8_t *const *gate_tab, const uint8_t *const *up_tab, uint64_t gate_stride, uint64_t gate_data_bytes,
+    float clamp, int n_tokens, int n_expert, unsigned n_total_expert, int in_dim, int mid_dim,
+    const void *act_q, const void *act_sf, int act_kbp,
+    void *emit_q, void *emit_sf, int emit_kbp) {
   if (in_dim % 256 || mid_dim % 8 || (gate_stride & 3u)) return 1;
+  const bool emit = emit_q != NULL;
+  if (emit && (mid_dim % 32 || !emit_sf || emit_kbp != pulsar_mx_kbp(mid_dim))) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  const size_t xq_floats = (size_t)n_tokens * in_dim;
-  if (!gemv_actbuf_ensure(xq_floats)) return 1;
-  float *xq = g_fp4_gemv_actbuf;
   auto sfl_gu = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, mid_dim, in_dim, 1));
-  { const long nb = (long)(xq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(xq, x, nb); }
-  dim3 g((unsigned)((mid_dim + 7) / 8), n_slots);
-  expert_gemv_gu_swiglu_kernel<<<g, 256>>>(mid, xq, selected, rweights, gate_w, up_w,
-      gate_stride, gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, in_dim, mid_dim);
+
+  /* The activation is the E4M3 the producing norm emitted, or the call refuses. */
+  if (!act_q || !act_sf) {
+    static int said_gu = 0;
+    if (!said_gu) { said_gu = 1; fprintf(stderr, "pulsar: fp4 decode gate/up GEMV: no producer E4M3 for x (in_dim=%d n_tokens=%d) -- refusing\n", in_dim, n_tokens); }
+    return 3;
+  }
+  /* Say it once: the announce is the evidence this lane ran. */
+  static int announced_gemv_a8 = 0;
+  if (!announced_gemv_a8) {
+    announced_gemv_a8 = 1;
+    fprintf(stderr, "pulsar: fp4 decode GEMV = producer's E4M3 (no re-encode) "
+                    "for in_dim=%d mid_dim=%d\n", in_dim, mid_dim);
+  }
+  if (emit) {
+    dim3 g((unsigned)(mid_dim / 32), n_slots);
+    expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), true><<<g, 256>>>(
+        nullptr, (uint8_t *)emit_q, (uint8_t *)emit_sf, emit_kbp,
+        (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+        selected, rweights, gate_tab, up_tab,
+        gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : 2;
+  }
+  dim3 g((unsigned)((mid_dim + 31) / 32), n_slots);
+  expert_gemv_gu_swiglu_kernel<decltype(sfl_gu), false><<<g, 256>>>(
+      mid, nullptr, nullptr, 0,
+      (const __nv_fp8_e4m3 *)act_q, (const uint8_t *)act_sf, act_kbp,
+      selected, rweights, gate_tab, up_tab,
+      gate_data_bytes, sfl_gu, clamp, n_expert, n_total_expert, n_slots, in_dim, mid_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 /* down W4A8 GEMV -> down_out[n_slots,out_dim] (pair layout, NO routing weight -- applied at gate/up). */
 int pulsar_cutlass_gemv_down(
-    float *down_out, const float *mid, const int32_t *selected,
-    const uint8_t *down_w, uint64_t down_stride, uint64_t down_data_bytes,
-    int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim) {
-  if (mid_dim % 256 || out_dim % 8 || (down_stride & 3u)) return 1;
+    float *down_out, const int32_t *selected,
+    const uint8_t *const *down_tab, uint64_t down_stride, uint64_t down_data_bytes,
+    int n_tokens, int n_expert, unsigned n_total_expert, int mid_dim, int out_dim,
+    const void *mid_q, const void *mid_sf, int mid_kbp) {
+  if (mid_dim % 128 || out_dim % 8 || (down_stride & 3u) || mid_dim > GEMV_DOWN_MAX_K) return 1;
   const unsigned n_slots = (unsigned)(n_tokens * n_expert);
-  const size_t midq_floats = (size_t)n_slots * mid_dim;
-  if (!gemv_actbuf_ensure(midq_floats)) return 1;
-  float *midq = g_fp4_gemv_actbuf;
+  /* mid arrives as the MoE stage's E4M3 encoding (slot rows = pair slots,
+   * VEC32 swizzle), or the call refuses. */
+  if (!mid_q || !mid_sf || mid_kbp != pulsar_mx_kbp(mid_dim)) {
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "pulsar: fp4 down GEMV: no producer E4M3 for mid (mid_dim=%d n_slots=%u) -- refusing\n", mid_dim, n_slots); }
+    return 1;
+  }
   auto sfl_dn = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1, out_dim, mid_dim, 1));
-  { const long nb = (long)(midq_floats / 32);
-    e4m3_act_roundtrip_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(midq, mid, nb); }
-  dim3 g((unsigned)((out_dim + 7) / 8), n_slots);
-  expert_gemv_down_kernel<<<g, 256>>>(down_out, midq, selected, down_w,
-      down_stride, down_data_bytes, sfl_dn, n_total_expert, mid_dim, out_dim);
+  dim3 g((unsigned)((out_dim + GEMV_DOWN_TILE_N - 1) / GEMV_DOWN_TILE_N), n_slots);
+  expert_gemv_down_kernel<decltype(sfl_dn)><<<g, 256>>>(
+      down_out, (const uint8_t *)mid_q, (const uint8_t *)mid_sf, mid_kbp, selected, down_tab,
+      down_data_bytes, sfl_dn, n_total_expert, n_slots, mid_dim, out_dim);
   return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
 
@@ -996,273 +1754,13 @@ int pulsar_cutlass_gemv_down(
 // DeepSeek-V4-Flash source stores rich experts — into CUTLASS B layout (ColumnMajor packed E2M1
 // data + swizzled SFB). Host-side, lossless (copies nibbles+scale verbatim). This is the permanent
 // source->CUTLASS packer; nothing consumes ds4's 17-byte format.
-void pulsar_cutlass_pack_source(uint8_t *Bd, ElementSF *Bsf, const uint8_t *e2m1, const uint8_t *e8m0, int N, int K){
-  auto lB   = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
-  auto layB = make_layout(make_shape(N,K,1), lB);
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  auto tB   = make_tensor(recast_ptr<cutlass::float_e2m1_t>(Bd), layB);
-  auto tSFB = make_tensor(Bsf, lSFB);
-  int nblk=K/32, rowbytes=K/2;
-  for(int n=0;n<N;n++) for(int kb=0;kb<nblk;kb++){
-    tSFB(n, kb*32, 0) = ElementSF::bitcast(e8m0[(size_t)n*nblk + kb]);   // E8M0 scale
-    const uint8_t *row = e2m1 + (size_t)n*rowbytes + kb*16;              // E2M1: 16 bytes = 32 nibbles
-    for(int i=0;i<16;i++){ uint8_t byte=row[i]; int k=kb*32+i*2;
-      tB(n,k,0)   = cutlass::float_e2m1_t::bitcast(byte & 0xF);
-      tB(n,k+1,0) = cutlass::float_e2m1_t::bitcast(byte >> 4); }
-  }
-}
 
 // Physical element count of the swizzled SF tensor for a weight of shape (N=out, K=in).
-size_t pulsar_cutlass_weight_sf_count(int N, int K){
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  return cute::size(cute::filter_zeros(lSFB));
-}
 
-// Packed E2M1 weight-data byte count for a weight of shape (N=out, K=in): 2 nibbles/byte.
-size_t pulsar_cutlass_weight_data_bytes(int N, int K){ return (size_t)N * (size_t)K / 2; }
 
-// ---- Runtime dequant->fp4 weight packer (2-bit prefill path). Quantizes a DEQUANTIZED f32
-// weight [N,K] (RowMajor: N rows of K) to MXFP4 on-device (LOSSY) directly into CUTLASS B layout.
-// LAYOUT FIX (2026-07-08): the CUTLASS B data section is ROW-MAJOR K-contiguous packed nibbles
-// -- logical (n,k) at nibble k + n*K, byte n*(K/2) + k/2 -- verified empirically against
-// pulsar_cutlass_pack_source, whose data section is an identity copy of the source's row-major
-// e2m1 bytes (temp/fp4gemv_test.cu). The previous "(n + k*N)/2 ColumnMajor" math here did NOT
-// match pack_source despite the old comment's claim, so the opt-in PULSAR_MOE_FP4_PREFILL path
-// was feeding scrambled weights to the GEMM. One thread per (row, 32-block) owns 16 whole
-// output bytes -> no cross-thread nibble RMW race. ----
-template<class TSFB>
-__global__ void pack_weight_f32_kernel(uint8_t *B_data, TSFB tSFB, const float *W, int N, int K){
-  int nblk = K/32;
-  long idx = (long)blockIdx.x*blockDim.x + threadIdx.x;
-  if (idx >= (long)N*nblk) return;
-  int n = (int)(idx / nblk), kb = (int)(idx % nblk);
-  const float *w = W + (size_t)n*K + (size_t)kb*32;
-  float mx=0.f;
-  for (int i=0;i<32;i++) mx=fmaxf(mx,fabsf(w[i]));
-  int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-127)e=-127; if(e>127)e=127;
-  float s=exp2f((float)e);
-  tSFB(n, kb*32, 0) = ElementSF::bitcast((uint8_t)(e+127));
-  uint8_t *ob = B_data + (size_t)n*(K/2) + (size_t)kb*16;
-  for (int i=0;i<16;i++){
-    uint8_t lo = d_to_e2m1(w[2*i]/s);
-    uint8_t hi = d_to_e2m1(w[2*i+1]/s);
-    ob[i] = (uint8_t)(lo | (hi<<4));
-  }
-}
-
-void pulsar_cutlass_pack_weight_f32(uint8_t *Bd, uint8_t *Bsf, const float *W, int N, int K){
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1));
-  auto tSFB = make_tensor(reinterpret_cast<ElementSF*>(Bsf), lSFB);
-  int nb = N*(K/32), t=128, b=(nb+t-1)/t;
-  pack_weight_f32_kernel<<<b,t>>>(Bd, tSFB, W, N, K);   // legacy default stream
-}
-
-#ifdef PULSAR_MXFP4_REPACK_CLI
-#include <cstdlib>
-#include <cstring>
-#include <algorithm>
-#include <vector>
-// Offline converter CLI. Two modes:
-//   per-expert: e2m1.bin e8m0.bin N K out_data.bin out_sf.bin
-//   stacked   : --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin
-//               (in: [ne,N,K/2] + [ne,N,K/32]; out: per expert data||sf, expert-major)
-int main(int argc, char **argv){
-  if(argc>=8 && strcmp(argv[1],"--stacked")==0){
-    int N=atoi(argv[4]), K=atoi(argv[5]), ne=atoi(argv[6]);
-    size_t e2each=(size_t)N*(K/2), e8each=(size_t)N*(K/32);
-    std::vector<uint8_t> e2(e2each*ne), e8(e8each*ne);
-    FILE*f1=fopen(argv[2],"rb"); if(!f1||fread(e2.data(),1,e2.size(),f1)!=e2.size()){ fprintf(stderr,"e2m1 read fail\n"); return 1; } fclose(f1);
-    FILE*f2=fopen(argv[3],"rb"); if(!f2||fread(e8.data(),1,e8.size(),f2)!=e8.size()){ fprintf(stderr,"e8m0 read fail\n"); return 1; } fclose(f2);
-    size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
-    FILE*fo=fopen(argv[7],"wb"); if(!fo){ fprintf(stderr,"out open fail\n"); return 1; }
-    std::vector<uint8_t> Bd((size_t)N*K/2); std::vector<ElementSF> Bsf(sfn);
-    for(int i=0;i<ne;i++){
-      std::fill(Bd.begin(),Bd.end(),(uint8_t)0);
-      std::fill(Bsf.begin(),Bsf.end(),ElementSF::bitcast(127));
-      pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data()+(size_t)i*e2each, e8.data()+(size_t)i*e8each, N, K);
-      fwrite(Bd.data(),1,Bd.size(),fo); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fo);
-    }
-    fclose(fo);
-    printf("stacked N=%d K=%d ne=%d -> per-expert data=%zuB sf=%zuB total=%zuB\n",
-           N,K,ne, Bd.size(), sfn*sizeof(ElementSF), (size_t)ne*(Bd.size()+sfn*sizeof(ElementSF)));
-    return 0;
-  }
-  if(argc<7){ fprintf(stderr,"usage: %s e2m1.bin e8m0.bin N K out_data.bin out_sf.bin\n       %s --stacked e2m1_stacked.bin e8m0_stacked.bin N K n_expert out_blob.bin\n",argv[0],argv[0]); return 1; }
-  int N=atoi(argv[3]), K=atoi(argv[4]);
-  size_t e2n=(size_t)N*(K/2), e8n=(size_t)N*(K/32);
-  std::vector<uint8_t> e2(e2n), e8(e8n);
-  FILE*f1=fopen(argv[1],"rb"); if(!f1||fread(e2.data(),1,e2n,f1)!=e2n){ fprintf(stderr,"e2m1 read fail %s\n",argv[1]); return 1; } fclose(f1);
-  FILE*f2=fopen(argv[2],"rb"); if(!f2||fread(e8.data(),1,e8n,f2)!=e8n){ fprintf(stderr,"e8m0 read fail %s\n",argv[2]); return 1; } fclose(f2);
-  std::vector<uint8_t> Bd((size_t)N*K/2,0);
-  size_t sfn=pulsar_cutlass_weight_sf_count(N,K);
-  std::vector<ElementSF> Bsf(sfn, ElementSF::bitcast(127));
-  pulsar_cutlass_pack_source(Bd.data(), Bsf.data(), e2.data(), e8.data(), N, K);
-  FILE*fd=fopen(argv[5],"wb"); fwrite(Bd.data(),1,Bd.size(),fd); fclose(fd);
-  FILE*fs=fopen(argv[6],"wb"); fwrite(Bsf.data(),sizeof(ElementSF),sfn,fs); fclose(fs);
-  printf("packed N=%d K=%d -> data=%zuB sf=%zuB\n",N,K,Bd.size(),sfn*sizeof(ElementSF));
-  return 0;
-}
-#endif
-
-#ifdef PULSAR_MXFP4_STANDALONE
-#include <vector>
-#include <random>
-#include <cmath>
-// host MXFP4 quant (matches device): returns dequantized value array + packs into B ColumnMajor layout.
-static const float hE2M1[16]={0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f, 0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
-static uint8_t h_nib(float v){ float best=1e30f; uint8_t bn=0; for(uint8_t n=0;n<16;n++){float d=fabsf(v-hE2M1[n]); if(d<best){best=d;bn=n;}} return bn; }
-// Pack weight W[out,in] (row-major float) -> B data+SF in CUTLASS ColumnMajor(B) layout for shape (N=out,K=in). Fill dq.
-static void host_pack_weight(std::vector<uint8_t>& Bd, std::vector<ElementSF>& Bsf, std::vector<float>& dq,
-                             const std::vector<float>& W, int N, int K){
-  auto lB  = cutlass::make_cute_packed_stride(typename GemmKernel::StrideB{}, {N,K,1});
-  auto layB = make_layout(make_shape(N,K,1), lB);
-  auto lSFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(1,N,K,1)); // M unused for SFB shape? use N,K
-  Bd.assign((size_t)N*K/2,0); dq.assign((size_t)N*K,0.f);
-  Bsf.assign(cute::size(cute::filter_zeros(lSFB)), ElementSF::bitcast(127));
-  auto tB  = make_tensor(recast_ptr<cutlass::float_e2m1_t>((uint8_t*)Bd.data()), layB);
-  auto tSFB= make_tensor(Bsf.data(), lSFB);
-  for(int n=0;n<N;n++) for(int kb=0;kb<K/32;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(W[(size_t)n*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    tSFB(n, kb*32, 0)=ElementSF::bitcast((uint8_t)(e+127));
-    for(int i=0;i<32;i++){ int k=kb*32+i; uint8_t nb=h_nib(W[(size_t)n*K+k]/sc); tB(n,k,0)=cutlass::float_e2m1_t::bitcast(nb); dq[(size_t)n*K+k]=hE2M1[nb]*sc; }
-  }
-}
-static void host_quant_act(const std::vector<float>& X, std::vector<float>& dq, int M, int K){
-  dq.assign((size_t)M*K,0.f);
-  for(int m=0;m<M;m++) for(int kb=0;kb<K/32;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(X[(size_t)m*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    for(int i=0;i<32;i++){ int k=kb*32+i; uint8_t nb=h_nib(X[(size_t)m*K+k]/sc); dq[(size_t)m*K+k]=hE2M1[nb]*sc; }
-  }
-}
-// host: float weight [N,K] -> SOURCE-format arrays (E2M1 [N,K/2] + E8M0 [N,K/32]), same quant as host_pack_weight
-static void host_to_source(const std::vector<float>& W, std::vector<uint8_t>& e2, std::vector<uint8_t>& e8, int N, int K){
-  int nblk=K/32; e2.assign((size_t)N*(K/2),0); e8.assign((size_t)N*nblk,0);
-  for(int n=0;n<N;n++) for(int kb=0;kb<nblk;kb++){
-    float mx=0.f; for(int i=0;i<32;i++) mx=fmaxf(mx,fabsf(W[(size_t)n*K+kb*32+i]));
-    int e=(mx>0.f)?(int)ceilf(log2f(mx/6.f)):0; if(e<-30)e=-30; if(e>30)e=30; float sc=exp2f((float)e);
-    e8[(size_t)n*nblk+kb]=(uint8_t)(e+127);
-    uint8_t* row=e2.data()+(size_t)n*(K/2)+kb*16;
-    for(int i=0;i<16;i++){ int k=kb*32+i*2; uint8_t lo=h_nib(W[(size_t)n*K+k]/sc), hi=h_nib(W[(size_t)n*K+k+1]/sc); row[i]=(uint8_t)(lo|(hi<<4)); }
-  }
-}
-// Multi-expert grouped-GEMM self-check: several experts, tokens round-robin-routed (n_expert=1),
-// run the grouped entry end-to-end (gather to 128-padded rows -> grouped gate/up/down -> scatter)
-// and compare per-token output to a double-precision CPU oracle. Catches SF-slice/offset bugs.
-static int run_grouped_selfcheck(){
-  // E experts total but tokens routed ONLY to a subset -> the rest carry count==0 (M==0 groups),
-  // exactly like a real prefill chunk where not every expert is hit. Verifies the grouped kernel
-  // tolerates empty groups (else the on-model path would silently fall back to the per-expert loop).
-  const int E=8, T=311, in_dim=256, mid_dim=256, out_dim=256; const float clamp=4.0f;
-  const int active[4]={1,3,4,6};   // experts 0,2,5,7 stay empty
-  std::mt19937 rng(11); std::normal_distribution<float> nd(0.f,1.f);
-  std::vector<float> X((size_t)T*in_dim); for(auto&v:X) v=nd(rng);
-  std::vector<std::vector<float>> Wg(E),Wu(E),Wd(E),dqWg(E),dqWu(E),dqWd(E);
-  std::vector<std::vector<uint8_t>> Bgd(E),Bud(E),Bdd(E);
-  std::vector<std::vector<ElementSF>> Bgs(E),Bus(E),Bds(E);
-  for(int e=0;e<E;e++){
-    Wg[e].resize((size_t)mid_dim*in_dim); Wu[e].resize((size_t)mid_dim*in_dim); Wd[e].resize((size_t)out_dim*mid_dim);
-    for(auto&v:Wg[e])v=nd(rng)*0.3f; for(auto&v:Wu[e])v=nd(rng)*0.3f; for(auto&v:Wd[e])v=nd(rng)*0.3f;
-    host_pack_weight(Bgd[e],Bgs[e],dqWg[e],Wg[e],mid_dim,in_dim);
-    host_pack_weight(Bud[e],Bus[e],dqWu[e],Wu[e],mid_dim,in_dim);
-    host_pack_weight(Bdd[e],Bds[e],dqWd[e],Wd[e],out_dim,mid_dim);
-  }
-  // routing: round-robin token->expert; per-token routing weight
-  std::vector<int> sel(T); std::vector<float> route(T);
-  for(int t=0;t<T;t++){ sel[t]=active[t%4]; route[t]=0.5f+std::abs(nd(rng))*0.5f; }
-  std::vector<uint32_t> counts(E,0); for(int t=0;t<T;t++) counts[sel[t]]++;
-  std::vector<uint32_t> padoff(E); uint32_t run=0; for(int e=0;e<E;e++){ padoff[e]=run; run+=(counts[e]+127u)/128u*128u; }
-  const int padded_total=(int)run;
-  // gather to padded rows (per-expert running index), record padded row per token for scatter
-  std::vector<float> xg((size_t)padded_total*in_dim,0.f), wg((size_t)padded_total,0.f);
-  std::vector<int> tok_row(T); std::vector<uint32_t> cur=padoff;
-  for(int t=0;t<T;t++){ uint32_t R=cur[sel[t]]++; tok_row[t]=(int)R;
-    for(int k=0;k<in_dim;k++) xg[(size_t)R*in_dim+k]=X[(size_t)t*in_dim+k]; wg[R]=route[t]; }
-  // oracle (double precision) per token
-  std::vector<float> dqX; host_quant_act(X,dqX,T,in_dim);
-  std::vector<float> mid((size_t)T*mid_dim), ref((size_t)T*out_dim,0.f), dqMid;
-  for(int t=0;t<T;t++){ int e=sel[t];
-    for(int j=0;j<mid_dim;j++){ double g=0,u=0; for(int k=0;k<in_dim;k++){ g+=(double)dqX[(size_t)t*in_dim+k]*dqWg[e][(size_t)j*in_dim+k]; u+=(double)dqX[(size_t)t*in_dim+k]*dqWu[e][(size_t)j*in_dim+k]; }
-      float gf=(float)g,uf=(float)u; if(clamp>1e-6f){if(gf>clamp)gf=clamp;if(uf>clamp)uf=clamp;if(uf<-clamp)uf=-clamp;} mid[(size_t)t*mid_dim+j]=(gf/(1.f+expf(-gf)))*uf*route[t]; } }
-  host_quant_act(mid,dqMid,T,mid_dim);
-  for(int t=0;t<T;t++){ int e=sel[t]; for(int o=0;o<out_dim;o++){ double a=0; for(int j=0;j<mid_dim;j++) a+=(double)dqMid[(size_t)t*mid_dim+j]*dqWd[e][(size_t)o*mid_dim+j]; ref[(size_t)t*out_dim+o]=(float)a; } }
-  // build device weight blobs [data||sf] per expert, stride = data + sf
-  const size_t gdata=(size_t)mid_dim*in_dim/2, gsf=Bgs[0].size()*sizeof(ElementSF);
-  const size_t ddata=(size_t)out_dim*mid_dim/2, dsf=Bds[0].size()*sizeof(ElementSF);
-  const uint64_t gstride=gdata+gsf, dstride=ddata+dsf;
-  std::vector<uint8_t> gate_blob((size_t)E*gstride), up_blob((size_t)E*gstride), down_blob((size_t)E*dstride);
-  for(int e=0;e<E;e++){
-    memcpy(gate_blob.data()+e*gstride, Bgd[e].data(), gdata); memcpy(gate_blob.data()+e*gstride+gdata, Bgs[e].data(), gsf);
-    memcpy(up_blob.data()  +e*gstride, Bud[e].data(), gdata); memcpy(up_blob.data()  +e*gstride+gdata, Bus[e].data(), gsf);
-    memcpy(down_blob.data()+e*dstride, Bdd[e].data(), ddata); memcpy(down_blob.data()+e*dstride+ddata, Bds[e].data(), dsf);
-  }
-  uint8_t *dGate,*dUp,*dDown; cudaMalloc(&dGate,gate_blob.size()); cudaMalloc(&dUp,up_blob.size()); cudaMalloc(&dDown,down_blob.size());
-  cudaMemcpy(dGate,gate_blob.data(),gate_blob.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dUp,up_blob.data(),up_blob.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dDown,down_blob.data(),down_blob.size(),cudaMemcpyHostToDevice);
-  float *dXg,*dWg2,*dFfn; cudaMalloc(&dXg,xg.size()*4); cudaMalloc(&dWg2,wg.size()*4); cudaMalloc(&dFfn,(size_t)padded_total*out_dim*4);
-  cudaMemcpy(dXg,xg.data(),xg.size()*4,cudaMemcpyHostToDevice); cudaMemcpy(dWg2,wg.data(),wg.size()*4,cudaMemcpyHostToDevice);
-  uint32_t *dCounts,*dPadoff; cudaMalloc(&dCounts,E*4); cudaMalloc(&dPadoff,E*4);
-  cudaMemcpy(dCounts,counts.data(),E*4,cudaMemcpyHostToDevice); cudaMemcpy(dPadoff,padoff.data(),E*4,cudaMemcpyHostToDevice);
-  size_t sb=pulsar_cutlass_grouped_moe_scratch_bytes(padded_total,E,in_dim,mid_dim,out_dim);
-  uint8_t *dScr; cudaMalloc(&dScr,sb);
-  int rc=pulsar_cutlass_grouped_moe(dFfn,dXg,dWg2,dGate,dUp,dDown,gstride,gdata,dstride,ddata,
-        clamp,E,in_dim,mid_dim,out_dim,dCounts,dPadoff,padded_total,dScr,sb);
-  cudaDeviceSynchronize();
-  std::vector<float> ffn((size_t)padded_total*out_dim); cudaMemcpy(ffn.data(),dFfn,ffn.size()*4,cudaMemcpyDeviceToHost);
-  double maxrel=0,maxabs=0; int bad=0;
-  for(int t=0;t<T;t++){ const float*o=ffn.data()+(size_t)tok_row[t]*out_dim; const float*r=ref.data()+(size_t)t*out_dim;
-    for(int c=0;c<out_dim;c++){ double a=fabs((double)o[c]-r[c]); double rr=a/(fabs(r[c])+1e-3); if(rr>maxrel)maxrel=rr; if(a>maxabs)maxabs=a; if(rr>0.05&&a>0.1)bad++; } }
-  printf("grouped(E=%d T=%d padded=%d): rc=%d max_rel=%.5f max_abs=%.4f bad=%d -> %s\n",
-         E,T,padded_total,rc,maxrel,maxabs,bad,(rc==0&&bad==0)?"PASS":"FAIL");
-  cudaFree(dGate);cudaFree(dUp);cudaFree(dDown);cudaFree(dXg);cudaFree(dWg2);cudaFree(dFfn);cudaFree(dCounts);cudaFree(dPadoff);cudaFree(dScr);
-  return (rc==0&&bad==0)?0:1;
-}
-
-int main(int argc,char**argv){
-  int T=256,in_dim=2048,mid_dim=1408,out_dim=2048;
-  if(argc>=5){T=atoi(argv[1]);in_dim=atoi(argv[2]);mid_dim=atoi(argv[3]);out_dim=atoi(argv[4]);}
-  std::mt19937 rng(7); std::normal_distribution<float> nd(0.f,1.f);
-  std::vector<float> X((size_t)T*in_dim), Wg((size_t)mid_dim*in_dim), Wu((size_t)mid_dim*in_dim), Wd((size_t)out_dim*mid_dim);
-  for(auto&v:X)v=nd(rng); for(auto&v:Wg)v=nd(rng)*0.3f; for(auto&v:Wu)v=nd(rng)*0.3f; for(auto&v:Wd)v=nd(rng)*0.3f;
-  // host-pack weights + dequant refs
-  std::vector<uint8_t> Wgd,Wud,Wdd; std::vector<ElementSF> Wgsf,Wusf,Wdsf; std::vector<float> dqWg,dqWu,dqWd,dqX;
-  host_pack_weight(Wgd,Wgsf,dqWg,Wg,mid_dim,in_dim);
-  host_pack_weight(Wud,Wusf,dqWu,Wu,mid_dim,in_dim);
-  host_pack_weight(Wdd,Wdsf,dqWd,Wd,out_dim,mid_dim);
-  host_quant_act(X,dqX,T,in_dim);
-  // validate source packer: float->(E2M1,E8M0)->CUTLASS must equal float->CUTLASS (byte-identical)
-  { std::vector<uint8_t> e2,e8; host_to_source(Wg,e2,e8,mid_dim,in_dim);
-    std::vector<uint8_t> Bd2(Wgd.size(),0); std::vector<ElementSF> Bsf2(Wgsf.size(),ElementSF::bitcast(127));
-    pulsar_cutlass_pack_source(Bd2.data(),Bsf2.data(),e2.data(),e8.data(),mid_dim,in_dim);
-    int dd=memcmp(Bd2.data(),Wgd.data(),Wgd.size());
-    int ds=memcmp(Bsf2.data(),Wgsf.data(),Wgsf.size()*sizeof(ElementSF));
-    printf("pack_source(E2M1+E8M0->CUTLASS) check: data=%s sf=%s\n", dd==0?"MATCH":"DIFFER", ds==0?"MATCH":"DIFFER"); }
-  // reference FFN using the same quantized values
-  std::vector<float> gate((size_t)T*mid_dim),up((size_t)T*mid_dim),mid((size_t)T*mid_dim),dqMid,ref((size_t)T*out_dim,0.f);
-  std::vector<float> W_route(T); for(auto&v:W_route) v=0.5f+std::abs(nd(rng))*0.5f;  // per-token routing weight
-  float clamp = 4.0f;
-  for(int t=0;t<T;t++)for(int j=0;j<mid_dim;j++){ double g=0,u=0; for(int k=0;k<in_dim;k++){ g+=(double)dqX[(size_t)t*in_dim+k]*dqWg[(size_t)j*in_dim+k]; u+=(double)dqX[(size_t)t*in_dim+k]*dqWu[(size_t)j*in_dim+k]; } gate[(size_t)t*mid_dim+j]=(float)g; up[(size_t)t*mid_dim+j]=(float)u; }
-  for(int t=0;t<T;t++)for(int j=0;j<mid_dim;j++){ size_t i=(size_t)t*mid_dim+j; float g=gate[i],u=up[i]; if(clamp>1e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;} float s=g/(1.f+expf(-g)); mid[i]=s*u*W_route[t]; }
-  host_quant_act(mid,dqMid,T,mid_dim);
-  for(int t=0;t<T;t++)for(int o=0;o<out_dim;o++){ double a=0; for(int j=0;j<mid_dim;j++) a+=(double)dqMid[(size_t)t*mid_dim+j]*dqWd[(size_t)o*mid_dim+j]; ref[(size_t)t*out_dim+o]=(float)a; }
-  // device buffers
-  float *dX,*dOut,*dWr; cudaMalloc(&dX,X.size()*4); cudaMalloc(&dOut,(size_t)T*out_dim*4); cudaMalloc(&dWr,(size_t)T*4);
-  cudaMemcpy(dX,X.data(),X.size()*4,cudaMemcpyHostToDevice);
-  cudaMemcpy(dWr,W_route.data(),(size_t)T*4,cudaMemcpyHostToDevice);
-  uint8_t *dWg,*dWu,*dWd; ElementSF *dWgs,*dWus,*dWds;
-  cudaMalloc(&dWg,Wgd.size()); cudaMalloc(&dWu,Wud.size()); cudaMalloc(&dWd,Wdd.size());
-  cudaMalloc(&dWgs,Wgsf.size()*sizeof(ElementSF)); cudaMalloc(&dWus,Wusf.size()*sizeof(ElementSF)); cudaMalloc(&dWds,Wdsf.size()*sizeof(ElementSF));
-  cudaMemcpy(dWg,Wgd.data(),Wgd.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWu,Wud.data(),Wud.size(),cudaMemcpyHostToDevice); cudaMemcpy(dWd,Wdd.data(),Wdd.size(),cudaMemcpyHostToDevice);
-  cudaMemcpy(dWgs,Wgsf.data(),Wgsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWus,Wusf.data(),Wusf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice); cudaMemcpy(dWds,Wdsf.data(),Wdsf.size()*sizeof(ElementSF),cudaMemcpyHostToDevice);
-  int rc=pulsar_cutlass_expert_ffn(dOut,dX,dWg,dWgs,dWu,dWus,dWd,dWds,dWr,clamp,T,in_dim,mid_dim,out_dim);
-  std::vector<float> got((size_t)T*out_dim); cudaMemcpy(got.data(),dOut,(size_t)T*out_dim*4,cudaMemcpyDeviceToHost);
-  double maxrel=0,maxabs=0; int bad=0;
-  for(size_t i=0;i<got.size();i++){ double a=fabs((double)got[i]-ref[i]); double r=a/(fabs(ref[i])+1e-3); if(r>maxrel)maxrel=r; if(a>maxabs)maxabs=a; if(r>0.05&&a>0.1)bad++; }
-  printf("rc=%d  max_rel=%.5f max_abs=%.4f bad=%d/%zu  -> %s\n", rc,maxrel,maxabs,bad,got.size(), (rc==0&&bad==0)?"PASS":"FAIL");
-  int single_fail = (rc==0&&bad==0)?0:1;
-  int grouped_fail = run_grouped_selfcheck();
-  return (single_fail==0 && grouped_fail==0)?0:1;
-}
-#endif
+/* An #ifdef PULSAR_MXFP4_STANDALONE self-check main() lived here until the
+ * 2026-08-22 types sweep.  Nothing ever defined the macro, its oracle modelled
+ * activations as FP4 (pre-W4A8), and it no longer compiled -- its
+ * pulsar_cutlass_grouped_moe call was four arguments short.  A silently absent
+ * self-check over exactly the format it was meant to pin is worse than none;
+ * the living oracle is temp/fp4gemv_test.cu plus the gate suite. */

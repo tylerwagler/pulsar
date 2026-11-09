@@ -1,0 +1,235 @@
+/** @file
+ *  The Nemotron-H chat format: renderer, reasoning-effort authority and output-parser configuration. */
+/* nemotron_chat.h -- the Nemotron-H chat format (L296 N8): the renderer, the effort authority and the output
+ * parser, as F5's frontend kit configured for Nemotron 3.5 Super's checkpoint.
+ *
+ * RENDERER.  `nemotron_chat_render` writes the text HF's `apply_chat_template(messages, tools=...,
+ * enable_thinking=..., medium_effort=..., add_generation_prompt=...)` writes with the checkpoint's
+ * chat_template.jinja (ChatML + <think>), byte for byte, and records the byte ranges it copied from CLIENT data
+ * (the L223 span map).  It is the ONE rendering authority for this family: the server, the CLI and every
+ * continuation suffix go through it.  What the template does that a reader might not expect, all of it rendered:
+ *   - a system turn is always written, empty when the conversation has no system message;
+ *   - message content is written as sent (no trim), except an assistant turn, which is trimmed whole;
+ *   - truncate_history_thinking (on: the template's default; no request sets it): an assistant turn before the
+ *     last user message loses its reasoning ("<think></think>" + what follows the last "</think>");
+ *   - medium effort appends "\n\n{reasoning effort: efficient}" to the LAST user message;
+ *   - a system message after the first renders in place, as a system turn; any other role renders as its own turn;
+ *   - a tool result opens a user turn after a non-tool message and closes it before one -- a tool result that is
+ *     the conversation's first message opens nothing (the template's loop.previtem test).
+ * IMAGES (L331).  A message's images render as the template's render_content writes a content list, followed by the
+ * processor's expansion of each `<image>` (processing_nemotron_h_omni.py: `<img>` + the image's `<image>` tokens +
+ * `</img>`, a text substitution before tokenisation): where image k sits, a "\n" first when text came since the last
+ * image and the content so far does not end in one, then "<image k>" when the message has more than one image (k from
+ * 1, per message), then the literal "<img><image></img>" outside client data (the engine's image front expands its
+ * `<image>` into the tile's block).  Images render in system, user and tool messages (render_content is the content
+ * of every turn); an assistant turn with an image is refused (image_position: a sampled turn never holds one, so its
+ * replay could not compose).  A message whose text spells "<image>" beside image parts renders as any other: the text
+ * stays text (L223) and each image goes where its part was -- a departure from the template, which would drop the
+ * image parts and let the processor fill the CLIENT's spelling (Tyler 2026-11-02: accept, not refuse).
+ * Refusals, by name: no_messages; tools_not_array; tool_name_missing; tool_arguments_not_json (a call's arguments
+ * text does not parse); tool_arguments_not_object (it parses to a non-object: the template's |items raises);
+ * raw_calls_without_calls; prompt_too_large; reasoning_without_thinking (the sampled-turn writer only);
+ * image_position.
+ *
+ * EFFORT.  The template knows three levels: thinking off (enable_thinking=false: the generation prompt closes an
+ * empty think block), medium (medium_effort: the last user message's suffix) and high (its default).
+ *
+ * OUTPUT PARSER.  The output-parser kit (out_parse_kit.h) in Nemotron's configuration: vLLM's nemotron_v3 reading
+ * (qwen3's grammar -- <think> / </think>, <tool_call> blocks with qwen3_coder's XML body, a call straight from
+ * reasoning ends it -- with trailing reasoning whitespace stripped) on qwen_chat.h's XML call body: one tool-call
+ * FORMAT, one reader (kernels -- and readers -- keyed by format, not family). */
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <string>
+#include <vector>
+
+#include "out_parse_kit.h"
+#include "pulsar.h"
+#include "pyjson.h"
+#include "qwen_chat.h"
+#include "chat_render_kit.h"
+
+/// The reasoning-effort levels the Nemotron template can express (the request's reasoning_effort, parsed).
+enum nemotron_effort {
+    NEMOTRON_EFFORT_NONE,     ///< enable_thinking=false
+    NEMOTRON_EFFORT_MEDIUM,   ///< medium_effort=true
+    NEMOTRON_EFFORT_HIGH,     ///< the template's default
+};
+
+/** The family's default effort: the template's own (thinking on, no medium suffix). */
+/// @return NEMOTRON_EFFORT_HIGH
+nemotron_effort nemotron_effort_default(void);
+/** "none", "medium", "high" -> the effort; false for anything else. */
+/// @param name the effort's name (may be NULL)
+/// @param out  receives the effort when `name` is known
+/// @return true when `name` is "none", "medium" or "high"
+bool nemotron_effort_parse(const char *name, nemotron_effort *out);
+/// The effort's name, as nemotron_effort_parse reads it.
+/// @param e the effort
+/// @return "none", "medium" or "high" ("?" for an out-of-range value)
+const char *nemotron_effort_name(nemotron_effort e);
+
+/** One tool call of an assistant message, as the API carries it. */
+struct nemotron_tool_call_in {
+    const char *name;       ///< function name
+    const char *arguments;  ///< the arguments object as JSON text; NULL or "" = none
+};
+
+/** One message.  `content` NULL renders as empty. */
+struct nemotron_msg_in {
+    const char *role;       ///< system | user | assistant | tool (any other role renders as its own turn)
+    /// The message text (client data); NULL renders as empty.
+    const char *content;
+    const char *reasoning;  ///< assistant reasoning_content; NULL = none
+    /// The assistant message's tool calls (n_calls of them); NULL when none.
+    const nemotron_tool_call_in *calls;
+    /// Number of entries in `calls`.
+    int n_calls;
+    /** The calls' SAMPLED bytes, from the first "<tool_call>" to the end of the last "</tool_call>" (the server's
+     *  tool memory): written in place of rendering `calls`, so a replayed turn byte-matches the live KV.  NULL =
+     *  render `calls`. */
+    const char *raw_calls;
+    /** L331: the byte offsets in `content` (ascending) where the message's images sit -- the template's
+     *  render_content writes each there (nemotron_chat_render, "IMAGES").  NULL / 0 = none. */
+    const uint32_t *image_at;
+    /// Number of entries in `image_at`.
+    int n_images;
+};
+
+/// A full render's request: the conversation, its tools and the effort.
+struct nemotron_render_in {
+    /// The conversation's messages, in order.
+    const nemotron_msg_in *msgs;
+    /// Number of entries in `msgs` (0 is refused as no_messages).
+    int n_msgs;
+    const char *tools_json;   ///< the request's tools array as JSON text; NULL = none
+    /// The thinking level the generation prompt and the medium suffix follow.
+    nemotron_effort effort;
+    /// End with nemotron_generation_prompt(effort).
+    bool add_generation_prompt;
+};
+
+/// A render's result: the prompt text and the client-data span map (the shared kit's, chat_render_kit.h).
+struct nemotron_render_out : chat_render_out {};
+
+/** Render.  false + "<refusal key>: detail" on refusal. */
+/// @param in     the conversation, tools and effort
+/// @param out    receives the text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
+bool nemotron_chat_render(const nemotron_render_in &in, nemotron_render_out *out, char *err, size_t errlen);
+
+/** L325: tool definitions in the tools block's encoding -- "<tools>", one function element per tool, "\n</tools>"
+ *  (the block without its head and call-format tail) -- for a tool loaded mid-conversation, rendered in place
+ *  inside the turn that loaded it.  `tools_json` is an OpenAI tools array.  Refusal: tools_not_array. */
+/// @param tools_json the OpenAI tools array as JSON text
+/// @param out        receives the tools block's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal
+bool nemotron_chat_tool_defs(const char *tools_json, nemotron_render_out *out, char *err, size_t errlen);
+
+/** The assistant turn `m` as the model SAMPLES it after the generation prompt -- the bytes the full render writes
+ *  for the turn (it is after the last user message: nothing is truncated) past "<|im_start|>assistant\n<think>\n"
+ *  with `thinking`, past "<|im_start|>assistant\n<think></think>" without: reasoning, "</think>", content (the turn
+ *  trimmed at its end), then "\n" and the calls (or `raw_calls`) and "<|im_end|>\n" -- or, with no call,
+ *  "<|im_end|>\n" alone.  A turn with no reasoning replays as an empty one ("</think>" right after the prompt's
+ *  "<think>\n" is NOT the template's "<think></think>": a thinking-on turn without reasoning does not compose, and
+ *  is refused as reasoning_missing).  Refusals: reasoning_without_thinking, reasoning_missing, and the calls'. */
+/// @param m        the assistant message
+/// @param thinking the generation prompt opened a think block
+/// @param out      receives the turn's bytes and their client-span map
+/// @param err      receives "<refusal key>: detail" on refusal
+/// @param errlen   size of `err`
+/// @return true on success, false on refusal
+bool nemotron_chat_render_assistant_turn(const nemotron_msg_in &m, bool thinking, nemotron_render_out *out, char *err,
+                                         size_t errlen);
+
+/** A continuation tail after a sampled turn (nemotron_chat_render_assistant_turn's bytes): `msgs` as the full
+ *  render places them after an assistant turn (a tool result opens the user turn; consecutive results share it),
+ *  then the generation prompt for `effort`.  full(history) + sampled turn + this = full(history + turn + msgs) when
+ *  `msgs` holds no user message (a user message moves last_user_idx: the template then truncates the sampled turn's
+ *  reasoning and moves the medium suffix -- the prefix does not compose, by the template's design). */
+/// @param msgs   the messages after the sampled turn
+/// @param n      entries in `msgs`
+/// @param effort the effort the generation prompt follows
+/// @param out    receives the tail's text and its client-span map
+/// @param err    receives "<refusal key>: detail" on refusal
+/// @param errlen size of `err`
+/// @return true on success, false on refusal
+bool nemotron_chat_render_tail(const nemotron_msg_in *msgs, int n, nemotron_effort effort, nemotron_render_out *out,
+                               char *err, size_t errlen);
+
+/** The head of a conversation built turn by turn (the CLI REPL and the agent): the system turn with `system`
+ *  (NULL = empty) and the tools block of `tools_json` (NULL or [] = none; L365: the agent's tools) -- the bytes the
+ *  full render writes before the first non-system message. */
+/// @param system     the system text (client data), or NULL for an empty system turn
+/// @param tools_json an OpenAI tools array as JSON text, or NULL for none
+/// @param out        receives the head's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal (tools_not_array)
+bool nemotron_chat_render_head(const char *system, const char *tools_json, nemotron_render_out *out, char *err,
+                               size_t errlen);
+
+/** One TURN of a conversation built turn by turn: `msgs` as the full render writes them after the head or an
+ *  assistant turn's close (the medium suffix on the turn's last user message), then the generation prompt for
+ *  `effort` when `generation_prompt`. */
+/// @param msgs              the turn's messages
+/// @param n                 entries in `msgs`
+/// @param effort            the effort the medium suffix and the generation prompt follow
+/// @param generation_prompt end with nemotron_generation_prompt(effort)
+/// @param out               receives the turn's text and its client-span map
+/// @param err               receives "<refusal key>: detail" on refusal
+/// @param errlen            size of `err`
+/// @return true on success, false on refusal
+bool nemotron_chat_render_turn(const nemotron_msg_in *msgs, int n, nemotron_effort effort, bool generation_prompt,
+                               nemotron_render_out *out, char *err, size_t errlen);
+
+/** The generation prompt for `effort` (the template's last bytes with add_generation_prompt). */
+/// @param effort the effort
+/// @return a static string: "<|im_start|>assistant\n<think></think>" for NONE, else "<|im_start|>assistant\n<think>\n"
+const char *nemotron_generation_prompt(nemotron_effort effort);
+
+/** Tool memory: the run of consecutive tool-call blocks (whitespace between them) at or after `p` -- one turn's
+ *  calls; `*end` = one past it.  NULL = none (an unclosed block is not a key). */
+/// @param p   NUL-terminated text to search
+/// @param end receives one past the block run's last "</tool_call>"
+/// @return the run's first "<tool_call>", or NULL when there is no closed block
+const char *nemotron_find_call_block(const char *p, const char **end);
+
+/** The text of the system turn a rendered prompt opens with (the tools block and the client's system text), or ""
+ *  when the prompt has none: what a tool error reminds the model of. */
+/// @param prompt a rendered prompt (may be NULL)
+/// @return the system turn's text, stripped, or "" when the prompt opens with no system turn
+std::string nemotron_rendered_system_text(const char *prompt);
+
+/** Nemotron's output grammar for the kit (vLLM's nemotron_v3: qwen3_config + strip_trailing_reasoning_whitespace):
+ *  `</think>` ends the reasoning the generation prompt opened (a stray one in content is dropped, a repeated
+ *  `<think>` in reasoning too); `<tool_call>` opens a call from reasoning or content; `</tool_call>` closes it.
+ *  Reasoning is reported with its trailing whitespace dropped; content verbatim until a call opens, then trimmed. */
+/// @return the family's grammar (static storage)
+const out_grammar &nemotron_output_grammar(void);
+
+/** The sampled-text parser for one Nemotron assistant turn: the kit in Nemotron's configuration. */
+class nemotron_output_parser : public out_parser {
+public:
+    /** `thinking`: the generation prompt opened a think block (the turn starts in reasoning).  `tools_json`: the
+     *  request's tools (NULL for none) -- the schema that types arguments.  false + reason if tools_json is not a
+     *  JSON array. */
+    /// @param thinking   the turn starts in OUT_REASONING
+    /// @param tools_json the request's tools array as JSON text, or NULL
+    /// @param err        receives "tools_not_array: <detail>" on failure
+    /// @param errlen     its size
+    /// @return true when the parser is ready for the turn
+    bool init(bool thinking, const char *tools_json, char *err, size_t errlen);
+    out_parser *clone() const override;
+
+private:
+    /// The call-body reader (Qwen's XML format, Python scalar spelling), schema-typed by the request's tools.
+    qwen_xml_call_body body_;
+};

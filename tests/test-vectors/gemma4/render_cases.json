@@ -1,0 +1,4161 @@
+[
+{
+"name": "plain",
+"messages": [
+{
+"role": "user",
+"content": "Hello there"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nHello there<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+28
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+9259,
+993,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "plain_nogen",
+"messages": [
+{
+"role": "user",
+"content": "Hello there"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": false,
+"expect": {
+"text": "<bos><|turn>user\nHello there<turn|>\n",
+"spans": [
+[
+17,
+28
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+9259,
+993,
+106,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "plain_thinking",
+"messages": [
+{
+"role": "user",
+"content": "Hello there"
+}
+],
+"tools": null,
+"thinking": true,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nHello there<turn|>\n<|turn>model\n",
+"spans": [
+[
+49,
+60
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+106,
+107,
+105,
+2364,
+107,
+9259,
+993,
+106,
+107,
+105,
+4368,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "system",
+"messages": [
+{
+"role": "system",
+"content": "  Be terse.  "
+},
+{
+"role": "user",
+"content": "  hi  "
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\nBe terse.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+19,
+28
+],
+[
+48,
+50
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+3912,
+17514,
+236761,
+106,
+107,
+105,
+2364,
+107,
+2202,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "developer",
+"messages": [
+{
+"role": "developer",
+"content": "Dev rules."
+},
+{
+"role": "user",
+"content": "hi"
+}
+],
+"tools": null,
+"thinking": true,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\nDev rules.<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n",
+"spans": [
+[
+29,
+39
+],
+[
+59,
+61
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+11062,
+6366,
+236761,
+106,
+107,
+105,
+2364,
+107,
+2202,
+106,
+107,
+105,
+4368,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "system_later",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "b"
+},
+{
+"role": "system",
+"content": "late system"
+},
+{
+"role": "user",
+"content": "c"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>system\nlate system<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+18
+],
+[
+39,
+40
+],
+[
+62,
+73
+],
+[
+93,
+94
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+236763,
+106,
+107,
+105,
+9731,
+107,
+7736,
+1458,
+106,
+107,
+105,
+2364,
+107,
+236755,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "multi_turn",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": " b "
+},
+{
+"role": "user",
+"content": "c"
+},
+{
+"role": "assistant",
+"content": "d"
+},
+{
+"role": "user",
+"content": "e"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\nd<turn|>\n<|turn>user\ne<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+18
+],
+[
+39,
+40
+],
+[
+60,
+61
+],
+[
+82,
+83
+],
+[
+103,
+104
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+236763,
+106,
+107,
+105,
+2364,
+107,
+236755,
+106,
+107,
+105,
+4368,
+107,
+236753,
+106,
+107,
+105,
+2364,
+107,
+236744,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "assistant_last_nogen",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "b"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": false,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n",
+"spans": [
+[
+17,
+18
+],
+[
+39,
+40
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+236763,
+106,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "assistant_last_gen",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "b"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+18
+],
+[
+39,
+40
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+236763,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "reasoning_after_last_user",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "ans",
+"reasoning_content": "thinking hard"
+}
+],
+"tools": null,
+"thinking": true,
+"gen": false,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\n<|channel>thought\nthinking hard\n<channel|>ans<turn|>\n",
+"spans": [
+[
+49,
+50
+],
+[
+89,
+102
+],
+[
+113,
+116
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+106,
+107,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+64980,
+2651,
+107,
+101,
+743,
+106,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "reasoning_before_last_user",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "ans",
+"reasoning_content": "old thought"
+},
+{
+"role": "user",
+"content": "b"
+}
+],
+"tools": null,
+"thinking": true,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nans<turn|>\n<|turn>user\nb<turn|>\n<|turn>model\n",
+"spans": [
+[
+49,
+50
+],
+[
+71,
+74
+],
+[
+94,
+95
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+106,
+107,
+105,
+2364,
+107,
+236746,
+106,
+107,
+105,
+4368,
+107,
+743,
+106,
+107,
+105,
+2364,
+107,
+236763,
+106,
+107,
+105,
+4368,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "strip_thinking",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "pre<|channel>thought\nhidden<channel|>post"
+},
+{
+"role": "user",
+"content": "b"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nprepost<turn|>\n<|turn>user\nb<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": null
+}
+},
+{
+"name": "strip_thinking_unclosed",
+"messages": [
+{
+"role": "user",
+"content": "a"
+},
+{
+"role": "assistant",
+"content": "x<|channel>never closed"
+},
+{
+"role": "user",
+"content": "b"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nx<turn|>\n<|turn>user\nb<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": null
+}
+},
+{
+"name": "tools_block",
+"messages": [
+{
+"role": "user",
+"content": "weather?"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nweather?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+715,
+723
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+19323,
+236881,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "tools_block_thinking",
+"messages": [
+{
+"role": "system",
+"content": "sys"
+},
+{
+"role": "user",
+"content": "weather?"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": true,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\nsys<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nweather?<turn|>\n<|turn>model\n",
+"spans": [
+[
+29,
+32
+],
+[
+728,
+736
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+16648,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+19323,
+236881,
+106,
+107,
+105,
+4368,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "tools_rich",
+"messages": [
+{
+"role": "user",
+"content": "find"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "search",
+"description": "Search.",
+"parameters": {
+"type": "object",
+"properties": {
+"q": {
+"type": "string"
+},
+"filters": {
+"type": "array",
+"items": {
+"type": "object",
+"properties": {
+"k": {
+"type": "string"
+}
+},
+"required": [
+"k"
+],
+"description": null
+}
+},
+"modes": {
+"type": "array",
+"items": {
+"type": [
+"string",
+"null"
+],
+"enum": [
+"a",
+"b"
+]
+}
+}
+}
+},
+"response": {
+"description": "hits",
+"type": "object"
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "noargs",
+"description": "No parameters."
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:search{description:<|\"|>Search.<|\"|>,parameters:{properties:{filters:{items:{properties:{k:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>k<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>},modes:{items:{enum:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],type:[<|\"|>STRING<|\"|>,<|\"|>NULL<|\"|>]},type:<|\"|>ARRAY<|\"|>},q:{type:<|\"|>STRING<|\"|>}},type:<|\"|>OBJECT<|\"|>},response:{description:<|\"|>hits<|\"|>,type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:noargs{description:<|\"|>No parameters.<|\"|>}<tool|><turn|>\n<|turn>user\nfind<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+536,
+540
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+2305,
+236782,
+7777,
+236787,
+52,
+8980,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+28881,
+29616,
+7633,
+29616,
+15921,
+29616,
+236767,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+236767,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+89351,
+29616,
+7633,
+29616,
+24626,
+24845,
+52,
+236746,
+52,
+236764,
+52,
+236763,
+52,
+1604,
+2084,
+24845,
+52,
+35410,
+52,
+236764,
+52,
+14057,
+52,
+59117,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+236809,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+6275,
+29616,
+7777,
+236787,
+52,
+66743,
+52,
+236764,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+46,
+163688,
+236787,
+1904,
+5985,
+236782,
+7777,
+236787,
+52,
+3771,
+6137,
+236761,
+52,
+236783,
+47,
+106,
+107,
+105,
+2364,
+107,
+4114,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "call_and_result",
+"messages": [
+{
+"role": "user",
+"content": "weather in Paris?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "c1",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\", \"days\": 3, \"opts\": {\"Zeta\": true, \"alpha\": 1.5}, \"tags\": [\"x\", null]}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "{\"temp\": 21}",
+"tool_call_id": "c1"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nweather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,opts:{alpha:1.5,Zeta:true},tags:[<|\"|>x<|\"|>,null],unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\": 21}<|\"|>}<tool_response|>",
+"spans": [
+[
+715,
+732
+],
+[
+770,
+781
+],
+[
+782,
+786
+],
+[
+792,
+797
+],
+[
+803,
+807
+],
+[
+810,
+814
+],
+[
+816,
+821
+],
+[
+826,
+830
+],
+[
+837,
+841
+],
+[
+848,
+849
+],
+[
+861,
+865
+],
+[
+871,
+878
+],
+[
+921,
+932
+],
+[
+944,
+956
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+19323,
+528,
+9079,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+50429,
+52,
+236764,
+14356,
+236787,
+236800,
+236764,
+33997,
+29616,
+2482,
+236787,
+236770,
+236761,
+236810,
+236764,
+236953,
+1766,
+236787,
+3397,
+1263,
+19112,
+24845,
+52,
+236781,
+52,
+236764,
+6455,
+1604,
+6805,
+236787,
+52,
+236755,
+42024,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+52,
+14937,
+7617,
+1083,
+236743,
+236778,
+236770,
+236783,
+52,
+236783,
+51
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "call_and_result_thinking",
+"messages": [
+{
+"role": "user",
+"content": "weather?"
+},
+{
+"role": "assistant",
+"content": "",
+"reasoning_content": "need tool",
+"tool_calls": [
+{
+"id": "c1",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"Oslo\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "cold",
+"tool_call_id": "c1"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": true,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nweather?<turn|>\n<|turn>model\n<|channel>thought\nneed tool\n<channel|><|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>cold<|\"|>}<tool_response|><|channel>thought\n",
+"spans": [
+[
+725,
+733
+],
+[
+772,
+781
+],
+[
+809,
+820
+],
+[
+821,
+825
+],
+[
+831,
+835
+],
+[
+878,
+889
+],
+[
+901,
+905
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+98,
+107,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+19323,
+236881,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+25109,
+5904,
+107,
+101,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+23458,
+844,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+52,
+66471,
+52,
+236783,
+51,
+100,
+45518,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "call_result_then_answer",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "c1",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"Rome\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "sunny",
+"tool_call_id": "c1"
+},
+{
+"role": "assistant",
+"content": "It is sunny."
+},
+{
+"role": "user",
+"content": "thanks"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Rome<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>sunny<|\"|>}<tool_response|>It is sunny.<turn|>\n<|turn>user\nthanks<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+715,
+717
+],
+[
+755,
+766
+],
+[
+767,
+771
+],
+[
+777,
+781
+],
+[
+824,
+835
+],
+[
+847,
+852
+],
+[
+874,
+886
+],
+[
+906,
+912
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+97375,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+52,
+185060,
+52,
+236783,
+51,
+1509,
+563,
+17635,
+236761,
+106,
+107,
+105,
+2364,
+107,
+43849,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "two_calls_two_results",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": "checking",
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"A\"}"
+}
+},
+{
+"id": "b",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"B\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "ra",
+"tool_call_id": "a"
+},
+{
+"role": "tool",
+"content": "rb",
+"tool_call_id": "b"
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "get_weather",
+"description": "Get the current weather for a city.",
+"parameters": {
+"type": "object",
+"properties": {
+"city": {
+"type": "string",
+"description": "City name"
+},
+"unit": {
+"type": "string",
+"enum": [
+"celsius",
+"fahrenheit"
+]
+},
+"days": {
+"type": "integer",
+"description": "Forecast days",
+"nullable": true
+},
+"tags": {
+"type": "array",
+"items": {
+"type": "string"
+}
+},
+"opts": {
+"type": "object",
+"properties": {
+"Zeta": {
+"type": "boolean"
+},
+"alpha": {
+"type": "number"
+}
+},
+"required": [
+"alpha"
+]
+},
+"Mixed": {
+"type": "object",
+"description": "free-form",
+"extra_key": 5
+}
+},
+"required": [
+"city"
+]
+}
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Get the current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},days:{description:<|\"|>Forecast days<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>},Mixed:{description:<|\"|>free-form<|\"|>,properties:{extra_key:{type:<|\"|><|\"|>}},type:<|\"|>OBJECT<|\"|>},opts:{properties:{alpha:{type:<|\"|>NUMBER<|\"|>},Zeta:{type:<|\"|>BOOLEAN<|\"|>}},required:[<|\"|>alpha<|\"|>],type:<|\"|>OBJECT<|\"|>},tags:{items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>A<|\"|>}<tool_call|><|tool_call>call:get_weather{city:<|\"|>B<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>ra<|\"|>}<tool_response|><|tool_response>response:get_weather{value:<|\"|>rb<|\"|>}<tool_response|>checking<turn|>\n",
+"spans": [
+[
+715,
+717
+],
+[
+755,
+766
+],
+[
+767,
+771
+],
+[
+777,
+778
+],
+[
+813,
+824
+],
+[
+825,
+829
+],
+[
+835,
+836
+],
+[
+879,
+890
+],
+[
+902,
+904
+],
+[
+951,
+962
+],
+[
+974,
+976
+],
+[
+998,
+1006
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+828,
+236779,
+19323,
+236782,
+7777,
+236787,
+52,
+3407,
+506,
+1873,
+7606,
+573,
+496,
+3207,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+13319,
+29616,
+7777,
+236787,
+52,
+17698,
+1463,
+52,
+236764,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+14356,
+29616,
+7777,
+236787,
+52,
+101170,
+2668,
+52,
+236764,
+35951,
+236787,
+3397,
+236764,
+2084,
+236787,
+52,
+86752,
+52,
+1263,
+105367,
+29616,
+7777,
+236787,
+52,
+6796,
+236772,
+845,
+52,
+236764,
+15921,
+29616,
+27909,
+236779,
+2478,
+29616,
+2084,
+236787,
+52,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+33997,
+29616,
+15921,
+29616,
+2482,
+29616,
+2084,
+236787,
+52,
+38631,
+52,
+1263,
+236953,
+1766,
+29616,
+2084,
+236787,
+52,
+166264,
+1536,
+52,
+5237,
+15979,
+24845,
+52,
+2482,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+19112,
+29616,
+7633,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+6805,
+29616,
+24626,
+24845,
+52,
+236755,
+42024,
+52,
+236764,
+52,
+46435,
+15882,
+52,
+1604,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+13319,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+106,
+107,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236776,
+52,
+236783,
+49,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236799,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+52,
+601,
+52,
+236783,
+51,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+52,
+10370,
+52,
+236783,
+51,
+73357,
+106,
+107
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "result_name_fallback",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"A\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "r",
+"tool_call_id": "zz",
+"name": "other"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>A<|\"|>}<tool_call|><|tool_response>response:other{value:<|\"|>r<|\"|>}<tool_response|>",
+"spans": [
+[
+17,
+19
+],
+[
+57,
+68
+],
+[
+69,
+73
+],
+[
+79,
+80
+],
+[
+123,
+128
+],
+[
+140,
+141
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236776,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+1538,
+236782,
+2394,
+236787,
+52,
+236750,
+52,
+236783,
+51
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "result_unknown",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"A\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "r",
+"tool_call_id": "zz"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>A<|\"|>}<tool_call|><|tool_response>response:unknown{value:<|\"|>r<|\"|>}<tool_response|>",
+"spans": [
+[
+17,
+19
+],
+[
+57,
+68
+],
+[
+69,
+73
+],
+[
+79,
+80
+],
+[
+142,
+143
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236776,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+20774,
+236782,
+2394,
+236787,
+52,
+236750,
+52,
+236783,
+51
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "result_null_body",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"A\"}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": null,
+"tool_call_id": "a"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>A<|\"|>}<tool_call|><|tool_response>response:get_weather{value:null}<tool_response|>",
+"spans": [
+[
+17,
+19
+],
+[
+57,
+68
+],
+[
+69,
+73
+],
+[
+79,
+80
+],
+[
+123,
+134
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236776,
+52,
+236783,
+49,
+50,
+6275,
+236787,
+828,
+236779,
+19323,
+236782,
+2394,
+236787,
+6455,
+236783,
+51
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "call_no_result_gen",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "get_weather",
+"arguments": "{\"city\": \"A\"}"
+}
+}
+]
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>A<|\"|>}<tool_call|><|tool_response>",
+"spans": [
+[
+17,
+19
+],
+[
+57,
+68
+],
+[
+69,
+73
+],
+[
+79,
+80
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+828,
+236779,
+19323,
+236782,
+13319,
+236787,
+52,
+236776,
+52,
+236783,
+49,
+50
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "call_null_args",
+"messages": [
+{
+"role": "user",
+"content": "w?"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "noargs",
+"arguments": "null"
+}
+}
+]
+}
+],
+"tools": [
+{
+"type": "function",
+"function": {
+"name": "search",
+"description": "Search.",
+"parameters": {
+"type": "object",
+"properties": {
+"q": {
+"type": "string"
+},
+"filters": {
+"type": "array",
+"items": {
+"type": "object",
+"properties": {
+"k": {
+"type": "string"
+}
+},
+"required": [
+"k"
+],
+"description": null
+}
+},
+"modes": {
+"type": "array",
+"items": {
+"type": [
+"string",
+"null"
+],
+"enum": [
+"a",
+"b"
+]
+}
+}
+}
+},
+"response": {
+"description": "hits",
+"type": "object"
+}
+}
+},
+{
+"type": "function",
+"function": {
+"name": "noargs",
+"description": "No parameters."
+}
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>system\n<|tool>declaration:search{description:<|\"|>Search.<|\"|>,parameters:{properties:{filters:{items:{properties:{k:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>k<|\"|>],type:<|\"|>OBJECT<|\"|>},type:<|\"|>ARRAY<|\"|>},modes:{items:{enum:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],type:[<|\"|>STRING<|\"|>,<|\"|>NULL<|\"|>]},type:<|\"|>ARRAY<|\"|>},q:{type:<|\"|>STRING<|\"|>}},type:<|\"|>OBJECT<|\"|>},response:{description:<|\"|>hits<|\"|>,type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:noargs{description:<|\"|>No parameters.<|\"|>}<tool|><turn|>\n<|turn>user\nw?<turn|>\n<|turn>model\n<|tool_call>call:noargs{}<tool_call|><|tool_response>",
+"spans": [
+[
+536,
+538
+],
+[
+576,
+582
+]
+],
+"ids": [
+2,
+105,
+9731,
+107,
+46,
+163688,
+236787,
+2305,
+236782,
+7777,
+236787,
+52,
+8980,
+236761,
+52,
+236764,
+19031,
+29616,
+15921,
+29616,
+28881,
+29616,
+7633,
+29616,
+15921,
+29616,
+236767,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+15979,
+24845,
+52,
+236767,
+52,
+1604,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+89351,
+29616,
+7633,
+29616,
+24626,
+24845,
+52,
+236746,
+52,
+236764,
+52,
+236763,
+52,
+1604,
+2084,
+24845,
+52,
+35410,
+52,
+236764,
+52,
+14057,
+52,
+59117,
+2084,
+236787,
+52,
+48832,
+52,
+1263,
+236809,
+29616,
+2084,
+236787,
+52,
+35410,
+52,
+5237,
+2084,
+236787,
+52,
+60688,
+52,
+1263,
+6275,
+29616,
+7777,
+236787,
+52,
+66743,
+52,
+236764,
+2084,
+236787,
+52,
+60688,
+52,
+1807,
+47,
+46,
+163688,
+236787,
+1904,
+5985,
+236782,
+7777,
+236787,
+52,
+3771,
+6137,
+236761,
+52,
+236783,
+47,
+106,
+107,
+105,
+2364,
+107,
+236765,
+236881,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+1904,
+5985,
+16454,
+49,
+50
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "orphan_tool",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "tool",
+"content": "orphan",
+"tool_call_id": "q"
+},
+{
+"role": "user",
+"content": "y"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nx<turn|>\n<|turn>user\ny<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+18
+],
+[
+38,
+39
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236781,
+106,
+107,
+105,
+2364,
+107,
+236762,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "consecutive_assistants",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": "one"
+},
+{
+"role": "assistant",
+"content": "two"
+},
+{
+"role": "user",
+"content": "y"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nx<turn|>\n<|turn>model\nonetwo<turn|>\n<|turn>user\ny<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+18
+],
+[
+39,
+45
+],
+[
+65,
+66
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236781,
+106,
+107,
+105,
+4368,
+107,
+90002,
+1014,
+106,
+107,
+105,
+2364,
+107,
+236762,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "args_nested",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "f",
+"arguments": "{\"b\": [1, 2.0, -3e-07, true, null, \"q\"], \"A\": {\"Z\": \"z\", \"a\": {}}, \"c\": 100000000000000000000}"
+}
+}
+]
+},
+{
+"role": "tool",
+"content": "ok",
+"tool_call_id": "a"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nx<turn|>\n<|turn>model\n<|tool_call>call:f{A:{a:{},Z:<|\"|>z<|\"|>},b:[1,2.0,-3e-07,true,null,<|\"|>q<|\"|>],c:100000000000000000000}<tool_call|><|tool_response>response:f{value:<|\"|>ok<|\"|>}<tool_response|>",
+"spans": [
+[
+17,
+18
+],
+[
+56,
+57
+],
+[
+58,
+59
+],
+[
+61,
+62
+],
+[
+66,
+67
+],
+[
+73,
+74
+],
+[
+81,
+82
+],
+[
+112,
+113
+],
+[
+120,
+121
+],
+[
+181,
+182
+],
+[
+194,
+196
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+236781,
+106,
+107,
+105,
+4368,
+107,
+48,
+6639,
+236787,
+236760,
+236782,
+236776,
+29616,
+236746,
+29616,
+1263,
+236953,
+236787,
+52,
+236802,
+52,
+1263,
+236763,
+24845,
+236770,
+236764,
+236778,
+236761,
+236771,
+10442,
+236800,
+236744,
+236772,
+236771,
+236832,
+236764,
+3397,
+236764,
+6455,
+236764,
+52,
+236809,
+52,
+1604,
+236755,
+236787,
+236770,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236771,
+236783,
+49,
+50,
+6275,
+236787,
+236760,
+236782,
+2394,
+236787,
+52,
+680,
+52,
+236783,
+51
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "client_markers",
+"messages": [
+{
+"role": "user",
+"content": "say <|turn> and <turn|> and <|\"|>"
+},
+{
+"role": "assistant",
+"content": "ok <|tool_call>"
+},
+{
+"role": "user",
+"content": "<bos>"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\nsay <|turn> and <turn|> and <|\"|><turn|>\n<|turn>model\nok <|tool_call><turn|>\n<|turn>user\n<bos><turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+50
+],
+[
+71,
+86
+],
+[
+106,
+111
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+30468,
+655,
+236909,
+887,
+236813,
+532,
+655,
+887,
+111038,
+532,
+655,
+153857,
+111038,
+106,
+107,
+105,
+4368,
+107,
+680,
+655,
+236909,
+13205,
+236779,
+6639,
+236813,
+106,
+107,
+105,
+2364,
+107,
+236820,
+46757,
+236813,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "guarded"
+}
+},
+{
+"name": "unicode",
+"messages": [
+{
+"role": "user",
+"content": "\u65e5\u672c\u8a9e \ud83d\ude42 \u00e9\u0301 \u2581 tab\tend"
+},
+{
+"role": "assistant",
+"content": "r\u00e9ponse"
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"text": "<bos><|turn>user\n\u65e5\u672c\u8a9e \ud83d\ude42 \u00e9\u0301 \u2581 tab\tend<turn|>\n<|turn>model\nr\u00e9ponse<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+"spans": [
+[
+17,
+48
+],
+[
+69,
+77
+]
+],
+"ids": [
+2,
+105,
+2364,
+107,
+94951,
+57235,
+1559,
+238288,
+139,
+4823,
+255968,
+643,
+106,
+107,
+105,
+4368,
+107,
+11460,
+4826,
+106,
+107,
+105,
+4368,
+107,
+100,
+45518,
+107,
+101
+],
+"ids_kind": "hf"
+}
+},
+{
+"name": "refuse_args_string",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "f",
+"arguments": "\"{\\\"k\\\": 1}\""
+}
+}
+]
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "tool_arguments_not_object"
+}
+},
+{
+"name": "refuse_args_list",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "f",
+"arguments": "[1, 2]"
+}
+}
+]
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "tool_arguments_not_object"
+}
+},
+{
+"name": "refuse_args_not_json",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "f",
+"arguments": "{bad"
+}
+}
+]
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "tool_arguments_not_json"
+}
+},
+{
+"name": "refuse_args_missing",
+"messages": [
+{
+"role": "user",
+"content": "x"
+},
+{
+"role": "assistant",
+"content": null,
+"tool_calls": [
+{
+"id": "a",
+"type": "function",
+"function": {
+"name": "f",
+"arguments": ""
+}
+}
+]
+}
+],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "tool_arguments_missing"
+}
+},
+{
+"name": "refuse_tool_no_function",
+"messages": [
+{
+"role": "user",
+"content": "x"
+}
+],
+"tools": [
+{
+"type": "function",
+"name": "flat"
+}
+],
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "tool_function_missing"
+}
+},
+{
+"name": "refuse_empty",
+"messages": [],
+"tools": null,
+"thinking": false,
+"gen": true,
+"expect": {
+"refusal": "no_messages"
+}
+}
+]

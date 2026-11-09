@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: the edit and search tools. */
 #include "pulsar_agent_internal.h"
 
 
@@ -7,6 +9,13 @@
  * ============================================================================
  */
 
+/** @brief Write `len` bytes to `path`, truncating it.
+ *  @param path   the file
+ *  @param data   bytes to write
+ *  @param len    byte count
+ *  @param err    receives the failure (open / write / close and errno text)
+ *  @param errlen bytes at `err`
+ *  @return 0, or -1 with `err` set */
 static int agent_write_file_bytes(const char *path, const char *data, size_t len,
                                   char *err, size_t errlen) {
     FILE *fp = fopen(path, "wb");
@@ -29,6 +38,11 @@ static int agent_write_file_bytes(const char *path, const char *data, size_t len
 
 
 
+/** @brief Append one numbered line ("<line> <text>\n", the line's content without its terminator) to `b`.
+ *  @param b    the result buffer
+ *  @param data the file's bytes
+ *  @param sp   the line's span in `data`
+ *  @param line its 1-based line number */
 static void agent_edit_result_append_line(agent_buf *b, const char *data,
                                           const agent_line_span *sp,
                                           int line) {
@@ -101,6 +115,12 @@ void agent_edit_result_append_context(agent_buf *b,
 
 
 
+/** @brief Find the first occurrence of `needle` in `hay` (bytes, not NUL-terminated).
+ *  @param hay        the haystack
+ *  @param hay_len    bytes at `hay`
+ *  @param needle     the needle
+ *  @param needle_len bytes at `needle`; 0 matches at `hay`
+ *  @return a pointer into `hay`, or NULL */
 static const char *agent_memmem_simple(const char *hay, size_t hay_len,
                                        const char *needle, size_t needle_len) {
     if (!needle_len) return hay;
@@ -115,6 +135,16 @@ static const char *agent_memmem_simple(const char *hay, size_t hay_len,
 
 
 
+/** @brief Find `needle` in the file, requiring exactly one occurrence.
+ *  @param data       the file's bytes
+ *  @param len        bytes at `data`
+ *  @param needle     the text to find
+ *  @param needle_len bytes at `needle`; 0 refuses
+ *  @param match      receives the occurrence on success
+ *  @param label      what the needle is, for the error ("old text", ...)
+ *  @param err        receives why it failed (empty, not found, not unique)
+ *  @param err_len    bytes at `err`
+ *  @return true with `*match` set, false with `err` set */
 static bool agent_find_unique(const char *data, size_t len,
                               const char *needle, size_t needle_len,
                               const char **match, const char *label,
@@ -149,6 +179,17 @@ static bool agent_find_unique(const char *data, size_t len,
  * may legitimately appear earlier in the file, so checking global uniqueness
  * would reject valid edits.
  */
+/// @brief agent_find_unique, searching only from `start` (see above).
+/// @param data       the file's bytes
+/// @param len        bytes at `data`
+/// @param start      where the search starts, inside [data, data + len]
+/// @param needle     the text to find
+/// @param needle_len bytes at `needle`; 0 refuses
+/// @param match      receives the occurrence on success
+/// @param label      what the needle is, for the error
+/// @param err        receives why it failed
+/// @param err_len    bytes at `err`
+/// @return true with `*match` set, false with `err` set
 static bool agent_find_unique_after(const char *data, size_t len,
                                     const char *start,
                                     const char *needle, size_t needle_len,
@@ -183,6 +224,10 @@ static bool agent_find_unique_after(const char *data, size_t len,
 
 
 
+/** @brief Whether streamed `old` text's first non-whitespace byte is '<' (it may still become a closing tag).
+ *  @param text the text so far
+ *  @param len  bytes at `text`
+ *  @return true when the first non-whitespace byte is '<' */
 static bool agent_edit_old_may_be_closing_tag(const char *text, size_t len) {
     size_t i = 0;
     while (i < len && (text[i] == ' ' || text[i] == '\t' ||
@@ -193,6 +238,10 @@ static bool agent_edit_old_may_be_closing_tag(const char *text, size_t len) {
 
 
 
+/** @brief Whether the text is only spaces, tabs, CRs and LFs (true for an empty text).
+ *  @param text the text
+ *  @param len  bytes at `text`
+ *  @return true when there is no other byte */
 static bool agent_edit_old_is_only_space(const char *text, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (text[i] != ' ' && text[i] != '\t' &&
@@ -204,6 +253,10 @@ static bool agent_edit_old_is_only_space(const char *text, size_t len) {
 
 
 
+/** @brief Whether the bytes contain any non-isspace() byte.
+ *  @param s   bytes
+ *  @param len byte count
+ *  @return true when one is found */
 static bool agent_span_has_nonspace(const char *s, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (!isspace((unsigned char)s[i])) return true;
@@ -213,6 +266,11 @@ static bool agent_span_has_nonspace(const char *s, size_t len) {
 
 
 
+/** @brief Whether streamed `old` text is long enough to anchor an [upto] edit: at least
+ *  AGENT_EDIT_UPTO_MIN_PREFIX_BYTES bytes and AGENT_EDIT_UPTO_MIN_PREFIX_LINES complete non-blank lines.
+ *  @param old     the old text so far
+ *  @param old_len bytes at `old`
+ *  @return true when both minimums are met */
 static bool agent_edit_old_prefix_mature_for_upto(const char *old, size_t old_len) {
     if (old_len < AGENT_EDIT_UPTO_MIN_PREFIX_BYTES) return false;
     int nonempty_lines = 0;
@@ -230,6 +288,11 @@ static bool agent_edit_old_prefix_mature_for_upto(const char *old, size_t old_le
 
 
 
+/** @brief Whether the forcer may inject "[upto]" now: old text has none yet, is mature
+ *  (agent_edit_old_prefix_mature_for_upto) and ends at a line end (trailing spaces / tabs / CR ignored).
+ *  @param old     the old text so far (NUL-terminated)
+ *  @param old_len bytes at `old`
+ *  @return true when ready */
 static bool agent_edit_old_ready_for_upto(const char *old, size_t old_len) {
     if (!old_len || strstr(old, "[upto]")) return false;
     if (!agent_edit_old_prefix_mature_for_upto(old, old_len)) return false;
@@ -296,6 +359,17 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
 
 
 
+/** @brief Locate the span the edit's `old` text names: a unique literal match, or with one "[upto]" marker the
+ *  unique head through the first unique tail after it.
+ *  @param data      the file's bytes
+ *  @param len       bytes at `data`
+ *  @param old       the old text (NUL-terminated)
+ *  @param match     receives the span's start
+ *  @param match_len receives the span's length, bytes
+ *  @param anchored  receives true when the span came from an [upto] pair
+ *  @param err       receives why it failed
+ *  @param err_len   bytes at `err`
+ *  @return true with the span set, false with `err` set */
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, const char **match,
                                      size_t *match_len, bool *anchored,
@@ -422,9 +496,276 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 
 
 
+/* L184: the agent's parser and detector recognise every syntax in the shared
+ * table (canonical, first-bar-omitted), decode attribute values
+ * and string parameter values with the server's entity decoder, and still
+ * accept the lenient closing-tag variants. */
+static void test_agent_dsml_parser_recognises_every_syntax(void) {
+    /* The table is the authority; this pins its expected size -- V4.1 and V4,
+     * each with the first-bar-omitted spelling.  It still said 2 after the V4
+     * rows landed, which is why this test was aborting instead of passing. */
+    AGENT_TEST_ASSERT(PULSAR_DSML_SYNTAXES == 4);
+    for (size_t i = 0; i < PULSAR_DSML_SYNTAXES; i++) {
+        const pulsar_dsml_syntax *syn = &pulsar_dsml_syntaxes[i];
+        char text[1024];
+        snprintf(text, sizeof text,
+                 "%s\n%s name=\"a&amp;b\">\n%s name=\"command\" string=\"true\">ls &amp;&amp; pwd &lt;x%s\n"
+                 "%s name=\"timeout\" string=\"false\">10%s\n%s\n%s",
+                 syn->tool_calls_start, syn->invoke_start, syn->param_start, syn->param_end,
+                 syn->param_start, syn->param_end, syn->invoke_end, syn->tool_calls_end);
+
+        /* the parser, from SEARCH: every opener is found, every body tag parsed */
+        agent_dsml_parser p;
+        memset(&p, 0, sizeof p);
+        p.state = AGENT_DSML_SEARCH;
+        agent_dsml_feed(&p, text, strlen(text));
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+        AGENT_TEST_ASSERT(p.calls.len == 1);
+        if (p.calls.len == 1) {
+            AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "a&b"));           /* attribute decoded */
+            const char *cmd = agent_tool_arg_value(&p.calls.v[0], "command");
+            AGENT_TEST_ASSERT(cmd && !strcmp(cmd, "ls && pwd <x"));         /* string value decoded */
+            const char *to = agent_tool_arg_value(&p.calls.v[0], "timeout");
+            AGENT_TEST_ASSERT(to && !strcmp(to, "10"));
+        }
+        agent_dsml_parser_free(&p);
+
+        /* the streaming detector: the tool_calls opener completes for every row */
+        bool complete = false, implicit = true;
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->tool_calls_start,
+                                                        strlen(syn->tool_calls_start),
+                                                        &complete, &implicit));
+        AGENT_TEST_ASSERT(complete && !implicit);
+        /* one byte short: held, not complete */
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->tool_calls_start,
+                                                        strlen(syn->tool_calls_start) - 1,
+                                                        &complete, &implicit));
+        AGENT_TEST_ASSERT(!complete);
+        /* a bare invoke opener starts a block only in the marker-bearing spellings */
+        const bool marker_bearing = strstr(syn->invoke_start, PULSAR_DSML_SHORT) != NULL;
+        AGENT_TEST_ASSERT(agent_stream_dsml_start_match(syn->invoke_start, strlen(syn->invoke_start),
+                                                        &complete, &implicit) == marker_bearing);
+        if (marker_bearing) AGENT_TEST_ASSERT(complete && implicit);
+
+        /* a streamed partial close of this row's parameter tag is recognised */
+        size_t part = strlen(syn->param_end) - 1;
+        AGENT_TEST_ASSERT(agent_dsml_parameter_close_tail(syn->param_end, part, &complete) && !complete);
+        AGENT_TEST_ASSERT(agent_dsml_parameter_close_tail(syn->param_end, part + 1, &complete) && complete);
+    }
+    /* the lenient close variants: whitespace and a stray bar before '>' */
+    agent_dsml_parser p;
+    memset(&p, 0, sizeof p);
+    agent_dsml_start(&p);
+    const char *body =
+        "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+        PULSAR_PARAM_START " name=\"command\" string=\"true\">pwd</" PULSAR_DSML " parameter ｜ >\n"
+        "</" PULSAR_DSML " invoke\n>\n" PULSAR_TOOL_CALLS_END;
+    agent_dsml_feed(&p, body, strlen(body));
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1 && !strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "pwd"));
+    agent_dsml_parser_free(&p);
+    /* a bare "</" in a value does not arm the argmax force; a marker does */
+    memset(&p, 0, sizeof p);
+    agent_dsml_start(&p);
+    const char *partial = "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                          PULSAR_PARAM_START " name=\"command\" string=\"true\">echo </";
+    agent_dsml_feed(&p, partial, strlen(partial));
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE && !p.param_close_prefix);
+    agent_dsml_feed(&p, PULSAR_DSML_SHORT, strlen(PULSAR_DSML_SHORT));   /* "</DSML｜" */
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE && p.param_close_prefix);
+    agent_dsml_parser_free(&p);
+}
+
+/* L264: a saved session file round-trips its title, times, model id and exact
+ * ids -- including a control-token id, which no re-tokenised text could keep
+ * (L223) -- and every damaged form (a flipped byte, a truncation, a trailing
+ * byte) is refused rather than read.  Host-only. */
+static void test_agent_session_file_round_trip(void) {
+    char dir[] = "/tmp/pulsar-agent-session-test.XXXXXX";
+    if (!mkdtemp(dir)) {
+        AGENT_TEST_ASSERT(!"mkdtemp failed");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s/s.session", dir);
+    int ids[] = { 0, 128803, 17, 128804, 42 };
+    agent_session_file want;
+    memset(&want, 0, sizeof(want));
+    want.title = (char *)"a title";
+    want.created_at = 1759500000ull;
+    want.last_used = 1759600000ull;
+    want.model_id = 3u;
+    want.tokens.v = ids;
+    want.tokens.len = want.tokens.cap = 5;
+    char err[160] = {0};
+    AGENT_TEST_ASSERT(agent_session_file_write(path, &want, err, sizeof err));
+    agent_session_file got;
+    AGENT_TEST_ASSERT(agent_session_file_read(path, &got, err, sizeof err));
+    AGENT_TEST_ASSERT(!strcmp(got.title, "a title") && got.created_at == want.created_at &&
+                      got.last_used == want.last_used && got.model_id == 3u && got.tokens.len == 5);
+    for (int i = 0; got.tokens.len == 5 && i < 5; i++) AGENT_TEST_ASSERT(got.tokens.v[i] == ids[i]);
+    agent_session_file_free(&got);
+
+    FILE *fp = fopen(path, "rb");
+    uint8_t buf[256];
+    const size_t n = fp ? fread(buf, 1, sizeof buf, fp) : 0;
+    if (fp) fclose(fp);
+    AGENT_TEST_ASSERT(n > 40 && n < sizeof buf);
+    for (int leg = 0; n > 40 && leg < 3; leg++) {
+        uint8_t bad[260];
+        memcpy(bad, buf, n);
+        size_t len = n;
+        if (leg == 0) bad[40] ^= 0x01u;   /* a title byte: the digest catches it */
+        if (leg == 1) len = n - 3;        /* truncated */
+        if (leg == 2) bad[len++] = 0u;    /* a trailing byte */
+        fp = fopen(path, "wb");
+        if (fp) { fwrite(bad, 1, len, fp); fclose(fp); }
+        AGENT_TEST_ASSERT(!agent_session_file_read(path, &got, err, sizeof err));
+    }
+    unlink(path);
+    rmdir(dir);
+}
+
+/* parse_u64 (pulsar_argparse.h, the --seed parser): a value it refuses exits 2, so each refusal runs in a child */
+static int test_parse_u64_exit(const char *s) {
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(99);
+        (void)parse_u64(s, "--seed");
+        _exit(0);
+    }
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static void test_parse_u64_refuses_sign_and_range(void) {
+    AGENT_TEST_ASSERT(parse_u64("7", "--seed") == 7u);
+    AGENT_TEST_ASSERT(parse_u64("18446744073709551615", "--seed") == UINT64_MAX);
+    static const char *const bad_values[] = {"-1", " -1", "-0", "18446744073709551616", "0", "", "1x"};
+    for (const char *bad : bad_values)
+        AGENT_TEST_ASSERT(test_parse_u64_exit(bad) == 2);
+}
+
+/* The session title and /history scan the loaded family's turn markers (agent_turn_marks), not DeepSeek's: a
+ * Qwen transcript (ChatML) and a DeepSeek one read the same way.  The markers are what agent_turn_marks_init
+ * builds from each family's renderer (pulsar_chat_turn_markers + pulsar_chat_end_assistant, rendered as text). */
+static agent_turn_marks test_turn_marks(const char *user, const char *assistant, const char *end) {
+    agent_turn_marks m;
+    memset(&m, 0, sizeof(m));
+    snprintf(m.user, sizeof m.user, "%s", user);
+    m.user_len = strlen(m.user);
+    snprintf(m.assistant, sizeof m.assistant, "%s", assistant);
+    m.assistant_len = strlen(m.assistant);
+    snprintf(m.end, sizeof m.end, "%s", end);
+    m.end_len = strlen(m.end);
+    return m;
+}
+
+static void test_agent_turn_marks_family_neutral(void) {
+    const agent_turn_marks qwen = test_turn_marks("<|im_start|>user", "<|im_start|>assistant", "<|im_end|>");
+    const agent_turn_marks ds = test_turn_marks("<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>");
+    const char *qt =
+        "<|im_start|>system\nYou are a coding agent.<|im_end|>\n"
+        "<|im_start|>user\nFix the build<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nlook\n</think>\n\nDone.<|im_end|>\n"
+        "<|im_start|>user\nthanks<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const char *dt =
+        "<｜begin▁of▁sentence｜>You are a coding agent.<｜User｜>Fix the build<｜Assistant｜></think>Done."
+        "<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜>";
+    for (int leg = 0; leg < 2; leg++) {
+        const agent_turn_marks *m = leg ? &ds : &qwen;
+        const char *t = leg ? dt : qt;
+        char *title = agent_session_title_from_text(m, t, strlen(t), 0);
+        AGENT_TEST_ASSERT(!strcmp(title, "Fix the build"));
+        free(title);
+        /* the walk: user and assistant turns in order, each bounded by the next marker */
+        int users = 0, assistants = 0;
+        const char *p = t, *end = t + strlen(t);
+        agent_history_mark kind = AGENT_HISTORY_MARK_NONE;
+        size_t len = 0;
+        for (const char *at; (at = agent_history_next_marker(m, p, end, &kind, &len)) != NULL; p = at + len) {
+            users += kind == AGENT_HISTORY_MARK_USER;
+            assistants += kind == AGENT_HISTORY_MARK_ASSISTANT;
+        }
+        AGENT_TEST_ASSERT(users == 2 && assistants == 2);
+        /* /history's last user turn starts at the second user marker */
+        bool tool_only = true;
+        const char *start = agent_history_start_for_turns(m, t, strlen(t), 1, &tool_only);
+        AGENT_TEST_ASSERT(!tool_only && start == strstr(strstr(t, m->user) + 1, m->user));
+    }
+    /* a family that spells no markers finds no prompt (never DeepSeek's) */
+    const agent_turn_marks none = test_turn_marks("", "", "");
+    char *title = agent_session_title_from_text(&none, dt, strlen(dt), 0);
+    AGENT_TEST_ASSERT(!strcmp(title, "(no user prompt)"));
+    free(title);
+}
+
+/* worker_progress_cb takes the bar's end from the session's `total`, not the worker's pre-sync estimate */
+static void test_worker_progress_uses_session_total(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe: agent_wake_locked writes nothing */
+    w.progress_base = 100;
+    w.status.prefill_total = 5;   /* a stale estimate */
+    worker_progress_cb(&w, "prefill_chunk", 150, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 50);
+    worker_progress_cb(&w, "prefill_display", 400, 300);
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200 && w.status.prefill_done == 200);
+    worker_progress_cb(&w, "decode", 500, 900);   /* not a prefill event: ignored */
+    AGENT_TEST_ASSERT(w.status.prefill_total == 200);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* L354 (F5): the file tools' boundary, and what reaches the terminal. */
+static void test_agent_workspace_and_terminal(void) {
+    char tmpl[] = "/tmp/pulsar-agent-ws.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char old[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(old, sizeof old) != NULL);
+    AGENT_TEST_ASSERT(chdir(dir) == 0);
+    AGENT_TEST_ASSERT(mkdir("sub", 0700) == 0);
+    AGENT_TEST_ASSERT(symlink("/etc", "out") == 0);
+    agent_workspace_init(false);
+    const auto refused = [](const char *p) { char *e = agent_workspace_refusal(p); const bool r = e != NULL; free(e); return r; };
+    AGENT_TEST_ASSERT(!refused("."));
+    AGENT_TEST_ASSERT(!refused("sub"));
+    AGENT_TEST_ASSERT(!refused("new.txt"));
+    AGENT_TEST_ASSERT(!refused("sub/deep/new.txt"));
+    AGENT_TEST_ASSERT(refused("/etc/passwd"));
+    AGENT_TEST_ASSERT(refused(".."));
+    AGENT_TEST_ASSERT(refused("sub/../../x"));
+    AGENT_TEST_ASSERT(refused("missing/../../x"));
+    AGENT_TEST_ASSERT(refused("out/passwd"));
+    AGENT_TEST_ASSERT(refused("out/new.txt"));
+    agent_workspace_init(true);
+    AGENT_TEST_ASSERT(!refused("/etc/passwd"));
+    AGENT_TEST_ASSERT(chdir(old) == 0);
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+    char t[] = "a\x1b[2Jb\n\tc\r\x07\x7f\xc2\x9b" "1m\xc3\xa9";
+    agent_terminal_sanitize(t, strlen(t));
+    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc\r????" "1m\xc3\xa9"));
+}
+
+static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
+
 static void pulsar_agent_unit_tests_run(void) {
+    test_agent_workspace_and_terminal();
+    test_worker_progress_uses_session_total();
+    test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_dsml_parser_recognises_every_syntax();
+    test_agent_family_tools();
+    test_agent_session_file_round_trip();
+    test_parse_u64_refuses_sign_and_range();
 }
 
 
@@ -459,6 +800,15 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
 
 
+/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file.
+ *  @param path       the file
+ *  @param data       its current bytes
+ *  @param len        bytes at `data`
+ *  @param offset     splice start, bytes
+ *  @param remove_len bytes removed
+ *  @param insert     text inserted; NULL = ""
+ *  @param kind       how the span was found, for the result's "Edited <path> using <kind>" line
+ *  @return the tool result (the changed lines in context, or "Tool error: ..."), malloc'd; caller frees */
 static char *agent_apply_file_splice(const char *path,
                                      const char *data, size_t len,
                                      size_t offset, size_t remove_len,
@@ -503,6 +853,7 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     const char *old = agent_tool_arg_value(call, "old");
     const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
@@ -544,6 +895,12 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
 
 
 
+/** @brief Whether `q` occurs anywhere in s[0, n).
+ *  @param s              the line's bytes
+ *  @param n              byte count
+ *  @param q              the query (NUL-terminated); empty matches
+ *  @param case_sensitive compare bytes exactly, else ASCII case-folded
+ *  @return true on a match */
 static bool agent_literal_match(const char *s, size_t n, const char *q,
                                 bool case_sensitive) {
     size_t qn = strlen(q);
@@ -570,6 +927,11 @@ static bool agent_literal_match(const char *s, size_t n, const char *q,
 
 
 
+/** @brief Whether one line matches the search (the compiled regex, else a literal match).
+ *  @param ctx the search
+ *  @param s   the line's bytes
+ *  @param n   byte count
+ *  @return true on a match */
 static bool agent_search_line_matches(agent_search_ctx *ctx, const char *s, size_t n) {
     if (ctx->use_regex) {
         char *line = xstrndup(s, n);
@@ -582,6 +944,11 @@ static bool agent_search_line_matches(agent_search_ctx *ctx, const char *s, size
 
 
 
+/** @brief Append one result line ("  <line_no> <text>\n") to the search output.
+ *  @param ctx     the search
+ *  @param data    the file's bytes
+ *  @param sp      the line's span
+ *  @param line_no its 1-based line number */
 static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
                                    agent_line_span sp, int line_no) {
     char prefix[64];
@@ -594,6 +961,9 @@ static void agent_search_emit_line(agent_search_ctx *ctx, const char *data,
 
 
 /* Search one text file and emit matching lines with plain line numbers. */
+/// @brief Search one file (see above); skips files the glob rejects, unreadable files and binary (NUL-bearing) ones.
+/// @param ctx  the search (results counted against max_results)
+/// @param path the file
 static void agent_search_file(agent_search_ctx *ctx, const char *path) {
     if (ctx->results >= ctx->max_results) return;
     if (ctx->glob && ctx->glob[0]) {
@@ -643,6 +1013,10 @@ static void agent_search_file(agent_search_ctx *ctx, const char *path) {
 
 /* Recursively search a file or directory, avoiding .git and stopping once the
  * result cap is reached. */
+/// @brief Search a path (see above); symlinks are not followed, depth is capped at 24.
+/// @param ctx   the search
+/// @param path  file or directory
+/// @param depth recursion depth, 0 at the root
 static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth) {
     if (ctx->results >= ctx->max_results || depth > 24) return;
     struct stat st;
@@ -674,6 +1048,7 @@ char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    if (char *refused = agent_workspace_refusal(path)) return refused;
     const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,

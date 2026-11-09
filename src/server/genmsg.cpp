@@ -1,7 +1,13 @@
+/** @file
+ *  Client output from the worker: the non-blocking deferred slot writer, the prefill keepalive / heartbeat and
+ *  the blocking send helpers.
+ */
 #include "pulsar_server_internal.h"
 
 
 
+/// @brief The wall clock (gettimeofday), in milliseconds; the writer's stall and idle clock.
+/// @return milliseconds since the epoch
 static long long wall_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -13,10 +19,14 @@ static long long wall_ms(void) {
 /* Thread-local: only the GPU worker installs a writer (around a job), so
  * client threads always see NULL here and keep the classic bounded-blocking
  * send_all behavior with zero contention. */
+/// The calling thread's installed slot writer (slot_writer_install); NULL on client threads.
 static __thread slot_writer *g_slot_writer;
 
 
 
+/// @brief Zero a writer and bind it to `fd`.
+/// @param w   the writer
+/// @param fd  the client socket
 void slot_writer_init(slot_writer *w, int fd) {
     memset(w, 0, sizeof(*w));
     w->fd = fd;
@@ -24,12 +34,16 @@ void slot_writer_init(slot_writer *w, int fd) {
 
 
 
+/// @brief Make `w` this thread's writer: send_all to its fd queues through it, non-blocking.  Worker only.
+/// @param w  the writer (NULL: uninstall)
 void slot_writer_install(slot_writer *w) {
     g_slot_writer = w;
 }
 
 
 
+/// @brief Free the queued bytes, uninstalling `w` when it is this thread's writer.
+/// @param w  the writer (NULL: nothing)
 void slot_writer_free(slot_writer *w) {
     if (!w) return;
     if (g_slot_writer == w) g_slot_writer = NULL;
@@ -79,6 +93,13 @@ bool slot_writer_flush(slot_writer *w) {
 
 
 
+/// @brief Non-blocking send: straight to the socket while nothing is queued, the rest queued and flushed;
+///        fails (sticky) on a hard socket error, shutdown, or more than PULSAR_SERVER_WRITER_MAX_PENDING_BYTES
+///        queued.  Stamps last_write_ms and arms the stall deadline.
+/// @param w  the writer
+/// @param p  the bytes
+/// @param n  bytes at `p`
+/// @return false once the writer has failed
 static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
     if (w->failed) return false;
     if (g_stop_requested) {
@@ -123,6 +144,20 @@ static bool slot_writer_send(slot_writer *w, const void *p, size_t n) {
 
 
 
+/// @brief Start the writer's keepalive clock now: bytes went out on its socket before it existed (L249 D's early
+///        stream, written by the client thread).
+/// @param w  the writer
+void slot_writer_mark_written(slot_writer *w) {
+    w->last_write_ms = wall_ms();
+}
+
+
+
+/// @brief Whether the writer has sent nothing for `interval_ms` (false before its first write or after a failure).
+/// @param w            the writer (NULL: false)
+/// @param now_ms       the wall clock now, ms (wall_ms)
+/// @param interval_ms  the idle interval, ms
+/// @return true when a keepalive is due
 bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long interval_ms) {
     if (!w || w->failed || w->fd < 0) return false;
     if (!w->last_write_ms) return false;   /* nothing sent yet: no clock to judge */
@@ -131,7 +166,8 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
 
 
 
-/* Surface-appropriate keepalive for a slot that has gone quiet mid-request.
+/* Surface-appropriate keepalive for a slot that has gone quiet mid-request
+ * (stream_keepalive_beat).
  *
  * Anthropic gets a REAL `ping` event: it is documented, and clients are told to
  * ignore unknown/ping events, so it costs nothing.
@@ -145,17 +181,22 @@ bool slot_writer_idle_for(const slot_writer *w, long long now_ms, long long inte
  * (st->next_output_index) — repeating it would either duplicate or advance the
  * sequence for a non-event, which strict clients may reject. A comment keeps
  * the socket warm with zero protocol surface. */
+/// @brief Send the protocol's keepalive when the stream has been idle PULSAR_SERVER_HEARTBEAT_MS.  Worker thread.
+/// @param g  the request's generation state (NULL: false)
+/// @return true when a beat was sent; false when none was due, the request does not stream, or the write failed
 bool gen_stream_heartbeat(gen_state *g) {
-    if (!g) return false;
-    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
-
-    const char *beat = NULL;
-    if (g->anthropic_live.active) {
-        beat = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
-    } else if (g->responses_live.active || g->openai_live.active) {
-        beat = ": ping\n\n";
+    if (!g || !g->j || !g->j->req.stream || g->phase == GEN_DONE || g->progress.stream_failed) return false;
+    const char *beat = stream_keepalive_beat(&g->j->req);
+    if (!g->progress.headers_sent) {
+        /* L249 D: bound, but nothing written yet (a restore, an admission wait, a long first chunk): the stream
+         * opens once the request has waited a beat since it was accepted, the SSE head and a beat at once -- the
+         * pre-bind wait has the client thread's early stream (job_early_keepalive) */
+        if (server_now_sec() - g->j->accepted_at < PULSAR_SERVER_HEARTBEAT_MS / 1000.0) return false;
+        g->progress.headers_sent = true;
+        return slot_writer_send(&g->writer, k_sse_head, strlen(k_sse_head)) &&
+               slot_writer_send(&g->writer, beat, strlen(beat));
     }
-    if (!beat) return false;   /* non-streaming request: nothing to keep alive */
+    if (!slot_writer_idle_for(&g->writer, wall_ms(), PULSAR_SERVER_HEARTBEAT_MS)) return false;
 
     /* Write through the slot's OWN writer, not send_all: send_all only becomes
      * non-blocking when that writer is INSTALLED thread-locally, which it is
@@ -169,6 +210,8 @@ bool gen_stream_heartbeat(gen_state *g) {
 
 /* Blocking completion of all queued bytes, used once per job after the final
  * response: same poll cadence and stall timeout as blocking send_all. */
+/// @param w  the writer
+/// @return false when the client failed, stalled past the deadline, or shutdown began
 bool slot_writer_drain(slot_writer *w) {
     while (!w->failed && w->off < w->pending.len) {
         if (g_stop_requested) {
@@ -198,6 +241,12 @@ bool slot_writer_drain(slot_writer *w) {
 
 
 
+/// @brief Write all bytes to `fd`: through this thread's installed slot writer when it owns `fd` (non-blocking),
+///        else blocking with a PULSAR_SERVER_SEND_STALL_TIMEOUT_MS stall timeout (reset by each write).
+/// @param fd  the client socket
+/// @param p   the bytes
+/// @param n   bytes at `p`
+/// @return false on a write error, a stall, or shutdown
 bool send_all(int fd, const void *p, size_t n) {
     if (g_slot_writer && g_slot_writer->fd == fd) {
         return slot_writer_send(g_slot_writer, p, n);
@@ -230,38 +279,33 @@ bool send_all(int fd, const void *p, size_t n) {
 
 
 
+/// @brief Append `s` as a quoted JSON string.
+/// @param b  the buffer
+/// @param s  NUL-terminated text
 void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
+    json_escape_fragment_n(b, s, strlen(s));
     buf_putc(b, '"');
 }
 
 
 
+/// @brief Append the first `n` bytes of `s` as a quoted JSON string (an embedded NUL is escaped as \\u0000, L335).
+/// @param b  the buffer
+/// @param s  the bytes (NULL: "", with n 0)
+/// @param n  bytes at `s`
 void json_escape_n(buf *b, const char *s, size_t n) {
-    char *tmp = xstrndup(s ? s : "", n);
-    json_escape(b, tmp);
-    free(tmp);
+    buf_putc(b, '"');
+    if (s) json_escape_fragment_n(b, s, n);
+    buf_putc(b, '"');
 }
 
 
 
+/// @brief Append `n` bytes JSON-escaped, without quotes (a streamed string's piece).
+/// @param b  the buffer
+/// @param s  the bytes
+/// @param n  bytes at `s`
 void json_escape_fragment_n(buf *b, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -283,631 +327,14 @@ void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 }
 
 
-/* Trim a TRAILING partial DSML closing tag of ANY style from [start, len).
- * A truncated generation can end mid-closing-tag, and the model sometimes
- * mixes styles (opens short "<DSML|...>", closes long "</|DSML|...>"), so
- * the active-style hold in the streamers cannot recognize the tail.  Any
- * suffix beginning at a '<' that is a prefix of ANY known closing form is
- * tag debris, never value content.  Returns len unchanged when the tail is
- * not tag-shaped. */
-size_t trim_truncated_dsml_close_tail(const char *raw, size_t start, size_t len) {
-    static const char *ends[] = {
-        PULSAR_PARAM_END, PULSAR_INVOKE_END, PULSAR_TOOL_CALLS_END,
-        PULSAR_PARAM_END_SHORT, PULSAR_INVOKE_END_SHORT, PULSAR_TOOL_CALLS_END_SHORT,
-        "</parameter>", "</invoke>", "</tool_calls>",
-    };
-    size_t max_tag = 0;
-    for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
-        const size_t l = strlen(ends[i]);
-        if (l > max_tag) max_tag = l;
-    }
-    const size_t scan = len - start > max_tag ? len - max_tag : start;
-    for (size_t i = len; i > scan; i--) {
-        if (raw[i - 1] != '<') continue;
-        const size_t marker = i - 1;
-        const size_t tail = len - marker;
-        for (size_t e = 0; e < sizeof(ends) / sizeof(ends[0]); e++) {
-            if (tail < strlen(ends[e]) && !memcmp(raw + marker, ends[e], tail))
-                return marker;
-        }
-        break;
-    }
-    return len;
-}
 
-const char *find_any_tool_start(const char *s) {
-    const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, PULSAR_TOOL_CALLS_START),
-        strstr(s, PULSAR_TOOL_CALLS_START_SHORT),
-        strstr(s, "<tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
-    }
-    return best;
-}
 
 
 
-const char *find_any_tool_end(const char *s) {
-    const char *best = NULL;
-    const char *candidates[] = {
-        strstr(s, PULSAR_TOOL_CALLS_END),
-        strstr(s, PULSAR_TOOL_CALLS_END_SHORT),
-        strstr(s, "</tool_calls>"),
-    };
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
-    }
-    return best;
-}
-
-
-
-void observe_tool_markers(const char *scan, bool *saw_start,
-                                 bool *saw_end, bool *orphan_end) {
-    if (!scan) return;
-    bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
-    if (start) *saw_start = true;
-
-    const char *end_scan = had_start ? scan : (start ? start : NULL);
-    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
-    if (end) {
-        *saw_end = true;
-    } else if (!had_start && !start && find_any_tool_end(scan)) {
-        if (orphan_end) *orphan_end = true;
-    }
-}
-
-
-
-size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
-    while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
-    return limit;
-}
-
-
-
-static const char *skip_ascii_ws(const char *p) {
-    while (*p && isspace((unsigned char)*p)) p++;
-    return p;
-}
-
-
-
-const char *find_last_substr(const char *s, const char *needle) {
-    if (!s || !needle || !needle[0]) return NULL;
-    const char *last = NULL;
-    const char *p = s;
-    while ((p = strstr(p, needle)) != NULL) {
-        last = p;
-        p++;
-    }
-    return last;
-}
-
-
-
-/* The prompt renderer escapes DSML text so a tool argument can safely contain
- * shell operators or closing tags.  The generated-DSML parser must undo exactly
- * those entities before it turns parameters back into JSON; otherwise
- * parse->render is not a stable cache key. */
-char *dsml_unescape_text(const char *s) {
-    buf b = {0};
-    for (s = s ? s : ""; *s; s++) {
-        if (*s != '&') {
-            buf_putc(&b, *s);
-        } else if (!strncmp(s, "&amp;", 5)) {
-            buf_putc(&b, '&');
-            s += 4;
-        } else if (!strncmp(s, "&lt;", 4)) {
-            buf_putc(&b, '<');
-            s += 3;
-        } else if (!strncmp(s, "&gt;", 4)) {
-            buf_putc(&b, '>');
-            s += 3;
-        } else if (!strncmp(s, "&quot;", 6)) {
-            buf_putc(&b, '"');
-            s += 5;
-        } else if (!strncmp(s, "&apos;", 6)) {
-            buf_putc(&b, '\'');
-            s += 5;
-        } else {
-            buf_putc(&b, '&');
-        }
-    }
-    return buf_take(&b);
-}
-
-
-
-char *dsml_attr(const char *tag, const char *name) {
-    char pat[64];
-    snprintf(pat, sizeof(pat), "%s=\"", name);
-    const char *p = strstr(tag, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
-    const char *q = strchr(p, '"');
-    if (!q) return NULL;
-    char *raw = xstrndup(p, (size_t)(q - p));
-    char *decoded = dsml_unescape_text(raw);
-    free(raw);
-    return decoded;
-}
-
-
-
-static void tool_call_json_args_add(buf *args, const char *name, const char *value, const char *is_string) {
-    if (args->len) buf_puts(args, ", ");
-    json_escape(args, name ? name : "");
-    buf_puts(args, ": ");
-    if (is_string && !strcmp(is_string, "true")) {
-        json_escape(args, value ? value : "");
-    } else {
-        char *min = json_minify_raw_value(value ? value : "null");
-        buf_puts(args, min && min[0] ? min : "null");
-        free(min);
-    }
-}
-
-
-
-/* DSML produced by the model is usually a flat list of typed parameters:
- *
- *   <parameter name="path" string="true">/tmp/x</parameter>
- *   <parameter name="timeout" string="false">10</parameter>
- *
- * Long generations sometimes drift into a looser XML-ish shape, omitting the
- * outer string attribute and putting child parameters inside it.  The server
- * does not know client tool schemas, so it cannot make that semantically
- * perfect.  Still, returning a structured JSON value lets the client/tool layer
- * reject or repair the call, which is much better than aborting the assistant
- * turn and losing the whole sampled continuation.
- */
-static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_start,
-                                       const char *param_end, buf *out) {
-    const char *p = *p_in;
-    if (strncmp(p, param_start, strlen(param_start)) != 0) return false;
-    const char *tag_end = strchr(p, '>');
-    if (!tag_end) return false;
-
-    char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name) {
-        free(is_string);
-        return false;
-    }
-
-    const char *value_start = tag_end + 1;
-    const char *value_end = strstr(value_start, param_end);
-    if (!value_end) {
-        free(name);
-        free(is_string);
-        return false;
-    }
-
-    char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
-    const char *type = is_string ? is_string : "true";
-    char *value = !strcmp(type, "true") ?
-        dsml_unescape_text(raw_value) : xstrdup(raw_value);
-    tool_call_json_args_add(out, name, value, type);
-
-    free(name);
-    free(is_string);
-    free(raw_value);
-    free(value);
-    *p_in = value_end + strlen(param_end);
-    return true;
-}
-
-
-
-static bool dsml_parse_nested_params_object(const char **p_in,
-                                            const char *param_start,
-                                            const char *param_end,
-                                            buf *out) {
-    const char *p = *p_in;
-    buf members = {0};
-    bool any = false;
-
-    for (;;) {
-        p = skip_ascii_ws(p);
-        if (strncmp(p, param_start, strlen(param_start)) != 0) break;
-        if (!dsml_parse_leaf_param_json(&p, param_start, param_end, &members)) {
-            buf_free(&members);
-            return false;
-        }
-        any = true;
-    }
-
-    if (!any) {
-        buf_free(&members);
-        return false;
-    }
-    buf_putc(out, '{');
-    buf_puts(out, members.ptr ? members.ptr : "");
-    buf_putc(out, '}');
-    buf_free(&members);
-    *p_in = p;
-    return true;
-}
-
-
-
-static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
-    char *s = xstrndup(text ? text : "", n);
-    char *body = s;
-    const bool opened_think = !strncmp(body, "<think>", 7);
-    if (opened_think) body += 7;
-
-    char *think_end = strstr(body, "</think>");
-    if (think_end) {
-        *think_end = '\0';
-        *reasoning_out = xstrdup(body);
-        *content_out = xstrdup(think_end + 8);
-    } else if (opened_think) {
-        /* Generation ended inside the think block (token cap / stop). The
-         * partial reasoning is still reasoning: surfacing it as content
-         * hands raw chain-of-thought to clients that score or display the
-         * answer channel (the streaming path already promises reasoning is
-         * never visible assistant text). */
-        *reasoning_out = xstrdup(body);
-        *content_out = xstrdup("");
-    } else {
-        *reasoning_out = NULL;
-        *content_out = xstrdup(s);
-    }
-    free(s);
-}
-
-
-
-/* The prefix before a tool call recovered from UNCLOSED reasoning is
- * reasoning, not content (upstream ds4 51a1c14). */
-static void unterminated_reasoning_before_tool(const char *text,
-                                               size_t prefix_len,
-                                               char **content_out,
-                                               char **reasoning_out) {
-    const char *body = text ? text : "";
-    if (prefix_len > strlen(body)) prefix_len = strlen(body);
-    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
-        body += 7;
-        prefix_len -= 7;
-    }
-    *reasoning_out = xstrndup(body, prefix_len);
-    *content_out = xstrdup("");
-}
-
-bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
-                                       char **content_out, char **reasoning_out,
-                                       tool_calls *calls) {
-    text = text ? text : "";
-    const char *tool_search = text;
-    bool recovered_unclosed_tool = false;
-
-    /* When thinking mode is enabled the model is expected to close
-     * </think> before it enters the executable assistant surface.  DSML inside
-     * reasoning is just model text: it may be a mistaken attempt, a quotation,
-     * or an explanation of the protocol.  Treating it as a real tool call
-     * duplicates it into both reasoning and structured tool_calls, and can make
-     * clients execute something the assistant had not actually emitted as its
-     * post-thinking action. */
-    if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
-        if (!think_end) {
-            /* Model did not close thinking. A COMPLETE tool block in the
-             * buffer is unambiguous enough to recover structurally (upstream
-             * ds4 51a1c14); anything less — truncation, a quoted opening —
-             * stays reasoning, even when the <think> opener lives in the
-             * prompt rather than the generation, and off the content
-             * channel. */
-            const char *candidate = find_any_tool_start(text);
-            if (!candidate || !find_any_tool_end(candidate)) {
-                server_log(PULSAR_LOG_TOOL,
-                           "thinking not closed, ignoring incomplete DSML in reasoning");
-                const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
-                *reasoning_out = xstrdup(body);
-                *content_out = xstrdup("");
-                return true;
-            }
-            tool_search = candidate;
-            recovered_unclosed_tool = true;
-        } else {
-            tool_search = think_end + 8;
-        }
-    }
-
-    const char *start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START);
-    int style = 0; /* 0: DSML, 1: plain XML, 2: DSML with the first vertical bar omitted. */
-    if (!start) start = strstr(tool_search, PULSAR_TOOL_CALLS_START);
-    if (!start) {
-        start = strstr(tool_search, "\n\n" PULSAR_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, PULSAR_TOOL_CALLS_START_SHORT);
-        style = start ? 2 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "\n\n<tool_calls>");
-        style = start ? 1 : style;
-    }
-    if (!start) {
-        start = strstr(tool_search, "<tool_calls>");
-        style = start ? 1 : style;
-    }
-    if (!start) {
-        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
-        return true;
-    }
-
-    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
-    const char *raw_block_start = start;
-    const char *tool_calls_start = PULSAR_TOOL_CALLS_START;
-    const char *tool_calls_end = PULSAR_TOOL_CALLS_END;
-    const char *invoke_start = PULSAR_INVOKE_START;
-    const char *invoke_end = PULSAR_INVOKE_END;
-    const char *param_start = PULSAR_PARAM_START;
-    const char *param_end = PULSAR_PARAM_END;
-    if (style == 1) {
-        tool_calls_start = "<tool_calls>";
-        tool_calls_end = "</tool_calls>";
-        invoke_start = "<invoke";
-        invoke_end = "</invoke>";
-        param_start = "<parameter";
-        param_end = "</parameter>";
-    } else if (style == 2) {
-        tool_calls_start = PULSAR_TOOL_CALLS_START_SHORT;
-        tool_calls_end = PULSAR_TOOL_CALLS_END_SHORT;
-        invoke_start = PULSAR_INVOKE_START_SHORT;
-        invoke_end = PULSAR_INVOKE_END_SHORT;
-        param_start = PULSAR_PARAM_START_SHORT;
-        param_end = PULSAR_PARAM_END_SHORT;
-    }
-
-    const char *p = strstr(start, tool_calls_start);
-    if (!p) return false;
-    p += strlen(tool_calls_start);
-
-    for (;;) {
-        p = skip_ascii_ws(p);
-        if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
-            const char *raw_block_end = p + strlen(tool_calls_end);
-            free(calls->raw_dsml);
-            calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
-            if (recovered_unclosed_tool) {
-                unterminated_reasoning_before_tool(text, content_len,
-                                                   content_out, reasoning_out);
-            } else {
-                split_reasoning_content(text, content_len, content_out, reasoning_out);
-            }
-            return true;
-        }
-        if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
-        const char *tag_end = strchr(p, '>');
-        if (!tag_end) return false;
-        char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
-        char *name = dsml_attr(tag, "name");
-        free(tag);
-        if (!name) return false;
-        p = tag_end + 1;
-
-        buf args = {0};
-        while (true) {
-            p = skip_ascii_ws(p);
-            if (!strncmp(p, invoke_end, strlen(invoke_end))) {
-                p += strlen(invoke_end);
-                break;
-            }
-            if (strncmp(p, param_start, strlen(param_start)) != 0) {
-                free(name);
-                buf_free(&args);
-                return false;
-            }
-            tag_end = strchr(p, '>');
-            if (!tag_end) {
-                free(name);
-                buf_free(&args);
-                return false;
-            }
-            tag = xstrndup(p, (size_t)(tag_end - p + 1));
-            char *param_name = dsml_attr(tag, "name");
-            char *param_is_string = dsml_attr(tag, "string");
-            free(tag);
-            if (!param_name) {
-                free(name);
-                free(param_name);
-                free(param_is_string);
-                buf_free(&args);
-                return false;
-            }
-            const char *value_start = tag_end + 1;
-            if (!param_is_string &&
-                !strncmp(skip_ascii_ws(value_start), param_start, strlen(param_start)))
-            {
-                buf nested = {0};
-                const char *nested_p = value_start;
-                if (!dsml_parse_nested_params_object(&nested_p, param_start,
-                                                     param_end, &nested)) {
-                    free(name);
-                    free(param_name);
-                    buf_free(&nested);
-                    buf_free(&args);
-                    return false;
-                }
-                tool_call_json_args_add(&args, param_name,
-                                        nested.ptr ? nested.ptr : "{}",
-                                        "false");
-                buf_free(&nested);
-                p = skip_ascii_ws(nested_p);
-                if (!strncmp(p, param_end, strlen(param_end))) {
-                    p += strlen(param_end);
-                }
-                free(param_name);
-                continue;
-            }
-            const char *value_end = strstr(value_start, param_end);
-            if (!value_end) {
-                free(name);
-                free(param_name);
-                free(param_is_string);
-                buf_free(&args);
-                return false;
-            }
-            char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
-            const char *type = param_is_string ? param_is_string : "true";
-            char *value = !strcmp(type, "true") ?
-                dsml_unescape_text(raw_value) : xstrdup(raw_value);
-            tool_call_json_args_add(&args, param_name, value, type);
-            free(param_name);
-            free(param_is_string);
-            free(raw_value);
-            free(value);
-            p = value_end + strlen(param_end);
-        }
-
-        tool_call tc = {0};
-        tc.name = name;
-        buf wrapped = {0};
-        buf_putc(&wrapped, '{');
-        buf_puts(&wrapped, args.ptr ? args.ptr : "");
-        buf_putc(&wrapped, '}');
-        tc.arguments = buf_take(&wrapped);
-        tool_calls_push(calls, tc);
-        buf_free(&args);
-    }
-}
-
-
-
-/* Try to repair a truncated DSML block.
- *
- * DSML nesting order is: tool_calls > invoke > parameter.
- * Single-pass scan: count opens vs closes, then append missing closing tags.
- *
- * Returns true if repair was applied, false if the text had no recognizable DSML
- * or was already balanced.  This deliberately does not rewrite malformed but
- * balanced DSML into assistant text; semantic recovery belongs to the model. */
-bool try_repair_dsml(const char *s, size_t len, buf *out) {
-    if (!s || !len) return false;
-
-    /* Only scan DSML tags after the last </think>.  DSML mentioned inside
-     * reasoning is not executable — it inflates tag counts and causes false
-     * positive repairs.  If no </think> is found, scan from the start
-     * (thinking mode is not active or thinking was never opened). */
-    const char *think_end = find_last_substr(s, "</think>");
-    const char *scan_start = think_end ? (think_end + 8) : s;
-    size_t scan_len = (size_t)((s + len) - scan_start);
-
-    /* Detect style from first <tool_calls> tag */
-    const char *ts, *te, *is, *ie, *ps, *pe;
-    if (strstr(scan_start, PULSAR_TOOL_CALLS_START)) {
-        ts = PULSAR_TOOL_CALLS_START;  te = PULSAR_TOOL_CALLS_END;
-        is = PULSAR_INVOKE_START;      ie = PULSAR_INVOKE_END;
-        ps = PULSAR_PARAM_START;       pe = PULSAR_PARAM_END;
-    } else if (strstr(scan_start, PULSAR_TOOL_CALLS_START_SHORT)) {
-        ts = PULSAR_TOOL_CALLS_START_SHORT;  te = PULSAR_TOOL_CALLS_END_SHORT;
-        is = PULSAR_INVOKE_START_SHORT;      ie = PULSAR_INVOKE_END_SHORT;
-        ps = PULSAR_PARAM_START_SHORT;       pe = PULSAR_PARAM_END_SHORT;
-    } else if (strstr(scan_start, "<tool_calls>")) {
-        ts = "<tool_calls>";   te = "</tool_calls>";
-        is = "<invoke";        ie = "</invoke>";
-        ps = "<parameter";     pe = "</parameter>";
-    } else {
-        return false; /* No recognizable DSML start tag */
-    }
-
-    /* Single-pass: count all 6 tag types in one scan */
-    size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
-    const char *e = scan_start + scan_len;
-    for (const char *p = scan_start; p < e; ) {
-        size_t d;
-        if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
-        else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
-        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
-        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
-        else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
-        else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
-        else p++;
-    }
-    if (tos == toe && ios == ioe && pos == poe) return false;
-    if (toe > tos || ioe > ios || poe > pos) {
-        /* Extra closing tags are not a truncation pattern.  Refuse repair so the
-         * unsigned differences below cannot wrap and append a huge suffix. */
-        return false;
-    }
-    /* Repair: copy original text and append missing closing tags in reverse
-     * order.  First TRIM a trailing partial closing tag: the model was cut
-     * mid-"</...>", and appending a fresh close after the fragment would bake
-     * tag debris into the parsed parameter VALUE (seen live: a truncated bash
-     * call carrying "</｜DSML｜" inside command).  The fragment counts no tag
-     * above, so the appended deficit is unchanged by the trim. */
-    size_t keep = trim_truncated_dsml_close_tail(s, (size_t)(scan_start - s), len);
-    buf_append(out, s, keep);
-    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
-    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
-    for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
-    return true;
-}
-
-
-
-static const char *tool_parse_failure_recovery_finish(const char *finish) {
-    /* Once DSML failed to parse there is no executable tool call to report.
-     * Preserve a true length stop, because callers can distinguish truncation
-     * from a completed turn.  Every other non-error tool-parse failure becomes
-     * a normal assistant stop with the raw model text returned as content. */
-    if (finish && !strcmp(finish, "length")) return "length";
-    return "stop";
-}
-
-
-
-bool parse_generated_message_for_response(const char *text,
-                                                 bool has_tools,
-                                                 bool saw_tool_start,
-                                                 bool require_thinking_closed,
-                                                 const char **finish_io,
-                                                 char *err,
-                                                 size_t errlen,
-                                                 char **content_out,
-                                                 char **reasoning_out,
-                                                 tool_calls *calls,
-                                                 bool *recovered_out) {
-    if (recovered_out) *recovered_out = false;
-
-    bool parsed_ok = parse_generated_message_ex(text ? text : "",
-                                                require_thinking_closed,
-                                                content_out, reasoning_out,
-                                                calls);
-    if (parsed_ok) return true;
-
-    free(*content_out);
-    free(*reasoning_out);
-    *content_out = xstrdup(text ? text : "");
-    *reasoning_out = NULL;
-    tool_calls_free(calls);
-
-    /* A malformed tool block is model output, not a server failure.  The
-     * generation worker may hide this turn from the client, append a tool error
-     * plus protocol reminder to the live session, and let the model try again.
-     * If that continuation is unavailable, parsed_content keeps the raw text as
-     * a last-resort assistant fallback instead of crashing the request. */
-    const char *finish = finish_io && *finish_io ? *finish_io : "stop";
-    if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
-        if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
-        if (err && errlen) snprintf(err, errlen, "invalid tool call");
-        if (recovered_out) *recovered_out = true;
-    }
-    return false;
-}
-
-
-
+/// @brief Append a JSON object as a JSON string (OpenAI's "arguments"): `json` normalised by
+///        append_json_object_or_empty, then escaped.
+/// @param b     the buffer
+/// @param json  the object text (empty or invalid: "{}")
 void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
     append_json_object_or_empty(&tmp, json);
@@ -917,9 +344,11 @@ void append_json_object_string(buf *b, const char *json) {
 
 
 
-void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                   const tool_schema_orders *orders) {
-    (void)orders;
+/// @brief Append OpenAI's message tool_calls array.
+/// @param b          the buffer
+/// @param calls      the calls
+/// @param id_prefix  the id base for a call without one ("<prefix>_tool_<i>")
+void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_prefix) {
     buf_putc(b, '[');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
@@ -939,13 +368,16 @@ void append_tool_calls_json(buf *b, const tool_calls *calls, const char *id_pref
 
 
 
-void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *id_prefix,
-                                         const tool_schema_orders *orders) {
-    (void)orders;
+/// @brief Append OpenAI's streaming delta tool_calls array: calls [first, calls->len), each whole, with its index.
+/// @param b          the buffer
+/// @param calls      the calls
+/// @param first      the first call to send (the ones before it went out as live deltas)
+/// @param id_prefix  the id base for a call without one ("<prefix>_tool_<i>")
+void append_tool_call_deltas_json(buf *b, const tool_calls *calls, int first, const char *id_prefix) {
     buf_putc(b, '[');
-    for (int i = 0; i < calls->len; i++) {
+    for (int i = first; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
-        if (i) buf_putc(b, ',');
+        if (i > first) buf_putc(b, ',');
         char idbuf[128];
         snprintf(idbuf, sizeof(idbuf), "%s_tool_%d", id_prefix, i);
         buf_puts(b, "{\"index\":");
@@ -960,4 +392,3 @@ void append_tool_call_deltas_json(buf *b, const tool_calls *calls, const char *i
     }
     buf_putc(b, ']');
 }
-

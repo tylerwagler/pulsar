@@ -1,23 +1,46 @@
+/** @file
+ *  HTTP response writers and the OpenAI chat / completions SSE stream and protocol sink.
+ */
 #include "pulsar_server_internal.h"
 
 
 
-static void append_cors_headers(buf *h) {
-    buf_puts(h,
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: *\r\n");
+/* L335: the reason phrase of every status the server sends (200, 204, 400, 404, 409, 429, 500, 503 --
+ * 429 is in the table for the admission paths that may send it, no path does today).  A status outside
+ * the table is a server bug, not a client's: http_write dies on it rather than send "<code> Error". */
+/// The RFC 9110 reason phrase of an HTTP status the server sends.
+/// @param code  the HTTP status
+/// @return the phrase, or NULL for a status outside the server's table
+static const char *http_reason(int code) {
+    switch (code) {
+    case 200: return "OK";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
+    default: return NULL;
+    }
 }
 
-
-
-bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
-    const char *reason = code == 200 ? "OK" :
-                         code == 204 ? "No Content" :
-                         code == 400 ? "Bad Request" :
-                         code == 404 ? "Not Found" :
-                         code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+/* Writes one complete response.  `extra` is NULL or pre-formatted
+ * "Name: value\r\n" lines, placed before Connection. */
+/// Write one complete HTTP response with optional extra header lines (Connection: close).
+/// @param fd     the client socket
+/// @param code   the HTTP status (one http_reason knows; any other dies)
+/// @param type   the Content-Type (NULL or empty: none)
+/// @param body   the body, NUL-terminated (NULL: empty)
+/// @param extra  extra header lines, or NULL
+/// @return false when a write failed
+static bool http_write(int fd, int code, const char *type, const char *body,
+                       const char *extra) {
+    const char *reason = http_reason(code);
+    if (!reason) {
+        fprintf(stderr, "pulsar-server: http_write: status %d has no reason phrase in http_reason\n", code);
+        pulsar_die("http_write: a status outside the server's table");
+    }
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -29,7 +52,7 @@ bool http_response(int fd, bool enable_cors, int code, const char *type, const c
         buf_puts(&h, type);
         buf_puts(&h, "\r\n");
     }
-    if (enable_cors) append_cors_headers(&h);
+    if (extra) buf_puts(&h, extra);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
@@ -37,20 +60,115 @@ bool http_response(int fd, bool enable_cors, int code, const char *type, const c
     return ok;
 }
 
+/// Write one complete HTTP response (Connection: close).
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param type  the Content-Type (NULL or empty: none)
+/// @param body  the body, NUL-terminated (NULL: empty)
+/// @return false when a write failed
+bool http_response(int fd, int code, const char *type, const char *body) {
+    return http_write(fd, code, type, body, NULL);
+}
 
+/* A retryable failure tells the client when to come back: Retry-After in
+ * whole seconds (never an HTTP date; Claude Code reads integers and stops
+ * retrying above 60) and X-Should-Retry: true.  Permanent failures carry
+ * neither, so a client never backs off to retry something that cannot work. */
+/// Write a retryable HTTP response: Retry-After (whole seconds) and X-Should-Retry: true.
+/// @param fd             the client socket
+/// @param code           the HTTP status
+/// @param type           the Content-Type
+/// @param body           the body (NULL: empty)
+/// @param retry_after_s  the Retry-After value, whole seconds
+/// @return false when a write failed
+bool http_response_retry(int fd, int code, const char *type, const char *body,
+                         int retry_after_s) {
+    char extra[96];
+    snprintf(extra, sizeof extra, "Retry-After: %d\r\nX-Should-Retry: true\r\n",
+             retry_after_s);
+    return http_write(fd, code, type, body, extra);
+}
 
-bool http_error(int fd, bool enable_cors, int code, const char *msg) {
+/// Append OpenAI's error envelope ({"error":{"message":...,"type":"invalid_request_error"}}).
+/// @param b    the buffer appended to
+/// @param msg  the message
+static void openai_error_body(buf *b, const char *msg) {
+    buf_puts(b, "{\"error\":{\"message\":");
+    json_escape(b, msg);
+    buf_puts(b, ",\"type\":\"invalid_request_error\"}}\n");
+}
+
+/// Send an OpenAI-shaped error response.
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param msg   the message
+/// @return false when a write failed
+bool http_error(int fd, int code, const char *msg) {
     buf b = {0};
-    buf_puts(&b, "{\"error\":{\"message\":");
+    openai_error_body(&b, msg);
+    bool ok = http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+/// Send an OpenAI-shaped retryable error (http_response_retry's headers).
+/// @param fd             the client socket
+/// @param code           the HTTP status
+/// @param msg            the message
+/// @param retry_after_s  the Retry-After value, whole seconds
+/// @return false when a write failed
+bool http_error_retry(int fd, int code, const char *msg, int retry_after_s) {
+    buf b = {0};
+    openai_error_body(&b, msg);
+    bool ok = http_response_retry(fd, code, "application/json", b.ptr, retry_after_s);
+    buf_free(&b);
+    return ok;
+}
+
+/* Anthropic error envelope: the Messages API wraps the error object in a
+ * top-level {"type":"error", ...}, and the Anthropic SDK keys on that
+ * discriminator -- an OpenAI-shaped {"error":{...}} surfaces as a generic
+ * unknown APIError instead of a typed InvalidRequestError. The
+ * context-length path already emits this shape; every other 4xx on the
+ * /v1/messages surface must too. */
+/* L249 D: the Messages API's error type for a status -- what Claude Code's retry logic reads (an
+ * overloaded_error is retried with backoff, an invalid_request_error is not). */
+const char *anthropic_error_type(int code) {
+    switch (code) {
+    case 401: return "authentication_error";
+    case 403: return "permission_error";
+    case 404: return "not_found_error";
+    case 413: return "request_too_large";
+    case 429: return "rate_limit_error";
+    case 503:
+    case 529: return "overloaded_error";
+    default: return code >= 400 && code < 500 ? "invalid_request_error" : "api_error";
+    }
+}
+
+/// Send an error in Anthropic's envelope ({"type":"error","error":{...}}), its type the status's
+/// (anthropic_error_type); a capacity refusal (429 / 503 / 529) carries Retry-After and X-Should-Retry.
+/// @param fd    the client socket
+/// @param code  the HTTP status
+/// @param msg   the message
+/// @return false when a write failed
+bool http_error_anthropic(int fd, int code, const char *msg) {
+    buf b = {0};
+    buf_printf(&b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", anthropic_error_type(code));
     json_escape(&b, msg);
-    buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
-    bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
+    buf_puts(&b, "}}\n");
+    const bool retry = code == 429 || code == 503 || code == 529;
+    bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
+                    : http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
 
 
 
+/// The OpenAI error's "param" for a context overflow: the field that carried the prompt.
+/// @param r  the request (NULL: "prompt")
+/// @return "input" (Responses), "messages" (chat) or "prompt" (completions)
 static const char *context_length_error_param(const request *r) {
     if (!r) return "prompt";
     if (r->api == API_RESPONSES) return "input";
@@ -59,6 +177,10 @@ static const char *context_length_error_param(const request *r) {
 
 
 
+/// Whether the prompt leaves no room to generate.
+/// @param r         the request (NULL: false)
+/// @param ctx_size  the context size, tokens
+/// @return true when the prompt's tokens reach `ctx_size`
 bool request_exceeds_context(const request *r, int ctx_size) {
     /* pulsar_session_sync() rejects prompt->len >= ctx_size because generation
      * needs at least one free context slot.  Catch the same boundary here so
@@ -68,7 +190,14 @@ bool request_exceeds_context(const request *r, int ctx_size) {
 
 
 
-bool http_error_context_length_exceeded(int fd, bool enable_cors,
+/// Send the 400 context_length_exceeded error in the request's protocol shape (Anthropic's envelope or OpenAI's,
+/// with n_prompt_tokens and n_ctx).
+/// @param fd               the client socket
+/// @param r                the request (selects the shape; NULL: OpenAI's)
+/// @param n_prompt_tokens  the prompt's tokens
+/// @param ctx_size         the context size, tokens
+/// @return false when a write failed
+bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size) {
@@ -97,7 +226,7 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
         buf_printf(&b, "%d", ctx_size);
         buf_puts(&b, "}}\n");
     }
-    bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
+    bool ok = http_response(fd, 400, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }
@@ -107,32 +236,50 @@ bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
-bool sse_headers(int fd, bool enable_cors) {
-    buf h = {0};
-    buf_puts(&h,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n");
-    if (enable_cors) append_cors_headers(&h);
-    buf_puts(&h, "Connection: close\r\n\r\n");
-    bool ok = send_all(fd, h.ptr, h.len);
-    buf_free(&h);
-    return ok;
+/// The SSE response head (pulsar_server_internal.h).
+extern const char k_sse_head[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/event-stream\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n\r\n";
+
+/// Write the 200 text/event-stream response head that opens every SSE stream.
+/// @param fd  the client socket
+/// @return false when the write failed
+bool sse_headers(int fd) {
+    return send_all(fd, k_sse_head, sizeof k_sse_head - 1);
+}
+
+/* Anthropic gets a REAL `ping` event: it is documented, and its SDK skips every ping event before parsing the
+ * stream (before message_start too).  OpenAI chat and Responses get an SSE comment, which every conformant SSE
+ * parser discards before it reaches application code (see gen_stream_heartbeat for why not response.in_progress). */
+const char *stream_keepalive_beat(const request *r) {
+    return r && r->api == API_ANTHROPIC ? "event: ping\ndata: {\"type\": \"ping\"}\n\n" : ": ping\n\n";
 }
 
 
 
-bool sse_error_event(int fd, const request *r, const char *msg) {
+/// Send an error event in an open SSE stream: Anthropic's envelope with the status's type (anthropic_error_type:
+/// api_error for a 500, overloaded_error for a capacity refusal), or OpenAI's (server_error for a 5xx, else
+/// invalid_request_error).  The status the event stands for is the one the request would have had before the
+/// stream opened (L249 D: a stream may open while the request still waits for its bank).
+/// @param fd    the client socket
+/// @param r     the request (selects the shape; may be NULL)
+/// @param code  the HTTP status the error stands for
+/// @param msg   the message (NULL or empty: "internal server error")
+/// @return false when the write failed
+bool sse_error_event(int fd, const request *r, int code, const char *msg) {
     const char *message = msg && msg[0] ? msg : "internal server error";
     buf b = {0};
     if (r && r->api == API_ANTHROPIC) {
-        buf_puts(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":");
+        buf_printf(&b, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":",
+                   anthropic_error_type(code));
         json_escape(&b, message);
         buf_puts(&b, "}}\n\n");
     } else {
         buf_puts(&b, "event: error\ndata: {\"error\":{\"message\":");
         json_escape(&b, message);
-        buf_puts(&b, ",\"type\":\"server_error\"}}\n\n");
+        buf_printf(&b, ",\"type\":\"%s\"}}\n\n", code >= 500 ? "server_error" : "invalid_request_error");
     }
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
@@ -141,6 +288,13 @@ bool sse_error_event(int fd, const request *r, const char *msg) {
 
 
 
+/// Send one plain-stream chunk: a chat.completion.chunk content delta, or a text_completion chunk.
+/// @param fd      the client socket
+/// @param r       the request (kind and model)
+/// @param id      the response id
+/// @param text    the text (NULL: a role delta, or an empty delta with `finish`)
+/// @param finish  the finish_reason, or NULL while streaming
+/// @return false when the write failed
 bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
@@ -174,20 +328,41 @@ bool sse_chunk(int fd, const request *r, const char *id, const char *text, const
 
 
 
+/// Clamp a reported token count to [0, max].
+/// @param value  the count
+/// @param max    the upper bound (negative: none)
+/// @return the clamped count
 int clamp_usage_tokens(int value, int max) {
     if (value < 0) return 0;
     if (max >= 0 && value > max) return max;
     return value;
 }
 
+/* The cache read/write split reported to clients: read is capped at the
+ * prompt size, write at what read leaves. Single-sourced so all three
+ * protocol usage emitters (OpenAI/Anthropic/Responses) apply the same policy
+ * -- the order (read before write) is a contract they must not drift on. */
+/// Clamp the reported cache split: read to the prompt, write to what read leaves.
+/// @param cache_read   in/out: the cache-read tokens, clamped to [0, total]
+/// @param cache_write  in/out: the cache-write tokens, clamped to [0, total - read]
+/// @param total        the prompt's tokens
+void resolve_cache_split(int *cache_read, int *cache_write, int total) {
+    *cache_read = clamp_usage_tokens(*cache_read, total);
+    *cache_write = clamp_usage_tokens(*cache_write, total - *cache_read);
+}
 
 
+
+/// Append OpenAI's "usage" object (with prompt_tokens_details: cached_tokens and the cache_write_tokens extension).
+/// @param b                  the JSON being built
+/// @param r                  the request (its cache split; NULL: none)
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
 void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
-    cached_tokens = clamp_usage_tokens(cached_tokens, prompt_tokens);
-    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cached_tokens);
+    resolve_cache_split(&cached_tokens, &cache_write_tokens, prompt_tokens);
     /* OpenAI defines cached_tokens as prompt tokens retrieved from cache.
      * Newly-prefilled tokens are useful to expose, but they are a DS4 extension
      * and must stay separate so OpenAI-compatible clients do not over-count
@@ -201,12 +376,134 @@ void append_openai_usage_json(buf *b, const request *r,
 
 
 
+/* A token piece can be a PARTIAL UTF-8 sequence — the tokenizer splits
+ * multibyte characters across tokens — while the wire must stay valid UTF-8.
+ * "bytes" carries the exact bytes and is the authoritative form; "token"
+ * substitutes U+FFFD for anything that is not a well-formed sequence, which is
+ * what the OpenAI API does with the same problem. */
+/// Append a token piece as a JSON string, ill-formed UTF-8 replaced by U+FFFD.
+/// @param b      the JSON being built
+/// @param piece  the token's bytes
+/// @param len    bytes at `piece`
+static void append_logprob_text_json(buf *b, const char *piece, size_t len) {
+    buf clean = {0};
+    size_t i = 0;
+    while (i < len) {
+        /* Table 3-7 well-formedness is the lib's one rule (utf8_seq_ok,
+         * L187): ED A0 80 and the other overlong / surrogate / > U+10FFFF
+         * forms are rejected there, so a strict client never sees them. */
+        const int need = utf8_seq_ok((const unsigned char *)piece + i, len - i);
+        if (need > 0) {
+            buf_append(&clean, piece + i, (size_t)need);
+            i += (size_t)need;
+        } else {
+            buf_puts(&clean, "\xef\xbf\xbd");
+            i++;
+        }
+    }
+    buf_putc(b, '"');
+    json_escape_fragment_n(b, clean.ptr ? clean.ptr : "", clean.len);
+    buf_putc(b, '"');
+    buf_free(&clean);
+}
+
+
+
+/* JSON has no -Infinity.  A degenerate row (every logit non-finite) is the only
+ * way to produce one, and `null` is how the engine's --dump-logits reports the
+ * same condition — an unmistakable hole beats a fabricated finite number. */
+/// Append a logprob as a JSON number, or null when it is not finite.
+/// @param b  the JSON being built
+/// @param v  the logprob (non-finite: null)
+static void append_logprob_number_json(buf *b, float v) {
+    if (isfinite(v)) buf_printf(b, "%.9g", (double)v);
+    else buf_puts(b, "null");
+}
+
+
+
+/* {"token":...,"logprob":...,"bytes":[...]  — the whole of an alternative's
+ * entry and the head of a chosen token's, whose "top_logprobs" array follows.
+ * Left OPEN for that reason; both callers close the object. */
+/// Append a logprob entry's token, logprob and bytes, leaving the object open.
+/// @param b  the JSON being built
+/// @param t  the token entry
+static void append_logprob_token_open_json(buf *b, const logprob_token *t) {
+    buf_puts(b, "{\"token\":");
+    append_logprob_text_json(b, t->piece, t->piece_len);
+    buf_puts(b, ",\"logprob\":");
+    append_logprob_number_json(b, t->logprob);
+    buf_puts(b, ",\"bytes\":[");
+    for (size_t k = 0; k < t->piece_len; k++) {
+        if (k) buf_putc(b, ',');
+        buf_printf(b, "%u", (unsigned)(unsigned char)t->piece[k]);
+    }
+    buf_putc(b, ']');
+}
+
+
+
+/* The OpenAI logprobs object for entries [from, to) of a request's ledger,
+ * emitted with a leading comma so callers append it inside a choice object
+ * (append_openai_timings_json's convention).  Nothing is written unless the
+ * client asked for logprobs.
+ *
+ * The array is named `content` because that is the field name in the OpenAI
+ * schema; see logprob_ledger for what it actually spans (every generated token,
+ * not only the visible content substring). */
+/// Append ",\"logprobs\":{...}" for ledger entries [from, to) when the client asked for logprobs.
+/// @param b     the JSON being built
+/// @param lg    the request's ledger (NULL or disabled: nothing written)
+/// @param from  the first entry (clamped at 0)
+/// @param to    one past the last entry (clamped to the ledger's length)
+void append_openai_logprobs_json(buf *b, const logprob_ledger *lg, int from, int to) {
+    if (!lg || !lg->enabled) return;
+    if (from < 0) from = 0;
+    if (to > lg->len) to = lg->len;
+    buf_puts(b, ",\"logprobs\":{\"content\":[");
+    for (int i = from; i < to; i++) {
+        const logprob_entry *e = &lg->v[i];
+        if (i > from) buf_putc(b, ',');
+        append_logprob_token_open_json(b, &e->tok);
+        buf_puts(b, ",\"top_logprobs\":[");
+        for (int t = 0; t < e->n_top; t++) {
+            if (t) buf_putc(b, ',');
+            append_logprob_token_open_json(b, &e->top[t]);
+            buf_putc(b, '}');
+        }
+        buf_puts(b, "]}");
+    }
+    buf_puts(b, "]}");
+}
+
+
+
+/* Streaming form: attach the entries whose token bytes this chunk RELEASES
+ * (piece ending at or before the watermark; SIZE_MAX on the final chunk) and
+ * mark them streamed, so the entries concatenated over a stream reproduce the
+ * non-streaming array exactly once. */
+/// Append the logprob entries a chunk releases and mark them streamed.
+/// @param b             the chunk being built
+/// @param lp            the ledger (NULL or disabled: nothing); lp->streamed advances
+/// @param release_upto  the byte offset in the completion the chunk releases (SIZE_MAX: everything left)
+static void append_openai_logprobs_delta(buf *b, logprob_ledger *lp, size_t release_upto) {
+    if (!lp || !lp->enabled) return;
+    const int to = logprob_stream_ready(lp, release_upto);
+    append_openai_logprobs_json(b, lp, lp->streamed, to);
+    lp->streamed = to;
+}
+
+
+
 /* Additive per-response timing block (llama.cpp-ish field names for client
  * familiarity, plus DS4 cache-split and DSpark extensions). Emits a leading
  * ",\"timings\":{...}" so callers append it directly after the usage object.
  * Pure metadata: every value comes from counters the worker already kept, and
  * the rates are derived here with guarded divisions (a zero denominator omits
  * the rate rather than emitting a non-finite number). Never affects sampling. */
+/// Append the ",\"timings\":{...}" block from the request's timings.
+/// @param b  the JSON being built
+/// @param r  the request (its timings; NULL or not valid: nothing written)
 void append_openai_timings_json(buf *b, const request *r) {
     const req_timings *t = r ? &r->timings : NULL;
     if (!t || !t->valid) return;
@@ -244,6 +541,13 @@ void append_openai_timings_json(buf *b, const request *r) {
 
 
 
+/// Send the usage chunk (usage + timings, empty choices) when the client asked for stream_options.include_usage.
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when the write failed (true when not asked for)
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -270,6 +574,13 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
 
 
 
+/// End an OpenAI stream: the usage chunk (when asked for), then "data: [DONE]".
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
 bool sse_done(int fd, const request *r, const char *id,
                      int prompt_tokens, int completion_tokens) {
     return sse_usage_chunk(fd, r, id, prompt_tokens, completion_tokens) &&
@@ -278,123 +589,35 @@ bool sse_done(int fd, const request *r, const char *id,
 
 
 
-bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
-                            const char *reasoning, const tool_calls *calls, const char *finish,
-                            int prompt_tokens, int completion_tokens) {
-    if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
-
-    buf b = {0};
-    long now = (long)time(NULL);
-    if (reasoning && reasoning[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
-        json_escape(&b, reasoning);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    if (content && content[0]) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
-        json_escape(&b, content);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    if (calls && calls->len) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
-        buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
-        buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
-    }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-    json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
-    json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
-
-    bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
-    return ok;
-}
 
 
 
+/// Reset an OpenAI live-stream state and mark it active.
+/// @param r   the request (unused)
+/// @param st  the state, zeroed
 void openai_stream_start(const request *r, openai_stream *st) {
+    (void)r;
     memset(st, 0, sizeof(*st));
     st->active = true;
-    st->mode = pulsar_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning =
-        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
 }
 
 
 
-static void openai_tool_stream_free(openai_tool_stream *ts) {
-    if (!ts) return;
-    for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
-    free(ts->ids);
-    ts->ids = NULL;
-    ts->ids_cap = 0;
-}
-
-
-
-void openai_stream_free(openai_stream *st) {
-    if (!st) return;
-    openai_tool_stream_free(&st->tool);
-}
-
-
-
-static bool openai_tool_stream_has_id(const openai_tool_stream *ts,
-                                      const char *id, int upto) {
-    if (!ts || !id || !id[0]) return false;
-    if (upto > ts->ids_cap) upto = ts->ids_cap;
-    for (int i = 0; i < upto; i++) {
-        if (ts->ids[i] && !strcmp(ts->ids[i], id)) return true;
-    }
-    return false;
-}
-
-
-
-/* Free function (NOT a server:: method): legitimately called with a null server.
- * As a member the `!s` guard would be elided under -O3 (this assumed non-null);
- * as a free function taking server* the guard holds. */
-static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
-                                         int index) {
-    if (!ts || index < 0) return "";
-    if (index >= ts->ids_cap) {
-        int old = ts->ids_cap;
-        int cap = old ? old : 4;
-        while (cap <= index) cap *= 2;
-        ts->ids = (char* *)server_xrealloc(ts->ids, (size_t)cap * sizeof(ts->ids[0]));
-        memset(ts->ids + old, 0, (size_t)(cap - old) * sizeof(ts->ids[0]));
-        ts->ids_cap = cap;
-    }
-    if (!ts->ids[index]) {
-        char id[64];
-        for (;;) {
-            random_tool_id(id, sizeof(id), API_OPENAI);
-            if (!openai_tool_stream_has_id(ts, id, index) &&
-                (!s || !s->tool_memory_has_id(id))) break;  /* null s (no bound server) => no dedup, as the predecessor free fn did */
-        }
-        ts->ids[index] = xstrdup(id);
-    }
-    return ts->ids[index];
-}
-
-
-
-size_t text_stream_safe_limit(const char *raw, size_t start,
-                                     size_t raw_len, bool has_tools,
-                                     bool final);
-
-
-
+/* `release_upto` is the absolute offset in the raw completion that this delta
+ * carries the client up to; the logprob entries it covers ride along. */
+/// Send one chat.completion.chunk delta carrying `field` (content or reasoning_content), with its logprobs.
+/// @param fd            the client socket
+/// @param r             the request
+/// @param id            the response id
+/// @param field         the delta member's name
+/// @param text          the bytes
+/// @param len           bytes at `text` (0: nothing sent)
+/// @param lp            the logprob ledger (may be NULL)
+/// @param release_upto  the completion byte offset the delta releases
+/// @return false when the write failed
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
-                             const char *field, const char *text, size_t len) {
+                             const char *field, const char *text, size_t len,
+                             logprob_ledger *lp, size_t release_upto) {
     if (len == 0) return true;
     buf b = {0};
     long now = (long)time(NULL);
@@ -404,7 +627,9 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     json_escape(&b, field);
     buf_putc(&b, ':');
     json_escape_n(&b, text, len);
-    buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
+    buf_putc(&b, '}');
+    append_openai_logprobs_delta(&b, lp, release_upto);
+    buf_puts(&b, ",\"finish_reason\":null}]}\n\n");
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
     return ok;
@@ -413,10 +638,17 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
 
 
 /* OpenAI clients can consume function.arguments as a stream of JSON text
- * fragments.  DS4 generates XML-ish DSML instead, so this parser switches to a
- * hidden tool mode at <...tool_calls>, emits the tool header once the invoke tag
- * is complete, then translates each parameter body into argument deltas while
- * holding only tiny tails for partial closing tags, UTF-8, and DSML entities. */
+ * fragments: a family's output parser announces each call once its name is
+ * known (the header below), then sends the argument object's text as it reads
+ * it (the args delta after it) -- the generic tool events of sink_tool_ops. */
+/// Send the tool_calls start delta for call `index` (id, name, empty arguments).
+/// @param fd       the client socket
+/// @param r        the request
+/// @param id       the response id
+/// @param index    the call's index in tool_calls
+/// @param tool_id  the call id (NULL: empty)
+/// @param name     the function's name (NULL: empty)
+/// @return false when the write failed
 static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char *id,
                                            int index, const char *tool_id,
                                            const char *name) {
@@ -438,6 +670,14 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
 
 
 
+/// Send a fragment of call `index`'s arguments JSON text as a function.arguments delta.
+/// @param fd     the client socket
+/// @param r      the request
+/// @param id     the response id
+/// @param index  the call's index
+/// @param text   the fragment
+/// @param len    bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char *id,
                                             int index, const char *text, size_t len) {
     if (len == 0) return true;
@@ -457,915 +697,155 @@ static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char
 
 
 
-bool raw_full_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
-    size_t n = strlen(lit);
-    return pos <= raw_len && raw_len - pos >= n && !memcmp(raw + pos, lit, n);
-}
+/* ---- L267: the OpenAI sink (chat_sink) --------------------------------------- */
 
-
-
-static bool raw_partial_lit(const char *raw, size_t raw_len, size_t pos, const char *lit) {
-    size_t n = strlen(lit);
-    if (pos > raw_len || raw_len - pos >= n) return false;
-    return !memcmp(raw + pos, lit, raw_len - pos);
-}
-
-
-
-bool raw_partial_any(const char *raw, size_t raw_len, size_t pos,
-                            const char *a, const char *b) {
-    return raw_partial_lit(raw, raw_len, pos, a) || raw_partial_lit(raw, raw_len, pos, b);
-}
-
-
-
-const char *find_lit_bounded(const char *s, size_t n, const char *lit) {
-    size_t m = strlen(lit);
-    if (m == 0) return s;
-    if (n < m) return NULL;
-    for (size_t i = 0; i <= n - m; i++) {
-        if (!memcmp(s + i, lit, m)) return s + i;
-    }
-    return NULL;
-}
-
-
-
-const dsml_syntax dsml_syntaxes[3] = {
-    {
-        PULSAR_TOOL_CALLS_START, PULSAR_TOOL_CALLS_END,
-        PULSAR_INVOKE_START, PULSAR_INVOKE_END,
-        PULSAR_PARAM_START, PULSAR_PARAM_END,
-    },
-    {
-        PULSAR_TOOL_CALLS_START_SHORT, PULSAR_TOOL_CALLS_END_SHORT,
-        PULSAR_INVOKE_START_SHORT, PULSAR_INVOKE_END_SHORT,
-        PULSAR_PARAM_START_SHORT, PULSAR_PARAM_END_SHORT,
-    },
-    {
-        "<tool_calls>", "</tool_calls>",
-        "<invoke", "</invoke>",
-        "<parameter", "</parameter>",
-    },
-};
-
-
-
-static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
-                                const char *lit, size_t min_len) {
-    size_t lit_len = strlen(lit);
-    if (!raw || pos > raw_len || raw_len - pos >= lit_len) return false;
-    size_t avail = raw_len - pos;
-    return avail >= min_len && !memcmp(raw + pos, lit, avail);
-}
-
-
-
-static size_t dsml_max_tool_start_len(void) {
-    size_t max = 0;
-    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
-        size_t n = strlen(dsml_syntaxes[i].tool_calls_start);
-        if (n > max) max = n;
-    }
-    return max;
-}
-
-
-
-static bool dsml_find_tool_start(const char *raw, size_t raw_len,
-                                 size_t *pos_out,
-                                 const dsml_syntax **syn_out) {
-    const char *best = NULL;
-    const dsml_syntax *best_syn = NULL;
-    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
-        const char *p = find_lit_bounded(raw, raw_len, dsml_syntaxes[i].tool_calls_start);
-        if (p && (!best || p < best)) {
-            best = p;
-            best_syn = &dsml_syntaxes[i];
-        }
-    }
-    if (!best) return false;
-    *pos_out = (size_t)(best - raw) + strlen(best_syn->tool_calls_start);
-    *syn_out = best_syn;
+/// chat_sink::text for OpenAI chat: a content or reasoning_content delta (an inactive stream sends nothing).
+/// @param k             the sink
+/// @param reasoning     the text is reasoning
+/// @param text          the bytes
+/// @param len           bytes at `text`
+/// @param release_upto  the completion byte offset the delta releases
+/// @return false when the write failed
+static bool openai_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t release_upto) {
+    openai_stream *st = (openai_stream *)k->st;
+    if (!st->active) return true;
+    if (!sse_chat_delta_n(k->fd, k->r, k->id, reasoning ? "reasoning_content" : "content", text, len, st->lp,
+                          release_upto)) return false;
+    if (reasoning) st->sent_reasoning = true;
     return true;
 }
 
+/// chat_sink::end for OpenAI: nothing to send.
+/// @return true
+static bool openai_sink_end_cb(chat_sink *, bool) { return true; }
 
+/* A tool call as it decodes (a family's live tool events): the tool_call start delta (id + name),
+ * then its argument object's JSON in fragments. */
+/// sink_tool_ops::begin for OpenAI: the call's start delta.
+/// @param k      the OpenAI sink (openai_stream::tools_streamed counts the call)
+/// @param index  the call's index
+/// @param id     the call id
+/// @param name   the function's name
+/// @return false when the write failed
+static bool openai_tool_begin(chat_sink *k, int index, const char *id, const char *name) {
+    ((openai_stream *)k->st)->tools_streamed++;
+    return sse_chat_tool_call_start_delta(k->fd, k->r, k->id, index, id, name);
+}
 
-static bool dsml_find_tool_start_from(const char *raw, size_t raw_len,
-                                      size_t start,
-                                      size_t *pos_out,
-                                      const dsml_syntax **syn_out) {
-    if (start > raw_len) return false;
-    size_t rel = 0;
-    if (!dsml_find_tool_start(raw + start, raw_len - start, &rel, syn_out)) {
-        return false;
-    }
-    *pos_out = start + rel;
-    return true;
+/// sink_tool_ops::args for OpenAI.
+/// @param k      the OpenAI sink
+/// @param index  the call's index
+/// @param text   the fragment
+/// @param len    bytes at `text`
+/// @return false when the write failed
+static bool openai_tool_args(chat_sink *k, int index, const char *text, size_t len) {
+    return sse_chat_tool_call_args_delta_n(k->fd, k->r, k->id, index, text, len);
+}
+
+/// sink_tool_ops::end for OpenAI: nothing to send.
+/// @return true
+static bool openai_tool_end(chat_sink *, int) { return true; }
+
+/// The OpenAI sink's live tool-call events.
+static const sink_tool_ops openai_tool_ops = {openai_tool_begin, openai_tool_args, openai_tool_end};
+
+/// Build the OpenAI chat protocol sink over `st` (live tool events on; worker thread).
+/// @param k   the sink to fill
+/// @param fd  the client socket
+/// @param s   the server (NULL in unit tests)
+/// @param r   the request
+/// @param id  the response id (borrowed for the sink's life)
+/// @param st  the stream state (openai_stream_start)
+void openai_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id, openai_stream *st) {
+    *k = {fd, s, r, id, st, openai_sink_text_cb, openai_sink_end_cb, &openai_tool_ops, true};
 }
 
 
 
-static bool dsml_attr_is_string_true(const char *raw, size_t raw_len,
-                                     size_t tag_start, size_t tag_end) {
-    if (tag_end <= tag_start || tag_end > raw_len) return false;
-    char *tag = xstrndup(raw + tag_start, tag_end - tag_start);
-    char *is_string = dsml_attr(tag, "string");
-    bool result = is_string && !strcmp(is_string, "true");
-    free(is_string);
-    free(tag);
-    return result;
-}
 
 
+/* Append the closing chat chunk (empty delta, the remaining logprob entries,
+ * finish_reason) to `b`, send `b`, then the usage chunk and [DONE]; frees `b`. */
+/// Send the closing chat chunk (remaining logprobs, finish_reason), then usage and [DONE].
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the response id
+/// @param now                the chunk's created time (time(NULL))
+/// @param b                  bytes already queued to send first (freed here)
+/// @param lp                 the logprob ledger (may be NULL)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
+static bool openai_sse_send_final(int fd, const request *r, const char *id, long now, buf *b,
+                                  logprob_ledger *lp, const char *finish,
+                                  int prompt_tokens, int completion_tokens) {
+    buf_printf(b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
+    json_escape(b, r->model);
+    buf_puts(b, ",\"choices\":[{\"index\":0,\"delta\":{}");
+    /* Entries whose bytes never reached a content/reasoning delta (tool-call
+     * bytes, suppressed protocol markers, a held tail) are still this
+     * completion's tokens: flush the remainder here so the streamed logprobs
+     * concatenate to the non-streaming array. */
+    append_openai_logprobs_delta(b, lp, SIZE_MAX);
+    buf_puts(b, ",\"finish_reason\":");
+    json_escape(b, finish);
+    buf_puts(b, "}]}\n\n");
 
-#ifdef PULSAR_SERVER_TEST
-
-static bool raw_suffix_partial_lit(const char *raw, size_t raw_len,
-                                   const char *lit, size_t min_len) {
-    size_t lit_len = strlen(lit);
-    if (!raw || raw_len == 0 || lit_len == 0) return false;
-    size_t max = raw_len < lit_len ? raw_len : lit_len - 1;
-    for (size_t n = min_len; n <= max; n++) {
-        if (!memcmp(raw + raw_len - n, lit, n)) return true;
-    }
-    return false;
-}
-
-
-
-static dsml_decode_state dsml_decode_scan_json_param(const char *raw,
-                                                     size_t raw_len,
-                                                     size_t pos,
-                                                     const dsml_syntax *syn) {
-    bool in_string = false;
-    bool escaped = false;
-    while (pos < raw_len) {
-        if (!in_string && raw_full_lit(raw, raw_len, pos, syn->param_end)) {
-            return DSML_DECODE_STRUCTURAL;
-        }
-        unsigned char c = (unsigned char)raw[pos++];
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-        } else if (c == '"') {
-            in_string = true;
-        }
-    }
-    if (!in_string && raw_suffix_partial_lit(raw, raw_len, syn->param_end, 2)) {
-        return DSML_DECODE_STRUCTURAL;
-    }
-    return in_string ? DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
-}
-
-
-
-/* Slow reference recognizer used by tests. */
-dsml_decode_state dsml_decode_state_for_text(const char *raw, size_t raw_len) {
-    if (!raw || raw_len == 0) return DSML_DECODE_OUTSIDE;
-
-    size_t pos = 0;
-    const dsml_syntax *syn = NULL;
-    if (!dsml_find_tool_start(raw, raw_len, &pos, &syn)) {
-        return DSML_DECODE_OUTSIDE;
-    }
-
-    for (;;) {
-        while (pos < raw_len && isspace((unsigned char)raw[pos])) pos++;
-        if (pos >= raw_len) return DSML_DECODE_STRUCTURAL;
-
-        if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_end)) {
-            return DSML_DECODE_OUTSIDE;
-        }
-        if (raw_full_lit(raw, raw_len, pos, syn->invoke_end)) {
-            pos += strlen(syn->invoke_end);
-            continue;
-        }
-        if (raw_full_lit(raw, raw_len, pos, syn->invoke_start)) {
-            const char *tag_end = (const char *)memchr(raw + pos, '>', raw_len - pos);
-            if (!tag_end) return DSML_DECODE_STRUCTURAL;
-            pos = (size_t)(tag_end - raw) + 1;
-            continue;
-        }
-        if (raw_full_lit(raw, raw_len, pos, syn->param_start)) {
-            size_t tag_start = pos;
-            const char *tag_end_ptr = (const char *)memchr(raw + pos, '>', raw_len - pos);
-            if (!tag_end_ptr) return DSML_DECODE_STRUCTURAL;
-            size_t tag_end = (size_t)(tag_end_ptr - raw) + 1;
-            bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_end);
-            pos = tag_end;
-
-            if (string_value) {
-                const char *end = find_lit_bounded(raw + pos, raw_len - pos, syn->param_end);
-                if (!end) {
-                    if (raw_suffix_partial_lit(raw, raw_len, syn->param_end, 2)) {
-                        return DSML_DECODE_STRUCTURAL;
-                    }
-                    return DSML_DECODE_STRING_BODY;
-                }
-                pos = (size_t)(end - raw) + strlen(syn->param_end);
-                continue;
-            }
-
-            dsml_decode_state json_state =
-                dsml_decode_scan_json_param(raw, raw_len, pos, syn);
-            if (json_state == DSML_DECODE_STRUCTURAL) {
-                const char *end = find_lit_bounded(raw + pos, raw_len - pos, syn->param_end);
-                if (!end) return DSML_DECODE_STRUCTURAL;
-                pos = (size_t)(end - raw) + strlen(syn->param_end);
-                continue;
-            }
-            return json_state;
-        }
-
-        for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
-            if (raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].tool_calls_end) ||
-                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].invoke_start) ||
-                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].invoke_end) ||
-                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].param_start) ||
-                raw_partial_lit(raw, raw_len, pos, dsml_syntaxes[i].param_end))
-            {
-                return DSML_DECODE_STRUCTURAL;
-            }
-        }
-        return DSML_DECODE_STRUCTURAL;
-    }
-}
-
-
-#endif
-
-
-bool dsml_decode_state_is_tool(dsml_decode_state state) {
-    return state != DSML_DECODE_OUTSIDE;
-}
-
-
-
-bool dsml_decode_state_uses_payload_sampling(dsml_decode_state state) {
-    return state == DSML_DECODE_STRING_BODY || state == DSML_DECODE_JSON_STRING;
-}
-
-
-
-void dsml_decode_tracker_init(dsml_decode_tracker *dt) {
-    memset(dt, 0, sizeof(*dt));
-    dt->mode = DSML_TRACK_SEARCH;
-    dt->decode = DSML_DECODE_OUTSIDE;
-}
-
-
-
-/* Track where generation is inside a DSML tool call.  This is intentionally a
- * forgiving recognizer, not a validator: malformed DSML still gets parsed later
- * by the normal tool-call parser.  Here we only need enough state to decide
- * whether the next token belongs to protocol syntax or arbitrary payload. */
-void dsml_decode_tracker_update(dsml_decode_tracker *dt,
-                                       const char *raw, size_t raw_len) {
-    if (!dt || !raw) return;
-
-    for (;;) {
-        if (dt->mode == DSML_TRACK_DONE) {
-            dt->decode = DSML_DECODE_OUTSIDE;
-            return;
-        }
-
-        if (dt->mode == DSML_TRACK_SEARCH) {
-            size_t pos = 0;
-            const dsml_syntax *syn = NULL;
-            if (!dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn)) {
-                size_t hold = dsml_max_tool_start_len();
-                dt->pos = raw_len > hold ? raw_len - hold : 0;
-                dt->decode = DSML_DECODE_OUTSIDE;
-                return;
-            }
-            dt->syn = syn;
-            dt->pos = pos;
-            dt->mode = DSML_TRACK_STRUCTURAL;
-            dt->decode = DSML_DECODE_STRUCTURAL;
-        }
-
-        if (dt->mode == DSML_TRACK_STRING_BODY) {
-            while (dt->pos < raw_len) {
-                if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
-                    dt->pos += strlen(dt->syn->param_end);
-                    dt->mode = DSML_TRACK_STRUCTURAL;
-                    dt->decode = DSML_DECODE_STRUCTURAL;
-                    goto structural;
-                }
-                if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
-                    dt->decode = DSML_DECODE_STRUCTURAL;
-                    return;
-                }
-                dt->pos++;
-            }
-            dt->decode = DSML_DECODE_STRING_BODY;
-            return;
-        }
-
-        if (dt->mode == DSML_TRACK_JSON_PARAM) {
-            while (dt->pos < raw_len) {
-                if (!dt->json_in_string) {
-                    if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
-                        dt->pos += strlen(dt->syn->param_end);
-                        dt->mode = DSML_TRACK_STRUCTURAL;
-                        dt->decode = DSML_DECODE_STRUCTURAL;
-                        goto structural;
-                    }
-                    if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
-                        dt->decode = DSML_DECODE_STRUCTURAL;
-                        return;
-                    }
-                }
-
-                unsigned char c = (unsigned char)raw[dt->pos++];
-                if (dt->json_in_string) {
-                    if (dt->json_escaped) {
-                        dt->json_escaped = false;
-                    } else if (c == '\\') {
-                        dt->json_escaped = true;
-                    } else if (c == '"') {
-                        dt->json_in_string = false;
-                    }
-                } else if (c == '"') {
-                    dt->json_in_string = true;
-                }
-            }
-            dt->decode = dt->json_in_string ?
-                DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
-            return;
-        }
-
-structural:
-        while (dt->mode == DSML_TRACK_STRUCTURAL) {
-            while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
-            if (dt->pos >= raw_len) {
-                dt->decode = DSML_DECODE_STRUCTURAL;
-                return;
-            }
-
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
-                dt->mode = DSML_TRACK_DONE;
-                dt->pos += strlen(dt->syn->tool_calls_end);
-                dt->decode = DSML_DECODE_OUTSIDE;
-                return;
-            }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
-                dt->pos += strlen(dt->syn->invoke_end);
-                continue;
-            }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_start)) {
-                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
-                if (!tag_end) {
-                    dt->decode = DSML_DECODE_STRUCTURAL;
-                    return;
-                }
-                dt->pos = (size_t)(tag_end - raw) + 1;
-                continue;
-            }
-            if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_start)) {
-                size_t tag_start = dt->pos;
-                const char *tag_end = (const char *)memchr(raw + dt->pos, '>', raw_len - dt->pos);
-                if (!tag_end) {
-                    dt->decode = DSML_DECODE_STRUCTURAL;
-                    return;
-                }
-                size_t tag_after = (size_t)(tag_end - raw) + 1;
-                bool string_value = dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
-                dt->pos = tag_after;
-                if (string_value) {
-                    dt->mode = DSML_TRACK_STRING_BODY;
-                    dt->decode = DSML_DECODE_STRING_BODY;
-                } else {
-                    dt->mode = DSML_TRACK_JSON_PARAM;
-                    dt->json_in_string = false;
-                    dt->json_escaped = false;
-                    dt->decode = DSML_DECODE_JSON_STRUCTURAL;
-                }
-                break;
-            }
-
-            if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_start) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->invoke_end) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_start) ||
-                raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end))
-            {
-                dt->decode = DSML_DECODE_STRUCTURAL;
-                return;
-            }
-
-            dt->decode = DSML_DECODE_STRUCTURAL;
-            return;
-        }
-    }
-}
-
-
-
-static size_t dsml_entity_stream_safe_len(const char *raw, size_t start, size_t limit) {
-    static const char *ents[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
-    const size_t max_ent = 6;
-    size_t scan = limit > start + max_ent ? limit - max_ent : start;
-    for (size_t i = limit; i > scan; i--) {
-        if (raw[i - 1] != '&') continue;
-        size_t amp = i - 1;
-        size_t tail = limit - amp;
-        for (size_t ei = 0; ei < sizeof(ents) / sizeof(ents[0]); ei++) {
-            size_t elen = strlen(ents[ei]);
-            if (tail < elen && !memcmp(raw + amp, ents[ei], tail)) return amp;
-        }
-        break;
-    }
-    return limit;
-}
-
-
-
-size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
-                                               size_t raw_len, const char *param_end,
-                                               bool is_string) {
-    /* Hold a trailing partial closing tag of ANY DSML style, not only the
-     * active one: the model sometimes mixes styles (opens short, closes
-     * long), and a mismatched partial close streamed as value bytes is tag
-     * debris in the argument (seen live: a truncated call carrying
-     * "</｜DSML｜" inside command).  A held tail self-resolves on the next
-     * update: either the prefix breaks (real value text, released) or the
-     * tag completes (parsed or trimmed at finalize). */
-    (void)param_end;
-    size_t limit = trim_truncated_dsml_close_tail(raw, start, raw_len);
-    if (is_string) limit = dsml_entity_stream_safe_len(raw, start, limit);
-    return utf8_stream_safe_len(raw, start, limit, false);
-}
-
-
-
-static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
-                                           openai_tool_stream *ts,
-                                           const char *text, size_t len) {
-    return sse_chat_tool_call_args_delta_n(fd, r, id, ts->index, text, len);
-}
-
-
-
-static bool openai_tool_emit_string_value(int fd, const request *r, const char *id,
-                                          openai_tool_stream *ts,
-                                          const char *text, size_t len) {
-    if (len == 0) return true;
-    char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
-    buf frag = {0};
-    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
-    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
-    free(unescaped);
-    free(raw);
+    bool ok = send_all(fd, b->ptr, b->len) &&
+              sse_done(fd, r, id, prompt_tokens, completion_tokens);
+    buf_free(b);
     return ok;
 }
 
 
 
-static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *id,
-                                          openai_tool_stream *ts,
-                                          const char *name, bool is_string) {
-    buf frag = {0};
-    if (ts->first_param) ts->first_param = false;
-    else buf_putc(&frag, ',');
-    json_escape(&frag, name ? name : "");
-    buf_putc(&frag, ':');
-    if (is_string) buf_putc(&frag, '"');
-    bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
-    buf_free(&frag);
-    return ok;
-}
-
-
-
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
-                                    size_t raw_len, size_t pos) {
-    openai_tool_stream_free(ts);
-    memset(ts, 0, sizeof(*ts));
-    ts->active = true;
-    ts->state = DSML_TOOL_BETWEEN_INVOKES;
-    ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, PULSAR_TOOL_CALLS_START)) {
-        ts->parse_pos += strlen(PULSAR_TOOL_CALLS_START);
-        ts->tool_calls_end = PULSAR_TOOL_CALLS_END;
-        ts->invoke_start = PULSAR_INVOKE_START;
-        ts->invoke_end = PULSAR_INVOKE_END;
-        ts->param_start = PULSAR_PARAM_START;
-        ts->param_end = PULSAR_PARAM_END;
-    } else if (raw_full_lit(raw, raw_len, pos, PULSAR_TOOL_CALLS_START_SHORT)) {
-        ts->parse_pos += strlen(PULSAR_TOOL_CALLS_START_SHORT);
-        ts->tool_calls_end = PULSAR_TOOL_CALLS_END_SHORT;
-        ts->invoke_start = PULSAR_INVOKE_START_SHORT;
-        ts->invoke_end = PULSAR_INVOKE_END_SHORT;
-        ts->param_start = PULSAR_PARAM_START_SHORT;
-        ts->param_end = PULSAR_PARAM_END_SHORT;
-    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
-        ts->parse_pos += strlen("<tool_calls>");
-        ts->tool_calls_end = "</tool_calls>";
-        ts->invoke_start = "<invoke";
-        ts->invoke_end = "</invoke>";
-        ts->param_start = "<parameter";
-        ts->param_end = "</parameter>";
-    } else {
-        ts->active = false;
-        ts->state = DSML_TOOL_ERROR;
-        return false;
-    }
-    return true;
-}
-
-
-
-static bool openai_tool_stream_fail(openai_tool_stream *ts) {
-    ts->active = false;
-    ts->state = DSML_TOOL_ERROR;
-    return true;
-}
-
-
-
-static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
-                                     openai_tool_stream *ts,
-                                     const char *raw, size_t raw_len) {
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
-    if (!name) return openai_tool_stream_fail(ts);
-
-    const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
-    bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
-              openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
-    free(name);
-    if (!ok) return false;
-
-    ts->emitted_any = true;
-    ts->args_open = true;
-    ts->first_param = true;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-
-
-static bool openai_tool_start_param(int fd, const request *r, const char *id,
-                                    openai_tool_stream *ts,
-                                    const char *raw, size_t raw_len) {
-    const char *tag_end = (const char *)memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
-    if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
-    free(tag);
-    if (!name || !is_string) {
-        free(name);
-        free(is_string);
-        return openai_tool_stream_fail(ts);
-    }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
-    free(name);
-    free(is_string);
-    if (!ok) return false;
-
-    ts->param_is_string = string_value;
-    ts->parse_pos = (size_t)(tag_end - raw) + 1;
-    ts->state = DSML_TOOL_PARAM_VALUE;
-    return true;
-}
-
-
-
-static bool openai_tool_finish_param(int fd, const request *r, const char *id,
-                                     openai_tool_stream *ts,
-                                     const char *raw, size_t value_end) {
-    if (value_end > ts->parse_pos) {
-        bool ok = ts->param_is_string ?
-            openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                          value_end - ts->parse_pos) :
-            openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                           value_end - ts->parse_pos);
-        if (!ok) return false;
-    }
-    if (ts->param_is_string &&
-        !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->param_end);
-    ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    return true;
-}
-
-
-
-/* Generation ended (final) while a streamed tool call is still open: the
- * client has already received the call header and a prefix of the argument
- * deltas, so the truncation cannot be reclassified as text (the non-stream
- * path's try_repair_dsml equivalent).  What CAN be guaranteed is well-formed
- * wire JSON: flush the un-emitted value bytes, close an open string value,
- * close the args object.  The argument VALUE stays truncated — exactly what
- * the repaired non-stream parse of the same bytes yields — and the finish
- * reason (length) still tells the client the turn was cut. */
-static bool openai_tool_stream_finalize(int fd, const request *r, const char *id,
-                                        openai_tool_stream *ts,
-                                        const char *raw, size_t raw_len) {
-    if (!ts->active) return true;
-    if (ts->state == DSML_TOOL_PARAM_VALUE) {
-        /* Flush only up to the stream-safe limit: the held-back tail is a
-         * partial closing tag (the model was mid-"</...parameter>") or a
-         * split UTF-8 sequence -- tag debris and mojibake, never value
-         * content.  Dropping it beats the non-stream repair here, which
-         * keeps the fragment in the value. */
-        size_t limit = tool_param_value_stream_safe_len(
-                raw, ts->parse_pos, raw_len, ts->param_end, ts->param_is_string);
-        limit = trim_truncated_dsml_close_tail(raw, ts->parse_pos, limit);
-        if (limit > ts->parse_pos) {
-            bool ok = ts->param_is_string ?
-                openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                              limit - ts->parse_pos) :
-                openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                               limit - ts->parse_pos);
-            if (!ok) return false;
-            ts->parse_pos = limit;
-        }
-        if (ts->param_is_string &&
-            !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
-        ts->state = DSML_TOOL_BETWEEN_PARAMS;
-    }
-    if (ts->args_open) {
-        if (!openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
-        ts->args_open = false;
-    }
-    ts->active = false;
-    ts->state = DSML_TOOL_DONE;
-    return true;
-}
-
-static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
-                                      openai_tool_stream *ts,
-                                      const char *raw, size_t raw_len) {
-    while (ts->active && ts->parse_pos < raw_len) {
-        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
-                ts->parse_pos += strlen(ts->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!openai_tool_start_invoke(fd, s, r, id, ts, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return openai_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
-            while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
-            if (ts->parse_pos >= raw_len) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_end)) {
-                if (ts->args_open &&
-                    !openai_tool_emit_args_fragment(fd, r, id, ts, "}", 1)) return false;
-                ts->args_open = false;
-                ts->parse_pos += strlen(ts->invoke_end);
-                ts->index++;
-                ts->state = DSML_TOOL_BETWEEN_INVOKES;
-                continue;
-            }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->invoke_end, ts->param_start)) return true;
-            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->param_start)) {
-                size_t before_pos = ts->parse_pos;
-                dsml_tool_stream_state before_state = ts->state;
-                if (!openai_tool_start_param(fd, r, id, ts, raw, raw_len)) return false;
-                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
-                continue;
-            }
-            return openai_tool_stream_fail(ts);
-        }
-
-        if (ts->state == DSML_TOOL_PARAM_VALUE) {
-            const char *end = find_lit_bounded(raw + ts->parse_pos,
-                                               raw_len - ts->parse_pos,
-                                               ts->param_end);
-            if (end) {
-                if (!openai_tool_finish_param(fd, r, id, ts, raw,
-                                              (size_t)(end - raw))) return false;
-                continue;
-            }
-            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
-                                                            raw_len, ts->param_end,
-                                                            ts->param_is_string);
-            if (limit > ts->parse_pos) {
-                bool ok = ts->param_is_string ?
-                    openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
-                                                  limit - ts->parse_pos) :
-                    openai_tool_emit_args_fragment(fd, r, id, ts, raw + ts->parse_pos,
-                                                   limit - ts->parse_pos);
-                if (!ok) return false;
-                ts->parse_pos = limit;
-            }
-            return true;
-        }
-
-        return true;
-    }
-    return true;
-}
-
-
-
-bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
-                                     openai_stream *st,
-                                     const char *raw, size_t raw_len,
-                                     bool final) {
-    if (!st->active || !raw) return true;
-
-    if (st->mode == OPENAI_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
-        /* A tool call starting before any </think> is the unclosed-reasoning
-         * recovery case (upstream ds4 51a1c14): stream only the prose before
-         * the marker as reasoning, hold until the block completes, and keep
-         * the protocol bytes off every channel. */
-        const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
-        const bool tool_before_close = tool && (!close || tool < close);
-        /* The END must also land before </think>: a block whose end falls past
-         * the close straddles the reasoning boundary and is NOT an executable
-         * call (upstream ds4 0ead8a8). */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
-        const bool complete_tool = tool_end && (!close || tool_end < close);
-        size_t limit;
-        if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else if (close) {
-            /* An incomplete marker that remains inside a closed think block is
-             * reasoning text, not an executable call. */
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
-            limit = raw_len;
-        } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
-        }
-
-        if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
-            st->sent_reasoning = true;
-            st->emit_pos = limit;
-        }
-
-        if (complete_tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = OPENAI_STREAM_SUPPRESS;
-            return true;
-        }
-
-        if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
-            st->mode = OPENAI_STREAM_TEXT;
-        } else if (final) {
-            st->mode = OPENAI_STREAM_SUPPRESS;
-            return true;
-        } else {
-            return true;
-        }
-    }
-
-    if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            /* A second </think> before any tool marker means the held text
-             * was another reasoning pass — reroute it. A tool marker or the
-             * final flush releases the hold as genuine answer text. */
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool2 || close < tool2)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool2 && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
-
-        if (limit > st->emit_pos) {
-            if (!sse_chat_delta_n(fd, r, id, "content",
-                                  raw + st->emit_pos,
-                                  limit - st->emit_pos)) return false;
-            st->sent_content = true;
-            st->emit_pos = limit;
-        }
-
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
-                st->mode = OPENAI_STREAM_TOOL;
-            } else {
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
-        } else if (final) {
-            st->mode = OPENAI_STREAM_SUPPRESS;
-        }
-    }
-
-    if (st->mode == OPENAI_STREAM_TOOL) {
-        if (!openai_tool_stream_update(fd, s, r, id, &st->tool, raw, raw_len)) return false;
-        if (final && st->tool.active &&
-            !openai_tool_stream_finalize(fd, r, id, &st->tool, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
-    }
-    return true;
-}
-
-
-
-bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
-                                   openai_stream *st, const char *raw,
-                                   size_t raw_len, const tool_calls *calls,
-                                   const char *finish, int prompt_tokens,
-                                   int completion_tokens) {
-    if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
-
+/* The end of the stream: the calls no delta carried yet (a block the final
+ * parse recovered, or the calls after the ones streamed live), then the closing
+ * chunk, usage and [DONE]. */
+/// End an OpenAI chat stream: calls no delta carried, the closing chunk, usage and [DONE].
+/// @param k                  the OpenAI sink
+/// @param calls              the turn's calls: those past openai_stream::tools_streamed are sent whole, each once,
+///                           under its own index (as the Anthropic finish sends the calls past its count)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when a write failed
+bool openai_sse_finish(chat_sink *k, const tool_calls *calls, const char *finish, int prompt_tokens,
+                       int completion_tokens) {
+    const openai_stream *st = (const openai_stream *)k->st;
     buf b = {0};
     long now = (long)time(NULL);
-    if (calls && calls->len && !st->tool.emitted_any) {
-        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-        json_escape(&b, r->model);
+    if (calls && calls->len > st->tools_streamed) {
+        buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", k->id, now);
+        json_escape(&b, k->r->model);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
-        append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
+        append_tool_call_deltas_json(&b, calls, st->tools_streamed, k->id);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
-    buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
-    json_escape(&b, r->model);
-    buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
-    json_escape(&b, finish);
-    buf_puts(&b, "}]}\n\n");
-
-    bool ok = send_all(fd, b.ptr, b.len) &&
-              sse_done(fd, r, id, prompt_tokens, completion_tokens);
-    buf_free(&b);
-    return ok;
+    return openai_sse_send_final(k->fd, k->r, k->id, now, &b, st->lp, finish, prompt_tokens, completion_tokens);
 }
 
 
 
+/// @param r  the request
+/// @return true for a streamed OpenAI chat request (its output goes through the OpenAI sink)
 bool request_uses_openai_live_stream(const request *r) {
     return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
 }
 
 
 
+/// @param r  the request
+/// @return true for a streamed Responses request
 bool request_uses_responses_live_stream(const request *r) {
     return r->stream && r->api == API_RESPONSES && r->kind == REQ_CHAT;
 }
 
 
 
+/// @param r  the request
+/// @return true when the stream is a protocol projection (Anthropic, Responses or OpenAI chat), not plain chunks
 bool request_uses_structured_stream(const request *r) {
     return r->stream && (r->api == API_ANTHROPIC ||
                          r->api == API_RESPONSES ||

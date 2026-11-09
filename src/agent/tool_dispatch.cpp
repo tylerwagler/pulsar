@@ -1,3 +1,5 @@
+/** @file
+ *  pulsar-agent: executes one parsed tool call and returns its model-visible result. */
 #include "pulsar_agent_internal.h"
 
 
@@ -10,6 +12,10 @@
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
+/// @brief Execute one tool call (see above).
+/// @param w    the worker
+/// @param call the parsed call
+/// @return the tool-role result text (a "Tool error: ..." text on failure), malloc'd; caller frees
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
@@ -24,6 +30,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
+        /* L354: nobody is watching a non-interactive run: running a model's commands is asked for by name */
+        if (w->cfg->non_interactive && !w->cfg->allow_bash)
+            return xstrdup("Tool error: bash is refused in a non-interactive run (--allow-bash permits it)\n");
         int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
         int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
                                               60, 1, 3600);
@@ -66,6 +75,12 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         agent_buf_puts(&result, "\n");
         return agent_buf_take(&result);
     }
+}
+
+
+
+char *agent_execute_tool_call_one(agent_worker *w, const agent_tool_call *call) {
+    return agent_execute_tool_call(w, call);
 }
 
 

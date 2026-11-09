@@ -1,42 +1,33 @@
+/** @file
+ *  OpenAI Responses API responses: the final JSON body, the SSE event stream and its protocol sink.
+ */
 #include "pulsar_server_internal.h"
 
 
 
-/* Codex' Responses API uses 24-hex suffixes for response/item ids. Prefix
- * controls the variant (resp_, rs_, msg_, fc_) so each event references a
- * stable identifier across output_item.added / .done. */
-static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
-    unsigned char bytes[12];
-    size_t pos = snprintf(dst, dstlen, "%s", prefix);
-    if (pos >= dstlen) return;
-    if (!random_bytes(bytes, sizeof(bytes))) {
-        /* Fail closed like random_tool_id: ids must not be predictable. */
-        pulsar_die("random_bytes failed; cannot generate response ids");
-    }
-    static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < sizeof(bytes) && pos + 2 < dstlen; i++) {
-        dst[pos++] = hex[bytes[i] >> 4];
-        dst[pos++] = hex[bytes[i] & 15];
-    }
-    dst[pos] = '\0';
-}
+/* Codex' Responses API uses 24-hex suffixes for response/item ids
+ * (random_prefixed_id with 12 bytes).  The prefix controls the variant
+ * (resp_, rs_, msg_, fc_) so each event references a stable identifier across
+ * output_item.added / .done. */
 
 
-
+/// Reset a Responses stream state: fresh resp_ / rs_ / msg_ ids (24 hex), no items open (indexes -1).
+/// @param r   the request (unused)
+/// @param st  the state, zeroed
 void responses_stream_init(const request *r, responses_stream *st) {
+    (void)r;
     memset(st, 0, sizeof(*st));
-    st->mode = pulsar_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
-    st->guard_second_reasoning =
-        pulsar_think_mode_enabled(r->think_mode) && r->has_tools;
-    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
-    responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
-    responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
+    random_prefixed_id(st->response_id, sizeof(st->response_id), "resp_", 12);
+    random_prefixed_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_", 12);
+    random_prefixed_id(st->message_id, sizeof(st->message_id), "msg_", 12);
     st->reasoning_index = -1;
     st->message_index = -1;
 }
 
 
 
+/// Free the accumulated reasoning and message text (the state itself is the caller's).
+/// @param st  the state (NULL: nothing)
 void responses_stream_free(responses_stream *st) {
     if (!st) return;
     buf_free(&st->reasoning_text);
@@ -49,6 +40,11 @@ void responses_stream_free(responses_stream *st) {
  * ordering and reconnect resilience. We inject it after the `{"type":...` head
  * so emitters can stay readable while still producing the wire shape Codex
  * expects. */
+/// Send one Responses SSE event with sequence_number spliced in after its "type" (st->sequence advances).
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param body  the event's JSON object, starting with {"type":"..."
+/// @return false when the write failed
 static bool responses_sse_emit_event(int fd, responses_stream *st, const char *body) {
     buf b = {0};
     buf_puts(&b, "data: ");
@@ -84,6 +80,12 @@ static bool responses_sse_emit_event(int fd, responses_stream *st, const char *b
 
 
 
+/// Send response.created (status in_progress, empty output).
+/// @param fd          the client socket
+/// @param r           the request (its model)
+/// @param st          the stream state (its response_id)
+/// @param created_at  the response's creation time, Unix seconds
+/// @return false when the write failed
 bool responses_sse_created(int fd, const request *r, responses_stream *st,
                                   long created_at) {
     buf b = {0};
@@ -100,6 +102,10 @@ bool responses_sse_created(int fd, const request *r, responses_stream *st,
 
 
 
+/// Send output_item.added for the reasoning item at st->reasoning_index.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_reasoning_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -114,6 +120,10 @@ static bool responses_sse_reasoning_added(int fd, responses_stream *st) {
 
 
 
+/// Send reasoning_summary_part.added (summary index 0) for the reasoning item.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_reasoning_summary_part_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -128,6 +138,12 @@ static bool responses_sse_reasoning_summary_part_added(int fd, responses_stream 
 
 
 
+/// Send a reasoning_summary_text.delta.
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param text  the bytes
+/// @param len   bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
                                           const char *text, size_t len) {
     if (len == 0) return true;
@@ -145,6 +161,9 @@ static bool responses_sse_reasoning_delta(int fd, responses_stream *st,
 
 
 
+/// An output item's status for a finish.
+/// @param finish  the finish label (may be NULL)
+/// @return "incomplete" for length / error, else "completed"
 static const char *responses_item_status_for_finish(const char *finish) {
     if (finish && (!strcmp(finish, "length") || !strcmp(finish, "error"))) return "incomplete";
     return "completed";
@@ -152,6 +171,12 @@ static const char *responses_item_status_for_finish(const char *finish) {
 
 
 
+/// Close the reasoning item: summary_text.done, summary_part.done (when one was opened), output_item.done; the
+/// item is completed only when the model closed its reasoning itself.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param finish  the finish label (unused: the status follows reasoning_closed_naturally)
+/// @return false when a write failed
 static bool responses_sse_reasoning_done(int fd, responses_stream *st,
                                          const char *finish) {
     /* If the stream terminates before `</think>` was actually observed the
@@ -214,6 +239,10 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
 
 
 
+/// Send output_item.added for the assistant message item at st->message_index.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_message_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -228,6 +257,10 @@ static bool responses_sse_message_added(int fd, responses_stream *st) {
 
 
 
+/// Send content_part.added (an empty output_text part) for the message item.
+/// @param fd  the client socket
+/// @param st  the stream state
+/// @return false when the write failed
 static bool responses_sse_message_text_part_added(int fd, responses_stream *st) {
     buf b = {0};
     buf_printf(&b,
@@ -242,6 +275,12 @@ static bool responses_sse_message_text_part_added(int fd, responses_stream *st) 
 
 
 
+/// Send an output_text.delta for the message item.
+/// @param fd    the client socket
+/// @param st    the stream state
+/// @param text  the bytes
+/// @param len   bytes at `text` (0: nothing sent)
+/// @return false when the write failed
 static bool responses_sse_output_text_delta(int fd, responses_stream *st,
                                             const char *text, size_t len) {
     if (len == 0) return true;
@@ -259,6 +298,11 @@ static bool responses_sse_output_text_delta(int fd, responses_stream *st,
 
 
 
+/// Close the message item: output_text.done, content_part.done, output_item.done with the accumulated text.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param finish  the finish label (the item's status)
+/// @return false when a write failed
 static bool responses_sse_message_done(int fd, responses_stream *st,
                                        const char *finish) {
     const char *item_status = responses_item_status_for_finish(finish);
@@ -307,6 +351,10 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
 
 
 
+/// Whether a call is the client-executed tool_search (sent as a tool_search_call item).
+/// @param tc     the call (NULL: false)
+/// @param order  the tool's schema order (NULL: the name alone decides)
+/// @return true for a tool_search call the request declared as Responses tool search
 static bool responses_tool_call_is_tool_search(const tool_call *tc,
                                                const tool_schema_order *order) {
     return tc && tc->name && !strcmp(tc->name, "tool_search") &&
@@ -321,6 +369,11 @@ static bool responses_tool_call_is_tool_search(const tool_call *tc,
  * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
  * defaults to function_call because Codex CLI registers all its tools as
  * function tools. */
+/// Build the per-call Responses item identities: a fresh fc_ id, the call id (or a fresh call_ id), the output
+/// index.
+/// @param out                    receives the malloc'd array (calls->len entries; NULL for no calls); caller frees
+/// @param calls                  the turn's calls (may be NULL)
+/// @param starting_output_index  the output index of the first call
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
                                        int starting_output_index) {
@@ -329,11 +382,11 @@ static void responses_tool_items_build(responses_tool_item **out,
     responses_tool_item *items = (responses_tool_item *)server_xmalloc((size_t)calls->len * sizeof(*items));
     for (int i = 0; i < calls->len; i++) {
         memset(&items[i], 0, sizeof(items[i]));
-        responses_random_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_");
+        random_prefixed_id(items[i].fc_id, sizeof(items[i].fc_id), "fc_", 12);
         if (calls->v[i].id && calls->v[i].id[0]) {
             snprintf(items[i].call_id, sizeof(items[i].call_id), "%s", calls->v[i].id);
         } else {
-            responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
+            random_prefixed_id(items[i].call_id, sizeof(items[i].call_id), "call_", 12);
         }
         items[i].is_custom = false;
         items[i].output_index = starting_output_index + i;
@@ -343,6 +396,13 @@ static void responses_tool_items_build(responses_tool_item **out,
 
 
 
+/// Append one function_call (or custom_tool_call / tool_search_call) output item.
+/// @param b            the JSON being built
+/// @param tc           the call
+/// @param item         its Responses identity (responses_tool_items_build)
+/// @param item_status  the item's status string
+/// @param with_args    include the arguments (false: an empty arguments string, for output_item.added)
+/// @param orders       the request's tool schema orders (wire names, namespaces)
 void responses_append_function_call_item(buf *b, const tool_call *tc,
                                                 const responses_tool_item *item,
                                                 const char *item_status,
@@ -386,6 +446,15 @@ void responses_append_function_call_item(buf *b, const tool_call *tc,
 
 
 
+/// Send output_item.added (in_progress, no arguments) or output_item.done for one call.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param tc      the call
+/// @param item    its Responses identity
+/// @param orders  the request's tool schema orders
+/// @param finish  the finish label (the done item's status)
+/// @param done    send .done, else .added
+/// @return false when the write failed
 static bool responses_sse_function_call_event(int fd, responses_stream *st,
                                               const tool_call *tc,
                                               const responses_tool_item *item,
@@ -415,6 +484,13 @@ static bool responses_sse_function_call_event(int fd, responses_stream *st,
  * the whole DSML invoke as one unit before the worker decides which tool was
  * called. Clients that follow the OpenAI Responses lifecycle expect both
  * events between output_item.added (in_progress) and output_item.done. */
+/// Send a function call's arguments as one function_call_arguments.delta and .done.
+/// @param fd      the client socket
+/// @param st      the stream state
+/// @param tc      the call
+/// @param item    its Responses identity (custom calls and tool_search send nothing)
+/// @param orders  the request's tool schema orders
+/// @return false when a write failed
 static bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
                                                        const tool_call *tc,
                                                        const responses_tool_item *item,
@@ -459,6 +535,9 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
 
 
 
+/// The response's status for a finish.
+/// @param finish  the finish label (may be NULL)
+/// @return "incomplete" (length), "failed" (error) or "completed"
 static const char *responses_status_for_finish(const char *finish) {
     if (finish && !strcmp(finish, "length")) return "incomplete";
     if (finish && !strcmp(finish, "error")) return "failed";
@@ -467,12 +546,16 @@ static const char *responses_status_for_finish(const char *finish) {
 
 
 
+/// Append the Responses "usage" object (input with the cache split, output, total).
+/// @param b              the JSON being built
+/// @param r              the request (its cache split; NULL: none)
+/// @param input_tokens   the prompt's tokens
+/// @param output_tokens  the tokens generated
 static void append_responses_usage_json(buf *b, const request *r,
                                         int input_tokens, int output_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
     int cache_write_tokens = r ? r->cache_write_tokens : 0;
-    cached_tokens = clamp_usage_tokens(cached_tokens, input_tokens);
-    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, input_tokens - cached_tokens);
+    resolve_cache_split(&cached_tokens, &cache_write_tokens, input_tokens);
     buf_printf(b,
         "{\"input_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d},"
         "\"output_tokens\":%d,\"output_tokens_details\":{\"reasoning_tokens\":0},"
@@ -483,6 +566,18 @@ static void append_responses_usage_json(buf *b, const request *r,
 
 
 
+/// Send the terminal event (response.completed, .incomplete or .failed) with the whole output: the reasoning item,
+/// the message item and the calls.
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param st                 the stream state
+/// @param calls              the turn's calls (may be NULL)
+/// @param tool_items         their Responses identities (NULL: calls not listed)
+/// @param finish             the finish label
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @param created_at         the response's creation time, Unix seconds
+/// @return false when the write failed
 bool responses_sse_completed(int fd, const request *r,
                                     responses_stream *st,
                                     const tool_calls *calls,
@@ -565,187 +660,102 @@ bool responses_sse_completed(int fd, const request *r,
  * consumes: <think>...</think> is reasoning, anything before the tool-call
  * marker is output text. Tool-call argument deltas are not surfaced because
  * Codex' SSE parser only ingests function_call items via output_item.done. */
-bool responses_sse_stream_update(int fd, const request *r,
-                                        responses_stream *st,
-                                        const char *raw, size_t raw_len,
-                                        bool final) {
-    if (!st->active || !raw) return true;
-
-    /* The client only sees reasoning if it explicitly opted in via
-     * reasoning.summary. Otherwise we still need to walk past <think>...</think>
-     * to find the user-visible text, but we suppress the per-chunk emission. */
-    const bool emit_reasoning = r->reasoning_summary_emit;
-
-    if (st->mode == RESP_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            /* The chat template ends the prompt with the literal `<think>` (or
-             * `</think>` when thinking is off), so generation usually starts
-             * mid-reasoning rather than with the open tag. If the model does
-             * happen to repeat `<think>` we skip it; otherwise start from
-             * position 0. The earlier "no-think-prefix => switch to TEXT"
-             * shortcut here was incorrect: it leaked reasoning to clients as
-             * regular output_text because the model was already inside the
-             * think block when it produced its first token. The actual
-             * mode change to TEXT happens only when `</think>` is observed. */
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
-        /* Unclosed-reasoning recovery (upstream ds4 51a1c14): see the OpenAI
-         * stream twin. */
-        const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
-        const bool tool_before_close = tool && (!close || tool < close);
-        /* The END must also land before </think> (upstream ds4 0ead8a8): see
-         * the OpenAI stream twin. */
-        const char *tool_end = tool_before_close ? find_any_tool_end(tool) : NULL;
-        const bool complete_tool = tool_end && (!close || tool_end < close);
-        size_t limit;
-        if (complete_tool) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else if (close) {
-            /* An incomplete marker that remains inside a closed think block is
-             * reasoning text, not an executable call. */
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            /* Match non-stream parsing: flush incomplete DSML as reasoning. */
-            limit = raw_len;
-        } else if (tool_before_close) {
-            limit = trim_tool_separator_ws(raw, st->emit_pos,
-                                           (size_t)(tool - raw));
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
-        }
-
-        if (limit > st->emit_pos) {
-            if (emit_reasoning) {
-                if (!st->reasoning_item_opened) {
-                    st->reasoning_index = st->next_output_index++;
-                    if (!responses_sse_reasoning_added(fd, st)) return false;
-                    st->reasoning_item_opened = true;
-                }
-                if (!st->reasoning_summary_started) {
-                    if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
-                    st->reasoning_summary_started = true;
-                }
-                if (!responses_sse_reasoning_delta(fd, st,
-                                                   raw + st->emit_pos,
-                                                   limit - st->emit_pos)) return false;
-                buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
-                st->reasoning_emitted_any = true;
-            }
-            st->emit_pos = limit;
-        }
-
-        if (complete_tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
-            return true;
-        }
-
-        if (close) {
-            st->emit_pos = (size_t)(close - raw) + strlen("</think>");
-            st->mode = RESP_STREAM_TEXT;
-            st->reasoning_closed_naturally = true;
-        } else if (final) {
-            st->mode = RESP_STREAM_SUPPRESS;
-            return true;
-        } else {
-            return true;
-        }
+/* One reasoning delta into the reasoning item (opened, with its summary part, on
+ * the first) and one output_text delta into the message item: the two shapes
+ * every producer streams -- DeepSeek's text projection below and a family's
+ * output parser (responses_sink_text). */
+/// Stream reasoning into the reasoning item, opening it and its summary part on the first delta.
+/// @param fd    the client socket
+/// @param st    the stream state (the text is also accumulated in st->reasoning_text)
+/// @param text  the bytes
+/// @param len   bytes at `text`
+/// @return false when a write failed
+static bool responses_emit_reasoning(int fd, responses_stream *st, const char *text, size_t len) {
+    if (!st->reasoning_item_opened) {
+        st->reasoning_index = st->next_output_index++;
+        if (!responses_sse_reasoning_added(fd, st)) return false;
+        st->reasoning_item_opened = true;
     }
-
-    if (st->mode == RESP_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            /* Second </think> before any tool marker: the held text was
-             * another reasoning pass — reroute (or drop, when reasoning
-             * summaries are off) instead of leaking it into output_text. */
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool2 = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool2 || close < tool2)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos && r->reasoning_summary_emit) {
-                    if (!st->reasoning_item_opened) {
-                        st->reasoning_index = st->next_output_index++;
-                        if (!responses_sse_reasoning_added(fd, st)) return false;
-                        st->reasoning_item_opened = true;
-                    }
-                    if (!st->reasoning_summary_started) {
-                        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
-                        st->reasoning_summary_started = true;
-                    }
-                    if (!responses_sse_reasoning_delta(fd, st,
-                                                       raw + st->emit_pos,
-                                                       limit - st->emit_pos)) return false;
-                    buf_append(&st->reasoning_text, raw + st->emit_pos,
-                               limit - st->emit_pos);
-                    st->reasoning_emitted_any = true;
-                }
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool2 && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
-        size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
-
-        if (limit > st->emit_pos) {
-            if (!st->message_item_opened) {
-                st->message_index = st->next_output_index++;
-                if (!responses_sse_message_added(fd, st)) return false;
-                st->message_item_opened = true;
-            }
-            if (!st->message_text_part_open) {
-                if (!responses_sse_message_text_part_added(fd, st)) return false;
-                st->message_text_part_open = true;
-            }
-            if (!responses_sse_output_text_delta(fd, st,
-                                                 raw + st->emit_pos,
-                                                 limit - st->emit_pos)) return false;
-            buf_append(&st->message_text, raw + st->emit_pos, limit - st->emit_pos);
-            st->message_emitted_any = true;
-            st->emit_pos = limit;
-        }
-
-        if (tool) {
-            st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
-        } else if (final) {
-            st->mode = RESP_STREAM_SUPPRESS;
-        }
+    if (!st->reasoning_summary_started) {
+        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+        st->reasoning_summary_started = true;
     }
+    if (!responses_sse_reasoning_delta(fd, st, text, len)) return false;
+    buf_append(&st->reasoning_text, text, len);
+    st->reasoning_emitted_any = true;
+    return true;
+}
+
+/// Stream answer text into the message item, opening it and its text part on the first delta.
+/// @param fd    the client socket
+/// @param st    the stream state (the text is also accumulated in st->message_text)
+/// @param text  the bytes
+/// @param len   bytes at `text`
+/// @return false when a write failed
+static bool responses_emit_text(int fd, responses_stream *st, const char *text, size_t len) {
+    if (!st->message_item_opened) {
+        st->message_index = st->next_output_index++;
+        if (!responses_sse_message_added(fd, st)) return false;
+        st->message_item_opened = true;
+    }
+    if (!st->message_text_part_open) {
+        if (!responses_sse_message_text_part_added(fd, st)) return false;
+        st->message_text_part_open = true;
+    }
+    if (!responses_sse_output_text_delta(fd, st, text, len)) return false;
+    buf_append(&st->message_text, text, len);
+    st->message_emitted_any = true;
     return true;
 }
 
 
 
-bool responses_sse_finish_live(int fd, const request *r,
-                                      responses_stream *st,
-                                      const char *raw, size_t raw_len,
-                                      const char *recovered_content,
-                                      const tool_calls *calls,
-                                      const char *finish,
-                                      int prompt_tokens, int completion_tokens,
-                                      long created_at) {
-    if (!responses_sse_stream_update(fd, r, st, raw, raw_len, true)) return false;
+/* ---- L267: the Responses sink (chat_sink) ------------------------------------ */
 
+/* Reasoning reaches the client only when it opted into a summary
+ * (reasoning.summary); tool calls go out with the response's completion
+ * (responses_sse_finish), not as they decode. */
+/// chat_sink::text for Responses.
+/// @param k          the sink
+/// @param reasoning  the text is reasoning (sent only with reasoning_summary_emit)
+/// @param text       the bytes
+/// @param len        bytes at `text` (0, or an inactive stream: nothing sent)
+/// @return false when a write failed
+static bool responses_sink_text_cb(chat_sink *k, bool reasoning, const char *text, size_t len, size_t) {
+    responses_stream *st = (responses_stream *)k->st;
+    if (!st->active || len == 0) return true;
+    if (reasoning) return !k->r->reasoning_summary_emit || responses_emit_reasoning(k->fd, st, text, len);
+    return responses_emit_text(k->fd, st, text, len);
+}
+
+/* A reasoning section that ended at the model's own </think> is a complete
+ * reasoning item (not one a stop or an error cut short). */
+/// chat_sink::end for Responses.
+/// @param k             the sink
+/// @param think_closed  the section ended at the model's own reasoning close
+/// @return true
+static bool responses_sink_end_cb(chat_sink *k, bool think_closed) {
+    if (think_closed) ((responses_stream *)k->st)->reasoning_closed_naturally = true;
+    return true;
+}
+
+/// Build the Responses protocol sink over `st` (no live tool events: calls go out with the finish).
+/// @param k   the sink to fill
+/// @param fd  the client socket
+/// @param s   the server (NULL in unit tests)
+/// @param r   the request
+/// @param id  the response id (borrowed for the sink's life)
+/// @param st  the stream state (responses_stream_init)
+void responses_sink_init(chat_sink *k, int fd, server *s, const request *r, const char *id,
+                         responses_stream *st) {
+    *k = {fd, s, r, id, st, responses_sink_text_cb, responses_sink_end_cb, NULL, false};
+}
+
+
+
+bool responses_sse_finish(int fd, const request *r, responses_stream *st, const char *recovered_tail,
+                          size_t tail_len, const tool_calls *calls, const char *finish, int prompt_tokens,
+                          int completion_tokens, long created_at) {
     /* Close any half-open reasoning summary so the TUI knows the part ended
      * before we slot in any tool calls or completion. */
     if (st->reasoning_item_opened && !st->reasoning_item_closed) {
@@ -753,30 +763,11 @@ bool responses_sse_finish_live(int fd, const request *r,
         st->reasoning_item_closed = true;
     }
     /* Recovery path: when DSML tool parsing fails the worker promotes the entire
-     * generation to assistant text. Streaming had already entered suppress mode
-     * at the tool marker, so anything in raw[st->emit_pos..raw_len] never made
-     * it to the client. Emit those bytes as additional output_text deltas so
-     * what the client accumulates matches output_item.done and the terminal
-     * response. We use the stream cursor instead of comparing against
-     * recovered_content because the raw text can begin with `<think>...</think>`
-     * which the streaming side consumed as reasoning, not message text. */
-    if (recovered_content && raw && st->emit_pos < raw_len) {
-        const char *tail = raw + st->emit_pos;
-        size_t tail_len = raw_len - st->emit_pos;
-        if (!st->message_item_opened) {
-            st->message_index = st->next_output_index++;
-            if (!responses_sse_message_added(fd, st)) return false;
-            st->message_item_opened = true;
-        }
-        if (!st->message_text_part_open) {
-            if (!responses_sse_message_text_part_added(fd, st)) return false;
-            st->message_text_part_open = true;
-        }
-        if (!responses_sse_output_text_delta(fd, st, tail, tail_len)) return false;
-        buf_append(&st->message_text, tail, tail_len);
-        st->message_emitted_any = true;
-        st->emit_pos = raw_len;
-    }
+     * generation to assistant text.  Streaming had already stopped at the tool
+     * marker, so the bytes after the walk's position never made it to the
+     * client: they go out as additional output_text deltas so what the client
+     * accumulates matches output_item.done and the terminal response. */
+    if (recovered_tail && tail_len && !responses_emit_text(fd, st, recovered_tail, tail_len)) return false;
     if (st->message_item_opened && !st->message_item_closed) {
         if (!responses_sse_message_done(fd, st, finish)) return false;
         st->message_item_closed = true;
@@ -804,16 +795,27 @@ bool responses_sse_finish_live(int fd, const request *r,
 
 
 
-bool responses_final_response(int fd, bool enable_cors,
+/// Send a non-streamed Responses body (fresh ids; the reasoning item only with reasoning_summary_emit).
+/// @param fd                 the client socket
+/// @param r                  the request
+/// @param id                 the request's response id (unused: the body's ids are drawn here)
+/// @param text               the answer text (may be NULL)
+/// @param reasoning          the reasoning (may be NULL)
+/// @param calls              the turn's calls (may be NULL)
+/// @param finish             the finish label
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @return false when the write failed
+bool responses_final_response(int fd,
                                      const request *r, const char *id,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
     (void)id;
     char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
-    responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
-    responses_random_id(message_id, sizeof(message_id), "msg_");
+    random_prefixed_id(response_id, sizeof(response_id), "resp_", 12);
+    random_prefixed_id(reasoning_id, sizeof(reasoning_id), "rs_", 12);
+    random_prefixed_id(message_id, sizeof(message_id), "msg_", 12);
 
     responses_tool_item *items = NULL;
     responses_tool_items_build(&items, calls, 0);
@@ -872,7 +874,7 @@ bool responses_final_response(int fd, bool enable_cors,
     buf_puts(&b, ",\"usage\":");
     append_responses_usage_json(&b, r, prompt_tokens, completion_tokens);
     buf_putc(&b, '}');
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     free(items);
     return ok;
@@ -880,10 +882,23 @@ bool responses_final_response(int fd, bool enable_cors,
 
 
 
-bool final_response(int fd, bool enable_cors,
+/// Send a non-streamed OpenAI chat.completion or text_completion body (usage and timings appended).
+/// @param fd                 the client socket
+/// @param r                  the request (kind, model, tool orders)
+/// @param id                 the response id
+/// @param text               the answer text (NULL: empty)
+/// @param reasoning          the reasoning (chat: reasoning_content; may be NULL)
+/// @param calls              the turn's calls (chat only; may be NULL)
+/// @param finish             the finish_reason
+/// @param prompt_tokens      the prompt's tokens
+/// @param completion_tokens  the tokens generated
+/// @param lp                 the logprob ledger (chat; NULL or disabled: none)
+/// @return false when the write failed
+bool final_response(int fd,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
-                           int prompt_tokens, int completion_tokens) {
+                           int prompt_tokens, int completion_tokens,
+                           const logprob_ledger *lp) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -897,16 +912,20 @@ bool final_response(int fd, bool enable_cors,
         }
         if (calls && calls->len) {
             buf_puts(&b, ",\"tool_calls\":");
-            append_tool_calls_json(&b, calls, id, &r->tool_orders);
+            append_tool_calls_json(&b, calls, id);
         }
-        buf_puts(&b, "},\"finish_reason\":");
+        buf_putc(&b, '}');
+        /* Sibling of message/finish_reason inside the choice, as in the OpenAI
+         * schema; absent unless the client asked for it. */
+        append_openai_logprobs_json(&b, lp, 0, lp ? lp->len : 0);
+        buf_puts(&b, ",\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     } else {
         buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[{\"text\":");
-        json_escape(&b, text);
+        json_escape(&b, text ? text : "");   /* L335: the chat branch's NULL guard (NULL: no text) */
         buf_puts(&b, ",\"index\":0,\"finish_reason\":");
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
@@ -914,7 +933,7 @@ bool final_response(int fd, bool enable_cors,
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
     append_openai_timings_json(&b, r);
     buf_puts(&b, "}\n");
-    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }

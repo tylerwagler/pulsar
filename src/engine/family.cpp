@@ -1,0 +1,145 @@
+/** @file family.cpp
+ *  @brief The model-family registry and the capability check (family.h). */
+/* family.cpp -- the family registry and the capability check (L251 S1).
+ * See family.h for the contract. */
+#include "pulsar_engine_internal.h"
+
+const char *pulsar_layer_kind_name(pulsar_layer_kind k) {
+    switch (k) {
+    case PULSAR_LAYER_NONE:      return "none";
+    case PULSAR_LAYER_DS4_BLOCK: return "ds4_block";
+    case PULSAR_LAYER_QWEN_GDN:  return "qwen_gdn";
+    case PULSAR_LAYER_QWEN_QSA:  return "qwen_qsa";
+    case PULSAR_LAYER_BLOCKS:    return "blocks";
+    case PULSAR_LAYER_KIND_COUNT: break;
+    }
+    return "unknown";
+}
+
+uint32_t pulsar_layer_plan_count(const pulsar_layer_plan *p, pulsar_layer_kind k) {
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < p->n_layer; il++) n += p->kind[il] == k;
+    return n;
+}
+
+const char *pulsar_layer_plan_check(const pulsar_layer_plan *p, uint32_t *at_layer) {
+    *at_layer = UINT32_MAX;
+    if (p->n_layer == 0 || p->n_layer > PULSAR_FAMILY_MAX_LAYER) return "a layer count outside 1 .. PULSAR_FAMILY_MAX_LAYER";
+    static const pulsar_layer_desc zero = {};
+    for (uint32_t il = 0; il < p->n_layer; il++) {
+        *at_layer = il;
+        const pulsar_layer_kind k = p->kind[il];
+        const pulsar_layer_desc &d = p->desc[il];
+        if (k == PULSAR_LAYER_NONE || k >= PULSAR_LAYER_KIND_COUNT) return "a layer with no kind";
+        if (k != PULSAR_LAYER_BLOCKS) {
+            if (memcmp(&d, &zero, sizeof d) != 0) return "a block description on a layer that is not a blocks layer";
+            continue;
+        }
+        if (d.mixer != PULSAR_MIXER_ATTN_FULL && d.mixer != PULSAR_MIXER_ATTN_WINDOW && d.mixer != PULSAR_MIXER_MAMBA2)
+            return "a blocks layer with no mixer";
+        if (d.ffn != PULSAR_FFN_NONE && d.ffn != PULSAR_FFN_DENSE && d.ffn != PULSAR_FFN_MOE &&
+            d.ffn != PULSAR_FFN_DENSE_MOE)
+            return "a blocks layer with an unknown FFN";
+        if ((d.window != 0) != (d.mixer == PULSAR_MIXER_ATTN_WINDOW)) return "a window on a full-attention layer, or none on a window layer";
+    }
+    *at_layer = UINT32_MAX;
+    return NULL;
+}
+
+/* A family module under src/families/<name>/ (L295) declares its descriptor here, beside its registry row. */
+/// The Inkling family (src/families/inkling).
+extern const pulsar_family PULSAR_FAMILY_INKLING;
+/// The Nemotron-H decoder family (src/families/nemotron_h).
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_H;
+/// The Nemotron embed / rerank encoder family.
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_ENC;
+/// The Nemotron Parse page-parser family.
+extern const pulsar_family PULSAR_FAMILY_NEMOTRON_PARSE;
+/// The Gemma 4 family (src/families/gemma4).
+extern const pulsar_family PULSAR_FAMILY_GEMMA4;
+
+/* Every family the engine serves.  The ONE place an architecture string is
+ * mapped to code. */
+/// The registry pulsar_family_for_model searches, by `arch`.
+static const pulsar_family *const k_families[] = {
+    &PULSAR_FAMILY_DEEPSEEK4,
+    &PULSAR_FAMILY_QWEN4_EXP,
+    &PULSAR_FAMILY_INKLING,
+    &PULSAR_FAMILY_NEMOTRON_H,
+    &PULSAR_FAMILY_NEMOTRON_ENC,
+    &PULSAR_FAMILY_NEMOTRON_PARSE,
+    &PULSAR_FAMILY_GEMMA4,
+};
+
+const pulsar_family *pulsar_family_for_model(const pulsar_model *m) {
+    pulsar_str arch = {NULL, 0};
+    if (!model_get_string(m, "general.architecture", &arch)) {
+        fprintf(stderr, "pulsar: the artifact has no general.architecture key; "
+                        "no model family can claim it -- refusing\n");
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(k_families) / sizeof(k_families[0]); i++) {
+        const pulsar_family *f = k_families[i];
+        if (strlen(f->arch) != arch.len || memcmp(f->arch, arch.ptr, arch.len) != 0) continue;
+        /* the core calls the bank ops unguarded, and an entry whose cap is declared calls its op */
+        if (!f->banks || ((f->caps & PULSAR_FAMILY_CAP_REWIND) != 0) != (f->banks->rewind != NULL)) {
+            fprintf(stderr, "pulsar: the %s family's bank ops are %s -- refusing\n", f->name,
+                    f->banks ? "out of step with its PULSAR_FAMILY_CAP_REWIND" : "missing");
+            return NULL;
+        }
+        if (((f->caps & PULSAR_FAMILY_CAP_ENCODE) != 0) != (f->encoder != NULL) ||
+            ((f->caps & PULSAR_FAMILY_CAP_PARSE) != 0) != (f->parser != NULL)) {
+            fprintf(stderr, "pulsar: the %s family's encoder / parser entries are out of step with its "
+                            "PULSAR_FAMILY_CAP_ENCODE / _PARSE -- refusing\n", f->name);
+            return NULL;
+        }
+        return f;
+    }
+    fprintf(stderr, "pulsar: general.architecture '%.*s' is not a family this engine serves (",
+            (int)arch.len, arch.ptr);
+    for (size_t i = 0; i < sizeof(k_families) / sizeof(k_families[0]); i++)
+        fprintf(stderr, "%s'%s'", i ? ", " : "", k_families[i]->arch);
+    fprintf(stderr, ") -- refusing\n");
+    return NULL;
+}
+
+/* L280: the rope_id of a family whose model id fixes its rope (family.h) */
+uint64_t pulsar_family_rope_fixed(const pulsar_engine *) { return 0; }
+
+bool pulsar_refusal_first(const char *op) {
+    /* Once per op name (rule 9): a caller that keeps asking gets its refusal value every time, and the log gets the
+     * reason once.  The op names are string literals, so their addresses identify them.  The table is a bound, not a
+     * count of the source's ops (some arrive through a caller's own name): past it every refusal is said each time,
+     * and that is said once. */
+    static const char *said[PULSAR_REFUSAL_OPS_MAX];
+    static uint32_t n_said = 0;
+    static bool full_said = false;
+    for (uint32_t i = 0; i < n_said; i++)
+        if (said[i] == op) return false;
+    if (n_said < PULSAR_REFUSAL_OPS_MAX) {
+        said[n_said++] = op;
+    } else if (!full_said) {
+        full_said = true;
+        fprintf(stderr, "pulsar: the refusal table is full (%u ops): a refusal of an op past them is said each time\n",
+                (unsigned)PULSAR_REFUSAL_OPS_MAX);
+    }
+    return true;
+}
+
+bool pulsar_family_require(const pulsar_engine *e, uint32_t cap, const char *op) {
+    if (!e || (e->family->caps & cap) == cap) return true;
+    if (pulsar_refusal_first(op))
+        fprintf(stderr, "pulsar: the %s family does not implement %s -- refusing\n", e->family->name, op);
+    return false;
+}
+
+
+/* L272: every family's loader has one failure policy.  A refusal is said where it is found and counted
+ * here; the stage that found it finishes (so one load reports every problem it can see), and the family's
+ * load fails at its next stage boundary -- pulsar_engine_open returns an error, the process never exits on
+ * a bad artifact.  Loads run one at a time (engine open is not concurrent). */
+/// Refusals counted since the last reset (pulsar_load_refuse); single-threaded, loads are serial.
+static uint32_t g_load_refusals;
+void pulsar_load_refuse(void) { g_load_refusals++; }
+uint32_t pulsar_load_refusals(void) { return g_load_refusals; }
+void pulsar_load_refusals_reset(void) { g_load_refusals = 0; }

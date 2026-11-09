@@ -1,4 +1,4 @@
-/* linenoise.c -- guerrilla line editing library against the idea that a
+/* linenoise.cpp -- guerrilla line editing library against the idea that a
  * line editing lib needs to be 20,000 lines of C code.
  *
  * You can find the latest source code at:

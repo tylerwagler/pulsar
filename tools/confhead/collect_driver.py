@@ -46,9 +46,9 @@ def prose_prompt(depth_tok, variant):
     return text + "\n\nContinue this document in the same style and register, developing the ideas above in depth.\n"
 
 CODE_SETS = [
-    ["src/engine/session.c"],
-    ["src/engine/gpu_decode.c", "src/cuda/ds4_cuda_dspark.cu", "src/engine/gpu_prefill.c",
-     "src/cuda/ds4_cuda_moe.cu", "src/engine/imatrix.c", "src/server/generate.c"],
+    ["src/engine/session.cpp"],
+    ["src/engine/gpu_decode.cpp", "src/cuda/pulsar_cuda_dspark.cu", "src/engine/gpu_prefill.cpp",
+     "src/cuda/pulsar_cuda_moe.cu", "src/engine/imatrix.cpp", "src/server/generate.cpp"],
 ]
 def code_prompt(depth_tok, variant):
     budget = int(depth_tok * CPT["code"])

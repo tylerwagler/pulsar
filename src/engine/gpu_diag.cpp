@@ -1,18 +1,17 @@
+/** @file gpu_diag.cpp
+ *  @brief DeepSeek graph diagnostics: f32 observation, debug dumps, graph dimensions and memory sizing. */
 #include "pulsar_engine_internal.h"
+#include <map>
+#include <string>
 
 
 
-float rms_abs_diff(const float *a, const float *b, uint64_t n) {
-    double ss = 0.0;
-    for (uint64_t i = 0; i < n; i++) {
-        const double d = (double)a[i] - (double)b[i];
-        ss += d * d;
-    }
-    return n ? (float)sqrt(ss / (double)n) : 0.0f;
-}
 
 
 
+/// @param x [n] values
+/// @param n count (>= 1)
+/// @return the index of the first maximum
 uint64_t argmax_f32(const float *x, uint64_t n) {
     uint64_t best = 0;
     for (uint64_t i = 1; i < n; i++) {
@@ -24,24 +23,72 @@ uint64_t argmax_f32(const float *x, uint64_t n) {
 
 
 
-void print_vec_stats(const char *name, const float *x, uint64_t n) {
-    float minv = PULSAR_POS_INF;
-    float maxv = PULSAR_NEG_INF;
-    double ss = 0.0;
 
-    for (uint64_t i = 0; i < n; i++) {
-        const float v = x[i];
-        if (v < minv) minv = v;
-        if (v > maxv) maxv = v;
-        ss += (double)v * v;
-    }
 
-    printf("%s: min=%g max=%g rms=%g\n",
-        name, minv, maxv, sqrt(ss / (double)n));
+
+
+/* "Will anything OBSERVE these f32 bytes?" -- the question every f32
+ * store-skip has to ask.  The observer is the file dump
+ * (gpu_graph_debug_dump_tensor, gated by gpu_graph_debug_wants).  Every
+ * store-skip gates on THESE two predicates rather than on the dump predicates
+ * directly, so adding another observer is one edit here instead of a hunt
+ * through the skip sites. */
+bool gpu_graph_f32_store_observed(const char *name, uint32_t il, uint32_t pos) {
+    return gpu_graph_debug_wants(name, il, pos);
+}
+
+/// @return true when any observer (the graph dump) may read skipped f32 stores
+bool gpu_graph_f32_store_observed_any(void) {
+    return gpu_graph_debug_dump_enabled();
 }
 
 
+/* How many times this (name, layer, pos) dump has already been written.  A
+ * single run can call the layer encoder more than once for the same
+ * (il, pos) -- measured: THREE times at layer 0 for a one-token prompt -- and
+ * every call overwrote `<prefix>_<name>-<il>_pos<pos>.bin`.  The file therefore
+ * held whichever pass ran last, which is how a layer-by-layer comparison
+ * between two engines can end up comparing different passes and calling the
+ * result a numerical divergence (L218 s49: it very nearly did).  Each write now
+ * gets its own file, so the lossy part is gone and the pass index is visible. */
+/** @var dump_hist_entry::name
+ *  the dump's tensor name; the caller's pointer, compared by strcmp (not owned) */
+/** @var dump_hist_entry::il
+ *  the layer index */
+/** @var dump_hist_entry::pos
+ *  the token position */
+/** @var dump_hist_entry::n
+ *  writes so far for this key (1 after the first) */
+/** One (name, layer, pos) dump key and how many times it has been written. */
+struct dump_hist_entry { const char *name; uint32_t il; uint32_t pos; uint32_t n; };
+/// The dump keys seen so far (process-wide; full = lossy names).
+static dump_hist_entry g_dump_hist[1024];
+/// Entries used in g_dump_hist.
+static uint32_t g_dump_hist_n = 0;
 
+/// @param name the dump name
+/// @param il the layer
+/// @param pos the position
+/// @return this key's write count including this one (1 = first), or 0 when the table is full
+static uint32_t dump_hist_next(const char *name, uint32_t il, uint32_t pos) {
+    for (uint32_t i = 0; i < g_dump_hist_n; i++) {
+        dump_hist_entry *e = &g_dump_hist[i];
+        if (e->il == il && e->pos == pos && strcmp(e->name, name) == 0) return ++e->n;
+    }
+    if (g_dump_hist_n < sizeof(g_dump_hist) / sizeof(g_dump_hist[0])) {
+        dump_hist_entry *e = &g_dump_hist[g_dump_hist_n++];
+        e->name = name; e->il = il; e->pos = pos; e->n = 1;
+        return 1;
+    }
+    return 0;   /* table full: fall back to the old lossy name */
+}
+
+/// Dump n_f32 floats of t to `<prefix>_<name>-<il>_pos<pos>.bin` when the dump wants (name, il, pos); syncs.
+/// @param name the dump name (and the file name's stem)
+/// @param t the device tensor
+/// @param n_f32 floats
+/// @param il the layer
+/// @param pos the position
 void gpu_graph_debug_dump_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -49,7 +96,7 @@ void gpu_graph_debug_dump_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_f32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -57,11 +104,19 @@ void gpu_graph_debug_dump_tensor(
     }
 
     float *buf = (float *)xmalloc((size_t)n_f32 * sizeof(buf[0]));
-    if (pulsar_gpu_tensor_read(t, 0, buf, n_f32 * sizeof(buf[0])) != 0) {
+    /* Reads ELEMENTS, not bytes, and widens whatever they are stored as.  This
+     * was a raw byte read that assumed f32; heads (L033) is the first narrowed
+     * tensor on this path, and the failure mode was a dump full of plausible
+     * garbage rather than an error. */
+    if (pulsar_gpu_tensor_read_f32(t, 0, buf, n_f32) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_f32)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
         }
     }
     free(buf);
@@ -75,6 +130,12 @@ void gpu_graph_debug_dump_tensor(
 /* Same dump for an HC residual CARRIER (BF16 storage; task #62). The plain f32
  * dump above would read n*sizeof(float) from a buffer holding n*PULSAR_HC_ELT_SIZE
  * bytes — a 2x out-of-bounds read — so carriers MUST come through here. */
+/// The dump for an HC carrier (BF16 storage), widened to f32.
+/// @param name the dump name (and the file name's stem)
+/// @param t the device tensor
+/// @param n_elems samples
+/// @param il the layer
+/// @param pos the position
 void gpu_graph_debug_dump_hc_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -82,7 +143,7 @@ void gpu_graph_debug_dump_hc_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -92,9 +153,65 @@ void gpu_graph_debug_dump_hc_tensor(
     float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
     if (pulsar_read_hc_carrier_f32(t, 0, buf, n_elems) != 0) {
         char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        /* Same per-(name, layer, pos) call index as the plain f32 dump above:
+         * this helper writes a DIFFERENT buffer but collides on the same
+         * filename rule, and it was missed when the counter landed -- which
+         * showed up as an apparent carrier mismatch between two engines whose
+         * only difference was which pass each file held. */
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, n_elems)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
+        }
+    }
+    free(buf);
+
+    if (pulsar_gpu_begin_commands() == 0) {
+        fprintf(stderr, "pulsar: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
+    }
+}
+
+/* Same dump for the stored Q buffer (f16 since L045).  As with the HC
+ * carrier, the plain f32 dump above would read n*sizeof(float) from a
+ * buffer holding n*PULSAR_Q_ELT_SIZE -- a 2x out-of-bounds read -- so Q
+ * MUST come through here.
+ *
+ * Q is also deliberately out of the range-sweep census that the f32 dump
+ * runs: that census reads f32 and exists to decide what to narrow, which
+ * for Q is now an answered question. */
+/// The dump for a Q buffer (f16 storage), widened to f32.
+/// @param name the dump name (and the file name's stem)
+/// @param t the device tensor
+/// @param n_elems elements
+/// @param il the layer
+/// @param pos the position
+void gpu_graph_debug_dump_q_tensor(
+        const char       *name,
+        pulsar_gpu_tensor *t,
+        uint64_t          n_elems,
+        uint32_t          il,
+        uint32_t          pos) {
+    if (!t || n_elems == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
+    const char *prefix = gpu_graph_debug_dump_prefix();
+
+    if (pulsar_gpu_synchronize() == 0) {
+        fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
+        return;
+    }
+
+    float *buf = (float *)xmalloc((size_t)n_elems * sizeof(buf[0]));
+    if (pulsar_read_q_f32(t, 0, buf, n_elems) != 0) {
+        char path[1024];
+        const uint32_t c = dump_hist_next(name, il, pos);
+        if (c != 0)
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u_c%u.bin", prefix, name, il, pos, c);
+        else
+            snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, buf, n_elems)) {
+            fprintf(stderr, "pulsar: dumped %s layer %u pos %u call %u to %s\n", name, il, pos, c, path);
         }
     }
     free(buf);
@@ -106,40 +223,15 @@ void gpu_graph_debug_dump_hc_tensor(
 
 
 
-void gpu_graph_debug_dump_f16_tensor(
-        const char       *name,
-        pulsar_gpu_tensor *t,
-        uint64_t          n_f16,
-        uint32_t          il,
-        uint32_t          pos) {
-    if (!t || n_f16 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
-
-    if (pulsar_gpu_synchronize() == 0) {
-        fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
-        return;
-    }
-
-    uint16_t *hbuf = (uint16_t *)xmalloc((size_t)n_f16 * sizeof(hbuf[0]));
-    float *fbuf = (float *)xmalloc((size_t)n_f16 * sizeof(fbuf[0]));
-    if (pulsar_gpu_tensor_read(t, 0, hbuf, n_f16 * sizeof(hbuf[0])) != 0) {
-        for (uint64_t i = 0; i < n_f16; i++) fbuf[i] = f16_to_f32(hbuf[i]);
-        char path[1024];
-        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
-        if (write_f32_binary_file(path, fbuf, n_f16)) {
-            fprintf(stderr, "pulsar: dumped %s layer %u pos %u to %s\n", name, il, pos, path);
-        }
-    }
-    free(fbuf);
-    free(hbuf);
-
-    if (pulsar_gpu_begin_commands() == 0) {
-        fprintf(stderr, "pulsar: failed to resume GPU command batch after dumping %s layer %u pos %u\n", name, il, pos);
-    }
-}
 
 
 
+/// The dump for an int32 tensor.
+/// @param name the dump name (and the file name's stem)
+/// @param t the device tensor
+/// @param n_i32 int32 elements
+/// @param il the layer
+/// @param pos the position
 void gpu_graph_debug_dump_i32_tensor(
         const char       *name,
         pulsar_gpu_tensor *t,
@@ -147,7 +239,7 @@ void gpu_graph_debug_dump_i32_tensor(
         uint32_t          il,
         uint32_t          pos) {
     if (!t || n_i32 == 0 || !gpu_graph_debug_wants(name, il, pos)) return;
-    const char *prefix = getenv("PULSAR_CUDA_GRAPH_DUMP_PREFIX");
+    const char *prefix = gpu_graph_debug_dump_prefix();
 
     if (pulsar_gpu_synchronize() == 0) {
         fprintf(stderr, "pulsar: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
@@ -175,23 +267,20 @@ void gpu_graph_debug_dump_i32_tensor(
 
 
 
+/// @param g the graph
+/// @param il the layer
+/// @param pos the position
+/// @return true when the FFN output must be stored (FFN steering, or an observer wants it)
 bool gpu_graph_needs_ffn_out(const pulsar_gpu_graph *g, uint32_t il, uint32_t pos) {
     return gpu_graph_directional_steering_ffn_enabled(g) ||
-           g->materialize_ffn_out ||
-           gpu_graph_debug_wants("ffn_out", il, pos);
+           gpu_graph_f32_store_observed("ffn_out", il, pos);
 }
 
 
 
-bool gpu_graph_ensure_ffn_out(pulsar_gpu_graph *g) {
-    if (!g->ffn_out) {
-        g->ffn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    }
-    return g->ffn_out != NULL;
-}
-
-
-
+/// Allocate batch_ffn_out on first need ([prefill_cap][PULSAR_N_EMBD] f32).
+/// @param g the graph
+/// @return false = allocation failed
 bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
     if (!g->batch_ffn_out) {
         g->batch_ffn_out = pulsar_gpu_tensor_alloc((uint64_t)g->prefill_cap * PULSAR_N_EMBD * sizeof(float));
@@ -205,36 +294,40 @@ bool gpu_graph_ensure_batch_ffn_out(pulsar_gpu_graph *g) {
  * GPU Release Graph Allocation.
  * ========================================================================= */
 
-/* Derived capacities and tensor dimensions for one session's GPU graph.
- * Computed by gpu_graph_compute_dims and shared by the allocator
- * (gpu_graph_alloc_raw_cap) and the sizing estimate (gpu_graph_session_bytes)
- * so admission control and the allocator can never disagree about the derived
- * quantities.  The per-buffer byte expressions still appear in both functions;
- * the server's estimate-vs-actual reconciliation (>10% drift warning) is the
- * enforcement that they stay in sync. */
+/** Derived capacities and tensor dimensions for one session's GPU graph,
+ * computed by gpu_graph_compute_dims for gpu_graph_alloc_raw_cap.  There is
+ * no separate sizing estimate: a session is priced by running that allocator
+ * dry (pulsar_engine::session_cost_bytes_banked). */
 typedef struct {
-    uint32_t raw_cap;
-    uint32_t raw_window;
-    uint32_t ctx_size;
-    uint32_t prefill_cap;
-    uint32_t comp_cap;
-    uint32_t attn_comp_stage_cap;          /* only meaningful under PULSAR_ATTN_PACK */
+    uint32_t raw_cap;      ///< positions the raw KV ring holds
+    uint32_t raw_window;   ///< positions retained per layer in that ring
+    uint32_t ctx_size;     ///< session context size the graph is sized for
+    uint32_t prefill_cap;  ///< maximum rows one prefill chunk may carry
+    uint32_t comp_cap;     ///< worst-case compressed rows per kv source (the ratio-1 bound)
+    uint32_t attn_comp_stage_cap;  ///< rows the attention compressor staging buffer holds
+    /** Per-layer compressed capacity, sized from each layer's ACTUAL ratio --
+     * a ratio-128 layer needs far fewer rows than the ratio-4 bound in
+     * comp_cap, and sizing every layer at that bound wastes most of it. */
     uint32_t layer_comp_cap[PULSAR_MAX_LAYER];
-    uint64_t hc_dim;
-    uint64_t mix_hc;
-    uint64_t q_rank;
-    uint64_t q_dim;
-    uint64_t low_dim;
-    uint64_t shared_dim;
-    uint64_t routed_mid_dim;
-    uint64_t vocab_dim;
-    uint64_t comp_width_max;
-    uint64_t indexer_q_dim;
+    uint64_t hc_dim;          ///< HC carrier width
+    uint64_t mix_hc;          ///< width of the HC mix projection output
+    uint64_t q_rank;          ///< low-rank query latent width
+    uint64_t q_dim;           ///< query width in head space
+    uint64_t low_dim;         ///< width of the attention output's low-rank 'a' projection
+    uint64_t shared_dim;      ///< shared-expert intermediate width
+    uint64_t routed_mid_dim;  ///< routed-expert intermediate width
+    uint64_t comp_width_max;  ///< widest compressed row across layers; sizes the shared staging
+    uint64_t index_comp_width_max; ///< widest INDEXER-compressor row across layers; same rule at the indexer's head dim
+    uint64_t indexer_q_dim;   ///< indexer query width
 } gpu_graph_dims;
 
+/// @param d receives the dimensions
+/// @param layer layer 0's weights (the shapes)
+/// @param raw_cap the raw ring's rows (0 = 1)
+/// @param ctx_size the context (0 = raw_cap)
+/// @param prefill_cap the prefill chunk's rows (0 = 1)
 static void gpu_graph_compute_dims(
         gpu_graph_dims *d,
-        const pulsar_weights       *weights,
         const pulsar_layer_weights *layer,
         uint32_t                 raw_cap,
         uint32_t                 ctx_size,
@@ -260,18 +353,14 @@ static void gpu_graph_compute_dims(
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
     if (min_ratio == UINT32_MAX) min_ratio = ctx_size ? ctx_size : 1u;
-    d->comp_cap = ctx_size / min_ratio + 2u;
-    if (d->comp_cap < 2u) d->comp_cap = 2u;
+    d->comp_cap = gpu_graph_comp_cap(ctx_size, min_ratio);
     d->attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
     if (d->attn_comp_stage_cap < 2u) d->attn_comp_stage_cap = 2u;
+    /* CSA2: a pool exists at kv sources only; a member layer's cap is its
+     * source's, reached through gpu_graph_kv_source(il). */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) {
-            d->layer_comp_cap[il] = 0;
-        } else {
-            d->layer_comp_cap[il] = ctx_size / ratio + 2u;
-            if (d->layer_comp_cap[il] < 2u) d->layer_comp_cap[il] = 2u;
-        }
+        d->layer_comp_cap[il] = gpu_graph_layer_is_kv_source(il)
+            ? gpu_graph_comp_cap(ctx_size, pulsar_layer_compress_ratio(il)) : 0u;
     }
 
     d->hc_dim = (uint64_t)PULSAR_N_HC * PULSAR_N_EMBD;
@@ -281,261 +370,42 @@ static void gpu_graph_compute_dims(
     d->low_dim = (uint64_t)PULSAR_N_OUT_GROUP * PULSAR_N_LORA_O;
     d->shared_dim = layer->ffn_gate_shexp->dim[1];
     d->routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    d->vocab_dim = weights->output ? weights->output->dim[1] : PULSAR_N_VOCAB;
-    d->comp_width_max = 2ull * (PULSAR_N_HEAD_DIM > PULSAR_N_INDEXER_HEAD_DIM
-        ? PULSAR_N_HEAD_DIM
-        : PULSAR_N_INDEXER_HEAD_DIM);
+    /* The widest compressor row any layer needs.  Derived from the layout table
+     * rather than written as head_dim: V4's ratio-4 layers project to
+     * 2*head_dim (they overlap), so a head_dim literal would under-size the
+     * shared staging the moment a V4 layer ran through it. */
+    d->comp_width_max = 0;
+    d->index_comp_width_max = 0;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        const uint64_t w = pulsar_comp_row_width(ratio, PULSAR_N_HEAD_DIM);
+        if (w > d->comp_width_max) d->comp_width_max = w;
+        /* V4's indexer compresses its own index key at the indexer's head dim
+         * (pulsar_shape::indexer_own_compressor); the same derivation keeps the
+         * two stagings from disagreeing about what a row is. */
+        const uint64_t iw = pulsar_comp_row_width(ratio, PULSAR_N_INDEXER_HEAD_DIM);
+        if (iw > d->index_comp_width_max) d->index_comp_width_max = iw;
+    }
     d->indexer_q_dim = (uint64_t)PULSAR_N_INDEXER_HEAD * PULSAR_N_INDEXER_HEAD_DIM;
 }
 
 
 
-/* TRUE total per-session GPU byte cost: the sum of every pulsar_gpu_tensor that
- * gpu_graph_alloc_raw_cap (and, when enable_spec, gpu_graph_init_dspark_target)
- * allocates for one session.  This is what admission control must price a
- * session at — the packed KV estimate (pulsar_context_memory_estimate_packed)
- * covers only the persistent KV rows plus the indexer score/mask scratch and
- * undercounts the real cost by roughly an order of magnitude (2026-07-13
- * incident: three ctx=65536 slots admitted at 0.5 GiB each consumed the whole
- * GB10 and hard-locked the machine).
- *
- * KEEP IN SYNC with the allocators below (gpu_graph_alloc_raw_cap,
- * gpu_graph_bank_slabs_alloc, gpu_graph_init_dspark_target — same order,
- * same expressions).
- * The server reconciles this estimate against the measured allocation delta
- * after every session create and logs a loud warning on >10% drift, so a
- * missed buffer surfaces on the first live run instead of as an
- * under-admission OOM.
- *
- * EXCLUSION LIST — intentionally unaccounted per-session allocations (each
- * negligible, absorbed by PULSAR_SERVER_MEM_FLOOR_BYTES; do not re-derive):
- *   - the lazy gpu_graph_ensure_ffn_out/gpu_graph_ensure_batch_ffn_out
- *     buffers (only allocated under steering/diagnostics);
- *   - directional-steering dirs (gpu_graph_load_directional_steering,
- *     ~PULSAR_N_LAYER*PULSAR_N_EMBD floats — these ARE inside the measured create
- *     delta, so they show up in reconciliation but never in this estimate);
- *   - the spec snapshot/restore descriptor tables that
- *     pulsar_gpu_batched_copy_prepare lazily cudaMallocs on the first fused
- *     spec step (~KBs; raw cudaMalloc, outside both this estimate and the
- *     pulsar_gpu_tensor byte counter that reconciliation measures). */
-uint64_t gpu_graph_session_bytes(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec) {
-    return gpu_graph_session_bytes_banked(weights, layer, raw_cap, ctx_size,
-                                          prefill_cap, enable_spec,
-                                          gpu_graph_bank_pool_n());
-}
 
-uint64_t gpu_graph_session_bytes_banked(
-        const pulsar_weights       *weights,
-        const pulsar_layer_weights *layer,
-        uint32_t                 raw_cap,
-        uint32_t                 ctx_size,
-        uint32_t                 prefill_cap,
-        bool                     enable_spec,
-        uint32_t                 n_banks_in) {
-    gpu_graph_dims dz;
-    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
-    const uint64_t pc = dz.prefill_cap;
-    const uint64_t f32 = sizeof(float);
-    const uint64_t hc = PULSAR_HC_ELT_SIZE;   /* HC residual carrier element (BF16); task #62 */
 
-    /* Persistent KV caches (raw ring, packed attn comp, indexer comp) plus the
-     * indexer_scores/comp_mask working pair — shared with the managed-vs-device
-     * KV placement policy the allocator itself uses.  In bank-pool mode the
-     * persistent KV slabs (and the per-bank compressor state lanes below)
-     * scale with the pool size; everything else is shared by all banks. */
-    const uint64_t n_banks = n_banks_in < 1u ? 1u : n_banks_in;
-    uint64_t kv_cache_bytes = 0;
-    uint64_t total = gpu_graph_context_bytes_for_kv_policy(
-            dz.ctx_size, dz.raw_cap, dz.prefill_cap, &kv_cache_bytes);
-    if (n_banks > 1u) total += (n_banks - 1u) * kv_cache_bytes;
 
-    /* Per-layer attention/indexer state — one lane per bank — and the
-     * single-lane spec shadows (spec never runs against a shared pool). */
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint64_t attn_state = (uint64_t)coff * PULSAR_N_HEAD_DIM *
-                                    coff * ratio * f32;
-        total += n_banks * 2ull * attn_state;             /* layer_attn_state_kv/score */
-        if (enable_spec) total += 2ull * attn_state;      /* spec_attn_state_kv/score */
-        if (ratio == 4) {
-            const uint64_t index_state = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM *
-                                         coff * ratio * f32;
-            total += n_banks * 2ull * index_state;        /* layer_index_state_kv/score */
-            if (enable_spec) total += 2ull * index_state; /* spec_index_state_kv/score */
-        }
-    }
-
-    /* Single-token graph buffers. */
-    total += dz.hc_dim * hc;                              /* cur_hc (carrier) */
-    total += dz.hc_dim * f32;                             /* flat_hc (RMSNorm out, f32) */
-    total += 2ull * dz.mix_hc * f32;                      /* hc_mix, hc_split (views free) */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* attn_cur, attn_norm */
-    total += 2ull * dz.q_rank * f32;                      /* qr, qr_norm */
-    total += dz.q_dim * f32;                              /* q */
-    total += 2ull * PULSAR_N_HEAD_DIM * f32;                 /* kv_raw, kv */
-    total += 2ull * dz.comp_width_max * f32;              /* comp_kv_cur, comp_sc_cur */
-    if (gpu_graph_attn_pack_enabled()) {
-        total += (uint64_t)dz.attn_comp_stage_cap * PULSAR_N_HEAD_DIM * f32; /* attn_comp_stage */
-        total += (uint64_t)dz.comp_cap * PULSAR_N_HEAD_DIM * f32;            /* attn_comp_dequant */
-    }
-    if (gpu_graph_idx_fp4_enabled()) {
-        total += (uint64_t)dz.comp_cap * PULSAR_N_INDEXER_HEAD_DIM * f32;    /* idx_comp_stage */
-    }
-    total += dz.indexer_q_dim * f32;                      /* indexer_q */
-    total += (uint64_t)PULSAR_N_INDEXER_HEAD * f32;          /* indexer_weights */
-    total += (uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
-             pc * sizeof(uint32_t);                       /* comp_selected */
-    total += dz.q_dim * f32;                              /* heads */
-    total += dz.low_dim * f32;                            /* attn_low */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* attn_out */
-    total += dz.hc_dim * hc;                              /* after_attn_hc (carrier) */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* ffn_cur, ffn_norm */
-    total += 3ull * dz.shared_dim * f32;                  /* shared_gate/up/mid */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* shared_out */
-    total += 2ull * PULSAR_N_EXPERT * f32;                   /* router_logits, router_probs */
-    total += (uint64_t)PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* router_selected/weights */
-    total += 3ull * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* routed_gate/up/mid */
-    total += (uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;     /* routed_down */
-    total += (uint64_t)PULSAR_N_EMBD * f32;                  /* routed_out */
-    total += dz.hc_dim * hc;                              /* after_ffn_hc (carrier) */
-    total += 2ull * PULSAR_N_HC * f32;                       /* output_pre, output_weights */
-    total += 2ull * PULSAR_N_EMBD * f32;                     /* output_embd, output_norm */
-    total += dz.vocab_dim * f32;                          /* logits */
-    total += pc * sizeof(int32_t);                        /* prefill_tokens */
-    /* Multi-row logits readback slab.  Allocated unconditionally (NOT under
-     * enable_spec): besides the DSpark draft/verify passes it is the output
-     * buffer of every batched multi-row head — gpu_graph_verify_suffix_tops
-     * and the Tier-2 batched multi-session decode driver
-     * (gpu_graph_decode_multiseq_batch) both read their rows out of it, and
-     * those paths must work with speculation disabled (--no-dspark,
-     * pulsar-bench/pulsar-eval/agent, or any model without a merged drafter). */
-    total += 16ull * PULSAR_N_VOCAB * f32;                   /* spec_logits */
-
-    /* Batch (prefill working set) buffers — the pc-scaled bulk that dominates
-     * the non-KV cost (~4 GiB at pc=4096 on Flash). */
-    total += 2ull * pc * dz.hc_dim * hc;                  /* batch_cur/next_hc (carriers) */
-    total += pc * dz.hc_dim * f32;                        /* batch_flat_hc (RMSNorm out, f32) */
-    total += 2ull * pc * dz.mix_hc * f32;                 /* batch_hc_mix/split */
-    total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_attn_cur/norm */
-    total += 2ull * pc * dz.q_rank * f32;                 /* batch_qr/qr_norm */
-    total += pc * dz.q_dim * f32;                         /* batch_q */
-    total += 2ull * pc * PULSAR_N_HEAD_DIM * f32;            /* batch_kv_raw/kv */
-    total += 2ull * pc * dz.comp_width_max * f32;         /* batch_comp_kv/sc */
-    total += pc * dz.indexer_q_dim * f32;                 /* batch_indexer_q */
-    total += pc * PULSAR_N_INDEXER_HEAD * f32;               /* batch_indexer_weights */
-    total += pc * dz.q_dim * f32;                         /* batch_heads */
-    total += pc * dz.low_dim * f32;                       /* batch_attn_low */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_attn_out */
-    total += pc * dz.hc_dim * hc;                         /* batch_after_attn_hc (carrier) */
-    total += 2ull * pc * PULSAR_N_EMBD * f32;                /* batch_ffn_cur/norm */
-    total += 3ull * pc * dz.shared_dim * f32;             /* batch_shared_gate/up/mid */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_shared_out */
-    total += 2ull * pc * PULSAR_N_EXPERT * f32;              /* batch_router_logits/probs */
-    total += pc * PULSAR_N_EXPERT_USED * (sizeof(int) + f32); /* batch_router_selected/weights */
-    total += 3ull * pc * PULSAR_N_EXPERT_USED * dz.routed_mid_dim * f32; /* batch_routed_gate/up/mid */
-    total += pc * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * f32;   /* batch_routed_down */
-    total += pc * PULSAR_N_EMBD * f32;                       /* batch_routed_out */
-
-    /* DSpark drafter graph state (gpu_graph_init_dspark_target), allocated by
-     * pulsar_session_create whenever the engine has a drafter loaded — the
-     * production merged GGUF auto-enables it. */
-    if (enable_spec) {
-        total += 3ull * PULSAR_N_EMBD * f32;                 /* dspark_target_h[3] */
-        total += 3ull * 17 * PULSAR_N_EMBD * f32;            /* dspark_target_h_batch[3] */
-        /* Option F: dspark_raw_cache[3] + dspark_prompt_h[3] are BANKED slabs
-         * (n_banks lanes) so the N=2 spec-time-slice lane keeps a warm ring per
-         * bank; the rest of the drafter state is shared across banks. */
-        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * f32; /* dspark_raw_cache[3] */
-        total += (uint64_t)PULSAR_N_EMBD * f32;              /* dspark_main_x */
-        total += 3ull * pc * PULSAR_N_EMBD * f32;            /* dspark_bulk_h[3] */
-        total += (uint64_t)n_banks * 3ull * PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_EMBD * f32; /* dspark_prompt_h[3] */
-        const uint64_t attn_w = 2ull * PULSAR_N_HEAD_DIM;
-        const uint64_t idx_w = 2ull * PULSAR_N_INDEXER_HEAD_DIM;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            total += 2ull * 17 * attn_w * f32;            /* spec_comp_kv/sc_save */
-            if (ratio == 4) total += 2ull * 17 * idx_w * f32; /* spec_icomp_kv/sc_save */
-        }
-        total += (uint64_t)PULSAR_N_HEAD_DIM * f32;          /* spec_comp_scratch_row */
-        total += 3ull * PULSAR_N_EMBD * f32;                 /* dspark_concat */
-        total += (uint64_t)PULSAR_N_EMBD * f32;              /* dspark_proj_out */
-        total += 3ull * PULSAR_N_HEAD_DIM * f32;             /* dspark_seed_kv/norm/rot */
-        total += (uint64_t)PULSAR_N_VOCAB * f32;             /* dspark_markov_logits */
-    }
-    return total;
+/* Tier-2 overcommit: the DEMAND-PAGED (cudaMallocManaged, physical-on-touch)
+ * bytes of ONE bank's ctx-scaled comp + index caches -- the part the overcommit
+ * auto-size reserves as VA only and does NOT charge at admission (the eager
+ * floor is charged; physical materializes as the frontier grows, tracked by
+ * pulsar_session_touched_kv_bytes).  The comp/index term of the KV-policy sizing,
+ * from the same function (steering.cpp). */
+KvBytes gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
+    return KvBytes{gpu_graph_comp_index_bytes_for_context(ctx_size)};
 }
 
 
 
-/* Tier-2 overcommit (task #55, increment 1): the DEMAND-PAGED (cudaMallocManaged,
- * physical-on-touch) bytes of ONE bank's ctx-scaled comp + index caches at the
- * given context.  This is exactly the comp/index portion of
- * gpu_graph_kv_cache_bytes_for_context (steering.c) MINUS the eager raw ring —
- * the part the overcommit auto-size reserves as VA only and does NOT charge at
- * admission (the eager floor is charged; physical materializes as the frontier
- * grows, tracked by gpu_graph_touched_kv_bytes).  Row widths track the ACTUAL
- * packed storage (PULSAR_ATTN_PACK attn comp + MXFP4 indexer), matching the slab
- * allocator in gpu_graph_bank_slabs_alloc. */
-uint64_t gpu_graph_demand_paged_bytes_per_bank(uint32_t ctx_size) {
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    uint64_t bytes = 0;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
-        bytes += comp_cap * attn_row;
-        if (ratio == 4) bytes += comp_cap * idx_row;
-    }
-    return bytes;
-}
-
-
-
-/* PULSAR_KV_MANAGED: measurement override for the managed-vs-device placement of
- * the PERSISTENT KV caches (raw ring + attn/index comp caches), for the
- * multi-session UVM over-provisioning design (plan addendum 2026-07-14 —
- * first-touch fault cost must be measured before committing to
- * always-managed slot KV). Unset/empty → the size-based policy
- * (pulsar_gpu_should_use_managed_kv_cache) decides, as before. "1"/"on" →
- * force cudaMallocManaged; "0"/"off"/"false" → force device cudaMalloc.
- * Read once per process (static cache) and consulted only at graph
- * allocation (session create) — never on a token/layer path. */
-static int gpu_graph_kv_managed_override(void) {
-    static int cached = -2;
-    if (cached == -2) {
-        const char *v = getenv("PULSAR_KV_MANAGED");
-        if (!v || !v[0]) {
-            cached = -1;
-        } else if (strcmp(v, "0") == 0 || strcasecmp(v, "off") == 0 ||
-                   strcasecmp(v, "false") == 0) {
-            cached = 0;
-        } else if (strcmp(v, "1") == 0 || strcasecmp(v, "on") == 0 ||
-                   strcasecmp(v, "true") == 0) {
-            cached = 1;
-        } else {
-            /* Unrecognized values fall back to the size policy instead of
-             * silently force-flipping a measurement flag (a typo'd "of[f]"
-             * must not force-manage the KV of a 128 GB box). */
-            fprintf(stderr,
-                    "pulsar: PULSAR_KV_MANAGED=\"%s\" not recognized "
-                    "(want 1/on/true or 0/off/false); using size policy\n", v);
-            cached = -1;
-        }
-    }
-    return cached;
-}
 
 
 
@@ -543,11 +413,29 @@ static int gpu_graph_kv_managed_override(void) {
  * 1 (default) keeps the classic single-session cache layout; 2..PULSAR_MSEQ_MAX
  * allocates the fixed per-bank slabs (pulsar_bank_slabs) and installs bank-0
  * views, so every existing single-session path runs unmodified against
- * bank 0.  Read once per process at graph allocation — never on a
- * token/layer path.  Interim wiring: later increments make the server pass
- * the pool size explicitly instead. */
+ * bank 0.  ONE owner of the number (L159 inc 5): this reader parses the
+ * variable once per process (never on a token/layer path); a caller that
+ * derives the size itself (the server's auto-sizing) SETS it through
+ * gpu_graph_bank_pool_set instead of writing the environment for this
+ * function to read back, and asks through the same accessor. */
+/// The bank pool size once set or parsed (-1 = not yet).
+static long g_bank_pool_cached = -1;
+/// 1 when the size came from the environment (an operator pin).
+static int  g_bank_pool_env_pinned = 0;
+/// Set the bank pool size (the server's auto-sizing), clamped to 1 .. PULSAR_MSEQ_MAX.
+/// @param n banks
+void gpu_graph_bank_pool_set(uint32_t n) {
+    if (n < 1u) n = 1u;
+    if (n > PULSAR_MSEQ_MAX) n = PULSAR_MSEQ_MAX;
+    g_bank_pool_cached = (long)n;
+}
+/// @return 1 when PULSAR_MSEQ_BANKS set the pool size, else 0
+int gpu_graph_bank_pool_env_pinned(void) {
+    (void)gpu_graph_bank_pool_n();
+    return g_bank_pool_env_pinned;
+}
 uint32_t gpu_graph_bank_pool_n(void) {
-    static long cached = -1;
+    long &cached = g_bank_pool_cached;
     if (cached < 0) {
         const char *v = getenv("PULSAR_MSEQ_BANKS");
         long n = 1;
@@ -563,9 +451,12 @@ uint32_t gpu_graph_bank_pool_n(void) {
                         "bank pool disabled\n", v, PULSAR_MSEQ_MAX);
                 n = 1;
             } else if (n > (long)PULSAR_MSEQ_MAX) {
+                g_bank_pool_env_pinned = 1;
                 fprintf(stderr, "pulsar: PULSAR_MSEQ_BANKS=%ld clamped to %u\n",
                         n, PULSAR_MSEQ_MAX);
                 n = (long)PULSAR_MSEQ_MAX;
+            } else {
+                g_bank_pool_env_pinned = 1;
             }
         }
         cached = n;
@@ -578,24 +469,34 @@ uint32_t gpu_graph_bank_pool_n(void) {
 /* Allocate the fixed per-bank KV slabs (layout: pulsar_bank_slabs in
  * pulsar_engine_internal.h; design adapted from Entrpi/ds4 v0.2 — citation at
  * the struct).  Per-bank byte expressions MUST match the single-session
- * branches in gpu_graph_alloc_raw_cap below and the pricing in
- * gpu_graph_session_bytes.  Compressor state lanes are primed for every bank
+ * branches in gpu_graph_alloc_raw_cap below (the bank-0 views installed there
+ * cover exactly what the classic layout allocates).  Compressor state lanes are primed for every bank
  * here (kv = 0, score = -inf), exactly like a fresh single-session graph, so
  * a later bank admit starts from the same state a cold session would. */
+/// @param g the graph
+/// @param n_banks banks in the pool
+/// @param managed_kv_cache allocate the raw KV slabs as managed memory
+/// @param dz the graph's dimensions
+/// @param enable_spec also allocate the grid snapshot lanes
+/// @return false (said) on overflow or allocation failure
 static bool gpu_graph_bank_slabs_alloc(
         pulsar_gpu_graph      *g,
         uint32_t              n_banks,
         bool                  managed_kv_cache,
-        const gpu_graph_dims *dz) {
+        const gpu_graph_dims *dz,
+        bool                  enable_spec) {
     pulsar_bank_slabs *b = &g->banks;
-    const uint64_t raw_elem = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
-                                                          : sizeof(float);
+    /* The raw KV ring is WINDOW rows: pulsar_kv_row_bytes(PULSAR_KV_ROW_RING)
+     * = 384 B at head_dim 512 (224 E2M1 nibble bytes + 28 E4M3 block scales +
+     * 4 B f32 row scale + 128 B bf16 rope tail), the same layout the compressed
+     * pool uses. It was __half (1024 B) until 2026-08-17, which spent 2 bytes
+     * per element on nope dims the source model holds at E4M3 precision. */
     b->n_banks = n_banks;
     b->cur_bank = 0;
-    b->raw_bank_bytes = (uint64_t)dz->raw_cap * PULSAR_N_HEAD_DIM * raw_elem;
+    b->raw_bank_bytes = (uint64_t)dz->raw_cap * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
+        const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
         /* uint32 row-ABI audit: batched kernels address rows as
          * seq_id * cap + local in uint32; reject the geometry up front. */
         if ((uint64_t)n_banks * dz->raw_cap > 4294967296ull ||
@@ -609,73 +510,89 @@ static bool gpu_graph_bank_slabs_alloc(
         b->raw[il] = gpu_graph_alloc_kv_cache_tensor(
                 managed_kv_cache, (uint64_t)n_banks * b->raw_bank_bytes);
         ok = b->raw[il] != NULL;
-        if (!ok || ratio == 0) continue;
+        /* CSA2 (L218): only a kv source owns a compressed pool, an index-K
+         * pool and (at ratio > 1) a compressor state lane.  A kv source is
+         * not the same question as an indexer -- 0731's ratio-128 HCA layers
+         * are kv sources that run none, so they get no index pool. */
+        if (!ok || !pulsar_attn_owns_kv(attn->mode)) continue;
 
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
-        const uint64_t attn_rows = (uint64_t)coff * ratio;
+        const bool indexed = gpu_graph_layer_has_index_pool(il);
+        /* coff-aware: V4's ratio-4 overlap keeps a two-group state, so its
+         * state is twice as wide and twice as tall as V4.1's.  coff is 1 for
+         * every ratio V4.1 uses, so this is inert there. */
+        const uint64_t attn_width = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM);
+        const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
         const uint64_t attn_lane = attn_width * attn_rows * sizeof(float);
         b->comp_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
-                                 gpu_graph_attn_comp_cache_row_bytes();
+                                 pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+        b->index_bank_bytes[il] = indexed
+            ? (uint64_t)dz->layer_comp_cap[il] * pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX) : 0u;
         b->astate_bank_bytes[il] = attn_lane;
         /* Increment 2a: one cudaMallocManaged PER BANK (not one n_banks*bytes
          * slab) so the eviction guard can cudaFree a single idle bank's physical
          * directly. Uniform stride (comp_bank_bytes[il] is bank-independent). */
-        void *comp_ptr_h[PULSAR_MSEQ_MAX];
+        void *comp_ptr_h[PULSAR_MSEQ_MAX], *index_ptr_h[PULSAR_MSEQ_MAX];
         for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
             b->comp[il][bk] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
             ok = b->comp[il][bk] != NULL;
-            if (ok) comp_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->comp[il][bk]);
-        }
-        b->askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
-        b->assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
-        /* Device base-pointer table (indexed by seq_id) the batched READ kernels
-         * use instead of base + seq_id*comp_cap over one slab. */
-        if (ok) b->comp_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
-        ok = ok && b->askv[il] && b->assc[il] && b->comp_bases[il] &&
-             pulsar_gpu_tensor_write(b->comp_bases[il], 0, comp_ptr_h,
-                                  (uint64_t)n_banks * sizeof(void *)) &&
-             gpu_tensor_fill_f32(b->askv[il], 0.0f,
-                                 (uint64_t)n_banks * attn_width * attn_rows) &&
-             gpu_tensor_fill_f32(b->assc[il], PULSAR_NEG_INF,
-                                 (uint64_t)n_banks * attn_width * attn_rows);
-        if (ok && ratio == 4) {
-            const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
-            const uint64_t index_rows = (uint64_t)coff * ratio;
-            const uint64_t index_lane = index_width * index_rows * sizeof(float);
-            const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-                ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-            b->index_bank_bytes[il] = (uint64_t)dz->layer_comp_cap[il] *
-                                      index_row_bytes;
-            b->istate_bank_bytes[il] = index_lane;
-            void *index_ptr_h[PULSAR_MSEQ_MAX];
-            for (uint32_t bk = 0; ok && bk < n_banks; bk++) {
+            if (ok && indexed) {
                 b->index[il][bk] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
                 ok = b->index[il][bk] != NULL;
-                if (ok) index_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->index[il][bk]);
             }
-            b->iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
-            b->issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
-            if (ok) b->index_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
-            ok = ok && b->iskv[il] && b->issc[il] && b->index_bases[il] &&
-                 pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
-                                      (uint64_t)n_banks * sizeof(void *)) &&
-                 gpu_tensor_fill_f32(b->iskv[il], 0.0f,
-                                     (uint64_t)n_banks * index_width * index_rows) &&
-                 gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
-                                     (uint64_t)n_banks * index_width * index_rows);
+            if (ok) {
+                comp_ptr_h[bk] = pulsar_gpu_tensor_device_ptr(b->comp[il][bk]);
+                index_ptr_h[bk] = indexed ? pulsar_gpu_tensor_device_ptr(b->index[il][bk]) : NULL;
+            }
         }
-    }
-    /* plan-33 inc C: the partial-fork boundary-row stash (one packed comp row +
-     * one packed index row per (bank, layer); a few hundred KB total). */
-    if (ok) {
-        const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-        const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-            ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-        g->emit_stash_comp = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * attn_row);
-        g->emit_stash_index = pulsar_gpu_tensor_alloc((uint64_t)n_banks * PULSAR_N_LAYER * idx_row);
-        ok = g->emit_stash_comp && g->emit_stash_index;
+        /* Device base-pointer tables (indexed by seq_id) the batched READ
+         * kernels use instead of base + seq_id*comp_cap over one slab. */
+        if (ok) b->comp_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
+        if (ok && indexed) b->index_bases[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * sizeof(void *));
+        ok = ok && b->comp_bases[il] && (!indexed || b->index_bases[il]) &&
+             pulsar_gpu_tensor_write(b->comp_bases[il], 0, comp_ptr_h,
+                                  (uint64_t)n_banks * sizeof(void *)) &&
+             (!indexed || pulsar_gpu_tensor_write(b->index_bases[il], 0, index_ptr_h,
+                                  (uint64_t)n_banks * sizeof(void *)));
+        /* V4's indexer keeps a SECOND recurrent lane (it compresses its own key);
+         * V4.1 derives the index key from the latent and keeps none.  Same two
+         * authorities, the indexer's width. */
+        const bool own_index = g_pulsar_shape.indexer_own_compressor && indexed;
+        const uint64_t index_lane = own_index && attn_rows
+            ? pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
+              pulsar_comp_state_rows(attn->ratio) * sizeof(float) : 0u;
+        b->istate_bank_bytes[il] = index_lane;
+        if (ok && attn_lane) {
+            b->askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+            b->assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+            if (index_lane) {
+                b->iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                b->issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+            }
+            /* L183 grid snapshot lanes: written by a save before any restore reads them. */
+            if (enable_spec) {
+                /* No fill: a snapshot always writes a lane before its restore
+                 * reads it, and nothing else reads these. */
+                b->spec_askv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+                b->spec_assc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * attn_lane);
+                if (index_lane) {
+                    b->spec_iskv[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                    b->spec_issc[il] = pulsar_gpu_tensor_alloc((uint64_t)n_banks * index_lane);
+                    ok = ok && b->spec_iskv[il] && b->spec_issc[il];
+                }
+                ok = ok && b->spec_askv[il] && b->spec_assc[il];
+            }
+            ok = ok && b->askv[il] && b->assc[il] &&
+                 (!index_lane || (b->iskv[il] && b->issc[il])) &&
+                 gpu_tensor_fill_f32(b->askv[il], 0.0f,
+                                     (uint64_t)n_banks * attn_width * attn_rows) &&
+                 gpu_tensor_fill_f32(b->assc[il], PULSAR_NEG_INF,
+                                     (uint64_t)n_banks * attn_width * attn_rows) &&
+                 (!index_lane ||
+                  (gpu_tensor_fill_f32(b->iskv[il], 0.0f,
+                                       (uint64_t)n_banks * (index_lane / sizeof(float))) &&
+                   gpu_tensor_fill_f32(b->issc[il], PULSAR_NEG_INF,
+                                       (uint64_t)n_banks * (index_lane / sizeof(float)))));
+        }
     }
     return ok;
 }
@@ -685,6 +602,12 @@ static bool gpu_graph_bank_slabs_alloc(
 /* Write one bank's entry in the comp/index base-pointer tables (device arrays).
  * A NULL slab nulls the entry so a stray batched-kernel read of an evicted bank
  * faults instead of touching freed pages. */
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @param comp_slab its comp slab (NULL nulls the entry)
+/// @param index_slab its index slab (NULL nulls the entry)
+/// @return false = a table write failed
 static bool bank_bases_set(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
                            pulsar_gpu_tensor *comp_slab, pulsar_gpu_tensor *index_slab) {
     pulsar_bank_slabs *b = &g->banks;
@@ -706,10 +629,10 @@ static bool bank_bases_set(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
  * own comp/index physical by a DIRECT cudaFree of its per-bank split allocations
  * (the only primitive that returns physical on GB10; Step-1/2a reclaim gate).
  * Nulls the slab pointers and their base-table entries, and ZEROES this bank's
- * frontier counters (ms_n_comp/ms_n_index_comp) so touched_kv_bytes stops counting
+ * frontier counters (ms_n_comp) so touched_kv_bytes stops counting
  * a freed bank — else the guard's projected never drops after a spill and it
- * cascades, evicting every idle bank on one breach (review finding 2). The disk
- * snapshot preserves the real counts for restore. MUST NOT be the installed (cur)
+ * cascades, evicting every idle bank on one breach (review finding 2). The
+ * restore rebuilds the counts from what it loads. MUST NOT be the installed (cur)
  * bank — the caller repoints away first. The eager raw ring + state lanes
  * (contiguous, bounded floor) are NOT freed and survive the cycle in place.
  *
@@ -725,22 +648,23 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
     pulsar_bank_slabs *b = &g->banks;
     bool table_ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         pulsar_gpu_tensor_free(b->comp[il][bank]);
         b->comp[il][bank] = NULL;
-        if (ratio == 4) {
-            pulsar_gpu_tensor_free(b->index[il][bank]);
-            b->index[il][bank] = NULL;
-        }
+        pulsar_gpu_tensor_free(b->index[il][bank]);
+        b->index[il][bank] = NULL;
         table_ok = bank_bases_set(g, il, bank, NULL, NULL) && table_ok;
-        /* Finding 2: a freed bank contributes 0 resident KV. */
+        /* Finding 2: a freed bank contributes 0 resident KV -- its frontier AND
+         * its resident high-water, the one place the pages actually go. */
         g->ms_n_comp[bank][il] = 0;
-        g->ms_n_index_comp[bank][il] = 0;
+        g->ms_comp_hw[bank][il] = 0;
     }
-    /* plan-33: an evicted bank's boundary stash is meaningless — disarm the
-     * emit-restore hook so a later cold refill cannot restore stale bytes. */
-    g->ms_emit_keep[bank] = 0u;
+    /* L264: the bank's grid checkpoints are left in place: their slab is
+     * eager, nothing reads them while the bank is evicted, and every way back
+     * -- the server's segment-chain restore (whose root segment invalidates),
+     * a restore that finds nothing (invalidate), a bank reused for another
+     * conversation -- goes through rewind(0), which drops them.  So the
+     * frontier zeroed above is not a "rows below G changed" write. */
     if (!table_ok) {
         fprintf(stderr,
                 "pulsar: WARNING free_physical bank %u: base-table NULL device-write "
@@ -752,35 +676,33 @@ bool gpu_graph_bank_free_physical(pulsar_gpu_graph *g, uint32_t bank) {
 /* Tier-2 task #55 increment 2b — RESTORE alloc primitive. Reallocate ONE evicted
  * bank's comp/index physical (fresh cudaMallocManaged: VA reserved, physical on
  * touch) and rebuild its base-table entries to the new pointers. The caller then
- * reloads the bank's KV (H2D from the disk snapshot) into these. Idempotent: a
+ * reloads the bank's KV into these (the server from its segment chain). Idempotent: a
  * slab already present is left untouched. Returns false on OOM. */
 bool gpu_graph_bank_alloc_physical(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || g->banks.n_banks == 0 || bank >= g->banks.n_banks) return false;
     pulsar_bank_slabs *b = &g->banks;
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         if (!b->comp[il][bank]) {
             b->comp[il][bank] = pulsar_gpu_tensor_alloc_managed(b->comp_bank_bytes[il]);
             ok = b->comp[il][bank] != NULL;
         }
-        if (ok && ratio == 4 && !b->index[il][bank]) {
+        if (ok && b->index_bank_bytes[il] && !b->index[il][bank]) {
             b->index[il][bank] = pulsar_gpu_tensor_alloc_managed(b->index_bank_bytes[il]);
             ok = b->index[il][bank] != NULL;
         }
-        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank],
-                                    ratio == 4 ? b->index[il][bank] : NULL);
+        if (ok) ok = bank_bases_set(g, il, bank, b->comp[il][bank], b->index[il][bank]);
     }
     if (!ok) {
         /* TRANSACTIONAL: roll the bank back to fully-evicted rather than leaving
          * layers 0..k allocated.  A half-allocated bank is the dangerous state —
-         * callers (server_bank_restore_spilled) return false, so the slot stays
+         * callers (server::bank_unspill) return false, so the slot stays
          * marked spilled, but the bank now LOOKS partly live.  Returning it to a
          * clean evicted state keeps gpu_graph_bank_is_evicted's answer truthful
          * and lets a later retry start from scratch. */
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            if (pulsar_layer_compress_ratio(il) == 0) continue;
+            if (!gpu_graph_layer_is_kv_source(il)) continue;
             if (b->comp[il][bank])  { pulsar_gpu_tensor_free(b->comp[il][bank]);  b->comp[il][bank] = NULL; }
             if (b->index[il][bank]) { pulsar_gpu_tensor_free(b->index[il][bank]); b->index[il][bank] = NULL; }
             (void)bank_bases_set(g, il, bank, NULL, NULL);
@@ -798,206 +720,82 @@ bool gpu_graph_bank_is_evicted(const pulsar_gpu_graph *g, uint32_t bank) {
      * That holds for eviction, but NOT for a FAILED (re)allocation:
      * gpu_graph_bank_alloc_physical can fail partway and leave layers 0..k
      * allocated, at which point a layer-0 sample reports the bank LIVE while it
-     * is really half-built — and bank_fork_copy would then read NULL/garbage
-     * slabs from it (silent cross-conversation KV corruption).  A bank is only
-     * "live" when every compressed layer has physical. */
+     * is really half-built — and a consumer would then read NULL slabs from
+     * it.  A bank is only "live" when every compressed layer has the physical
+     * it is entitled to --
+     * an index pool only where the layer runs an indexer, so an unindexed
+     * source's absent index slab is not eviction. */
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        if (pulsar_layer_compress_ratio(il) == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         if (g->banks.comp[il][bank] == NULL) return true;
+        if (gpu_graph_layer_has_index_pool(il) && g->banks.index[il][bank] == NULL) return true;
     }
     return false;
 }
 
-/* plan-33 inc C: base alignment for a partial cut = LCM of the layer compress
- * ratios (128 on Flash): a multiple-of-LCM cut leaves every ratio-128 layer with
- * an EMPTY in-progress group; only ratio-4 layers straddle (boundary row). */
-uint32_t pulsar_partial_fork_base_align(void) {
-    static uint32_t a = 0;
-    if (a == 0u) {
-        uint32_t m = 4u;
-        for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-            const uint32_t r = pulsar_layer_compress_ratio(il);
-            if (r > m) m = r;
+/* A ratio-2 kv source's compressor state at any EVEN position is the canonical
+ * empty group (the two rows were consumed at the emit; the next two stores
+ * rewrite both before the next emit reads them): kv 0, score -INF -- what a
+ * cold prefill that ends on an even position leaves.  A rewound bank
+ * holds whatever its frontier left; reset it so the continuation's state is
+ * the cold prefill's byte for byte.  Ratio-1 sources keep no state. */
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @return false = a bad bank or a failed fill
+static bool compressor_state_reset_layer(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    {
+        pulsar_gpu_tensor *kv, *sc; uint64_t off, lane;
+        if (g->banks.n_banks) {
+            if (bank >= g->banks.n_banks) return false;
+            kv = g->banks.askv[il]; sc = g->banks.assc[il];
+            lane = g->banks.astate_bank_bytes[il]; off = (uint64_t)bank * lane;
+        } else {
+            kv = g->layer_attn_state_kv[il]; sc = g->layer_attn_state_score[il];
+            lane = kv ? pulsar_gpu_tensor_bytes(kv) : 0; off = 0;
         }
-        a = m;
-    }
-    return a;
-}
-
-/* plan-33 inc C: byte-REPLACE the recomputed ratio-4 boundary row with the stash.
- * Fires after any ratio-4 emit that wrote rows starting below the bank's keep
- * threshold (R/4+1); self-deactivates once emits move past. Byte-copy — NEVER
- * re-encode (MXFP4 QAT is non-idempotent; MXFP8 pack byte-copy is trivially
- * bit-exact too). Same-stream D2D: ordered after the emit's store and before any
- * later attention read. No-op when the pool/stash is absent or keep==0. */
-bool gpu_graph_emit_keep_restore(pulsar_gpu_graph *g, uint32_t il, uint32_t bank,
-                                 uint32_t row0, uint32_t rows, bool indexer) {
-    if (!g || rows == 0u || bank >= PULSAR_MSEQ_MAX) return true;
-    const uint32_t keep = g->ms_emit_keep[bank];
-    if (keep == 0u || row0 >= keep) return true;
-    if (pulsar_layer_compress_ratio(il) != 4u) return true;
-    pulsar_gpu_tensor *stash = indexer ? g->emit_stash_index : g->emit_stash_comp;
-    if (!stash) return true;
-    const uint64_t row_bytes = indexer
-        ? (gpu_graph_idx_fp4_enabled() ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                                       : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float))
-        : gpu_graph_attn_comp_cache_row_bytes();
-    const uint32_t keep4 = keep - 1u;              /* the boundary row index R/4 */
-    pulsar_gpu_tensor *cache = indexer ? gpu_graph_bank_index_comp_view(g, il, bank)
-                                    : gpu_graph_bank_attn_comp_view(g, il, bank);
-    if (!cache) return false;
-    const bool ok = pulsar_gpu_tensor_copy(cache, (uint64_t)keep4 * row_bytes,
-                                        stash,
-                                        ((uint64_t)bank * PULSAR_N_LAYER + il) * row_bytes,
-                                        row_bytes) != 0;
-    pulsar_gpu_tensor_free(cache);
-    return ok;
-}
-
-/* Tier-2 PATH-A PARTIAL-CUT FORK (plan-33 increment C, the risky core). Clone
- * bank src's KV TRUNCATED at position R into dst (src==dst = in-place truncate:
- * no copies, counters/stash only). Preconds: pool on, R >= align, R % align == 0,
- * R+4 <= src_len (the boundary row R/4 pools [R-4, R+4) — all inside the
- * validated prefix). Wrapped-ring guard: if src's ring has scrolled past
- * R - raw_window, the replay's attention would read scrolled-out raw rows —
- * REFUSE (caller cold-prefills). Per layer: raw [0,R) (or the whole wrapped
- * ring); ratio-4 comp/index rows [0, R/4+1) — ONE row past the counter (the
- * byte-valid boundary row), counters set to R/4 so it is present-but-invisible;
- * ratio-128 rows [0, R/128) (group closed exactly at a 128-multiple cut); state
- * lanes copied for hygiene (the replay re-seeds ratio-4 state from raw). The
- * boundary rows are stashed (packed bytes, from src) and ms_emit_keep[dst] =
- * R/4+1 arms the emit-restore hook. Caller validates tokens + pins src FIRST. */
-bool gpu_graph_bank_fork_copy_cut(pulsar_gpu_graph *g, uint32_t src, uint32_t dst,
-                                  uint32_t R, uint32_t src_len) {
-    if (!g || g->banks.n_banks == 0) return false;
-    if (src >= g->banks.n_banks || dst >= g->banks.n_banks) return false;
-    const uint32_t align = pulsar_partial_fork_base_align();
-    if (R < align || (R % align) != 0u || (uint64_t)R + 4u > src_len) return false;
-    if (gpu_graph_bank_is_evicted(g, src)) return false;
-    if (src != dst && gpu_graph_bank_is_evicted(g, dst) &&
-        !gpu_graph_bank_alloc_physical(g, dst)) return false;
-    pulsar_bank_slabs *b = &g->banks;
-    /* Wrapped-ring window guard: ring holds positions [oldest, src_len); the
-     * replay from R reads raw rows [R - raw_window, R). */
-    const uint32_t rcap = g->raw_cap;
-    const uint64_t oldest = src_len > rcap ? (uint64_t)src_len - rcap : 0u;
-    if ((uint64_t)R < oldest + g->raw_window) return false;   /* scrolled out */
-    if (!g->emit_stash_comp || !g->emit_stash_index) return false;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    const uint32_t keep4 = R / 4u;
-    const uint64_t raw_row_bytes = b->raw_bank_bytes / rcap;
-    bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (src != dst) {
-            const uint64_t raw_bytes = (uint64_t)(src_len <= rcap ? R : rcap) * raw_row_bytes;
-            if (raw_bytes)
-                ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
-                                         b->raw[il], (uint64_t)src * b->raw_bank_bytes,
-                                         raw_bytes) != 0;
-            if (ok && ratio != 0) {
-                const uint64_t crows = ratio == 4u ? (uint64_t)keep4 + 1u
-                                                   : (uint64_t)R / ratio;
-                if (crows)
-                    ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0,
-                                             crows * attn_row) != 0;
-                if (ok) ok = pulsar_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                                 b->askv[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                                 b->astate_bank_bytes[il]) != 0;
-                if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                                 b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                                 b->astate_bank_bytes[il]) != 0;
-                if (ok && ratio == 4u) {
-                    ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0,
-                                             ((uint64_t)keep4 + 1u) * idx_row) != 0;
-                    if (ok) ok = pulsar_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                                     b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                                     b->istate_bank_bytes[il]) != 0;
-                    if (ok) ok = pulsar_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                                     b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                                     b->istate_bank_bytes[il]) != 0;
-                }
+        if (!kv || !sc || lane == 0) return false;
+        pulsar_gpu_tensor *vk = pulsar_gpu_tensor_view(kv, off, lane);
+        pulsar_gpu_tensor *vs = pulsar_gpu_tensor_view(sc, off, lane);
+        const bool ok = vk && vs &&
+                        gpu_tensor_fill_f32(vk, 0.0f, lane / sizeof(float)) &&
+                        gpu_tensor_fill_f32(vs, PULSAR_NEG_INF, lane / sizeof(float));
+        pulsar_gpu_tensor_free(vk);
+        pulsar_gpu_tensor_free(vs);
+        if (!ok) { fprintf(stderr, "pulsar: compressor state reset failed at layer %u\n", il); return false; }
+        /* V4: the indexer's own compressor is a SECOND recurrent lane with the
+         * same empty group (kv 0 / score -INF).  It lives only on an indexed
+         * ratio-4 source, and leaving it unreset would carry a stale slot into
+         * the next bank that uses this one. */
+        if (g->banks.n_banks) {
+            pulsar_gpu_tensor *ik = gpu_graph_bank_index_state_kv_view(g, il, bank);
+            pulsar_gpu_tensor *is = gpu_graph_bank_index_state_score_view(g, il, bank);
+            if (!ik && !is) return true;   /* V4.1: this profile keeps no such lane */
+            const bool iok = ik && is &&
+                             gpu_tensor_fill_f32(ik, 0.0f, pulsar_gpu_tensor_bytes(ik) / sizeof(float)) &&
+                             gpu_tensor_fill_f32(is, PULSAR_NEG_INF, pulsar_gpu_tensor_bytes(is) / sizeof(float));
+            pulsar_gpu_tensor_free(is);
+            pulsar_gpu_tensor_free(ik);
+            if (!iok) { fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il); return false; }
+        } else if (g->layer_index_state_kv[il]) {
+            const uint64_t ib = pulsar_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, ib / sizeof(float)) ||
+                !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, ib / sizeof(float))) {
+                fprintf(stderr, "pulsar: indexer-compressor state reset failed at layer %u\n", il);
+                return false;
             }
         }
-        if (!ok) break;
-        /* Boundary-row stash (from SRC's rows — identical to dst's copy, and the
-         * only source for the src==dst truncate) + counters at frontier R. */
-        if (ratio == 4u) {
-            ok = pulsar_gpu_tensor_copy(g->emit_stash_comp,
-                                     ((uint64_t)dst * PULSAR_N_LAYER + il) * attn_row,
-                                     b->comp[il][src], (uint64_t)keep4 * attn_row,
-                                     attn_row) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(g->emit_stash_index,
-                                     ((uint64_t)dst * PULSAR_N_LAYER + il) * idx_row,
-                                     b->index[il][src], (uint64_t)keep4 * idx_row,
-                                     idx_row) != 0;
-            g->ms_n_comp[dst][il] = keep4;
-            g->ms_n_index_comp[dst][il] = keep4;
-        } else if (ratio != 0) {
-            g->ms_n_comp[dst][il] = R / ratio;
-            g->ms_n_index_comp[dst][il] = 0u;
-        } else {
-            g->ms_n_comp[dst][il] = 0u;
-            g->ms_n_index_comp[dst][il] = 0u;
-        }
     }
-    if (ok) g->ms_emit_keep[dst] = keep4 + 1u;
-    return ok;
+    return true;
 }
 
-/* Tier-2 PATH-A FULL-PREFIX FORK (plan-33 increment A). Device-side D2D clone of
- * bank `src`'s entire committed KV into bank `dst`: per layer the raw ring (whole
- * bank region — position-indexed, stale slots harmlessly copied), the comp
- * frontier rows (ms_n_comp[src] rows at offset 0 of the split alloc), the ratio-4
- * index frontier rows, and the attn/index compressor state lanes; the per-bank
- * frontier counters are mirrored src->dst. No captured-graph invalidation (pure
- * D2D + host counters). The CALLER (pulsar_session_bank_fork) has already memcmp-
- * validated the request prefix against src's committed history and pinned src
- * against eviction — this routine performs the copy only. Refuses if src is
- * evicted (no physical to clone; the caller restores from disk first) and
- * reallocs dst if it was freed. Returns false on a bad geometry / copy error. */
-bool gpu_graph_bank_fork_copy(pulsar_gpu_graph *g, uint32_t src, uint32_t dst) {
-    if (!g || g->banks.n_banks == 0) return false;
-    if (src >= g->banks.n_banks || dst >= g->banks.n_banks || src == dst) return false;
-    if (gpu_graph_bank_is_evicted(g, src)) return false;   /* caller restores src first */
-    if (gpu_graph_bank_is_evicted(g, dst) && !gpu_graph_bank_alloc_physical(g, dst)) return false;
-    pulsar_bank_slabs *b = &g->banks;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    bool ok = true;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        /* Raw ring: copy the whole bank region (bounded by raw_cap; the ring is
-         * position-indexed so any stale slots are never read at dst's pos). */
-        ok = pulsar_gpu_tensor_copy(b->raw[il], (uint64_t)dst * b->raw_bank_bytes,
-                                 b->raw[il], (uint64_t)src * b->raw_bank_bytes,
-                                 b->raw_bank_bytes) != 0;
-        g->ms_n_comp[dst][il] = g->ms_n_comp[src][il];
-        g->ms_n_index_comp[dst][il] = g->ms_n_index_comp[src][il];
-        if (!ok || ratio == 0) continue;
-        const uint64_t csz = (uint64_t)g->ms_n_comp[src][il] * attn_row;
-        if (ok && csz) ok = pulsar_gpu_tensor_copy(b->comp[il][dst], 0, b->comp[il][src], 0, csz) != 0;
-        if (ok) ok = pulsar_gpu_tensor_copy(b->askv[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                         b->askv[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                         b->astate_bank_bytes[il]) != 0;
-        if (ok) ok = pulsar_gpu_tensor_copy(b->assc[il], (uint64_t)dst * b->astate_bank_bytes[il],
-                                         b->assc[il], (uint64_t)src * b->astate_bank_bytes[il],
-                                         b->astate_bank_bytes[il]) != 0;
-        if (ratio == 4) {
-            const uint64_t isz = (uint64_t)g->ms_n_index_comp[src][il] * idx_row;
-            if (ok && isz) ok = pulsar_gpu_tensor_copy(b->index[il][dst], 0, b->index[il][src], 0, isz) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(b->iskv[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                             b->iskv[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                             b->istate_bank_bytes[il]) != 0;
-            if (ok) ok = pulsar_gpu_tensor_copy(b->issc[il], (uint64_t)dst * b->istate_bank_bytes[il],
-                                             b->issc[il], (uint64_t)src * b->istate_bank_bytes[il],
-                                             b->istate_bank_bytes[il]) != 0;
-        }
+bool gpu_graph_compressor_state_reset(pulsar_gpu_graph *g, uint32_t bank) {
+    if (!g) return false;
+    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_has_comp_state(il)) continue;
+        if (!compressor_state_reset_layer(g, il, bank)) return false;
     }
-    return ok;
+    return true;
 }
 
 
@@ -1017,35 +815,64 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
         g->layer_raw_cache[il] = pulsar_gpu_tensor_view(
                 b->raw[il], (uint64_t)bank * b->raw_bank_bytes, b->raw_bank_bytes);
         ok = g->layer_raw_cache[il] != NULL;
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (!ok || ratio == 0) continue;
+        if (!ok || !gpu_graph_layer_is_kv_source(il)) continue;
         pulsar_gpu_tensor_free(g->layer_attn_comp_cache[il]);
-        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
-        pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
+        pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
         g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
                 b->comp[il][bank], 0, b->comp_bank_bytes[il]);
+        /* The index-K pool exists only where an indexer runs (0731's ratio-128
+         * HCA layers publish none), so an absent pool is not a failure. */
+        g->layer_index_comp_cache[il] = b->index_bank_bytes[il]
+            ? pulsar_gpu_tensor_view(b->index[il][bank], 0, b->index_bank_bytes[il]) : NULL;
+        ok = g->layer_attn_comp_cache[il] &&
+             (!b->index_bank_bytes[il] || g->layer_index_comp_cache[il]);
+        if (!ok || !b->astate_bank_bytes[il]) continue;   /* ratio 1: no state lane */
+        pulsar_gpu_tensor_free(g->layer_attn_state_kv[il]);
+        pulsar_gpu_tensor_free(g->layer_attn_state_score[il]);
         g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(
                 b->askv[il], (uint64_t)bank * b->astate_bank_bytes[il],
                 b->astate_bank_bytes[il]);
         g->layer_attn_state_score[il] = pulsar_gpu_tensor_view(
                 b->assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
                 b->astate_bank_bytes[il]);
-        ok = g->layer_attn_comp_cache[il] && g->layer_attn_state_kv[il] &&
-             g->layer_attn_state_score[il];
-        if (ok && ratio == 4) {
-            pulsar_gpu_tensor_free(g->layer_index_comp_cache[il]);
+        ok = g->layer_attn_state_kv[il] && g->layer_attn_state_score[il];
+        /* V4: the indexer-compressor lane follows the bank too (views only; the
+         * lane is eager slab memory, not per-bank managed). */
+        if (ok && b->istate_bank_bytes[il]) {
             pulsar_gpu_tensor_free(g->layer_index_state_kv[il]);
             pulsar_gpu_tensor_free(g->layer_index_state_score[il]);
-            g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
-                    b->index[il][bank], 0, b->index_bank_bytes[il]);
             g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
                     b->iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
                     b->istate_bank_bytes[il]);
             g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
                     b->issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
                     b->istate_bank_bytes[il]);
-            ok = g->layer_index_comp_cache[il] && g->layer_index_state_kv[il] &&
-                 g->layer_index_state_score[il];
+            ok = g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+            if (ok && b->spec_iskv[il]) {
+                pulsar_gpu_tensor_free(g->spec_index_state_kv[il]);
+                pulsar_gpu_tensor_free(g->spec_index_state_score[il]);
+                g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                        b->spec_iskv[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+                g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                        b->spec_issc[il], (uint64_t)bank * b->istate_bank_bytes[il],
+                        b->istate_bank_bytes[il]);
+                ok = g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+            }
+        }
+        /* inc 6: the spec frontier snapshot lanes follow the live views, so
+         * the snapshot machinery (incl. its re-prepared copy tables) is
+         * bank-correct with no call-site changes. */
+        if (ok && b->spec_askv[il]) {
+            pulsar_gpu_tensor_free(g->spec_attn_state_kv[il]);
+            pulsar_gpu_tensor_free(g->spec_attn_state_score[il]);
+            g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
+                    b->spec_askv[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                    b->astate_bank_bytes[il]);
+            g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
+                    b->spec_assc[il], (uint64_t)bank * b->astate_bank_bytes[il],
+                    b->astate_bank_bytes[il]);
+            ok = g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
         }
     }
     /* Option F: swap the per-bank DSpark drafter ring views (present only when
@@ -1065,14 +892,34 @@ bool gpu_graph_bank_repoint(pulsar_gpu_graph *g, uint32_t bank) {
             ok = g->dspark_raw_cache[i] && g->dspark_prompt_h[i];
         }
     }
-    /* Stale pointer hygiene (mirrors gpu_graph_free). */
-    pulsar_gpu_batched_copy_free(g->spec_snap_copies);
-    pulsar_gpu_batched_copy_free(g->spec_restore_copies);
-    g->spec_snap_copies = NULL;
-    g->spec_restore_copies = NULL;
-    g->spec_frontier_copy_n = 0;
-    g->spec_frontier_copy_init = 0;
-    if (ok) b->cur_bank = bank;
+    if (ok) {
+        /* L260: park the outgoing bank's spec-frontier copy tables and install the incoming bank's (built lazily at
+         * its first snapshot): they address per-bank state-lane views that never move (pulsar_bank_slabs). */
+        const uint32_t out = b->cur_bank;
+        b->spec_snap_copies[out] = g->spec_snap_copies;
+        b->spec_restore_copies[out] = g->spec_restore_copies;
+        b->spec_frontier_copy_n[out] = g->spec_frontier_copy_n;
+        b->spec_frontier_copy_max_bytes[out] = g->spec_frontier_copy_max_bytes;
+        b->spec_frontier_copy_init[out] = g->spec_frontier_copy_init;
+        g->spec_snap_copies = b->spec_snap_copies[bank];
+        g->spec_restore_copies = b->spec_restore_copies[bank];
+        g->spec_frontier_copy_n = b->spec_frontier_copy_n[bank];
+        g->spec_frontier_copy_max_bytes = b->spec_frontier_copy_max_bytes[bank];
+        g->spec_frontier_copy_init = b->spec_frontier_copy_init[bank];
+        b->spec_snap_copies[bank] = NULL;
+        b->spec_restore_copies[bank] = NULL;
+        b->spec_frontier_copy_init[bank] = 0;
+        b->cur_bank = bank;
+    } else {
+        /* A half-repointed view set: the installed tables no longer match it.  Drop them (the next snapshot
+         * rebuilds from whatever views are installed); the parked banks' tables still match their own views. */
+        pulsar_gpu_batched_copy_free(g->spec_snap_copies);
+        pulsar_gpu_batched_copy_free(g->spec_restore_copies);
+        g->spec_snap_copies = NULL;
+        g->spec_restore_copies = NULL;
+        g->spec_frontier_copy_n = 0;
+        g->spec_frontier_copy_init = 0;
+    }
     return ok;
 }
 
@@ -1096,16 +943,31 @@ pulsar_gpu_tensor *gpu_graph_bank_raw_pool(pulsar_gpu_graph *g, uint32_t il) {
 /* Nominal comp/index operand for the batched attention/indexer wrappers. With
  * per-bank split allocations there is no single slab; the batched (descriptor)
  * path addresses banks through the base-pointer table (below), so this returns
- * bank 0's allocation as the nominal typed operand (its per-bank size drives the
- * wrappers' buffer-size validation). Pool disabled → the classic tensor. */
-pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
-    if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.comp[il][0] : g->layer_attn_comp_cache[il];
+ * a RESIDENT bank's allocation as the nominal typed operand (every bank's is the
+ * same size, which drives the wrappers' buffer-size validation; the kernels read
+ * through the table).  L328: the lowest resident bank, not bank 0 -- the server
+ * spills bank 0 like any idle bank, and a freed slab is NULL; a step always has
+ * a resident bank (its own rows).  Pool disabled → the classic tensor. */
+/// @param per_bank [n_banks] each bank's slab (NULL = not resident)
+/// @param n_banks banks
+/// @return the lowest resident bank's slab, or NULL
+static pulsar_gpu_tensor *bank_nominal_slab(pulsar_gpu_tensor *const *per_bank, uint32_t n_banks) {
+    for (uint32_t b = 0; b < n_banks; b++)
+        if (per_bank[b]) return per_bank[b];
+    return NULL;
 }
 
+pulsar_gpu_tensor *gpu_graph_bank_attn_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
+    if (!g || il >= PULSAR_N_LAYER) return NULL;
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.comp[il], g->banks.n_banks) : g->layer_attn_comp_cache[il];
+}
+
+/// @param g the graph
+/// @param il the layer
+/// @return the lowest resident bank's index slab (pool), else the classic index cache; NULL for a bad layer
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_pool(pulsar_gpu_graph *g, uint32_t il) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
-    return g->banks.n_banks ? g->banks.index[il][0] : g->layer_index_comp_cache[il];
+    return g->banks.n_banks ? bank_nominal_slab(g->banks.index[il], g->banks.n_banks) : g->layer_index_comp_cache[il];
 }
 
 /* Per-bank comp/index base-pointer tables (device arrays of n_banks pointers,
@@ -1116,6 +978,9 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_comp_bases(pulsar_gpu_graph *g, uint32_t 
     return g->banks.n_banks ? g->banks.comp_bases[il] : NULL;
 }
 
+/// @param g the graph
+/// @param il the layer
+/// @return the index base-pointer table, or NULL when the pool is disabled
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t il) {
     if (!g || il >= PULSAR_N_LAYER) return NULL;
     return g->banks.n_banks ? g->banks.index_bases[il] : NULL;
@@ -1125,6 +990,13 @@ pulsar_gpu_tensor *gpu_graph_bank_index_comp_bases(pulsar_gpu_graph *g, uint32_t
  * the bank's lane in the slab, or (pool disabled) a fresh view wrapping the
  * whole classic tensor — bank 0 only, so a stale bank id cannot silently
  * alias the single session's state. */
+/// @param g the graph
+/// @param slab the contiguous slab
+/// @param lane_bytes [PULSAR_N_LAYER] each layer's lane size
+/// @param classic the classic tensor (pool disabled)
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 static pulsar_gpu_tensor *bank_lane_view(pulsar_gpu_graph *g,
                                       pulsar_gpu_tensor *slab,
                                       const uint64_t *lane_bytes,
@@ -1141,6 +1013,13 @@ static pulsar_gpu_tensor *bank_lane_view(pulsar_gpu_graph *g,
 
 /* Per-bank comp/index view: with split allocations the bank's whole allocation
  * IS its lane (offset 0), so it bypasses the contiguous-slab bank_lane_view. */
+/// @param g the graph
+/// @param bank_slab the bank's own allocation
+/// @param lane_bytes [PULSAR_N_LAYER] each layer's lane size
+/// @param classic the classic tensor (pool disabled)
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 static pulsar_gpu_tensor *bank_split_view(pulsar_gpu_graph *g,
                                        pulsar_gpu_tensor *bank_slab,
                                        const uint64_t *lane_bytes,
@@ -1161,38 +1040,71 @@ pulsar_gpu_tensor *gpu_graph_bank_attn_comp_view(pulsar_gpu_graph *g, uint32_t i
                            g->layer_attn_comp_cache[il], il, bank);
 }
 
+/// Bank `bank`'s index comp pool at layer il.
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_bank_index_comp_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
     return bank_split_view(g, g->banks.n_banks ? g->banks.index[il][bank] : NULL,
                            g->banks.index_bank_bytes,
                            g->layer_index_comp_cache[il], il, bank);
 }
 
+/// Bank `bank`'s attention compressor state lane (kv) at layer il.
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_bank_attn_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
     return bank_lane_view(g, g->banks.askv[il], g->banks.astate_bank_bytes,
                           g->layer_attn_state_kv[il], il, bank);
 }
 
+/// Bank `bank`'s attention compressor state lane (score) at layer il.
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_bank_attn_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
     return bank_lane_view(g, g->banks.assc[il], g->banks.astate_bank_bytes,
                           g->layer_attn_state_score[il], il, bank);
 }
 
 pulsar_gpu_tensor *gpu_graph_bank_index_state_kv_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    /* No lane at all on a profile whose indexer keeps none: bank_lane_view hands
+     * back NULL, so a caller can tell "this model has no such lane" from "the
+     * bank is wrong".
+     *
+     * The SLAB STRIDE is not the authority for that: it is 0 whenever the pool is
+     * disabled, while the classic lane is exactly the lane then.  Gating on it
+     * returned NULL for a mixed decode step's index lane on a pool-less graph,
+     * and the silent conjunction in the index compressor's caller turned that
+     * into "attention batch encode failed" at layer 2.  Ask the lane, not the
+     * stride: iskv[il] is NULL where there is no lane, and the classic tensor is
+     * NULL too. */
+    if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.iskv[il], g->banks.istate_bank_bytes,
                           g->layer_index_state_kv[il], il, bank);
 }
 
+/// Bank `bank`'s indexer compressor state lane (score) at layer il; NULL on a profile with none.
+/// @param g the graph
+/// @param il the layer
+/// @param bank the bank
+/// @return a fresh view (the caller frees it), or NULL
 pulsar_gpu_tensor *gpu_graph_bank_index_state_score_view(pulsar_gpu_graph *g, uint32_t il, uint32_t bank) {
+    if (!g || il >= PULSAR_N_LAYER) return NULL;
     return bank_lane_view(g, g->banks.issc[il], g->banks.istate_bank_bytes,
                           g->layer_index_state_score[il], il, bank);
 }
 
 void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->ms_n_comp[bank][il] = g->layer_n_comp[il];
-        g->ms_n_index_comp[bank][il] = g->layer_n_index_comp[il];
-    }
+    /* STAGE 1b: the frontier is no longer copied here. ms_n_comp[bank] IS the
+     * storage now -- this loop had become a self-copy (callers capture the
+     * LIVE bank, and gpu_graph_n_comp resolves to exactly that row). The other
+     * fields below still have scalar twins and still ride the hand-off. */
     /* Option F: the drafter-ring frontier is per-bank too (device rings live in
      * banks.dspark_*), so it rides the same capture/install hand-off. */
     for (int i = 0; i < 3; i++) g->ms_dspark_n_raw[bank][i] = g->dspark_n_raw[i];
@@ -1200,88 +1112,66 @@ void gpu_graph_bank_counters_capture(pulsar_gpu_graph *g, uint32_t bank) {
     g->ms_dspark_prompt_lo[bank] = g->dspark_prompt_lo;
 }
 
+/// Install bank `bank`'s host counter twins (the DSpark ring counters) as the live scalars.
+/// @param g the graph
+/// @param bank the bank (>= PULSAR_MSEQ_MAX: no-op)
 void gpu_graph_bank_counters_install(pulsar_gpu_graph *g, uint32_t bank) {
     if (!g || bank >= PULSAR_MSEQ_MAX) return;
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        g->layer_n_comp[il] = g->ms_n_comp[bank][il];
-        g->layer_n_index_comp[il] = g->ms_n_index_comp[bank][il];
-    }
+    /* STAGE 1b: the frontier is not copied here -- ms_n_comp[bank] IS its storage, and gpu_graph_bank_repoint has
+     * already made `bank` current (the per-layer self-copy this used to run is gone). */
     for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = g->ms_dspark_n_raw[bank][i];
     g->dspark_prompt_n = g->ms_dspark_prompt_n[bank];
     g->dspark_prompt_lo = g->ms_dspark_prompt_lo[bank];
 }
 
 /* Tier-2 overcommit (task #55, increment 1): EXACT touched (physically resident)
- * demand-paged KV bytes across the whole pool — Σ over live banks Σ over layers
- * of (comp frontier rows × comp row bytes + index frontier rows × index row
- * bytes).  Deterministic from the position-driven compressor frontier; no
- * cudaMemGetInfo / MemAvailable.  This is the number the increment-2 eviction
- * guard triggers on, and the accounting-exactness gate proves it tracks the real
- * physical delta.  The CURRENT bank's frontier is live in layer_n_comp /
- * layer_n_index_comp; idle banks keep their frontier in ms_n_comp / ms_n_index_comp
- * (captured on switch-away).  Pool disabled (n_banks==0) → pool_count 1, cur 0 →
- * the classic single-session frontier (layer_n_comp) is summed. Only the ctx-
- * scaled comp/index are counted; the eager raw ring + state lanes are the fixed
- * floor and are already resident (not part of the growing touched set). */
-/* Exact touched (physically resident) demand-paged comp/index KV of ONE bank,
- * from its compressor frontier.  cur bank reads the live layer_n_comp; idle banks
- * read their captured ms_n_comp.  The increment-2b guard uses this for the
- * per-bank Δ projection and the smallest-frontier victim tie-break. */
-uint64_t gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank) {
-    if (!g) return 0;
+ * demand-paged KV bytes across the whole pool -- Σ over banks Σ over kv sources
+ * of resident rows × (comp row + index-K row) bytes.  Deterministic, no
+ * cudaMemGetInfo / MemAvailable: the number the increment-2 eviction guard
+ * triggers on and the server's budget and provisioning read.  RESIDENT rows are
+ * the bank's high-water (ms_comp_hw), not its frontier: a rewind, an invalidate
+ * or an eviction to an empty conversation lowers the frontier and frees no page,
+ * and counting the frontier let the books read a 1M-token pool 17% used on a box
+ * with 4 GiB left (2026-09-29, the pair).  Only gpu_graph_bank_free_physical
+ * returns pages, and only it clears the high-water.  The accounting gate proves
+ * both halves: growth tracks the physical delta, and a rewind leaves both still.
+ * Only the ctx-scaled comp/index are counted; the eager raw ring + state lanes
+ * are the fixed floor and are already resident. */
+KvBytes gpu_graph_bank_touched_kv_bytes(const pulsar_gpu_graph *g, uint32_t bank) {
+    if (!g) return KvBytes{};
     const uint32_t nb = gpu_graph_bank_pool_count(g);
-    if (bank >= nb) return 0;
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-        : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
-    const uint32_t cur = g->banks.n_banks ? g->banks.cur_bank : 0u;
+    if (bank >= nb) return KvBytes{};
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t ncomp = (bank == cur) ? g->layer_n_comp[il]
-                                             : g->ms_n_comp[bank][il];
-        bytes += (uint64_t)ncomp * attn_row;
-        if (ratio == 4) {
-            const uint32_t nidx = (bank == cur) ? g->layer_n_index_comp[il]
-                                                : g->ms_n_index_comp[bank][il];
-            bytes += (uint64_t)nidx * idx_row;
-        }
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
+        /* one emit writes a comp row AND an index-K row */
+        bytes += (uint64_t)g->ms_comp_hw[bank][il] * (attn_row + idx_row);
     }
-    return bytes;
-}
-
-uint64_t gpu_graph_touched_kv_bytes(const pulsar_gpu_graph *g) {
-    if (!g) return 0;
-    const uint32_t nb = gpu_graph_bank_pool_count(g);
-    uint64_t bytes = 0;
-    for (uint32_t b = 0; b < nb; b++) bytes += gpu_graph_bank_touched_kv_bytes(g, b);
-    return bytes;
+    return KvBytes{bytes};   /* per-layer compressed rows times their row bytes: the conversion, raw inside */
 }
 
 /* Tier-2 task #55 increment 2b — CONSERVATIVE per-bank comp/index growth over one
- * decode quantum of `q` tokens: Σ_layers( ceil(q/ratio)·comp_row + q·index_row ).
- * The index term charges q (not ceil(q/ratio)) rows — a deliberate over-estimate
- * so the guard fires EARLY (safe side). Position-independent, so total Δ =
+ * decode quantum of `q` tokens: Σ_kv-sources ceil(q/ratio)·(comp_row + index_row)
+ * (one emit writes both rows).  Position-independent, so total Δ =
  * n_live_growing_banks × this. */
-uint64_t gpu_graph_quantum_growth_bytes_per_bank(uint32_t q) {
-    const uint64_t attn_row = gpu_graph_attn_comp_cache_row_bytes();
-    const uint64_t idx_row = gpu_graph_idx_fp4_enabled()
-        ? PULSAR_ENGINE_IDXFP4_ROWBYTES : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+KvBytes gpu_graph_quantum_growth_bytes_per_bank(KvRows rows) {
+    const uint32_t q = (uint32_t)rows.raw();   /* token rows, uint32 as before; each layer compresses them by its ratio */
+    const uint64_t attn_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+    const uint64_t idx_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
     uint64_t bytes = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        bytes += (uint64_t)((q + ratio - 1u) / ratio) * attn_row;
-        if (ratio == 4) bytes += (uint64_t)q * idx_row;
+        bytes += (uint64_t)((q + ratio - 1u) / ratio) * (attn_row + idx_row);
     }
-    return bytes;
+    return KvBytes{bytes};
 }
 
 bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
                                    const int32_t *seq, uint32_t n_rows,
-                                   bool capture_cur) {
+                                   bool capture_cur, int32_t n_dec_declared) {
     if (!g || !pos || !seq || n_rows == 0 || n_rows > g->prefill_cap) {
         fprintf(stderr, "pulsar: multiseq step rejected: bad args (n_rows=%u)\n",
                 n_rows);
@@ -1294,13 +1184,15 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
     const uint32_t n_banks = gpu_graph_bank_pool_count(g);
     /* Constraint (relaxed for the batched-decode driver): contiguous per-bank
      * runs (each bank at most one run), positions consecutive WITHIN each
-     * bank's run, and every run starting at a position > 0.  Banks may sit at
-     * unrelated positions — the multi-session shape; the upstream batch
-     * stages (RoPE q/kv/indexer-q/inverse, compressor loop, raw scatter,
-     * attention, indexer) are all per-row-position driven.  Position-0 rows
-     * stay rejected: admission (from-zero) prefill runs on the classic
-     * single-bank view path in v1, and negative positions would wrap the
-     * uint32 casts below. */
+     * bank's run.  Banks may sit at unrelated positions — the multi-session
+     * shape; the upstream batch stages (RoPE q/kv/indexer-q/inverse,
+     * compressor loop, raw scatter, attention, indexer) are all
+     * per-row-position driven.  L260 (fusion phase A): a run may START at
+     * position 0 -- a fresh bank's first prompt chunk riding a mixed step --
+     * but never as the batch's FIRST row: the layer encode keys its from-zero
+     * single-sequence arms (zero_prefix) on row 0's position, and a multiseq
+     * batch must take the per-row arms (mixed_zero_prefill_gate).  Negative
+     * positions would wrap the uint32 casts below. */
     bool bank_seen[PULSAR_MSEQ_MAX] = {false};
     int32_t prev_bank = -1;
     for (uint32_t t = 0; t < n_rows; t++) {
@@ -1318,10 +1210,11 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             }
             bank_seen[seq[t]] = true;
             prev_bank = seq[t];
-            if (pos[t] <= 0) {
-                fprintf(stderr, "pulsar: multiseq step rejected: bank %d first "
-                                "position %d <= 0 (admission prefill is "
-                                "single-bank classic)\n", seq[t], pos[t]);
+            if (pos[t] < 0 || (pos[t] == 0 && t == 0)) {
+                fprintf(stderr, "pulsar: multiseq step rejected: bank %d run starts "
+                                "at position %d as row %u (a from-zero run must "
+                                "follow at least one row of another bank)\n",
+                        seq[t], pos[t], t);
                 return false;
             }
         } else if ((int64_t)pos[t] != (int64_t)pos[t - 1] + 1) {
@@ -1337,9 +1230,9 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         /* Bound EVERY row (not just each run's first): positions are cast to
          * uint32 downstream (ring slot, visible-comp, RoPE), and the
          * position-derived arithmetic below adds 1. */
-        if (pos[t] <= 0 || pos[t] == INT32_MAX) {
+        if (pos[t] < 0 || pos[t] == INT32_MAX) {
             fprintf(stderr, "pulsar: multiseq step rejected: bank %d row %u "
-                            "position %d out of range (want 0 < pos < "
+                            "position %d out of range (want 0 <= pos < "
                             "INT32_MAX)\n", seq[t], t, pos[t]);
             return false;
         }
@@ -1361,21 +1254,19 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
         if (t > 0 && seq[t] == seq[t - 1]) continue;
         const uint32_t b = (uint32_t)seq[t];
         const uint32_t p = (uint32_t)pos[t];
-        const bool use_scalars = capture_cur && b == cur_bank;
         for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
+            if (!gpu_graph_layer_is_kv_source(il)) continue;
             const uint32_t ratio = pulsar_layer_compress_ratio(il);
-            if (ratio == 0) continue;
-            const uint32_t have_comp = use_scalars ? g->layer_n_comp[il]
-                                                   : g->ms_n_comp[b][il];
-            const uint32_t have_index = use_scalars ? g->layer_n_index_comp[il]
-                                                    : g->ms_n_index_comp[b][il];
-            if (have_comp != p / ratio ||
-                (ratio == 4 && have_index != p / ratio)) {
+            /* Stage 1b made the per-bank array the only frontier storage; the
+             * cur-bank selector that stood here chose between two names for
+             * the same memory (L178). */
+            const uint32_t have_comp = g->ms_n_comp[b][il];
+            if (have_comp != p / ratio) {
                 fprintf(stderr,
                         "pulsar: multiseq step rejected: bank %u frontier not "
-                        "position-true at layer %u (pos %u ratio %u: "
-                        "n_comp %u want %u, n_index_comp %u)\n",
-                        b, il, p, ratio, have_comp, p / ratio, have_index);
+                        "position-true at kv source %u (pos %u ratio %u: "
+                        "n_comp %u want %u)\n",
+                        b, il, p, ratio, have_comp, p / ratio);
                 return false;
             }
         }
@@ -1426,7 +1317,7 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
         sup[il] = 0;
-        if (ratio == 0) continue;
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         for (uint32_t t = 0; t < n_rows; t++) {
             const uint32_t v = ((uint32_t)pos[t] + 1u) / ratio;
             if (v > sup[il]) sup[il] = v;
@@ -1438,85 +1329,118 @@ bool gpu_graph_multiseq_step_begin(pulsar_gpu_graph *g, const int32_t *pos,
             return false;
         }
     }
-    /* All rejection points passed: NOW commit the cur-bank capture (the
-     * scalars are still the pre-step classic values here — the superset
-     * write below is the first scalar mutation). */
+    /* One authority for the step's comp bound: the layer encode reads
+     * batch_comp_sup instead of re-deriving it from ms_positions (L178). */
+    memcpy(g->batch_comp_sup, sup, sizeof(uint32_t) * PULSAR_N_LAYER);
+    /* All rejection points passed: NOW commit the cur-bank capture. */
     if (capture_cur) gpu_graph_bank_counters_capture(g, cur_bank);
-    for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        g->layer_n_comp[il] = sup[il];
-        if (ratio == 4) g->layer_n_index_comp[il] = sup[il];
-    }
+    /* STAGE 1b: the cross-bank SUPERSET is no longer written anywhere.
+     *
+     * This loop used to publish max-over-banks into the scalars, which the step
+     * then treated as a read-only working value. With the scalars gone that
+     * write lands on ms_n_comp[cur_bank] -- i.e. it overwrites one real bank's
+     * frontier with the maximum across all of them, and step_end catches it as
+     * "bank N layer 2 frontier 18/18 want 17" whenever another bank is ahead.
+     *
+     * sup[] is still computed above because the comp-cap rejection needs it;
+     * it is a bound check, not stored state. Every consumer of the frontier
+     * during the step reads its own bank: the per-row loop through
+     * ms_n_comp[ms_seq_id[t]], the kernels through the per-row comp_counts[]
+     * device array. */
     g->batch_multiseq_rows = n_rows;
     g->batch_multiseq = true;
-    /* plan-34 inc 2/3/4: arm the M-independent custom GEMMs for the DECODE PREFIX
-     * of this step. Row layout (inc 4): decode rows first — one 1-row run per
-     * decode bank — then the K-row PREFILL run(s). n_dec = the count of leading
-     * rows that live in length-1 runs; every dense GEMM runs those rows through the
-     * M-independent custom kernel (byte-identical to a decode-only step of that
-     * width — gate-4 neutrality) and the trailing prefill rows through the fast
-     * tensor-core path. Decode-only (every run length 1) => n_dec == n_rows (arm
-     * all, == inc-2). Pure prefill (first run length>1) => n_dec == 0 (arm none,
-     * == inc-3). The scan stops at the first multi-row run: the inc-4 scheduler
-     * lays decode rows strictly before the prefill run (a length-1 run appearing
-     * AFTER a prefill run is not an inc-4 layout and would be treated as prefill —
-     * documented, enforced by the row builder / gate). */
+    /* Declare the step's DECODE-ROW COUNT (pulsar_gpu.h,
+     * pulsar_gpu_matmul_set_batch_decode_rows): row KIND is what every dense
+     * GEMM and MoE tier reads to choose its arm (L167).  Row layout (plan-34
+     * inc 4): decode rows first -- one run per decode bank, 1 row plain or
+     * 1 + drafts under verify -- then the K-row PREFILL run(s).  Where
+     * 0 < n_dec < n_rows the dispatchers split the batch at n_dec: the decode
+     * prefix runs as its own call, so its bytes equal a decode-only step of
+     * that width (gate-4 neutrality), and the prefill suffix runs through the
+     * tensor-core window arm.  This entry is not told the kinds, so it infers
+     * them from the layout: a step of <= PULSAR_GPU_MNEUTRAL_ROWS_MAX rows is
+     * the served decode/verify shape (three slots x (1 + draft depth) rows, no
+     * prefill run -- L146) and declares every row decode; a wider step counts
+     * the leading length-1 runs, stopping at the first multi-row run because
+     * the scheduler lays decode rows strictly before the prefill run.  The
+     * inference is exact for every step the scheduler builds today; a prefill
+     * chunk of <= 16 rows co-scheduled into a <= 16-row step would be declared
+     * decode by it (the caller would have to pass the count).  The setter
+     * refuses a count past the cap, which the PULSAR_MSEQ_MAX static_assert
+     * makes unreachable from here. */
+    /* L260: a caller that KNOWS its decode rows declares them -- a fused step
+     * (where its decode / verify prefix ends) and the spec lane's verify step
+     * (every row; PULSAR_MSEQ_HEAD_ALL_ROWS) -- and the declared rows are all
+     * decode rows, multi-row verify runs included, up to the verify slab
+     * (L262: a c16 verify step is 16 runs of 2 rows; inferred, it declared 0
+     * decode rows and ran its experts on the IQ2 tile at ~4.5 ms a layer where
+     * the decode GEMV takes ~3.0, and its dense GEMMs on the 4096-row picks --
+     * width-dependent arithmetic is the decode rule now, Tyler 2026-10-01).
+     * Without a declaration the kinds are inferred as before. */
     uint32_t n_dec = 0;
-    for (uint32_t t = 0; t < n_rows; ) {
-        uint32_t rl = 1;
-        while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
-        if (rl == 1) { n_dec++; t++; } else break;
+    const int dec_cap = n_dec_declared >= 0 ? (int)PULSAR_SPEC_LOGITS_ROWS : (int)PULSAR_GPU_MNEUTRAL_ROWS_MAX;
+    if (n_dec_declared >= 0) {
+        n_dec = (uint32_t)n_dec_declared;
+    } else if (n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX) {
+        n_dec = n_rows;
+    } else {
+        for (uint32_t t = 0; t < n_rows; ) {
+            uint32_t rl = 1;
+            while (t + rl < n_rows && seq[t + rl] == seq[t]) rl++;
+            if (rl == 1) { n_dec++; t++; } else break;
+        }
     }
-    pulsar_gpu_matmul_set_batch_mneutral((int)n_dec);
+    if (!pulsar_gpu_matmul_set_batch_decode_rows_capped((int)n_dec, dec_cap)) {
+        g->batch_multiseq = false;
+        g->batch_multiseq_rows = 0;
+        return false;
+    }
+    /* Where the prompt runs start: the declared decode prefix ends there (its
+     * verify runs are decode rows whatever their length), an inferred one ends
+     * at the first multi-row run, and a <= MNEUTRAL step has none. */
+    g->batch_multiseq_pf_row0 = n_dec_declared >= 0 ? (uint32_t)n_dec_declared
+                              : n_rows <= PULSAR_GPU_MNEUTRAL_ROWS_MAX ? n_rows : n_dec;
     return true;
 }
 
+/// End a multiseq step: disarm the batched mode and self-check every bank's frontier.
+/// @param g the graph
+/// @return false when no step was armed or a frontier check failed
 bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
     if (!g || !g->batch_multiseq) return false;
-    pulsar_gpu_matmul_set_batch_mneutral(0);
+    (void)pulsar_gpu_matmul_set_batch_decode_rows(0);   /* 0 cannot be refused */
     g->batch_multiseq = false;
     const uint32_t n_rows = g->batch_multiseq_rows;
     g->batch_multiseq_rows = 0;
+    g->batch_multiseq_pf_row0 = 0;
     /* Self-check (host ints only): every batched bank's frontier advanced to
      * exactly its position-derived value — (last_pos+1)/ratio — and the
-     * scalar superset (untouched since step top) equals the max over the
-     * batched banks.  A miss here is the silent-KV-corruption class; fail
-     * loud so the driver aborts the session instead of serving garbage. */
+     * position-derived value -- (last_pos+1)/ratio.  A miss here is the
+     * silent-KV-corruption class; fail loud so the driver aborts the session
+     * instead of serving garbage.
+     * STAGE 1b: the companion "scalar superset" check is gone with the scalar
+     * (see below) -- there is no longer a shared value for a bank to corrupt. */
     bool ok = true;
     for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
+        if (!gpu_graph_layer_is_kv_source(il)) continue;
         const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        uint32_t sup = 0;
         for (uint32_t t = 0; t < n_rows && ok; t++) {
             if (t + 1 < n_rows && g->ms_seq_id[t + 1] == g->ms_seq_id[t]) continue;
             const uint32_t b = (uint32_t)g->ms_seq_id[t];
             const uint32_t want = ((uint32_t)g->ms_positions[t] + 1u) / ratio;
-            if (want > sup) sup = want;
-            if (g->ms_n_comp[b][il] != want ||
-                (ratio == 4 && g->ms_n_index_comp[b][il] != want)) {
+            if (g->ms_n_comp[b][il] != want) {
                 fprintf(stderr,
-                        "pulsar: multiseq step_end FAILED: bank %u layer %u "
-                        "frontier %u/%u want %u (ratio %u)\n",
-                        b, il, g->ms_n_comp[b][il],
-                        g->ms_n_index_comp[b][il], want, ratio);
+                        "pulsar: multiseq step_end FAILED: bank %u kv source %u "
+                        "frontier %u want %u (ratio %u)\n",
+                        b, il, g->ms_n_comp[b][il], want, ratio);
                 ok = false;
             }
         }
-        if (ok && g->layer_n_comp[il] != sup) {
-            fprintf(stderr,
-                    "pulsar: multiseq step_end FAILED: layer %u superset %u "
-                    "mutated mid-step (want %u)\n",
-                    il, g->layer_n_comp[il], sup);
-            ok = false;
-        }
-        if (ok && ratio == 4 && g->layer_n_index_comp[il] != sup) {
-            fprintf(stderr,
-                    "pulsar: multiseq step_end FAILED: layer %u indexer superset "
-                    "%u mutated mid-step (want %u)\n",
-                    il, g->layer_n_index_comp[il], sup);
-            ok = false;
-        }
+        /* STAGE 1b: the "scalar superset mutated mid-step" checks are gone with
+         * the scalar. They existed to catch corruption of a SHARED value that
+         * several banks' rows wrote through; there is no shared value now, so
+         * the failure mode is unrepresentable rather than merely detected.
+         * The per-bank assertions above are the real check and they remain. */
     }
     return ok;
 }
@@ -1524,7 +1448,19 @@ bool gpu_graph_multiseq_step_end(pulsar_gpu_graph *g) {
 
 
 /* Allocate the GPU graph state for a chosen raw-cache capacity.  The model
- * weights are not copied here; tensors reference the mapped GGUF. */
+ * weights are not copied here; tensors reference the mapped GGUF.  n_banks is
+ * the Tier-2 pool size (1 = the classic single-session layout; a live create
+ * passes gpu_graph_bank_pool_n(), the pricer the candidate it is costing).
+ * On failure the graph's tensors are released; nothing else is touched. */
+/// @param g the graph, zeroed and filled
+/// @param weights the model's device weights
+/// @param layer layer 0's weights (the shapes)
+/// @param raw_cap the raw ring's rows
+/// @param ctx_size the context, tokens
+/// @param prefill_cap the prefill chunk's rows
+/// @param n_banks the bank pool (1 = classic)
+/// @param enable_spec allocate the speculation buffers
+/// @return false (said) on failure; the graph is released
 bool gpu_graph_alloc_raw_cap(
         pulsar_gpu_graph *g,
         const pulsar_weights     *weights,
@@ -1532,11 +1468,21 @@ bool gpu_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
+        uint32_t                n_banks,
         bool                    enable_spec) {
     memset(g, 0, sizeof(*g));
-    g->comp_ratio_override = -1;
+    /* A graph owns the WHOLE layer's output groups unless a session hands it
+     * the engine's TP span (session.cpp, right after this call).  The raw
+     * graphs -- imatrix collection, the raw one-shot generation, the render
+     * lane -- never get a span, and since slice 4g-1 the attention refuses an
+     * empty one ("owns output groups [0,0) of 8"), which broke imatrix
+     * collection on ONE box (L246, found 2026-09-24).  Under TP the raw paths
+     * refuse by name before reaching a layer. */
+    g->tp_group_lo = 0;
+    g->tp_group_hi = PULSAR_N_OUT_GROUP;
+    if (n_banks < 1u) n_banks = 1u;
     gpu_graph_dims dz;
-    gpu_graph_compute_dims(&dz, weights, layer, raw_cap, ctx_size, prefill_cap);
+    gpu_graph_compute_dims(&dz, layer, raw_cap, ctx_size, prefill_cap);
     raw_cap = dz.raw_cap;
     ctx_size = dz.ctx_size;
     prefill_cap = dz.prefill_cap;
@@ -1544,29 +1490,19 @@ bool gpu_graph_alloc_raw_cap(
     g->raw_window = dz.raw_window;
     g->prefill_cap = dz.prefill_cap;
 
-    /* PULSAR_ATTN_PACK validation lives up here: no allocations have happened
-     * yet, so these early returns need no cleanup. */
+    /* Row-format validation lives up here: no allocations have happened yet,
+     * so these early returns need no cleanup. */
     if (getenv("PULSAR_ATTN_MX") != NULL) {
-        /* Removed 2026-07-10: superseded by PULSAR_ATTN_PACK (bit-exact, smaller
-         * rows; MX re-quantized the rope dims and cost drafter acceptance).
-         * Refuse loudly instead of silently running a different format. */
+        /* Removed 2026-07-10: superseded by the packed KV rows (MX re-quantized
+         * the rope dims and cost drafter acceptance).  Refuse loudly instead of
+         * silently running a different format. */
         fprintf(stderr,
-                "pulsar: PULSAR_ATTN_MX has been removed (superseded by PULSAR_ATTN_PACK); "
-                "unset PULSAR_ATTN_MX (use PULSAR_ATTN_PACK=0 for the classic f32 comp cache)\n");
-        return false;
-    }
-    if (gpu_graph_attn_pack_enabled() &&
-        (PULSAR_N_ROT != 64u || ((PULSAR_N_HEAD_DIM - PULSAR_N_ROT) % 64u) != 0u)) {
-        fprintf(stderr,
-                "pulsar: PULSAR_ATTN_PACK requires n_rot 64 and 64-aligned nope dims "
-                "(head_dim %u / n_rot %u)\n",
-                (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_N_ROT);
+                "pulsar: PULSAR_ATTN_MX has been removed (superseded by the packed KV rows); "
+                "unset PULSAR_ATTN_MX\n");
         return false;
     }
     g->comp_cap = dz.comp_cap;
-    if (gpu_graph_attn_pack_enabled()) {
-        g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
-    }
+    g->attn_comp_stage_cap = dz.attn_comp_stage_cap;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_comp_cap[il] = dz.layer_comp_cap[il];
     }
@@ -1578,27 +1514,14 @@ bool gpu_graph_alloc_raw_cap(
     const uint64_t low_dim = dz.low_dim;
     const uint64_t shared_dim = dz.shared_dim;
     const uint64_t routed_mid_dim = dz.routed_mid_dim;
-    const uint64_t vocab_dim = dz.vocab_dim;
     const uint64_t comp_width_max = dz.comp_width_max;
     const uint64_t indexer_q_dim = dz.indexer_q_dim;
     const uint64_t pc = prefill_cap;
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         gpu_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
-    const int managed_override = gpu_graph_kv_managed_override();
-    const bool managed_kv_cache = managed_override >= 0
-        ? managed_override != 0
-        : pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
-    if (managed_override >= 0) {
-        fprintf(stderr,
-                "pulsar: PULSAR_KV_MANAGED override: KV caches use %s allocation "
-                "(measurement flag; policy would have chosen %s)\n",
-                managed_kv_cache ? "MANAGED (cudaMallocManaged)"
-                                 : "DEVICE (cudaMalloc)",
-                pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes,
-                                                    context_bytes) != 0
-                    ? "managed" : "device");
-    }
+    const bool managed_kv_cache =
+        pulsar_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -1617,224 +1540,287 @@ bool gpu_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
+    /* ROW GEOMETRY: one definition (src/pulsar_gpu.h), so the only thing left
+     * to check is that this model's head_dim tiles both rows' scale blocks.
+     * Refuse before anything is sized by a row. */
+    if (PULSAR_N_HEAD_DIM % PULSAR_WINKV_BLOCK != 0u || PULSAR_N_HEAD_DIM % PULSAR_MAINKV_BLOCK != 0u) {
+        fprintf(stderr,
+                "pulsar: head_dim %u does not tile the KV rows' scale blocks (%u window, %u main) -- refusing\n",
+                (unsigned)PULSAR_N_HEAD_DIM, (unsigned)PULSAR_WINKV_BLOCK, (unsigned)PULSAR_MAINKV_BLOCK);
+        gpu_graph_release(g);
+        return false;
+    }
+
+    /* One KV row format since the L111 unification.  Name it once in the log
+     * (the arm a measurement ran is a fact the log must witness), and refuse
+     * a set PULSAR_KV4: the switch is DEAD -- an env that once chose formats
+     * and now silently does nothing is how an A/B grades the wrong thing
+     * (ATTN_MX removal set the pattern). */
+    {
+        if (getenv("PULSAR_KV4")) {
+            fprintf(stderr,
+                    "pulsar: PULSAR_KV4 is set but the switch was REMOVED (L111 "
+                    "unification 2026-08-27: every KV buffer is the 384 B NVFP4 "
+                    "row); unset it -- refusing to start\n");
+            gpu_graph_release(g);
+            return false;
+        }
+        if (!pulsar_gpu_tensor_dry_active())   /* a pricing run allocates nothing */
+            fprintf(stderr, "pulsar: KV rows = window E4M3/E8M0 %llu B (raw rings, drafter, chunk) + "
+                            "main E2M1/E4M3 %llu B (kv-source pools)\n",
+                    (unsigned long long)pulsar_kv_row_bytes(PULSAR_KV_ROW_RING),
+                    (unsigned long long)pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP));
+    }
+
     /* Tier-2 bank pool: allocate the per-bank slabs first; the per-layer
      * cache pointers below then become bank-0 views instead of owning
      * allocations, and all single-session code runs unmodified. */
-    const uint32_t n_banks = gpu_graph_bank_pool_n();
     if (n_banks >= 2u &&
-        !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz)) {
-        gpu_graph_free(g);
+        !gpu_graph_bank_slabs_alloc(g, n_banks, managed_kv_cache, &dz, enable_spec)) {
+        gpu_graph_release(g);
         return false;
     }
     const bool banked = g->banks.n_banks != 0;
 
-    g->cur_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier (BF16); task #62 */
-    g->flat_hc = pulsar_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->hc_mix = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
+    g->cur_hc = pulsar_gpu_tensor_alloc_elt(hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier (BF16); task #62 */
     g->hc_split = pulsar_gpu_tensor_alloc(mix_hc * sizeof(float));
-    g->hc_pre = pulsar_gpu_tensor_view(g->hc_split, 0, (uint64_t)PULSAR_N_HC * sizeof(float));
     g->hc_post = pulsar_gpu_tensor_view(g->hc_split,
                                        (uint64_t)PULSAR_N_HC * sizeof(float),
                                        (uint64_t)PULSAR_N_HC * sizeof(float));
     g->hc_comb = pulsar_gpu_tensor_view(g->hc_split,
                                        2ull * PULSAR_N_HC * sizeof(float),
                                        (uint64_t)PULSAR_N_HC * PULSAR_N_HC * sizeof(float));
-    g->attn_cur = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->attn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->qr = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->qr_norm = pulsar_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->q = pulsar_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->kv_raw = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     g->kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
-    const uint64_t raw_elem_bytes = gpu_graph_raw_f16_enabled() ? sizeof(uint16_t)
-                                                                : sizeof(float);
+    /* WINDOW rows -- see the bank sizing above. */
+    const uint64_t raw_row_bytes_pack = pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         g->layer_raw_cache[il] = banked
             ? pulsar_gpu_tensor_view(g->banks.raw[il], 0, g->banks.raw_bank_bytes)
             : gpu_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
-                    (uint64_t)raw_cap * PULSAR_N_HEAD_DIM * raw_elem_bytes);
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (ratio != 0) {
-            const uint32_t coff = ratio == 4 ? 2u : 1u;
-            const uint64_t attn_width = (uint64_t)coff * PULSAR_N_HEAD_DIM;
-            const uint64_t attn_rows = (uint64_t)coff * ratio;
-            const uint64_t comp_row_bytes = gpu_graph_attn_comp_cache_row_bytes();
+                    (uint64_t)raw_cap * raw_row_bytes_pack);
+        /* CSA2 (L218): the compressed pool and (ratio > 1) the compressor state
+         * exist at every kv source; the index-K pool only where an indexer
+         * does -- 0731's ratio-128 layers publish none. */
+        const pulsar_layer_attn *attn = pulsar_layer_attn_layout(il);
+        if (pulsar_attn_owns_kv(attn->mode)) {
+            const uint64_t attn_width = pulsar_comp_row_width(attn->ratio, PULSAR_N_HEAD_DIM);
+            const uint64_t attn_rows = attn->ratio > 1u ? pulsar_comp_state_rows(attn->ratio) : 0u;
+            const uint64_t state_bytes = attn_width * attn_rows * sizeof(float);
+            const uint64_t comp_row_bytes = pulsar_kv_row_bytes(PULSAR_KV_ROW_COMP);
+            const uint64_t index_row_bytes = pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX);
+            const bool indexed = pulsar_attn_runs_indexer(attn->mode);
             if (banked) {
                 g->layer_attn_comp_cache[il] = pulsar_gpu_tensor_view(
                         g->banks.comp[il][0], 0, g->banks.comp_bank_bytes[il]);
-                g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(
-                        g->banks.askv[il], 0, g->banks.astate_bank_bytes[il]);
-                g->layer_attn_state_score[il] = pulsar_gpu_tensor_view(
-                        g->banks.assc[il], 0, g->banks.astate_bank_bytes[il]);
+                if (indexed) {
+                    g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
+                            g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
+                }
             } else {
                 g->layer_attn_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * comp_row_bytes);
-                g->layer_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->layer_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                if (indexed) {
+                    g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
+                            managed_kv_cache,
+                            (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
+                }
             }
-            if (enable_spec) {
-                g->spec_attn_state_kv[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_attn_state_score[il] = pulsar_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            }
-            /* Banked mode primes every bank's state lanes at slab alloc. */
-            if (!banked && g->layer_attn_state_kv[il]) {
-                state_init_ok = state_init_ok &&
-                                gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows);
-            }
-            if (!banked && g->layer_attn_state_score[il]) {
-                state_init_ok = state_init_ok &&
-                                gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows);
-            }
-
-            if (ratio == 4) {
-                const uint64_t index_width = (uint64_t)coff * PULSAR_N_INDEXER_HEAD_DIM;
-                const uint64_t index_rows = (uint64_t)coff * ratio;
-                const uint64_t index_row_bytes = gpu_graph_idx_fp4_enabled()
-                    ? PULSAR_ENGINE_IDXFP4_ROWBYTES
-                    : (uint64_t)PULSAR_N_INDEXER_HEAD_DIM * sizeof(float);
+            state_init_ok = state_init_ok && g->layer_attn_comp_cache[il] &&
+                            (!indexed || g->layer_index_comp_cache[il]);
+            if (state_bytes) {
                 if (banked) {
-                    g->layer_index_comp_cache[il] = pulsar_gpu_tensor_view(
-                            g->banks.index[il][0], 0, g->banks.index_bank_bytes[il]);
+                    g->layer_attn_state_kv[il] = pulsar_gpu_tensor_view(
+                            g->banks.askv[il], 0, g->banks.astate_bank_bytes[il]);
+                    g->layer_attn_state_score[il] = pulsar_gpu_tensor_view(
+                            g->banks.assc[il], 0, g->banks.astate_bank_bytes[il]);
+                } else {
+                    g->layer_attn_state_kv[il] = pulsar_gpu_tensor_alloc(state_bytes);
+                    g->layer_attn_state_score[il] = pulsar_gpu_tensor_alloc(state_bytes);
+                }
+                state_init_ok = state_init_ok && g->layer_attn_state_kv[il] && g->layer_attn_state_score[il];
+                if (enable_spec) {
+                    if (banked) {
+                        g->spec_attn_state_kv[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_askv[il], 0, g->banks.astate_bank_bytes[il]);
+                        g->spec_attn_state_score[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_assc[il], 0, g->banks.astate_bank_bytes[il]);
+                    } else {
+                        g->spec_attn_state_kv[il] = pulsar_gpu_tensor_alloc(state_bytes);
+                        g->spec_attn_state_score[il] = pulsar_gpu_tensor_alloc(state_bytes);
+                    }
+                    state_init_ok = state_init_ok && g->spec_attn_state_kv[il] && g->spec_attn_state_score[il];
+                }
+                /* Banked mode primes every bank's state lanes at slab alloc. */
+                if (!banked && state_init_ok) {
+                    state_init_ok = gpu_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows) &&
+                                    gpu_tensor_fill_f32(g->layer_attn_state_score[il], PULSAR_NEG_INF, attn_width * attn_rows);
+                }
+            }
+            /* V4 ONLY: the indexer's OWN compressor lane (see the struct note).
+             * Same two authorities, the indexer's head dim -- so a geometry
+             * change cannot leave the two lanes disagreeing.  Absent on a V4.1
+             * artifact (indexer_own_compressor is false): nothing would write it,
+             * and an unwritten lane that a payload still serializes is a file
+             * full of whatever the allocator handed back. */
+            if (g_pulsar_shape.indexer_own_compressor && indexed && attn_rows != 0u) {
+                if (banked) {
+                    /* V4's indexer-compressor lane, per bank, from the slab. */
                     g->layer_index_state_kv[il] = pulsar_gpu_tensor_view(
                             g->banks.iskv[il], 0, g->banks.istate_bank_bytes[il]);
                     g->layer_index_state_score[il] = pulsar_gpu_tensor_view(
                             g->banks.issc[il], 0, g->banks.istate_bank_bytes[il]);
+                    if (enable_spec) {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_iskv[il], 0, g->banks.istate_bank_bytes[il]);
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_view(
+                                g->banks.spec_issc[il], 0, g->banks.istate_bank_bytes[il]);
+                        state_init_ok = state_init_ok &&
+                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                    }
+                    state_init_ok = state_init_ok &&
+                                    g->layer_index_state_kv[il] && g->layer_index_state_score[il];
                 } else {
-                    g->layer_index_comp_cache[il] = gpu_graph_alloc_kv_cache_tensor(
-                            managed_kv_cache,
-                            (uint64_t)g->layer_comp_cap[il] * index_row_bytes);
-                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                }
-                if (enable_spec) {
-                    g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                }
-                if (!banked && g->layer_index_state_kv[il]) {
-                    state_init_ok = state_init_ok &&
-                                    gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows);
-                }
-                if (!banked && g->layer_index_state_score[il]) {
-                    state_init_ok = state_init_ok &&
-                                    gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, index_width * index_rows);
+                    const uint64_t index_state_bytes =
+                            pulsar_comp_row_width(attn->ratio, PULSAR_N_INDEXER_HEAD_DIM) *
+                            pulsar_comp_state_rows(attn->ratio) * sizeof(float);
+                    g->layer_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                    g->layer_index_state_score[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                    if (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il]) {
+                        fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane alloc failed (%llu B each)\n",
+                                il, (unsigned long long)index_state_bytes);
+                    }
+                    state_init_ok = state_init_ok && g->layer_index_state_kv[il] && g->layer_index_state_score[il];
+                    if (enable_spec) {
+                        g->spec_index_state_kv[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                        g->spec_index_state_score[il] = pulsar_gpu_tensor_alloc(index_state_bytes);
+                        state_init_ok = state_init_ok &&
+                                        g->spec_index_state_kv[il] && g->spec_index_state_score[il];
+                    }
+                    if (state_init_ok) {
+                        const uint64_t n = index_state_bytes / sizeof(float);
+                        if (!gpu_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, n) ||
+                            !gpu_tensor_fill_f32(g->layer_index_state_score[il], PULSAR_NEG_INF, n)) {
+                            fprintf(stderr, "pulsar: layer %u: indexer-compressor state lane prime failed\n", il);
+                            state_init_ok = false;
+                        }
+                    }
                 }
             }
         }
     }
-    g->comp_kv_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    g->comp_sc_cur = pulsar_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    if (gpu_graph_attn_pack_enabled()) {
-        /* f32 staging: the compressor writes real f32 rows here, then the commit
-         * step packs them to the persistent PULSAR_ATTN_PACK comp cache. */
-        g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
-                                                  PULSAR_N_HEAD_DIM * sizeof(float));
-        /* f32 shadow the prefill attention consumers (and session save) read
-         * after the persistent packed comp cache is dequantized (see
-         * gpu_graph_attn_comp_read_cache). */
-        g->attn_comp_dequant = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
-                                                    PULSAR_N_HEAD_DIM * sizeof(float));
-    }
-    if (gpu_graph_idx_fp4_enabled()) {
+    /* f32 staging: the compressor writes real f32 rows here, then the commit
+     * step packs them to the persistent packed comp cache. */
+    g->attn_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
+                                              PULSAR_N_HEAD_DIM * sizeof(float));
+    {
         if (PULSAR_N_INDEXER_HEAD_DIM != 128u) {
             /* The packed loader and QAT+pack kernels hard-code the 68-byte
              * head_dim-128 row; fail loud here instead of deep in a launch. */
             fprintf(stderr,
                     "pulsar: PULSAR_IDX_FP4 requires indexer head_dim 128 (model has %u)\n",
                     PULSAR_N_INDEXER_HEAD_DIM);
-            gpu_graph_free(g);
+            gpu_graph_release(g);
             return false;
         }
         /* f32 emit/repack staging for the packed indexer cache: comp-cap rows so
          * the compressor writers can keep their absolute row indices. */
         g->idx_comp_stage = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap *
                                                  PULSAR_N_INDEXER_HEAD_DIM * sizeof(float));
-        pulsar_gpu_indexer_set_fp4(1);
     }
-    g->indexer_q = pulsar_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
-    g->indexer_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_INDEXER_HEAD * sizeof(float));
-    /* PULSAR_PREFILL_SLICE: these two are the only ctx-scaling f32 work buffers
-     * with a prefill_cap token dimension; under slicing they only ever hold
-     * one <=slice-token span at a time. */
+    /* Prefill slice (gpu_graph_prefill_slice): indexer_scores is the one
+     * ctx-scaling f32 work buffer with a prefill_cap token dimension; under
+     * slicing it holds one <=slice-token span at a time.  comp_selected is
+     * uint32 and stays at the full pc -- the selection is whole-chunk. */
     const uint64_t score_rows = (gpu_graph_prefill_slice() != 0u &&
                                  (uint64_t)gpu_graph_prefill_slice() < pc)
         ? (uint64_t)gpu_graph_prefill_slice() : pc;
     g->indexer_scores = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
-    g->comp_mask = pulsar_gpu_tensor_alloc((uint64_t)g->comp_cap * score_rows * sizeof(float));
     g->comp_selected = pulsar_gpu_tensor_alloc((uint64_t)(PULSAR_N_INDEXER_TOP_K ? PULSAR_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
-    g->heads = pulsar_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->attn_low = pulsar_gpu_tensor_alloc(low_dim * sizeof(float));
-    g->attn_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_attn_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
-    g->ffn_cur = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
+    /* CSA2 candidate pool: a block bitmask per batch row over the deepest
+     * pool (the candidate source is the ratio-1 source, comp_cap rows), and
+     * the block-max scratch for one span. */
+    g->cand_mask_words = pulsar_gpu_candidate_mask_words(g->comp_cap, PULSAR_CANDIDATE_BLOCK_SIZE);
+    g->cand_mask = pulsar_gpu_tensor_alloc((uint64_t)pc * g->cand_mask_words * sizeof(uint32_t));
+    g->cand_bscore = pulsar_gpu_tensor_alloc(score_rows * (uint64_t)g->cand_mask_words * 32u * sizeof(float));
     g->ffn_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->shared_gate = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_up = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_mid = pulsar_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->router_logits = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT * sizeof(float));
-    g->router_probs = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT * sizeof(float));
-    g->router_selected = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(int));
-    g->router_weights = pulsar_gpu_tensor_alloc(PULSAR_N_EXPERT_USED * sizeof(float));
-    /* NOTE (task #64): these look debug-only — the qwarp32 kernels' stores are
-     * read only by gpu_graph_debug_dump_tensor — but they are NOT safe to skip:
-     * routed_moe_*_impl rejects NULL gate/up (moe.cu ~2597/2908) and the batch
-     * path REUSES gate->ptr as cuda_block_q8_K staging for quantized mid
-     * (moe.cu ~2957). Keep them allocated unconditionally. */
-    g->routed_gate = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_up = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_mid = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_down = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
-    g->routed_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->after_ffn_hc = pulsar_gpu_tensor_alloc(hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
-    g->output_pre = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
-    g->output_weights = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HC * sizeof(float));
     g->output_embd = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
     g->output_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-    g->logits = pulsar_gpu_tensor_alloc(vocab_dim * sizeof(float));
     g->prefill_tokens = pulsar_gpu_tensor_alloc(pc * sizeof(int32_t));
-    /* Shared multi-row logits slab (16 rows).  Unconditional, NOT gated on
+    /* L216 image-span visibility: one left half and one right half of
+     * prefill_cap int32 each, written per chunk only when the chunk carries
+     * sentinel ids (gpu_graph_upload_vision_visible).  vision_visible_tokens ==
+     * 0 means "no span in this chunk" and every attention launch gets NULL. */
+    g->vision_visible = pulsar_gpu_tensor_alloc(2ull * pc * sizeof(int32_t));
+    g->vision_visible_tokens = 0;
+    /* Shared multi-row logits slab (PULSAR_SPEC_LOGITS_ROWS rows).  Unconditional, NOT gated on
      * speculation: every batched multi-row output head writes its rows here —
-     * the DSpark draft/verify passes, gpu_graph_verify_suffix_tops, and the
+     * the DSpark draft/verify passes, gpu_graph_verify_suffix, and the
      * Tier-2 batched multi-session decode driver.  It used to be allocated
      * only by gpu_graph_init_dspark_target (session create, dspark_ready
      * only), which left the multiseq driver rejecting every step whenever
      * speculation was off. */
-    g->spec_logits = pulsar_gpu_tensor_alloc(16ull * PULSAR_N_VOCAB * sizeof(float));
-    g->batch_cur_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
-    g->batch_next_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->spec_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_SPEC_LOGITS_ALLOC_ROWS * PULSAR_N_VOCAB * sizeof(float));
+    g->batch_cur_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
+    g->batch_next_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
     g->batch_flat_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_hc_mix = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = pulsar_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_attn_cur = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
+    g->batch_hc_pre = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HC * sizeof(float));
+    /* 0731's HC head-mix scratch: one row's coefficients, produced by the fused
+     * norm+mix and then by the sigmoid.  V4.1 allocates them too -- 16 B each --
+     * because its collapse reads batch_hc_pre instead and never touches these. */
+    g->output_pre = pulsar_gpu_tensor_alloc(PULSAR_N_HC * sizeof(float));
+    g->output_weights = pulsar_gpu_tensor_alloc(PULSAR_N_HC * sizeof(float));
+    /* Dump-only carrier (L090.1): its WRITE has been dump-gated NULL since the
+     * dead-store pass, but the 64 MiB allocation never followed.  Confirmed by
+     * the D2 hand census: zero non-debug readers.  Allocate it only when a
+     * dump can actually want it, and keep the budget line in step -- the
+     * session ledger asserts est == actual. */
+    g->batch_attn_cur = gpu_graph_f32_store_observed_any()
+            ? pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float)) : NULL;
     g->batch_attn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_qr = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = pulsar_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_q = pulsar_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    g->batch_q = pulsar_gpu_tensor_alloc_elt(pc * q_dim, PULSAR_Q_ELT_SIZE, PULSAR_Q_ELT_FMT);
     g->batch_kv_raw = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HEAD_DIM * sizeof(float));
     g->batch_kv = pulsar_gpu_tensor_alloc(pc * PULSAR_N_HEAD_DIM * sizeof(float));
+    g->batch_kv_pack = pulsar_gpu_tensor_alloc(pc * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
     g->batch_comp_kv = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_comp_sc = pulsar_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
+    g->batch_index_comp_kv = pulsar_gpu_tensor_alloc(pc * dz.index_comp_width_max * sizeof(float));
+    g->batch_index_comp_sc = pulsar_gpu_tensor_alloc(pc * dz.index_comp_width_max * sizeof(float));
     g->batch_indexer_q = pulsar_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
+    g->batch_indexer_qp = pulsar_gpu_tensor_alloc(pc * (uint64_t)PULSAR_N_INDEXER_HEAD *
+                                                  pulsar_kv_row_bytes(PULSAR_KV_ROW_INDEX));
     g->batch_indexer_weights = pulsar_gpu_tensor_alloc(pc * PULSAR_N_INDEXER_HEAD * sizeof(float));
-    g->batch_heads = pulsar_gpu_tensor_alloc(pc * q_dim * sizeof(float));
+    /* The stored width is PULSAR_HEADS_ELT_SIZE, not sizeof(float): the alloc,
+     * the byte budget and the kernels must agree on ONE authority or the flip
+     * to bf16 silently under-allocates. */
+    g->batch_heads = pulsar_gpu_tensor_alloc_elt(pc * q_dim, PULSAR_HEADS_ELT_SIZE, PULSAR_HEADS_ELT_FMT);
     g->batch_attn_low = pulsar_gpu_tensor_alloc(pc * low_dim * sizeof(float));
     g->batch_attn_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
-    g->batch_after_attn_hc = pulsar_gpu_tensor_alloc(pc * hc_dim * PULSAR_HC_ELT_SIZE);   /* HC residual carrier */
+    g->batch_after_attn_hc = pulsar_gpu_tensor_alloc_elt(pc * hc_dim, PULSAR_HC_ELT_SIZE, PULSAR_HC_ELT_FMT);   /* HC residual carrier */
     g->batch_ffn_cur = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_ffn_norm = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
-    g->batch_shared_gate = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_up = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
+    /* L033 increment 2: gate/up staging is F16.  Sole producer is the mxfp8
+     * GEMM (writes __half whenever the out tensor's esz is 2, on every arm —
+     * the L045 machinery), sole consumer is the swiglu fold's f16-load
+     * instantiation; decode's fused shared-expert path uses its own f32
+     * scratch and never sees these.  NOT bit-exact (swiglu's inputs are
+     * f16-rounded): graded by cuda-reference-gate, not the byte gate. */
+    g->batch_shared_gate = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, PULSAR_SHARED_ACT_ELT_SIZE, PULSAR_SHARED_ACT_ELT_FMT);
+    g->batch_shared_up = pulsar_gpu_tensor_alloc_elt(pc * shared_dim, PULSAR_SHARED_ACT_ELT_SIZE, PULSAR_SHARED_ACT_ELT_FMT);
     g->batch_shared_mid = pulsar_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_out = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EMBD * sizeof(float));
     g->batch_router_logits = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT * sizeof(float));
     g->batch_router_probs = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT * sizeof(float));
     g->batch_router_selected = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * sizeof(int));
     g->batch_router_weights = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * sizeof(float));
-    g->batch_routed_gate = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_down = pulsar_gpu_tensor_alloc(pc * PULSAR_N_EXPERT_USED * PULSAR_N_EMBD * sizeof(float));
@@ -1842,55 +1828,74 @@ bool gpu_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < PULSAR_N_LAYER; il++) {
-        layer_cache_ok = g->layer_raw_cache[il] != NULL;
-        const uint32_t ratio = pulsar_layer_compress_ratio(il);
-        if (layer_cache_ok && ratio != 0) {
-            layer_cache_ok = g->layer_attn_comp_cache[il] != NULL &&
-                             g->layer_attn_state_kv[il] != NULL &&
-                             g->layer_attn_state_score[il] != NULL &&
-                             (!enable_spec ||
-                              (g->spec_attn_state_kv[il] != NULL &&
-                               g->spec_attn_state_score[il] != NULL));
+        if (!g->layer_raw_cache[il]) {
+            fprintf(stderr, "pulsar: layer %u: the raw ring cache is missing -- refusing\n", il);
+            layer_cache_ok = false;
+            break;
         }
-        if (layer_cache_ok && ratio == 4) {
-            layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
-                             (!gpu_graph_idx_fp4_enabled() || g->idx_comp_stage != NULL) &&
-                             g->layer_index_state_kv[il] != NULL &&
-                             g->layer_index_state_score[il] != NULL &&
-                             (!enable_spec ||
-                              (g->spec_index_state_kv[il] != NULL &&
-                               g->spec_index_state_score[il] != NULL));
+        /* The index pool exists only where an indexer RUNS, which is the same
+         * predicate the allocation above used.  Demanding it of every kv source
+         * is a second authority: 0731's ratio-128 HCA layers are kv sources that
+         * run no indexer, so they legitimately have none -- and requiring it
+         * made every V4 session fail to allocate, reported three layers up as
+         * "sampled CLI generation requires a session backend". */
+        const bool indexed = pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode);
+        if (gpu_graph_layer_is_kv_source(il) &&
+            (!g->layer_attn_comp_cache[il] || !g->idx_comp_stage ||
+             (indexed && !g->layer_index_comp_cache[il]))) {
+            fprintf(stderr, "pulsar: layer %u: kv-source cache missing (comp pool %s, index pool %s, "
+                            "index stage %s) -- refusing\n",
+                    il, g->layer_attn_comp_cache[il] ? "ok" : "MISSING",
+                    !indexed ? "n/a (no indexer)" : (g->layer_index_comp_cache[il] ? "ok" : "MISSING"),
+                    g->idx_comp_stage ? "ok" : "MISSING");
+            layer_cache_ok = false;
+            break;
+        }
+        /* V4's indexer keeps a second recurrent lane; demand it exactly where the
+         * profile says it exists (the same predicate the allocation used). */
+        const bool own_index = g_pulsar_shape.indexer_own_compressor && indexed;
+        if (gpu_graph_layer_has_comp_state(il) &&
+            (!g->layer_attn_state_kv[il] || !g->layer_attn_state_score[il] ||
+             (own_index && (!g->layer_index_state_kv[il] || !g->layer_index_state_score[il])) ||
+             (enable_spec && (!g->spec_attn_state_kv[il] || !g->spec_attn_state_score[il])) ||
+             (enable_spec && own_index &&
+              (!g->spec_index_state_kv[il] || !g->spec_index_state_score[il])))) {
+            fprintf(stderr, "pulsar: layer %u: compressor state missing (attn %s/%s, index %s/%s, "
+                            "spec %s/%s, spec index %s/%s) -- refusing\n",
+                    il, g->layer_attn_state_kv[il] ? "ok" : "MISSING",
+                    g->layer_attn_state_score[il] ? "ok" : "MISSING",
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_kv[il] ? "ok" : "MISSING"),
+                    !own_index ? "n/a (no index compressor)" : (g->layer_index_state_score[il] ? "ok" : "MISSING"),
+                    !enable_spec ? "off" : (g->spec_attn_state_kv[il] ? "ok" : "MISSING"),
+                    !enable_spec ? "off" : (g->spec_attn_state_score[il] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_kv[il] ? "ok" : "MISSING"),
+                    (!enable_spec || !own_index) ? "off" : (g->spec_index_state_score[il] ? "ok" : "MISSING"));
+            layer_cache_ok = false;
+            break;
         }
     }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
-                    g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
-                    g->hc_pre && g->hc_post && g->hc_comb &&
-                    g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
-                    g->q && g->kv_raw && g->kv &&
-                    g->comp_kv_cur && g->comp_sc_cur &&
-                    (!gpu_graph_attn_pack_enabled() ||
-                     (g->attn_comp_stage && g->attn_comp_dequant)) &&
-                    g->indexer_q && g->indexer_weights && g->indexer_scores &&
-                    g->comp_mask && g->comp_selected &&
-                    g->heads && g->attn_low && g->attn_out &&
-                    g->after_attn_hc && g->ffn_cur && g->ffn_norm &&
-                    g->shared_gate && g->shared_up && g->shared_mid &&
-                    g->shared_out &&
-                    g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
-                    g->routed_gate && g->routed_up && g->routed_mid &&
-                    g->routed_down && g->routed_out &&
-                    g->after_ffn_hc &&
-                    g->output_pre && g->output_weights && g->output_embd &&
-                    g->output_norm && g->logits &&
+    const bool ok = state_init_ok && layer_cache_ok &&                    g->cur_hc && g->hc_split &&
+                    g->hc_post && g->hc_comb &&
+                    g->attn_norm && g->kv &&
+                    g->attn_comp_stage &&
+                    g->indexer_scores &&
+                    g->comp_selected && g->cand_mask && g->cand_bscore &&
+                    g->ffn_norm &&
+                    g->output_embd &&
+                    g->output_norm &&
                     g->prefill_tokens && g->spec_logits &&
+                    g->vision_visible &&
                     g->batch_cur_hc && g->batch_next_hc && g->batch_flat_hc &&
-                    g->batch_hc_mix && g->batch_hc_split &&
-                    g->batch_attn_cur && g->batch_attn_norm &&
+                    g->batch_hc_mix && g->batch_hc_split && g->batch_hc_pre &&
+                    g->output_pre && g->output_weights &&
+                    (g->batch_attn_cur || !gpu_graph_f32_store_observed_any()) &&
+                    g->batch_attn_norm &&
                     g->batch_qr && g->batch_qr_norm && g->batch_q &&
                     g->batch_kv_raw && g->batch_kv &&
                     g->batch_comp_kv && g->batch_comp_sc &&
-                    g->batch_indexer_q && g->batch_indexer_weights &&
+                    g->batch_index_comp_kv && g->batch_index_comp_sc &&
+                    g->batch_indexer_q && g->batch_indexer_qp && g->batch_indexer_weights &&
                     g->batch_heads && g->batch_attn_low && g->batch_attn_out &&
                     g->batch_after_attn_hc &&
                     g->batch_ffn_cur && g->batch_ffn_norm &&
@@ -1898,28 +1903,50 @@ bool gpu_graph_alloc_raw_cap(
                     g->batch_shared_mid && g->batch_shared_out &&
                     g->batch_router_logits && g->batch_router_probs &&
                     g->batch_router_selected && g->batch_router_weights &&
-                    g->batch_routed_gate && g->batch_routed_up &&
+                    g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
-    if (!ok) gpu_graph_free(g);
-    return ok;
+    /* Name the failing GROUP before releasing: this returned false with no
+     * message at all, so a session-create failure reached the caller as
+     * "sampled CLI generation requires a session backend" -- three layers away
+     * from the actual cause, and against rule 9 (fail closed, LOUDLY).  The two
+     * named flags are the aggregates the per-tensor checks fold into. */
+    /* L264: the grid-checkpoint slabs size themselves from the layer views just
+     * installed, so they come last. */
+    const bool ckpt_ok = ok && pulsar_ckpt_alloc(&g->ckpt, &PULSAR_KV_STATE_DS4, g, banked ? g->banks.n_banks : 1u);
+    /* L242 slice 5: the Engram step scratch and history ring (none without Engram layers) */
+    const bool engram_ok = ckpt_ok && gpu_graph_engram_alloc(g, weights, g->prefill_cap,
+                                                             banked ? g->banks.n_banks : 1u);
+    if (!ok || !ckpt_ok || !engram_ok) {
+        fprintf(stderr, "pulsar: graph alloc failed: state lanes %s, layer caches %s, checkpoints %s, engram %s -- "
+                        "refusing\n", state_init_ok ? "ok" : "FAILED", layer_cache_ok ? "ok" : "FAILED",
+                ckpt_ok ? "ok" : "FAILED", engram_ok ? "ok" : "FAILED");
+        gpu_graph_release(g);
+        return false;
+    }
+    return true;
 }
 
+/// Allocate the DSpark anchor capture buffers and record the three target layers.
+/// @param g the graph
+/// @param target_layer_ids the layers whose hiddens condition the drafter
+/// @return false = allocation failed
 bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_layer_ids[3]) {
     bool ok = true;
     for (int i = 0; i < 3; i++) {
         g->dspark_target_layer_ids[i] = target_layer_ids[i];
         g->dspark_target_h[i] = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-        /* Fused-loop batch capture: one anchor hidden per verify-batch position
-         * (17 = the spec block clamp of 16 drafts + first_token). */
+        /* Fused-loop batch capture: one anchor hidden per verify-batch position.
+         * Sized from the slab authority (L117: a 32-row sweep reduces up to
+         * n_tokens rows into this; the old literal 17 would overflow). */
         g->dspark_target_h_batch[i] = pulsar_gpu_tensor_alloc(
-            (uint64_t)17 * PULSAR_N_EMBD * sizeof(float));
+            (uint64_t)(PULSAR_SPEC_LOGITS_ROWS + 1u) * PULSAR_N_EMBD * sizeof(float));
         /* Option F: bank the drafter ring when the pool is enabled — one
          * bank-major slab, dspark_raw_cache[i] becomes bank 0's view (repoint
          * swaps it). */
         if (g->banks.n_banks != 0) {
             g->banks.dspark_raw_bank_bytes =
-                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float);
+                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
             g->banks.dspark_raw[i] = pulsar_gpu_tensor_alloc(
                 (uint64_t)g->banks.n_banks * g->banks.dspark_raw_bank_bytes);
             g->dspark_raw_cache[i] = g->banks.dspark_raw[i]
@@ -1928,14 +1955,14 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
                 : NULL;
         } else {
             g->dspark_raw_cache[i] = pulsar_gpu_tensor_alloc(
-                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * PULSAR_N_HEAD_DIM * sizeof(float));
+                (uint64_t)PULSAR_DSPARK_DRAFT_WINDOW * pulsar_kv_row_bytes(PULSAR_KV_ROW_RING));
         }
         g->dspark_n_raw[i] = 0;
         ok = ok && g->dspark_target_h[i] && g->dspark_target_h_batch[i] &&
              g->dspark_raw_cache[i];
     }
     g->dspark_capture_batch_n = 0;
-    g->dspark_main_x = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
+    g->dspark_main_x = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_EMBD * sizeof(float));
     ok = ok && g->dspark_main_x;
     /* Bulk prefill capture buffers: always allocated when the drafter is
      * loaded (~200 MB at prefill_cap 4096) -- the prompt-window seeding
@@ -1946,6 +1973,27 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         g->dspark_bulk_h[i] = pulsar_gpu_tensor_alloc(
             (uint64_t)g->prefill_cap * PULSAR_N_EMBD * sizeof(float));
         ok = ok && g->dspark_bulk_h[i];
+    }
+    /* plan-92 P0 teacher dump: allocated only when the collection mode is on
+     * (env read once here, not per token -- [[no-hot-path-flags]]). ~1.1 MiB
+     * at prefill_cap 4096. */
+    {
+        const char *dd = getenv("PULSAR_DISTILL_DUMP");
+        if (dd && dd[0]) {
+            g->distill_top_ids = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * 64 * sizeof(int32_t));
+            g->distill_top_vals = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * 64 * sizeof(uint16_t));
+            g->distill_tail_lse = pulsar_gpu_tensor_alloc(
+                (uint64_t)g->prefill_cap * sizeof(uint16_t));
+            g->distill_inexact = pulsar_gpu_tensor_alloc(sizeof(int32_t));
+            ok = ok && g->distill_top_ids && g->distill_top_vals &&
+                 g->distill_tail_lse && g->distill_inexact;
+            if (ok) {
+                const int32_t z = 0;
+                ok = pulsar_gpu_tensor_write(g->distill_inexact, 0, &z, sizeof(z)) != 0;
+            }
+        }
     }
     /* Prompt-window ring: last <=128 prompt positions' anchor hiddens. */
     g->dspark_prompt_n = 0;
@@ -1966,41 +2014,62 @@ bool gpu_graph_init_dspark_target(pulsar_gpu_graph *g, const uint32_t target_lay
         ok = ok && g->dspark_prompt_h[i];
     }
     /* Stage-B no-replay rollback: per-position compressor projection saves for
-     * every compressed layer (attn comp_width <= 2*PULSAR_N_HEAD_DIM; indexer width
-     * = 2*PULSAR_N_INDEXER_HEAD_DIM) + one emit-sink scratch row. ~8 MB total. */
+     * every ratio>1 kv source (one head_dim row of kv and of score per verify
+     * row) + one emit-sink scratch row.  The index-K row derives from the
+     * emitted latent, so no separate indexer save exists. */
     {
-        const uint64_t attn_w = 2ull * PULSAR_N_HEAD_DIM;
-        const uint64_t idx_w = 2ull * PULSAR_N_INDEXER_HEAD_DIM;
         for (uint32_t il = 0; il < PULSAR_N_LAYER && ok; il++) {
-            const uint32_t ratio = pulsar_layer_compress_ratio(il);
             g->spec_comp_kv_save[il] = NULL;
             g->spec_comp_sc_save[il] = NULL;
             g->spec_icomp_kv_save[il] = NULL;
             g->spec_icomp_sc_save[il] = NULL;
-            if (ratio == 0) continue;
-            g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
-            g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc(17ull * attn_w * sizeof(float));
+            if (!gpu_graph_layer_has_comp_state(il)) continue;
+            /* saved rows are the compressor PROJECTIONS, so their width is the
+             * layer's coff width, not head_dim */
+            const uint32_t il_ratio = pulsar_layer_compress_ratio(il);
+            const uint64_t attn_w = pulsar_comp_row_width(il_ratio, PULSAR_N_HEAD_DIM);
+            g->spec_comp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
+            g->spec_comp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * attn_w * sizeof(float));
             ok = ok && g->spec_comp_kv_save[il] && g->spec_comp_sc_save[il];
-            if (ratio == 4) {
-                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
-                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc(17ull * idx_w * sizeof(float));
+            /* V4's indexer owns a SECOND recurrent lane over the same rows, so a
+             * rejected draft has to roll it back from its own projections -- the
+             * attention pair says nothing about it.  V4.1 has no such lane and
+             * must not pay for one. */
+            if (g_pulsar_shape.indexer_own_compressor && pulsar_attn_runs_indexer(pulsar_layer_attn_layout(il)->mode)) {
+                const uint64_t idx_w = pulsar_comp_row_width(il_ratio, PULSAR_N_INDEXER_HEAD_DIM);
+                g->spec_icomp_kv_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
+                g->spec_icomp_sc_save[il] = pulsar_gpu_tensor_alloc((PULSAR_SPEC_LOGITS_ROWS + 1ull) * idx_w * sizeof(float));
                 ok = ok && g->spec_icomp_kv_save[il] && g->spec_icomp_sc_save[il];
             }
         }
         g->spec_comp_scratch_row = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
         ok = ok && g->spec_comp_scratch_row;
         g->spec_comp_save_n = 0;
-        g->dspark_concat = pulsar_gpu_tensor_alloc(3ull * PULSAR_N_EMBD * sizeof(float));
-        g->dspark_proj_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_EMBD * sizeof(float));
-        g->dspark_seed_kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-        g->dspark_seed_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
+        /* L260: the seed scratch holds one batched-seed chunk (every bank's
+         * committed rows, PULSAR_DSPARK_SEED_ROWS at a time); the one-row seed
+         * uses row 0. */
+        g->dspark_concat = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * 3ull * PULSAR_N_EMBD * sizeof(float));
+        g->dspark_proj_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_EMBD * sizeof(float));
+        g->dspark_seed_kv = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_HEAD_DIM * sizeof(float));
+        g->dspark_seed_norm = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_SEED_ROWS * PULSAR_N_HEAD_DIM * sizeof(float));
         g->dspark_seed_rot = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_HEAD_DIM * sizeof(float));
-        g->dspark_markov_logits = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_N_VOCAB * sizeof(float));
-        g->dspark_conf_scores = pulsar_gpu_tensor_alloc(16ull * sizeof(float));
-        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc(16ull * sizeof(int32_t));
+        /* L150: the drafter scratch holds every bank of a batched redraft
+         * (PULSAR_DSPARK_BANKS_MAX banks of refined logits / chain ids, a
+         * confidence row per drafted row); the single-bank paths use slot 0. */
+        g->dspark_markov_logits = pulsar_gpu_tensor_alloc(
+            (uint64_t)PULSAR_DSPARK_BANKS_MAX * PULSAR_N_VOCAB * sizeof(float));
+        g->dspark_conf_scores = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(float));
+        g->dspark_conf_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
+        g->dspark_bank_meta = pulsar_gpu_tensor_alloc(2ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
+        ok = ok && g->dspark_bank_meta;
+        g->dspark_embed_tokens = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
+        g->dspark_refined_ids = pulsar_gpu_tensor_alloc(17ull * PULSAR_DSPARK_BANKS_MAX * sizeof(int32_t));
+        g->dspark_row_meta = pulsar_gpu_tensor_alloc(7ull * PULSAR_DSPARK_DRAFT_ROWS_MAX * sizeof(int32_t));
+        ok = ok && g->dspark_row_meta;
         ok = ok && g->dspark_concat && g->dspark_proj_out && g->dspark_seed_kv &&
              g->dspark_seed_norm && g->dspark_seed_rot && g->dspark_markov_logits &&
-             g->dspark_conf_scores && g->dspark_conf_tokens;
+             g->dspark_conf_scores && g->dspark_conf_tokens && g->dspark_embed_tokens &&
+             g->dspark_refined_ids;
     }
     /* spec_logits is NOT allocated here: it is the shared multi-row logits
      * slab, allocated unconditionally by gpu_graph_alloc_raw_cap (the batched

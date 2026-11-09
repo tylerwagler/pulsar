@@ -6,6 +6,12 @@ for local inference, Pulsar development, and benchmark interpretation.
 
 Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash
 
+This page covers the DeepSeek V4 family only; pulsar's other families (Qwen,
+Nemotron, Inkling) follow their own model cards.  Pulsar serves several
+DeepSeek V4 profiles (V4 0731, Vision-Exp, V4.1); where their per-layer shape
+differs from the published Flash card below (layer count, compression ratios,
+the KV row style), the authority is `src/engine/shape_profiles.cpp`.
+
 ## Model Family
 
 DeepSeek-V4 is a preview model family with two Mixture-of-Experts language
@@ -49,8 +55,8 @@ to 512 of them for attention. Ratio-128 layers are the heavily compressed path:
 they do not have the indexer stream and use the available ratio-128 compressed
 rows directly.
 
-Pulsar validates these details from the GGUF metadata. The relevant fixed
-implementation constants are:
+Pulsar validates these details against the container's `pulsar.kv` metadata.
+The relevant implementation constants for the V4 Flash profile are:
 
 - Layers: 43
 - Raw sliding-window attention: 128 tokens
