@@ -696,6 +696,9 @@ def main():
     ap.add_argument("--prompts", default="story,code")
     ap.add_argument("--q-chunk", type=int, default=1024, help="query rows per sdpa call (fp32 scores: keep it small)")
     ap.add_argument("--check-dense", action="store_true", help="Qwen: QSA == dense at depths <= the indexer budget")
+    ap.add_argument("--only", help="diagnostic: one sequence, PROMPT:DEPTH (e.g. code:512); writes no capture")
+    ap.add_argument("--dump-layers", help="with --only: each layer's output rows, raw f32 [T][hidden], to "
+                    "DIR/ref-<layer>.bin (the engine's PULSAR_CUDA_GRAPH_DUMP_PREFIX layout)")
     ap.add_argument("--plan", action="store_true", help="no GPU: build every module on meta and resolve each tensor "
                     "against the container by name and size, then stop")
     a = ap.parse_args()
@@ -732,6 +735,26 @@ def main():
         log("%s: %d ids, depths %s" % (name, n, depths))
     # every prompt's depth sequences through one layer pass: each layer's weights are decoded once
     seqs = [torch.tensor(ids[:d], dtype=torch.long) for _, ids, depths, _, _ in plan for d in depths]
+    if a.only:
+        # diagnostic: one sequence, its layers dumped, no capture written
+        pname, depth = a.only.split(":")
+        ids = [p for p in plan if p[0] == pname][0][1]
+        seq = torch.tensor(ids[:int(depth)], dtype=torch.long)
+        if a.dump_layers:
+            os.makedirs(a.dump_layers, exist_ok=True)
+        hs = ad.embed([seq])
+        for i in range(ad.layers()):
+            layer = ad.build(i, [seq])
+            hs[0] = ad.run(layer, hs[0], seq)
+            if a.dump_layers:
+                hs[0][0].float().contiguous().cpu().numpy().astype("<f4").tofile(
+                    os.path.join(a.dump_layers, "ref-%d.bin" % i))
+            del layer
+            torch.cuda.empty_cache()
+        row = ad.logits(hs)[0]
+        v, ix = row.topk(5)
+        log("--only %s: top-5 %s" % (a.only, [(int(t), tok.decode([int(t)]), round(float(x), 3)) for t, x in zip(ix, v)]))
+        return 0
 
     def forward(sel):
         hs = ad.embed([seqs[j] for j in sel])
