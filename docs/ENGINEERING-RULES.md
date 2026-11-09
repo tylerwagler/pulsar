@@ -265,6 +265,24 @@ queue when someone is waiting on the number; the release run waits behind it.
   unified memory is defined on the system's MemAvailable, so it measures that,
   and runs only alone on the box (a quiet gpuq job, production stopped).
 
+## 11. Never free device memory at exit.
+
+Device allocations are freed by code that runs while the context is alive --
+eviction, growth, explicit shutdown -- never from a static destructor or an
+`atexit` handler.  Globals holding device memory are raw pointers that leak
+at exit; the leak is the design, not slop (rule 2 does not reach it).
+
+*Why:* the CUDA runtime tears the context down in its own exit handler, and
+whether a static destructor runs before or after it is registration order,
+not code we control.  exllamav3 hit exactly this in v1.6.4 (their `350debfa`,
+2026-10-19): static device workspaces in the routing GEMM freed in their
+destructors after the allocator had gone, and under
+`PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` every TP worker aborted at
+exit with `freeAsync` "CUDA error: no error".  Our scratch arenas
+(`g_cuda_tmp[]`), cuBLASLt plan caches and MXFP8 act cache already leak at
+exit by design; this rule is what stops a future RAII deleter on one of them
+from reintroducing the ordering bug silently.
+
 ## Named exceptions to rule 1
 
 Two places let the same input take two paths on purpose.  Each is listed
