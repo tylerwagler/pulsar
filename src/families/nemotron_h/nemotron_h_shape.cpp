@@ -36,6 +36,7 @@ const pulsar_nemotron_h_shape PULSAR_NEMOTRON_H_SHAPE_SUPER = {
     /* .route_scale    = */ 5.0f,
     /* .max_context    = */ 1048576,
     /* .eos_id         = */ 11,
+    /* .dt_min         = */ 0.001f,
 };
 
 /// The prefix of every config refusal.
@@ -118,7 +119,8 @@ const nh_key k_keys[] = {
     SW_U("n_shared_experts", 1),
     SW_U("n_group", 1),                       /* no group-limited selection */
     SW_U("topk_group", 1),
-    {"nemotron_h.time_step_limit.min", K_F32_EQ, 0, false, false, NULL, 0.0},   /* no dt clamp: [0, inf] (vLLM) */
+    {"nemotron_h.time_step_limit.min", K_F32_EQ, 0, false, false, NULL, 0.0},   /* the checkpoint's [0, inf]; the floor
+                                                                                  * the model needs is time_step_min */
     SW_B("time_step_limit.max_inf", true),
     {"nemotron_h.sliding_window", K_ABSENT, 0, false, false, NULL, 0},         /* null in the config: full attention */
     {"nemotron_h.time_step_limit", K_ABSENT, 0, false, false, NULL, 0},        /* the builder writes it as the two above */
@@ -128,8 +130,9 @@ const nh_key k_keys[] = {
     IGN("hidden_dropout", "training only"),
     IGN("initializer_range", "initialisation only"),
     IGN("rescale_prenorm_residual", "initialisation only"),
-    IGN("time_step_min", "dt_bias initialisation (transformers 5.19 also clamps dt at it; vLLM, the graded reference, "
-                         "uses time_step_limit)"),
+    /* L363: transformers' NemotronH clamps dt at it (time_step_limit = (time_step_min, inf)); vLLM's [0, inf] mispredicts
+     * decisively where a head's dt runs below it -- the HF reference without the clamp gives the engine's old logits */
+    {"nemotron_h.time_step_min", K_F32, F(dt_min), true, false, NULL, 0},
     IGN("time_step_max", "dt_bias initialisation only"),
     IGN("time_step_floor", "dt_bias initialisation only"),
     IGN("chunk_size", "vLLM's SSD prefill chunk: a schedule, not the model (pulsar's scan is its own)"),

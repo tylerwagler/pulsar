@@ -121,6 +121,7 @@ pulsar_mamba2_geom mamba_geom(const pulsar_nemotron_h_shape &s) {
     g.conv_kernel = s.conv_k;
     g.norm_group = s.ssm_n_head * s.ssm_head_dim / s.ssm_groups;
     g.norm_eps = s.rms_eps;
+    g.dt_min = s.dt_min;   /* L363 */
     return g;
 }
 /* the in_proj row [z | x B C | dt]: d_inner, the conv's channels, heads */

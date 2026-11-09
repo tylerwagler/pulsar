@@ -89,6 +89,11 @@ typedef struct {
     float route_scale;         ///< routed_scaling_factor (5.0): on the renormalised weights' sum
     uint64_t max_context;      ///< max_position_embeddings (1048576)
     uint32_t eos_id;           ///< eos_token_id (11, <|im_end|>)
+    /** L363: time_step_min (0.001): the Mamba-2 dt floor, dt = max(softplus(dt_raw + dt_bias), dt_min) -- transformers'
+     *  NemotronH clamp.  Without it (vLLM's time_step_limit [0, inf]) the model mispredicts decisively where a head's dt
+     *  runs below it (story 4102: ' output' for the text's ' made', which it ranks #142); with it the engine's logits
+     *  are HF's. */
+    float dt_min;
     /* the plan: the container's */
     uint32_t n_blocks;         ///< len(layers_block_type)
     uint32_t n_layer;          ///< the grouped layers

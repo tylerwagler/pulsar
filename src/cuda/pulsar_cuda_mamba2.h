@@ -81,6 +81,8 @@ typedef struct {
     uint32_t norm_group;   /**< channels per gated-RMSNorm group: a multiple of 256, <= 8192, dividing H*P */
     /** The gated RMSNorm's epsilon (must be > 0). */
     float    norm_eps;
+    /** L363: dt's floor after the softplus, dt = max(dt, dt_min) (transformers' time_step_min clamp); 0 = none. */
+    float    dt_min;
 } pulsar_mamba2_geom;
 
 /** One layer: its geometry and its (bf16, device, 16-byte aligned) parameters. */

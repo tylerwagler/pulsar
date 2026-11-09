@@ -16,6 +16,7 @@
 struct m2ref_layer {
     int H = 0, P = 0, N = 0, G = 0, K = 0, NG = 0;   /* NG: the norm group */
     double eps = 1e-5;
+    double dt_min = 0.0;                             /* L363: dt's floor after the softplus (0 = none) */
     std::vector<float> conv_w, conv_b;               /* [CC][K], [CC] */
     std::vector<float> A_log, dt_bias, D, norm_w;    /* [H] x 3, [H*P] */
     int CC() const { return H * P + 2 * G * N; }
@@ -29,6 +30,7 @@ enum m2ref_mut {
     M2_GROUP_WHOLE,   /* one norm group over all H*P channels */
     M2_GROUP_MAP,     /* head h reads B / C group h % G instead of h / (H / G) */
     M2_NO_CONV_BIAS,  /* the conv's bias dropped */
+    M2_NO_DT_MIN,     /* L363: dt's floor dropped (vLLM's time_step_limit [0, inf]) */
 };
 
 static inline double m2_softplus(double v) { return v > 20.0 ? v : log1p(exp(v)); }
@@ -55,7 +57,9 @@ static inline void m2ref_seq(const m2ref_layer &L, int T, const float *z, size_t
         }
         for (int h = 0; h < H; ++h) {
             const int g = mut == M2_GROUP_MAP ? h % G : h / (H / G);
-            const double dt = m2_softplus((double)dt_raw[(size_t)t * ldd + h] + (double)L.dt_bias[(size_t)h]);
+            const double sp = m2_softplus((double)dt_raw[(size_t)t * ldd + h] + (double)L.dt_bias[(size_t)h]);
+            /* L363: transformers' clamp at time_step_min, at the f32 the kernel holds dt in */
+            const double dt = mut != M2_NO_DT_MIN && (double)(float)sp < (double)(float)L.dt_min ? (double)(float)L.dt_min : sp;
             const double dA = exp(dt * -exp((double)L.A_log[(size_t)h]));
             const double *B = &xc[(size_t)HP + (size_t)g * N], *C = &xc[(size_t)HP + (size_t)G * N + (size_t)g * N];
             for (int p = 0; p < P; ++p) {

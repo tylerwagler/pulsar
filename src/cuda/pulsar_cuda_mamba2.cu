@@ -56,16 +56,19 @@ __device__ __forceinline__ float bf2f(uint16_t b) { return pulsar_sconv_bf2f(b);
 __device__ __forceinline__ uint16_t f2bf(float f) { return pulsar_sconv_f2bf(f); }
 
 /* ---- dt and dA of (row, head), double: softplus(dt_raw + dt_bias) and exp(dt * A), A = -exp(A_log) ------ */
-/// dt = softplus(dt_raw + dt_bias) (torch threshold 20) and dA = exp(dt * -exp(A_log)), the transcendentals in double.
+/// dt = max(softplus(dt_raw + dt_bias), dt_min) (torch threshold 20; L363: transformers' time_step_min floor) and
+/// dA = exp(dt * -exp(A_log)), the transcendentals in double.
 /// @param dt_raw  the row's raw dt for the head, bf16 bits.
 /// @param dt_bias the head's dt bias, bf16 bits.
 /// @param A_log   the head's A_log, bf16 bits.
+/// @param dt_min  dt's floor (0 = none).
 /// @param dt_out  out: dt (f32).
 /// @param dA_out  out: dA (f32).
-__device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uint16_t A_log, float *dt_out,
-                                          float *dA_out) {
+__device__ __forceinline__ void mamba2_dt(uint16_t dt_raw, uint16_t dt_bias, uint16_t A_log, float dt_min,
+                                          float *dt_out, float *dA_out) {
     const float s = __fadd_rn(bf2f(dt_raw), bf2f(dt_bias));
-    const float dt = s > 20.0f ? s : (float)log1p(exp((double)s));            /* softplus, torch's threshold 20 */
+    const float sp = s > 20.0f ? s : (float)log1p(exp((double)s));            /* softplus, torch's threshold 20 */
+    const float dt = sp < dt_min ? dt_min : sp;                                 /* torch.clamp(dt, min=dt_min) */
     const double A = -exp((double)bf2f(A_log));
     *dt_out = dt;
     *dA_out = (float)exp((double)dt * A);
@@ -82,16 +85,17 @@ constexpr int DT_THREADS = 256;
 /// @param A_log   bf16 [H].
 /// @param H       heads.
 /// @param rows    call rows.
+/// @param dt_min  dt's floor (0 = none).
 /// @param dt_out  out: f32 [rows][H].
 /// @param dA_out  out: f32 [rows][H].
 __global__ void __launch_bounds__(DT_THREADS)
 mamba2_dt_kernel(const uint16_t *__restrict__ dt_raw, uint64_t ld_dt, const uint16_t *__restrict__ dt_bias,
-                 const uint16_t *__restrict__ A_log, uint32_t H, uint32_t rows, float *__restrict__ dt_out,
-                 float *__restrict__ dA_out) {
+                 const uint16_t *__restrict__ A_log, uint32_t H, uint32_t rows, float dt_min,
+                 float *__restrict__ dt_out, float *__restrict__ dA_out) {
     const uint64_t i = (uint64_t)blockIdx.x * DT_THREADS + threadIdx.x;
     if (i >= (uint64_t)rows * H) return;
     const uint32_t row = (uint32_t)(i / H), h = (uint32_t)(i % H);
-    mamba2_dt(dt_raw[(uint64_t)row * ld_dt + h], dt_bias[h], A_log[h], &dt_out[i], &dA_out[i]);
+    mamba2_dt(dt_raw[(uint64_t)row * ld_dt + h], dt_bias[h], A_log[h], dt_min, &dt_out[i], &dA_out[i]);
 }
 
 /* ---- one DELTA record applied to a thread's state slice: the scan's own update on the recorded values ---- */
@@ -142,6 +146,8 @@ struct scan_args {
      *  A_log, bf16 [H]. */
     /// The skip weight D, bf16 [H]: y += D[h] * x.
     const uint16_t *D;
+    /// L363: dt's floor (0 = none), when the scan stages dt itself.
+    float dt_min;
     /// [n_seqs + 1] first call row of each sequence.
     const int32_t *seq_first, *seq_slot;
     /** @var seq_slot
@@ -244,7 +250,7 @@ __global__ void __launch_bounds__(NT) mamba2_scan_kernel(const scan_args a) {
                 sdt[tid] = a.dt[row * a.H + h];
                 sda[tid] = a.dA[row * a.H + h];
             } else {
-                mamba2_dt(a.dt_raw[row * a.ld_dt + h], a.dt_bias[h], a.A_log[h], &sdt[tid], &sda[tid]);
+                mamba2_dt(a.dt_raw[row * a.ld_dt + h], a.dt_bias[h], a.A_log[h], a.dt_min, &sdt[tid], &sda[tid]);
             }
         }
         __syncthreads();
@@ -412,6 +418,7 @@ const char *geom_refusal(const pulsar_mamba2_geom *g) {
     if (g->norm_group == 0 || g->norm_group % 256 || g->norm_group > 8192 || (g->n_heads * P) % g->norm_group)
         return "norm_group must be a multiple of 256, at most 8192, dividing n_heads * head_dim";
     if (!(g->norm_eps > 0.0f)) return "norm_eps must be positive";
+    if (!(g->dt_min >= 0.0f)) return "dt_min must be >= 0";
     return nullptr;
 }
 
@@ -513,7 +520,7 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     if (dt_launch) {
         const uint64_t n_dt = (uint64_t)rows * H;
         mamba2_dt_kernel<<<(unsigned)((n_dt + DT_THREADS - 1) / DT_THREADS), DT_THREADS, 0, stream>>>(
-            c->dt, c->ld_dt, L->dt_bias, L->A_log, H, rows, dt, dA);
+            c->dt, c->ld_dt, L->dt_bias, L->A_log, H, rows, g->dt_min, dt, dA);
     }
 
     /* 3. the scan */
@@ -522,6 +529,7 @@ extern "C" int pulsar_mamba2_forward(const pulsar_mamba2_layer *L, const pulsar_
     a.dA = dt_launch ? dA : nullptr;
     a.conv_out = conv_out; a.dt_raw = c->dt; a.ld_dt = c->ld_dt; a.dt_bias = L->dt_bias; a.A_log = L->A_log;
     a.D = L->D;
+    a.dt_min = g->dt_min;
     a.seq_first = c->seq_first; a.seq_slot = c->seq_slot;
     a.ssm = c->ssm_state; a.cap = c->ssm_capture; a.y = y;
     a.fold = c->ssm_fold; a.fold_rows = c->ssm_fold_rows;

@@ -126,10 +126,11 @@ struct Case {
     int32_t *d_first = nullptr, *d_slot = nullptr;
 };
 
-static void case_init(Case &c, const char *name, int H, int G, int NG, int K, uint32_t Nrows, uint64_t seed) {
+static void case_init(Case &c, const char *name, int H, int G, int NG, int K, uint32_t Nrows, uint64_t seed,
+                      float dt_min = 0.0f) {
     c.name = name; c.Nrows = Nrows;
     m2ref_layer &R = c.R;
-    R.H = H; R.P = 64; R.N = 128; R.G = G; R.K = K; R.NG = NG; R.eps = (double)1e-5f;
+    R.H = H; R.P = 64; R.N = 128; R.G = G; R.K = K; R.NG = NG; R.eps = (double)1e-5f; R.dt_min = (double)dt_min;
     c.HP = (uint32_t)(H * 64); c.CC = (uint32_t)R.CC(); c.ROW = (c.HP + c.CC + (uint32_t)H + 7u) / 8u * 8u;
     Rng g(seed);
     auto bfv = [&](size_t n, double mu, double sd) {
@@ -156,7 +157,7 @@ static void case_init(Case &c, const char *name, int H, int G, int NG, int K, ui
     CK(cudaMalloc(&c.d_par, tot * 2));
     CK(cudaMemcpy(c.d_par, hp.data(), tot * 2, cudaMemcpyHostToDevice));
     pulsar_mamba2_layer &L = c.L;
-    L.geom = {(uint32_t)H, 64, 128, (uint32_t)G, (uint32_t)K, (uint32_t)NG, 1e-5f};
+    L.geom = {(uint32_t)H, 64, 128, (uint32_t)G, (uint32_t)K, (uint32_t)NG, 1e-5f, dt_min};
     L.conv_w = c.d_par + off[0]; L.conv_b = c.d_par + off[1]; L.A_log = c.d_par + off[2];
     L.dt_bias = c.d_par + off[3]; L.D = c.d_par + off[4]; L.norm_w = c.d_par + off[5];
     c.rec = pulsar_mamba2_conv_state_elems(&L.geom);
@@ -552,14 +553,16 @@ static void run_case(Case &c) {
     }
 
     /* 7: mutations */
-    for (m2ref_mut m : {M2_NO_D, M2_NO_GATE, M2_GROUP_HALF, M2_GROUP_WHOLE, M2_GROUP_MAP, M2_NO_CONV_BIAS}) {
+    for (m2ref_mut m : {M2_NO_D, M2_NO_GATE, M2_GROUP_HALF, M2_GROUP_WHOLE, M2_GROUP_MAP, M2_NO_CONV_BIAS, M2_NO_DT_MIN}) {
         if (m == M2_GROUP_WHOLE && c.R.NG == (int)HP) continue;
         if (m == M2_GROUP_MAP && c.R.G == 1) continue;
+        if (m == M2_NO_DT_MIN && c.R.dt_min == 0.0) continue;
         std::vector<double> mref;
         reference(c, 0, N, m, &mref);
         const Grade mg = grade(pf, mref);
         const char *nm = m == M2_NO_D ? "D dropped" : m == M2_NO_GATE ? "gate dropped" : m == M2_GROUP_HALF ? "norm group halved"
-                       : m == M2_GROUP_WHOLE ? "one norm group" : m == M2_GROUP_MAP ? "B/C group map h % G" : "conv bias dropped";
+                       : m == M2_GROUP_WHOLE ? "one norm group" : m == M2_GROUP_MAP ? "B/C group map h % G"
+                       : m == M2_NO_DT_MIN ? "dt floor dropped" : "conv bias dropped";
         check(mg.fro >= 10 * kFroBar, "mutation (%s) fails the grade: fro %.3e (>= %.0e)", nm, mg.fro, 10 * kFroBar);
     }
 }
@@ -629,17 +632,19 @@ static bool read_file(const std::string &p, std::vector<uint8_t> *out) {
     return ok;
 }
 
-/* DIR/layers.txt lists the layer subdirectories; DIR/geom.txt holds "H P N G K NG eps T". */
+/* DIR/layers.txt lists the layer subdirectories; DIR/geom.txt holds "H P N G K NG eps T [dt_min]" (L363: the dt floor
+ * the fixture's transformers applied, 0 when absent). */
 static int fixture(const char *dir) {
     std::vector<uint8_t> gt, lt;
     if (!read_file(std::string(dir) + "/geom.txt", &gt) || !read_file(std::string(dir) + "/layers.txt", &lt)) return 2;
     gt.push_back(0); lt.push_back(0);
     unsigned H, Pd, Nd, G, K, NG, T;
-    float eps;
-    if (sscanf((const char *)gt.data(), "%u %u %u %u %u %u %f %u", &H, &Pd, &Nd, &G, &K, &NG, &eps, &T) != 8) return 2;
+    float eps, dt_min = 0.0f;
+    if (sscanf((const char *)gt.data(), "%u %u %u %u %u %u %f %u %f", &H, &Pd, &Nd, &G, &K, &NG, &eps, &T, &dt_min) < 8)
+        return 2;
     printf("== real Mamba-2 layers vs transformers' NemotronHMamba2Mixer (fp32): H %u x P %u, N %u, G %u, K %u, norm "
            "group %u, eps %g, %u rows ==\n", H, Pd, Nd, G, K, NG, eps, T);
-    const pulsar_mamba2_geom geom{H, Pd, Nd, G, K, NG, eps};
+    const pulsar_mamba2_geom geom{H, Pd, Nd, G, K, NG, eps, dt_min};
     const uint32_t HP = H * Pd, CC = pulsar_mamba2_conv_channels(&geom), ROW = HP + CC + H;
     const uint64_t rec = pulsar_mamba2_conv_state_elems(&geom), ssmf = pulsar_mamba2_ssm_state_floats(&geom);
     char name[64];
@@ -776,7 +781,8 @@ int main(int argc, char **argv) {
     if (argc != 1) { fprintf(stderr, "usage: %s [--fixture DIR]\n", argv[0]); return 2; }
     printf("mamba2 gate (L296 N2): the family-neutral Mamba-2 mixer block\n");
     Case cases[3];
-    case_init(cases[0], "Nemotron 3.5 Super layer", 128, 8, 1024, 4, 160, 21);
+    /* L363: the full layer with a dt floor that binds (dt here runs ~0.007 .. 0.3, so 0.02 floors a good share) */
+    case_init(cases[0], "Nemotron 3.5 Super layer, dt floor 0.02", 128, 8, 1024, 4, 160, 21, 0.02f);
     case_init(cases[1], "one TP=2 rank of it", 64, 4, 1024, 4, 120, 22);
     case_init(cases[2], "small: 12 heads, 3 groups, norm group 256, kernel 2", 12, 3, 256, 2, 120, 23);
     for (Case &c : cases) run_case(c);

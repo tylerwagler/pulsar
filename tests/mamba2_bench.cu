@@ -64,7 +64,7 @@ int main() {
            fma_tflops, sms);
 
     /* the Nemotron layer, parameters at plausible values */
-    const pulsar_mamba2_geom g{128, 64, 128, 8, 4, 1024, 1e-5f};
+    const pulsar_mamba2_geom g{128, 64, 128, 8, 4, 1024, 1e-5f, 0.001f};
     const uint32_t H = 128, HP = 8192, CC = pulsar_mamba2_conv_channels(&g), ROW = HP + CC + H;
     const uint32_t LD = (ROW + 7) / 8 * 8;
     const uint64_t rec = pulsar_mamba2_conv_state_elems(&g), ssmf = pulsar_mamba2_ssm_state_floats(&g),
