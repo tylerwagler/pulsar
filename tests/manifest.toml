@@ -8,18 +8,19 @@
 # budget is seconds; a test over budget is flagged, not failed.  [sections] budgets what one test reports for each model.
 
 [limits]
-release = 3000
+release = 3600   # L357 2026-11-08: #676 measured 3446 s (21 -> 11 server starts; Gemma + Nemotron reference gates added)
 
 [sections]
 "cuda-runner-gate [Qwen4-exp]" = 1200
-"cuda-runner-gate [Nemotron-H]" = 300
+"cuda-runner-gate [Nemotron-H]" = 450   # its two reference gates since L357 (#676: 409 s)
+"cuda-runner-gate [Gemma 4]" = 90
 "live-legs [qwen]" = 1500
 "live-legs [nemotron]" = 420
 
 [[test]]
 name = "warnings-gate"
 tier = "check"
-budget = 300   # L357 2026-11-08: the engine + every test program (VM -j48: 165 s); Sparky's figure from the next release run
+budget = 150   # L357 2026-11-08: the engine + every test program (Sparky #676: 89 s)
 
 [[test]]
 name = "doxygen-gate"
@@ -59,7 +60,7 @@ budget = 35
 [[test]]
 name = "cuda-attn-gates"
 tier = "kernels"
-budget = 45
+budget = 60
 
 [[test]]
 name = "cuda-attn-pack-gate"
@@ -112,7 +113,7 @@ tier = "release"
 [[test]]
 name = "server-kv-headroom-live"
 tier = "release"
-budget = 240
+budget = 420   # #676: 361 s (Super, its balloon)
 
 [[test]]
 name = "cuda-reap-router-audit"
