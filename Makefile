@@ -2371,13 +2371,21 @@ GATE_RUNNER_FLAGS ?=
 # L357: and graph-eager-gate, whose graphed driver steps Qwen does not take (its driver stages none: SKIPped there).
 # L357 (2026-11-08): Gemma 4 is hosted for its two reference gates only (smoke otherwise): its first reference
 # (tools/reference/capture.py, 1492bd71, fp32, the K6 head) matched top-1 10 of 10 (gpuq #665); every story depth past
-# 512 and code 4094 sit above the tolerance -- known-high, graded by the budgets.  Nemotron's reference gates wait on
-# L363 (decisive mispredictions at 3 of 10 depths).
+# 512 and code 4094 sit above the tolerance -- known-high, graded by the budgets.
+# Nemotron 3.5 Super: its first reference (6faf460d, fp32, the K6 head) found L363 -- the engine had no dt floor in its
+# Mamba-2 (vLLM's time_step_limit [0, inf]; transformers clamps at time_step_min) and mispredicted decisively at 3 of 10
+# depths.  With the floor (38235e1b; gpuq #675): story top-1 7/7, KL 1.5e-6 .. 0.23 (4096, 4102 and the end above the
+# tolerance); code 2048 3.4e-5, 3956 5.2e-3, and 512 flips to the reference's own #3 (' secure', 3.0 below ' a') --
+# a position HF itself flips in bf16 ('\n' 39.4, ' a' 38.9): model-sensitive, known-flip.
+NEMOTRON_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(LILICORR_GATE_MODEL)) --ref-tol 1e-3 \
+	--kl-story tests/test-vectors/kl-budget-nemotron-story.txt --kl-code tests/test-vectors/kl-budget-nemotron-code.txt \
+	--story-known-high 4096,4102,31304 --code-known-high 512,3956 --code-known-flip 512
 GEMMA4_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(GEMMA4_GATE_MODEL)) --ref-tol 1e-3 \
 	--kl-story tests/test-vectors/kl-budget-gemma-story.txt --kl-code tests/test-vectors/kl-budget-gemma-code.txt \
 	--story-known-high 2048,4096,4102,6144,16388,30339 --code-known-high 4094
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
-	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate \
+	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
+	$(NEMOTRON_REF_ANCHORS) \
 	--model $(GEMMA4_GATE_MODEL) --gates=cuda-reference-gate-story,cuda-reference-gate-code $(GEMMA4_REF_ANCHORS)
 # Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
 # itself and is unaffected.
