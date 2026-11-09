@@ -510,6 +510,9 @@ class NemotronAdapter:
         cfg = NemotronHConfig(**hf_json(c.config["llm_config"]))
         cfg._attn_implementation = "sdpa"
         self.cfg = cfg
+        # L363: transformers clamps dt at time_step_min (its mixer's time_step_limit); the checkpoint says [0, inf]
+        self.dt_limit = (tuple(float(x) for x in hf_json(c.config["llm_config"])["time_step_limit"])
+                         if a is not None and getattr(a, "nemotron_dt_limit", "hf") == "config" else None)
 
     def layers(self):
         return self.cfg.num_hidden_layers
@@ -523,7 +526,10 @@ class NemotronAdapter:
     def build(self, i, seqs):
         with self.torch.device("meta"):
             layer = self.M.NemotronHBlock(self.cfg, i).float()
-        return fill_module(layer, "%slayers.%d." % (self.PFX, i), self.dec)
+        layer = fill_module(layer, "%slayers.%d." % (self.PFX, i), self.dec)
+        if self.dt_limit is not None and hasattr(layer.mixer, "time_step_limit"):
+            layer.mixer.time_step_limit = self.dt_limit
+        return layer
 
     def run(self, layer, h, ids):
         torch, dev = self.torch, self.dec.dev
@@ -700,6 +706,9 @@ def main():
     ap.add_argument("--only-dtype", choices=["fp32", "bf16"], default="fp32",
                     help="with --only: run the layers in bf16 (the container's decoded weights cast once, activations "
                          "bf16 -- HF's native-dtype run) to tell a bf16 property of the model from an engine bug")
+    ap.add_argument("--nemotron-dt-limit", choices=["hf", "config"], default="hf",
+                    help="Nemotron's Mamba dt clamp: hf = transformers' (time_step_min, inf); config = the checkpoint's "
+                         "time_step_limit [0, inf], as vLLM (and the engine) apply it (L363)")
     ap.add_argument("--dump-layers", help="with --only: each layer's output rows, raw f32 [T][hidden], to "
                     "DIR/ref-<layer>.bin (the engine's PULSAR_CUDA_GRAPH_DUMP_PREFIX layout)")
     ap.add_argument("--plan", action="store_true", help="no GPU: build every module on meta and resolve each tensor "
