@@ -94,6 +94,7 @@ in the log when set.
 | `PULSAR_SERVER_KV_BUDGET_OVERRIDE` | Bytes: lower the guard's KV budget so spills fire at small fills. |
 | `PULSAR_SERVER_KV_RESTORE_SLICE_MS` | Milliseconds (1..600000) per disk-restore slice. The default is one prefill chunk's priced time. |
 | `PULSAR_GRAMMAR_FAIL_AFTER` | Inject a grammar-matcher failure after N tokens of a constrained region. |
+| `PULSAR_SERVER_TEST_ROUTES` | `1`: answer the test routes -- `POST /test/guard-budget` (body: bytes) sets the guard's KV budget at run time, `0` restores it (L357).  Said at startup; never set in production. |
 | `PULSAR_SCRATCH_POISON` | Poison disposable scratch buffers (`scratch-poison-gate`). |
 | `PULSAR_BLOCK_UNPRICED` | Block drafter: turn off the priced chain cut (a sweep's control arm). |
 | `PULSAR_QWEN_MTP_DRAFT_EXTRA` | Qwen MTP draft-vocabulary extra width (must agree with the container). |
