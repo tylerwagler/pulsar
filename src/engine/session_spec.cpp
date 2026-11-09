@@ -403,8 +403,22 @@ void spec_quench_reset(pulsar_session *s) {
     s->spec.spec_quenched = false;
 }
 
-/* A request boundary: the lookahead goes, the quench re-arms. */
+/* A request boundary: the lookahead goes, the quench re-arms.  L368 measurement switch: PULSAR_SPEC_NO_CARRY=1 also
+ * restarts the draft-depth controller (spec_depth.h) at every boundary -- the start depth, fresh counters -- instead
+ * of carrying the bank's last depth into its next request (L112). */
 void spec_lookahead_reset(pulsar_session *s) {
+    static int no_carry = -1;
+    if (no_carry < 0) {
+        const char *e = getenv("PULSAR_SPEC_NO_CARRY");
+        no_carry = e && e[0] == '1';
+        if (no_carry) fprintf(stderr, "pulsar: draft depth restarts every request (PULSAR_SPEC_NO_CARRY, a measurement switch)\n");
+    }
+    if (no_carry) {
+        s->spec.spec_adaptive_depth = 0;
+        s->spec.spec_depth_down_forgiven = false;
+        s->spec.spec_depth_rounds_since_up = 0;
+        s->spec.spec_depth_climb_cooldown = 0;
+    }
     s->spec.spec_carry_valid = false;
     s->spec.copy_accept = 0.0f;   /* L288: copies are measured per request */
     s->spec.copy_unseen = 0u;

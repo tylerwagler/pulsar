@@ -3587,6 +3587,26 @@ static_assert(SCHED_PROMPTS_MAX == PULSAR_SESSION_POOL_CAP, "the round selection
  * 0.99; L304's budget: the prompt never finished while the streams ran (gap p99 0.97 s / max 1.89 s).
  * PULSAR_SERVER_SCHED="out=..,fair=..,prompts=..,age=..,adapt=.." (read once, announced) moves them for a
  * measurement sweep; a malformed value refuses to start the lane. */
+/* L368 measurement switch: PULSAR_LANE_PIN=spec holds every decode sweep the spec lane can carry on the spec lane --
+ * no plain-lane measuring at a fresh bank, no re-measure.  A measurement aid (the lane choice changes which kernel
+ * computes a token, and with it a near-tied greedy argmax); read once and announced; any other value refuses. */
+/// @return true when PULSAR_LANE_PIN=spec
+static bool server_lane_pinned_spec() {
+    static int v = -1;
+    if (v >= 0) return v == 1;
+    const char *e = getenv("PULSAR_LANE_PIN");
+    v = 0;
+    if (e && *e) {
+        if (strcmp(e, "spec") != 0) {
+            server_log(PULSAR_LOG_ERROR, "pulsar-server: PULSAR_LANE_PIN=\"%s\": only \"spec\" -- refusing", e);
+            exit(2);
+        }
+        v = 1;
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: decode lane pinned to spec (PULSAR_LANE_PIN, a measurement switch)");
+    }
+    return v == 1;
+}
+
 /// @return the round selection's preferences (static; read from PULSAR_SERVER_SCHED once, exits(2) on a malformed one)
 static const sched_prefs *server_sched_prefs() {
     static sched_prefs v;
@@ -5061,7 +5081,9 @@ void *server_worker_main(void *arg) {
                                   server_spec_lane_carries(pulsar_engine_has_spec_rounds(s->engine), verify_rows,
                                                            dec, n_dec);
         int priced = 0;
-        if (spec_carries) {
+        if (spec_carries && server_lane_pinned_spec()) {
+            priced = 3;   /* L368 measurement switch: the spec lane, never priced, measured or re-measured */
+        } else if (spec_carries) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             uint64_t dsum = 0;   /* L338: the decoders' mean frontier: the depth band the prices are measured in */
