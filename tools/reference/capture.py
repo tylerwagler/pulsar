@@ -697,6 +697,9 @@ def main():
     ap.add_argument("--q-chunk", type=int, default=1024, help="query rows per sdpa call (fp32 scores: keep it small)")
     ap.add_argument("--check-dense", action="store_true", help="Qwen: QSA == dense at depths <= the indexer budget")
     ap.add_argument("--only", help="diagnostic: one sequence, PROMPT:DEPTH (e.g. code:512); writes no capture")
+    ap.add_argument("--only-dtype", choices=["fp32", "bf16"], default="fp32",
+                    help="with --only: run the layers in bf16 (the container's decoded weights cast once, activations "
+                         "bf16 -- HF's native-dtype run) to tell a bf16 property of the model from an engine bug")
     ap.add_argument("--dump-layers", help="with --only: each layer's output rows, raw f32 [T][hidden], to "
                     "DIR/ref-<layer>.bin (the engine's PULSAR_CUDA_GRAPH_DUMP_PREFIX layout)")
     ap.add_argument("--plan", action="store_true", help="no GPU: build every module on meta and resolve each tensor "
@@ -743,17 +746,19 @@ def main():
         if a.dump_layers:
             os.makedirs(a.dump_layers, exist_ok=True)
         hs = ad.embed([seq])
+        dt = torch.bfloat16 if a.only_dtype == "bf16" else torch.float32
+        hs = [h.to(dt) for h in hs]
         for i in range(ad.layers()):
-            layer = ad.build(i, [seq])
+            layer = ad.build(i, [seq]).to(dt)
             hs[0] = ad.run(layer, hs[0], seq)
             if a.dump_layers:
                 hs[0][0].float().contiguous().cpu().numpy().astype("<f4").tofile(
                     os.path.join(a.dump_layers, "ref-%d.bin" % i))
             del layer
             torch.cuda.empty_cache()
-        row = ad.logits(hs)[0]
+        row = ad.logits([h.float() for h in hs])[0]
         v, ix = row.topk(5)
-        log("--only %s: top-5 %s" % (a.only, [(int(t), tok.decode([int(t)]), round(float(x), 3)) for t, x in zip(ix, v)]))
+        log("--only %s (%s): top-5 %s" % (a.only, a.only_dtype, [(int(t), tok.decode([int(t)]), round(float(x), 3)) for t, x in zip(ix, v)]))
         return 0
 
     def forward(sel):
