@@ -9,10 +9,15 @@
 /* The set of ignored top-level keys already named in the log.  Keys are client
  * input, so the set is bounded: past the cap, further new keys are not
  * tracked, and that is said once. */
+/// The most (endpoint, key) pairs api_key_first_seen tracks; past it new keys are not named (said once).
 #define API_SEEN_KEYS_MAX 256
+/// Guards the ignored-key set below (the parsers run on client threads).
 static pthread_mutex_t api_seen_mu = PTHREAD_MUTEX_INITIALIZER;
+/// The "endpoint/key" names already logged, heap strings, never freed (process lifetime).
 static char *api_seen_keys[API_SEEN_KEYS_MAX];
+/// Entries used in api_seen_keys.
 static int api_seen_n = 0;
+/// The set-is-full line was said.
 static bool api_seen_full_warned = false;
 
 bool api_key_first_seen(const char *api, const char *key) {
@@ -40,6 +45,11 @@ bool api_key_first_seen(const char *api, const char *key) {
 /* The default arm of every top-level body parser: skip the value, and name the
  * key in the log the first time this process ignores it.  The key is client
  * text, so only printable ASCII reaches the log. */
+/// Skip an ignored top-level value, naming the key once per process (api_key_first_seen).
+/// @param api  the endpoint
+/// @param key  the key, client text (only printable ASCII is logged)
+/// @param p    the parse cursor, advanced past the value
+/// @return json_skip_value's verdict
 static bool skip_ignored_key(const char *api, const char *key, const char **p) {
     if (api_key_first_seen(api, key)) {
         char shown[65];
