@@ -781,8 +781,8 @@ int main(int argc, char **argv) {
     if (argc != 1) { fprintf(stderr, "usage: %s [--fixture DIR]\n", argv[0]); return 2; }
     printf("mamba2 gate (L296 N2): the family-neutral Mamba-2 mixer block\n");
     Case cases[3];
-    /* L363: the full layer with a dt floor that binds (dt here runs ~0.007 .. 0.3, so 0.02 floors a good share) */
-    case_init(cases[0], "Nemotron 3.5 Super layer, dt floor 0.02", 128, 8, 1024, 4, 160, 21, 0.02f);
+    /* L363: the full layer with a dt floor that binds (dt here runs ~0.007 .. 0.3, so 0.05 floors a good share) */
+    case_init(cases[0], "Nemotron 3.5 Super layer, dt floor 0.05", 128, 8, 1024, 4, 160, 21, 0.05f);
     case_init(cases[1], "one TP=2 rank of it", 64, 4, 1024, 4, 120, 22);
     case_init(cases[2], "small: 12 heads, 3 groups, norm group 256, kernel 2", 12, 3, 256, 2, 120, 23);
     for (Case &c : cases) run_case(c);
