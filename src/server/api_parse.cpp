@@ -24,7 +24,7 @@ bool api_key_first_seen(const char *api, const char *key) {
     while (i < api_seen_n && strcmp(api_seen_keys[i], name)) i++;
     if (i == api_seen_n) {
         if (api_seen_n < API_SEEN_KEYS_MAX) {
-            api_seen_keys[api_seen_n++] = xstrdup(name);
+            api_seen_keys[api_seen_n++] = server_xstrdup(name);
             first = true;
         } else if (!api_seen_full_warned) {
             api_seen_full_warned = true;
