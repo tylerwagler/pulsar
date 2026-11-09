@@ -200,16 +200,19 @@ bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, q
 
 /** A conversation built turn by turn (L284 P14: the CLI REPL and the agent, through the family's chat front):
  * the HEAD is the system block the full render writes before the first message -- the effort line and the
- * system message's `system` content (NULL = none; no tools) -- and is empty when it has neither.
+ * system message's `system` content (NULL = none) and the tools block of `tools_json` (NULL or [] = none; L365:
+ * the agent's tools) -- and is empty when it has none of them.
  * full(history) = head + each turn; a turn after an assistant turn is preceded by that turn's close
  * "<|im_end|>\n" (the sampled turn ends before its stop token, as qwen_chat_render_tail's live KV does). */
-/// @param system the system message's content (client data), or NULL for none
-/// @param effort the effort whose instruction line the head carries
-/// @param out    receives the head's text and its client-span map
-/// @param err    receives "<refusal key>: detail" on refusal
-/// @param errlen size of `err`
-/// @return true on success, false on refusal
-bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_out *out, char *err, size_t errlen);
+/// @param system     the system message's content (client data), or NULL for none
+/// @param tools_json an OpenAI tools array as JSON text, or NULL for none
+/// @param effort     the effort whose instruction line the head carries
+/// @param out        receives the head's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal (tools_not_array)
+bool qwen_chat_render_head(const char *system, const char *tools_json, qwen_effort effort, qwen_render_out *out,
+                           char *err, size_t errlen);
 
 /** One TURN of a conversation built turn by turn: `msgs` as the full render writes them after an assistant
  * turn (a tool result opens the user turn; consecutive results share it), then the generation prompt for

@@ -754,6 +754,8 @@ static void test_agent_workspace_and_terminal(void) {
     AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc\r????" "1m\xc3\xa9"));
 }
 
+static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
+
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
     test_worker_progress_uses_session_total();
@@ -761,6 +763,7 @@ static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
+    test_agent_family_tools();
     test_agent_session_file_round_trip();
     test_parse_u64_refuses_sign_and_range();
 }

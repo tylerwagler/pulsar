@@ -165,13 +165,16 @@ bool nemotron_chat_render_tail(const nemotron_msg_in *msgs, int n, nemotron_effo
                                char *err, size_t errlen);
 
 /** The head of a conversation built turn by turn (the CLI REPL and the agent): the system turn with `system`
- *  (NULL = empty), no tools. */
-/// @param system the system text (client data), or NULL for an empty system turn
-/// @param out    receives the head's text and its client-span map
-/// @param err    receives "<refusal key>: detail" on refusal
-/// @param errlen size of `err`
-/// @return true on success, false on refusal
-bool nemotron_chat_render_head(const char *system, nemotron_render_out *out, char *err, size_t errlen);
+ *  (NULL = empty) and the tools block of `tools_json` (NULL or [] = none; L365: the agent's tools) -- the bytes the
+ *  full render writes before the first non-system message. */
+/// @param system     the system text (client data), or NULL for an empty system turn
+/// @param tools_json an OpenAI tools array as JSON text, or NULL for none
+/// @param out        receives the head's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal (tools_not_array)
+bool nemotron_chat_render_head(const char *system, const char *tools_json, nemotron_render_out *out, char *err,
+                               size_t errlen);
 
 /** One TURN of a conversation built turn by turn: `msgs` as the full render writes them after the head or an
  *  assistant turn's close (the medium suffix on the turn's last user message), then the generation prompt for

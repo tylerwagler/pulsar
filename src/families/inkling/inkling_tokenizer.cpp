@@ -119,8 +119,9 @@ void chat_append(const pulsar_engine *e, const inkling_render_out &r, pulsar_tok
  *  @param tokens      the head's ids are appended here
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
+ *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
  *  @param think_mode  picks the effort line (the default effort, or none); an unsupported mode ends the process */
-void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
     char err[256];
     if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
@@ -133,6 +134,7 @@ void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
     in.n_msgs = content.empty() ? 0 : 1;
     in.effort = pulsar_think_mode_enabled(think_mode) ? inkling_effort_default() : inkling_effort_named("none");
     in.add_generation_prompt = false;
+    in.tools_json = tools_json;
     inkling_render_out r;
     if (!inkling_chat_render(in, &r, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
     chat_append(e, r, tokens);

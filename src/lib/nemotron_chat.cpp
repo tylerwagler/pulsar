@@ -484,12 +484,24 @@ bool nemotron_chat_tool_defs(const char *tools_json, nemotron_render_out *out, c
     return finish(out, err, errlen);
 }
 
-bool nemotron_chat_render_head(const char *system, nemotron_render_out *out, char *err, size_t errlen) {
+bool nemotron_chat_render_head(const char *system, const char *tools_json, nemotron_render_out *out, char *err,
+                               size_t errlen) {
     out->text.clear();
     out->spans.clear();
     writer w{out};
+    pyjson_value tools;
+    if (tools_json) {
+        char jerr[160];
+        if (!pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr))
+            return chat_refuse(err, errlen, "tools_not_array", "tools: %s", jerr);
+        if (tools.kind != pyjson_value::ARR) return chat_refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+    }
     w.lit("<|im_start|>system\n");
     w.client(system ? system : "");
+    if (tools_json && !tools.a.empty()) {   /* nemotron_chat_render's system turn */
+        if (system && system[0]) w.lit("\n\n");
+        write_tools(w, tools);
+    }
     w.lit("<|im_end|>\n");
     return finish(out, err, errlen);
 }

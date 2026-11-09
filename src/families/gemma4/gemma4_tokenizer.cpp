@@ -125,20 +125,22 @@ bool chat_thinking(pulsar_engine *e, pulsar_think_mode think_mode, const char *o
  *  @param tokens      the head's ids are appended here
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
+ *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
  *  @param think_mode  thinking on or off (an unsupported mode ends the process) */
-void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
     const bool thinking = chat_thinking(e, think_mode, "pulsar_chat_open");
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     gemma4_render_out r;
     char err[256];
-    if (!gemma4_chat_render_head(content.empty() ? NULL : content.c_str(), thinking, &r, err, sizeof err))
+    if (!gemma4_chat_render_head(content.empty() ? NULL : content.c_str(), tools_json, thinking, &r, err, sizeof err))
         chat_refuse("pulsar_chat_open", err);
     chat_append(e, r, tokens);
 }
 
 /* One turn: the messages as the full render writes them after the head or a sampled turn's close, then the generation
- * prompt. */
+ * prompt.  A turn that opens with "tool" messages answers the calls of the sampled turn before it, which was left
+ * open (pulsar_chat_calls_continue_turn): the responses go inside that turn (gemma4_chat_render_tool_turn, L365). */
 /** pulsar_family_tokenizer::chat_turn.
  *  @param e                  the engine
  *  @param tokens             the turn's ids are appended here
@@ -154,10 +156,13 @@ void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
         m[(size_t)i] = {};
         m[(size_t)i].role = msgs[i].role ? msgs[i].role : "user";
         m[(size_t)i].content = msgs[i].content;
+        m[(size_t)i].name = msgs[i].name;
     }
     gemma4_render_out r;
     char err[256];
-    if (!gemma4_chat_render_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err))
+    const bool answers = n > 0 && !strcmp(m[0].role, "tool");
+    if (answers ? !gemma4_chat_render_tool_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err)
+                : !gemma4_chat_render_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err))
         chat_refuse("pulsar_chat_append_turn", err);
     chat_append(e, r, tokens);
 }

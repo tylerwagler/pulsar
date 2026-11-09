@@ -95,14 +95,34 @@ bool gemma4_chat_render(const gemma4_render_in &in, gemma4_render_out *out, char
 
 /** The turn-by-turn front's head (pulsar_chat_open): `<bos>`, then the system turn when `thinking` or `system` is
  *  non-empty -- what the full render writes before the messages for a conversation that opens with that system
- *  message (none when `system` is NULL / empty) and no tools. */
-/// @param system   the system text (client data; NULL = none)
-/// @param thinking enable_thinking
-/// @param out      receives the head's text and its client-span map
-/// @param err      receives "<refusal key>: detail" on refusal
-/// @param errlen   size of `err`
-/// @return true on success, false on refusal
-bool gemma4_chat_render_head(const char *system, bool thinking, gemma4_render_out *out, char *err, size_t errlen);
+ *  message (none when `system` is NULL / empty) and the tools of `tools_json` (NULL or [] = none; L365). */
+/// @param system     the system text (client data; NULL = none)
+/// @param tools_json an OpenAI tools array as JSON text, or NULL for none
+/// @param thinking   enable_thinking
+/// @param out        receives the head's text and its client-span map
+/// @param err        receives "<refusal key>: detail" on refusal
+/// @param errlen     size of `err`
+/// @return true on success, false on refusal (tools_not_array, a declaration's refusal)
+bool gemma4_chat_render_head(const char *system, const char *tools_json, bool thinking, gemma4_render_out *out,
+                             char *err, size_t errlen);
+
+/** L365: the tool responses of a sampled model turn that made calls (the agent's tool loop).  Gemma answers calls
+ *  INSIDE the model turn: the turn sampled its calls and stopped at "<|tool_response>" (not committed), so this
+ *  writes each leading `tool` message's response block (its `name`, the call's function; NULL = "unknown") where the
+ *  full render writes it, then -- when only tool messages follow -- the generation prompt that continues the same
+ *  turn ("<|channel>thought\n" with thinking, else nothing); when other messages follow, the turn's close and those
+ *  messages as gemma4_chat_render_turn writes them.  head + turns + sampled turn (without its stop) + this == the
+ *  full render of the same conversation. */
+/// @param msgs              the messages: one or more `tool` messages first
+/// @param n                 their count
+/// @param thinking          enable_thinking
+/// @param generation_prompt end with the generation prompt
+/// @param out               receives the text and its client-span map
+/// @param err               receives "<refusal key>: detail" on refusal
+/// @param errlen            size of `err`
+/// @return true on success, false on refusal (no_tool_response, a later message's refusal)
+bool gemma4_chat_render_tool_turn(const gemma4_msg_in *msgs, int n, bool thinking, bool generation_prompt,
+                                  gemma4_render_out *out, char *err, size_t errlen);
 
 /** The turn-by-turn front's turn (pulsar_chat_append_turn): `msgs` (no system message in the first place: the head
  *  holds it) as the full render writes them after the head, then the generation prompt when asked. */

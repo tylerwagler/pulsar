@@ -507,22 +507,32 @@ static void p2_roundtrip(const std::string &cases_dir) {
 }
 
 /* C1: the turn-by-turn front (head, then turns, each closed as a sampled turn is) == the full render */
+/* L365: the agent's head declares tools (pulsar_chat_open_tools): head(tools) + turns must still compose the full
+ * render with those tools */
+static const char kC1Tools[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a file.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"number\"}},\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"grep\",\"description\":\"Search.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}}]";
+
 static void c1_composition(void) {
     int bad = 0, n = 0;
     for (int think = 0; think < 2; think++)
-        for (const char *sys : {(const char *)NULL, "  Be brief.  "}) {
+        for (const char *sys : {(const char *)NULL, "  Be brief.  "})
+        for (const char *tj : {(const char *)NULL, kC1Tools}) {
             gemma4_msg_in m[5] = {};
             int k = 0;
             if (sys) m[k++] = {"system", sys, NULL, NULL, 0, NULL, NULL};
             m[k++] = {"user", " first question ", NULL, NULL, 0, NULL, NULL};
             m[k++] = {"assistant", "first answer", NULL, NULL, 0, NULL, NULL};
             m[k++] = {"user", "second", NULL, NULL, 0, NULL, NULL};
-            gemma4_render_in in = {m, k, NULL, (bool)think, true};
+            gemma4_render_in in = {m, k, tj, (bool)think, true};
             gemma4_render_out full, head, t1, t2;
             char err[300];
             const int s = sys ? 1 : 0;
             bool ok = gemma4_chat_render(in, &full, err, sizeof err) &&
-                      gemma4_chat_render_head(sys, think, &head, err, sizeof err) &&
+                      gemma4_chat_render_head(sys, tj, think, &head, err, sizeof err) &&
                       gemma4_chat_render_turn(m + s, 1, think, false, &t1, err, sizeof err) &&
                       gemma4_chat_render_turn(m + s + 1, 2, think, true, &t2, err, sizeof err);
             /* the full render's assistant turn is "<|turn>model\nfirst answer<turn|>\n": the head + the user turn +
@@ -532,11 +542,68 @@ static void c1_composition(void) {
             g_checks++;
             if (!ok || composed != full.text) {
                 bad++;
-                fail("C1 think %d system %s: head + turns != the full render (%s)", think, sys ? "yes" : "no",
+                fail("C1 think %d system %s tools %s: head + turns != the full render (%s)", think, sys ? "yes" : "no",
+                     tj ? "yes" : "no",
                      ok ? "text differs" : err);
             }
         }
     printf("C1 turn-by-turn composition: %d conversations, %d mismatched\n", n, bad);
+}
+
+/* C2 (L365): the agent's tool loop turn by turn == the full render.  The model turn samples its calls and stops at
+ * "<|tool_response>" (not committed); gemma4_chat_render_tool_turn then answers inside that turn -- followed by the
+ * model's own continuation (the same turn), or by a user turn. */
+static void c2_tool_turn(void) {
+    int bad = 0, n = 0;
+    const gemma4_tool_call_in calls[2] = {{"c1", "read", "{\"path\":\"notes/a.txt\"}"},
+                                          {"c2", "grep", "{\"q\":\"x\"}"}};
+    for (int think = 0; think < 2; think++)
+        for (int ncalls = 1; ncalls <= 2; ncalls++)
+            for (int then_user = 0; then_user < 2; then_user++) {
+                gemma4_msg_in m[8] = {};
+                int k = 0;
+                m[k++] = {"system", "Be brief.", NULL, NULL, 0, NULL, NULL};
+                m[k++] = {"user", "read it", NULL, NULL, 0, NULL, NULL};
+                const int a = k;
+                m[k++] = {"assistant", "", NULL, calls, ncalls, NULL, NULL};
+                const int t0 = k;
+                m[k++] = {"tool", "line one\nline two", NULL, NULL, 0, "c1", "read"};
+                if (ncalls == 2) m[k++] = {"tool", "no match", NULL, NULL, 0, "c2", "grep"};
+                const int t1 = k;
+                if (then_user) m[k++] = {"user", "and now?", NULL, NULL, 0, NULL, NULL};
+                else m[k++] = {"assistant", "Done.", think ? "it says two lines" : NULL, NULL, 0, NULL, NULL};
+                char err[300] = "";
+                gemma4_render_in in = {m, k, kC1Tools, (bool)think, (bool)then_user};
+                gemma4_render_out full, head, t_user, tt;
+                bool ok = gemma4_chat_render(in, &full, err, sizeof err) &&
+                          gemma4_chat_render_head(m[0].content, kC1Tools, think, &head, err, sizeof err) &&
+                          gemma4_chat_render_turn(m + 1, a, think, false, &t_user, err, sizeof err) &&
+                          gemma4_chat_render_tool_turn(m + t0, (then_user ? k : t1) - t0, think, true, &tt, err,
+                                                       sizeof err);
+                std::string composed;
+                if (ok) {
+                    /* the model turn's calls as sampled: the render of [user, assistant] ends with the stop the model
+                     * sampled, "<|tool_response>", which the transcript does not commit */
+                    std::string turn = t_user.text;
+                    static const char kStop[] = "<|tool_response>";
+                    const bool ends = turn.size() >= strlen(kStop) &&
+                                      !turn.compare(turn.size() - strlen(kStop), strlen(kStop), kStop);
+                    if (!ends) ok = false, snprintf(err, sizeof err, "the call turn does not end at <|tool_response>");
+                    else turn.resize(turn.size() - strlen(kStop));
+                    composed = head.text + turn + tt.text;
+                    if (!then_user)   /* the model continues the same turn, then closes it */
+                        composed += std::string(think ? "it says two lines\n<channel|>" : "") + "Done.<turn|>\n";
+                }
+                n++;
+                g_checks++;
+                if (!ok || composed != full.text) {
+                    bad++;
+                    fail("C2 think %d calls %d then %s: the tool loop turn by turn != the full render (%s)", think,
+                         ncalls, then_user ? "user" : "model", ok ? "text differs" : err);
+                    if (ok) fprintf(stderr, "  composed: %s\n  full:     %s\n", composed.c_str(), full.text.c_str());
+                }
+            }
+    printf("C2 tool loop turn by turn: %d conversations, %d mismatched\n", n, bad);
 }
 
 int main(int argc, char **argv) {
@@ -582,6 +649,7 @@ int main(int argc, char **argv) {
     r1_hand(t, vec_dir);
     if (!cases.empty()) r2_corpus(t, vec_dir, cases);
     c1_composition();
+    c2_tool_turn();
     p1_vllm(vec_dir);
     if (!cases.empty()) p2_roundtrip(cases);
     bpe_tokenizer_free(t);

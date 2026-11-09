@@ -94,14 +94,16 @@ static void qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, p
 /// @param[in,out] tokens ids appended
 /// @param trusted trusted text, or NULL
 /// @param system system text, or NULL
+/// @param tools_json the tools array as JSON text, or NULL (pulsar_chat_open_tools)
 /// @param think_mode the mode
 static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
-                           pulsar_think_mode think_mode) {
+                           const char *tools_json, pulsar_think_mode think_mode) {
     const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_open");
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     qwen_render_out r;
     char err[256];
-    if (!qwen_chat_render_head(content.c_str(), qe, &r, err, sizeof err)) qwen_chat_refuse("pulsar_chat_open", err);
+    if (!qwen_chat_render_head(content.c_str(), tools_json, qe, &r, err, sizeof err))
+        qwen_chat_refuse("pulsar_chat_open", err);
     qwen_chat_append(e, r, tokens);
 }
 

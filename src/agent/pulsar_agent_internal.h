@@ -16,6 +16,8 @@
 #include "pulsar_dsml.h"
 #include "linenoise.h"
 
+class out_parser;   /* src/lib/out_parse_kit.h: a family's output parser (family_tools.cpp, L365) */
+
 #include <errno.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -328,6 +330,10 @@ typedef struct {
     char *queued_user_drain_text;     ///< drained queue contents, owned by the worker once taken
 
     bool datetime_context_injected;   ///< the current date/time was already stated in this transcript
+    /** L365: the transcript ends inside a sampled model turn that made calls and awaits their responses (a family
+     *  whose calls continue the turn: pulsar_chat_calls_continue_turn).  The next turn rendered must open with the
+     *  "tool" messages; anything else closes the turn first (agent_worker_close_open_turn). */
+    bool model_turn_open;
 
     /** Continuation cursor for a truncated file read, so the `more` tool can
      * resume where the last read stopped. `more_valid` is false when there is
@@ -605,6 +611,13 @@ typedef struct {
 
     bool tool_preflight_error;       ///< the call was rejected before execution
     char tool_preflight_error_msg[256];  ///< why it was rejected, for display
+
+    /** L365: a non-DSML family's output parser.  When set it owns the stream: the raw bytes go to it, and the
+     *  display is projected from its events (reasoning, content, completed calls); the DSML machinery above
+     *  stays idle. */
+    out_parser *family;
+    bool family_gap;                 ///< swallow whitespace between the reasoning and the reply
+    char family_error[160];          ///< the first malformed call's diagnostic (empty = none)
 } agent_stream_renderer;
 
 /** Stops the model retyping a long `edit old=...` block it has already
@@ -975,9 +988,49 @@ double agent_now_sec(void);
  *  @param argv arguments; the returned config points into them
  *  @return the resolved configuration */
 agent_config parse_options(int argc, char **argv);
-/** The built-in DSML tool prompt: trusted control text (pulsar_chat_message::trusted). */
-/** @return the prompt text, malloc'd; caller frees */
-char *agent_build_tools_prompt(void);
+/** The built-in tool prompt: trusted control text (pulsar_chat_message::trusted).  `dsml` (DeepSeek) spells the
+ *  DSML call shape and lists the schemas; otherwise the family's template declares the tools
+ *  (agent_build_tools_json) and the prompt keeps only the guidance (L365). */
+/** @param dsml the loaded family calls tools in DSML (agent_engine_dsml)
+ *  @return the prompt text, malloc'd; caller frees */
+char *agent_build_tools_prompt(bool dsml);
+/** The agent's tools as an OpenAI tools array (JSON text), for a family template's tools head (L365). */
+/** @return the array's text, malloc'd; caller frees */
+char *agent_build_tools_json(void);
+
+/* ---- tool calling in the loaded family's syntax (family_tools.cpp, L365) ---- */
+/** @param e the engine
+ *  @return true when the loaded family calls tools in DSML (DeepSeek), read by the agent's own parser */
+bool agent_engine_dsml(pulsar_engine *e);
+/** @param w the worker
+ *  @return agent_engine_dsml of its engine */
+bool agent_worker_dsml(const agent_worker *w);
+/** Whether pulsar-agent can call tools on the loaded family (DeepSeek, Qwen, Nemotron-H, Gemma 4).
+ *  @param e      the engine
+ *  @param err    receives why not
+ *  @param errlen size of `err`
+ *  @return true when supported */
+bool agent_family_tools_supported(pulsar_engine *e, char *err, size_t errlen);
+/** The family's output parser for one assistant round, typed by the agent's tools; NULL for DeepSeek (DSML) or a
+ *  refused family.
+ *  @param e        the engine
+ *  @param thinking the round starts inside reasoning (pulsar_chat_opens_reasoning)
+ *  @param err      receives why NULL
+ *  @param errlen   size of `err`
+ *  @return the parser (agent_family_parser_free), or NULL */
+out_parser *agent_family_parser_new(pulsar_engine *e, bool thinking, char *err, size_t errlen);
+/** @param p the parser; NULL is a no-op */
+void agent_family_parser_free(out_parser *p);
+/** @param p the parser, or NULL
+ *  @return true inside a call's structure (argmax), false in its string payload or outside a call */
+bool agent_family_parser_wants_greedy(const out_parser *p);
+/** Append the parser's well-formed calls to `calls` as agent tool calls.
+ *  @param p      the parser (after finish)
+ *  @param calls  appended to
+ *  @param err    receives why a call's arguments could not be read
+ *  @param errlen size of `err`
+ *  @return false when a call's arguments are not a JSON object */
+bool agent_family_calls_take(const out_parser *p, agent_tool_calls *calls, char *err, size_t errlen);
 /** Record that the model has just seen the system prompt: the reminder clock restarts at the transcript's
  *  current length.  Worker thread.
  *  @param w the worker */
@@ -1270,6 +1323,17 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
  *  @param content the text, copied
  *  @param trusted render as control text (pulsar_chat_message::trusted) */
 void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted);
+/** Add a "tool" message answering one call to the turn being built (L365: Gemma names each response).
+ *  @param w       the worker
+ *  @param name    the call's function, copied; NULL = none
+ *  @param content the result text, copied */
+void agent_turn_add_tool(agent_worker *w, const char *name, const char *content);
+/** L365: when the transcript ends in an open model turn (model_turn_open) and the turn being built does not answer
+ *  it, close it (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never
+ *  lands inside it.
+ *  @param w      the worker
+ *  @param tokens the transcript (or a copy of it) to close */
+void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
 /** The turn being built plus `extra` (n_extra messages after it), rendered as ONE turn onto `tokens`, with the
  *  assistant turn opened for `think_mode` -- what the next prefill will hold. */
 /** @param w          the worker
@@ -1617,6 +1681,11 @@ pid_t agent_tool_pid(const agent_tool_call *call);
  *  @param calls the parsed calls
  *  @return the combined result, malloc'd; caller frees */
 char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls);
+/** Execute one tool call (L365: a family that answers each call separately).
+ *  @param w    the worker
+ *  @param call the call
+ *  @return its result text, malloc'd; caller frees */
+char *agent_execute_tool_call_one(agent_worker *w, const agent_tool_call *call);
 /** If compaction happens while a bash process is still alive, inject a small
  * tool-role reminder into the rebuilt transcript.  Otherwise the summary could
  * preserve the user's task but lose the fact that an external process still

@@ -79,6 +79,12 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
 
 
 
+char *agent_execute_tool_call_one(agent_worker *w, const agent_tool_call *call) {
+    return agent_execute_tool_call(w, call);
+}
+
+
+
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls. */
 char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {

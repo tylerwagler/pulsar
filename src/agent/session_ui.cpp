@@ -572,6 +572,16 @@ static void agent_history_render_assistant(agent_worker *w,
         .parser = &dsml,
         .replay = true,
     };
+    /* L365: a non-DSML family's turn replays through its own output parser */
+    char perr[200];
+    /* a replayed turn opens where a fresh one does (Gemma's continuations after tool responses are part of it) */
+    const bool thinking = pulsar_think_mode_enabled(w->cfg->gen.think_mode) &&
+                          !pulsar_chat_calls_continue_turn(w->engine);
+    out_parser *family = agent_worker_dsml(w) ? NULL : agent_family_parser_new(w->engine, thinking, perr, sizeof perr);
+    if (family) {
+        stream.family = family;
+        renderer.think.in_think = thinking;
+    }
 
     /* Dry-run replay: the same streaming projection hides DSML and renders
      * semantic tool lines, but no tool is executed and no transcript state is
@@ -579,6 +589,7 @@ static void agent_history_render_assistant(agent_worker *w,
     agent_stream_text(&stream, p, (size_t)(end - p), true);
     renderer_finish(&renderer);
     agent_dsml_parser_free(&dsml);
+    agent_family_parser_free(family);
 
     if (source_truncated) {
         size_t tail_len = 0;

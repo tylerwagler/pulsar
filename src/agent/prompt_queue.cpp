@@ -9,12 +9,15 @@
  * ============================================================================
  */
 
-/** The system prompt's opening: the agent's role, the DSML tool-call shape and the read tools. */
-static const char agent_tools_prompt_intro[] =
+/** The system prompt's opening: the agent's role. */
+static const char agent_tools_prompt_role[] =
     "You are a coding agent running in a local workspace. Use tools for local file and system work. "
     "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
     "then summarize results briefly.\n\n"
-    "## Tools\n\n"
+    "## Tools\n\n";
+
+/** DeepSeek's tool-call shape: DSML, spelled out in the prompt (the family has no tools template). */
+static const char agent_tools_prompt_dsml_shape[] =
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
     PULSAR_TOOL_CALLS_START "\n"
     PULSAR_INVOKE_START " name=\"$TOOL_NAME\">\n"
@@ -22,7 +25,15 @@ static const char agent_tools_prompt_intro[] =
     PULSAR_INVOKE_END "\n"
     PULSAR_TOOL_CALLS_END "\n\n"
     "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
-    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
+    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n";
+
+/** Every other family (L365): the template declares the tools and their call syntax; the prompt only says when. */
+static const char agent_tools_prompt_family_shape[] =
+    "Call the tools declared in this prompt in the format it describes. "
+    "Finish thinking before calling a tool; a call inside the thinking is not run.\n\n";
+
+/** The read tools. */
+static const char agent_tools_prompt_read[] =
     "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
     "If read says more lines are available, call more with count=<lines> to read the next chunk; "
     "more defaults to the next 500 lines. "
@@ -46,7 +57,10 @@ static const char agent_tools_prompt_edit_line[] =
     "- [upto]\n"
     "- }\n"
     "because the closing brace may match many functions. Instead include final lines that are unique near that function, "
-    "for example its last calculation and return line before the brace.\n"
+    "for example its last calculation and return line before the brace.\n";
+
+/** The anchored-edit example in DSML. */
+static const char agent_tools_prompt_edit_example_dsml[] =
     "Example anchored edit:\n"
     PULSAR_TOOL_CALLS_START "\n"
     PULSAR_INVOKE_START " name=\"edit\">\n"
@@ -60,17 +74,36 @@ static const char agent_tools_prompt_edit_line[] =
     "    return parse_impl();\n"
     "}" PULSAR_PARAM_END "\n"
     PULSAR_INVOKE_END "\n"
-    PULSAR_TOOL_CALLS_END "\n"
+    PULSAR_TOOL_CALLS_END "\n";
+
+/** The anchored-edit example as arguments (any family's call syntax). */
+static const char agent_tools_prompt_edit_example_family[] =
+    "Example anchored edit: call edit with path \"/tmp/example.c\", old\n"
+    "static int parse(void) {\n"
+    "    int ok = 0;\n"
+    "[upto]\n"
+    "    return ok;\n"
+    "}\n"
+    "and new\n"
+    "static int parse(void) {\n"
+    "    return parse_impl();\n"
+    "}\n";
+
+/** The edit guidance after the example. */
+static const char agent_tools_prompt_edit_tail[] =
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
     "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
 
 
-/** The system prompt's bash-job guidance and the tool schemas. */
-static const char agent_tools_prompt_after_edit[] =
+/** The bash-job guidance. */
+static const char agent_tools_prompt_bash[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
-    "bash_status to check it early or bash_stop to terminate it.\n\n"
-    "### Available Tool Schemas\n\n"
+    "bash_status to check it early or bash_stop to terminate it.\n\n";
+
+/** The tool schemas, OpenAI function objects: the DSML prompt lists them, the other families' templates
+ *  declare them (agent_build_tools_json). */
+static const char *const agent_tool_schemas[] = {
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -86,7 +119,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"command\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -102,7 +135,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"job\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -118,7 +151,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"job\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -136,7 +169,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -149,7 +182,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      }\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -164,7 +197,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\", \"content\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -180,7 +213,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\", \"old\", \"new\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -200,7 +233,7 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"query\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}",
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -214,10 +247,16 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
-    "}\n"
-    "\n"
-    "# Rules\n\n"
-    "- Always use strict syntax for DSML tool stanzas.\n"
+    
+    "}",
+};
+
+/** The DSML rule. */
+static const char agent_tools_prompt_dsml_rule[] =
+    "- Always use strict syntax for DSML tool stanzas.\n";
+
+/** The rules every family shares. */
+static const char agent_tools_prompt_rules[] =
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
     "and a few tens of tokens/s decoding speed. Use read/search to get the "
     "anchors you need, then use anchored edit to avoid having to "
@@ -229,16 +268,40 @@ static const char agent_tools_prompt_after_edit[] =
 
 
 
-char *agent_build_tools_prompt(void) {
-    const char *edit = agent_tools_prompt_edit_line;
-    size_t a = strlen(agent_tools_prompt_intro);
-    size_t b = strlen(edit);
-    size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = (char *)agent_xmalloc(a + b + c + 1);
-    memcpy(out, agent_tools_prompt_intro, a);
-    memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
-    return out;
+char *agent_build_tools_prompt(bool dsml) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, agent_tools_prompt_role);
+    agent_buf_puts(&b, dsml ? agent_tools_prompt_dsml_shape : agent_tools_prompt_family_shape);
+    agent_buf_puts(&b, agent_tools_prompt_read);
+    agent_buf_puts(&b, agent_tools_prompt_edit_line);
+    agent_buf_puts(&b, dsml ? agent_tools_prompt_edit_example_dsml : agent_tools_prompt_edit_example_family);
+    agent_buf_puts(&b, agent_tools_prompt_edit_tail);
+    agent_buf_puts(&b, agent_tools_prompt_bash);
+    if (dsml) {   /* DeepSeek reads the schemas here; every other family's template declares them */
+        agent_buf_puts(&b, "### Available Tool Schemas\n\n");
+        const size_t n = sizeof agent_tool_schemas / sizeof agent_tool_schemas[0];
+        for (size_t i = 0; i < n; i++) {
+            agent_buf_puts(&b, agent_tool_schemas[i]);
+            agent_buf_puts(&b, i + 1 < n ? "\n\n" : "\n");
+        }
+        agent_buf_puts(&b, "\n");
+    }
+    agent_buf_puts(&b, "# Rules\n\n");
+    if (dsml) agent_buf_puts(&b, agent_tools_prompt_dsml_rule);
+    agent_buf_puts(&b, agent_tools_prompt_rules);
+    return agent_buf_take(&b);
+}
+
+char *agent_build_tools_json(void) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "[");
+    const size_t n = sizeof agent_tool_schemas / sizeof agent_tool_schemas[0];
+    for (size_t i = 0; i < n; i++) {
+        if (i) agent_buf_puts(&b, ",");
+        agent_buf_puts(&b, agent_tool_schemas[i]);
+    }
+    agent_buf_puts(&b, "]");
+    return agent_buf_take(&b);
 }
 
 
@@ -253,9 +316,10 @@ const char agent_dsml_syntax_reminder[] =
 
 
 /** @brief The tools prompt (agent_build_tools_prompt) wrapped in "[System prompt reminder ...]" markers.
+ *  @param dsml the family calls tools in DSML (agent_build_tools_prompt)
  *  @return the text, malloc'd; caller frees */
-static char *agent_build_system_prompt_reminder(void) {
-    char *tools = agent_build_tools_prompt();
+static char *agent_build_system_prompt_reminder(bool dsml) {
+    char *tools = agent_build_tools_prompt(dsml);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -313,7 +377,7 @@ void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder();
+    char *reminder = agent_build_system_prompt_reminder(agent_worker_dsml(w));
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);

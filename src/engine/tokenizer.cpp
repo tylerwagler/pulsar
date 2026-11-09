@@ -2,6 +2,7 @@
  *  @brief DeepSeek's byte-level BPE tokenizer: vocabulary tables, BPE merge and chat tokenization. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
+#include "gemma4_chat.h"
 #include <string>
 
 
@@ -1030,7 +1031,21 @@ bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trust
                       pulsar_think_mode think_mode) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open");
     if (!t) return false;
-    t->chat_open(e, tokens, trusted, system, think_mode);
+    t->chat_open(e, tokens, trusted, system, NULL, think_mode);
+    return true;
+}
+
+bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                            const char *tools_json, pulsar_think_mode think_mode) {
+    const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open_tools");
+    if (!t) return false;
+    const pulsar_chat_format f = pulsar_engine_chat_format(e);
+    if (tools_json && (f == PULSAR_CHAT_DS4_V4 || f == PULSAR_CHAT_DS4_V41)) {
+        fprintf(stderr, "pulsar: pulsar_chat_open_tools: DeepSeek has no tools head (its tools are DSML prompt "
+                        "text, passed as trusted)\n");
+        return false;
+    }
+    t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
     return true;
 }
 
@@ -1040,6 +1055,24 @@ bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const puls
     if (!t) return false;
     t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
     return true;
+}
+
+bool pulsar_chat_calls_continue_turn(const pulsar_engine *e) {
+    return pulsar_engine_chat_format(e) == PULSAR_CHAT_GEMMA4;
+}
+
+bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    if (pulsar_engine_chat_format(e) != PULSAR_CHAT_GEMMA4) return pulsar_think_mode_enabled(think_mode);
+    /* the tail is enough: the markers it looks for close a turn's last few tokens */
+    const int from = tokens && tokens->len > 64 ? tokens->len - 64 : 0;
+    std::string text;
+    for (int i = from; tokens && i < tokens->len; i++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, tokens->v[i], &n);
+        text.append(t, n);
+        free(t);
+    }
+    return gemma4_prompt_opens_reasoning(text.c_str());
 }
 
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
@@ -1180,9 +1213,11 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
 /// @param tokens     the tokens appended to
 /// @param trusted    trusted control text for the system region, or NULL
 /// @param system     the client's system message, or NULL
+/// @param tools_json unused (refused upstream)
 /// @param think_mode the reasoning effort
 static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
-                          pulsar_think_mode think_mode) {
+                          const char *tools_json, pulsar_think_mode think_mode) {
+    (void)tools_json;   /* refused by pulsar_chat_open_tools: DeepSeek's tools are DSML text in `trusted` */
     pulsar_vocab *vocab = &e->vocab;
     const bool has_system = system && system[0];
     chat_tmpl_push_marker(tokens, vocab->bos_id);

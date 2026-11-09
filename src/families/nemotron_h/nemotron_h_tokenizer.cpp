@@ -125,14 +125,15 @@ nemotron_effort chat_effort(pulsar_engine *e, pulsar_think_mode think_mode, cons
  *  @param tokens      the head's ids are appended here
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
+ *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
  *  @param think_mode  checked against the engine (an unsupported mode ends the process) */
-void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
     chat_effort(e, think_mode, "pulsar_chat_open");
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     nemotron_render_out r;
     char err[256];
-    if (!nemotron_chat_render_head(content.c_str(), &r, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
+    if (!nemotron_chat_render_head(content.c_str(), tools_json, &r, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
     chat_append(e, r, tokens);
 }
 

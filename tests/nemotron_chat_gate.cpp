@@ -685,6 +685,15 @@ static void e1_effort(void) {
  * the full render byte for byte where the template composes: a tool loop after the last user message (a later user
  * message truncates the history's reasoning, by the template's design).  Every piece the front end renders tokenizes
  * on its own to the full render's ids over its bytes. */
+/* L365: the agent's head declares tools (pulsar_chat_open_tools): head(tools) + turns must still compose the full
+ * render with those tools */
+static const char kC1Tools[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a file.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"number\"}},\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"grep\",\"description\":\"Search.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}}]";
+
 static void c1_composition(const bpe_tokenizer *t) {
     struct piece { std::string text; std::vector<pulsar_text_span> spans; bool sampled; };
     const nemotron_tool_call_in call = {"read_file", "{\"path\": \"a.txt\", \"lines\": 3}"};
@@ -701,12 +710,13 @@ static void c1_composition(const bpe_tokenizer *t) {
     };
     const int len = (int)(sizeof m / sizeof m[0]);
     int bad = 0, n = 0;
-    for (nemotron_effort eff : {NEMOTRON_EFFORT_HIGH, NEMOTRON_EFFORT_MEDIUM, NEMOTRON_EFFORT_NONE}) {
+    for (nemotron_effort eff : {NEMOTRON_EFFORT_HIGH, NEMOTRON_EFFORT_MEDIUM, NEMOTRON_EFFORT_NONE})
+    for (const char *tj : {(const char *)NULL, kC1Tools}) {
         const bool thinking = eff != NEMOTRON_EFFORT_NONE;
         char err[300] = "";
         std::vector<piece> pieces;
         nemotron_render_out r;
-        bool ok = nemotron_chat_render_head(m[0].content, &r, err, sizeof err);
+        bool ok = nemotron_chat_render_head(m[0].content, tj, &r, err, sizeof err);
         pieces.push_back({r.text, r.spans, false});
         int i = 1;
         bool first = true;
@@ -728,7 +738,7 @@ static void c1_composition(const bpe_tokenizer *t) {
         if (!thinking)
             for (auto &x : full_msgs) x.reasoning = NULL;
         nemotron_render_out full;
-        ok = ok && nemotron_chat_render({full_msgs.data(), len, NULL, eff, false}, &full, err, sizeof err);
+        ok = ok && nemotron_chat_render({full_msgs.data(), len, tj, eff, false}, &full, err, sizeof err);
         std::string text;
         for (const piece &p : pieces) text += p.text;
         const int before = g_fail;
@@ -771,7 +781,7 @@ static void c1_composition(const bpe_tokenizer *t) {
         bad += g_fail != before;
         n++;
     }
-    printf("C1 turn-by-turn composition (a tool loop): %d efforts, %d mismatched\n", n, bad);
+    printf("C1 turn-by-turn composition (a tool loop): %d efforts x tools, %d mismatched\n", n, bad);
 }
 
 /* L331: R3 -- image parts.  A content list becomes the joined text with each image at its offset (what the server's

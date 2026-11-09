@@ -58,6 +58,11 @@ tier = "release"
 budget = 35
 
 [[test]]
+name = "agent-tools-gate"
+tier = "release"
+budget = 300   # L365: three model loads (Qwen, Nemotron-H, Gemma 4), two tool rounds each; #678: 82 s without Gemma
+
+[[test]]
 name = "cuda-attn-gates"
 tier = "kernels"
 budget = 60

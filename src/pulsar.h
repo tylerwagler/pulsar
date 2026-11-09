@@ -821,6 +821,8 @@ typedef struct {
      *  DSML tool prompt): DeepSeek tokenizes it as rendered chat; a family whose markers it does not spell
      *  renders it as text. */
     bool trusted;
+    /** A "tool" message's function -- the call it answers (L365: Gemma 4 names each response); NULL = none. */
+    const char *name;
 } pulsar_chat_message;
 
 /** The family's chat front, turn by turn (L284 P14): the CLI REPL and the agent build a live transcript with
@@ -841,6 +843,20 @@ typedef struct {
  *  @return false when refused (no chat front) */
 bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
+/** pulsar_chat_open with TOOLS (L365): the head also declares `tools_json`, an OpenAI tools array as JSON text
+ * (NULL or [] = none), the way the family's template declares a request's tools -- the model then calls them in its
+ * own syntax, which the family's output parser reads (the server's path).  DeepSeek has no tools head: its tools
+ * are front-end DSML prompt text in `trusted`, so a non-NULL `tools_json` is refused there (false, `tokens`
+ * untouched).  A tools array the renderer cannot read ends the process, as any refused render does. */
+/** @param e the engine
+ *  @param tokens the transcript (start empty); the head is appended
+ *  @param trusted front-end control text, or NULL
+ *  @param system client system text, or NULL
+ *  @param tools_json the tools array, or NULL
+ *  @param think_mode the family's think mode
+ *  @return false when refused (no chat front, or tools on DeepSeek) */
+bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+                            const char *tools_json, pulsar_think_mode think_mode);
 /** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
  * with `generation_prompt`, the assistant turn opened for `think_mode`. */
 /** @param e the engine
@@ -858,6 +874,21 @@ bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const puls
  *  @param tokens the transcript, appended to
  *  @return false when refused (no chat front) */
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+/** L365: whether the loaded family answers tool calls INSIDE the model turn that made them (Gemma 4: the response
+ * follows the call, then the same turn continues).  There a sampled turn that made calls is NOT closed with
+ * pulsar_chat_end_assistant: the next pulsar_chat_append_turn opens with the "tool" messages (each `name`d), which
+ * render as that turn's responses.  Every other family closes the turn and answers in a turn of its own. */
+/** @param e the engine
+ *  @return true when calls continue the turn */
+bool pulsar_chat_calls_continue_turn(const pulsar_engine *e);
+/** L365: whether the transcript `tokens` leaves the model's turn inside its reasoning, so the output parser starts
+ * there: the generation prompt opened it (DeepSeek, Qwen, Nemotron-H, Inkling: `think_mode` on), or -- Gemma 4 --
+ * the prompt's text ends in an open thought channel (after a tool response with thinking on; the server's rule). */
+/** @param e the engine
+ *  @param tokens the transcript, ending with a generation prompt
+ *  @param think_mode the mode the turn was opened for
+ *  @return true when the turn starts in reasoning */
+bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode);
 /** The one-shot prompt: pulsar_chat_open(system) + a turn of one user message with the generation prompt. */
 /** @param e the engine
  *  @param system the system text, or NULL

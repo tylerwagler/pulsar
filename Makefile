@@ -1915,6 +1915,14 @@ PREFILL_BASELINE_REF_SHORT := $(shell git rev-parse --short $(PREFILL_BASELINE_R
 cuda-chat-smoke-gate: pulsar
 	python3 tests/chat_smoke_gate.py $(FRONTIER_MODEL) ./pulsar
 
+# L365: pulsar-agent's tool loop, live (tests/agent_tools_gate.py): a read and a write in the family's own call
+# syntax, run and fed back, on each model (Gemma 4's responses inside the model turn that called).
+AGENT_TOOLS_MODELS ?= $(QWEN_GATE_MODEL) $(NEMOTRON_GATE_MODEL) $(GEMMA4_GATE_MODEL)
+.PHONY: agent-tools-gate
+agent-tools-gate: pulsar-agent
+	@sync; sudo -n sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null; \
+	python3 tests/agent_tools_gate.py ./pulsar-agent $(AGENT_TOOLS_MODELS)
+
 # L278 contract 6: the live server tier -- a real pulsar-server per family on a scratch port, driven over HTTP
 # (tests/server_live.py: plain answer, forced / streamed / required tool calls, the tool_result continuation, the
 # undeclared-tool refusal).  L317: the battery runs it as a leg of live-legs (one shared server per model); this target

@@ -142,6 +142,7 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char *prompt_text = agent_compact_make_prompt(reason);
     pulsar_tokens prompt = {0};
     pulsar_tokens_copy(&prompt, &w->transcript);
+    agent_worker_close_open_turn(w, &prompt);   /* L365: the private request never lands inside an open turn */
     const pulsar_chat_message request = {"user", prompt_text, false};
     agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
@@ -299,7 +300,10 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     pulsar_tokens_free(&sys);
     char *bash_update = agent_bash_jobs_compaction_observation(w);
     if (bash_update) {
-        agent_turn_add(w, "tool", bash_update, false);
+        /* L365: a tool message answers an open turn's calls where calls continue the turn (Gemma); with none
+         * open there, the observation is the user's note */
+        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) || w->model_turn_open;
+        agent_turn_add(w, as_tool ? "tool" : "user", bash_update, false);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
         agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",

@@ -1,6 +1,7 @@
 /** @file
  *  pulsar-agent: the model worker thread (prefill, generation, tool turns). */
 #include "pulsar_agent_internal.h"
+#include "out_parse_kit.h"
 
 
 
@@ -23,6 +24,7 @@
 /// @param sr the round's stream renderer; NULL = no
 /// @return true inside DSML structure, a held DSML-shaped opening, or a possible parameter close
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) {
+    if (sr && sr->family) return agent_family_parser_wants_greedy(sr->family);   /* L365 */
     if (!sr || !sr->parser) return false;
     if (sr->parser->state == AGENT_DSML_ERROR ||
         sr->parser->state == AGENT_DSML_DONE)
@@ -114,6 +116,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
+    agent_worker_close_open_turn(w, &w->transcript);   /* L365: a turn left open by an earlier failure */
     agent_turn_add(w, "user", user_text, false);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
@@ -202,11 +205,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         else if (max_tokens > room - 1) max_tokens = room - 1;
 
         bool use_color = isatty(STDOUT_FILENO) != 0;
+        /* L365: where the prompt leaves the turn -- the generation prompt's thinking, or (Gemma) a thought channel
+         * reopened after the tool responses */
+        const bool reasoning_open = pulsar_chat_opens_reasoning(w->engine, &w->transcript, think_mode);
         agent_token_renderer renderer = {
             .engine = w->engine,
             .worker = w,
             .format_markdown = use_color,
-            .think = {.in_think = pulsar_think_mode_enabled(think_mode)},
+            .think = {.in_think = reasoning_open},
             .use_color = use_color,
             .last_output_newline = true,
         };
@@ -215,6 +221,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             .renderer = &renderer,
             .parser = &dsml,
         };
+        /* L365: every family but DeepSeek calls tools in its own syntax, read by its output parser; the guard
+         * frees it on every exit from the round */
+        struct family_guard {
+            out_parser *p;
+            ~family_guard() { agent_family_parser_free(p); }
+        } family = {NULL};
+        if (!agent_worker_dsml(w)) {
+            family.p = agent_family_parser_new(w->engine, reasoning_open, err, sizeof(err));
+            if (!family.p) {
+                agent_set_error(w, err);
+                return 1;
+            }
+            stream.family = family.p;
+        }
         agent_edit_upto_forcer upto_forcer = {0};
         bool got_tool = false;
         bool malformed_tool = false;
@@ -318,7 +338,21 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "incomplete DSML tool call");
         }
 
-        pulsar_chat_end_assistant(w->engine, &w->transcript);
+        if (family.p) {   /* the parser has read the whole turn (agent_stream_text's finish above) */
+            if (stream.family_error[0]) {
+                malformed_tool = true;
+                snprintf(dsml.error, sizeof(dsml.error), "%s", stream.family_error);
+            } else if (!family.p->calls().empty()) {
+                if (agent_family_calls_take(family.p, &dsml.calls, dsml.error, sizeof(dsml.error))) got_tool = true;
+                else malformed_tool = true;
+            }
+        }
+
+        /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses */
+        if (family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine))
+            w->model_turn_open = true;
+        else
+            pulsar_chat_end_assistant(w->engine, &w->transcript);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
@@ -326,6 +360,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 0;
         }
 
+        std::vector<char *> each;   /* the family path's per-call results (owned) */
+        struct each_guard {
+            std::vector<char *> *v;
+            ~each_guard() { for (char *s : *v) free(s); }
+        } each_free = {&each};
         char *tool_result;
         if (early_tool_error) {
             agent_buf b = {0};
@@ -337,10 +376,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             tool_result = agent_buf_take(&b);
         } else if (malformed_tool) {
             agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
+            agent_buf_puts(&b, family.p ? "Tool error: invalid tool call: " : "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, agent_dsml_syntax_reminder);
+            if (!family.p) agent_buf_puts(&b, agent_dsml_syntax_reminder);
+            tool_result = agent_buf_take(&b);
+        } else if (family.p) {
+            /* L365: one result per call, each its own tool message naming its function (the templates answer calls
+             * one by one); `tool_result` is their concatenation, for the context check */
+            agent_buf b = {0};
+            for (int i = 0; i < dsml.calls.len; i++) {
+                char *res = agent_execute_tool_call_one(w, &dsml.calls.v[i]);
+                each.push_back(res);
+                agent_buf_puts(&b, res);
+            }
             tool_result = agent_buf_take(&b);
         } else {
             tool_result = agent_execute_tool_calls(w, &dsml.calls);
@@ -378,6 +427,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          AGENT_TOOL_RESULT_RESERVE_TOKENS);
                 agent_buf_puts(&b, msg);
                 tool_result = agent_buf_take(&b);
+                for (char *s : each) free(s);
+                each.clear();   /* the one error answers the round's calls */
                 if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
                     free(tool_result);
                     agent_dsml_parser_free(&dsml);
@@ -386,7 +437,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        agent_turn_add(w, "tool", tool_result, false);
+        if (!each.empty()) {
+            for (size_t i = 0; i < each.size(); i++) agent_turn_add_tool(w, dsml.calls.v[i].name, each[i]);
+        } else {
+            agent_turn_add_tool(w, family.p && dsml.calls.len > 0 ? dsml.calls.v[0].name : NULL, tool_result);
+        }
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 

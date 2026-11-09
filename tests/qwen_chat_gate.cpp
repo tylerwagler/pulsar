@@ -531,6 +531,15 @@ static void e1_effort(void) {
  * piece is the full render and its KV continues across turns.  The one edge that is the model's is where a
  * generation prompt meets the sampled turn: the whole text may merge across it (an empty reasoning's
  * "<think>\n" + "\n</think>" holds one "\n\n" token), so there the piece's last token is not compared. */
+/* L365: the agent's head declares tools (pulsar_chat_open_tools): head(tools) + turns must still compose the full
+ * render with those tools */
+static const char kC1Tools[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a file.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},"
+    "\"start_line\":{\"type\":\"number\"}},\"required\":[\"path\"]}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"grep\",\"description\":\"Search.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}}]";
+
 static void c1_composition(const bpe_tokenizer *t) {
     struct piece { std::string text; std::vector<pulsar_text_span> spans; bool sampled; };
     const qwen_tool_call_in call = {"read_file", "{\"path\": \"a.txt\", \"lines\": 3}"};
@@ -555,7 +564,7 @@ static void c1_composition(const bpe_tokenizer *t) {
     const qwen_effort efforts[] = {QWEN_EFFORT_XHIGH, QWEN_EFFORT_MEDIUM, QWEN_EFFORT_LOW, QWEN_EFFORT_NONE};
     int bad = 0, n = 0;
     for (int c = 0; c < 2; c++) {
-        for (qwen_effort eff : efforts) {
+        for (qwen_effort eff : efforts) for (const char *tj : {(const char *)NULL, kC1Tools}) {
             const qwen_msg_in *m = convs[c];
             const int len = lens[c];
             const bool thinking = eff != QWEN_EFFORT_NONE;
@@ -563,7 +572,7 @@ static void c1_composition(const bpe_tokenizer *t) {
             std::vector<piece> pieces;
             qwen_render_out r;
             const bool sys = !strcmp(m[0].role, "system");
-            bool ok = qwen_chat_render_head(sys ? m[0].content : NULL, eff, &r, err, sizeof err);
+            bool ok = qwen_chat_render_head(sys ? m[0].content : NULL, tj, eff, &r, err, sizeof err);
             pieces.push_back({r.text, r.spans, false});
             int i = sys ? 1 : 0;
             while (ok && i < len) {
@@ -585,7 +594,7 @@ static void c1_composition(const bpe_tokenizer *t) {
             if (!thinking)
                 for (auto &x : full_msgs) x.reasoning = NULL;
             qwen_render_out full;
-            ok = ok && qwen_chat_render({full_msgs.data(), len, NULL, eff, true}, &full, err, sizeof err);
+            ok = ok && qwen_chat_render({full_msgs.data(), len, tj, eff, true}, &full, err, sizeof err);
             std::string text;
             for (const piece &p : pieces) text += p.text;
             const int before = g_fail;
@@ -632,7 +641,7 @@ static void c1_composition(const bpe_tokenizer *t) {
             n++;
         }
     }
-    printf("C1 turn-by-turn composition: %d conversations x efforts, %d mismatched\n", n, bad);
+    printf("C1 turn-by-turn composition: %d conversations x efforts x tools, %d mismatched\n", n, bad);
 }
 
 int main(int argc, char **argv) {

@@ -11,6 +11,7 @@
 #include "../src/agent/session_ui.cpp"
 #include "../src/agent/file_tools.cpp"
 #include "../src/agent/edit_tools.cpp"
+#include "../src/agent/family_tools.cpp"
 #include "../src/agent/bash_jobs.cpp"
 #include "../src/agent/tool_dispatch.cpp"
 #include "../src/agent/compaction.cpp"

@@ -2,6 +2,9 @@
  *  pulsar-agent: streaming tool visualisation -- hides raw DSML and paints compact per-tool
  *  progress while the model is still sampling. */
 #include "pulsar_agent_internal.h"
+#include "out_parse_kit.h"
+#include "pyjson.h"
+#include "chat_render_kit.h"
 
 
 
@@ -961,7 +964,93 @@ struct agent_stream_think_sink {
     }
 };
 
+/** @brief L365: paint one completed family call through the tool visualizer -- the same projection a DSML call
+ *  gets, fed from the call's arguments object instead of the stream.
+ *  @param sr        the stream renderer
+ *  @param name      the function name
+ *  @param arguments the arguments, a JSON object's text */
+static void agent_stream_family_call(agent_stream_renderer *sr, const std::string &name, const std::string &arguments) {
+    agent_tool_viz_start(sr);
+    agent_tool_viz_tool(sr, name.c_str());
+    pyjson_value v;
+    char jerr[160];
+    if (pyjson_parse(arguments.data(), arguments.size(), &v, jerr, sizeof jerr) && v.kind == pyjson_value::OBJ) {
+        for (const auto &m : v.o) {
+            const std::string text = m.second.kind == pyjson_value::STR ? m.second.s : py_tojson(m.second);
+            agent_tool_viz_param_begin(sr, m.first.c_str());
+            for (char c : text) agent_tool_viz_param_value_byte(sr, c);
+            agent_tool_viz_param_end(sr);
+        }
+    }
+    agent_tool_viz_render_read(sr);
+    agent_tool_viz_finish(sr, NULL);
+}
+
+/** @brief L365: a non-DSML family's stream -- the raw bytes to its output parser, the display from its events.
+ *  Reasoning shows grey, the reply as markdown; a call shows once it closes; a malformed call is reported and its
+ *  diagnostic kept for the retry (family_error).
+ *  @param sr     the stream renderer (sr->family set)
+ *  @param text   the bytes (NULL with finish)
+ *  @param len    byte count
+ *  @param finish the round ended: release held bytes, report an unterminated call */
+static void agent_stream_family_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
+    std::vector<out_event> ev;
+    if (len) sr->family->feed(text, len, &ev);
+    if (finish) sr->family->finish(&ev);
+    agent_token_renderer *r = sr->renderer;
+    for (const out_event &e : ev) {
+        switch (e.kind) {
+        case out_event::REASONING:
+            if (!r->think.in_think) {
+                r->think.in_think = true;
+                renderer_restore_text_attrs(r);
+            }
+            for (char c : e.text) renderer_write_char(r, c);
+            break;
+        case out_event::CONTENT:
+            if (r->think.in_think) {
+                r->think.in_think = false;
+                renderer_reset_color(r);
+                sr->family_gap = true;
+            }
+            for (char c : e.text) {
+                if (sr->family_gap && (c == ' ' || c == '\t' || c == '\r' || c == '\n')) continue;
+                sr->family_gap = false;
+                renderer_write_char(r, c);
+            }
+            break;
+        case out_event::TOOL_END:
+            if (r->think.in_think) {
+                r->think.in_think = false;
+                renderer_reset_color(r);
+            }
+            sr->family_gap = true;
+            agent_trace(r->worker, "family call %d %s", e.index, e.name.c_str());
+            agent_stream_family_call(sr, e.name, e.arguments);
+            break;
+        case out_event::ERROR: {
+            if (!sr->family_error[0])
+                snprintf(sr->family_error, sizeof sr->family_error, "%s", e.text.c_str());
+            agent_trace(r->worker, "family call error %s", e.text.c_str());
+            char status[300];
+            snprintf(status, sizeof status, "[invalid tool call: %s]\n", e.text.c_str());
+            agent_tool_viz_start(sr);
+            agent_tool_viz_finish(sr, status);
+            break;
+        }
+        case out_event::TOOL_BEGIN:
+        case out_event::TOOL_ARGS:
+            break;
+        }
+    }
+}
+
 void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish) {
+    if (sr->family) {
+        if (len) renderer_restore_text_attrs(sr->renderer);
+        agent_stream_family_text(sr, text, len, finish);
+        return;
+    }
     /* The UI may reset terminal attributes while redrawing the editable prompt
      * between generated chunks.  If a DSML parameter is still streaming, make
      * each new token fragment self-contained by restoring the active parameter

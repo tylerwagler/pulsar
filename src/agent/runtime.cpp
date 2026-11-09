@@ -627,6 +627,12 @@ int main(int argc, char **argv) {
             pulsar_engine_close(engine);
             return 2;
         }
+        /* L365: tools are called in the family's own syntax; a family the agent cannot do that on is refused */
+        if (!agent_family_tools_supported(engine, why, sizeof why)) {
+            fprintf(stderr, "pulsar-agent: %s family: %s\n", pulsar_engine_family_name(engine), why);
+            pulsar_engine_close(engine);
+            return 2;
+        }
     }
     {
         char ctxmem_line[256];

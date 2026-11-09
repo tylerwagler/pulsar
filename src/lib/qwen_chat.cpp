@@ -443,11 +443,20 @@ bool qwen_chat_render_tail(const qwen_msg_in *msgs, int n, qwen_effort effort, q
     return finish(out, err, errlen);
 }
 
-bool qwen_chat_render_head(const char *system, qwen_effort effort, qwen_render_out *out, char *err, size_t errlen) {
+bool qwen_chat_render_head(const char *system, const char *tools_json, qwen_effort effort, qwen_render_out *out,
+                           char *err, size_t errlen) {
     out->text.clear();
     out->spans.clear();
     writer w{out};
-    write_head(w, NULL, system, effort);
+    pyjson_value tools;
+    if (tools_json) {
+        char jerr[160];
+        if (!pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr))
+            return chat_refuse(err, errlen, "tools_not_array", "tools: %s", jerr);
+        if (tools.kind != pyjson_value::ARR)
+            return chat_refuse(err, errlen, "tools_not_array", "tools is not a JSON array");
+    }
+    write_head(w, tools_json && !tools.a.empty() ? &tools : NULL, system, effort);
     return finish(out, err, errlen);
 }
 

@@ -520,9 +520,17 @@ bool gemma4_chat_render(const gemma4_render_in &in, gemma4_render_out *out, char
     return chat_render_finish(out, err, errlen);
 }
 
-bool gemma4_chat_render_head(const char *system, bool thinking, gemma4_render_out *out, char *err, size_t errlen) {
+bool gemma4_chat_render_head(const char *system, const char *tools_json, bool thinking, gemma4_render_out *out,
+                             char *err, size_t errlen) {
     out->text.clear();
     out->spans.clear();
+    pyjson_value tools;
+    const bool have_tools = tools_json && tools_json[0];
+    if (have_tools) {
+        char jerr[200];
+        if (!pyjson_parse(tools_json, strlen(tools_json), &tools, jerr, sizeof jerr) || tools.kind != pyjson_value::ARR)
+            return chat_refuse(err, errlen, "tools_not_array", "the tools are not a JSON array");
+    }
     gemma4_msg_in sys = {};
     sys.role = "system";
     sys.content = system;
@@ -530,7 +538,8 @@ bool gemma4_chat_render_head(const char *system, bool thinking, gemma4_render_ou
     chat_writer w{out};
     prev_type prev;
     int taken;
-    if (!write_setup(w, has_system ? &sys : NULL, has_system ? 1 : 0, NULL, thinking, &prev, &taken, err, errlen))
+    if (!write_setup(w, has_system ? &sys : NULL, has_system ? 1 : 0, have_tools ? &tools : NULL, thinking, &prev,
+                     &taken, err, errlen))
         return false;
     return chat_render_finish(out, err, errlen);
 }
@@ -541,6 +550,26 @@ bool gemma4_chat_render_turn(const gemma4_msg_in *msgs, int n, bool thinking, bo
     out->spans.clear();
     chat_writer w{out};
     if (!write_messages(w, msgs, n, thinking, generation_prompt, PREV_NONE, err, errlen)) return false;
+    return chat_render_finish(out, err, errlen);
+}
+
+bool gemma4_chat_render_tool_turn(const gemma4_msg_in *msgs, int n, bool thinking, bool generation_prompt,
+                                  gemma4_render_out *out, char *err, size_t errlen) {
+    out->text.clear();
+    out->spans.clear();
+    chat_writer w{out};
+    int k = 0;
+    while (k < n && msgs[k].role && !strcmp(msgs[k].role, "tool")) {
+        tool_response_block(w, msgs[k].name && msgs[k].name[0] ? msgs[k].name : NULL, msgs[k].content);
+        k++;
+    }
+    if (k == 0) return chat_refuse(err, errlen, "no_tool_response", "the turn does not open with a tool message");
+    if (k < n) {   /* the model's turn ends with its responses (no content); the rest are turns of their own */
+        w.lit("<turn|>\n");
+        if (!write_messages(w, msgs + k, n - k, thinking, generation_prompt, PREV_NONE, err, errlen)) return false;
+    } else if (generation_prompt && thinking) {
+        w.lit("<|channel>thought\n");   /* the template's generation prompt after a tool response */
+    }
     return chat_render_finish(out, err, errlen);
 }
 

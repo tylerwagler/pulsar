@@ -239,9 +239,11 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
 
 
 /* The transcript's head, through the family's chat front: the built-in tool prompt is trusted control text
- * (DeepSeek keeps its DSML markers native); the -sys text is client text after it. */
+ * (DeepSeek keeps its DSML markers native); the -sys text is client text after it.  Every other family's head
+ * also declares the tools in its own template (L365, pulsar_chat_open_tools). */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
-    char *tools_prompt = agent_build_tools_prompt();
+    const bool dsml = agent_worker_dsml(w);
+    char *tools_prompt = agent_build_tools_prompt(dsml);
     const char *extra = w->cfg->gen.system;
     char *system = NULL;
     if (extra && extra[0]) {
@@ -250,7 +252,13 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
         memcpy(system, "\n\n", 2);
         memcpy(system + 2, extra, n + 1);
     }
-    pulsar_chat_open(w->engine, out, tools_prompt, system, w->cfg->gen.think_mode);
+    if (dsml) {
+        pulsar_chat_open(w->engine, out, tools_prompt, system, w->cfg->gen.think_mode);
+    } else {
+        char *tools = agent_build_tools_json();
+        pulsar_chat_open_tools(w->engine, out, tools_prompt, system, tools, w->cfg->gen.think_mode);
+        free(tools);
+    }
     free(system);
     free(tools_prompt);
 }
@@ -262,7 +270,19 @@ void agent_turn_add(agent_worker *w, const char *role, const char *content, bool
         w->turn_cap = w->turn_cap ? w->turn_cap * 2 : 4;
         w->turn = (pulsar_chat_message *)agent_xrealloc(w->turn, (size_t)w->turn_cap * sizeof(w->turn[0]));
     }
-    w->turn[w->turn_len++] = {role, xstrdup(content ? content : ""), trusted};
+    w->turn[w->turn_len++] = {role, xstrdup(content ? content : ""), trusted, NULL};
+}
+
+void agent_turn_add_tool(agent_worker *w, const char *name, const char *content) {
+    agent_turn_add(w, "tool", content, false);
+    w->turn[w->turn_len - 1].name = name ? xstrdup(name) : NULL;
+}
+
+void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
+    if (!w->model_turn_open) return;
+    if (w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;   /* the turn being built answers it */
+    pulsar_chat_end_assistant(w->engine, tokens);
+    if (tokens == &w->transcript) w->model_turn_open = false;
 }
 
 
@@ -280,14 +300,19 @@ void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsa
 
 
 void agent_turn_clear(agent_worker *w) {
-    for (int i = 0; i < w->turn_len; i++) free((char *)w->turn[i].content);
+    for (int i = 0; i < w->turn_len; i++) {
+        free((char *)w->turn[i].content);
+        free((char *)w->turn[i].name);
+    }
     w->turn_len = 0;
 }
 
 
 
 void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
+    agent_worker_close_open_turn(w, &w->transcript);
     agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
+    w->model_turn_open = false;   /* answered by the turn's tool messages, or closed above */
     agent_turn_clear(w);
 }
 

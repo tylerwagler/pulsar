@@ -262,7 +262,7 @@ typedef struct pulsar_family_tokenizer {
     /** The chat front turn by turn (pulsar.h pulsar_chat_open / _append_turn / _end_assistant): the head, one
      *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
     void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
-                      pulsar_think_mode think_mode);
+                      const char *tools_json, pulsar_think_mode think_mode);
     /** Append `n` messages rendered whole, then the assistant generation prompt when `generation_prompt`. */
     void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                       bool generation_prompt, pulsar_think_mode think_mode);
