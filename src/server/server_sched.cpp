@@ -2788,7 +2788,7 @@ bool server::worker_readmit_preempted() {
         int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
         KvBytes drop[PULSAR_SESSION_POOL_CAP];
         const int n_victims = guard_spill_victims(s, NULL, 0, order, drop);
-        bool busy = false;   /* another job whose end may make room */
+        bool busy = server_judge_holds_kv(s);   /* another job whose end may make room (L372: a judge request's) */
         int n_decoding = 0;
         for (int i = 0; i < s->n_slots; i++) {
             busy = busy || (&s->slots[i] != v && s->slots[i].active_job && !s->slots[i].preempted);
@@ -2800,6 +2800,8 @@ bool server::worker_readmit_preempted() {
                 pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{PULSAR_SERVER_DECODE_QUANTUM_TOKENS}));
         const prompt_kv_verdict pv = server_prompt_kv_verdict(s->kv_reserved_bytes(v), want,
                                                               s->guard_budget(), drop, n_victims, busy, &n_spill);
+        /* L372 (O12): no idle chat bank makes the room -- the judge bank's KV may; the next pass decides again */
+        if ((pv == PROMPT_KV_WAIT || pv == PROMPT_KV_REFUSE) && server_judge_release(s)) return false;
         if (pv == PROMPT_KV_WAIT) return false;
         if (pv == PROMPT_KV_REFUSE) {
             /* nothing running will make room and no spill does: it can never come back -- ended by name (Flare: a
@@ -3078,7 +3080,7 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
     const int n_victims = guard_spill_victims(s, self, sl ? 1 : 0, order, drop);
     /* a bank bound to a job now is a victim once that job ends */
-    bool busy = false;
+    bool busy = server_judge_holds_kv(s);   /* L372 (O12): as is the judge bank under a judge request */
     for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
     /* L326: from the reserved base -- prompts bound earlier in this worker turn have touched nothing yet */
     return server_prompt_kv_verdict(s->kv_reserved_bytes(sl), *need, s->guard_budget(), drop, n_victims, busy,
@@ -3094,8 +3096,10 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
     prompt_kv_verdict v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     /* L314: no idle bank can make room: the newest running decoders are preempted through their terminal checkpoints,
      * one at a time, while that can (a prompt whose growth alone is past the budget never fits) */
+    /* L372 (O12): the judge bank goes first -- its KV is in the same resident sum, and before this it was never a
+     * victim: a large judge state lowered what chat could admit until restart */
     while ((v == PROMPT_KV_WAIT || v == PROMPT_KV_REFUSE) && need <= s->guard_budget() &&
-           s->preempt_newest_decoder(sl, need))
+           (server_judge_release(s) || s->preempt_newest_decoder(sl, need)))
         v = s->prompt_kv_check(sl, j, order, &n_spill, &need);
     if (v == PROMPT_KV_FITS) return true;
     const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -3175,6 +3179,32 @@ KvBytes server::prefill_chunk_need() {
     return pulsar_session_quantum_growth_bytes_per_bank(sess, pulsar_kv_rows(pulsar_session_prefill_cap(sess)));
 }
 
+bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
+    auto *s = this;
+    /* a host-only server (the unit tests) has no session to price a row by: the floor alone decides */
+    const KvBytes need = s->sess ? pulsar_session_quantum_growth_bytes_per_bank(s->sess, KvRows{(uint32_t)rows})
+                                 : KvBytes{};
+    const KvBytes floor = server_mem_floor();
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    KvBytes avail{server_mem_available_bytes()};
+    int spilled = 0;
+    for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
+        int useful[PULSAR_SESSION_POOL_CAP];
+        const int n_idle = s->guard_enabled && s->pool_banks > 0 ? guard_spill_victims(s, NULL, 0, useful, NULL) : 0;
+        const prefill_mem_step step = server_prefill_mem_step(avail, need, floor, n_idle, /*preemptible=*/false);
+        if (step == PREFILL_MEM_GO) return true;
+        if (step != PREFILL_MEM_SPILL || !s->spill_bank(&s->slots[useful[0]])) break;
+        s->count_metric(&s->m_spills);
+        spilled++;
+        avail = KvBytes{server_mem_available_bytes()};
+    }
+    snprintf(err, errlen,
+             "not enough memory for the next chunk now (MemAvailable %.2f GiB, the chunk %.2f GiB, floor %.2f GiB, "
+             "after %d spill(s)); retry later",
+             (double)avail.raw() / gib, (double)need.raw() / gib, (double)floor.raw() / gib, spilled);
+    return false;
+}
+
 bool server::prefill_headroom_ok(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -3194,6 +3224,13 @@ bool server::prefill_headroom_ok(session_slot *sl) {
             decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
         const prefill_mem_step step = server_prefill_mem_step(avail, need, floor, n_idle, decoders && !preempt_tried);
         if (step == PREFILL_MEM_GO) return true;
+        /* L372 (O12): with no idle chat bank left, the judge bank goes before a decoder is preempted or the prompt
+         * refused (server_judge_release: never under a judge request) */
+        if (step != PREFILL_MEM_SPILL && server_judge_release(s)) {
+            if (!s->bank_switch(sl->bank)) { why = "the bank could not be reinstalled after a remedy"; break; }
+            avail = KvBytes{server_mem_available_bytes()};
+            continue;
+        }
         if (step == PREFILL_MEM_REFUSE) break;
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: prefill on bank %u: MemAvailable %.2f GiB does not cover the next chunk's %.2f GiB "
@@ -3279,6 +3316,8 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
          * preempted through their terminal checkpoints (L314), one at a time while one makes the others' growth fit
          * -- where that makes progress (server_guard_may_preempt).  Before, the guard proceeded past its budget here whenever every bank was live,
          * the MemAvailable floor the only backstop (L319 item 2; gpuq #472's "NO idle victim -- back-pressure"). */
+        /* L372 (O12): the judge bank first, when it is no judge request's now */
+        if (s->kv_reserved_bytes(NULL) + dpb.times((uint64_t)n) > bound) (void)server_judge_release(s);
         bool reserving = false;
         for (int i = 0; i < s->n_slots && !reserving; i++) reserving = server_slot_reserves(&s->slots[i]);
         while (s->kv_reserved_bytes(NULL) + dpb.times((uint64_t)n) > bound && server_guard_may_preempt(n, reserving) &&

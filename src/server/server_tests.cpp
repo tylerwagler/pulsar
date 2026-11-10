@@ -9620,6 +9620,64 @@ static void test_l372_evict_snapshot_word(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* L372 (O12): the judge bank in the guard's order, and the judge's own floor.  (a) a judge chunk the memory floor
+ * does not admit, with no idle chat bank to spill, is answered busy -- before anything is installed, the bank as it
+ * stood.  (b) the judge bank is the relief after the idle chat banks (server_prefill_mem_step says "spill" while one
+ * is left) and before a decoder or a refusal -- only while no judge request is running or queued, and once.  No
+ * session here: the bank holds no resident KV, so a release frees nothing and says so. */
+static void test_l372_judge_bank_floor_and_release(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.live_bank = -1;
+    TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s) && !server_judge_holds_kv(&s));   /* no judge */
+    server_judge *J = new server_judge();
+    J->bank = 1;
+    s.judge = J;
+    TEST_ASSERT(server_judge_releasable(&s));
+    TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
+    /* the order: an idle chat bank is spilled first; the judge bank's turn is where the step would preempt or refuse */
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 1, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, false) == PREFILL_MEM_REFUSE);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        judge_job jb;
+        pthread_mutex_init(&jb.mu, NULL);
+        pthread_cond_init(&jb.cv, NULL);
+        jb.fd = sv[0];
+        pulsar_tokens prompt = {0};
+        pulsar_tokens_push(&prompt, 1);
+        jb.prompts.push_back(prompt);
+        J->head = J->tail = &jb;
+        /* a judge request running or queued: the bank is its own */
+        TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s));
+        J->released = true;
+        TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
+        J->released = false;
+        /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
+        (void)server_mem_floor_init(UINT64_MAX / 4, KvBytes{0});
+        char err[320] = "";
+        TEST_ASSERT(!s.floor_admits_chunk(1024, err, sizeof err) && strstr(err, "not enough memory") != NULL);
+        TEST_ASSERT(server_judge_step(&s));
+        (void)server_mem_floor_init(0, KvBytes{0});
+        TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
+        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == -1);
+        TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
+        pulsar_tokens_free(&jb.prompts[0]);
+        pthread_cond_destroy(&jb.cv);
+        pthread_mutex_destroy(&jb.mu);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    J->released = true;
+    TEST_ASSERT(!server_judge_releasable(&s));   /* freed once: not again until a request re-backs it */
+    server_judge_close(&s);
+    pthread_mutex_destroy(&s.mu);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15418,6 +15476,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
+    test_l372_judge_bank_floor_and_release();
     test_l372_evict_snapshot_word();
     test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();

@@ -3038,6 +3038,14 @@ struct server {
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     /// @return true when the quantum may start; false = refused (503 sent, gen done)
     bool prefill_headroom_ok(session_slot *sl);
+    /** L372 (O12): the per-chunk memory floor for a prefill that is no slot's -- the judge's.  MemAvailable must cover
+     *  `rows` new KV rows over the floor (prefill_headroom_ok's rule, server_prefill_mem_step); short of it the idle
+     *  chat banks are spilled, least recently used first, until it does.  No decoder is preempted for it. */
+    /// @param rows       the chunk's rows
+    /// @param err        receives the refusal (the numbers, and how many banks were spilled)
+    /// @param errlen     its size
+    /// @return true when the chunk may run; false = the floor still stands (the caller answers 503)
+    bool floor_admits_chunk(int rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -4782,6 +4790,24 @@ bool server_judge_queued(const struct server *s);
  *  @param s the server
  *  @return true when it did work */
 bool server_judge_step(struct server *s);
+/** L372 (O12): may the judge bank's physical KV be freed for chat -- a judge exists, its bank is backed, and no judge
+ *  request is running or queued (a running one stays at the queue's head until it is answered).
+ *  @param s the server
+ *  @return true when server_judge_release may free it */
+bool server_judge_releasable(struct server *s);
+/** L372 (O12): free the judge bank's physical KV, for chat's use: the last relief before a decoder is preempted or a
+ *  request answered 503, after the idle chat banks.  The pool is parked on a resident chat bank first when nothing
+ *  is installed (free_physical refuses the installed bank; the judge's step leaves its own installed).  The next
+ *  judge request re-backs the bank empty and prefills again (server_judge_step).  Worker thread.
+ *  @param s the server
+ *  @return true when resident KV was freed */
+bool server_judge_release(struct server *s);
+/** L372 (O12): is the judge bank's KV held by a judge request now -- resident and not releasable until that request
+ *  ends?  Its end makes room as a busy chat bank's does, so a verdict that finds no victim waits instead of
+ *  refusing.
+ *  @param s the server
+ *  @return true when a running or queued judge request keeps resident judge KV */
+bool server_judge_holds_kv(struct server *s);
 /** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer.
  *  @param s    the server
  *  @param fd   the client socket (the answer is written here)

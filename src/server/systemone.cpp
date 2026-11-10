@@ -69,6 +69,7 @@ struct judge_job {
     int pos = 0;                          ///< tokens of prompts[at] the bank holds
     bool started = false;                 ///< prompts[at]'s prefill has begun
     bool done = false;                    ///< the worker has finished with it
+    bool busy = false;                    ///< its refusal is "no memory now": answered 503 with Retry-After (L372)
     int fd = -1;                          ///< the client socket (the worker's disconnect poll, L372)
     pthread_mutex_t mu;                   ///< guards done
     pthread_cond_t cv;                    ///< signalled when done
@@ -87,6 +88,9 @@ struct server_judge {
     judge_job *head = nullptr;            ///< queue head (under server::mu)
     judge_job *tail = nullptr;            ///< queue tail (under server::mu)
     uint64_t served = 0;                  ///< questions answered (worker)
+    /** L372 (O12): the bank's physical KV was freed for chat (server_judge_release); the next request re-backs it
+     *  empty.  Worker thread. */
+    bool released = false;
 };
 
 namespace {
@@ -302,6 +306,44 @@ void server_judge_close(server *s) {
 /// @return true when the worker has judge work
 bool server_judge_queued(const server *s) { return s->judge && s->judge->head; }
 
+bool server_judge_releasable(server *s) {
+    const server_judge *J = s->judge;
+    if (!J || J->released) return false;
+    pulsar::ScopedLock lk(&s->mu);
+    return J->head == NULL;
+}
+
+bool server_judge_holds_kv(server *s) {
+    const server_judge *J = s->judge;
+    if (!J || J->released) return false;
+    {
+        pulsar::ScopedLock lk(&s->mu);
+        if (!J->head) return false;
+    }
+    return pulsar_session_bank_touched_kv_bytes(s->sess, (uint32_t)J->bank) > KvBytes{};
+}
+
+bool server_judge_release(server *s) {
+    server_judge *J = s->judge;
+    if (!server_judge_releasable(s)) return false;
+    pulsar_session *pool = s->sess;
+    const KvBytes held = pulsar_session_bank_touched_kv_bytes(pool, (uint32_t)J->bank);
+    if (held == KvBytes{}) return false;   /* nothing resident: freeing it makes no room */
+    if (s->live_bank < 0) {
+        /* nothing the server installed: the engine's bank may be the judge's own (its step leaves it so) */
+        const int park = s->park_bank(J->bank);
+        if (park < 0 || !pulsar_session_bank_state_restore(pool, (uint32_t)park)) return false;
+        s->live_bank = park;
+        s->slots[park].committed_pos = pulsar_session_pos(pool);
+    }
+    if (!pulsar_session_bank_free_physical(pool, (uint32_t)J->bank)) return false;
+    J->released = true;
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d's KV freed for chat (%.2f GiB; no judge "
+               "request waits): the next one re-backs it empty and prefills again", J->bank,
+               (double)held.raw() / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
 bool server_judge_step(server *s) {
     server_judge *J = s->judge;
     if (!J) return false;
@@ -331,16 +373,36 @@ bool server_judge_step(server *s) {
     }
     pulsar_session *pool = s->sess;
     pulsar_stall_mark("worker: systemone");
+    char err_floor[320] = "";
+    /* L372 (O12 a): the judge's chunk obeys the per-chunk memory floor a chat prefill obeys, with the guard's spills
+     * as its relief; short of it the request is answered 503 with the retry hint.  Before anything is installed: the
+     * bank stays valid where it stands, and the next request resumes on it. */
+    if (!s->floor_admits_chunk(JUDGE_CHUNK_TOKENS, err_floor, sizeof err_floor)) {
+        server_log(PULSAR_LOG_WARNING, "pulsar-server: /v1/systemone REFUSED (503): %s", err_floor);
+        pop();
+        jb->busy = true;
+        judge_finish(jb, err_floor);
+        return true;
+    }
     /* install the judge bank: the chat bank installed saved first (bank_switch's rule) */
     if (s->live_bank >= 0 && s->live_bank != J->bank) {
         s->slots[s->live_bank].committed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, (uint32_t)s->live_bank);
     }
     s->live_bank = -1;
-    if (!pulsar_session_bank_state_restore(pool, (uint32_t)J->bank)) {
+    /* L372 (O12 b): a bank freed for chat is re-backed, and comes back EMPTY (its carry still names the freed rows) */
+    const bool reback = J->released;
+    if ((reback && !pulsar_session_bank_alloc_physical(pool, (uint32_t)J->bank)) ||
+        !pulsar_session_bank_state_restore(pool, (uint32_t)J->bank)) {
         pop();
-        judge_finish(jb, "the judge bank could not be installed");
+        judge_finish(jb, reback ? "the judge bank could not be re-backed" : "the judge bank could not be installed");
         return true;
+    }
+    if (reback) {
+        pulsar_session_invalidate(pool);
+        pulsar_session_bank_state_save(pool, (uint32_t)J->bank);
+        J->released = false;
+        server_log(PULSAR_LOG_DEFAULT, "pulsar-server: /v1/systemone: bank %d re-backed empty", J->bank);
     }
     char err[256] = "";
     const pulsar_tokens &P = jb->prompts[jb->at];
@@ -548,7 +610,8 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     while (!jb->done) pthread_cond_wait(&jb->cv, &jb->mu);
     pthread_mutex_unlock(&jb->mu);
     if (!jb->err.empty()) {
-        http_error(fd, 503, jb->err.c_str());
+        if (jb->busy) http_error_retry(fd, 503, jb->err.c_str(), HTTP_RETRY_BUSY_S);
+        else http_error(fd, 503, jb->err.c_str());
         free_job();
         return;
     }
