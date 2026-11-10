@@ -222,7 +222,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
 
 
 /* The transcript's head, through the family's chat front: the built-in tool prompt is trusted control text
- * (DeepSeek keeps its DSML markers native); the -sys text is client text after it.  Every other family's head
+ * (DeepSeek keeps its DSML markers native); the -sys text (UTF-8: main refuses any other) is client text after it.  Every other family's head
  * also declares the tools in its own template (L365, pulsar_chat_open_tools). */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
     const bool dsml = agent_worker_dsml(w);

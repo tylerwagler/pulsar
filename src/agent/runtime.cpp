@@ -612,6 +612,16 @@ int main(int argc, char **argv) {
         return 2;
     }
     cfg.unattended = cfg.non_interactive || !stdin_tty;
+    /* L373: the -sys text goes into the transcript's head through pulsar_chat_open, where a tokenizer that refuses
+     * non-UTF-8 would leave no head at all: refused here, by name */
+    if (cfg.gen.system) {
+        char *repaired = agent_utf8_repaired(cfg.gen.system);
+        if (repaired) {
+            free(repaired);
+            fprintf(stderr, "pulsar-agent: the -sys text is not UTF-8 -- refusing\n");
+            return 2;
+        }
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "pulsar-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
