@@ -1157,6 +1157,23 @@ int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap) {
                 !ops || !ops->hidden ? "the family offers no hidden-state readout" : "no buffer, or a mirrored session");
         return 0;
     }
+    /* L375 O47: the readout is ONE row a session -- the last any step headed, whichever bank and position that was --
+     * so it is served only as what the caller means by it: the live bank's last row, the one its valid view ends on
+     * (a sync's last prompt token).  Another bank's row, a verify's rejected draft row, or a view no row was headed
+     * for (a prompt end restored from its record) is refused by name. */
+    const pulsar_driver_state *d = s->driver;
+    const uint32_t live = pulsar_session_live_bank(s);
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0 || !d->hidden_valid || d->hidden_bank != live ||
+        d->hidden_pos != (uint32_t)s->checkpoint.len - 1u) {
+        if (!d->hidden_valid || !s->checkpoint_valid || s->checkpoint.len <= 0)
+            fprintf(stderr, "pulsar: copy hidden: %s -- refusing\n",
+                    !d->hidden_valid ? "no row has been headed (or the step that last headed one failed)"
+                                     : "the live bank holds no valid history");
+        else
+            fprintf(stderr, "pulsar: copy hidden: the readout holds bank %u's row at %u, not the live bank %u's last "
+                            "row at %d -- refusing\n", d->hidden_bank, d->hidden_pos, live, s->checkpoint.len - 1);
+        return 0;
+    }
     return (int)ops->hidden(s, out, (uint32_t)cap);
 }
 

@@ -434,6 +434,15 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     }
     s->dev.step_rows = ok ? d->logits : NULL;
     s->dev.step_n = ok ? heads.n : 0u;
+    /* L375 O47: which row the family's hidden readout now holds -- the last row this step headed (the head calls run
+     * in list order; a step that heads none leaves the readout alone) */
+    if (heads.n) {
+        d->hidden_valid = ok;
+        if (ok) {
+            d->hidden_bank = (uint32_t)bank[heads.row[heads.n - 1u]];
+            d->hidden_pos = (uint32_t)pos[heads.row[heads.n - 1u]];
+        }
+    }
     if (ok && heads.n && logits_out)
         ok = pulsar_gpu_tensor_read(d->logits, 0, logits_out, (uint64_t)heads.n * e->logits_width() * sizeof(float)) != 0;
     return ok;

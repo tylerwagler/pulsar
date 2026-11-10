@@ -449,8 +449,6 @@ struct g4_state : pulsar_driver_state {
     bool step_adapter;
     /// bf16 [n_embd]: L338 P2 -- the final-norm hidden of the last row the head read (the decision head's input)
     pulsar_gpu_tensor *last_hidden;
-    /// The head has run since create: last_hidden holds a row
-    bool headed;
 };
 
 /** A step object: the driver's step (its base) plus the family's view -- the weights and the session state. */
@@ -1099,25 +1097,25 @@ bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out
         return fail("the head linear refused");
     const pulsar_head_decl hd = head_decl(s);
     if (pulsar_head_logits_finish_launch(&hd, logits, n, s.n_vocab, 0) != 0) return fail("the logits finish refused");
-    /* L338 P2: the last headed row's final-norm hidden, kept for the decision head (pulsar_session_copy_hidden) */
+    /* L338 P2: the last headed row's final-norm hidden, kept for the decision head (pulsar_session_copy_hidden; which
+     * row it is, is the driver's record: pulsar_driver_state::hidden_bank / hidden_pos) */
     const uint64_t rb = (uint64_t)s.n_embd * 2u;
     if (pulsar_gpu_tensor_copy_async(st->st->last_hidden, 0, st->st->xa, (uint64_t)(row0 + n - 1) * rb, rb) == 0)
         return fail("could not keep the last row's hidden");
-    st->st->headed = true;
     return true;
 }
 
-/** pulsar_driver_ops::hidden (L338 P2): the last headed row's final-norm hidden, widened from bf16.
+/** pulsar_driver_ops::hidden (L338 P2): the last headed row's final-norm hidden, widened from bf16 (the caller,
+ *  pulsar_session_copy_hidden, has checked which row that is).
  *  @param s      the session
  *  @param out    receives n_embd floats
  *  @param cap    floats at out
- *  @return n_embd, or 0 when nothing was headed or cap is short (said) */
+ *  @return n_embd, or 0 when cap is short or the readback failed (said) */
 uint32_t hidden(pulsar_session *s, float *out, uint32_t cap) {
     g4_state *q = ST(s);
     const uint32_t E = W(s->engine)->shape.n_embd;
-    if (!q->headed || cap < E) {
-        fprintf(stderr, "pulsar: %s: hidden readout: %s -- refusing\n", ARCH,
-                !q->headed ? "no row headed yet" : "the buffer is shorter than the hidden width");
+    if (cap < E) {
+        fprintf(stderr, "pulsar: %s: hidden readout: the buffer is shorter than the hidden width -- refusing\n", ARCH);
         return 0;
     }
     std::vector<uint16_t> h(E);

@@ -102,6 +102,15 @@ struct pulsar_driver_state {
     uint8_t *bank_adapter;
     /** L298: the block drafter's lane (spec_block.h) when the engine loaded one, else NULL */
     struct pulsar_block_lane *block;
+    /** @var pulsar_driver_state::hidden_pos
+     *  L375 O47: the position of the row the hidden readout holds (see hidden_bank) */
+    /** L375 O47: the row a family's hidden readout (pulsar_driver_ops::hidden) holds -- the LAST headed row of the
+     *  last step that headed any -- by bank and position, written by the driver after every such step (a replayed
+     *  graph runs no host code of the head).  pulsar_session_copy_hidden serves it only as the live bank's last
+     *  row. */
+    uint32_t hidden_bank, hidden_pos;
+    /// L375 O47: hidden_bank / hidden_pos name a row (false: nothing headed yet, or the step that last headed failed)
+    bool hidden_valid;
 };
 
 /** Everything an op needs for one step: the core's part.  A family's step EXTENDS it with what its ops read of
@@ -235,7 +244,9 @@ typedef struct pulsar_driver_ops {
     bool (*adapter)(const pulsar_engine *e);
     /** Optional (L338 P2): the final-norm hidden state of the LAST row the head produced logits for (what a decision
      *  head reads: Gemma 4's JEV), widened to f32 into out[0, cap).  Returns the floats written (the model's hidden
-     *  width); 0 = nothing headed yet / cap short / refused.  NULL = not offered (pulsar_session_copy_hidden refuses). */
+     *  width); 0 = cap short / refused.  Which row that is, is the driver's record (pulsar_driver_state::hidden_bank /
+     *  hidden_pos, L375 O47): pulsar_session_copy_hidden calls this only when it is the live bank's last row.  NULL =
+     *  not offered (pulsar_session_copy_hidden refuses). */
     uint32_t (*hidden)(pulsar_session *s, float *out, uint32_t cap);
     /** Optional (L338 P2.4): the adapter's decision head -- its weight (f32 [slots][hidden], row s the slot's) and
      *  bias (f32 [slots]) as the container's tensors, read on the host from the mapping.  Returns the slots; 0 = none
