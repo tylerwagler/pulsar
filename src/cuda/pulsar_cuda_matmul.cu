@@ -1,6 +1,8 @@
 /** @file
  *  Dense matmul arms: the GEMVs, the FP8 / MXFP8 cuBLASLt GEMMs, the weight resolvers and their caches. */
+#include <array>
 #include <atomic>
+#include <map>
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
@@ -2387,22 +2389,20 @@ static int cuda_attention_output_a_mx_gemm(
      * it picks a non-MX algo; the per-group loop re-sets them per call.
      * Prefill rows only: decode rows take the MMA arm (L262). */
     struct lt_group_shape {
-        uint64_t group_dim, rank; uint32_t n_groups; int valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
     };
-    /** thread_local -- same destroy-on-evict hazard as the shape cache above. */
-    static thread_local lt_group_shape shapes[32];
-    static thread_local int shapes_next;
-    lt_group_shape *sh = NULL;
-    for (int i = 0; i < 32; i++) {
-        if (shapes[i].valid && shapes[i].group_dim == group_dim && shapes[i].rank == rank &&
-            shapes[i].n_groups == n_groups) { sh = &shapes[i]; break; }
-    }
+    /* L375 (O55), the L306 rule bf16_lt_matmul took in L335: never evicted.  This was a 32-slot ring (and the
+     * per-row-count entries below another), evicted round-robin: a dropped shape's heuristic, re-run inside a graph
+     * capture, finds no kernel.  Keys: (group_dim, rank, n_groups) here, + ntok below.  thread_local: a second
+     * submitting thread gets its own descriptors. */
+    static thread_local std::unordered_map<lt_cache_key, lt_group_shape, lt_cache_key_hash> shapes;
+    const lt_cache_key sk = {group_dim, rank, 0u, (uint64_t)n_groups};
+    auto shit = shapes.find(sk);
+    lt_group_shape *sh = shit != shapes.end() ? &shit->second : NULL;
     if (!sh) {
         lt_group_shape ns = {};
-        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups;
         if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
@@ -2437,28 +2437,19 @@ static int cuda_attention_output_a_mx_gemm(
             return 0;
         }
         ns.algo = hr.algo;
-        ns.valid = 1;
-        sh = &shapes[shapes_next];
-        shapes_next = (shapes_next + 1) & 31;
-        if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
-        *sh = ns;
+        sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct lt_group_call {
-        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
-    static thread_local lt_group_call calls[32];
-    static thread_local int calls_next;
-    lt_group_call *e = NULL;
-    for (int i = 0; i < 32; i++) {
-        if (calls[i].valid && calls[i].group_dim == group_dim && calls[i].rank == rank &&
-            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens) { e = &calls[i]; break; }
-    }
+    static thread_local std::unordered_map<lt_cache_key, lt_group_call, lt_cache_key_hash> calls;
+    const lt_cache_key ck = {group_dim, rank, (uint64_t)n_tokens, (uint64_t)n_groups};
+    auto chit = calls.find(ck);
+    lt_group_call *e = chit != calls.end() ? &chit->second : NULL;
     if (!e) {
         lt_group_call ne = {};
-        ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
         cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
         cublasLtMatmulHeuristicResult_t chk;
@@ -2471,11 +2462,7 @@ static int cuda_attention_output_a_mx_gemm(
                     (int)PULSAR_BF16_LT_CANON_ROWS, n_tokens);
             return 0;
         }
-        ne.valid = 1;
-        e = &calls[calls_next];
-        calls_next = (calls_next + 1) & 31;
-        if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
-        *e = ne;
+        e = &calls.emplace(ck, ne).first->second;
     }
     cublasLtMatmulDesc_t op = sh->op;
     cublasLtMatrixLayout_t la = sh->la, lb = e->lb, ld = e->ld;
@@ -3583,24 +3570,19 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
         return 0;
     }
     struct shape_t {
-        int ldc, lda, ldb, b_trans, m, n, k, batch;
-        int64_t sc, sa, sb;
-        bool valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, lc;
         cublasLtMatmulAlgo_t algo;
     };
-    static thread_local shape_t cache[8];
-    static thread_local int next;
-    shape_t *e = nullptr;
-    for (int i = 0; i < 8 && !e; i++) {
-        shape_t &q = cache[i];
-        if (q.valid && q.ldc == ldc && q.lda == lda && q.ldb == ldb && q.b_trans == b_trans && q.m == m && q.n == n &&
-            q.k == k && q.batch == batch && q.sc == stride_c && q.sa == stride_a && q.sb == stride_b)
-            e = &q;
-    }
+    /* L375 (O55), the L306 rule: never evicted.  This was an 8-slot ring evicted round-robin, and 8 was exactly the
+     * shapes the LiLiCorr head runs today with nothing tying the two: a ninth shape would have dropped one whose
+     * heuristic, re-run inside the draft pass's graph capture, finds no kernel.  The key is the whole call shape. */
+    static thread_local std::map<std::array<int64_t, 11>, shape_t> cache;
+    const std::array<int64_t, 11> key = {ldc, lda, ldb, b_trans, m, n, k, batch, stride_c, stride_a, stride_b};
+    auto hit = cache.find(key);
+    shape_t *e = hit != cache.end() ? &hit->second : nullptr;
     if (!e) {
-        shape_t q = {ldc, lda, ldb, b_trans, m, n, k, batch, stride_c, stride_a, stride_b, false, NULL, NULL, NULL, NULL, {}};
+        shape_t q = {NULL, NULL, NULL, NULL, {}};
         const cublasOperation_t ta = b_trans ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
         const uint64_t zero = 0;
         cublasLtMatmulPreference_t pf = NULL;
@@ -3655,16 +3637,7 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
                             "cuBLASLt kernel -- refusing\n", m, n, k, b_trans, batch);
             return 0;
         }
-        q.valid = true;
-        e = &cache[next];
-        next = (next + 1) & 7;
-        if (e->valid) {
-            cublasLtMatrixLayoutDestroy(e->lc);
-            cublasLtMatrixLayoutDestroy(e->lb);
-            cublasLtMatrixLayoutDestroy(e->la);
-            cublasLtMatmulDescDestroy(e->op);
-        }
-        *e = q;
+        e = &cache.emplace(key, q).first->second;
     }
     const float al = 1.0f, be = 0.0f;
     /* L298: stream 0 is the engine's per-thread default stream; cuBLAS reads 0 as the LEGACY one, outside a capture
