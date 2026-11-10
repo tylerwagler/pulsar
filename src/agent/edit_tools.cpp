@@ -743,6 +743,29 @@ static void test_agent_workspace_and_terminal(void) {
     AGENT_TEST_ASSERT(refused("missing/../../x"));
     AGENT_TEST_ASSERT(refused("out/passwd"));
     AGENT_TEST_ASSERT(refused("out/new.txt"));
+    /* L373: a symlink that does not resolve is refused (an open would create its target), inside or out, as the
+     * last component or a parent; ".." is a component, not a substring */
+    AGENT_TEST_ASSERT(symlink("/tmp/pulsar-agent-ws-absent/x.desktop", "dangling-out") == 0);
+    AGENT_TEST_ASSERT(symlink("../pulsar-agent-ws-absent.txt", "dangling-up") == 0);
+    AGENT_TEST_ASSERT(symlink("sub/absent.txt", "dangling-in") == 0);
+    AGENT_TEST_ASSERT(symlink("loop", "loop") == 0);
+    AGENT_TEST_ASSERT(refused("dangling-out"));
+    AGENT_TEST_ASSERT(refused("dangling-up"));
+    AGENT_TEST_ASSERT(refused("dangling-in"));
+    AGENT_TEST_ASSERT(refused("dangling-out/new.txt"));
+    AGENT_TEST_ASSERT(refused("loop"));
+    AGENT_TEST_ASSERT(!refused("a..b.txt"));
+    AGENT_TEST_ASSERT(!refused("sub/..hidden/new..txt"));
+    AGENT_TEST_ASSERT(refused("missing/.."));
+    AGENT_TEST_ASSERT(!refused("sub/../new.txt"));
+    {   /* the write tool leaves the link's target absent */
+        agent_tool_arg args[2] = {{(char *)"path", (char *)"dangling-up", true}, {(char *)"content", (char *)"x", true}};
+        agent_tool_call call = {(char *)"write", args, 2, 2};
+        char *res = agent_tool_write(NULL, &call);
+        AGENT_TEST_ASSERT(strstr(res, "outside the workspace") != NULL);
+        free(res);
+        AGENT_TEST_ASSERT(access("../pulsar-agent-ws-absent.txt", F_OK) != 0);
+    }
     agent_workspace_init(true);
     AGENT_TEST_ASSERT(!refused("/etc/passwd"));
     AGENT_TEST_ASSERT(chdir(old) == 0);

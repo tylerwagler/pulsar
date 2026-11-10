@@ -340,6 +340,19 @@ void agent_workspace_init(bool allow_outside) {
     }
 }
 
+/** @brief Whether a '/'-separated relative path has a component equal to "..".
+ *  @param rest the path (a file named `a..b` has none)
+ *  @return true when one climbs */
+static bool agent_path_has_dotdot_component(const std::string &rest) {
+    for (size_t at = 0; at < rest.size();) {
+        size_t end = rest.find('/', at);
+        if (end == std::string::npos) end = rest.size();
+        if (end - at == 2 && rest[at] == '.' && rest[at + 1] == '.') return true;
+        at = end + 1;
+    }
+    return false;
+}
+
 char *agent_workspace_refusal(const char *path) {
     if (!g_workspace[0]) return NULL;
     /* the deepest part of the path that exists, resolved (symlinks and ..); the rest must not climb back out */
@@ -350,10 +363,14 @@ char *agent_workspace_refusal(const char *path) {
     for (;;) {
         if (realpath(probe.empty() ? "." : probe.c_str(), real)) {
             const size_t n = strlen(g_workspace);
-            inside = rest.find("..") == std::string::npos && !strncmp(real, g_workspace, n) &&
+            inside = !agent_path_has_dotdot_component(rest) && !strncmp(real, g_workspace, n) &&
                      (real[n] == '\0' || real[n] == '/' || (n == 1 && g_workspace[0] == '/'));
             break;
         }
+        /* a symlink that does not resolve (dangling, a loop) is not "a path that doesn't exist yet": an open
+         * would follow it to wherever it points */
+        struct stat st;
+        if (!probe.empty() && lstat(probe.c_str(), &st) == 0 && S_ISLNK(st.st_mode)) break;
         const size_t slash = probe.find_last_of('/');
         if (slash == std::string::npos) {
             rest = probe + "/" + rest;

@@ -205,7 +205,9 @@ typedef struct {
  *  @param allow_outside true turns the boundary off */
 void agent_workspace_init(bool allow_outside);
 /** L354: the file tools' boundary: a path resolved through its symlinks must lie inside the workspace.  A path that doesn't
- *  exist yet is judged by its deepest existing parent.
+ *  exist yet is judged by its deepest existing parent, and the part below it may not hold a ".." component.  A symlink
+ *  that does not resolve (dangling, a loop) is refused wherever it points, inside or out: the path is not absent, and
+ *  an open would create the link's target.
  *  @param path the tool's path
  *  @return NULL when allowed, else the tool's error text (malloc'd; the caller returns it) */
 char *agent_workspace_refusal(const char *path);
