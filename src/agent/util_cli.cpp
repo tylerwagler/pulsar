@@ -79,6 +79,59 @@ size_t agent_utf8_complete_len(const char *s, size_t n) {
 
 
 
+bool agent_write_file_atomic(const char *path, const void *data, size_t len, mode_t create_mode,
+                             char *err, size_t err_len) {
+    char real[PATH_MAX];
+    const char *target = realpath(path, real) ? real : path;   /* a link that resolves is written through */
+    struct stat st;
+    const bool exists = stat(target, &st) == 0;
+    static unsigned counter;
+    char *tmp = NULL;
+    int fd = -1;
+    for (int attempt = 0; fd < 0 && attempt < 16; attempt++) {
+        free(tmp);
+        agent_buf name = {0};
+        char suffix[64];
+        snprintf(suffix, sizeof suffix, ".tmp.%ld.%u", (long)getpid(), counter++);
+        agent_buf_puts(&name, target);
+        agent_buf_puts(&name, suffix);
+        tmp = agent_buf_take(&name);
+        /* O_EXCL | O_NOFOLLOW: the temp is a new regular file here, never something planted under its name */
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, create_mode);
+        if (fd < 0 && errno != EEXIST) break;
+    }
+    if (fd < 0) {
+        snprintf(err, err_len, "create a temporary file beside %s: %s", path, strerror(errno));
+        free(tmp);
+        return false;
+    }
+    const char *step = NULL;
+    if (exists && fchmod(fd, st.st_mode & 07777) != 0) step = "chmod";
+    for (size_t off = 0; !step && off < len;) {
+        const ssize_t w = write(fd, (const char *)data + off, len - off);
+        if (w > 0) off += (size_t)w;
+        else if (w == 0 || errno != EINTR) step = "write";
+    }
+    if (!step && fsync(fd) != 0) step = "fsync";
+    int saved_errno = errno;
+    if (close(fd) != 0 && !step) {
+        step = "close";
+        saved_errno = errno;
+    }
+    if (!step && rename(tmp, target) != 0) {
+        step = "rename over";
+        saved_errno = errno;
+    }
+    if (step) {
+        unlink(tmp);
+        snprintf(err, err_len, "%s %s: %s", step, path, strerror(saved_errno));
+    }
+    free(tmp);
+    return !step;
+}
+
+
+
 void write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t wr = write(fd, p, n);

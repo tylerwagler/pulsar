@@ -9,35 +9,6 @@
  * ============================================================================
  */
 
-/** @brief Write `len` bytes to `path`, truncating it.
- *  @param path   the file
- *  @param data   bytes to write
- *  @param len    byte count
- *  @param err    receives the failure (open / write / close and errno text)
- *  @param errlen bytes at `err`
- *  @return 0, or -1 with `err` set */
-static int agent_write_file_bytes(const char *path, const char *data, size_t len,
-                                  char *err, size_t errlen) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        snprintf(err, errlen, "open %s: %s", path, strerror(errno));
-        return -1;
-    }
-    size_t wr = fwrite(data, 1, len, fp);
-    if (wr != len) {
-        snprintf(err, errlen, "write %s: %s", path, strerror(errno));
-        fclose(fp);
-        return -1;
-    }
-    if (fclose(fp) != 0) {
-        snprintf(err, errlen, "close %s: %s", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-
-
 /** @brief Append one numbered line ("<line> <text>\n", the line's content without its terminator) to `b`.
  *  @param b    the result buffer
  *  @param data the file's bytes
@@ -867,12 +838,84 @@ static void test_agent_tool_call_display_is_sanitized(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* L373: write and edit replace the file by rename -- the mode is kept, a link that resolves is written through, no
+ * temporary file is left, and a write that cannot complete leaves the old contents whole. */
+static void test_agent_write_and_edit_are_atomic(void) {
+    char tmpl[] = "/tmp/pulsar-agent-atomic.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char file[PATH_MAX], link[PATH_MAX], fresh[PATH_MAX];
+    snprintf(file, sizeof file, "%s/a.sh", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    snprintf(fresh, sizeof fresh, "%s/new.txt", dir);
+    const auto run = [](const char *tool, const char *path, const char *a, const char *b) {
+        agent_tool_arg args[3] = {{(char *)"path", (char *)path, true},
+                                  {(char *)(b ? "old" : "content"), (char *)a, true},
+                                  {(char *)"new", (char *)b, true}};
+        agent_tool_call call = {(char *)tool, args, b ? 3 : 2, 3};
+        return b ? agent_tool_edit(NULL, &call) : agent_tool_write(NULL, &call);
+    };
+    const auto holds = [](const char *path, const char *want) {
+        char err[256];
+        char *data = NULL;
+        size_t len = 0;
+        if (agent_read_file_bytes(path, &data, &len, err, sizeof err) != 0) return false;
+        const bool same = !strcmp(data, want);
+        free(data);
+        return same;
+    };
+    const auto entries = [dir]() {
+        int n = 0;
+        DIR *d = opendir(dir);
+        for (struct dirent *de; d && (de = readdir(d)) != NULL;) n += de->d_name[0] != '.';
+        if (d) closedir(d);
+        return n;
+    };
+    agent_workspace_init(true);
+    struct stat before, after;
+    char *res = run("write", file, "echo one\n", NULL);
+    AGENT_TEST_ASSERT(strstr(res, "Wrote 9 bytes") != NULL && holds(file, "echo one\n"));
+    free(res);
+    AGENT_TEST_ASSERT(chmod(file, 0751) == 0 && stat(file, &before) == 0);
+    res = run("edit", file, "one", "two");
+    AGENT_TEST_ASSERT(strstr(res, "Edited ") != NULL && holds(file, "echo two\n"));
+    free(res);
+    AGENT_TEST_ASSERT(stat(file, &after) == 0 && (after.st_mode & 07777) == 0751 && after.st_ino != before.st_ino);
+    AGENT_TEST_ASSERT(symlink("a.sh", link) == 0);
+    res = run("write", link, "echo three\n", NULL);
+    AGENT_TEST_ASSERT(strstr(res, "Wrote ") != NULL && holds(file, "echo three\n"));
+    free(res);
+    AGENT_TEST_ASSERT(lstat(link, &after) == 0 && S_ISLNK(after.st_mode));
+    AGENT_TEST_ASSERT(stat(file, &after) == 0 && (after.st_mode & 07777) == 0751);
+    res = run("write", fresh, "x", NULL);
+    const mode_t mask = umask(0);
+    umask(mask);
+    AGENT_TEST_ASSERT(stat(fresh, &after) == 0 && (after.st_mode & 07777) == (0666 & ~mask));
+    free(res);
+    AGENT_TEST_ASSERT(entries() == 3);   /* a.sh, link, new.txt: no temporary file */
+    if (geteuid() != 0) {   /* a directory that takes no new file: the write fails, the old contents stay */
+        AGENT_TEST_ASSERT(chmod(dir, 0500) == 0);
+        res = run("write", file, "lost\n", NULL);
+        AGENT_TEST_ASSERT(strstr(res, "Tool error: ") == res && holds(file, "echo three\n"));
+        free(res);
+        res = run("edit", file, "three", "four");
+        AGENT_TEST_ASSERT(strstr(res, "Tool error: ") == res && holds(file, "echo three\n"));
+        free(res);
+        AGENT_TEST_ASSERT(chmod(dir, 0700) == 0);
+    }
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+}
+
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
 static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
 
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
     test_agent_tool_call_display_is_sanitized();
+    test_agent_write_and_edit_are_atomic();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -917,7 +960,8 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
 
 
-/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file.
+/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file
+ *  (agent_write_file_atomic).
  *  @param path       the file
  *  @param data       its current bytes
  *  @param len        bytes at `data`
@@ -941,8 +985,7 @@ static char *agent_apply_file_splice(const char *path,
            len - offset - remove_len);
     out[out_len] = '\0';
 
-    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
-    if (rc != 0) {
+    if (!agent_write_file_atomic(path, out, out_len, 0666, err, sizeof(err))) {
         free(out);
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");

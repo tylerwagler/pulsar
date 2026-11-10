@@ -82,26 +82,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
         agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i]);
     agent_put64(buf + bytes, agent_fnv(1469598103934665603ull, buf, bytes));
 
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    const int fd = mkstemp(tmp);
-    bool ok = fd >= 0;
-    int saved_errno = ok ? 0 : errno;
-    if (ok) {
-        size_t off = 0;
-        while (ok && off < bytes + 8u) {
-            const ssize_t w = write(fd, buf + off, bytes + 8u - off);
-            if (w <= 0) { saved_errno = errno; ok = false; } else off += (size_t)w;
-        }
-        if (ok && fsync(fd) != 0) { saved_errno = errno; ok = false; }
-        if (close(fd) != 0 && ok) { saved_errno = errno; ok = false; }
-        if (ok && rename(tmp, path) != 0) { saved_errno = errno; ok = false; }
-        if (!ok) unlink(tmp);
-    }
-    if (!ok) snprintf(err, err_len, "%s", saved_errno ? strerror(saved_errno) : "failed to write session file");
-    free(tmp);
+    const bool ok = agent_write_file_atomic(path, buf, bytes + 8u, 0600, err, err_len);
     free(buf);
     return ok;
 }

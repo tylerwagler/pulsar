@@ -480,21 +480,12 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (char *refused = agent_workspace_refusal(path)) return refused;
     if (!content) return xstrdup("Tool error: write requires content\n");
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: open for write failed: ");
-        agent_buf_puts(&b, strerror(errno));
-        agent_buf_puts(&b, "\n");
-        return agent_buf_take(&b);
-    }
     size_t len = strlen(content);
-    size_t wr = fwrite(content, 1, len, fp);
-    int close_rc = fclose(fp);
-    if (wr != len || close_rc != 0) {
+    char err[PATH_MAX + 128];
+    if (!agent_write_file_atomic(path, content, len, 0666, err, sizeof(err))) {
         agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: write failed: ");
-        agent_buf_puts(&b, strerror(errno));
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }

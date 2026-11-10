@@ -980,6 +980,20 @@ const char *agent_utf8_skip_continuation(const char *p, const char *end);
  *  @param n their count
  *  @return the length to keep (n - 3 .. n) */
 size_t agent_utf8_complete_len(const char *s, size_t n);
+/** L373: replace a file's contents atomically -- the bytes go to a new file beside it (created O_EXCL | O_NOFOLLOW),
+ *  fsync'd, then renamed over it, so a failed or interrupted write leaves the old contents whole.  A `path` that
+ *  resolves (realpath) is written at its target, so a symlink to a file stays a link; one that does not is replaced.
+ *  The new file takes the existing file's permission bits, else `create_mode` under the umask; it is a new inode
+ *  (the caller's ownership, hard links to the old file not followed).
+ *  @param path        the file
+ *  @param data        the new contents
+ *  @param len         their byte count
+ *  @param create_mode the mode of a file that did not exist (before the umask)
+ *  @param err         receives the failed step and its errno text
+ *  @param err_len     its capacity
+ *  @return true on success; false with `path` as it was */
+bool agent_write_file_atomic(const char *path, const void *data, size_t len, mode_t create_mode,
+                             char *err, size_t err_len);
 /** write(2) until all n bytes are written, retrying EINTR; any other error drops the rest silently.
  *  @param fd the descriptor
  *  @param p  the bytes
@@ -1305,7 +1319,7 @@ void agent_worker_clear_session_identity(agent_worker *w);
 /** Free a session file's title and tokens and zero it.
  *  @param f the file contents */
 void agent_session_file_free(agent_session_file *f);
-/** Write a session file atomically (a temp file renamed over `path`).
+/** Write a session file atomically (agent_write_file_atomic, mode 0600).
  *  @param path    the destination
  *  @param f       the contents
  *  @param err     receives the reason on failure
