@@ -4792,7 +4792,22 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, 250, toks, lg, 4, NULL));
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, 240, toks, NULL, 0, NULL));
     r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
-    TEST_ASSERT(r && pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && moved);
+    {
+        /* L375 O46: a bank on the runtime adapter and a plain one do not adopt from each other -- refused before dst
+         * moves (O43), whichever of the two is adapted; two banks of a kind do */
+        uint8_t adapter[3] = {1, 0, 0};
+        st->bank_adapter = adapter;
+        moved = true;
+        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
+        adapter[0] = 0;
+        adapter[1] = 1;
+        moved = true;
+        TEST_ASSERT(!pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
+        TEST_ASSERT(pulsar_ckpt_end(st, 1) == 0u && pulsar_ckpt_end(st, 0) == 300u);   /* nothing lent, nothing dropped */
+        adapter[0] = 1;
+        TEST_ASSERT(pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && moved);
+        st->bank_adapter = NULL;
+    }
     TEST_ASSERT(pulsar_ckpt_end(st, 1) == 300u && pulsar_ckpt_end(st, 0) == 300u);   /* dst's copy, the lender's own */
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 290, toks, NULL, 0, NULL));
     TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u);                                    /* still the lender's */

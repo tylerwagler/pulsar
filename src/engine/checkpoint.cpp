@@ -557,6 +557,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
     *moved = false;
     if (dst >= PULSAR_MSEQ_MAX || src >= PULSAR_MSEQ_MAX || dst == src || T == 0u || !st->ops->bank_pools)
         why = "not two banks of the pool";
+    else if (st->bank_adapter && (st->bank_adapter[src] != 0) != (st->bank_adapter[dst] != 0))
+        why = "one bank runs the runtime adapter and the other does not (their states are different models')";
     else if (r) {
         if (r < st->rec || r >= st->rec + st->n_rec || r->bank != src || r->T != T) why = "the record is not the source's at T";
         else from = ckpt_rec_place(st, r);

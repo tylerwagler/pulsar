@@ -405,7 +405,8 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
  *  walked into dst, exactly what a restore on src would leave there (a published checkpoint is any bank's to restore
  *  while its own bank's history still reaches T, the frontier rule).  dst's own checkpoints and records go (its
  *  history is replaced); it keeps a copy of the one it now stands at.  A lent record is stamped used (the pool's LRU,
- *  L326).  False, said, when the banks' pools do not pair, one is freed, or a copy failed.  `*moved` tells the two kinds of refusal apart
+ *  L326).  False, said, when the banks' pools do not pair, one is freed, the banks differ in runtime adapter (L375
+ *  O46: an adapted bank's state is another model's), or a copy failed.  `*moved` tells the two kinds of refusal apart
  *  (L375 O43): false = refused before anything of dst was touched (dst is still what its view describes), true = dst's
  *  checkpoints went and its state was being written (on a failure it then describes no position). */
 /// @param st    the store

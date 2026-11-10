@@ -2004,6 +2004,8 @@ pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t s
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     if (tp_mirror_target(s)) return none;
+    /* L375 O46: nor does a bank adopt across the runtime adapter (pulsar_ckpt_adopt refuses it) */
+    if (pulsar_session_bank_adapter(s, src) != pulsar_session_bank_adapter(s, pulsar_session_live_bank(s))) return none;
     const pulsar_ckpt_record *r = NULL;
     int len = 0;
     const TokPos T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
@@ -2052,8 +2054,8 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     std::vector<float> end_row;
     if (at_end) end_row.assign(r->logits, r->logits + st->end_width);
     /* L375 O43: dst's view -- its history, its host logits, its validity -- is given up only once the adopt has
-     * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank) leaves the bank exactly
-     * what its view describes */
+     * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank, banks that differ in
+     * runtime adapter, O46) leaves the bank exactly what its view describes */
     bool moved = false;
     bool ok = pulsar_ckpt_adopt(st, dst, src, T, r, &moved);
     if (moved) s->checkpoint_valid = false;   /* the state moved */
