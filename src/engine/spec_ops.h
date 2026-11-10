@@ -8,12 +8,13 @@
  * head and has DSpark and DFlash2 drafters trained for it; a Flash-Next DFlash has been served on two
  * DGX Sparks), so the family's part is only the verify side of the round -- snapshot and roll back the
  * state a verify run mutates, arm the forward's per-row captures and its logits readback, read a
- * bank's rows out of the shared forward, leave the bank's state at the committed position, and cut the
- * history on the L155 trim -- and the drafter's part is its own weights and state: prime its context
+ * bank's rows out of the shared forward, and leave the bank's state at the committed position -- and the
+ * drafter's part is its own weights and state: prime its context
  * from the prompt's captured features, absorb a committed row, draft a chain of up to K ids with
  * per-position confidences (sampled drafts with their proposal q recorded), finish a deferred device
  * draft, and the banked forms of those.  The core owns the round object, the per-bank pendings / carry /
- * depth / quench / counters, the accept walk, the EOS clamp, the emit, the L155 trim decision and the
+ * depth / quench / counters, the accept walk, the EOS clamp, the emit (L155: every committed position is handed
+ * back; a round whose accepted[] could not hold it is refused before it commits) and the
  * batch plumbing (assemble / round_end / redraft, one step per bank, one verdict per phase on a pair).
  *
  * A verify row carries its position in the chain today (parent = row - 1); a tree verifier (DDTree,
@@ -58,9 +59,6 @@ typedef struct pulsar_spec_target_ops {
      *  snapshot restore plus a roll-forward of the recurrent state from the inputs saved during the
      *  verify on a partial one; a recurrent family also moves its position counters here. */
     bool (*commit)(struct pulsar_session *s, struct pulsar_spec_round *r, uint32_t commit, uint32_t row0);
-    /** The L155 trim: the bank's history ends at `pos`, below what the round committed (DeepSeek: rewind;
-     *  a recurrent family invalidates or restores a grid checkpoint). */
-    void (*cut)(struct pulsar_session *s, int pos);
     /* The rows one shared verify forward carries -- and so the decoders it carries, one base row each -- are the
      * family's session fact pulsar_family_session_ops::fused_heads_max (L284), not a field here. */
 } pulsar_spec_target_ops;
@@ -114,10 +112,10 @@ typedef struct pulsar_drafter_ops {
      *  target's draw for that token reads; `rng` is read, never advanced (L288 sdet) -- stamped into the bank's
      *  pendings.
      *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
-     *  the round refuses with it (L306) -- it never continues as a plain round.  `features_ready` = the drafter's
-     *  conditioning features are those of the last committed row. */
-    uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng);
+     *  the round refuses with it (L306) -- it never continues as a plain round.  The drafter's conditioning
+     *  features are those of the last committed row: the round's absorb ran before this. */
+    uint32_t (*draft)(struct pulsar_session *s, int next_base, float temperature, int top_k, float top_p,
+                      float min_p, uint64_t *rng);
     /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
     void (*harvest)(struct pulsar_session *s);
     /** N banks' drafts in one pass, no bank switch, each result into rounds[i]->redraft; byte-exact with

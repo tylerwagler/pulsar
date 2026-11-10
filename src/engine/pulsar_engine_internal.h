@@ -1523,7 +1523,7 @@ typedef struct {
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
     pulsar_gpu_tensor *attn_comp_stage;  ///< staging the attention compressor writes through
-    /** f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
+    /** f32 staging for the packed (MXKV-FP4) indexer cache: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
      * the QAT+pack step stores them MXKV-FP4-packed into the persistent
      * layer_index_comp_cache.  Also reused for session-save dequant and
@@ -2563,7 +2563,6 @@ typedef struct pulsar_spec_carry_state {
      * generate_speculative already refuses when mseq_dirty). */
     float spec_quench_debt;  ///< cumulative plain-token-equivalents lost
     float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
-    int spec_round_banks;       ///< banks sharing the round being ended (the flat cost's divisor); 1 in the single lane
     uint32_t spec_quench_steps; ///< fused spec steps taken by this request
     bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
     /** Per-SESSION mirror of the engine's cumulative DSpark counters. The engine
@@ -2902,8 +2901,9 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
 typedef struct pulsar_session_dev_rows {
     pulsar_gpu_tensor *live;        ///< [W] f32: the live row
     bool host_stale;                ///< pulsar_session::logits is behind `live`
-    bool live_valid;                ///< L354: something has written `live` for the view installed
+    bool live_valid;                ///< L354: something has written `live` for the view installed (read by live_dev())
     pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
+    bool *bank_valid;               ///< [n_banks] L375: bank_rows holds that bank's row (its live_valid when saved)
     /// Banks bank_rows holds a row for.
     uint32_t n_banks;
     pulsar_gpu_tensor *scratch;     ///< the sampler's and the logprob passes' (the larger of their scratch bytes)
@@ -3312,14 +3312,18 @@ struct pulsar_session {
     /// @param row  logits-width floats (may be `logits` itself)
     /// @return false when the upload fails.
     bool live_from_host(const float *row);
+    /// The live row on the device, for a reader (L375: the one gate of every draw, logprob and host readback).
+    /// @return dev.live, or NULL (said) when nothing has written a row for the installed view.
+    const pulsar_gpu_tensor *live_dev();
     /// The live row's host mirror, read back first when the device moved past it.
-    /// @return `logits`, or NULL when the readback fails.
+    /// @return `logits`, or NULL when the view has no row (live_dev) or the readback fails.
     const float *live_host();
-    /// Copy the live row into `bank`'s saved row on the device.
+    /// Copy the live row, and whether the view has one, into `bank`'s saved row on the device.
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_save_bank(uint32_t bank);
-    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale).
+    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale); the view has a row
+    /// exactly when the bank's saved one was written (dev.bank_valid).
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_restore_bank(uint32_t bank);
@@ -4724,6 +4728,13 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
 /** L354: whether `bank` has a saved view (a false pulsar_bank_carry_restore_view then is a failure, not a fresh bank).
  *  @param s the session  @param bank the bank  @return true when one is saved */
 bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank);
+/** L375: `bank`'s host view names no position any more -- its device state moved without it (a step that failed and
+ *  reset the bank, a speculative round that could not be undone on it).  The live view when the bank is installed,
+ *  and its saved carry either way, so pulsar_bank_history stops serving the history and the bank's next sync rebuilds
+ *  it. */
+/// @param s     the session
+/// @param bank  the bank, < the pool's count
+void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
  *  synced on).  Every family's restore of such a bank installs it. */

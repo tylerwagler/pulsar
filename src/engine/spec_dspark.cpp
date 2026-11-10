@@ -555,9 +555,9 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 /// @param top_p request top-p
 /// @param min_p request min-p
 /// @param rng the request's stream
-/// @return drafts kept
-static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p,
-                             float min_p, uint64_t *rng) {
+/// @return drafts kept, or PULSAR_DRAFT_REFUSED (said) when the drafting pass failed
+static uint32_t dspark_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+                             uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
@@ -570,21 +570,21 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
     spec_redraft_req *qs[1] = {&rec};
     uint64_t *rngs[1] = {rng};
     char err[200];
-    uint32_t keep = 0;
     if (dspark_draft_group(s, qs, NULL, rngs, 1, defer, err, sizeof err) != 0) {
-        fprintf(stderr, "pulsar: %s -- no drafts this round\n", err);
+        /* L375 O41: the ops contract (spec_ops.h, L306) -- a failed draft refuses the round that asked for it; it
+         * used to drop the pendings and go on as a plain round, a second path nothing measured */
+        fprintf(stderr, "pulsar: %s -- refusing the chain\n", err);
         pulsar_spec_drop_pendings(&s->spec);
-    } else {
-        if (defer) rec.keep = 0;   /* the harvest sets the real count */
-        pulsar_spec_redraft_stamp(s, &rec);
-        if (defer) {
-            s->spec.dspark_chain_unharvested = true;
-            s->spec.dspark_chain_conf = rec.have_conf;
-            s->spec.dspark_chain_n = rec.n_draft;
-        }
-        keep = rec.keep;
+        return PULSAR_DRAFT_REFUSED;
     }
-    return keep;
+    if (defer) rec.keep = 0;   /* the harvest sets the real count */
+    pulsar_spec_redraft_stamp(s, &rec);
+    if (defer) {
+        s->spec.dspark_chain_unharvested = true;
+        s->spec.dspark_chain_conf = rec.have_conf;
+        s->spec.dspark_chain_n = rec.n_draft;
+    }
+    return rec.keep;
 }
 
 /* L108 P2: lazy completion of a deferred greedy chain: the ids and the confidences read back, the stop rule
@@ -836,13 +836,6 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
                                                    (uint32_t)r->saved_len, 1u + commit, row0);
 }
 
-/* The L155 trim: rewind() clamps the compressor frontier and drops the carry and the drafter window
- * (the carry was conditioned on positions that no longer exist). */
-/// pulsar_spec_target_ops::cut.
-/// @param s the session
-/// @param pos the position to rewind to
-static void ds4_cut(pulsar_session *s, int pos) { s->rewind(pos); }
-
 const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .snapshot      = */ ds4_spec_snapshot,
     /* .restore       = */ ds4_spec_restore,
@@ -850,7 +843,6 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .arm_verify    = */ ds4_arm_verify,
     /* .verify_single = */ ds4_verify_single,
     /* .commit        = */ ds4_commit,
-    /* .cut           = */ ds4_cut,
 };
 
 /* ---- the DSpark drafter -------------------------------------------------------------------------- */
@@ -888,9 +880,9 @@ static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8
  * 31.34 / 30.00 / 31.44; 0.25: 31.08 / 29.97 / 30.61).  The 2026-07-17 sweep under the old rule: tau barely
  * moves GREEDY throughput at depth 3, but clearly wins under T = 1.0 SAMPLING (+25% structured, +10% prose vs
  * verify-all), where the low-confidence tail is real.  The stop is a SCHEDULE knob: it decides which drafts
- * are verified, never a verified row's numerics (verify rows are decode rows; cuda-mixed-neutrality-gate
- * GATE 5/5R) -- a named exception in docs/ENGINEERING-RULES.md; tools/confhead sets --spec-tau off to collect
- * unbiased labels. */
+ * are verified, never a verified row's numerics (verify rows are decode rows; session-contract-gate B6 / F1,
+ * which replaced cuda-mixed-neutrality-gate with L357) -- a named exception in docs/ENGINEERING-RULES.md;
+ * tools/confhead sets --spec-tau off to collect unbiased labels. */
 const pulsar_drafter_ops k_dspark_drafter = {
     /* .name          = */ "DSpark",
     /* .depth         = */ 3u,

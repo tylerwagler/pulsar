@@ -14,7 +14,7 @@ const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
 /** pulsar_family::unload: free the tokenizer, the block drafter's record (a plain record that owns nothing,
  *  pulsar_block_drafter: free() is its teardown) and the family state, and clear the engine's block-drafter pointer
- *  (safe after a partial load).
+ *  and its drafter ops (L375 O50: the block drafter's ops live in the record just freed) (safe after a partial load).
  *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
     pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)e->family_state;
@@ -24,6 +24,7 @@ void unload(pulsar_engine *e) {
         pulsar_nemotron_h_vision_run_free(&w->vision);
     }
     e->block_drafter = NULL;
+    e->drafter_ops = NULL;
     delete w;   /* the state holds the tower's host tables (std::vector): new / delete */
     e->family_state = NULL;
 }
@@ -134,6 +135,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);
+    if (!pulsar_state_plan_slots_fit(&e->state_plan, ARCH)) return false;   /* L375 O48: a drafter past the slot table */
     {
         uint64_t h = 1469598103934665603ull;
         auto mix = [&h](const void *p, size_t n) {

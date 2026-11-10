@@ -1372,7 +1372,8 @@ int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
  *  @param s the session
  *  @param out receives the model's hidden width of floats
  *  @param cap floats at out
- *  @return floats copied (the hidden width), or 0 when the family offers none, cap is short or nothing was headed */
+ *  @return floats copied (the hidden width), or 0 (said) when the family offers none, cap is short, or the row the
+ *          readout holds is not the installed bank's last row (nothing headed, another bank's row, a view that moved) */
 int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap);
 /** Overwrite the live logits row (mirrored on a TP group).
  *  @param s the session
@@ -2038,7 +2039,8 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
  *  @param accepted_cap slots at accepted
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return tokens emitted (0 on bad arguments), or -1 */
+ *  @return tokens emitted (0 on bad arguments), or -1 (a failure; a tensor-parallel session, which no frame mirrors
+ *          this entry for) */
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int max_tokens,
                                         int *accepted, int accepted_cap,

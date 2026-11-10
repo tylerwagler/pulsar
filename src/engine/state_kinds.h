@@ -123,6 +123,9 @@ typedef struct pulsar_state_plan {
     uint32_t n_decl;
     /// decls pulsar_state_plan_add refused because the table was full; nonzero = the create refuses the plan by name
     uint32_t n_overflow;
+    /// L375 O48: drafter slots pulsar_state_plan_add_slot refused because slot[] was full; nonzero = the family's load
+    /// refuses (pulsar_state_plan_slots_fit), and so does the create
+    uint32_t slot_overflow;
     uint32_t n_slots;              ///< [0, n_trunk) the trunk's layers, [n_trunk, n_slots) a drafter's
     /// layer slots belonging to the trunk; slots [n_trunk, n_slots) are a drafter's
     uint32_t n_trunk;
@@ -148,6 +151,19 @@ uint64_t pulsar_state_decl_bank_bytes(const pulsar_state_decl *d);
 /// @return the new decl's id; PULSAR_STATE_DECLS_MAX when the table is full -- an id past the table, so a mask built
 ///         from it names no decl (a shift by it is defined: the static_assert below), and the plan never runs
 uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d);
+/** L375 O48: append one layer slot past the trunk's -- a drafter's (the MTP layer, a block drafter's layers) -- with
+ *  the decl mask it carries.  The one way a slot is added after the trunk's: a full table (PULSAR_STATE_SLOTS_MAX)
+ *  writes nothing and counts the slot in slot_overflow. */
+/// @param p    the plan being built (its trunk slots [0, n_trunk) already set)
+/// @param mask the slot's decl ids, bit i = decl[i]
+/// @return the new slot's index, or PULSAR_STATE_SLOTS_MAX when the table is full
+uint32_t pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask);
+/** L375 O48: the load-time verdict on a built plan's slots -- false, said, when a drafter's slots did not fit beside
+ *  the trunk's.  Every family's load calls it after building its plan and refuses the model on false. */
+/// @param p    the built plan
+/// @param arch the family arch, for the message
+/// @return true when every slot the plan asked for is in the table
+bool pulsar_state_plan_slots_fit(const pulsar_state_plan *p, const char *arch);
 static_assert(PULSAR_STATE_DECLS_MAX < 32u, "decl ids are bits of a uint32_t mask, PULSAR_STATE_DECLS_MAX included");
 
 /** A session's declared state (the plan's instance for n_banks banks). */

@@ -195,6 +195,20 @@ static bool ds4_prepare_restore(void *state, uint32_t G) {
     return gpu_graph_compressor_state_reset(g, bank);
 }
 
+/* L375 O42: an adopt replaces the installed bank's history with another bank's.  The drafter's window -- its
+ * committed-row counters and the prompt capture's extent -- described the old one, and a grid checkpoint carries
+ * neither (ds4_walk: the frontier walk only), so both are emptied, as trim_history empties them for a restore on the
+ * bank's own history: the prefill that follows captures its own rows from its start (a capture that began exactly
+ * where the old one ended would otherwise read the old conversation's ring rows as this prompt's), and the next round
+ * primes from them.  A record's adopt writes the source's window back with its frontier walk, after this.  Acceptance
+ * only: the drafter proposes, the target decides. */
+/** pulsar_kv_state_ops::history_replaced.  @param state the graph */
+static void ds4_history_replaced(void *state) {
+    pulsar_gpu_graph *g = G_(state);
+    for (int i = 0; i < 3; i++) g->dspark_n_raw[i] = 0;
+    g->dspark_prompt_n = 0;
+}
+
 /** pulsar_kv_state_ops::restored: clear the installed bank's stale mark.  @param state the graph */
 static void ds4_restored(void *state) {
     pulsar_gpu_graph *g = G_(state);
@@ -327,4 +341,5 @@ const pulsar_kv_state_ops PULSAR_KV_STATE_DS4 = {
     /* .trailing_pools     = */ NULL,   /* no row trails its position */
     /* .noted_at           = */ ds4_noted_at,
     /* .bank_pools         = */ ds4_bank_pools,
+    /* .history_replaced   = */ ds4_history_replaced,
 };

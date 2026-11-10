@@ -2512,9 +2512,40 @@ static int test_spans_control_ids(pulsar_engine *e, const char *text,
     return n;
 }
 
+/* L375 O52: the tokeniser half's range edge, on a vocabulary with no text tokens (plain text emits nothing, so the
+ * ids that come out are exactly the control tokens matched): a control token whose spelling starts in the renderer's
+ * text and is completed by the first bytes of a client range is client text; one that ends exactly where the range
+ * begins, or sits whole outside every range, is the renderer's. */
+static void test_control_token_span_edge(void) {
+    pulsar_vocab v{};
+    v.bos_id = v.eos_id = v.user_id = v.assistant_id = v.system_id = v.think_end_id = v.dsml_id = v.image_id = -1;
+    v.think_start_id = 7;
+    auto run = [&](const char *text, const pulsar_text_span *spans, uint32_t n) {
+        token_vec out = {};
+        v.tokenize_rendered_chat_spans_vocab(text, spans, n, &out);
+        const int got = out.len;
+        for (int i = 0; i < out.len; i++) TEST_ASSERT(out.v[i] == 7);
+        token_vec_free(&out);
+        return got;
+    };
+    const pulsar_text_span tail = {4, 7};                  /* "<thi" | "nk>" : the client completes it */
+    TEST_ASSERT(run("<think>", &tail, 1) == 0);
+    const pulsar_text_span last = {6, 7};                  /* "<think" | ">" : one client byte completes it */
+    TEST_ASSERT(run("<think>", &last, 1) == 0);
+    const pulsar_text_span after = {7, 9};                 /* "<think>" | "hi" : ends where the range begins */
+    TEST_ASSERT(run("<think>hi", &after, 1) == 1);
+    const pulsar_text_span inside = {0, 7};                /* the whole spelling is client text (L223) */
+    TEST_ASSERT(run("<think><think>", &inside, 1) == 1);   /* ... and the renderer's own after it is not */
+    const pulsar_text_span two[2] = {{0, 2}, {9, 12}};     /* "ab" "<think>" "nk>" : whole between two ranges */
+    TEST_ASSERT(run("ab<think>nk>", two, 2) == 1);
+    const pulsar_text_span past = {20, 30};                /* a range past the string: nothing to cross */
+    TEST_ASSERT(run("<think>", &past, 1) == 1);
+}
+
 /* The renderer half needs no model: every client-data write is marked, and the
  * renderer's own copy of the same literal is not. */
 static void test_control_token_spans(void) {
+    test_control_token_span_edge();
     char hostile[512];
     snprintf(hostile, sizeof hostile, "log: %s%s<think></think>%s%s%s",
              PULSAR_RENDER_USER, PULSAR_TOOL_CALLS_START, PULSAR_RENDER_ASSISTANT,
@@ -3797,6 +3828,144 @@ static void test_bank_carry_restore(void) {
     free(e);
 }
 
+/* L375 O15: the live row's validity.  A view nothing wrote a row for has none -- a fresh session, a bank saved
+ * without one, an invalidated bank -- and every reader of the row refuses there through the one gate (live_dev): the
+ * draws, the logprobs, the host mirror.  A bank's saved row carries its own validity across a switch (a restore used
+ * to mark whatever sat in the bank's slot valid), a step row kept for a bank (the mixed lane's prefill end) makes it
+ * valid, and invalidate clears it.  Host only: dry tensors (every copy a no-op that succeeds); no draw is launched,
+ * since each one asserted here refuses before the device. */
+static uint32_t test_live_bank0(pulsar_session *) { return 0u; }
+static void test_live_row_valid(void) {
+    static pulsar_family fam{};
+    static pulsar_family_session_ops sops{};
+    static pulsar_family_bank_ops bops{};
+    bops.live = test_live_bank0;
+    fam.name = "L375 live row test";
+    fam.logits_width = test_carry_width;
+    fam.session = &sops;
+    fam.banks = &bops;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->logits = (float *)xcalloc(8, sizeof(float));
+    pulsar_gpu_tensor_dry_begin();
+    const bool alloc = pulsar_session_dev_alloc(s, 2);
+    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(2u * 8u * sizeof(float));
+    pulsar_gpu_tensor_dry_end(NULL, NULL);
+    TEST_ASSERT(alloc && rows);
+    if (alloc && rows) {
+        pulsar_token_score sc[2];
+        float out[8];
+        /* a fresh session: no row, every reader refuses */
+        TEST_ASSERT(s->live_dev() == NULL && s->live_host() == NULL);
+        TEST_ASSERT(s->argmax() == PULSAR_SAMPLE_REFUSED && s->argmax_excluding(1) == PULSAR_SAMPLE_REFUSED);
+        TEST_ASSERT(s->top_logprobs(sc, 2) == 0 && s->token_logprob(1, sc) == 0 && s->copy_logits(out, 8) == 0);
+        /* a step heads the row */
+        TEST_ASSERT(s->live_from_rows(rows, 1) && s->live_dev() == s->dev.live);
+        /* bank 0 saved with its row; a view with none saved as bank 1 */
+        TEST_ASSERT(s->live_save_bank(0));
+        s->dev.live_valid = false;   /* pulsar_bank_carry_fresh_view's mark */
+        TEST_ASSERT(s->live_save_bank(1));
+        TEST_ASSERT(s->live_restore_bank(0) && s->live_dev() != NULL);
+        TEST_ASSERT(s->live_restore_bank(1) && s->live_dev() == NULL);   /* the bank had no row: still none */
+        /* a step row kept as bank 1's (the mixed lane's prefill end) is its row */
+        s->dev.step_rows = rows;
+        s->dev.step_n = 2;
+        TEST_ASSERT(s->step_row_to_bank(1, 1) && s->live_restore_bank(1) && s->live_dev() != NULL);
+        TEST_ASSERT(!s->step_row_to_bank(2, 1) && !s->live_restore_bank(2) && !s->live_save_bank(2));   /* out of range */
+        /* invalidate: the row was the forgotten history's */
+        pulsar_session_family_invalidate(s);
+        TEST_ASSERT(s->live_dev() == NULL && s->argmax() == PULSAR_SAMPLE_REFUSED);
+    }
+    pulsar_gpu_tensor_free(rows);
+    pulsar_session_dev_free(s);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s->logits);
+    free(s);
+    free(e);
+}
+
+/* L375: the round API's refusals that run before any device work, on a session with no model behind it.
+ *   O38  no drafter: begin, both ends and the batch phases refuse by name; a batch step fails without its bank being
+ *        installed or a base drawn.
+ *   O39  begin refuses a bank that stands at the context, and cuts the drafts to the room below it.
+ *   O37  an end that never reaches the walk (a sampled round with no stream) undoes the round: its base and drafts
+ *        leave the view, which is then no position's.
+ *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits. */
+static void test_spec_round_refusals(void) {
+    static pulsar_family fam{};
+    static pulsar_spec_target_ops target{};    /* no snapshot: nothing of a target to undo */
+    static pulsar_drafter_ops drafter{};       /* no prime, no harvest */
+    fam.name = "L375 round test";
+    fam.logits_width = test_carry_width;       /* ids 0 .. 7 */
+    fam.spec = &target;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = 6;
+    for (int t : {1, 2, 3}) token_vec_push(&s->checkpoint, t);
+    s->checkpoint_valid = true;
+    pulsar_spec_round *r = pulsar_spec_round_new();
+    char err[200] = "";
+    int acc[17];
+    const int32_t truth[17] = {0};
+    /* O38: no drafter */
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
+                strstr(err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
+    TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.0f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
+                                                    sizeof err) == -1 && strstr(err, "no drafter") != NULL);
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 17, err,
+                                                     sizeof err) == -1 && strstr(err, "no drafter") != NULL);
+    pulsar_spec_step st[2] = {};
+    st[0].bank = 0;
+    st[1].bank = 1;
+    st[0].round = st[1].round = r;
+    uint32_t rows = 7;
+    pulsar_session_spec_assemble_batch_local(s, st, 2, 16u, NULL, &rows);   /* no bank op is reached: fam.banks is NULL */
+    TEST_ASSERT(rows == 0u && st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
+                st[1].first_token == -1 && strstr(st[1].err, "no drafter") != NULL);
+    st[0].status = st[1].status = PULSAR_SPEC_STEP_OK;
+    pulsar_session_spec_round_end_batch_local(s, st, 2);
+    TEST_ASSERT(st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
+                strstr(st[0].err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
+    e->drafter_ops = &drafter;
+    /* O39: five drafts pending at position 3 of a 6-token context -- rows at 3, 4, 5: the base and two drafts */
+    s->spec.n_pend = 5;
+    s->spec.pend_base = 4;
+    s->spec.pend_pos = 3;
+    s->spec.pend_top_p = 1.0f;
+    for (int i = 0; i < 5; i++) s->spec.pend[i] = 5;
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == 0);
+    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 && pulsar_spec_round_saved_len(r) == 3);
+    /* L155: accepted[] of 2 for a round of 3 rows -- refused before anything commits, the round undone */
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 2, err,
+                                                     sizeof err) == -1 && strstr(err, "accepted[]") != NULL);
+    TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
+    /* O37: a begun round whose end cannot walk (sampled, no stream) is undone */
+    s->checkpoint_valid = true;
+    s->spec.n_pend = 1;
+    s->spec.pend_base = 4;
+    s->spec.pend_pos = 3;
+    s->spec.pend_temp = 0.7f;
+    s->spec.pend_top_p = 1.0f;
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.7f, 0, 1.0f, 0.0f, err, sizeof err) == 0 &&
+                s->checkpoint.len == 5);
+    TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.7f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
+                                                    sizeof err) == -1 && strstr(err, "stream") != NULL);
+    TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
+    /* O39: a bank at the context has no row for a base */
+    s->checkpoint_valid = true;
+    for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, t);
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
+                strstr(err, "context is full") != NULL && s->checkpoint.len == 6 && s->checkpoint_valid);
+    pulsar_spec_round_free(r);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s);
+    free(e);
+}
+
 /* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
  * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
  * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
@@ -3945,6 +4114,25 @@ static void test_state_plan_overflow(void) {
     }
     TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 2u);
     TEST_ASSERT(pulsar_state_create(NULL, &p, NULL, 1u, 64u, 0u) == NULL);   /* refused by name, nothing allocated */
+    /* L375 O48: the slot table.  A drafter's slots append through pulsar_state_plan_add_slot; past
+     * PULSAR_STATE_SLOTS_MAX nothing is written (the words after slot[] keep their value), the overflow is counted,
+     * the load's check refuses the model, and so does the create. */
+    pulsar_state_plan q{};
+    q.name = "slot-overflow-test";
+    q.resume_grid = 1u;
+    q.ckpt_slots = 1u;
+    const uint32_t id = pulsar_state_plan_add(&q, d);
+    q.n_trunk = q.n_slots = PULSAR_STATE_SLOTS_MAX - 2u;
+    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[k] = 1u << id;
+    q.session = 0xA5A5A5A5u;   /* the word after slot[]: a write past the table would land here */
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 2u);
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 1u);
+    TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 0u && pulsar_state_plan_slots_fit(&q, "test"));
+    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX);
+    TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 3u && q.session == 0xA5A5A5A5u);
+    TEST_ASSERT(!pulsar_state_plan_slots_fit(&q, "test"));
+    q.session = 0u;
+    TEST_ASSERT(pulsar_state_create(NULL, &q, NULL, 1u, 64u, 0u) == NULL);   /* the create's backstop names it too */
 }
 
 /* L301: the verify pick, its online correction and the lockstep chains' continuation (verify_curve.cpp; the
@@ -4801,8 +4989,10 @@ static void test_ckpt_records(void) {
     for (uint32_t i = 0; i < st->n_rec; i++)
         TEST_ASSERT((st->rec[i].kind == PULSAR_CKPT_REC_END) == (st->rec[i].logits != NULL));
     /* L313: an adopt between banks refuses without paired pools (this store has none), and from the bank itself */
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL));
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL));
+    bool moved = true;
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL, &moved) && !moved);   /* L375 O43: refused before dst moved */
+    moved = true;
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL, &moved) && !moved);
     pulsar_ckpt_drop_bank(st, 0);
     pulsar_ckpt_drop_bank(st, 1);
     /* L326: lending a record stamps it used.  Dry tensors (every copy a no-op that succeeds) give the banks paired
@@ -4818,7 +5008,22 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, 250, toks, lg, 4, NULL));
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, 240, toks, NULL, 0, NULL));
     r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
-    TEST_ASSERT(r && pulsar_ckpt_adopt(st, 1, 0, 300, r));
+    {
+        /* L375 O46: a bank on the runtime adapter and a plain one do not adopt from each other -- refused before dst
+         * moves (O43), whichever of the two is adapted; two banks of a kind do */
+        uint8_t adapter[3] = {1, 0, 0};
+        st->bank_adapter = adapter;
+        moved = true;
+        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
+        adapter[0] = 0;
+        adapter[1] = 1;
+        moved = true;
+        TEST_ASSERT(!pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && !moved);
+        TEST_ASSERT(pulsar_ckpt_end(st, 1) == 0u && pulsar_ckpt_end(st, 0) == 300u);   /* nothing lent, nothing dropped */
+        adapter[0] = 1;
+        TEST_ASSERT(pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && moved);
+        st->bank_adapter = NULL;
+    }
     TEST_ASSERT(pulsar_ckpt_end(st, 1) == 300u && pulsar_ckpt_end(st, 0) == 300u);   /* dst's copy, the lender's own */
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 290, toks, NULL, 0, NULL));
     TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u);                                    /* still the lender's */
@@ -5139,13 +5344,15 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
+    {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
+    {"--spec-round-refusals", "spec-round-refusals", "the round API's host-side refusals: no drafter, a bank at the context, a round that cannot be walked or handed back, each undone (L375)", test_spec_round_refusals},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
-    {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
+    {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--ckpt-host-tier", "ckpt-host-tier", "the checkpoint store's tiers: a dry price carries no host-tier checkpoint, a discrete card places them in pinned RAM and GB10 does not, each tier's capture / reader / reuse / claim / record round trip on this device (L347 I4)", test_ckpt_host_tier},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},

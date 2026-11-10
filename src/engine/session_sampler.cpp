@@ -36,6 +36,7 @@ bool pulsar_session_dev_alloc(pulsar_session *s, uint32_t n_banks) {
     d.out = pulsar_gpu_tensor_alloc(dev_digest_off() + sizeof(uint64_t));
     d.mask = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * mask_words(s) * sizeof(uint32_t));
     d.lp = pulsar_gpu_tensor_alloc(PULSAR_GPU_SAMPLE_ROWS_MAX * sizeof(pulsar_gpu_logprob_row));
+    d.bank_valid = (bool *)xcalloc(d.n_banks, sizeof(bool));   /* L375: no bank holds a row yet */
     d.chain_out = pulsar_gpu_tensor_alloc((uint64_t)PULSAR_GPU_CHAINS_MAX * PULSAR_GPU_CHAIN_SLOTS_MAX * sizeof(int32_t));
     d.host_stale = false;
     d.live_valid = false;   /* L354: nothing has written the live row: the readers refuse */
@@ -56,6 +57,7 @@ void pulsar_session_dev_free(pulsar_session *s) {
     pulsar_gpu_tensor_free(d.mask);
     pulsar_gpu_tensor_free(d.lp);
     pulsar_gpu_tensor_free(d.chain_out);
+    free(d.bank_valid);
     memset(&d, 0, sizeof(d));
 }
 
@@ -81,11 +83,20 @@ bool pulsar_session::live_from_host(const float *row) {
     return true;
 }
 
-const float *pulsar_session::live_host() {
+/* THE gate every reader of the live row goes through (L354 F16, L375 O15): the draws, the logprobs, the speculative
+ * base draw and the host mirror.  A view nothing has written a row for -- a fresh session, a bank with no carry, an
+ * invalidated bank -- has no next-token distribution, and dev.live then holds another bank's row or none. */
+const pulsar_gpu_tensor *pulsar_session::live_dev() {
     if (!dev.live_valid) {
-        fprintf(stderr, "pulsar: session: no live row to read (nothing stepped on this bank yet)\n");
+        fprintf(stderr, "pulsar: session: no live row to read (the installed bank's view has none: nothing stepped on "
+                        "it yet, or it was invalidated)\n");
         return NULL;
     }
+    return dev.live;
+}
+
+const float *pulsar_session::live_host() {
+    if (!live_dev()) return NULL;
     if (dev.host_stale) {
         if (!pulsar_gpu_tensor_read(dev.live, 0, logits, (uint64_t)engine->logits_width() * sizeof(float))) {
             fprintf(stderr, "pulsar: session: the live row's readback failed\n");
@@ -98,7 +109,9 @@ const float *pulsar_session::live_host() {
 
 bool pulsar_session::live_save_bank(uint32_t bank) {
     const uint64_t rb = (uint64_t)engine->logits_width() * sizeof(float);
-    return bank < dev.n_banks && pulsar_gpu_tensor_copy(dev.bank_rows, (uint64_t)bank * rb, dev.live, 0, rb);
+    if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.bank_rows, (uint64_t)bank * rb, dev.live, 0, rb)) return false;
+    dev.bank_valid[bank] = dev.live_valid;   /* L375: a view with no row saves none */
+    return true;
 }
 
 bool pulsar_session::step_row_to_bank(uint32_t row, uint32_t bank) {
@@ -108,6 +121,7 @@ bool pulsar_session::step_row_to_bank(uint32_t row, uint32_t bank) {
         fprintf(stderr, "pulsar: session: row %u of the step could not become bank %u's row\n", row, bank);
         return false;
     }
+    dev.bank_valid[bank] = true;
     return true;
 }
 
@@ -116,7 +130,7 @@ bool pulsar_session::live_restore_bank(uint32_t bank) {
     if (bank >= dev.n_banks || !pulsar_gpu_tensor_copy(dev.live, 0, dev.bank_rows, (uint64_t)bank * rb, rb))
         return false;
     dev.host_stale = true;
-    dev.live_valid = true;
+    dev.live_valid = dev.bank_valid[bank];   /* L375: the bank's row, or the fact that it has none */
     return true;
 }
 
@@ -248,7 +262,8 @@ static int session_draw(pulsar_session *s, const pulsar_gpu_tensor *rows, const 
 int pulsar_session::draw(const pulsar_row_draw *d) {
     const uint32_t zero = 0;
     int tok = PULSAR_SAMPLE_REFUSED;
-    return session_draw(this, dev.live, &zero, d, 1, &tok) == 0 ? tok : PULSAR_SAMPLE_REFUSED;
+    const pulsar_gpu_tensor *live = live_dev();
+    return live && session_draw(this, live, &zero, d, 1, &tok) == 0 ? tok : PULSAR_SAMPLE_REFUSED;
 }
 
 int pulsar_session::sample(float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
@@ -328,7 +343,8 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
     if (!out || k <= 0) return 0;
     k = clip_k(k);
     pulsar_gpu_logprob_row L;
-    if (!session_logprobs(this, dev.live, 0, -1, k, &L)) L.n_top = 0;
+    const pulsar_gpu_tensor *live = live_dev();
+    if (!live || !session_logprobs(this, live, 0, -1, k, &L)) L.n_top = 0;
     fill_top(L, out, k);
     return (int)L.n_top;
 }
@@ -336,7 +352,8 @@ int pulsar_session::top_logprobs(pulsar_token_score *out, int k) {
 int pulsar_session::token_logprob(int token, pulsar_token_score *out) {
     if (!out || token < 0 || token >= engine->logits_width()) return 0;
     pulsar_gpu_logprob_row L;
-    if (!session_logprobs(this, dev.live, 0, token, 0, &L) || !L.have_token) return 0;
+    const pulsar_gpu_tensor *live = live_dev();
+    if (!live || !session_logprobs(this, live, 0, token, 0, &L) || !L.have_token) return 0;
     *out = score(L.token);
     return 1;
 }
