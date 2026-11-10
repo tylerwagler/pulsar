@@ -1309,6 +1309,23 @@ typedef enum {
 } kv_persist_trigger;
 /// The triggers' log words, by kv_persist_trigger
 extern const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS];
+/** L372: the rule by which a persist wrote nothing ON PURPOSE (server::kv_cache_persist's early returns) -- not a
+ *  loss: a caller that names what became of the history (an eviction's line) says the rule instead of warning. */
+typedef enum {
+    KV_PERSIST_RULE_NONE,       ///< no rule applied: the persist ran (or was short of memory or room)
+    KV_PERSIST_RULE_READ_ONLY,  ///< the bank's history is read-only (X-Pulsar-KV)
+    KV_PERSIST_RULE_MIRRORED,   ///< inside a mirrored sync (a TP group's workers read chunk verdicts only)
+    KV_PERSIST_RULE_DEAD,       ///< a dead prefix, or a compaction request's prompt (server_hint_persist_skips)
+    KV_PERSIST_RULES            ///< count
+} kv_persist_rule;
+/// The rules' log words, by kv_persist_rule ("" for KV_PERSIST_RULE_NONE)
+extern const char *const kv_persist_rule_names[KV_PERSIST_RULES];
+/** L372: what an eviction's log line says of its disk snapshot.
+ *  @param stored  the store holds a chain of the history
+ *  @param rule    the rule its persist stopped on
+ *  @param word    receives the word: "disk", "none (<rule>)" or "none" (room for 40 bytes)
+ *  @return true when a store was expected and nothing was written (the caller warns) */
+bool server_evict_snapshot_word(bool stored, kv_persist_rule rule, char word[40]);
 /** L347 I2: what a persist for `t` writes (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR; rows up to the deepest grid point and
  *  the periodic restore points always).  Restore points are written where a restore starts: at the chain's end when
  *  the history is about to be lost (evict, spill, abandon, shutdown) and at an anchor -- never on the request path of
@@ -2721,7 +2738,9 @@ struct server {
     /// @param no_room    L347: receives whether the history is NOT stored -- no host pool room for a copy-out, the
     ///                   memory floor skipped the persist, or the persist failed (a spill that sees it keeps its bank);
     ///                   may be NULL
-    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
+    /// @param by_rule    L372: receives the rule the persist wrote nothing by (KV_PERSIST_RULE_NONE: none); may be NULL
+    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr,
+                         kv_persist_rule *by_rule = nullptr);
     /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point when kv_rp_worth
      *  says no (a prompt's or turn's end, or a loss; an anchor always writes its own).  @param why the trigger  @param kv_flags the bank's
      *  X-Pulsar-KV tokens (L347 I3b)  @param what receives the PULSAR_KVCHAIN_* mask  @return false when nothing is

@@ -9591,6 +9591,35 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
     TEST_ASSERT(g.abandoned && g.phase == GEN_FINISH && !g.batch_feed_valid && !strcmp(g.finish, "length"));
 }
 
+/* L372 (O24): an eviction says what became of the history -- on disk, not written by a rule (named, no warning), or
+ * not written though a store was expected (the warning's case). */
+static void test_l372_evict_snapshot_word(void) {
+    char w[40];
+    TEST_ASSERT(!server_evict_snapshot_word(true, KV_PERSIST_RULE_NONE, w) && !strcmp(w, "disk"));
+    TEST_ASSERT(server_evict_snapshot_word(false, KV_PERSIST_RULE_NONE, w) && !strcmp(w, "none"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_READ_ONLY, w) && !strcmp(w, "none (read-only)"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_MIRRORED, w) && !strcmp(w, "none (mirrored sync)"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_DEAD, w) && !strcmp(w, "none (dead prefix)"));
+    /* the persist reports its rule: a read-only history, then a dead prefix (no session: the store is never reached) */
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.kv.enabled = true;
+    session_slot *sl = &s.slots[0];
+    sl->provisioned = true;
+    kv_persist_rule rule = KV_PERSIST_RULE_NONE;
+    bool no_room = true;
+    int end = -1;
+    sl->kv_flags = KV_HDR_READ_ONLY;
+    TEST_ASSERT(s.kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room, &rule) == 0);
+    TEST_ASSERT(rule == KV_PERSIST_RULE_READ_ONLY && !no_room && end == 0);
+    sl->kv_flags = 0;
+    sl->hint_dead = true;
+    TEST_ASSERT(s.kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room, &rule) == 0);
+    TEST_ASSERT(rule == KV_PERSIST_RULE_DEAD && !no_room && end == 0);
+    pthread_mutex_destroy(&s.mu);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15389,6 +15418,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
+    test_l372_evict_snapshot_word();
     test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();

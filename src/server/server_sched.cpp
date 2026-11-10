@@ -1166,6 +1166,13 @@ static int evict_reset_slot_fields(session_slot *sl) {
     return evicted_ctx;
 }
 
+bool server_evict_snapshot_word(bool stored, kv_persist_rule rule, char word[40]) {
+    if (stored) snprintf(word, 40, "disk");
+    else if (rule != KV_PERSIST_RULE_NONE) snprintf(word, 40, "none (%s)", kv_persist_rule_names[rule]);
+    else snprintf(word, 40, "none");
+    return !stored && rule == KV_PERSIST_RULE_NONE;
+}
+
 /* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
  * possible, free the session, release the ledger, and leave the slot entry
  * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
@@ -1200,19 +1207,23 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     const pulsar_tokens *tokens = switched ? pulsar_session_tokens(s->sess) : NULL;
     const int live_tokens = tokens ? tokens->len : 0;
     bool stored = false;
+    kv_persist_rule rule = KV_PERSIST_RULE_NONE;
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
         bool no_room = false;
         int end = 0;
-        s->kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room);
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room, &rule);
         /* L353 no. 14: skipped or short, the history is not on disk, and the log says so.  L372: nor is it when the
          * persist writes nothing by rule (a read-only history, a dead prefix, a mirrored sync) or finds no grid
          * checkpoint to end a chain on: none of those is short of room, and each read "snapshot=disk".  The chain's
          * end is the fact: 0 when the store holds none of this history. */
         stored = !no_room && end > 0;
     }
-    if (!stored && live_tokens > 0) {
+    /* L372: a persist that wrote nothing by rule is no loss -- the eviction's line names the rule; the warning is
+     * for a store that was expected and did not happen */
+    char snapshot[40];
+    if (server_evict_snapshot_word(stored, rule, snapshot) && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: slot %d evicting WITHOUT a disk snapshot (%s); "
                    "a returning client re-prefills (correctness unaffected)",
@@ -1262,7 +1273,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
                "pulsar-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
-               vi, evicted_ctx, live_tokens, stored ? "disk" : "none",
+               vi, evicted_ctx, live_tokens, snapshot,
                (double)freed / (1024.0 * 1024.0 * 1024.0),
                (double)freed / (1024.0 * 1024.0 * 1024.0),
                (double)committed_now / (1024.0 * 1024.0 * 1024.0),
