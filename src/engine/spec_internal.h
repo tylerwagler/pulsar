@@ -58,6 +58,13 @@ typedef struct pulsar_spec_round {
     spec_redraft_req redraft;   ///< L150: batched-lane deferred redraft (see the typedef)
 } pulsar_spec_round;
 
+/** The batch round end's deferred banked absorb (session_spec.cpp): the drafter absorbs every bank's committed rows
+ *  in one pass; on a refusal each bank that had rows fails its step and loses its view.
+ *  @param s     the session, seed_defer filled by the round ends
+ *  @param steps [n] the batch's steps
+ *  @param n     steps */
+void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int n);
+
 /* ---- the core's helpers the implementations use ---- */
 /** The width of every host logits row the round API reads or stores (the engine's logits width). */
 /// @param s the session

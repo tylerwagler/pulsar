@@ -1527,6 +1527,35 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     *n_rows_out = rows;
 }
 
+/* The batch round end's one banked absorb (seed_defer: every bank's committed rows, recorded by its round end).  By
+ * the time it runs each round has ended: its tokens are in its bank's saved view and its step says OK.  A refused
+ * absorb therefore leaves banks whose drafter context is not the view's -- some of its rows absorbed, or none -- and
+ * nothing can say which.  Every bank that had rows fails its round and its view is invalidated (L375 O37), the single
+ * lane's rule for a failed state update after the walk: the bank's next sync starts from 0, which resets the bank's
+ * state, the drafter's context with it (the declared state's reset; DeepSeek's invalidate empties DSpark's window
+ * and the prompt capture primes it again).  So no later round's acceptance runs against a drafter that did not
+ * absorb: the tokens these rounds accepted were the target's and are reported in the steps, and the next thing the
+ * bank serves is a prefill. */
+void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    if (!s->seed_defer.active) return;
+    s->seed_defer.active = false;
+    if (!spec_drafter(s)->absorb_banked(s, s->seed_defer.src_row, s->seed_defer.bank, s->seed_defer.next_tok,
+                                        s->seed_defer.n)) {
+        for (int i = 0; i < n; i++) {
+            pulsar_spec_step *st = &steps[i];
+            bool had = false;
+            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
+            if (!had) continue;
+            pulsar_bank_view_invalidate(s, st->bank);
+            if (st->status != PULSAR_SPEC_STEP_OK) continue;
+            st->status = PULSAR_SPEC_STEP_FAILED;
+            st->round->redraft.valid = false;
+            snprintf(st->err, sizeof st->err, "the batched drafter absorb failed");
+        }
+    }
+    s->seed_defer.n = 0;
+}
+
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
     if (spec_steps_no_drafter(s, steps, n, "spec round end batch")) {
         for (int i = 0; i < n; i++) steps[i].pos_before = steps[i].pos_after = TokPos::none();   /* the phase's outputs */
@@ -1584,23 +1613,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         st->pos_after = TokPos{s->pos()};
         spec_bank_save(s, st->bank);
     }
-    if (!s->seed_defer.active) return;
-    s->seed_defer.active = false;
-    if (!spec_drafter(s)->absorb_banked(s, s->seed_defer.src_row, s->seed_defer.bank, s->seed_defer.next_tok,
-                                        s->seed_defer.n)) {
-        /* No counter advanced: every bank that had rows refuses its round, as a
-         * failed one-row seed did ("DSpark fused state update failed"). */
-        for (int i = 0; i < n; i++) {
-            pulsar_spec_step *st = &steps[i];
-            bool had = false;
-            for (uint32_t k = 0; k < s->seed_defer.n && !had; k++) had = s->seed_defer.bank[k] == st->bank;
-            if (!had || st->status != PULSAR_SPEC_STEP_OK) continue;
-            st->status = PULSAR_SPEC_STEP_FAILED;
-            st->round->redraft.valid = false;
-            snprintf(st->err, sizeof st->err, "the batched drafter absorb failed");
-        }
-    }
-    s->seed_defer.n = 0;
+    pulsar_spec_absorb_deferred(s, steps, n);
 }
 
 void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {

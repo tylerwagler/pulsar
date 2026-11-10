@@ -3944,7 +3944,11 @@ static void test_live_row_valid(void) {
  *   O39  begin refuses a bank that stands at the context, and cuts the drafts to the room below it.
  *   O37  an end that never reaches the walk (a sampled round with no stream) undoes the round: its base and drafts
  *        leave the view, which is then no position's.
- *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits. */
+ *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits.
+ *   O37  a refused banked absorb at a batch round's end fails each bank that had rows and invalidates its view. */
+static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const uint32_t *, const int32_t *, uint32_t) {
+    return false;
+}
 static void test_spec_round_refusals(void) {
     static pulsar_family fam{};
     static pulsar_spec_target_ops target{};    /* no snapshot: nothing of a target to undo */
@@ -4012,6 +4016,28 @@ static void test_spec_round_refusals(void) {
     for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, t);
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
                 strstr(err, "context is full") != NULL && s->checkpoint.len == 6 && s->checkpoint_valid);
+    /* O37: the batch end's banked absorb refuses -- bank 1 had rows: its step fails and its saved view is no
+     * position's (its next sync starts from 0 and the drafter's context is rebuilt with it); bank 0 had none and
+     * keeps its step and its view */
+    static pulsar_family_bank_ops bops{};
+    bops.live = test_live_bank0;
+    fam.banks = &bops;
+    drafter.absorb_banked = test_absorb_banked_refuses;
+    s->bank_carry = (pulsar_bank_carry *)xcalloc(2, sizeof(*s->bank_carry));
+    s->bank_carry_n = 2;
+    for (uint32_t b = 0; b < 2u; b++) s->bank_carry[b].valid = s->bank_carry[b].checkpoint_valid = true;
+    s->checkpoint_valid = true;
+    st[0].status = st[1].status = PULSAR_SPEC_STEP_OK;
+    st[0].err[0] = st[1].err[0] = '\0';
+    s->seed_defer.active = true;
+    s->seed_defer.n = 2;
+    s->seed_defer.bank[0] = s->seed_defer.bank[1] = 1u;
+    pulsar_spec_absorb_deferred(s, st, 2);
+    TEST_ASSERT(st[1].status == PULSAR_SPEC_STEP_FAILED && strstr(st[1].err, "absorb") != NULL &&
+                !s->bank_carry[1].checkpoint_valid);
+    TEST_ASSERT(st[0].status == PULSAR_SPEC_STEP_OK && s->bank_carry[0].checkpoint_valid && s->checkpoint_valid);
+    TEST_ASSERT(!s->seed_defer.active && s->seed_defer.n == 0u);
+    free(s->bank_carry);
     pulsar_spec_round_free(r);
     pulsar_tokens_free(&s->checkpoint);
     free(s);
