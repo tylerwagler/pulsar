@@ -1281,12 +1281,14 @@ char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     (void)w;
     const char *query, *path, *mode, *glob;
     int context, max_results;
+    bool case_sensitive;
     if (char *bad = agent_tool_arg_string(call, "query", &query)) return bad;
     if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
     if (char *bad = agent_tool_arg_string(call, "mode", &mode)) return bad;
     if (char *bad = agent_tool_arg_string(call, "glob", &glob)) return bad;
     if (char *bad = agent_tool_arg_int(call, "context", 0, 0, 5, &context)) return bad;
     if (char *bad = agent_tool_arg_int(call, "max_results", 50, 1, 500, &max_results)) return bad;
+    if (char *bad = agent_tool_arg_bool(call, "case_sensitive", true, &case_sensitive)) return bad;
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     if (!path || !path[0]) path = ".";
     if (char *refused = agent_workspace_refusal(path)) return refused;
@@ -1294,7 +1296,7 @@ char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         .query = query,
         .glob = glob,
         .use_regex = mode && !strcmp(mode, "regex"),
-        .case_sensitive = agent_parse_bool_default(agent_tool_arg_value(call, "case_sensitive"), true),
+        .case_sensitive = case_sensitive,
         .context = context,
         .max_results = max_results,
     };

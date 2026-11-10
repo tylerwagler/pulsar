@@ -1593,6 +1593,13 @@ char *agent_tool_arg_int(const agent_tool_call *call, const char *name, int def,
  *  @param out  receives seconds clamped to [1, 86400]; 3600 when absent, empty or <= 0
  *  @return NULL, or "Tool error: <name> is not a number" (malloc'd; the caller returns it) */
 char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int *out);
+/** A tool call's boolean argument: true/yes/1 or false/no/0 (case-insensitive words).
+ *  @param call the call
+ *  @param name the argument
+ *  @param def  the value when the argument is absent or empty
+ *  @param out  receives the value, or def
+ *  @return NULL, or "Tool error: <name> must be true or false" (malloc'd; the caller returns it) */
+char *agent_tool_arg_bool(const agent_tool_call *call, const char *name, bool def, bool *out);
 /** A tool call's string argument (L373: a JSON null, number or object is the tool's error, never its JSON text).
  *  @param call the call
  *  @param name the argument

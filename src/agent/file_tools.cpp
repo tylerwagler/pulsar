@@ -73,6 +73,34 @@ char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int 
     return NULL;
 }
 
+/** @brief Parse true/yes/1 or false/no/0 (case-insensitive words).
+ *  @param s the text
+ *  @param v receives the value
+ *  @return false when `s` is none of them */
+static bool agent_parse_bool(const char *s, bool *v) {
+    if (!strcasecmp(s, "true") || !strcasecmp(s, "yes") || !strcmp(s, "1")) {
+        *v = true;
+        return true;
+    }
+    if (!strcasecmp(s, "false") || !strcasecmp(s, "no") || !strcmp(s, "0")) {
+        *v = false;
+        return true;
+    }
+    return false;
+}
+
+bool agent_parse_bool_default(const char *s, bool def) {
+    bool v;
+    return s && s[0] && agent_parse_bool(s, &v) ? v : def;
+}
+
+char *agent_tool_arg_bool(const agent_tool_call *call, const char *name, bool def, bool *out) {
+    const char *s = agent_tool_arg_value(call, name);
+    *out = def;
+    if (!s || !s[0]) return NULL;
+    return agent_parse_bool(s, out) ? NULL : agent_tool_arg_error(name, "must be true or false");
+}
+
 char *agent_tool_arg_string(const agent_tool_call *call, const char *name, const char **out) {
     const agent_tool_arg *a = agent_tool_arg_find(call, name);
     *out = NULL;
@@ -80,17 +108,6 @@ char *agent_tool_arg_string(const agent_tool_call *call, const char *name, const
     if (!a->is_string) return agent_tool_arg_error(name, "must be a string");
     *out = a->value ? a->value : "";
     return NULL;
-}
-
-
-
-bool agent_parse_bool_default(const char *s, bool def) {
-    if (!s || !s[0]) return def;
-    if (!strcasecmp(s, "true") || !strcasecmp(s, "yes") || !strcmp(s, "1"))
-        return true;
-    if (!strcasecmp(s, "false") || !strcasecmp(s, "no") || !strcmp(s, "0"))
-        return false;
-    return def;
 }
 
 
@@ -446,14 +463,15 @@ char *agent_workspace_refusal(const char *path) {
 char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path;
     int start, count;
+    bool whole, raw;
     if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
     if (char *bad = agent_tool_arg_int(call, "start_line", 1, 1, INT_MAX, &start)) return bad;
     if (char *bad = agent_tool_arg_int(call, "max_lines", AGENT_READ_DEFAULT_LINES, 1, INT_MAX, &count)) return bad;
+    if (char *bad = agent_tool_arg_bool(call, "whole", false, &whole)) return bad;
+    if (char *bad = agent_tool_arg_bool(call, "raw", false, &raw)) return bad;
     if (path && path[0]) {
         if (char *refused = agent_workspace_refusal(path)) return refused;
     }
-    bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
-    bool raw = agent_parse_bool_default(agent_tool_arg_value(call, "raw"), false);
     return agent_read_range(w, path, start, count, whole, raw, true);
 }
 
