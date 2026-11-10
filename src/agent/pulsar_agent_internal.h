@@ -135,6 +135,8 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 /// Bytes of output a bash job's first observation shows from the head.
 #define AGENT_BASH_HEAD_BYTES (8*1024)
+/// Bash jobs tracked at once (running, or finished and not yet observed); agent_bash_start refuses one more.
+#define AGENT_BASH_JOBS_MAX 64
 /// Lines of output a bash job's first observation shows from the head.
 #define AGENT_BASH_HEAD_LINES 100
 /// Bytes at the end of a bash job's output file a tail read scans.
@@ -801,6 +803,7 @@ struct agent_bash_job {
     int exit_status;      ///< waitpid status once `running` is false
     bool running;         ///< the child has not been reaped yet
     bool timed_out;       ///< the job was killed by its timeout
+    int live_slot;        ///< the job's slot in the exit teardown's table (bash_jobs.cpp)
     struct agent_bash_job *next;  ///< next job in the worker's list
     agent_worker *worker;  ///< back-pointer for terminal state restoration
 
@@ -1715,7 +1718,17 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
  *  @param call the search call
  *  @return the result text, malloc'd; caller frees */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
-/** Free every bash job (killing running ones) and empty the list.
+/** L373: the bash jobs' ONE teardown -- SIGKILL every running job's process group and unlink every job's output
+ *  file.  Reached from the normal return (agent_bash_jobs_free), from exit() (atexit) and from SIGTERM / SIGHUP /
+ *  SIGINT (agent_bash_teardown_install), so it calls only kill and unlink (async-signal-safe) and reads only the
+ *  fixed table agent_bash_start fills. */
+void agent_bash_teardown(void);
+/** L373: register agent_bash_teardown with atexit and as the handler of SIGTERM and SIGHUP (the teardown, then the
+ *  signal's default action, so the process still dies by the signal).
+ *  @param with_sigint also SIGINT: a run with no terminal UI, where Ctrl-C ends the process (the interactive UI
+ *                     keeps its own SIGINT handler, which interrupts the turn) */
+void agent_bash_teardown_install(bool with_sigint);
+/** Free every bash job (agent_bash_teardown, then each job reaped and freed) and empty the list.
  *  @param w the worker */
 void agent_bash_jobs_free(agent_worker *w);
 /** Find a job by id, or by pid when id <= 0.
@@ -1729,7 +1742,7 @@ agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
  *  @param target the job; no-op when not in the list */
 void agent_bash_remove_job(agent_worker *w, agent_bash_job *target);
 /** Spawn `cmd` under /bin/sh in its own process group, output to a pipe and a /tmp file, and add it to the
- *  worker's job list.
+ *  worker's job list and the exit teardown's table (at most AGENT_BASH_JOBS_MAX jobs).
  *  @param w           the worker
  *  @param cmd         the shell command (copied)
  *  @param timeout_sec seconds before the job is killed

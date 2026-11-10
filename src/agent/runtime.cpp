@@ -649,6 +649,8 @@ int main(int argc, char **argv) {
     sa.sa_handler = agent_sigint_handler;
     bool sigint_installed = !cfg.non_interactive &&
         sigaction(SIGINT, &sa, &old_int) == 0;
+    /* L373: no way out of the process leaves a bash job running or its output file behind */
+    agent_bash_teardown_install(cfg.non_interactive);
 
     int rc = cfg.non_interactive ?
         run_agent_non_interactive(engine, &cfg) :

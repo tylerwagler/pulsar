@@ -5,6 +5,56 @@
 
 
 
+/** L373: one job's entry in the exit teardown's table: plain words a signal handler can read.  `path` is written
+ *  before `used` is set and never changes while it is. */
+struct agent_bash_live_slot {
+    volatile sig_atomic_t used;   ///< the slot holds a job's output file
+    volatile sig_atomic_t pgid;   ///< the job's process group while it runs; 0 once reaped
+    char path[sizeof(((agent_bash_job *)0)->path)];   ///< the job's output file
+};
+
+/** L373: the live jobs' process groups and output files, for the ONE teardown every way out of the process reaches
+ *  (agent_bash_teardown): a fixed table, not the worker's job list, because a signal handler walks it. */
+static agent_bash_live_slot g_bash_live[AGENT_BASH_JOBS_MAX];
+
+void agent_bash_teardown(void) {
+    for (int i = 0; i < AGENT_BASH_JOBS_MAX; i++) {
+        const pid_t pgid = (pid_t)g_bash_live[i].pgid;
+        if (pgid > 0) kill(-pgid, SIGKILL);
+        if (g_bash_live[i].used) unlink(g_bash_live[i].path);
+    }
+}
+
+/** @brief The signal handler: the teardown, then the signal's default action (SA_RESETHAND restored it; the raise is
+ *  delivered when the handler returns).  Only async-signal-safe calls: kill, unlink, raise.
+ *  @param sig the signal */
+static void agent_bash_teardown_signal(int sig) {
+    agent_bash_teardown();
+    raise(sig);
+}
+
+void agent_bash_teardown_install(bool with_sigint) {
+    atexit(agent_bash_teardown);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = agent_bash_teardown_signal;
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    if (with_sigint) sigaction(SIGINT, &sa, NULL);
+}
+
+/** @brief A free slot of the live table.
+ *  @return its index, or -1 when AGENT_BASH_JOBS_MAX jobs are tracked */
+static int agent_bash_live_free_slot(void) {
+    for (int i = 0; i < AGENT_BASH_JOBS_MAX; i++)
+        if (!g_bash_live[i].used) return i;
+    return -1;
+}
+
+
+
 int agent_bash_job::display_lines() const {
     const auto *job = this;
     if (!job || job->bytes == 0) return 0;
@@ -32,6 +82,7 @@ void agent_bash_job::job_free() {
         kill(job->pid, SIGKILL);
         waitpid(job->pid, NULL, 0);
     }
+    g_bash_live[job->live_slot].pgid = 0;
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
     /* Remove the mkstemp output file.  Only the three spawn-time error paths
@@ -39,6 +90,7 @@ void agent_bash_job::job_free() {
      * /tmp/pulsar_agent_output_* behind for the life of the box — a long agent
      * session orphaned one per command, sized by that command's full output. */
     if (job->path[0]) unlink(job->path);
+    g_bash_live[job->live_slot].used = 0;
     free(job->cmd);
     free(job);
 }
@@ -46,6 +98,7 @@ void agent_bash_job::job_free() {
 
 
 void agent_bash_jobs_free(agent_worker *w) {
+    agent_bash_teardown();   /* the same kill and unlink every other way out runs; job_free then reaps */
     agent_bash_job *job = w->bash_jobs;
     while (job) {
         agent_bash_job *next = job->next;
@@ -127,6 +180,7 @@ void agent_bash_job::finalize(int status) {
     else if (WIFSIGNALED(status)) job->exit_status = 128 + WTERMSIG(status);
     else job->exit_status = -1;
     job->running = false;
+    g_bash_live[job->live_slot].pgid = 0;   /* reaped: the id may be reused, the teardown no longer kills it */
     /* A child can still open /dev/tty directly and alter terminal state even
      * though its stdin is /dev/null.  Ask the UI thread to verify raw mode at
      * a safe point instead of touching linenoise from the worker path. */
@@ -152,6 +206,7 @@ void agent_bash_job::poll() {
     if (rc < 0 && errno != EINTR) {
         job->exit_status = -1;
         job->running = false;
+        g_bash_live[job->live_slot].pgid = 0;
         if (job->pipe_fd >= 0) {
             close(job->pipe_fd);
             job->pipe_fd = -1;
@@ -178,6 +233,11 @@ void agent_bash_job::poll() {
  * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
 agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
+    const int slot = agent_bash_live_free_slot();
+    if (slot < 0) {
+        snprintf(err, err_len, "%d bash jobs are already tracked; stop one with bash_stop", AGENT_BASH_JOBS_MAX);
+        return NULL;
+    }
     char tmp_path[] = "/tmp/ds4_agent_output_XXXXXX";
     int tmpfd = mkstemp(tmp_path);
     if (tmpfd < 0) {
@@ -226,6 +286,9 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 
     close(pipefd[1]);
     setpgid(pid, pid);
+    snprintf(g_bash_live[slot].path, sizeof(g_bash_live[slot].path), "%s", tmp_path);
+    g_bash_live[slot].pgid = pid;
+    g_bash_live[slot].used = 1;
     int old_flags;
     set_nonblock(pipefd[0], true, &old_flags);
 
@@ -234,6 +297,7 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     if (w->next_bash_job_id <= 0) w->next_bash_job_id = 1;
     job->id = w->next_bash_job_id++;
     job->pid = pid;
+    job->live_slot = slot;
     job->pipe_fd = pipefd[0];
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
@@ -602,6 +666,98 @@ static void test_agent_tool_results_are_utf8(void) {
             free(obs);
         }
         agent_bash_remove_job(&w, job);
+    }
+    pthread_mutex_destroy(&w.mu);
+}
+
+/** @brief Whether a process is gone: no such pid, or a zombie nobody has reaped yet.
+ *  @param pid the process
+ *  @return true when it no longer runs */
+static bool test_pid_dead(pid_t pid) {
+    if (kill(pid, 0) != 0) return true;
+    char name[64], stat[512];
+    snprintf(name, sizeof name, "/proc/%ld/stat", (long)pid);
+    FILE *fp = fopen(name, "rb");
+    if (!fp) return true;
+    const size_t n = fread(stat, 1, sizeof stat - 1, fp);
+    fclose(fp);
+    stat[n] = '\0';
+    const char *state = strrchr(stat, ')');   /* "pid (comm) S ..." */
+    return state && state[1] == ' ' && state[2] == 'Z';
+}
+
+/** L373: no way out of the process leaves a bash job running or its output file behind -- the teardown itself, the
+ *  table's cap, and a child process that leaves by exit() and by each handled signal. */
+static void test_agent_bash_teardown(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe */
+    char err[160] = {0};
+
+    agent_bash_job *job = agent_bash_start(&w, "sleep 300 & sleep 300", 600, err, sizeof err);
+    AGENT_TEST_ASSERT(job != NULL);
+    if (job) {
+        char path[sizeof job->path];
+        snprintf(path, sizeof path, "%s", job->path);
+        AGENT_TEST_ASSERT(access(path, F_OK) == 0 && !test_pid_dead(job->pid));
+        agent_bash_teardown();
+        for (int i = 0; job->running && i < 2500; i++) {
+            job->poll();
+            usleep(2000);
+        }
+        AGENT_TEST_ASSERT(!job->running && job->exit_status == 128 + SIGKILL && !job->timed_out);
+        AGENT_TEST_ASSERT(access(path, F_OK) != 0);
+        agent_bash_remove_job(&w, job);
+    }
+
+    for (int i = 0; i < AGENT_BASH_JOBS_MAX; i++) AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) != NULL);
+    AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) == NULL && strstr(err, "already tracked") != NULL);
+    agent_bash_jobs_free(&w);
+    AGENT_TEST_ASSERT(w.bash_jobs == NULL && agent_bash_live_free_slot() == 0);
+
+    static const int ways[] = {0, SIGTERM, SIGHUP, SIGINT};   /* 0: exit(), the atexit path */
+    for (int sig : ways) {
+        int fds[2], go[2];   /* the child reports its job on fds, and leaves by exit() when told on go */
+        AGENT_TEST_ASSERT(pipe(fds) == 0 && pipe(go) == 0);
+        fflush(NULL);
+        const pid_t child = fork();
+        if (child == 0) {
+            close(fds[0]);
+            close(go[1]);
+            agent_bash_teardown_install(true);
+            agent_bash_job *j = agent_bash_start(&w, "sleep 300", 600, err, sizeof err);
+            if (!j) _exit(99);
+            if (write(fds[1], &j->pid, sizeof j->pid) != (ssize_t)sizeof j->pid ||
+                write(fds[1], j->path, sizeof j->path) != (ssize_t)sizeof j->path)
+                _exit(98);
+            char told;
+            if (!sig && read(go[0], &told, 1) == 1) exit(0);
+            for (;;) pause();
+        }
+        close(fds[1]);
+        close(go[0]);
+        pid_t job_pid = 0;
+        char path[sizeof job->path] = {0};
+        AGENT_TEST_ASSERT(child > 0 && read(fds[0], &job_pid, sizeof job_pid) == (ssize_t)sizeof job_pid &&
+                          read(fds[0], path, sizeof path) == (ssize_t)sizeof path);
+        close(fds[0]);
+        if (child > 0 && job_pid > 0) AGENT_TEST_ASSERT(access(path, F_OK) == 0 && !test_pid_dead(job_pid));
+        if (child > 0 && sig) AGENT_TEST_ASSERT(kill(child, sig) == 0);
+        if (child > 0 && !sig) AGENT_TEST_ASSERT(write(go[1], "x", 1) == 1);
+        close(go[1]);
+        if (child <= 0 || job_pid <= 0) continue;
+        int status = 0;
+        AGENT_TEST_ASSERT(waitpid(child, &status, 0) == child);
+        if (sig) AGENT_TEST_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == sig);   /* still dies by the signal */
+        else AGENT_TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        bool dead = false;
+        for (int i = 0; !dead && i < 2500; i++) {
+            dead = test_pid_dead(job_pid);
+            if (!dead) usleep(2000);
+        }
+        AGENT_TEST_ASSERT(dead);
+        AGENT_TEST_ASSERT(access(path, F_OK) != 0);
     }
     pthread_mutex_destroy(&w.mu);
 }
