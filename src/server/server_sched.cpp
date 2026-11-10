@@ -4163,7 +4163,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
 
         /* ---- ONE shared forward over every bank's rows ------------------- */
         const double fwd_t0 = server_now_sec();   /* L288: the round's phases (server::w_spec_phase_ms) */
-        char err[160];
+        char err[160] = "";
         pulsar_session_spec_arm_capture(pool, rows);
         uint32_t got = 0;
         int rc;
@@ -4191,7 +4191,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 shape.head_last[r] = fr[r].fin ? 1u : 0u;
             }
             rc = pulsar_session_decode_fused(pool, fused_reqs, at, &shape, NULL, 0, &got, err, sizeof err);
-            if (rc == 0 && got == rows + (uint32_t)n_fin) got = rows;   /* the verify rows' share */
+            /* L372: a fused step heads the verify rows and one row a finishing chunk, or it is refused -- L260's
+             * `else rc = -1` here was orphaned when the announce below went between it and its `if`, and a step that
+             * headed the verify rows alone passed, its finishing prompts handed head rows that were never made */
+            if (rc == 0 && got != rows + (uint32_t)n_fin) {
+                snprintf(err, sizeof err, "the fused step headed %u rows, not its %u verify rows + %d finishing chunks",
+                         got, rows, n_fin);
+                server_log(PULSAR_LOG_ERROR, "pulsar-server: fused step REFUSED: %s", err);
+                rc = -1;
+            }
+            if (rc == 0) got = rows;   /* the verify rows' share */
             /* Rule 5: the lane announces that it RAN, once, with its shape --
              * otherwise only its refusals print and "it ran" rests on inference
              * (the pair's fusion measurement, 2026-10-01). */
@@ -4211,7 +4220,11 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
         pulsar_session_spec_arm_capture(pool, 0u);
         const double fwd_t1 = server_now_sec();
         s->live_bank = -1;   /* pool is multiseq-poisoned until a bank_switch */
-        if (rc != 0 || got != rows) {
+        if (rc == 0 && got != rows) {   /* the plain step: every row headed, or the round is refused by name */
+            snprintf(err, sizeof err, "the step headed %u of its %u rows", got, rows);
+            rc = -1;
+        }
+        if (rc != 0) {
             for (int r = 0; r < n_fr; r++) {
                 gen_state *pg = fr[r].sl->gen;
                 snprintf(pg->err, sizeof pg->err, "fused prefill forward failed: %s", err);
