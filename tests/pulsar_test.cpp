@@ -4476,6 +4476,66 @@ static void test_bpe_merge(void) {
     model_close(&model);
 }
 
+/* L373 (O64): DeepSeek's turn markers carry its tool-result suffix -- the tokens of "<tool_result" after the user
+ * marker -- so a tool result rendered as a user turn is told from the user's own (the compaction tail, the routing
+ * anchors).  The suffix must not depend on the result's body: bodies that open with a letter, a brace, a newline, a
+ * digit, nothing, and more punctuation each read as role 3; the user's own turn as 1.  Host: the DeepSeek
+ * container's vocabulary (PULSAR_TEST_DS4_TOKENIZER). */
+static pulsar_chat_format test_ds4_chat_v41(const pulsar_engine *) { return PULSAR_CHAT_DS4_V41; }
+static void test_ds4_tool_marker(void) {
+    const char *path = getenv("PULSAR_TEST_DS4_TOKENIZER");
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4-tool-marker: PULSAR_TEST_DS4_TOKENIZER is not set (the DeepSeek container whose "
+                        "vocabulary the test reads)\n");
+        TEST_ASSERT(path && path[0]);
+        return;
+    }
+    static pulsar_family fam{};
+    fam.arch = "l373-ds4-markers";
+    fam.name = "L373 DeepSeek markers test";
+    fam.tokenizer = &k_ds4_tokenizer;
+    fam.chat_format = test_ds4_chat_v41;
+    fam.caps = PULSAR_FAMILY_CAP_CHAT;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_model model;
+    const bool opened = model_open(&model, path, false);
+    TEST_ASSERT(opened);
+    if (!opened) {
+        model_close(&model);
+        free(e);
+        return;
+    }
+    e->vocab.vocab_load(&model);
+    pulsar_turn_markers m;
+    TEST_ASSERT(pulsar_chat_turn_markers(e, &m) && m.n_user == 1 && m.n_assistant == 1);
+    TEST_ASSERT(m.n_tool >= 1 && m.n_tool <= 3);
+    for (const char *body : {"hello", "{\"ok\": 1}", "\nline", "123", "", "-->x", " spaced", ">>"}) {
+        const std::string turn = std::string("<｜User｜><tool_result>") + body + "</tool_result><｜Assistant｜>";
+        pulsar_tokens t = {0};
+        TEST_ASSERT(pulsar_tokenize_rendered_chat(e, turn.c_str(), &t) && t.len > 1 + m.n_tool);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, 0) == 3);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, t.len - 1) == 2);
+        pulsar_tokens_free(&t);
+    }
+    for (const char *text : {"hello", "<tool>", "tool_result", "< tool_result>", "<tool-result>"}) {
+        const std::string turn = std::string("<｜User｜>") + text + "<｜Assistant｜>";
+        pulsar_tokens t = {0};
+        TEST_ASSERT(pulsar_tokenize_rendered_chat(e, turn.c_str(), &t) && t.len > 1);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, 0) == 1);
+        pulsar_tokens_free(&t);
+    }
+    /* the engine's own chat front writes the turn the markers read */
+    pulsar_tokens chat = {0};
+    const pulsar_chat_message tool = {"tool", "{\"exit\": 0}", false};
+    TEST_ASSERT(pulsar_chat_append_turn(e, &chat, &tool, 1, true, PULSAR_THINK_NONE));
+    TEST_ASSERT(chat.len > 1 + m.n_tool && pulsar_turn_marker_at(&m, chat.v, chat.len, 0) == 3);
+    pulsar_tokens_free(&chat);
+    e->vocab.vocab_free();
+    model_close(&model);
+    free(e);
+}
+
 /* L335: the library's say-once table (family.cpp pulsar_refusal_first) -- an op is said the first time only; past
  * PULSAR_REFUSAL_OPS_MAX ops every refusal is said (the table never silently drops one), and that fact once. */
 static void test_refusal_once(void) {
@@ -5762,6 +5822,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--bpe-merge", "bpe-merge", "DeepSeek's BPE merge off a heap: the ids of the old rescanning loop on the text fixtures, randomized vocabulary pieces and every short repeat; a 200k-character run in well under a second (L375)", test_bpe_merge},
+    {"--ds4-tool-marker", "ds4-tool-marker", "DeepSeek's turn markers carry the tool-result suffix: a tool result rendered as a user turn reads as one whatever its body (L373)", test_ds4_tool_marker},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},

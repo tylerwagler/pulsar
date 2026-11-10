@@ -1485,8 +1485,8 @@ void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const ch
     pulsar_tokens r = {0}, tok = {0};
     t->encode_rendered(e, opener, NULL, 0, &r);
     t->encode_rendered(e, tool_token, NULL, 0, &tok);
-    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE added token, so the render's
-     * own text after it cannot merge into it */
+    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE token the render's own text
+     * after it cannot merge into (an added token; DeepSeek: the end of a pre-tokenizer piece) */
     const int suffix = r.len - m->n_user;
     bool ok = tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
               r.v[r.len - 1] == tok.v[0];
@@ -1586,14 +1586,22 @@ static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { retu
 /** pulsar_family_tokenizer::think_close.  @param e the engine  @return the think-end marker id */
 static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id; }
 
-/* DeepSeek names a turn with one special token */
-/** pulsar_family_tokenizer::turn_markers: one special token each.  @param e the engine
+/* DeepSeek names a turn with one special token.  L373 (O64): its template renders a tool message as a user turn
+ * that opens "<tool_result>" (ds4_chat_append_message; the server's renderer writes the same text) -- BPE text, not
+ * an added token.  The tool-result suffix is the tokens of "<tool_result": the pre-tokenizer ends the "_result"
+ * piece at the ">" (a punctuation-led letter run stops at the next non-letter), and no merge crosses a piece, so
+ * those tokens are the same whatever the result's body is -- the ">" is not: it joins what follows (">" + "\n",
+ * "></").  A vocabulary that spells the suffix in more than three tokens, or "_result" in more than one, tells no
+ * tool turn apart (n_tool stays 0), as before.  A user message that itself begins "<tool_result" reads as a tool
+ * result: what the markers feed are anchors and cut choices, never a refusal. */
+/** pulsar_family_tokenizer::turn_markers: one special token each, and the tool-result suffix.  @param e the engine
  *  @param out receives the markers  @return true, always */
 static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     out->user[0] = e->vocab.user_id;
     out->n_user = 1;
     out->assistant[0] = e->vocab.assistant_id;
     out->n_assistant = 1;
+    pulsar_turn_markers_add_tool(e, "<｜User｜><tool_result", "_result", out);
     return true;
 }
 

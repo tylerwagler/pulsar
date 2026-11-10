@@ -314,6 +314,8 @@ typedef struct {
     FILE *trace;                ///< generation trace stream, or NULL
     bool wake_pending;          ///< a wake byte is already in the pipe (coalesces writes)
     bool stop;                  ///< shutdown requested; every wait loop must exit
+    bool worker_running;        ///< worker_main has started and `worker_tid` is its thread (it sets both itself)
+    pthread_t worker_tid;       ///< the worker thread, as it names itself: the owner of `bash_jobs` (agent_on_worker_thread)
     bool interrupt;             ///< Ctrl+C: abandon the current turn, keep the session
     bool initialized;           ///< engine + session are up and the worker may accept work
     bool save_requested;        ///< UI asked for a session save at the next safe point
@@ -1252,8 +1254,17 @@ void renderer_plain(agent_token_renderer *r, const char *s, size_t n);
  *  @param len    byte count
  *  @param finish the reply ended: flush held bytes and close any open DSML display */
 void agent_stream_text(agent_stream_renderer *sr, const char *text, size_t len, bool finish);
+/** Is the caller the worker thread -- the one thread that may touch the bash job list?  Takes w->mu.
+ *  @param w the worker
+ *  @return true on the worker thread once worker_main runs; false on the UI thread, and on a worker with no thread
+ *          (the unit tests) */
+bool agent_on_worker_thread(agent_worker *w);
 /** pulsar_session progress callback: on prefill_chunk / prefill_display events, updates status.prefill_total and
- *  prefill_done (both relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.
+ *  prefill_done (both relative to progress_base) and prefill_tps and wakes the UI.  Takes w->mu.  L373: at each
+ *  prefill chunk of a sync the WORKER thread runs -- a turn's, a compaction's, a deferred save's -- it polls the bash
+ *  jobs first (agent_bash_jobs_poll), so a long prefill keeps them drained and timed out.  A sync the UI thread runs
+ *  (a session switch, a save) polls nothing here: the list is the worker's, and the worker is idle then, polling
+ *  once a second itself.
  *  @param ud      the agent_worker
  *  @param event   the event name
  *  @param current tokens processed so far (absolute position)
@@ -1592,8 +1603,9 @@ char *agent_tool_arg_int(const agent_tool_call *call, const char *name, int def,
 /** A tool call's timeout argument, seconds (a number; fractions truncate).
  *  @param call the call
  *  @param name the argument
- *  @param out  receives seconds clamped to [1, 86400]; 3600 when absent, empty or <= 0
- *  @return NULL, or "Tool error: <name> is not a number" (malloc'd; the caller returns it) */
+ *  @param out  receives seconds clamped to [1, 86400]; 3600 when absent or empty
+ *  @return NULL, or "Tool error: <name> is not a number" / "... must be above 0 ..." (malloc'd; the caller returns
+ *          it): a value of 0 or less is refused, never read as the default */
 char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int *out);
 /** A tool call's boolean argument: true/yes/1 or false/no/0 (case-insensitive words).
  *  @param call the call
@@ -1760,8 +1772,9 @@ void agent_bash_teardown_install(bool with_sigint);
 void agent_bash_jobs_free(agent_worker *w);
 /** L373: poll every job once (agent_bash_job::poll: drain its pipe, reap it, apply its timeout_sec), so a job the
  *  model stopped asking about neither blocks on a full pipe nor outlives its timeout.  The worker thread calls it
- *  at the top of every tool round, at every prefill chunk of a turn, every AGENT_BASH_POLL_TOKENS sampled tokens,
- *  and once a second while it idles with a job running.
+ *  at the top of every tool round, at every prefill chunk of a sync it runs (worker_progress_cb), every
+ *  AGENT_BASH_POLL_TOKENS sampled tokens of a turn or a compaction summary, and once a second while it idles with
+ *  a job running.  The list is the worker thread's alone: never called from the UI thread.
  *  @param w the worker
  *  @return true while any job is still running */
 bool agent_bash_jobs_poll(agent_worker *w);

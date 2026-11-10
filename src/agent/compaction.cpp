@@ -231,6 +231,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             worker_clear_interrupt(w);
             return false;
         }
+        /* L373: the summary's decode polls the bash jobs as a turn's does (a compaction runs on the worker thread) */
+        if (w->bash_jobs && i > 0 && i % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
         int token = pulsar_session_argmax(w->session);
         if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {

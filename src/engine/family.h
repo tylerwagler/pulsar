@@ -287,12 +287,14 @@ typedef struct pulsar_family_tokenizer {
 
 /** L351: fill `m`'s tool-result suffix (pulsar_turn_markers::tool) for a template that renders a tool message as a
  *  user turn: `opener` is that turn's rendered opening (e.g. "<|im_start|>user\n<tool_response>"), `tool_token` the
- *  added token it ends in; the suffix is the opener's tokens after the user marker.  A family's turn_markers calls it
- *  once its user marker is set.  n_tool stays 0 (no tool turns told apart) when the opener does not begin with the
- *  user marker or the tool token is not one added token.
+ *  token it ends in -- one the text after it cannot merge into: an added token, or (DeepSeek's `<tool_result`, L373)
+ *  the end of a pre-tokenizer piece; the suffix is the opener's tokens after the user marker.  A family's
+ *  turn_markers calls it once its user marker is set.  n_tool stays 0 (no tool turns told apart) when the opener does
+ *  not begin with the user marker, the suffix is longer than pulsar_turn_markers::tool or the tool token is not one
+ *  token.
  *  @param e          the engine
  *  @param opener     the tool turn's rendered opening
- *  @param tool_token the added token it ends in
+ *  @param tool_token the token it ends in
  *  @param m          the markers (n_user set); receives tool / n_tool */
 void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const char *tool_token,
                                   pulsar_turn_markers *m);
