@@ -2485,8 +2485,8 @@ bool server::bank_unspill(int bank, spilled_history *was) {
         size_t len = 0;
         was->text = render_tokens_text(s->engine, hist, &len);
         /* L281: the bank's own image records are what its chain must carry back */
-        const int n_img = pulsar_session_image_hashes(pool, was->hashes, 64);
-        was->n_img = n_img < 64 ? n_img : 64;
+        const int n_img = pulsar_session_image_hashes(pool, was->hashes, PULSAR_IMAGE_BLOCKS_MAX);
+        was->n_img = n_img < PULSAR_IMAGE_BLOCKS_MAX ? n_img : PULSAR_IMAGE_BLOCKS_MAX;
     }
     pulsar_session_invalidate(pool);
     pulsar_session_bank_state_save(pool, (uint32_t)bank);

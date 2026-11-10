@@ -704,10 +704,9 @@ void server::gen_prefill_abandon(session_slot *sl) {
 static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int live_len,
                                      pulsar_image_ref *images, int n_images,
                                      char *why, size_t whylen) {
-    enum { HELD_MAX = 64 };
-    int starts[HELD_MAX];
-    const int held = pulsar_image_block_starts(e, eff, live_len, starts, HELD_MAX);
-    if (held < 0 || held > HELD_MAX || held > n_images) {
+    int starts[PULSAR_IMAGE_BLOCKS_MAX];   /* a history holds no more blocks (pulsar.h) */
+    const int held = pulsar_image_block_starts(e, eff, live_len, starts, PULSAR_IMAGE_BLOCKS_MAX);
+    if (held < 0 || held > PULSAR_IMAGE_BLOCKS_MAX || held > n_images) {
         snprintf(why, whylen, "the live history carries %d image block(s) for %d image(s)", held, n_images);
         return false;
     }

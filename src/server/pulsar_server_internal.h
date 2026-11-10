@@ -2808,7 +2808,7 @@ struct server {
     /// @param hit           receives the chain (n = 0 for none) with its bytes and RAM-resident bytes
     int kv_cache_find(const char *prompt_text, const uint64_t *image_hashes, int n_images, kv_chain_hit *hit);
     /** kv_cache_find() for a request's prompt and images. */
-    /// @param req  the request (its prompt_text and images; at most 64 image hashes are compared)
+    /// @param req  the request (its prompt_text and images; at most PULSAR_IMAGE_BLOCKS_MAX image hashes are compared)
     /// @param hit  receives the chain, as kv_cache_find
     /// @return the position the chain ends at, 0 for none
     int kv_cache_find_req(const request *req, kv_chain_hit *hit);
@@ -3857,8 +3857,8 @@ struct gen_restore {
  *  image records its job's restore finds the chain by.  `text` is owned (NULL: the bank held nothing). */
 typedef struct spilled_history {
     char *text;            ///< the history rendered
-    uint64_t hashes[64];   ///< its image records' content hashes, in order
-    int n_img;             ///< how many
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];   ///< its image records' content hashes, in order
+    int n_img;             ///< how many (at most PULSAR_IMAGE_BLOCKS_MAX: what a bank's history can hold)
 } spilled_history;
 /** L353 no. 8: whether restoring a spilled bank's history serves this request.
  *  @param was the history
