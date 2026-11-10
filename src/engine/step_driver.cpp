@@ -422,11 +422,14 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     ok = ops->step_end(&st, ok);
     pulsar_state_step_end(ss, bank, n_rows, ok);   /* L339: the step's banks folded their pending rows */
     if (!ok) {
-        /* the step may have advanced any of its banks' state before it failed: those banks start over, and the
-         * live bank's checkpoint no longer describes its state */
-        for (uint32_t r = 0; r < n_rows; r++)
+        /* the step may have advanced any of its banks' state before it failed: those banks start over, and no view
+         * of them describes their state any more -- the live one, and each reset bank's saved carry (L375 O44: only
+         * the live view was cleared, and a reset bank's carry went on naming a history its state no longer held) */
+        for (uint32_t r = 0; r < n_rows; r++) {
             if (!pulsar_state_reset_bank(ss, (uint32_t)bank[r]))
                 fprintf(stderr, "pulsar: %s: could not clear bank %d after a failed step\n", ARCH(e), bank[r]);
+            pulsar_bank_view_invalidate(s, (uint32_t)bank[r]);
+        }
         s->checkpoint_valid = false;
     }
     s->dev.step_rows = ok ? d->logits : NULL;
