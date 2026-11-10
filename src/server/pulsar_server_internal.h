@@ -4038,6 +4038,10 @@ struct gen_state {
      * it, and this is that backed-up position. */
     size_t stop_scan_from;
     const char *finish;       ///< finish reason once known ("stop", "length", ...); NULL while running
+    /** L372: the decode was abandoned (its client gone: lane_abandon).  The wire keeps a valid finish reason
+     *  (`finish`, for a half-closed reader); the server's own records say "abandoned" -- the log lines and the trace --
+     *  and the turn is neither observed in the request histograms nor given a terminal checkpoint. */
+    bool abandoned;
     char *stop_sequence;      ///< the client stop sequence that ended generation, when one did; owned
     int completion;           ///< tokens generated this attempt
     int max_tokens;           ///< cap for this attempt

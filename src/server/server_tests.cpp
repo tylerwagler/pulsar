@@ -9561,6 +9561,26 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
     }
 }
 
+/* L372 (O31): an abandoned decode is "abandoned" in the server's records, not the "length" turn its wire label
+ * says, and gets no terminal checkpoint; lane_abandon is what marks it.  (That gen_step_finish skips the request
+ * histograms for it needs a parser and a family: the live legs.) */
+static void test_l372_abandoned_decode_is_not_a_turn(void) {
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "length"), "abandoned"));
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "stop"), "abandoned"));
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "error"), "error"));      /* a failure stays one */
+    TEST_ASSERT(!strcmp(gen_said_finish(false, "length"), "length"));
+    TEST_ASSERT(gen_turn_wants_terminal(false, "length", 5) && gen_turn_wants_terminal(false, "stop", 1));
+    TEST_ASSERT(!gen_turn_wants_terminal(true, "length", 5));
+    TEST_ASSERT(!gen_turn_wants_terminal(false, "error", 5) && !gen_turn_wants_terminal(false, "stop", 0));
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.finish = "length";
+    g.phase = GEN_DECODE;
+    g.batch_feed_valid = true;
+    lane_abandon(&g, /*drop_feed=*/true);
+    TEST_ASSERT(g.abandoned && g.phase == GEN_FINISH && !g.batch_feed_valid && !strcmp(g.finish, "length"));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15359,6 +15379,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
+    test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();

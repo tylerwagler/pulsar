@@ -3383,7 +3383,7 @@ static bool lane_should_abandon(const gen_state *g, bool require_batch_feed, int
 
 /* The abandon itself, shared by the three lanes: name the signal, stop the
  * slot (drop_feed on the lanes whose pending commit must be dropped once). */
-/// @param g the slot's generation (phase set to GEN_FINISH)
+/// @param g the slot's generation (phase set to GEN_FINISH, marked abandoned)
 /// @param drop_feed also drop its pending batch_feed commit
 static void lane_abandon(gen_state *g, bool drop_feed) {
     server_log(PULSAR_LOG_DEFAULT,
@@ -3391,6 +3391,7 @@ static void lane_abandon(gen_state *g, bool drop_feed) {
                g->writer.failed ? "client stream failed" : "client disconnected",
                g->completion);
     if (drop_feed) g->batch_feed_valid = false;
+    g->abandoned = true;   /* L372: not a "length" turn in the server's records (gen_step_finish) */
     g->phase = GEN_FINISH;
 }
 

@@ -1647,6 +1647,7 @@ void server::gen_decode_init(session_slot *sl) {
     g->plain_stream_pos = 0;
     g->stop_scan_from = 0;
     g->finish = "length";
+    g->abandoned = false;
     g->completion = 0;
     /* Continued attempts (tool-error recovery) spend the request's ONE
      * max_tokens budget: completion_total holds what earlier attempts already
@@ -2024,6 +2025,22 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 
 
+/// @param abandoned     the decode was abandoned (gen_state::abandoned)
+/// @param final_finish  the turn's finish label as the wire carries it
+/// @return the label the server's log lines and trace give the turn: "abandoned" for an abandoned decode
+static const char *gen_said_finish(bool abandoned, const char *final_finish) {
+    return abandoned && strcmp(final_finish, "error") != 0 ? "abandoned" : final_finish;
+}
+
+/// @param abandoned     the decode was abandoned (gen_state::abandoned)
+/// @param final_finish  the turn's finish label
+/// @param generated     tokens the request generated, every attempt
+/// @return true when the idle worker should prefill the turn's reply (L311): it decoded, did not fail and its client
+///         heard it out
+static bool gen_turn_wants_terminal(bool abandoned, const char *final_finish, int generated) {
+    return !abandoned && strcmp(final_finish, "error") != 0 && generated > 0;
+}
+
 /* Post-decode epilogue: tool repair/recovery, final parse, protocol live
  * state, checkpoints, the final response, and logging. Recovery paths loop
  * back to GEN_DECODE_INIT (the old goto decode_again).  Only a job with a decode
@@ -2081,6 +2098,9 @@ void server::gen_step_finish(session_slot *sl) {
     char *parsed_content = turn.content;
     char *parsed_reasoning = turn.reasoning;
     const char *final_finish = !strcmp(g->finish, "error") ? g->finish : turn.finish;
+    /* L372: what the server's records call the turn -- an abandoned decode (lane_abandon) is not the "length" its
+     * wire label says (kept valid for a half-closed reader) */
+    const char *said_finish = gen_said_finish(g->abandoned, final_finish);
     if (j->req.kind == REQ_CHAT && !parsed_calls.len && j->req.api == API_RESPONSES) s->responses_live_clear(sl);
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
                            g->responses_protocol);
@@ -2108,15 +2128,16 @@ void server::gen_step_finish(session_slot *sl) {
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
-         * without scraping every response. */
-        s->observe_request_timings(t, finish_t - g->t0);
+         * without scraping every response.  L372: not an abandoned decode's -- its end-to-end time and its token
+         * count are where the client left, not a turn's. */
+        if (!g->abandoned) s->observe_request_timings(t, finish_t - g->t0);
     }
     /* L324: the pool's duplicate-prefix census at each request's end (host carries only, off the decode path) */
     s->kv_dup_census_update();
 
     bool tool_open = false, tool_closed = false;
     if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
-    s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,
+    s->trace_finish(g->trace_id, &j->req, said_finish, g->completion,
                  tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
@@ -2269,7 +2290,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
@@ -2279,7 +2300,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        server_now_sec() - g->t0);
         }
     } else {
@@ -2298,7 +2319,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
@@ -2309,7 +2330,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        server_now_sec() - g->t0);
         }
     }
@@ -2317,7 +2338,8 @@ void server::gen_step_finish(session_slot *sl) {
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
-    sl->terminal_pending = strcmp(final_finish, "error") != 0 && g->completion_total + g->completion > 0;
+    /* L372: not an abandoned one -- its partial reply is no turn the client will send back */
+    sl->terminal_pending = gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion);
     g->phase = GEN_DONE;
 }
 
