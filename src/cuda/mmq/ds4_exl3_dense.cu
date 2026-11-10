@@ -146,10 +146,6 @@ struct dense_proj {
     /** @var N
      *  its stored output width (exl3_out_stored, a multiple of 128) */
     int N;                           ///< its STORED outputs (exl3_out_stored)
-    /// Not read by anything.  It held the split count until L338 made a CTA cover all of K; the host half of
-    /// split-K went in L375, and this word stays only because dense_proj is the kernels' parameter block -- taking
-    /// it out moves Ny and resizes the block, a device-code change that wants its own byte-gated landing.
-    int layout_word;
     int Ny;                          ///< its logical outputs: y's row width, the columns stored (<= N)
 };
 
@@ -735,7 +731,7 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
             all.p[j] = dense_proj{static_cast<const uint32_t *>(p[j].w), suh, suh + K, reinterpret_cast<float *>(ws + L.part),
                                   p[j].y, reinterpret_cast<__nv_bfloat16 *>(p[j].yb),
                                   reinterpret_cast<__half *>(ws + L.hi), reinterpret_cast<__half *>(ws + L.lo),
-                                  reinterpret_cast<float *>(ws + L.inv), c, N, 0, p[j].N};
+                                  reinterpret_cast<float *>(ws + L.inv), c, N, p[j].N};
             ws += proj_ws_bytes(M, K, N);
             c += N / 128;
         }

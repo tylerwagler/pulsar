@@ -480,8 +480,6 @@ struct row_smem {
     float fsum;
     /// Candidates the cut emits.
     uint32_t filtered;
-    /// Unused: nothing in this file reads or writes it.
-    int32_t win;
 };
 
 /* A row's candidate list, wherever it lives: sorted (key, id) and its probabilities in sorted order. */
