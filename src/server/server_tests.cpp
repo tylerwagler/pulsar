@@ -9674,7 +9674,10 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
 }
 
 /* L372 (O23): an abandoned prefill keeps its bank, so it drops the live tool bindings it did not continue (they match
- * by ids and position alone); a live continuation's own binding stays. */
+ * by ids and position alone); a live continuation's own binding stays.  The memory refusal keeps the bank too and
+ * settles the bindings by the same rule (live_bindings_settle), with one more case: a job refused before it moved
+ * anything on the bank -- no adopt, no chain load, no sync -- leaves every binding, since the bank is still the
+ * history they were made on. */
 static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
     for (const bool continues : {false, true}) {
         int sv[2];
@@ -9702,6 +9705,9 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
         g.responses_live_continuation = g.anthropic_live_continuation = continues;
         slot_writer_init(&g.writer, sv[0]);
         sl->gen = &g;
+        s.live_bindings_settle(sl);   /* refused before its first chunk: nothing moved, nothing cleared */
+        TEST_ASSERT(sl->responses_live.valid && sl->anthropic_live.valid);
+        g.bank_written = true;        /* a sync was issued (an abandon is its interruption) */
         s.gen_prefill_abandon(sl);
         TEST_ASSERT(g.phase == GEN_DONE);
         TEST_ASSERT(sl->responses_live.valid == continues && sl->anthropic_live.valid == continues);
@@ -9713,6 +9719,22 @@ static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
     }
 }
 
+/* L372: a decoding job whose bank cannot be installed finishes on an error and keeps the first cause -- one helper
+ * for generate_job_step, batch_leave, the quanta's entry loops and the batched round's begin (the entry loops and
+ * the round's begin overwrote a cause already recorded with "bank N state restore failed"). */
+static void test_l372_bank_install_failure_keeps_the_first_error(void) {
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.phase = GEN_DECODE;
+    gen_bank_install_failed(&g, 3u);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "bank 3 state restore failed") != NULL);
+    memset(&g, 0, sizeof g);
+    g.phase = GEN_DECODE;
+    snprintf(g.err, sizeof g.err, "the pair's step failed");
+    gen_bank_install_failed(&g, 3u);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && !strcmp(g.err, "the pair's step failed"));
+}
+
 /* L372 (O31): an abandoned decode is "abandoned" in the server's records, not the "length" turn its wire label
  * says, and gets no terminal checkpoint; lane_abandon is what marks it.  (That gen_step_finish skips the request
  * histograms for it needs a parser and a family: the live legs.) */
@@ -9721,6 +9743,11 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
     TEST_ASSERT(!strcmp(gen_said_finish(true, "stop"), "abandoned"));
     TEST_ASSERT(!strcmp(gen_said_finish(true, "error"), "error"));      /* a failure stays one */
     TEST_ASSERT(!strcmp(gen_said_finish(false, "length"), "length"));
+    /* the request histograms count a turn that ran to its own end: not an abandoned one, not a failed one */
+    TEST_ASSERT(gen_turn_is_measured(false, "stop") && gen_turn_is_measured(false, "length") &&
+                gen_turn_is_measured(false, "tool_calls"));
+    TEST_ASSERT(!gen_turn_is_measured(false, "error") && !gen_turn_is_measured(true, "length") &&
+                !gen_turn_is_measured(true, "error"));
     TEST_ASSERT(gen_turn_wants_terminal(false, "length", 5) && gen_turn_wants_terminal(false, "stop", 1));
     TEST_ASSERT(!gen_turn_wants_terminal(true, "length", 5));
     TEST_ASSERT(!gen_turn_wants_terminal(false, "error", 5) && !gen_turn_wants_terminal(false, "stop", 0));
@@ -9808,6 +9835,8 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
         TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == -1);
         TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
+        /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
+        TEST_ASSERT(s.budget_admits_growth(1u, 1024, err, sizeof err));
         pulsar_tokens_free(&jb.prompts[0]);
         pthread_cond_destroy(&jb.cv);
         pthread_mutex_destroy(&jb.mu);
@@ -15758,6 +15787,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_no_fuse_prefill_is_the_classic_steps();
     test_l372_gone_client_wait_covers_prefill();
     test_l372_failed_batch_leave_is_still_stepped();
+    test_l372_bank_install_failure_keeps_the_first_error();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
     test_l372_ill_formed_utf8_is_refused_at_parse();

@@ -1644,7 +1644,13 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     const float tau = pulsar_spec_tau(s->engine);
     for (spec_redraft_req *q : chains) q->keep = pulsar_spec_conf_keep(q->conf, q->keep, tau);
     static int unpriced = -1;   /* diagnostic (PULSAR_BLOCK_UNPRICED set, read once): the sweep's rule-off arm */
-    if (unpriced < 0) unpriced = getenv("PULSAR_BLOCK_UNPRICED") ? 1 : 0;
+    if (unpriced < 0) {
+        unpriced = getenv("PULSAR_BLOCK_UNPRICED") ? 1 : 0;
+        /* rule 5: a schedule switch says once that it is the path taken */
+        if (unpriced)
+            fprintf(stderr, "pulsar: block drafter: PULSAR_BLOCK_UNPRICED is set -- the priced chain cut (the verify "
+                            "pick) is off for this process: every chain is verified up to its tau stop\n");
+    }
     if (!unpriced && !chains.empty()) pulsar_spec_keep_picked(s, n, reqs, n);
     return true;
 }

@@ -9,10 +9,22 @@
  * ============================================================================
  */
 
+bool agent_on_worker_thread(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    const bool yes = w->worker_running && pthread_equal(pthread_self(), w->worker_tid);
+    pthread_mutex_unlock(&w->mu);
+    return yes;
+}
+
+
+
 void worker_progress_cb(void *ud, const char *event, int current, int total) {
     agent_worker *w = (agent_worker *)ud;
     if (!w || !event) return;
     if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display")) return;
+    /* the jobs are the worker thread's (its idle tick polls them while the UI thread syncs): the thread first, then
+     * the list */
+    if (!strcmp(event, "prefill_chunk") && agent_on_worker_thread(w) && w->bash_jobs) agent_bash_jobs_poll(w);
     pthread_mutex_lock(&w->mu);
     /* the session's prompt length is the authority for the bar's end (the worker's pre-sync estimate only
      * seeds it before the first report) */

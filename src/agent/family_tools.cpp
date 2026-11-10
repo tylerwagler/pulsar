@@ -217,6 +217,10 @@ static void test_agent_family_tools(void) {
         const char *name, *arguments, *error;
     } wrong[] = {
         {"bash", "{\"command\": \"true\", \"timeout_sec\": \"10s\"}", "Tool error: timeout_sec is not a number\n"},
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": 0}",
+         "Tool error: timeout_sec must be above 0 (seconds; leave it out for the default, 3600)\n"},
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": -5}",
+         "Tool error: timeout_sec must be above 0 (seconds; leave it out for the default, 3600)\n"},
         {"bash", "{\"command\": \"true\", \"refresh_sec\": 1.5}", "Tool error: refresh_sec is not an integer\n"},
         {"bash", "{\"command\": [\"true\"]}", "Tool error: command must be a string\n"},
         {"bash_status", "{\"job\": \"first\"}", "Tool error: job is not an integer\n"},

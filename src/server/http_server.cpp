@@ -965,7 +965,7 @@ bool server::send_metrics(int fd) {
                    &h_prompt_tok, pulsar_hist_tokens_bounds);
     emit_histogram(&b, "vllm:request_generation_tokens", "Completion tokens per request.",
                    &h_gen_tok, pulsar_hist_tokens_bounds);
-    buf_puts(&b, "# HELP pulsar:requests_finished_total Requests that reached the finish phase.\n");
+    buf_puts(&b, "# HELP pulsar:requests_finished_total Requests whose turn ran to its end (not abandoned, not failed): the count the request histograms summarise.\n");
     buf_puts(&b, "# TYPE pulsar:requests_finished_total counter\n");
     buf_printf(&b, "pulsar:requests_finished_total %llu\n", reqs_finished);
 

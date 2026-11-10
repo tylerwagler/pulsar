@@ -958,7 +958,8 @@ static void test_agent_turn_open_is_the_transcripts(void) {
 }
 
 /* L373: the compaction tail starts at a user turn marker or there is no tail -- never mid-turn, never at a tool
- * result rendered as a user turn (Qwen-shaped markers: "<|im_start|> user" and the "\n <tool_response>" after it). */
+ * result rendered as a user turn (Qwen-shaped markers: "<|im_start|> user" and the "\n <tool_response>" after it;
+ * then DeepSeek-shaped ones). */
 static void test_agent_compact_tail_starts_at_a_user_turn(void) {
     pulsar_turn_markers m;
     memset(&m, 0, sizeof(m));
@@ -976,7 +977,23 @@ static void test_agent_compact_tail_starts_at_a_user_turn(void) {
     AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, 20) == 20);   /* a marker cut by bottom does not count */
     AGENT_TEST_ASSERT(agent_compact_tail_cut(NULL, v, 2, n) == n);   /* markers not spelled: no tail */
     m.n_tool = 0;   /* Gemma: no tool-result turns; every user marker is the user's */
-    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 9);
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 9);    /* DeepSeek-shaped markers: one special token a role, and a tool result a user turn that opens with the three
+     * tokens of "<tool_result" (the engine's ds4_tok_turn_markers) -- before L373 it had no tool suffix, and a tail
+     * could start at a tool result */
+    memset(&m, 0, sizeof(m));
+    m.user[0] = 30, m.n_user = 1;
+    m.assistant[0] = 31, m.n_assistant = 1;
+    m.tool[0] = 40, m.tool[1] = 41, m.tool[2] = 42, m.n_tool = 3;
+    /*              0   1  2   3  4   5   6   7   8  9  10  11  12  13 */
+    const int d[] = {1, 30, 5, 31, 6, 30, 40, 41, 42, 7, 31, 8, 30, 9};
+    const int dn = (int)(sizeof d / sizeof d[0]);
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 0, dn) == 1);     /* the first user turn */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 2, dn) == 12);    /* not the tool result at 5 */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 5, dn) == 12);    /* a window that opens ON the tool result */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 2, 12) == 12);    /* only the tool result before bottom: no tail */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 5, 8) == 5);      /* a suffix cut by bottom: a user turn (the rule) */
+    m.n_tool = 0;   /* ... and without the suffix the tail started at it */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, d, 2, dn) == 5);
 }
 
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */

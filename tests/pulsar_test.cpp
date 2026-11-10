@@ -3934,6 +3934,87 @@ static void test_driver_scratch_cap(void) {
     free(e);
 }
 
+/* L375 O39: the driver's context bound.  Every row of every step kind enters through the driver's one forward, and a
+ * row at or past the pool's capacity is refused there by name, before the family's trunk or any launch: a decode
+ * row, the plain eval's row, and a verify run whose first row fits and whose second does not.  Host: a driver family
+ * with no trunk (reaching it would crash the test), a state set of one 8-position bank. */
+static uint32_t test_driver_width(const pulsar_engine *) { return 4u; }
+static void test_driver_context_bound(void) {
+    static pulsar_driver_ops ops{};
+    ops.embed = test_driver_never;
+    ops.head = test_driver_head_never;
+    static pulsar_family fam{};
+    fam.arch = "l375_driver_test";
+    fam.name = "L375 driver test";
+    fam.driver = &ops;
+    fam.logits_width = test_driver_width;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_state_set *ss = (pulsar_state_set *)xcalloc(1, sizeof(*ss));
+    uint32_t bank_pos = 8u;
+    bool stale = false;
+    ss->n_banks = 1u;
+    ss->ctx = 8u;
+    ss->verify_rows = 4u;
+    ss->bank_pos = &bank_pos;
+    ss->frontier_stale = &stale;
+    pulsar_driver_state *d = (pulsar_driver_state *)xcalloc(1, sizeof(*d));
+    d->max_rows = 4u;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->states = ss;
+    s->driver = d;
+    s->ctx_size = 8;
+
+    char err[256] = "";
+    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, 1 };
+    TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
+    TEST_ASSERT(bank_pos == 8u);                       /* nothing moved */
+    for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
+    err[0] = '\0';
+    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == 8u);
+    bank_pos = 7u;                                     /* a verify of [7, 8]: its second row is past the pool */
+    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, 1 }, { 0u, TokPos{8}, 1 } };
+    uint32_t headed = 9u;
+    err[0] = '\0';
+    TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
+                err[0] && headed == 0u && bank_pos == 7u);
+    token_vec_free(&s->checkpoint);
+    free(s);
+    free(d);
+    free(ss);
+    free(e);
+}
+
+/* L375: the draft schedule's environment overrides are parsed by one helper (the engine's open calls it for both and
+ * refuses the load on false), and a value that is not a number is refused by name -- PULSAR_SPEC_DEPTH went through
+ * atoi, where "3x" read as 3 and "deep" as 0 (the drafter's own), silently. */
+static void test_spec_env(void) {
+    char *saved = test_save_env("PULSAR_SPEC_DEPTH");
+    bool set = true;
+    double v = 7.0;
+    unsetenv("PULSAR_SPEC_DEPTH");
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && !set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && !set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "5", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && set && v == 5.0);
+    for (const char *bad : {"deep", "3x", "2.5", "off", " ", "1e30", "nan", "inf"}) {
+        setenv("PULSAR_SPEC_DEPTH", bad, 1);
+        TEST_ASSERT(!pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v));
+    }
+    /* the tau's form: a number or the word */
+    setenv("PULSAR_SPEC_DEPTH", "off", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v) && set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "0.25", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v) && set && v == 0.25);
+    for (const char *bad : {"on", "0.25x", "nan", "inf", "offf"}) {
+        setenv("PULSAR_SPEC_DEPTH", bad, 1);
+        TEST_ASSERT(!pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v));
+    }
+    test_restore_env("PULSAR_SPEC_DEPTH", saved);
+}
+
 /* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
  * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
  * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
@@ -4074,6 +4155,7 @@ static void test_live_row_valid(void) {
         /* invalidate: the row was the forgotten history's */
         pulsar_session_family_invalidate(s);
         TEST_ASSERT(s->live_dev() == NULL && s->argmax() == PULSAR_SAMPLE_REFUSED);
+        TEST_ASSERT(pulsar_session_live_digest(s) == 0u);   /* the TP ack's reader: refused at the gate, no device read */
     }
     pulsar_gpu_tensor_free(rows);
     pulsar_session_dev_free(s);
@@ -4089,7 +4171,11 @@ static void test_live_row_valid(void) {
  *   O39  begin refuses a bank that stands at the context, and cuts the drafts to the room below it.
  *   O37  an end that never reaches the walk (a sampled round with no stream) undoes the round: its base and drafts
  *        leave the view, which is then no position's.
- *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits. */
+ *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits.
+ *   O37  a refused banked absorb at a batch round's end fails each bank that had rows and invalidates its view. */
+static bool test_absorb_banked_refuses(pulsar_session *, const uint32_t *, const uint32_t *, const int32_t *, uint32_t) {
+    return false;
+}
 static void test_spec_round_refusals(void) {
     static pulsar_family fam{};
     static pulsar_spec_target_ops target{};    /* no snapshot: nothing of a target to undo */
@@ -4157,6 +4243,28 @@ static void test_spec_round_refusals(void) {
     for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, t);
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
                 strstr(err, "context is full") != NULL && s->checkpoint.len == 6 && s->checkpoint_valid);
+    /* O37: the batch end's banked absorb refuses -- bank 1 had rows: its step fails and its saved view is no
+     * position's (its next sync starts from 0 and the drafter's context is rebuilt with it); bank 0 had none and
+     * keeps its step and its view */
+    static pulsar_family_bank_ops bops{};
+    bops.live = test_live_bank0;
+    fam.banks = &bops;
+    drafter.absorb_banked = test_absorb_banked_refuses;
+    s->bank_carry = (pulsar_bank_carry *)xcalloc(2, sizeof(*s->bank_carry));
+    s->bank_carry_n = 2;
+    for (uint32_t b = 0; b < 2u; b++) s->bank_carry[b].valid = s->bank_carry[b].checkpoint_valid = true;
+    s->checkpoint_valid = true;
+    st[0].status = st[1].status = PULSAR_SPEC_STEP_OK;
+    st[0].err[0] = st[1].err[0] = '\0';
+    s->seed_defer.active = true;
+    s->seed_defer.n = 2;
+    s->seed_defer.bank[0] = s->seed_defer.bank[1] = 1u;
+    pulsar_spec_absorb_deferred(s, st, 2);
+    TEST_ASSERT(st[1].status == PULSAR_SPEC_STEP_FAILED && strstr(st[1].err, "absorb") != NULL &&
+                !s->bank_carry[1].checkpoint_valid);
+    TEST_ASSERT(st[0].status == PULSAR_SPEC_STEP_OK && s->bank_carry[0].checkpoint_valid && s->checkpoint_valid);
+    TEST_ASSERT(!s->seed_defer.active && s->seed_defer.n == 0u);
+    free(s->bank_carry);
     pulsar_spec_round_free(r);
     pulsar_tokens_free(&s->checkpoint);
     free(s);
@@ -4261,6 +4369,367 @@ static void test_tokenizer_refusals(void) {
     TEST_ASSERT(!pulsar_chat_turn_markers(e, &tm) && tm.n_user == 0 && tm.n_assistant == 0);
     TEST_ASSERT(!pulsar_tokenize_text(e, "again", &out) && out.len == 0);   /* said once: the log has one line */
     pulsar_tokens_free(&out);
+    free(e);
+}
+
+/* L375 (O51): DeepSeek's BPE merge.  bpe_emit_piece ran the merge rule by rescanning every adjacent pair per merge
+ * (O(n^2) in the piece, and a piece has no length bound); it now runs the same rule off a heap.  The proof that the
+ * rule did not move is this frozen copy of the old loop (the body bpe_emit_piece had before L375, its symbols owned
+ * strings, its byte map and UTF-8 writer copied with it so the reference shares nothing with the engine but the
+ * vocabulary's two tables), run beside the engine's on the same pieces. */
+static void bpe_ref_utf8_put(char **p, uint32_t cp) {
+    if (cp <= 0x7f) {
+        *(*p)++ = (char)cp;
+    } else if (cp <= 0x7ff) {
+        *(*p)++ = (char)(0xc0 | (cp >> 6));
+        *(*p)++ = (char)(0x80 | (cp & 0x3f));
+    } else {
+        *(*p)++ = (char)(0xe0 | (cp >> 12));
+        *(*p)++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+        *(*p)++ = (char)(0x80 | (cp & 0x3f));
+    }
+}
+
+static uint32_t bpe_ref_byte_to_codepoint(uint8_t b) {
+    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) return b;
+    uint32_t n = 0;
+    for (uint32_t x = 0; x < 256; x++) {
+        if ((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174)) continue;
+        if (x == b) return 256 + n;
+        n++;
+    }
+    return b;
+}
+
+typedef struct {
+    char *ptr;
+    uint64_t len;
+} bpe_ref_str;
+
+static void bpe_ref_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, token_vec *out) {
+    char *encoded = (char *)xmalloc((size_t)raw_piece.len * 4 + 1);
+    char *ep = encoded;
+    for (uint64_t i = 0; i < raw_piece.len; i++) bpe_ref_utf8_put(&ep, bpe_ref_byte_to_codepoint((uint8_t)raw_piece.ptr[i]));
+    *ep = '\0';
+    const uint64_t encoded_len = (uint64_t)(ep - encoded);
+
+    int n_sym = 0;
+    int cap_sym = 32;
+    bpe_ref_str *sym = (bpe_ref_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
+
+    for (uint64_t off = 0; off < encoded_len;) {
+        int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
+        if (n == 0) n = 1;
+        if (n_sym == cap_sym) {
+            cap_sym *= 2;
+            sym = (bpe_ref_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+        }
+        sym[n_sym].ptr = (char *)xmalloc((size_t)n);
+        memcpy(sym[n_sym].ptr, encoded + off, (size_t)n);
+        sym[n_sym++].len = (uint64_t)n;
+        off += (uint64_t)n;
+    }
+
+    for (;;) {
+        int best_i = -1;
+        int best_rank = INT32_MAX;
+
+        for (int i = 0; i + 1 < n_sym; i++) {
+            int rank = vocab->bpe_rank({ sym[i].ptr, sym[i].len }, { sym[i + 1].ptr, sym[i + 1].len });
+            if (rank >= 0 && rank < best_rank) {
+                best_rank = rank;
+                best_i = i;
+            }
+        }
+
+        if (best_i < 0) break;
+
+        bpe_ref_str merged;
+        merged.len = sym[best_i].len + sym[best_i + 1].len;
+        merged.ptr = (char *)xmalloc((size_t)merged.len);
+        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
+        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
+
+        free(sym[best_i].ptr);
+        free(sym[best_i + 1].ptr);
+        sym[best_i] = merged;
+
+        for (int j = best_i + 1; j + 1 < n_sym; j++) {
+            sym[j] = sym[j + 1];
+        }
+        n_sym--;
+    }
+
+    for (int i = 0; i < n_sym; i++) {
+        const std::string whole(sym[i].ptr, (size_t)sym[i].len);   /* the encoding has no NUL: byte 0 maps to U+0100 */
+        int token = vocab->vocab_find(whole.c_str());
+        if (token >= 0) {
+            token_vec_push(out, token);
+        } else {
+            for (uint64_t j = 0; j < sym[i].len; j++) {
+                const char one[2] = { sym[i].ptr[j], '\0' };
+                token = vocab->vocab_find(one);
+                if (token >= 0) token_vec_push(out, token);
+            }
+        }
+        free(sym[i].ptr);
+    }
+
+    free(sym);
+    free(encoded);
+}
+
+/** One piece through both merges: false (and the piece named) when the ids differ. */
+static bool bpe_merge_same(const pulsar_vocab *v, const char *what, const std::string &piece, uint64_t *n_tokens) {
+    token_vec got = {0}, want = {0};
+    v->bpe_emit_piece({ piece.data(), piece.size() }, &got);
+    bpe_ref_emit_piece(v, { piece.data(), piece.size() }, &want);
+    const bool same = got.len == want.len && (got.len == 0 || !memcmp(got.v, want.v, (size_t)got.len * sizeof(got.v[0])));
+    if (!same) {
+        fprintf(stderr, "bpe-merge: %s: a %zu-byte piece tokenizes to %d ids, the old merge loop's %d: \"", what,
+                piece.size(), got.len, want.len);
+        pulsar_dump_piece_quoted(stderr, piece.data(), piece.size() < 120 ? piece.size() : 120);
+        fprintf(stderr, "\"\n");
+    }
+    *n_tokens += (uint64_t)got.len;
+    token_vec_free(&got);
+    token_vec_free(&want);
+    return same;
+}
+
+static double bpe_test_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+/* Host: the DeepSeek container's vocabulary and merge table (PULSAR_TEST_DS4_TOKENIZER, the container the engine
+ * would load -- only its metadata is read). */
+static void test_bpe_merge(void) {
+    const char *path = getenv("PULSAR_TEST_DS4_TOKENIZER");
+    if (!path || !path[0]) {
+        fprintf(stderr, "bpe-merge: PULSAR_TEST_DS4_TOKENIZER is not set (the DeepSeek container whose merge table "
+                        "the test reads)\n");
+        TEST_ASSERT(path && path[0]);
+        return;
+    }
+    pulsar_model model;
+    const bool opened = model_open(&model, path, false);
+    TEST_ASSERT(opened);
+    if (!opened) {
+        model_close(&model);
+        return;
+    }
+    pulsar_vocab v;
+    v.vocab_load(&model);
+
+    uint64_t n_tokens = 0;
+    /* (a) the repo's text fixtures, each cut three ways: at whitespace (a word with the whitespace before it), by
+     * line, and in fixed 1500-byte chunks -- the pre-tokenizer's pieces are a fourth cut of the same bytes, and the
+     * merge is a function of the piece alone */
+    static const char *const corpora[] = {
+        "tests/teacher_forced_corpus.txt", "tests/long_context_story_prompt.txt", "tests/api-golden/corpus.jsonl",
+        "tests/test-vectors/kl-budget-code.txt", "tests/test-vectors/kl-budget-story.txt",
+        "tests/test-vectors/render-bytes-3ed8f4b7.txt", "tests/test-vectors/prompts/long_code_audit.txt",
+        "tests/test-vectors/prompts/long_memory_archive.txt", "tests/test-vectors/prompts/short_italian_fact.txt",
+        "tests/test-vectors/prompts/short_code_completion.txt", "tests/test-vectors/prompts/short_reasoning_plain.txt",
+    };
+    uint64_t n_corpus = 0, bad = 0;
+    for (const char *file : corpora) {
+        std::string text;
+        FILE *f = fopen(file, "rb");
+        TEST_ASSERT(f != NULL);
+        if (!f) {
+            fprintf(stderr, "bpe-merge: %s: %s (run from the engine root)\n", file, strerror(errno));
+            continue;
+        }
+        char b[65536];
+        size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) text.append(b, n);
+        fclose(f);
+        for (size_t at = 0; at < text.size();) {   /* words */
+            size_t end = at;
+            while (end < text.size() && isspace((unsigned char)text[end])) end++;
+            while (end < text.size() && !isspace((unsigned char)text[end])) end++;
+            bad += !bpe_merge_same(&v, file, text.substr(at, end - at), &n_tokens);
+            n_corpus++;
+            at = end;
+        }
+        for (size_t at = 0; at < text.size();) {   /* lines, the newline with its line */
+            size_t end = text.find('\n', at);
+            end = end == std::string::npos ? text.size() : end + 1;
+            bad += !bpe_merge_same(&v, file, text.substr(at, end - at), &n_tokens);
+            n_corpus++;
+            at = end;
+        }
+        for (size_t at = 0; at < text.size(); at += 1500) {   /* chunks: a cut may fall inside a UTF-8 sequence */
+            bad += !bpe_merge_same(&v, file, text.substr(at, 1500), &n_tokens);
+            n_corpus++;
+        }
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* (b) randomized pieces built from the vocabulary's own tokens (their raw bytes), so merges chain and overlap:
+     * plain concatenations, one token repeated, two alternated, a token's bytes doubled unit by unit, and runs of
+     * one character of several scripts spliced between tokens.  A fixed seed: the same pieces every run. */
+    uint64_t rng = 0x4c333735ull;
+    auto next = [&rng]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)(rng >> 33);
+    };
+    auto token_bytes = [&](std::string *to) {
+        size_t len = 0;
+        char *t = vocab_token_text(&v, (int)(next() % (uint32_t)v.n_vocab), &len);
+        if (t) to->append(t, len);
+        free(t);
+    };
+    static const char *const runs[] = { "a", "e", " ", "\n", "=", "-", "0", ".", "\xc3\xa9", "\xe4\xb8\xad",
+                                        "\xd0\xb6", "\xe3\x81\x82", "\xf0\x9f\x98\x80", "\xff", "ab", "aab", "\t" };
+    const uint32_t n_runs = (uint32_t)(sizeof(runs) / sizeof(runs[0]));
+    const uint32_t n_random = 12000;
+    uint32_t longest = 0;
+    bad = 0;
+    for (uint32_t i = 0; i < n_random; i++) {
+        std::string piece;
+        const uint32_t shape = i % 6u;
+        if (shape == 0) {                                   /* 1..12 tokens */
+            for (uint32_t k = 1 + next() % 12u; k > 0; k--) token_bytes(&piece);
+        } else if (shape == 1) {                            /* one token, 2..40 times */
+            std::string t;
+            token_bytes(&t);
+            for (uint32_t k = 2 + next() % 39u; k > 0; k--) piece += t;
+        } else if (shape == 2) {                            /* two tokens alternated */
+            std::string t, u;
+            token_bytes(&t);
+            token_bytes(&u);
+            for (uint32_t k = 2 + next() % 20u; k > 0; k--) piece += (k & 1u) ? t : u;
+        } else if (shape == 3) {                            /* a long run of one character: 1..2000 units */
+            const char *r = runs[next() % n_runs];
+            for (uint32_t k = 1 + next() % ((i % 60u == 3u) ? 2000u : 200u); k > 0; k--) piece += r;
+        } else if (shape == 4) {                            /* mixed scripts: runs spliced between tokens */
+            for (uint32_t k = 2 + next() % 6u; k > 0; k--) {
+                token_bytes(&piece);
+                const char *r = runs[next() % n_runs];
+                for (uint32_t j = next() % 9u; j > 0; j--) piece += r;
+            }
+        } else {                                            /* overlaps: every byte of a few tokens doubled or tripled */
+            std::string t;
+            for (uint32_t k = 1 + next() % 4u; k > 0; k--) token_bytes(&t);
+            const uint32_t times = 2u + next() % 2u;
+            for (char c : t) piece.append(times, c);
+        }
+        if (piece.size() > longest) longest = (uint32_t)piece.size();
+        bad += !bpe_merge_same(&v, "random", piece, &n_tokens);
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* (c) every length 1..64 of each repeated character or unit */
+    uint32_t n_lengths = 0;
+    bad = 0;
+    for (const char *r : runs) {
+        std::string piece;
+        for (uint32_t len = 1; len <= 64u; len++) {
+            piece += r;
+            bad += !bpe_merge_same(&v, "repeat", piece, &n_tokens);
+            n_lengths++;
+        }
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* the bound: one 200,000-character run is one piece (the pre-tokenizer's letter rule), and it tokenizes in well
+     * under a second; the old loop's cost at a tenth of that, for the log */
+    const std::string run(200000u, 'a');
+    token_vec out = {0};
+    double t0 = bpe_test_seconds();
+    v.bpe_tokenize_text(run.c_str(), &out);
+    const double run_s = bpe_test_seconds() - t0;
+    TEST_ASSERT(out.len > 0 && run_s < 0.5);
+    size_t back = 0;
+    for (int i = 0; i < out.len; i++) {
+        size_t len = 0;
+        free(vocab_token_text(&v, out.v[i], &len));
+        back += len;
+    }
+    TEST_ASSERT(back == run.size());
+    std::string mixed;
+    for (uint32_t i = 0; i < 200000u; i++) mixed += (char)('a' + next() % 26u);
+    token_vec out_mixed = {0};
+    t0 = bpe_test_seconds();
+    v.bpe_tokenize_text(mixed.c_str(), &out_mixed);
+    const double mixed_s = bpe_test_seconds() - t0;
+    TEST_ASSERT(out_mixed.len > 0 && mixed_s < 0.5);
+    token_vec ref = {0};
+    t0 = bpe_test_seconds();
+    bpe_ref_emit_piece(&v, { run.data(), 20000u }, &ref);
+    const double ref_s = bpe_test_seconds() - t0;
+    printf("bpe-merge: %" PRIu64 " corpus pieces, %u randomized (the longest %u bytes), %u repeat lengths: "
+           "%" PRIu64 " ids identical to the old merge loop's; a 200000-character run %.3f s (%d ids), 200000 random "
+           "letters %.3f s (%d ids); the old loop on a 20000-character run %.3f s\n",
+           n_corpus, n_random, longest, n_lengths, n_tokens, run_s, out.len, mixed_s, out_mixed.len, ref_s);
+    token_vec_free(&out);
+    token_vec_free(&out_mixed);
+    token_vec_free(&ref);
+    v.vocab_free();
+    model_close(&model);
+}
+
+/* L373 (O64): DeepSeek's turn markers carry its tool-result suffix -- the tokens of "<tool_result" after the user
+ * marker -- so a tool result rendered as a user turn is told from the user's own (the compaction tail, the routing
+ * anchors).  The suffix must not depend on the result's body: bodies that open with a letter, a brace, a newline, a
+ * digit, nothing, and more punctuation each read as role 3; the user's own turn as 1.  Host: the DeepSeek
+ * container's vocabulary (PULSAR_TEST_DS4_TOKENIZER). */
+static pulsar_chat_format test_ds4_chat_v41(const pulsar_engine *) { return PULSAR_CHAT_DS4_V41; }
+static void test_ds4_tool_marker(void) {
+    const char *path = getenv("PULSAR_TEST_DS4_TOKENIZER");
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4-tool-marker: PULSAR_TEST_DS4_TOKENIZER is not set (the DeepSeek container whose "
+                        "vocabulary the test reads)\n");
+        TEST_ASSERT(path && path[0]);
+        return;
+    }
+    static pulsar_family fam{};
+    fam.arch = "l373-ds4-markers";
+    fam.name = "L373 DeepSeek markers test";
+    fam.tokenizer = &k_ds4_tokenizer;
+    fam.chat_format = test_ds4_chat_v41;
+    fam.caps = PULSAR_FAMILY_CAP_CHAT;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_model model;
+    const bool opened = model_open(&model, path, false);
+    TEST_ASSERT(opened);
+    if (!opened) {
+        model_close(&model);
+        free(e);
+        return;
+    }
+    e->vocab.vocab_load(&model);
+    pulsar_turn_markers m;
+    TEST_ASSERT(pulsar_chat_turn_markers(e, &m) && m.n_user == 1 && m.n_assistant == 1);
+    TEST_ASSERT(m.n_tool >= 1 && m.n_tool <= 3);
+    for (const char *body : {"hello", "{\"ok\": 1}", "\nline", "123", "", "-->x", " spaced", ">>"}) {
+        const std::string turn = std::string("<｜User｜><tool_result>") + body + "</tool_result><｜Assistant｜>";
+        pulsar_tokens t = {0};
+        TEST_ASSERT(pulsar_tokenize_rendered_chat(e, turn.c_str(), &t) && t.len > 1 + m.n_tool);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, 0) == 3);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, t.len - 1) == 2);
+        pulsar_tokens_free(&t);
+    }
+    for (const char *text : {"hello", "<tool>", "tool_result", "< tool_result>", "<tool-result>"}) {
+        const std::string turn = std::string("<｜User｜>") + text + "<｜Assistant｜>";
+        pulsar_tokens t = {0};
+        TEST_ASSERT(pulsar_tokenize_rendered_chat(e, turn.c_str(), &t) && t.len > 1);
+        TEST_ASSERT(pulsar_turn_marker_at(&m, t.v, t.len, 0) == 1);
+        pulsar_tokens_free(&t);
+    }
+    /* the engine's own chat front writes the turn the markers read */
+    pulsar_tokens chat = {0};
+    const pulsar_chat_message tool = {"tool", "{\"exit\": 0}", false};
+    TEST_ASSERT(pulsar_chat_append_turn(e, &chat, &tool, 1, true, PULSAR_THINK_NONE));
+    TEST_ASSERT(chat.len > 1 + m.n_tool && pulsar_turn_marker_at(&m, chat.v, chat.len, 0) == 3);
+    pulsar_tokens_free(&chat);
+    e->vocab.vocab_free();
+    model_close(&model);
     free(e);
 }
 
@@ -5539,6 +6008,8 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
+    {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
+    {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
@@ -5547,6 +6018,8 @@ static const pulsar_test_entry test_entries[] = {
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
+    {"--bpe-merge", "bpe-merge", "DeepSeek's BPE merge off a heap: the ids of the old rescanning loop on the text fixtures, randomized vocabulary pieces and every short repeat; a 200k-character run in well under a second (L375)", test_bpe_merge},
+    {"--ds4-tool-marker", "ds4-tool-marker", "DeepSeek's turn markers carry the tool-result suffix: a tool result rendered as a user turn reads as one whatever its body (L373)", test_ds4_tool_marker},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},
@@ -5583,6 +6056,7 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  PULSAR_TEST_MODEL=PATH        Checkpoint path (a shard directory or a");
     puts("                                single file). Default: model.safetensors");
+    puts("  PULSAR_TEST_DS4_TOKENIZER=PATH  The DeepSeek checkpoint whose vocabulary --bpe-merge reads.");
     puts("  PULSAR_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  PULSAR_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }

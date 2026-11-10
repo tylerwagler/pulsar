@@ -946,8 +946,9 @@ typedef struct {
     /** Tokens in `assistant` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_assistant;
     /** L351: the tokens that follow a user marker when that turn is a TOOL RESULT (Qwen's and Nemotron's templates
-     *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"), n_tool of them -- so the anchors
-     *  can tell the client's own turns from an agent loop's tool results. */
+     *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"; DeepSeek's as a user turn that opens
+     *  `<tool_result`, L373), n_tool of them -- so the anchors can tell the client's own turns from an agent loop's
+     *  tool results. */
     int tool[3];
     /** Tokens in `tool` (0: the template has no such turn, or the tokenizer does not spell it). */
     int n_tool;

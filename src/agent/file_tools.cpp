@@ -66,7 +66,8 @@ char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int 
     double v = strtod(s, &end);
     while (end != s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end++;
     if (end == s || *end || !isfinite(v)) return agent_tool_arg_error(name, "is not a number");
-    if (v <= 0.0) return NULL;
+    /* L373: 0 or less is no timeout the tool has -- it ran the default, an hour, for a model that asked for none */
+    if (v <= 0.0) return agent_tool_arg_error(name, "must be above 0 (seconds; leave it out for the default, 3600)");
     if (v < 1.0) v = 1.0;
     if (v > 24.0 * 3600.0) v = 24.0 * 3600.0;
     *out = (int)v;

@@ -2080,8 +2080,6 @@ typedef struct {
     uint64_t used;         ///< slots occupied; the load factor numerator
 } str_i32_table;
 
-struct owned_str;  ///< forward decl: bpe_rank() param; full def appears later
-
 /** Byte-level BPE vocabulary and the special ids the chat template needs.
  *
  * ⚠ `n_vocab` here is the TOKENIZER TABLE LENGTH and is not required to equal
@@ -2105,11 +2103,11 @@ struct pulsar_vocab {
     /** ---- methods (C++ port): 1:1 mirror of the vocab verb family in
      * tokenizer.cpp; bodies keep the auto *vocab = this alias, logic verbatim.
      * Names kept as-is (none carry the pulsar_vocab type-name prefix). ---- */
-    /** Merge priority of the pair (a, b); lower merges first. @return rank, or a
-     * sentinel above every real rank when the pair is not in the merge table. */
+    /** Merge priority of the pair (a, b); lower merges first. @return rank, or -1
+     * when the pair is not in the merge table. */
     /// @param a  left symbol of the pair
     /// @param b  right symbol of the pair
-    int bpe_rank(const owned_str *a, const owned_str *b) const;
+    int bpe_rank(pulsar_str a, pulsar_str b) const;
     /** Emit one pre-tokenized piece as ids, running the BPE merge loop over it. */
     /// @param raw_piece  the piece's bytes (borrowed)
     /// @param out        ids are appended
@@ -2421,15 +2419,6 @@ struct pulsar_engine {
     /// @return dspark_ready (false for a NULL engine).
     bool has_dspark();
 };
-
-/** A string this struct OWNS, as opposed to ::pulsar_str which borrows.
- * Not NUL-terminated either -- the length is authoritative. */
-typedef struct owned_str {
-    char *ptr;     ///< the bytes, owned
-    uint64_t len;  ///< length in bytes
-} owned_str;
-
-
 
 /** The per-conversation SPECULATIVE / DSpark host shadow, factored into one
  * named aggregate so it can be saved and restored WHOLESALE.  It is embedded
@@ -6242,6 +6231,12 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 /// @param[out] len byte count, or NULL
 /// @return the bytes (caller frees)
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
+/** The cross-rank identity digest of the session's live row (an eval's, a speculative run's last row), on the device,
+ *  read through the live row's gate (pulsar_session::live_dev): a view with no row refuses (said) and digests to 0.
+ *  The leader's and the worker's ack both call it (L375 O15).
+ *  @param s the session
+ *  @return the digest, 0 on a refusal or a device failure */
+uint64_t pulsar_session_live_digest(pulsar_session *s);
 /* The identity digest of a batched step's headed rows, on the device (engine_api.cpp; the TP mirror's check). */
 uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows);
 /** L260 fusion: a fused step's digest -- its decode rows', then its `n_heads` headed rows'. */

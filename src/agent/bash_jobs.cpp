@@ -760,6 +760,29 @@ static void test_agent_bash_teardown(void) {
     }
     agent_bash_jobs_free(&w);
 
+    /* a sync's prefill chunk polls the jobs on the worker thread only (worker_progress_cb): the list is that
+     * thread's, and a sync the UI thread runs (a session switch) leaves it to the worker's idle tick */
+    agent_bash_job *timed = agent_bash_start(&w, "sleep 300", 1, err, sizeof err);
+    AGENT_TEST_ASSERT(timed != NULL);
+    if (timed) {
+        usleep(1100 * 1000);
+        AGENT_TEST_ASSERT(!agent_on_worker_thread(&w));           /* no worker thread: this one is "the UI's" */
+        worker_progress_cb(&w, "prefill_chunk", 10, 100);
+        AGENT_TEST_ASSERT(timed->running && !timed->timed_out);   /* not polled */
+        w.worker_tid = pthread_self();
+        w.worker_running = true;
+        AGENT_TEST_ASSERT(agent_on_worker_thread(&w));
+        worker_progress_cb(&w, "prefill_display", 10, 100);       /* the display event polls nothing */
+        AGENT_TEST_ASSERT(timed->running && !timed->timed_out);
+        for (int i = 0; timed->running && i < 2500; i++) {
+            worker_progress_cb(&w, "prefill_chunk", 10, 100);
+            usleep(2000);
+        }
+        AGENT_TEST_ASSERT(!timed->running && timed->timed_out);
+        w.worker_running = false;
+    }
+    agent_bash_jobs_free(&w);
+
     for (int i = 0; i < AGENT_BASH_JOBS_MAX; i++) AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) != NULL);
     AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) == NULL && strstr(err, "already tracked") != NULL);
     agent_bash_jobs_free(&w);

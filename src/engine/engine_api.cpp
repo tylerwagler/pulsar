@@ -579,11 +579,9 @@ uint64_t pulsar_session_fused_digest(pulsar_session *s, uint32_t n_dec, uint32_t
     return dec * 0x100000001b3ull ^ heads;
 }
 
-/* The live row's digest (an eval's, a speculative run's last row). */
-/** The digest of the session's live row, on the device.  @param s the session  @return the digest, 0 on failure */
-static uint64_t live_digest(pulsar_session *s) {
+uint64_t pulsar_session_live_digest(pulsar_session *s) {
     uint64_t d = 0;
-    return s->rows_digest(s->dev.live, 0, 1, &d) ? d : 0u;
+    return s->rows_digest(s->live_dev(), 0, 1, &d) ? d : 0u;
 }
 
 /** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
@@ -1076,7 +1074,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     }
     char what[96];
     snprintf(what, sizeof(what), "eval at position %llu", (unsigned long long)pos);
-    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what, live_digest(s))) {
+    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what, pulsar_session_live_digest(s))) {
         pulsar_tp_drain_command_acks(tp);
         if (err) snprintf(err, errlen, "tp: could not defer the eval's identity check");
         return 1;
@@ -1291,7 +1289,7 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     char err[256];
     err[0] = '\0';
     int peers = 0;
-    const uint64_t digest = live_digest(s);
+    const uint64_t digest = pulsar_session_live_digest(s);
     if (!pulsar_tp_wait_command_status_digest(tp, s->tp_session_id, operation, &peers, digest,
                                               err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, operation, err);
