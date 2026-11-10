@@ -353,8 +353,8 @@ static bool agent_path_has_dotdot_component(const std::string &rest) {
     return false;
 }
 
-char *agent_workspace_refusal(const char *path) {
-    if (!g_workspace[0]) return NULL;
+bool agent_workspace_refuses(const char *path, char *err, size_t errlen) {
+    if (!g_workspace[0]) return false;
     /* the deepest part of the path that exists, resolved (symlinks and ..); the rest must not climb back out */
     std::string probe(path);
     std::string rest;
@@ -383,13 +383,18 @@ char *agent_workspace_refusal(const char *path) {
             probe.resize(slash);
         }
     }
-    if (inside) return NULL;
+    if (inside) return false;
+    snprintf(err, errlen, "%s is outside the workspace %s (--allow-outside-workspace permits it)", path, g_workspace);
+    return true;
+}
+
+char *agent_workspace_refusal(const char *path) {
+    char why[2 * PATH_MAX + 96];
+    if (!agent_workspace_refuses(path, why, sizeof why)) return NULL;
     agent_buf b = {0};
     agent_buf_puts(&b, "Tool error: ");
-    agent_buf_puts(&b, path);
-    agent_buf_puts(&b, " is outside the workspace ");
-    agent_buf_puts(&b, g_workspace);
-    agent_buf_puts(&b, " (--allow-outside-workspace permits it)\n");
+    agent_buf_puts(&b, why);
+    agent_buf_puts(&b, "\n");
     return agent_buf_take(&b);
 }
 

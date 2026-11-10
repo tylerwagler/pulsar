@@ -343,7 +343,8 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
     char err[256];
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0)
+    if (agent_workspace_refuses(path, err, sizeof(err)) ||
+        agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0)
         return false;
 
     const char *match = NULL;
@@ -766,6 +767,43 @@ static void test_agent_workspace_and_terminal(void) {
         free(res);
         AGENT_TEST_ASSERT(access("../pulsar-agent-ws-absent.txt", F_OK) != 0);
     }
+    {   /* L373: the edit preflight and the [upto] forcer read nothing outside the workspace */
+        static const char body[] = "first line of the anchor text, long enough to count\n"
+                                   "second line of the anchor text, long enough too\nrest\n";
+        static const char mature[] = "first line of the anchor text, long enough to count\n"
+                                     "second line of the anchor text, long enough too\n";
+        char outside[PATH_MAX];
+        snprintf(outside, sizeof outside, "%s-outside.txt", dir);
+        for (const char *f : {"inside.txt", (const char *)outside}) {
+            FILE *fp = fopen(f, "wb");
+            AGENT_TEST_ASSERT(fp != NULL);
+            if (fp) { fputs(body, fp); fclose(fp); }
+        }
+        for (int leg = 0; leg < 2; leg++) {
+            const char *path = leg ? outside : "inside.txt";
+            agent_tool_arg args[2] = {{(char *)"path", (char *)path, true}, {(char *)"old", (char *)"rest", true}};
+            agent_tool_call call = {(char *)"edit", args, 2, 2};
+            char err[2 * PATH_MAX] = {0};
+            AGENT_TEST_ASSERT(agent_preflight_edit_old(NULL, &call, err, sizeof err) == !leg);
+            AGENT_TEST_ASSERT((strstr(err, "outside the workspace") != NULL) == (leg == 1));
+            args[1].value = (char *)"absent text";   /* inside: the file is read, the text not found */
+            AGENT_TEST_ASSERT(!agent_preflight_edit_old(NULL, &call, err, sizeof err));
+            AGENT_TEST_ASSERT((strstr(err, "outside the workspace") != NULL) == (leg == 1));
+
+            agent_dsml_parser p;
+            memset(&p, 0, sizeof p);
+            agent_dsml_start(&p);
+            std::string text = std::string("\n" PULSAR_INVOKE_START " name=\"edit\">\n"
+                                           PULSAR_PARAM_START " name=\"path\" string=\"true\">") + path +
+                               PULSAR_PARAM_END "\n" PULSAR_PARAM_START " name=\"old\" string=\"true\">" + mature;
+            agent_dsml_feed(&p, text.data(), text.size());
+            AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE);
+            agent_edit_upto_forcer forcer = {0};
+            AGENT_TEST_ASSERT(agent_edit_upto_forcer_should_replace(&forcer, &p, "x", 1) == !leg);
+            agent_dsml_parser_free(&p);
+        }
+        unlink(outside);
+    }
     agent_workspace_init(true);
     AGENT_TEST_ASSERT(!refused("/etc/passwd"));
     AGENT_TEST_ASSERT(chdir(old) == 0);
@@ -809,7 +847,8 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
+    if (agent_workspace_refuses(path, err, err_len) ||
+        agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
         return false;
 
     const char *match = NULL;

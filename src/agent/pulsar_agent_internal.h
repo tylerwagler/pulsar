@@ -208,6 +208,12 @@ void agent_workspace_init(bool allow_outside);
  *  exist yet is judged by its deepest existing parent, and the part below it may not hold a ".." component.  A symlink
  *  that does not resolve (dangling, a loop) is refused wherever it points, inside or out: the path is not absent, and
  *  an open would create the link's target.
+ *  @param path   the tool's path
+ *  @param err    receives why it is refused ("<path> is outside the workspace ...")
+ *  @param errlen its capacity
+ *  @return true when the path is refused */
+bool agent_workspace_refuses(const char *path, char *err, size_t errlen);
+/** agent_workspace_refuses as a tool result.
  *  @param path the tool's path
  *  @return NULL when allowed, else the tool's error text (malloc'd; the caller returns it) */
 char *agent_workspace_refusal(const char *path);
@@ -1603,7 +1609,8 @@ void agent_edit_result_append_context(agent_buf *b,
                                              int anchor_start,
                                              int anchor_end);
 /** While an edit's old argument streams, whether the next sampled token should be replaced by an [upto]
- *  marker line because the emitted prefix is already a unique anchor in the file.
+ *  marker line because the emitted prefix is already a unique anchor in the file.  A path outside the workspace
+ *  is never read: no marker.
  *  @param forcer   the forcer's state (reset when the parser is outside edit/old)
  *  @param p        the DSML parser
  *  @param next_text the next token's text
@@ -1613,7 +1620,8 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
                                                   agent_dsml_parser *p,
                                                   const char *next_text,
                                                   size_t next_len);
-/** Check, before the edit runs, that its old text matches the file uniquely (the [upto] rules included).
+/** Check, before the edit runs, that its path is inside the workspace (agent_workspace_refuses: nothing is read
+ *  from a refused path) and its old text matches the file uniquely (the [upto] rules included).
  *  @param w       the worker (unused)
  *  @param call    the edit call
  *  @param err     receives the reason on failure
