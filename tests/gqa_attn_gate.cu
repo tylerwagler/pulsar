@@ -47,6 +47,12 @@
  * v's outliers saturate at 448).
  * Then refusals (incl. block + bias, a block run past 256 rows, store of a block,
  * a bad rope base, E4M3 + bias, an unknown KV format).
+ * O59 (L375), an operand outside fp16's range on a wide-head layer (16q/2kv/512, no norm): one q, k or v element of
+ * 1e5.  A build whose tensor-core arms widen bf16 to fp16 (sm_75) must REFUSE -- the one-call form by its own word
+ * (-4), a launch through the caller's flag with the caller's code, a later call that reads the element from the
+ * pool again, the MMA decode arm too -- while 60000 (in range) and the flash-decoding arm (f32, no widening) run;
+ * an sm_80+ build carries the element exactly: no flag, a finite output, and the rows that cannot see it unchanged.
+ * Every other call of the battery runs with the flag wired on its launches and must leave it clear.
  *
  * The fixture is live: an additive bias of ~N(0, 4) over logits of ~N(0, 0.1)
  * (RMS-normed q, k at scale 1/head_dim) gives peaked rows; the log prints the
@@ -176,6 +182,17 @@ static uint32_t g_bound = 0;
 static bool g_decode_call = false;
 /* L338: rows a flash-decoding CTA attends (pulsar_gqa_io::decode_group) for the decode calls */
 static int g_decode_group = 1;
+/* O59: the launches' non-finite flag (a device word; pulsar_gqa_io::nf_flag), the code a call records in it, what the
+ * last bounded call left there, and one poked input element (position, offset in the fused row, value) */
+static uint32_t *g_nf_dev = nullptr;
+static const uint32_t NF_CODE = 0x00590000u;
+static uint32_t g_nf_last = 0;
+static bool g_nf_expected = false;    /* run_o59's calls, whose flag is theirs to read */
+static uint32_t g_nf_launches = 0;    /* launches of the battery that left the flag clear (rule 5: the wiring ran) */
+static bool g_poke = false;
+static uint32_t g_poke_pos = 0;
+static uint64_t g_poke_off = 0;
+static float g_poke_val = 0.f;
 /* f(i) for i in [0, n) on up to 16 host threads */
 template <class F> static void par_for(uint32_t n, F f) {
     const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
@@ -200,6 +217,7 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
         std::vector<float> rowf(C.ld);
         gen_row(C, seqs[rs[i]]->sid + (junk ? 0x777777ull : 0ull), rp[i], rowf.data());
         for (uint64_t j = 0; j < C.ld; j++) in[(uint64_t)i * C.ld + j] = gref_f2bf(rowf[j]);
+        if (g_poke && rp[i] == g_poke_pos) in[(uint64_t)i * C.ld + g_poke_off] = gref_f2bf(g_poke_val);
     });
     const uint64_t need = store ? pulsar_gqa_store_workspace_bytes(&C.L, n)
                                 : pulsar_gqa_workspace_bytes(&C.L, n, g_bound ? g_bound : max_ctx);
@@ -242,9 +260,20 @@ static int run_call(const Case &C, std::vector<Seq *> &seqs, const std::vector<s
         if (rc == 0) {
             CK(cudaMalloc(&d_desc, desc.size()));
             CK(cudaMemcpy(d_desc, desc.data(), desc.size(), cudaMemcpyHostToDevice));
+            /* O59: a launch reports through the caller's flag (a step's: zeroed before, read after) */
+            if (!g_nf_dev) CK(cudaMalloc(&g_nf_dev, 256));
+            CK(cudaMemset(g_nf_dev, 0, sizeof(uint32_t)));
+            io.nf_flag = g_nf_dev;
+            io.nf_code = NF_CODE;
             rc = pulsar_gqa_launch(&C.L, &call, d_desc, &io, 0);
         }
         CK(cudaDeviceSynchronize());
+        if (rc == 0) {
+            CK(cudaMemcpy(&g_nf_last, g_nf_dev, sizeof(g_nf_last), cudaMemcpyDeviceToHost));
+            if (g_nf_last == 0u) g_nf_launches++;
+            else if (!g_nf_expected)
+                check(false, "%s: a launch of in-range operands raised the non-finite flag (0x%08x)", C.name, g_nf_last);
+        }
         if (d_desc) CK(cudaFree(d_desc));
     }
     CK(cudaDeviceSynchronize());
@@ -305,7 +334,14 @@ static bool fill_forward(const Case &C, Seq &s, uint32_t p0, uint32_t p1, uint32
     for (uint32_t p = p0; p < p1; p += chunk) {
         std::vector<std::pair<uint32_t, uint32_t>> rows;
         for (uint32_t i = 0; i < std::min(chunk, p1 - p); i++) rows.push_back({0u, p + i});
-        if (run_call(C, v, rows, nullptr) != 0) { check(false, "%s: a forward at %u was refused", C.name, p); return false; }
+        /* a context writer may start on unwritten slots (run_rope_long: "their outputs are junk"): the pool's fill is
+         * NaN, which a build that widens operands to fp16 reports (O59: -4) after the call has run and stored its
+         * rows -- the rows are what this writer is for */
+        const int rc = run_call(C, v, rows, nullptr);
+        if (rc != 0 && !(rc == -4 && pulsar_gqa_widens())) {
+            check(false, "%s: a forward at %u was refused", C.name, p);
+            return false;
+        }
     }
     return true;
 }
@@ -1092,6 +1128,120 @@ static void run_refusals(Case &C, Case &Rp) {
     seq_free(A);
 }
 
+/* ---- O59 (L375): an operand outside fp16's range on a wide-head layer ------------------------------------------------
+ * 16q/2kv/512, FULL, no norm (so a raw q / k element IS the MMA's operand; v never is normed), 40 rows.  One element
+ * of row 20 is poked.  What must happen is the build's: where the tensor-core arms widen bf16 to fp16
+ * (pulsar_gqa_widens: sm_75) the call refuses; where they carry bf16 (sm_80+) the element is an ordinary operand. */
+static void run_o59() {
+    Case C;
+    case_init(C, "o59-wide512-no-norm", 16, 2, 512, 0, 64, false, 0, 0.f, 0.f, false, 1.0f / sqrtf(512.f), 40, 590);
+    const bool widens = pulsar_gqa_widens() != 0;
+    printf("\n== O59: an operand of 1e5 on %s (this build %s) ==\n", C.name,
+           widens ? "WIDENS bf16 operands to fp16: must refuse" : "carries bf16 operands exactly: must run");
+    check(g_nf_launches > 0u, "the battery's %u launches of in-range operands left the non-finite flag clear",
+          g_nf_launches);
+    g_nf_expected = true;
+    struct unexpect { ~unexpect() { g_nf_expected = false; } } unexpect_;
+    std::vector<std::pair<uint32_t, uint32_t>> rows, tail, dec{{0u, 40u}};
+    for (uint32_t i = 0; i < 30; i++) rows.push_back({0u, i});
+    for (uint32_t i = 30; i < 40; i++) tail.push_back({0u, i});
+    auto finite = [](const std::vector<Out> &o) {
+        for (const Out &r : o)
+            for (const float v : r.tap)
+                if (!std::isfinite(v)) return false;
+        return true;
+    };
+    /* the clean baseline: the 30-row prefill, then 10 more rows */
+    Seq sb = seq_new(C, 59);
+    std::vector<Seq *> vb{&sb};
+    std::vector<Out> base, base_tail;
+    check(run_call(C, vb, rows, &base) == 0 && run_call(C, vb, tail, &base_tail) == 0 && finite(base) && finite(base_tail),
+          "%s: the clean calls ran and are finite", C.name);
+    seq_free(sb);
+    struct poke { const char *what; uint64_t off; };
+    const poke pokes[3] = {{"q", 5u * 512u + 3u}, {"k", C.off_k + 1u * 512u + 7u}, {"v", C.off_v + 1u * 512u + 9u}};
+    for (const poke &pk : pokes) {
+        for (const bool bounded : {false, true}) {
+            Seq s = seq_new(C, 59);
+            std::vector<Seq *> v{&s};
+            std::vector<Out> o, o2;
+            g_poke = true; g_poke_pos = 20u; g_poke_off = pk.off; g_poke_val = 1.0e5f;
+            g_bound = bounded ? 256u : 0u;
+            g_nf_last = 0u;
+            const int rc = run_call(C, v, rows, &o);
+            const uint32_t nf = g_nf_last;
+            g_poke = false;
+            /* the tail's rows read row 20 from the pool: a k / v element is widened again there */
+            g_nf_last = 0u;
+            const int rc2 = run_call(C, v, tail, &o2);
+            const uint32_t nf2 = g_nf_last;
+            g_bound = 0u;
+            const bool pool = pk.what[0] != 'q';   /* q is not stored */
+            if (widens) {
+                if (!bounded) {
+                    check(rc == -4, "%s: a %s element of 1e5, one-call form: refused by its own flag (-4; got %d)", C.name,
+                          pk.what, rc);
+                    check(rc2 == (pool ? -4 : 0), "%s: the next call, reading that %s from the pool: %s (got %d)", C.name,
+                          pk.what, pool ? "refused (-4)" : "runs", rc2);
+                } else {
+                    check(rc == 0 && nf == NF_CODE, "%s: a %s element of 1e5, a launch: the caller's flag holds the "
+                          "caller's code (rc %d, flag 0x%08x)", C.name, pk.what, rc, nf);
+                    check(rc2 == 0 && nf2 == (pool ? NF_CODE : 0u), "%s: the next launch, reading that %s from the pool: "
+                          "flag 0x%08x", C.name, pk.what, nf2);
+                }
+            } else {
+                bool before_same = rc == 0 && o.size() == base.size();
+                for (uint32_t i = 0; before_same && i < 20; i++) before_same = o[i].y == base[i].y;
+                check(rc == 0 && nf == 0u && rc2 == 0 && nf2 == 0u && finite(o) && finite(o2) && before_same &&
+                      o[20].y != base[20].y,
+                      "%s: a %s element of 1e5 (%s): carried exactly -- no flag, finite outputs, rows 0..19 unchanged, "
+                      "row 20 moved (rc %d %d, flag 0x%08x 0x%08x)", C.name, pk.what, bounded ? "launch" : "one call", rc,
+                      rc2, nf, nf2);
+            }
+            seq_free(s);
+        }
+        /* 60000 is inside fp16's range: every build runs it, flag clear */
+        {
+            Seq s = seq_new(C, 59);
+            std::vector<Seq *> v{&s};
+            std::vector<Out> o;
+            g_poke = true; g_poke_pos = 20u; g_poke_off = pk.off; g_poke_val = 60000.0f;
+            g_bound = 256u;
+            g_nf_last = 0u;
+            const int rc = run_call(C, v, rows, &o);
+            const uint32_t nf = g_nf_last;
+            g_bound = 0u;
+            const int rc1 = run_call(C, v, tail, nullptr);
+            g_poke = false;
+            check(rc == 0 && nf == 0u && rc1 == 0 && finite(o), "%s: a %s element of 60000 (in range): runs, flag clear "
+                  "(rc %d %d, flag 0x%08x)", C.name, pk.what, rc, rc1, nf);
+            seq_free(s);
+        }
+    }
+    /* a decode row (position 40 after a clean 40-row context) with a q element of 1e5: the MMA decode arm widens it
+     * (refused on a widening build); the flash-decoding arm computes in f32 and runs on every build */
+    for (const int arm : {2, 1}) {
+        Seq s = seq_new(C, 59);
+        std::vector<Seq *> v{&s};
+        std::vector<Out> o;
+        check(run_call(C, v, rows, nullptr) == 0 && run_call(C, v, tail, nullptr) == 0, "%s: the decode's context ran",
+              C.name);
+        g_decode_call = true;
+        pulsar_gqa_decode_arm_force(arm);
+        g_poke = true; g_poke_pos = 40u; g_poke_off = 5u * 512u + 3u; g_poke_val = 1.0e5f;
+        const int rc = run_call(C, v, dec, &o);
+        g_poke = false;
+        pulsar_gqa_decode_arm_force(0);
+        g_decode_call = false;
+        if (arm == 2 && widens)
+            check(rc == -4, "%s: a decode row's q element of 1e5 on the MMA decode arm: refused (-4; got %d)", C.name, rc);
+        else
+            check(rc == 0 && finite(o), "%s: a decode row's q element of 1e5 on the %s arm: runs, finite (rc %d)", C.name,
+                  arm == 2 ? "MMA decode" : "flash-decoding", rc);
+        seq_free(s);
+    }
+}
+
 /* ---- --fixture DIR: the Inkling-Small mini checkpoint's attention (tests/gqa_mini_fixture.py) ---- *
  * Graded against transformers' InklingAttention in fp32 (ref32, from the same bf16 inputs) and
  * required to be at least as close to it as transformers' own bf16 run (ref16). */
@@ -1364,6 +1514,8 @@ int main(int argc, char **argv) {
     run_refusals(g1, gr);
 
     run_bounded_tile();
+
+    run_o59();
 
     printf("\ngqa_attn_gate: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

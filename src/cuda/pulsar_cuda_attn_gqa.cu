@@ -139,6 +139,12 @@ struct gqa_args {
     uint64_t              ld_out;
     /// Optional f32 copy of the output, [rows][n_q * HD]; NULL in the lane.
     float                *tap;
+    /// The step's non-finite flag (pulsar_gqa_io::nf_flag, or pulsar_gqa_forward's own word): where the arms widen
+    /// (sm_75), an operand that is not finite as fp16 CASes nf_code into it (gqa_nf_raise).  Unconditional members:
+    /// the host pass builds this block and must lay it out as every device pass reads it; sm_80+ never reads them.
+    uint32_t             *nf;
+    /// The code recorded there, nonzero where the arms widen.
+    uint32_t              nf_code;
 };
 
 /** @var gqa_args::n_kv
@@ -154,7 +160,9 @@ struct gqa_args {
 /* A packed bf16 pair as the packed fp16 pair of the SAME values: a bf16 has 8 significant bits and fp16 11, so the
  * widening is exact for every value inside fp16's normal range (|x| in [2^-14, 65504]).  The attention's operands sit
  * far inside it (q / k / v peak ~32 in the Nemotron-3.5 encoders, retriever/README.md; P and its lo part are in
- * [0, 1]), and a P lo term small enough to land in fp16's subnormals carries at most 2^-8 of a weight already < 2^-14. */
+ * [0, 1]), and a P lo term small enough to land in fp16's subnormals carries at most 2^-8 of a weight already < 2^-14.
+ * ABOVE the range the widening is not the value: a finite bf16 past 65504 rounds to an fp16 infinity.  That is checked
+ * where a q / k / v / r / P operand is widened (gqa_opc) and refuses the step (gqa_nf_raise; O59, L375). */
 /// @param w a packed bf16x2 word.
 /// @return the same two values as a packed fp16x2 word (sm_75 only).
 __device__ __forceinline__ uint32_t gqa_bf2h(uint32_t w) {
@@ -176,10 +184,43 @@ __device__ __forceinline__ uint32_t gqa_op(uint32_t w) {
     return gqa_bf2h(w);
 #endif
 }
-/// gqa_op on the four words of a 16-byte load (a K / V row's 8 elements as staged to smem).
+/// gqa_op of a q / k / v / r / P operand word, CHECKED (O59): on sm_75 `bad` gathers whether either widened half is an
+/// fp16 infinity or NaN -- a finite bf16 above 65504 in magnitude, or an operand that was not finite to begin with --
+/// which the kernel then reports (gqa_nf_raise).  The widened word is gqa_op's, bit for bit.  On sm_80 it is gqa_op:
+/// the bf16 MMA carries every bf16 value exactly and there is nothing to check.
+/// @param w a packed bf16x2 word.
+/// @param bad accumulates nonzero when a half left fp16's range (sm_75; untouched on sm_80).
+/// @return the word in the MMA's operand form.
+__device__ __forceinline__ uint32_t gqa_opc(uint32_t w, uint32_t &bad) {
+#if PULSAR_SM80
+    (void)bad;
+    return w;
+#else
+    const uint32_t h = gqa_bf2h(w);
+    /* a half's exponent field (0x7c00) all ones: adding 0x0400 carries into its bit 15, and only then */
+    bad |= ((h & 0x7c007c00u) + 0x04000400u) & 0x80008000u;
+    return h;
+#endif
+}
+/// gqa_opc on the four words of a 16-byte load (a K / V row's 8 elements as staged to smem).
 /// @param v four packed bf16x2 words.
+/// @param bad accumulates nonzero when an element left fp16's range (sm_75).
 /// @return the same in the MMA's operand form.
-__device__ __forceinline__ uint4 gqa_op4(uint4 v) { return make_uint4(gqa_op(v.x), gqa_op(v.y), gqa_op(v.z), gqa_op(v.w)); }
+__device__ __forceinline__ uint4 gqa_opc4(uint4 v, uint32_t &bad) {
+    return make_uint4(gqa_opc(v.x, bad), gqa_opc(v.y, bad), gqa_opc(v.z, bad), gqa_opc(v.w, bad));
+}
+/// Reports what gqa_opc gathered: on sm_75 a nonzero `bad` CASes the call's code into the step's non-finite flag
+/// (first writer wins; the caller reads it at the step's end and refuses the step).  Nothing on sm_80.
+/// @param a the kernel's arguments (the flag and the code).
+/// @param bad gqa_opc's accumulator.
+__device__ __forceinline__ void gqa_nf_raise(const gqa_args &a, uint32_t bad) {
+#if PULSAR_SM80
+    (void)a;
+    (void)bad;
+#else
+    if (bad) atomicCAS(a.nf, 0u, a.nf_code);
+#endif
+}
 /// One m16n8k16 MMA with f32 accumulate, d += A B, over operands already in gqa_op form (on sm_75 two fp16 m16n8k8
 /// MMAs, k 0..7 then k 8..15).
 /// @param d the accumulator fragment, updated in place.
@@ -205,7 +246,8 @@ __device__ __forceinline__ void gqa_mma_op(float (&d)[4], uint32_t a0, uint32_t 
     pulsar_mma_f16_16816_k8(d, A, b0, b1);
 #endif
 }
-/// One m16n8k16 bf16 MMA with f32 accumulate, d += A B (on sm_75 two fp16 m16n8k8 MMAs, exact widening).
+/// One m16n8k16 bf16 MMA with f32 accumulate, d += A B (on sm_75 two fp16 m16n8k8 MMAs, the operands widened and
+/// checked: gqa_opc).
 /// @param d the accumulator fragment, updated in place.
 /// @param a0 A fragment register 0.
 /// @param a1 A fragment register 1.
@@ -213,9 +255,11 @@ __device__ __forceinline__ void gqa_mma_op(float (&d)[4], uint32_t a0, uint32_t 
 /// @param a3 A fragment register 3.
 /// @param b0 B fragment register 0.
 /// @param b1 B fragment register 1.
+/// @param bad gqa_opc's accumulator.
 __device__ __forceinline__ void gqa_mma(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                        uint32_t b0, uint32_t b1) {
-    gqa_mma_op(d, gqa_op(a0), gqa_op(a1), gqa_op(a2), gqa_op(a3), gqa_op(b0), gqa_op(b1));
+                                        uint32_t b0, uint32_t b1, uint32_t &bad) {
+    gqa_mma_op(d, gqa_opc(a0, bad), gqa_opc(a1, bad), gqa_opc(a2, bad), gqa_opc(a3, bad), gqa_opc(b0, bad),
+               gqa_opc(b1, bad));
 }
 /// ldmatrix .x4 of four 8x8 b16 tiles from shared memory.
 /// @param r the four fragment registers.
@@ -499,15 +543,17 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
     }
     /* the warp's Q as MMA A fragments, held for the whole call: a0 / a2 row gr, a1 / a3 row gr + 8 */
     uint32_t qa[KS][4];
+    uint32_t bad = 0u;   /* O59: a widened q / k / v / r / P operand outside fp16's range (sm_75) */
     #pragma unroll
     for (int hh = 0; hh < 2; hh++) {
         const __nv_bfloat16 *qp = a.q + ((uint64_t)mrow[hh] * a.n_q + mhead[hh]) * HD;
         #pragma unroll
         for (int kk = 0; kk < KS; kk++) {
-            qa[kk][hh]     = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u);
-            qa[kk][2 + hh] = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u);
+            qa[kk][hh]     = gqa_opc(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u, bad);
+            qa[kk][2 + hh] = gqa_opc(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u, bad);
         }
     }
+    gqa_nf_raise(a, bad);
     const bool warp_live = 16u * w < mrows;
     const uint32_t wpos0 = a.rows[T.row0 + (warp_live ? (16u * w) / G : 0u)].pos;   /* the warp's first row */
 
@@ -551,9 +597,10 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                 #pragma unroll
                 for (uint32_t it = 0; it < LPT; it++) {
                     const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8;
-                    *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_op4(ld[it]);   /* operand form (gqa_op) */
+                    *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_opc4(ld[it], bad);   /* operand form */
                 }
             }
+            gqa_nf_raise(a, bad);
             __syncthreads();
             if (!warp_live) continue;
 
@@ -579,7 +626,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                     const uint16_t *pc = pr + (in ? d : 0);
                     const uint32_t b0 = in ? (uint32_t)pc[(2u * c) * a.extent] | ((uint32_t)pc[(2u * c + 1u) * a.extent] << 16) : 0u;
                     const uint32_t b1 = in ? (uint32_t)pc[(2u * c + 8u) * a.extent] | ((uint32_t)pc[(2u * c + 9u) * a.extent] << 16) : 0u;
-                    gqa_mma(acc, ra[0], ra[1], ra[2], ra[3], b0, b1);
+                    gqa_mma(acc, ra[0], ra[1], ra[2], ra[3], b0, b1, bad);
                     #pragma unroll
                     for (int e = 0; e < 4; e++) {
                         const int hh = e >> 1;
@@ -587,6 +634,7 @@ __global__ void __launch_bounds__(128) gqa_attn_kernel(const gqa_args a) {
                         bs[(w * 16u + gr + 8u * hh) * GQA_BIAS_W + 8u * nt + 2u * c + (e & 1)] = __float2bfloat16_rn(v);
                     }
                 }
+                gqa_nf_raise(a, bad);
                 __syncwarp();
             }
 
@@ -804,11 +852,13 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
                 else              ld[it] = *reinterpret_cast<const uint4 *>(rec + off + part * 16u);
             }
         }
+        uint32_t bad = 0u;   /* O59: a widened K / V element outside fp16's range (sm_75) */
         #pragma unroll
         for (uint32_t it = 0; it < LPT; it++) {
             const uint32_t i = tid + 128u * it, t = i / V8, part = i % V8;
-            *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_op4(ld[it]);   /* operand form (gqa_op) */
+            *reinterpret_cast<uint4 *>(&dst[t * P + part * 8u]) = gqa_opc4(ld[it], bad);   /* operand form */
         }
+        gqa_nf_raise(a, bad);
     };
 
     for (uint32_t ch = c_first; ch <= c_end; ch++) {
@@ -832,15 +882,17 @@ __global__ void __launch_bounds__(128) gqa_attn_wide_kernel(const gqa_args a) {
                 __syncthreads();
                 if (!warp_live) continue;
                 uint32_t qa[KS][4];
+                uint32_t qbad = 0u;   /* O59: a widened q element outside fp16's range (sm_75) */
                 #pragma unroll
                 for (int hh = 0; hh < 2; hh++) {
                     const __nv_bfloat16 *qp = a.q + ((uint64_t)mrow[hh] * a.n_q + mhead[hh]) * HD + p * D;
                     #pragma unroll
                     for (int kk = 0; kk < KS; kk++) {
-                        qa[kk][hh]     = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u);
-                        qa[kk][2 + hh] = gqa_op(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u);
+                        qa[kk][hh]     = gqa_opc(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 2u * c) : 0u, qbad);
+                        qa[kk][2 + hh] = gqa_opc(mval[hh] ? *reinterpret_cast<const uint32_t *>(qp + kk * 16 + 8u + 2u * c) : 0u, qbad);
                     }
                 }
+                gqa_nf_raise(a, qbad);
                 #pragma unroll
                 for (int kk = 0; kk < KS; kk++) {
                     #pragma unroll
@@ -1284,13 +1336,14 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
 #pragma unroll 1
         for (int q = 0; q < QG; q++) {
             uint32_t qw[RB][8];
+            uint32_t bad = 0u;   /* O59: a widened q / k element outside fp16's range (sm_75) */
 #pragma unroll
             for (int r = 0; r < RB; r++) {
                 const uint4 *qp = reinterpret_cast<const uint4 *>(
                     a.q + ((uint64_t)(r0 + (act[r] ? (uint32_t)r : 0u)) * a.n_q + h0 + gq) * HD + 64 * q + 16 * (int)t);
-                const uint4 qa = qp[0], qb = qp[1];
-                qw[r][0] = gqa_op(qa.x); qw[r][1] = gqa_op(qa.y); qw[r][2] = gqa_op(qa.z); qw[r][3] = gqa_op(qa.w);
-                qw[r][4] = gqa_op(qb.x); qw[r][5] = gqa_op(qb.y); qw[r][6] = gqa_op(qb.z); qw[r][7] = gqa_op(qb.w);
+                const uint4 qa = gqa_opc4(qp[0], bad), qb = gqa_opc4(qp[1], bad);
+                qw[r][0] = qa.x; qw[r][1] = qa.y; qw[r][2] = qa.z; qw[r][3] = qa.w;
+                qw[r][4] = qb.x; qw[r][5] = qb.y; qw[r][6] = qb.z; qw[r][7] = qb.w;
             }
 #pragma unroll
             for (int m = 0; m < MT; m++) {
@@ -1307,11 +1360,11 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
                     b0 = p[0];
                     b1 = p[1];
                 }
-                /* widened once for every row's MMAs (gqa_op) */
-                const uint32_t k0[8] = {gqa_op(a0.x), gqa_op(a0.y), gqa_op(a0.z), gqa_op(a0.w),
-                                        gqa_op(a1.x), gqa_op(a1.y), gqa_op(a1.z), gqa_op(a1.w)};
-                const uint32_t k1[8] = {gqa_op(b0.x), gqa_op(b0.y), gqa_op(b0.z), gqa_op(b0.w),
-                                        gqa_op(b1.x), gqa_op(b1.y), gqa_op(b1.z), gqa_op(b1.w)};
+                /* widened once for every row's MMAs (gqa_opc) */
+                const uint32_t k0[8] = {gqa_opc(a0.x, bad), gqa_opc(a0.y, bad), gqa_opc(a0.z, bad), gqa_opc(a0.w, bad),
+                                        gqa_opc(a1.x, bad), gqa_opc(a1.y, bad), gqa_opc(a1.z, bad), gqa_opc(a1.w, bad)};
+                const uint32_t k1[8] = {gqa_opc(b0.x, bad), gqa_opc(b0.y, bad), gqa_opc(b0.z, bad), gqa_opc(b0.w, bad),
+                                        gqa_opc(b1.x, bad), gqa_opc(b1.y, bad), gqa_opc(b1.z, bad), gqa_opc(b1.w, bad)};
 #pragma unroll
                 for (int r = 0; r < RB; r++) {
                     if (!act[r]) continue;
@@ -1321,6 +1374,7 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
                                 qw[r][2 * jj + 1]);
                 }
             }
+            gqa_nf_raise(a, bad);
         }
         /* 2. each (row, head)'s chunk max and sum: the thread's heads 2t, 2t + 1 over its 2 MT keys, the quad lanes,
          *    the warps in order */
@@ -1416,14 +1470,15 @@ __global__ void __launch_bounds__(GQA_DMMA_THREADS) gqa_decode_mma_kernel(const 
         v_load(0);
 #pragma unroll 1
         for (int kt = 0; kt < KEYS / VT; kt++) {
+            uint32_t vbad = 0u;                   /* O59: a widened V element outside fp16's range (sm_75) */
             __syncthreads();                      /* sp written (first tile); the last tile's ldmatrix reads done */
 #pragma unroll
             for (int j = 0; j < VL; j++) {
                 const uint32_t i = tid + (uint32_t)j * GQA_DMMA_THREADS;
-                const uint4 v = vr[j];   /* the V tile goes to smem widened (gqa_op): its fragments serve every row */
-                reinterpret_cast<uint4 *>(&sv[i / (uint32_t)(HD / 8)][0])[i % (uint32_t)(HD / 8)] =
-                    make_uint4(gqa_op(v.x), gqa_op(v.y), gqa_op(v.z), gqa_op(v.w));
+                /* the V tile goes to smem widened (gqa_opc): its fragments serve every row */
+                reinterpret_cast<uint4 *>(&sv[i / (uint32_t)(HD / 8)][0])[i % (uint32_t)(HD / 8)] = gqa_opc4(vr[j], vbad);
             }
+            gqa_nf_raise(a, vbad);
             __syncthreads();
             if (kt + 1 < KEYS / VT) v_load(kt + 1);
             const uint32_t kk = (uint32_t)(kt * VT);
@@ -1628,11 +1683,28 @@ struct gqa_ws {
     float         *part;
     /// Split-schedule (max, denominator), [n_rows][n_q][max_chunks].
     float2        *ml;
+    /// pulsar_gqa_forward's own non-finite flag: the word it hands the launch when the caller gave none (O59).
+    uint32_t      *nf;
     /// Chunks a row can span at the layout's context (gqa_max_chunks).
     uint32_t       max_chunks;
     /// Total bytes carved.
     uint64_t       bytes;
 };
+
+/// Whether this build's tensor-core arms widen their bf16 operands to fp16: device code compiled below sm_80 (the
+/// host pass cannot ask PULSAR_SM80, which it always sees as 1; nvcc gives it the target list instead).  A build
+/// whose targets nvcc does not name is taken to widen: the flag is then asked for and never written.
+/// @return true when a launch's operands can leave the MMA's range (sm_75)
+bool gqa_build_widens() {
+#ifdef __CUDA_ARCH_LIST__
+    const int archs[] = {__CUDA_ARCH_LIST__};
+    for (const int a : archs)
+        if (a < 800) return true;
+    return false;
+#else
+    return true;
+#endif
+}
 
 /// @param x a byte count.
 /// @return x rounded up to a multiple of 256.
@@ -1682,6 +1754,7 @@ gqa_ws gqa_ws_layout(uint8_t *base, const pulsar_gqa_layer *L, uint32_t n_rows, 
     w.fresh = (uint8_t *)take((uint64_t)n_rows * tb);
     w.part  = (float *)take(part_rows * L->n_q * w.max_chunks * L->head_dim * sizeof(float));
     w.ml    = (float2 *)take(part_rows * L->n_q * w.max_chunks * sizeof(float2));
+    w.nf    = (uint32_t *)take(sizeof(uint32_t));
     w.bytes = off;
     return w;
 }
@@ -2009,6 +2082,13 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
     aa.ld_gate = io->gate.ld; aa.gate_hs = io->gate.head_stride;
     aa.out = (__nv_bfloat16 *)io->out_bf16; aa.ld_out = io->ld_out;
     aa.tap = io->tap_out_f32;
+    /* O59: where the arms widen bf16 to fp16 (sm_75) an operand can leave the MMA's range, and the kernels say so in
+     * the step's flag: a launch with nowhere to say it does not run */
+    aa.nf = io->nf_flag; aa.nf_code = io->nf_code;
+    if (gqa_build_widens() && (!aa.nf || aa.nf_code == 0u)) {
+        return gqa_refuse("no non-finite flag (pulsar_gqa_io::nf_flag with a nonzero nf_code): this build's arms widen "
+                          "bf16 operands to fp16 and report one outside fp16's range there");
+    }
 
     /* L338: rows a flash-decoding CTA attends (the caller's: a verify's rows share one sequence's keys) */
     if (io->decode_group != 0 && io->decode_group != 1 && io->decode_group != 2 && io->decode_group != 4)
@@ -2059,8 +2139,34 @@ int pulsar_gqa_forward(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, ui
         fprintf(stderr, "pulsar: gqa attention: descriptor upload failed\n");
         return -3;
     }
-    return pulsar_gqa_launch(L, &call, io->workspace, io, st);
+    /* O59: a caller with no step flag of its own (the one-call form: the encoders, Parse) gets the call's verdict
+     * here -- the flag is a word of the workspace, zeroed before the launch and read back after it */
+    if (io->nf_flag || !gqa_build_widens()) return pulsar_gqa_launch(L, &call, io->workspace, io, st);
+    pulsar_gqa_io own = *io;
+    own.nf_flag = gqa_ws_layout((uint8_t *)io->workspace, L, n_rows, call.ctx_bound).nf;
+    own.nf_code = 1u;
+    if (cudaMemsetAsync(own.nf_flag, 0, sizeof(uint32_t), st) != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa attention: the non-finite flag's reset failed\n");
+        return -3;
+    }
+    if (const int rc = pulsar_gqa_launch(L, &call, io->workspace, &own, st)) return rc;
+    uint32_t nf = 0u;
+    if (cudaMemcpyAsync(&nf, own.nf_flag, sizeof(nf), cudaMemcpyDeviceToHost, st) != cudaSuccess ||
+        cudaStreamSynchronize(st) != cudaSuccess) {
+        fprintf(stderr, "pulsar: gqa attention: the non-finite flag's readback failed\n");
+        return -3;
+    }
+    if (nf) {
+        fprintf(stderr, "pulsar: gqa attention refused: a q / k / v operand (or a relative bias's r / table) of this "
+                        "%uq/%ukv/%u call is outside fp16's range (|x| > 65504, or not finite); this build's arms "
+                        "widen bf16 to fp16 for the MMA, so its output is not the attention's (sm_80+ carries bf16 "
+                        "exactly)\n", L->n_q, L->n_kv, L->head_dim);
+        return -4;
+    }
+    return 0;
 }
+
+int pulsar_gqa_widens(void) { return gqa_build_widens() ? 1 : 0; }
 
 /* ---- the KV rows alone (L298): gqa_prep's K / V jobs and gqa_commit, nothing between --------------------------- */
 

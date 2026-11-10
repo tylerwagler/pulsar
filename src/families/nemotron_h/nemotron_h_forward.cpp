@@ -1030,6 +1030,9 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     io.ld_out = Q;
     io.workspace = base + M.gqa;
     io.workspace_bytes = M.gqa_bytes;
+    /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
+    io.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).nf);
+    io.nf_code = 0x4E800000u | il;
     if (pulsar_gqa_launch(&G1, &q->attn_call[slot], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[slot],
                           &io, 0) != 0)
         return failf("the attention refused", il);
@@ -1301,6 +1304,12 @@ bool step_end(const pulsar_driver_step *st0, bool ok) {
     uint32_t nf = 0;
     if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
         return fail("could not read the MoE non-finite flag");
+    if (nf & 0x800000u) {   /* O59: a build that widens the attention's bf16 operands to fp16 (sm_75) */
+        fprintf(stderr, "pulsar: %s: an attention operand (q / k / v) of layer %u is outside fp16's range, which this "
+                        "build's tensor-core arms widen bf16 to (code 0x%08x) -- refusing the step\n",
+                ARCH, nf & 0x7fffffu, nf);
+        return false;
+    }
     if (nf) {
         fprintf(stderr, "pulsar: %s: the MoE output of layer %u went non-finite (code 0x%08x) -- refusing the step\n",
                 ARCH, nf & 0xffffffu, nf);

@@ -698,6 +698,8 @@ struct draft_layout {
      *  Bytes of the whole region. */
     /// SELECTOR: bf16 [R][rank], the selector's projected rows.
     uint64_t hp, anchor_ids, total;
+    /// u32: the pass's non-finite flag (pulsar_gqa_io::nf_flag, O59), zeroed with the pass's uploads.
+    uint64_t nf;
 };
 
 /// The rows front door's workspace for one multi-Linear call.
@@ -792,6 +794,7 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     L.scores = o; o += a256(NB * SL * d->topk * d->topk * 4u);
     L.chain_ids = o; o += a256(NB * SL * 4u);
     L.chain_rows = o; o += a256(NB * SL * 4u);
+    L.nf = o; o += 256u;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {
         L.pass = o; o += a256(NB * SL * E * 2u);
         L.anchor = o; o += a256(NB * E * 2u);
@@ -1236,6 +1239,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
     uint32_t bound = 256u;   /* the attention's bound: a graph is recaptured once per doubling of the context */
     while (bound <= last) bound *= 2u;
     bool ok = pulsar_gpu_tensor_write_async(l->arena, D.ids, l->h_tok, (uint64_t)R * 4u) != 0;
+    static const uint32_t nf_clear = 0u;   /* O59: the pass's non-finite flag starts clear */
+    ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.nf, &nf_clear, sizeof(nf_clear)) != 0;
     if (lili) {   /* the candidate head's anchor rows (cn of each bank's last committed row) and their validity */
         pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
         ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
@@ -1320,6 +1325,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
             io.ld_out = Q;
             io.workspace = base + D.gqa;
             io.workspace_bytes = D.gqa_bytes;
+            io.nf_flag = (uint32_t *)(base + D.nf);   /* O59: read back after the pass, on a widening build */
+            io.nf_code = 0x42000000u | li;
             if (pulsar_gqa_launch(&G[li], &l->call[li], base + D.desc + (uint64_t)li * D.desc_stride, &io, 0) != 0)
                 return fail("the block attention refused");
             {
@@ -1458,6 +1465,16 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
                !pulsar_gpu_tensor_read(l->arena, D.scores, l->scores.data(), (uint64_t)nb * SL * K * K * 4u) ||
                !pulsar_gpu_tensor_read(l->arena, D.chain_ids, l->chain_ids.data(), (uint64_t)nb * SL * 4u)) {
         return fail("could not read the head's chain");
+    }
+    if (pulsar_gqa_widens()) {   /* O59: the tensor-core arms widened bf16 operands to fp16 (sm_75): were all in range? */
+        uint32_t nf = 0;
+        if (!pulsar_gpu_tensor_read(l->arena, D.nf, &nf, sizeof(nf))) return fail("could not read the pass's non-finite flag");
+        if (nf) {
+            fprintf(stderr, "pulsar: block drafter: an attention operand (q / k / v) of drafter layer %u is outside "
+                            "fp16's range, which this build's tensor-core arms widen bf16 to (code 0x%08x) -- "
+                            "refusing the pass\n", nf & 0xffffffu, nf);
+            return fail("a drafter attention operand left fp16's range");
+        }
     }
     if (dump_dir()) {
         static int passes = -1;
