@@ -423,20 +423,25 @@ bool gather(ctx &c, const int *ids, uint32_t n, uint32_t at) {
            fail(c.err, c.errlen, "the embedding gather refused");
 }
 
-/* greedy after the repetition penalty: transformers' RepetitionPenaltyLogitsProcessor then argmax (the first max) */
+/* greedy after the repetition penalty: transformers' RepetitionPenaltyLogitsProcessor then argmax (the first max).
+ * L375 O49: a row with a NaN or an infinite value has no argmax -- every comparison against a NaN is false, so the
+ * loop answered id 0 for it, step after step, to the token cap -- and is refused. */
 /** @param logits   the vocab's logits; penalised in place
  *  @param seq      the sequence so far (prompt + generated); each id is marked seen
  *  @param penalty  the repetition penalty (> 1)
  *  @param seen     per-id flags, vocab long, kept across steps
- *  @return the chosen id: the first maximum */
+ *  @return the chosen id: the first maximum; -1 when the row is not finite */
 int pick(std::vector<float> &logits, const std::vector<int> &seq, float penalty, std::vector<uint8_t> *seen) {
     for (int id : seq) (*seen)[(size_t)id] = 1;
     for (size_t i = 0; i < logits.size(); i++)
         if ((*seen)[i]) logits[i] = logits[i] < 0.0f ? logits[i] * penalty : logits[i] / penalty;
     size_t best = 0;
-    for (size_t i = 1; i < logits.size(); i++)
+    bool finite = !logits.empty() && std::isfinite(logits[0]);
+    for (size_t i = 1; i < logits.size(); i++) {
+        finite = finite && std::isfinite(logits[i]);
         if (logits[i] > logits[best]) best = i;
-    return (int)best;
+    }
+    return finite ? (int)best : -1;
 }
 
 /** pulsar_family_parser::parse: one page, prepared on the host, then tower, neck, prefill and greedy decode under the
@@ -498,6 +503,10 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
     uint32_t n_new = 0;
     while (ok) {
         const int tok = pick(logits, seq, s.rep_penalty, &seen);
+        if (tok < 0) {
+            ok = fail(err, errlen, "the logits row is not finite (a NaN or an infinity): no token to pick");
+            break;
+        }
         seq.push_back(tok);
         n_new++;
         const uint32_t pos = n_prefix + (uint32_t)seq.size() - 1u;
