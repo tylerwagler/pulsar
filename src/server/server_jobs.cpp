@@ -297,7 +297,7 @@ bool job_reply_error(const job *j, bool sse_open, int code, const char *msg) {
 void server::send_prefill_failure_response(const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
-                                          const char *err) {
+                                          const char *err, bool busy) {
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -307,7 +307,7 @@ void server::send_prefill_failure_response(const job *j,
                        flags && flags[0] ? flags : "", err);
             return;
         }
-        if (!sse_error_event(j->fd, &j->req, j->req.n_images > 0 ? 400 : 500, err)) {
+        if (!sse_error_event(j->fd, &j->req, busy ? 503 : j->req.n_images > 0 ? 400 : 500, err)) {
             server_log(PULSAR_LOG_GENERATION,
                        "pulsar-server: %s ctx=%s%s%s prefill SSE error failed: %s",
                        kind, ctx, flags && flags[0] ? " " : "",
@@ -318,8 +318,10 @@ void server::send_prefill_failure_response(const job *j,
     /* An image request that reaches the worker has already had its data: URL,
      * tower and block count validated by the parser, so a prefill refusal here
      * is about the client's image context (an image the tower cannot accept, a
-     * span that will not fit a chunk) -- a 400, not a server fault. */
-    http_error(j->fd, j->req.n_images > 0 ? 400 : 500, err);
+     * span that will not fit a chunk) -- a 400, not a server fault.  O34: except the one refusal that is not the
+     * image's: the decode budget held by other requests, which the same request passes on a retry. */
+    if (busy) http_error_retry(j->fd, 503, err, HTTP_RETRY_BUSY_S);
+    else http_error(j->fd, j->req.n_images > 0 ? 400 : 500, err);
 }
 
 
@@ -640,7 +642,7 @@ void server::gen_prefill_fail(session_slot *sl) {
      * failed before generate_job_step installed it, has another slot's writer installed (L372) */
     slot_writer_install(&g->writer);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
-                                  g->req_flags, g->err);
+                                  g->req_flags, g->err, g->prefill_busy);
     g->phase = GEN_DONE;
 }
 
@@ -675,7 +677,7 @@ void server::gen_prefill_abandon(session_slot *sl) {
     if (!g->responses_live_continuation) s->responses_live_clear(sl);
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
-    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
+    s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err, false);
     g->phase = GEN_DONE;
 }
 
@@ -711,7 +713,7 @@ static bool image_continuation_place(pulsar_engine *e, pulsar_tokens *eff, int l
     }
     for (int i = 0; i < held; i++) images[i].start_pos = starts[i];
     pulsar_tokens out = {0};
-    if (!pulsar_expand_image_placeholders(e, eff, live_len, images + held, n_images - held, &out, why, whylen))
+    if (pulsar_expand_image_placeholders(e, eff, live_len, images + held, n_images - held, &out, why, whylen) != 1)
         return false;
     pulsar_tokens_free(eff);
     *eff = out;
@@ -1499,6 +1501,7 @@ void server::gen_step_prefill(session_slot *sl) {
         return;
     }
     if (rc != 0) {
+        g->prefill_busy = rc == PULSAR_SESSION_SYNC_BUSY;
         s->gen_prefill_fail(sl);
         return;
     }

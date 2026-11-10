@@ -496,7 +496,8 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
 }
 
 /** Serve POST /v1/parse: decode the data: URL image, one pulsar_engine_parse_page call, reply with its text.
- *  An engine rc of -2 (the input) answers 400, any other failure 500.
+ *  An engine rc of -2 (the input) answers 400, -3 (the image-decode budget held by other decodes) 503 with
+ *  Retry-After, any other failure 500.
  *  @param c the parser
  *  @param fd the client socket (a response or an error is sent unless the client left while the call was queued)
  *  @param o the request body */
@@ -546,7 +547,8 @@ void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     if (!ran) return;
     if (rc != 0) {
         pulsar_tokens_free(&ids);
-        http_error(fd, rc == -2 ? 400 : 500, why);
+        if (rc == -3) http_error_retry(fd, 503, why, HTTP_RETRY_BUSY_S);
+        else http_error(fd, rc == -2 ? 400 : 500, why);
         return;
     }
     buf b = {0};

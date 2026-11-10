@@ -372,7 +372,8 @@ typedef struct pulsar_family_encoder {
 
 /** L321: a page-parser family's entry (pulsar.h pulsar_engine_parse_page), behind PULSAR_FAMILY_CAP_PARSE. */
 typedef struct pulsar_family_parser {
-    /** Parse one page image (pulsar_engine_parse_page): 0; -2 + `err` refused request; -1 + `err` engine failure. */
+    /** Parse one page image (pulsar_engine_parse_page): 0; -2 + `err` refused request; -3 + `err` the image-decode
+     *  budget is busy (retry); -1 + `err` engine failure. */
     int (*parse)(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids,
                  char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 } pulsar_family_parser;

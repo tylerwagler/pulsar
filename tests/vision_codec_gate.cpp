@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
         }
         uint8_t *got = NULL;
         int gw = 0, gh = 0;
-        const int ok = vision_decode_rgb(enc, enc_len, &got, &gw, &gh);
+        const bool ok = vision_decode_rgb(enc, enc_len, &got, &gw, &gh) == vision_decode::ok;
         const char *kind = fmt == 0 ? "png" : "jpeg";
         if (!ok) {
             fprintf(stderr, "  FAIL case %u (%s %dx%d): vision_decode_rgb refused\n", c, kind, w, h);

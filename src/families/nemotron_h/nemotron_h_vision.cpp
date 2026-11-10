@@ -461,7 +461,7 @@ bool tile_of(const pulsar_nemotron_h_vision *v, const pulsar_image_ref *img, uin
         }
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
-    if (!img->bytes || !vision_decode_rgb(img->bytes, img->len, &rgb, &w, &h)) return false;
+    if (!img->bytes || vision_decode_rgb(img->bytes, img->len, &rgb, &w, &h) != vision_decode::ok) return false;
     free(rgb);
     pulsar_nemotron_h_tile(&v->shape, w, h, wp, hp);
     if (!*wp || !*hp || *wp * *hp > v->shape.max_patches) return false;

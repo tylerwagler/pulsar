@@ -837,7 +837,15 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     PULSAR_NVTX_FN();
     if (!s) return 1;
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
+    if (!tp) {
+        /* O34: an image sync that failed on a decode the shared budget refused is busy, not a failed prefill (a
+         * mirrored sync below fails as 1 either way: a refused step fails the pair) */
+        vision_decode_busy_reset();
+        const int rc = pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
+        if (rc != 1 || n_images <= 0 || !vision_decode_busy_seen()) return rc;
+        if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+        return PULSAR_SESSION_SYNC_BUSY;
+    }
     if (tp_mirror_worker_drives_nothing(tp, "sync", err, errlen)) return 1;
     if (tp_mirror_dead(tp, err, errlen)) return 1;
     /* The leader's arguments ARE the operation, so an empty prompt is a caller bug. */
@@ -973,9 +981,12 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
         return 0;
     }
     /* L268: the family's front, through the core's walk (image_front.cpp) */
-    const bool ok = pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen);
-    if (!ok) pulsar_tokens_free(out);
-    return ok ? 1 : 0;
+    vision_decode_busy_reset();
+    if (pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen)) return 1;
+    pulsar_tokens_free(out);
+    if (!vision_decode_busy_seen()) return 0;
+    if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+    return -1;
 }
 TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return TokCount{s->common_prefix(prompt)}; }
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }

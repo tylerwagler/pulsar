@@ -60,7 +60,12 @@ bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels
     memset(out, 0, sizeof *out);
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
-    if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) {
+    const vision_decode dec = vision_decode_rgb(bytes, len, &rgb, &w, &h);
+    if (dec == vision_decode::busy) {
+        snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+        return false;
+    }
+    if (dec != vision_decode::ok) {
         snprintf(err, errlen, "the image could not be decoded (PNG or JPEG, at most %llu pixels)", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
@@ -341,7 +346,7 @@ static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, 
         }
     uint8_t *rgb = NULL;
     int iw = 0, ih = 0;
-    if (!img->bytes || !vision_decode_rgb(img->bytes, img->len, &rgb, &iw, &ih)) return false;
+    if (!img->bytes || vision_decode_rgb(img->bytes, img->len, &rgb, &iw, &ih) != vision_decode::ok) return false;
     free(rgb);
     int rh = 0, rw = 0;
     char err[128];

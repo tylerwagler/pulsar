@@ -455,7 +455,8 @@ int pick(std::vector<float> &logits, const std::vector<int> &seq, float penalty,
  *  @param stats    receives the call's counts and stage timings (NULL = not wanted)
  *  @param err      the refusal text
  *  @param errlen   err's capacity in bytes
- *  @return 0 = parsed; -2 = the input refused (prompt or image); -1 = the forward refused */
+ *  @return 0 = parsed; -2 = the input refused (prompt or image); -3 = the shared image-decode budget is held by
+ *          other decodes (the same call succeeds on a retry); -1 = the forward refused */
 int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt, pulsar_tokens *ids_out,
           char **text, pulsar_parse_stats *stats, char *err, size_t errlen) {
     pulsar_nemotron_parse_model *w = W(e);
@@ -472,7 +473,8 @@ int parse(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse
     }
     const double t0 = now_ms();
     pulsar_nemotron_parse_page pg;
-    if (!pulsar_nemotron_parse_page_prepare(&s, image, len, &pg, err, errlen)) return -2;
+    vision_decode_busy_reset();
+    if (!pulsar_nemotron_parse_page_prepare(&s, image, len, &pg, err, errlen)) return vision_decode_busy_seen() ? -3 : -2;
     const uint32_t n_patch = (pg.h / s.patch) * (pg.w / s.patch);
     st.image_w = pg.cw;
     st.image_h = pg.ch;

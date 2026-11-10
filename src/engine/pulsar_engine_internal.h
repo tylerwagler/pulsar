@@ -5207,8 +5207,10 @@ float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, 
 /** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
  *  reference tooling opens decodes here too. */
 #define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
-/** L354: the bytes all concurrent decodes may hold: one thread decodes per Parse connection, so the per-image cap alone is
- *  64 x 1.25 GiB.  A chat server decodes on its one worker and never meets it. */
+/** L354: the bytes all concurrent decodes may hold; the per-image cap alone is 1.25 GiB a decode.  Who decodes at
+ *  once: a chat server's connection threads, each expanding its own request's images at parse, beside its worker's
+ *  prefill (a tower-cache miss decodes again); a Parse server decodes on each parser engine's one GPU thread (L374),
+ *  so one decode an engine.  A decode over it is refused busy (vision_decode::busy), never as undecodable. */
 #define PULSAR_VISION_DECODE_BUDGET_BYTES (16ull << 30)
 /** L354: hold `bytes` of the decode budget.  @param bytes what the decode allocates  @return false (said) when over it */
 bool vision_decode_reserve(uint64_t bytes);
@@ -5217,8 +5219,24 @@ void vision_decode_release(uint64_t bytes);
 /** L354: whether an image of these dimensions may be decoded (said on stderr when not).
  *  @param width pixels  @param height pixels  @return true when its pixels are within the limit */
 bool vision_decode_admits(uint64_t width, uint64_t height);
-int vision_decode_rgb(const uint8_t *bytes, size_t len,
-                      uint8_t **rgb_out, int *w_out, int *h_out);
+/** O34: how a decode ended.  A class, so no caller reads `busy` as a success or folds it into `refused`. */
+enum class vision_decode {
+    ok,        ///< decoded
+    refused,   ///< not an image this decodes (not PNG / JPEG, corrupt, CMYK, past the pixel limit): permanent
+    busy,      ///< the shared decode budget is held by other decodes: the same image decodes on a retry
+};
+/** O34: what a refusal says when it was the budget's (the text of every layer that reports a busy decode). */
+#define PULSAR_VISION_DECODE_BUSY_TEXT "the image decode budget is in use by other requests; retry"
+/** O34: forget this thread's busy decodes.  The image front's layers between a decode and the engine's API report
+ *  with a bool and a text, which cannot carry "busy, retry"; the three calls that decode (the placeholder expansion,
+ *  an image sync, a page parse) call this on entry and, when they fail, read vision_decode_busy_seen to report the
+ *  refusal as busy through their own result.  Per thread: a decode runs on the thread of the call it serves. */
+void vision_decode_busy_reset(void);
+/** O34: whether a decode on this thread returned vision_decode::busy since vision_decode_busy_reset.
+ *  @return true when one did */
+bool vision_decode_busy_seen(void);
+vision_decode vision_decode_rgb(const uint8_t *bytes, size_t len,
+                                uint8_t **rgb_out, int *w_out, int *h_out);
 
 /** One image READY for the model: the reference's per-image half of
  * prepare_vl_inputs.  `span_ids` are the sentinel token ids (vocab_size + type),

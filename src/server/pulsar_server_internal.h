@@ -2987,7 +2987,9 @@ struct server {
     /// @param ctx       the context-span label for the log line
     /// @param flags     extra log flags (may be NULL or empty)
     /// @param err       the failure text sent to the client
-    void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err);
+    /// @param busy      the failure is "busy, retry" (gen_state::prefill_busy): a 503, with Retry-After when the
+    ///                  headers are still to send
+    void send_prefill_failure_response(const job *j, const server_prefill_progress *progress, const char *ctx, const char *flags, const char *err, bool busy);
     /** After a successful tool-call finish, make the live checkpoint match what the
      * next request will render.  Usually that is just the exact DSML remembered by
      * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -4015,6 +4017,9 @@ struct gen_state {
      * the specifics are.  gcc reported this as -Wformat-truncation on
      * four snprintf sites and nothing was reading warnings. */
     char err[256];
+    /** O34: the prefill failed because the engine's shared image-decode budget was held by other decodes
+     *  (PULSAR_SESSION_SYNC_BUSY): answered 503 with Retry-After, not as a fault of the request's image */
+    bool prefill_busy;
     pulsar_tokens effective_prompt;  ///< prompt after template rendering and any cache-driven rewrite
     const pulsar_tokens *prompt_for_sync;  ///< &j->req.prompt or &effective_prompt
     bool responses_protocol;          ///< request came in on the /responses API

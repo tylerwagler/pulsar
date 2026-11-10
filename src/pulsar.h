@@ -161,6 +161,10 @@ typedef bool (*pulsar_session_cancel_fn)(void *ud);
 /** pulsar_session_sync's return when the cancel callback stopped it at a chunk boundary (the checkpoint is a valid
  *  prefix; re-issue the sync to resume). */
 #define PULSAR_SESSION_SYNC_INTERRUPTED 2
+/** pulsar_session_sync_mm's return when an image of the request could not be decoded because the image-decode budget
+ *  every decode of the process shares is held by other decodes: a failed sync (the bank is to be invalidated as after
+ *  a 1), and the same request succeeds on a retry. */
+#define PULSAR_SESSION_SYNC_BUSY 3
 
 /** Options for pulsar_engine_open(). Zero-initialise, then set what you need:
  * every field's 0/NULL is a working default except `model_path`. */
@@ -451,7 +455,8 @@ bool pulsar_engine_is_parser(const pulsar_engine *e);
 /** Parse one page (`image`: PNG or JPEG bytes).  `ids` (appended): the whole sequence, prompt and generated, eos
  *  included when reached; `*text`: its decode (malloc'd; the model's tokenizer, special tokens kept); `stats` may be
  *  NULL.  0; -2 + `err`: the request refused (an image the model does not take, a prompt that is not its tokens);
- *  -1 + `err`: the engine failed (a device failure). */
+ *  -3 + `err`: the image-decode budget every decode of the process shares is held by other decodes -- the same call
+ *  succeeds on a retry; -1 + `err`: the engine failed (a device failure). */
 /** @param e the parser engine
  *  @param image the encoded page (PNG or JPEG), borrowed
  *  @param len bytes at image
@@ -461,7 +466,7 @@ bool pulsar_engine_is_parser(const pulsar_engine *e);
  *  @param stats receives the call's stats; may be NULL
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return 0, -2 (refused) or -1 (engine failure) */
+ *  @return 0, -2 (refused), -3 (busy: retry) or -1 (engine failure) */
 int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
                              pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 
@@ -1074,7 +1079,7 @@ int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *er
  *  @param n_images their count (0 = text only)
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return as pulsar_session_sync */
+ *  @return as pulsar_session_sync, or PULSAR_SESSION_SYNC_BUSY */
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images,
                            char *err, size_t errlen);
@@ -1105,7 +1110,8 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
  *  @param out receives the expanded prompt (freed on a refusal)
  *  @param err receives the refusal
  *  @param errlen bytes at err
- *  @return 1 on success, 0 on a refusal (note: not the 0-is-success convention) */
+ *  @return 1 on success, 0 on a refusal, -1 on a refusal that is the image-decode budget's (busy: the same call
+ *          succeeds on a retry).  Not the 0-is-success convention: compare with 1 */
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen);
