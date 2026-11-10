@@ -201,6 +201,8 @@ tests/sse-golden/out.txt
 /tests/loader_open
 /tests/inkling_family_gate
 /tests/gemma4_family_gate
+/tests/gemma4_jev_gate
+/tests/lora_rows_gate
 /tests/mma_k8_split_gate
 /tests/nemotron_family_gate
 /tests/nemotron_fwd_gate
