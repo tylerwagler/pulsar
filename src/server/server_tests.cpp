@@ -9442,6 +9442,27 @@ static void test_l372_gone_client_wait_covers_prefill(void) {
     TEST_ASSERT(!gen_gone_wait_phase(NULL));
 }
 
+/* L372 (O28): a decoder whose batch_leave failed is GEN_FINISH with batch_active still set and in no decode set: the
+ * step beside a decode quantum is what finishes it.  A decoder and a parked one stay out. */
+static void test_l372_failed_batch_leave_is_still_stepped(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    int dummy = 0;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    sl.provisioned = true;
+    sl.active_job = (job *)&dummy;
+    sl.gen = &g;
+    g.phase = GEN_FINISH;
+    g.batch_active = true;
+    TEST_ASSERT(slot_steppable_beside_decode(&sl) && slot_steppable_beside_fused(&sl));
+    g.phase = GEN_DECODE;
+    TEST_ASSERT(!slot_steppable_beside_decode(&sl));
+    g.phase = GEN_FINISH;
+    sl.preempted = true;
+    TEST_ASSERT(!slot_steppable_beside_decode(&sl));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15217,6 +15238,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_readmission_marks_the_bank_spilled();
     test_l372_no_fuse_prefill_is_the_classic_steps();
     test_l372_gone_client_wait_covers_prefill();
+    test_l372_failed_batch_leave_is_still_stepped();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

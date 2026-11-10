@@ -4955,10 +4955,15 @@ static session_slot *worker_pick_step(server *s, int *rr, const session_slot *sk
     return NULL;
 }
 
+/* L372: batch_active does not keep a slot out.  A slot that stopped in the plain batch is finished by the quantum's
+ * own pass while it is still in that pass's decode set; one whose batch_leave failed outside it -- a preemption tried
+ * for a prompt (worker_try_bind, a prefill's memory step) whose bank would not install -- is GEN_FINISH with
+ * batch_active still set (generate_job_step reconciles the batch's commits if the bank installs after all), in no
+ * decode set, and with the flag excluded here it was never stepped while another decoder ran. */
 /// @param c the slot
-/// @return true when it has a job that is not in the batched decode (nor preempted)
+/// @return true when it has a job that is not decoding in the batched quantum (nor preempted)
 static bool slot_steppable_beside_decode(const session_slot *c) {
-    return c->active_job && !c->preempted && !slot_is_batchable_decode(c) && !(c->gen && c->gen->batch_active);
+    return c->active_job && !c->preempted && !slot_is_batchable_decode(c);
 }
 
 /// @param c the slot
