@@ -1192,6 +1192,34 @@ static void run_fixture_layer(const std::string &dir) {
           dir.c_str(), fro, em / am, eq / ((double)T * W), fro16, eqo / ((double)T * W), fro16 / fro);
 }
 
+/* L370: a bounded call's split grid covers a TILE's chunks, not one row's.  Gemma 4's window layer at its real
+ * window (16q/8kv/256, window 1024: G = 2, 32 rows a tile): a row's keys span at most 5 chunks of 256, but a tile's
+ * rows share the first row's chunk origin, so a tile whose first row's window starts late in a chunk and whose last
+ * row is past the next chunk boundary needs 6.  One 1024-row call (the folding arm), then 37-row prompt calls (the
+ * split schedule): the call at 1505 has the tile 1505..1536 -- keys 482..1536, chunks 1..6.  The 300-key window the
+ * other Gemma cases run can never need the extra chunk (a tile there spans at most 3 = the bound's). */
+static void run_bounded_tile() {
+    const uint32_t N = 1600, W = 1024, BOUND = 2048;
+    Case C;
+    case_init(C, "gemma4-window1024-bounded-tile", 16, 8, 256, W, W + N, true, 0, 0.f, 0.f, false, 1.0f, N, 370);
+    C.R.rope_theta = 1e4f; C.L.rope_theta = 1e4f;
+    printf("\n=== %s: 16q/8kv/256, window %u, %u tokens: calls of 1024 then 37 rows, forward vs planned at ctx_bound %u\n",
+           C.name, W, N, BOUND);
+    g_flashdec = false;   /* prompt calls only: one arm, bit-exact */
+    Seq A = seq_new(C, 1), B = seq_new(C, 1);
+    const std::vector<Out> fwd = run_schedule(C, A, 0, N, {1024, 37});
+    g_bound = BOUND;
+    const std::vector<Out> bnd = run_schedule(C, B, 0, N, {1024, 37});
+    g_bound = 0;
+    const uint32_t d = fwd.size() == N && bnd.size() == N ? first_diff(fwd, bnd) : 0u;
+    check(fwd.size() == N && bnd.size() == N && d == UINT32_MAX && pools_equal(C, A, B, N),
+          "bounded tile (ctx_bound %u): 37-row calls on a %u-key window planned + launched == the forward, bit-exact%s",
+          BOUND, W, d == UINT32_MAX ? "" : " -- first difference at a row");
+    if (d != UINT32_MAX) printf("    first differing row: position %u\n", d);
+    seq_free(A);
+    seq_free(B);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--fixture")) {
         printf("gqa_attn_gate --fixture %s: the Inkling-Small mini checkpoint's attention vs transformers\n", argv[2]);
@@ -1334,6 +1362,8 @@ int main(int argc, char **argv) {
     run_encoder(gy, 600, &ge);
 
     run_refusals(g1, gr);
+
+    run_bounded_tile();
 
     printf("\ngqa_attn_gate: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

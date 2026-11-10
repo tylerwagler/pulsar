@@ -1649,6 +1649,20 @@ uint32_t gqa_max_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
     return std::min(full, (L->window - 1u + ahead + GQA_CHUNK - 1u) / GQA_CHUNK + 1u);
 }
 
+/// @param L the layer.
+/// @param max_ctx a bound on the call's positions (all < max_ctx).
+/// @return the most chunks one TILE's key range can touch: the split schedule's chunk CTAs count from the tile's first
+/// row's chunk (gqa_attn_kernel) up to its last row's, so a tile reaches its later rows' keys past one row's range.
+uint32_t gqa_tile_chunks(const pulsar_gqa_layer *L, uint32_t max_ctx) {
+    const uint32_t full = (max_ctx + GQA_CHUNK - 1u) / GQA_CHUNK;
+    if (L->span != PULSAR_GQA_WINDOW) return full;
+    /* keys past the first row's own position: a block row's run (gqa_max_chunks; every row of a run reads to its
+     * end), else the tile's later rows -- 64 / G - 1 of them (L370: at a row's count, a 1024-key window's tile across
+     * a chunk boundary had no CTA for its last chunk, and the combine folded a partial nothing had written) */
+    const uint32_t reach = L->block ? GQA_CHUNK - 1u : GQA_MROWS / (L->n_q / L->n_kv) - 1u;
+    return std::min(full, (L->window - 1u + reach + GQA_CHUNK - 1u) / GQA_CHUNK + 1u);
+}
+
 /// The ONE workspace sizer and carver.
 /// @param base workspace base (256-byte aligned), or NULL to size only (pointers come back NULL).
 /// @param L the layer.
@@ -1705,7 +1719,7 @@ pulsar_shape_once g_gqa_announce;
 /// @param aa the attention arguments.
 /// @param n_rows rows in the call.
 /// @param n_tiles query tiles.
-/// @param grid_chunks the split schedule's chunk CTAs per (KV head, tile).
+/// @param grid_chunks the split schedule's chunk CTAs per (KV head, tile); the decode arms' are a row's (ws.max_chunks).
 /// @param fold the folded schedule.
 /// @param decode the rows are decode rows (the wide heads' flash-decoding arm).
 /// @param shape the flash-decoding CTA's rows and heads (gqa_dec_pick).
@@ -1729,16 +1743,18 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
     const bool bias = L->rel_extent > 0u;
     if constexpr (HD > 128) {   /* L338: the wide heads (no bias, gate or block: refused at the declaration) */
         const dim3 grid(fold ? 1u : grid_chunks, L->n_kv * (HD / GQA_WIDE_D), n_tiles);
+        /* a decode CTA counts chunks from each row's own first (not a tile's): a row's most (L370) */
+        const uint32_t dec_chunks = std::min(grid_chunks, ws.max_chunks);
         if (decode && !fold) {   /* L338: decode / verify rows (never a prompt's): flash-decoding, a CTA a row (the combine
                                   * below) -- a verify's rows and a plain decode's are then the same arm's bytes, so
                                   * speculation never changes the output */
             if (mma_dec) {   /* L338: a wide GQA's decode rows on the tensor cores (pulsar_gqa_launch's pick) */
                 const uint32_t rb = shape.rb;   /* rows a CTA: gqa_dmma_rows */
-                gqa_decode_mma_dispatch<HD>(rb, dim3(L->n_q / GQA_DMMA_NV, grid_chunks, (n_rows + rb - 1u) / rb), aa,
+                gqa_decode_mma_dispatch<HD>(rb, dim3(L->n_q / GQA_DMMA_NV, dec_chunks, (n_rows + rb - 1u) / rb), aa,
                                             n_rows, st);
             } else {
                 const uint32_t rb = shape.rb, hb = shape.hb;   /* pulsar_gqa_launch's pick */
-                const dim3 dgrid(L->n_q / hb, grid_chunks, (n_rows + rb - 1u) / rb);
+                const dim3 dgrid(L->n_q / hb, dec_chunks, (n_rows + rb - 1u) / rb);
                 if (L->kv_fmt == PULSAR_GQA_KV_E4M3) gqa_decode_dispatch<HD, true>(rb, hb, dgrid, aa, n_rows, st);
                 else                                 gqa_decode_dispatch<HD, false>(rb, hb, dgrid, aa, n_rows, st);
             }
@@ -1906,10 +1922,11 @@ int pulsar_gqa_plan(const pulsar_gqa_layer *L, const pulsar_gqa_seq *seqs, uint3
         grid_chunks = std::max(grid_chunks, h_rows[r + n - 1u].hi / GQA_CHUNK - h_rows[r].chunk0 + 1u);
         r += n;
     }
-    /* A bounded call's split grid is the bound's (a CTA whose chunk is past its tile's last row exits before it reads
-     * anything, and the combine folds each row's own chunks): its launches then depend on (n_rows, n_tiles, the
+    /* A bounded call's split grid is the bound's -- the most chunks a TILE can touch (gqa_tile_chunks), which is what
+     * the loop above counts for the tiles at hand.  A CTA whose chunk is past its tile's last row exits before it
+     * reads anything, and the combine folds each row's own chunks: the launches then depend on (n_rows, n_tiles, the
      * bound) and never on the positions -- what a captured step replays.  The bytes are the unbounded call's. */
-    if (ctx_bound) grid_chunks = gqa_max_chunks(L, ctx_bound);
+    if (ctx_bound) grid_chunks = gqa_tile_chunks(L, ctx_bound);
     out->n_rows = n_rows;
     out->n_tiles = n_tiles;
     out->grid_chunks = grid_chunks;
@@ -1998,7 +2015,7 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
         return gqa_refuse("a decode group of other than 0, 1, 2 or 4 rows");
     /* the flash-decoding CTA's shape (decode rows of a wide-head layer): a function of the layer and n_rows (what a
      * captured step's key already holds) */
-    gqa_dec_shape shape = gqa_dec_pick(G, L->n_q, call->grid_chunks, n_rows,
+    gqa_dec_shape shape = gqa_dec_pick(G, L->n_q, std::min(call->grid_chunks, ws.max_chunks), n_rows,
                                              io->decode_group <= 1 ? 1u : (uint32_t)io->decode_group);
     if (G % shape.hb != 0u) return gqa_refuse("a forced decode shape whose heads do not divide the layer's G");
     /* L338: a wide GQA's decode rows (G a multiple of 8, BF16 rows) on the tensor cores -- a function of the layer
