@@ -2238,7 +2238,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * it replaces re-ran a dropped shape's heuristic on its next call, which inside a CUDA-graph capture finds no
      * kernel: a captured step refused for a shape it had run before (L306, the warmup's verify walk). */
     struct lt_shape_cache {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulHeuristicResult_t h;
@@ -2291,7 +2291,6 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
                                (unsigned long long)in_dim, (unsigned long long)out_dim, ntok, out_f16 ? "f16" : "f32",
                                (int)hs);
         }
-        ne.valid = 1;
         e = &cache.emplace(ck, ne).first->second;
     }
     cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
@@ -3126,16 +3125,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
     {
         const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < n_tok) {
-            /* Row strides are BYTES: the output half must follow the OUTPUT
-             * element size, or the suffix lands at the wrong offset. */
-            const uint64_t inb = in_dim * sizeof(float);
-            const uint64_t outb = out_dim * (out_f16 ? sizeof(__half) : sizeof(float));
             pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
             pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
-            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
-                                                             out->bytes - n_dec * outb);
-            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
-                                                             x->bytes - n_dec * inb);
             const int saved = g_batch_decode_rows;
             g_batch_decode_rows = (int)n_dec;  ///< decode prefix: n_dec == n_tok' => no further split
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
@@ -3146,7 +3137,6 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * the window reads the producer's full-width slot; an offset f32
              * view keyed no slot and used to be quantised here -- that path is
              * gone. */
-            (void)out_suf; (void)x_suf;
             int r2 = cuda_matmul_fp8_mx_window(out, model_map, model_size,
                     weight_offset, in_dim, out_dim, x, n_dec, n_tok - n_dec, label);
             g_batch_decode_rows = saved;
@@ -3444,7 +3434,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
     const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     /* ONE algorithm per weight shape, chosen at the canonical row count. */
     struct bf16_lt_shape {
-        uint64_t in_dim, out_dim; int valid;
+        uint64_t in_dim, out_dim;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
@@ -3485,13 +3475,12 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
             return 0;
         }
         ns.algo = hr.algo;
-        ns.valid = 1;
         sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct bf16_lt_call {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatrixLayout_t lb, ld;
     };
     static thread_local std::unordered_map<lt_cache_key, bf16_lt_call, lt_cache_key_hash> calls;
@@ -3513,7 +3502,6 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
                     (unsigned long long)in_dim, (unsigned long long)out_dim, PULSAR_BF16_LT_CANON_ROWS, ntok);
             return 0;
         }
-        ne.valid = 1;
         e = &calls.emplace(ck, ne).first->second;
     }
     cuda_arena ar;
@@ -3728,7 +3716,7 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
     }
     const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     struct bf16_lt_decode_ent {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulAlgo_t algo;
@@ -3783,7 +3771,6 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
             return 0;
         }
         ne.algo = hr.algo;
-        ne.valid = 1;
         static int announced = 0;
         if (!announced) {
             announced = 1;
@@ -3984,7 +3971,11 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
                                                uint64_t offset,
                                                uint64_t in_dim, uint64_t out_dim) {
     const f32w_key key{model_map, offset, in_dim, out_dim};
-    f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)(offset & (F32W_FC - 1u))];
+    /* L375: a hash of the offset.  The index was `offset & 7`, and weight offsets are aligned: every weight shared
+     * one or two of the eight slots.  The top three bits of a multiplicative hash spread them; a hit is still decided
+     * by the entry's key. */
+    static_assert(F32W_FC == 8u, "the slot index below is a 3-bit hash");
+    f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)((offset * 0x9E3779B97F4A7C15ull) >> 61)];
     const f32w_node *hit = fc->node.load(std::memory_order_acquire);
     if (hit && hit->first == key) return hit->second;
     auto it = g_f32w_bf16.find(key);

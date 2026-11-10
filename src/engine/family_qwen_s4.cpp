@@ -835,8 +835,7 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
     const pulsar_tensor *te = st->w->token_embd;
     const uint16_t *table = (const uint16_t *)wptr(st, te, "qwen embed_tokens");
     if (!tok || !table || !pulsar_gpu_tensor_write_async(tok, 0, st->tokens, (uint64_t)n * sizeof(int32_t))) return false;
-    if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (int)s->n_vocab,
-                                 (uint16_t *)dptr(st->streams), 0))
+    if (pulsar_qwen_embed_launch(table, (const int32_t *)dptr(tok), (int)n, (uint16_t *)dptr(st->streams), 0))
         return false;
 
     /* the PLE rows of these tokens: hash on the host, issue the gather now */

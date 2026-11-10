@@ -637,11 +637,6 @@ static double cuda_wall_sec(void) {
 
 
 
-/// @return 1: the load-progress lines are always on
-static int cuda_model_load_progress_enabled(void) {
-    return 1;
-}
-
 
 
 /// Resets the load-progress state (engine cleanup).
@@ -671,8 +666,6 @@ static void cuda_model_load_progress_finish(void) {
 /// Prints a load-progress line when due (every 2 GiB / 2 s on a tty, 16 GiB / 10 s otherwise).
 /// @param cached_bytes bytes cached on the device so far
 static void cuda_model_load_progress_note(uint64_t cached_bytes) {
-    if (!cuda_model_load_progress_enabled()) return;
-
     const double now = cuda_wall_sec();
     const int tty = isatty(STDERR_FILENO) != 0;
     const uint64_t step = (tty ? 2ull : 16ull) *

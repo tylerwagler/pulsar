@@ -266,11 +266,10 @@ const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert
 /// @param tokens  device int32 [T] token ids, each in [0, n_vocab) -- checked by the caller on the host
 ///                (pulsar_qwen_s4_embed); the kernel indexes the table unclamped
 /// @param T       rows
-/// @param n_vocab rows in the table
 /// @param streams device bf16 [T][4][2560] out
 /// @param stream  stream to launch on
 /// @return 0, -1 refused (said), -3 launch failure
-int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
+int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, uint16_t *streams,
                              cudaStream_t stream);
 
 /** L321: y [rows][out] f32 = the complete Linear of f16 rows x_f16 (an fp16 consumer's operand format: the f16 arm
