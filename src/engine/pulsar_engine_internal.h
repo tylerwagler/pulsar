@@ -2563,7 +2563,6 @@ typedef struct pulsar_spec_carry_state {
      * generate_speculative already refuses when mseq_dirty). */
     float spec_quench_debt;  ///< cumulative plain-token-equivalents lost
     float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
-    int spec_round_banks;       ///< banks sharing the round being ended (the flat cost's divisor); 1 in the single lane
     uint32_t spec_quench_steps; ///< fused spec steps taken by this request
     bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
     /** Per-SESSION mirror of the engine's cumulative DSpark counters. The engine

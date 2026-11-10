@@ -699,6 +699,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
 /// @param rng the request's stream (advanced past the emitted tokens; NULL greedy)
 /// @param wv the round's walk verdict
 /// @param row0 the round's first row in the forward's capture
+/// @param round_banks banks sharing the step the round rode (the quench guard's divisor of the flat cost; 1 = alone)
 /// @param defer_redraft record the redraft for the batched pass
 /// @param t0 the step's start (now_sec), 0 when the forward ran outside the round
 /// @param forced_truth [K + 1] the true continuation for a teacher-forced end, else NULL
@@ -714,6 +715,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
                           const uint32_t *masks, uint32_t mask_rows,
                           uint64_t *rng,
                           const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
+                          int round_banks,
                           bool defer_redraft,
                           double t0,
                           const int32_t *forced_truth,
@@ -861,7 +863,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         const pulsar_lane_cost_fit *cost = &e->lane_cost[PULSAR_LANE_SPEC];
         if (cost->valid && s->spec.spec_quench_steps > PULSAR_QUENCH_WARMUP) {
             const float margin = (1.0f + (float)commit) -
-                                 spec_quench_guard(cost, s->spec.spec_round_banks, n_batch);
+                                 spec_quench_guard(cost, round_banks, n_batch);
             s->spec.spec_quench_ewma = (1.0f - PULSAR_QUENCH_ALPHA) * s->spec.spec_quench_ewma +
                                   PULSAR_QUENCH_ALPHA * margin;
             s->spec.spec_quench_debt -= margin;   /* unclamped: NET tokens lost */
@@ -1085,11 +1087,11 @@ static int spec_single_round(pulsar_session *s, int first_token,
         return -1;
     }
     const uint32_t n_rows = pulsar_spec_round_n_rows(&r);
-    s->spec.spec_round_banks = 1;
     const int na = spec_round_end(s, &r, first_token,
                                   temperature, top_k, top_p, min_p, 0u /* the caller's params at every row */,
                                   NULL, 0u, rng,
-                                  &wv, 0u, false, t0, NULL, accepted, accepted_cap, err, errlen);
+                                  &wv, 0u, 1 /* the single lane: the step is this round's alone */, false, t0, NULL,
+                                  accepted, accepted_cap, err, errlen);
     free(r.snap);
     /* L263: this lane's own cost observation -- the whole step, redraft
      * included.  Off TP only: a group's ranks must hold the same fit, and this
@@ -1299,6 +1301,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
 /// @param rng the request's stream
 /// @param wv the walk verdict (NULL only on a teacher-forced end)
 /// @param row0 the round's first step row
+/// @param round_banks banks sharing the step (spec_round_end)
 /// @param forced_truth teacher-forced continuation, or NULL
 /// @param accepted [accepted_cap] receives the emitted tokens
 /// @param accepted_cap its size
@@ -1310,13 +1313,13 @@ static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
                                  float temperature, int top_k, float top_p,
                                  float min_p, uint32_t greedy_rows,
                                  const uint32_t *masks, uint32_t mask_rows, uint64_t *rng,
-                                 const pulsar_gpu_spec_walk_out *wv, uint32_t row0,
+                                 const pulsar_gpu_spec_walk_out *wv, uint32_t row0, int round_banks,
                                  const int32_t *forced_truth,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
     return spec_round_end(s, r, first_token,
                           temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows, rng,
-                          wv, row0,
+                          wv, row0, round_banks,
                           true /* L150: redraft deferred to the batch */,
                           0.0 /* t0: step_ms diagnostic reads 0 in this lane */,
                           forced_truth, accepted, accepted_cap, err, errlen);
@@ -1340,7 +1343,7 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
     pulsar_gpu_spec_walk_out wv;
     if (!spec_walk_rounds(s, &w, 1, &wv, err, errlen)) return -1;
     return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
-                                 rng, &wv, row0,
+                                 rng, &wv, row0, 1 /* one round's end: priced as its step's only bank */,
                                  NULL, accepted, accepted_cap, err, errlen);
 }
 
@@ -1357,7 +1360,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
         return -1;
     }
     return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, NULL, row0,
-                                 truth,
+                                 1, truth,
                                  accepted, accepted_cap, err, errlen);
 }
 
@@ -1515,7 +1518,6 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
      * bank (they were re-read per committed row -- 16 to 32 times a step at c16). */
     s->seed_defer.active = s->engine->family->banks->pooled(s);
     s->seed_defer.n = 0;
-    s->spec.spec_round_banks = n;   /* L263: the round's flat cost is shared n ways */
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
@@ -1532,8 +1534,8 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         else
             na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
-                                       &wv[widx[i]], st->row0, NULL,
-                                       st->accepted, st->accepted_cap, st->err, sizeof st->err);
+                                       &wv[widx[i]], st->row0, n /* L263: the step's flat cost is shared n ways */,
+                                       NULL, st->accepted, st->accepted_cap, st->err, sizeof st->err);
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
         st->pos_after = TokPos{s->pos()};
