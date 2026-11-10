@@ -115,6 +115,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         return 1;
     }
     const uint32_t live = pulsar_session_live_bank(s);
+    /* L380: a view a batch step on OTHER banks left valid (DeepSeek, pulsar_multiseq_step_stale) is the readers', not
+     * a resume's: the sync rebuilds, which re-establishes the bank and clears the mark, as after any batch step */
+    pulsar_session_dirty_view_drop(s);
     /* `common` and the seam are read before the agreement check: a view the state has moved past can no longer
      * be continued, but its prefix (and the live bytes it re-spells) still say which checkpoint the prompt shares */
     int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;

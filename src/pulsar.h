@@ -1461,8 +1461,12 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen);
  * with pulsar_engine_logits_width, never pulsar_engine_vocab_size.
  *
  * On success the session's single-bank bookkeeping is INVALIDATED -- the
- * checkpoint no longer describes any one bank, and a step that touched OTHER
- * banks leaves this session's per-bank carry needing re-establishment. The
+ * checkpoint no longer describes the installed bank once the step has moved
+ * it, and a step that touched OTHER banks leaves this session's per-bank
+ * carry needing re-establishment. (L380: a step that holds no row of the
+ * installed bank leaves that bank's history readable -- pulsar_session_bank_tokens
+ * / _bank_pos / pulsar_session_tokens keep naming it, on every family -- but
+ * not continuable: the entries below refuse and a sync rebuilds, as before.) The
  * caller owns per-bank histories and must re-establish state explicitly.
  * (This used to say the scalar frontier counters hold a cross-bank SUPERSET;
  * stage 1b deleted those scalars, so that particular shape is now

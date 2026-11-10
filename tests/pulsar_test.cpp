@@ -4201,6 +4201,66 @@ static void test_bank_carry_restore(void) {
     free(e);
 }
 
+/* L380: what a DeepSeek batch step leaves of the installed bank's view.  A step that holds no row of the installed
+ * bank leaves its history readable -- pulsar_bank_history serves the live view, as on the driver families -- while
+ * the per-bank truth is still to re-establish (mseq_dirty) and the speculation carry is dropped; a step that holds a
+ * row of it, or one that failed mid-sweep, drops the view as before.  A dirty view is the readers' only: the two
+ * places that would act on it (the sync's entry, a same-bank restore without a carry) drop it first
+ * (pulsar_session_dirty_view_drop).  Host only: the flags, the reader and the rule; the step itself is a GPU gate's. */
+static int test_mseq_bank_count(pulsar_session *) { return 3; }
+static uint32_t test_mseq_live_bank1(pulsar_session *) { return 1u; }
+static void test_multiseq_step_view(void) {
+    static pulsar_family fam{};
+    static pulsar_family_bank_ops bops{};
+    bops.count = test_mseq_bank_count;
+    bops.live = test_mseq_live_bank1;
+    fam.name = "L380 batch step view test";
+    fam.banks = &bops;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    for (int t : {5, 6, 7, 8}) token_vec_push(&s->checkpoint, t);
+    const uint32_t live = 1u;
+    const pulsar_multiseq_req others[2] = { {0u, TokPos{10}, 1}, {2u, TokPos{20}, 2} };
+    const pulsar_multiseq_req with_live[2] = { {0u, TokPos{10}, 1}, {1u, TokPos{4}, 2} };
+    auto arm = [&]() {
+        s->checkpoint_valid = true;
+        s->mseq_dirty = false;
+        s->spec.spec_carry_valid = true;
+    };
+    /* the other banks step: the installed bank still reads its history; nothing may continue it */
+    arm();
+    pulsar_multiseq_step_stale(s, others, 2u, live, true);
+    TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
+    TEST_ASSERT(pulsar_bank_history(s, live) == &s->checkpoint && pulsar_bank_history(s, live)->len == 4);
+    /* ... and a sync or a carry-less restore of it drops the view before acting, as when the step dropped it */
+    pulsar_session_dirty_view_drop(s);
+    TEST_ASSERT(!s->checkpoint_valid && pulsar_bank_history(s, live) == NULL);
+    /* a clean view is not dropped */
+    arm();
+    pulsar_session_dirty_view_drop(s);
+    TEST_ASSERT(s->checkpoint_valid);
+    /* a row of the installed bank moved its KV past the view: no history */
+    pulsar_multiseq_step_stale(s, with_live, 2u, live, true);
+    TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
+    TEST_ASSERT(pulsar_bank_history(s, live) == NULL);
+    /* the last row alone decides too, and a one-row step of another bank does not */
+    arm();
+    pulsar_multiseq_step_stale(s, with_live + 1, 1u, live, true);
+    TEST_ASSERT(!s->checkpoint_valid);
+    arm();
+    pulsar_multiseq_step_stale(s, others + 1, 1u, live, true);
+    TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty);
+    /* a sweep that failed leaves no bank's state known, whoever its rows were */
+    arm();
+    pulsar_multiseq_step_stale(s, others, 2u, live, false);
+    TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s);
+    free(e);
+}
+
 /* L375 O15: the live row's validity.  A view nothing wrote a row for has none -- a fresh session, a bank saved
  * without one, an invalidated bank -- and every reader of the row refuses there through the one gate (live_dev): the
  * draws, the logprobs, the host mirror.  A bank's saved row carries its own validity across a switch (a restore used
@@ -6162,6 +6222,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
+    {"--multiseq-view", "multiseq-view", "a DeepSeek batch step drops the installed bank's view only when it moved that bank (a row of it, or a failed sweep); a dirty view is read, never continued (L380)", test_multiseq_step_view},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
     {"--spec-round-refusals", "spec-round-refusals", "the round API's host-side refusals: no drafter, a bank at the context, a round that cannot be walked or handed back, each undone (L375)", test_spec_round_refusals},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},

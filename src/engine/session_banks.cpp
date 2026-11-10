@@ -160,6 +160,11 @@ static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
         }
     } else if (bank != held) {
         pulsar_bank_carry_fresh_view(s);
+    } else {
+        /* L380: the kept view of the bank the host was synced on, with no carry saved for it: after a batch step on
+         * other banks it is still valid, but the counters installed above are twins nothing captured -- not a state
+         * to continue; the next sync rebuilds, as when the step invalidated the view itself */
+        pulsar_session_dirty_view_drop(s);
     }
     s->mseq_dirty = false;
     return true;

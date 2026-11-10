@@ -3239,7 +3239,10 @@ struct pulsar_session {
      * does NOT cover this: pulsar_session_eval never reads it.  Set on every
      * decode_multiseq path that armed a step; cleared only where per-bank
      * device state is legitimately re-established (pulsar_session_sync's rebuild
-     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
+     * path, via gpu_graph_reset_prefill_state zeroing the counters).  L380: it
+     * can stand beside a VALID view -- the step held no row of the installed
+     * bank (pulsar_multiseq_step_stale) -- which the readers serve and nothing
+     * resumes from (pulsar_session_dirty_view_drop). */
     bool mseq_dirty;
     /** GPU bytes this session's create actually allocated (tensor-allocator
      * delta across pulsar_session_create); the server ledger commits this. */
@@ -4737,6 +4740,21 @@ void pulsar_bank_carry_fresh_view(pulsar_session *s);
 /// @param bank  the bank
 /// @return the history (borrowed), or NULL.
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
+/** L380: what an armed DeepSeek batch step (session_multiseq.cpp) leaves of the session's single-bank bookkeeping.
+ *  The view (checkpoint_valid) goes only when the step moved the installed bank -- a row of it -- or failed
+ *  mid-sweep; the per-bank truth is always to re-establish (mseq_dirty) and the speculation carry is dropped.
+ *  @param s      the session
+ *  @param reqs   [n_rows] the step's rows
+ *  @param n_rows rows
+ *  @param live   the installed bank
+ *  @param landed the step ran to its end (false: it failed mid-sweep) */
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+                                bool landed);
+/** L380: a view left valid across a batch step on other banks (pulsar_multiseq_step_stale) names the installed bank's
+ *  history for the readers, but nothing resumes from it while the per-bank truth is to re-establish: dropped here
+ *  (checkpoint_valid) when mseq_dirty is set, before the caller acts on it.
+ *  @param s the session */
+void pulsar_session_dirty_view_drop(pulsar_session *s);
 /** L334: pulsar_session_bank_pos's rule over what the pool knows: none() for a bank outside a pool of `n_banks`
  *  (refused by name, logged once) or one that holds no history (`history` NULL), else the history's length.
  *  @param bank the bank asked about
