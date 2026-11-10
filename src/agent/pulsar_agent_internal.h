@@ -217,10 +217,13 @@ bool agent_workspace_refuses(const char *path, char *err, size_t errlen);
  *  @param path the tool's path
  *  @return NULL when allowed, else the tool's error text (malloc'd; the caller returns it) */
 char *agent_workspace_refusal(const char *path);
-/** L354: overwrite in place the bytes a terminal would obey (ESC and the other controls but newline, tab and return; the
- *  UTF-8 form of the C1 controls) with '?', so model or tool text can't move the cursor or reach OSC 52.
- *  @param s the bytes  @param n how many */
-void agent_terminal_sanitize(char *s, size_t n);
+/** L354: rewrite in place the bytes a terminal would obey, so model or tool text can't move the cursor or reach OSC 52:
+ *  ESC and the other controls but newline and tab, and the UTF-8 form of the C1 controls, become '?'; a carriage
+ *  return is dropped unless a newline follows it in the same call (L373: a bare one overwrites the row), so a caller
+ *  that writes a byte at a time drops every one.
+ *  @param s the bytes  @param n how many
+ *  @return the bytes kept (<= n), at the front of `s` */
+size_t agent_terminal_sanitize(char *s, size_t n);
 
 /** Lifecycle state of the agent's single worker thread. Drives what the TUI
  * shows in the status line, so every long-running phase gets its own value
@@ -554,6 +557,7 @@ typedef struct {
     bool param_active;                  ///< inside a parameter value
     bool at_line_start;                 ///< the cursor is at column 0 of a fresh row
     bool last_output_newline;           ///< last byte emitted was '\n'
+    bool held_c2;                       ///< a 0xC2 byte waits for its second byte (a C1 control is sanitized whole)
 
     agent_tool_param_kind param_kind;   ///< how the current parameter is displayed
     char tool_name[64];                 ///< name of the tool being visualised

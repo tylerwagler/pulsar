@@ -811,14 +811,67 @@ static void test_agent_workspace_and_terminal(void) {
     snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
     AGENT_TEST_ASSERT(system(cmd) == 0);
     char t[] = "a\x1b[2Jb\n\tc\r\x07\x7f\xc2\x9b" "1m\xc3\xa9";
-    agent_terminal_sanitize(t, strlen(t));
-    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc\r????" "1m\xc3\xa9"));
+    t[agent_terminal_sanitize(t, strlen(t))] = '\0';
+    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc????" "1m\xc3\xa9"));
+    char cr[] = "x\r\ny\rz\r";   /* L373: a return stays only in front of its newline */
+    cr[agent_terminal_sanitize(cr, strlen(cr))] = '\0';
+    AGENT_TEST_ASSERT(!strcmp(cr, "x\r\nyz"));
+}
+
+/* L373: a tool call's name, parameter names and values are the model's text: nothing a terminal obeys (ESC, a bare
+ * CR, a C1 control split over two one-byte writes) reaches the UI from the call's display or the unknown-tool
+ * header, on the family path (JSON arguments) and the DSML path. */
+static void test_agent_tool_call_display_is_sanitized(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe */
+    const auto shown_clean = [&w](const char *must_show) {
+        AGENT_TEST_ASSERT(w.out != NULL && strstr(w.out, must_show) != NULL);
+        for (size_t i = 0; i < w.out_len; i++) {
+            const unsigned char c = (unsigned char)w.out[i];
+            AGENT_TEST_ASSERT(c != 0x1b && c != '\r' && c != 0x07);
+            AGENT_TEST_ASSERT(!(c == 0xc2 && i + 1 < w.out_len && (unsigned char)w.out[i + 1] < 0xa0));
+        }
+        w.out_len = 0;
+    };
+    for (int leg = 0; leg < 2; leg++) {
+        agent_token_renderer renderer = {.worker = &w, .last_output_newline = true};
+        agent_dsml_parser dsml = {.state = AGENT_DSML_SEARCH};
+        agent_stream_renderer stream = {.renderer = &renderer, .parser = &dsml};
+        if (leg == 0) {
+            agent_stream_family_call(&stream, "re\x1b[2Jad",
+                                     "{\"pa\\u001bth\": \"a\\u001b]52;c;eA==\\u0007b\\rc\\u009b" "0m.txt\", "
+                                     "\"content\": \"one\\rtwo\\u001b[1A\\r\\nthree\"}");
+            shown_clean("]52;c;eA==");
+        } else {
+            static const char text[] =
+                PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                PULSAR_PARAM_START " name=\"command\" string=\"true\">echo \x1b]52;c;eA==\x07 hi\rbye \xc2\x9b" "0m"
+                PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END;
+            for (const char *s = text; *s; s++) agent_stream_text(&stream, s, 1, false);
+            agent_stream_text(&stream, NULL, 0, true);
+            AGENT_TEST_ASSERT(dsml.state == AGENT_DSML_DONE);
+            shown_clean("]52;c;eA==");
+        }
+        renderer_finish(&renderer);
+        agent_dsml_parser_free(&dsml);
+        w.out_len = 0;
+    }
+    agent_tool_call call = {(char *)"no\x1b[2Jsuch\rtool", NULL, 0, 0};
+    char *res = agent_execute_tool_call_one(&w, &call);
+    AGENT_TEST_ASSERT(strstr(res, "unknown tool") != NULL);
+    free(res);
+    shown_clean("unknown tool");
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
 }
 
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
 
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
+    test_agent_tool_call_display_is_sanitized();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();

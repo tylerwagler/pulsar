@@ -412,16 +412,23 @@ void agent_wake_locked(agent_worker *w) {
 
 
 
-void agent_terminal_sanitize(char *s, size_t n) {
+size_t agent_terminal_sanitize(char *s, size_t n) {
+    size_t out = 0;
     for (size_t i = 0; i < n; i++) {
         const unsigned char c = (unsigned char)s[i];
-        if ((c < 0x20 && c != '\n' && c != '\t' && c != '\r') || c == 0x7f) {
-            s[i] = '?';
+        if (c == '\r') {
+            if (i + 1 < n && s[i + 1] == '\n') s[out++] = '\r';   /* a bare return would overwrite the row */
+        } else if ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7f) {
+            s[out++] = '?';
         } else if (c == 0xc2 && i + 1 < n && (unsigned char)s[i + 1] >= 0x80 && (unsigned char)s[i + 1] < 0xa0) {
-            s[i] = '?';
-            s[++i] = '?';
+            s[out++] = '?';
+            s[out++] = '?';
+            i++;
+        } else {
+            s[out++] = s[i];
         }
     }
+    return out;
 }
 
 void agent_publish_untrusted(agent_worker *w, const char *s, size_t n) {
@@ -430,8 +437,7 @@ void agent_publish_untrusted(agent_worker *w, const char *s, size_t n) {
     char *copy = n <= sizeof stack ? stack : (char *)malloc(n);
     if (!copy) return;   /* out of memory: nothing unsanitized goes out */
     memcpy(copy, s, n);
-    agent_terminal_sanitize(copy, n);
-    agent_publish(w, copy, n);
+    agent_publish(w, copy, agent_terminal_sanitize(copy, n));
     if (copy != stack) free(copy);
 }
 

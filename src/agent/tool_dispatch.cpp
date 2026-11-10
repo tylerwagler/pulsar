@@ -69,7 +69,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
-        agent_publish(w, header, strlen(header));
+        agent_publish_untrusted(w, header, strlen(header));   /* the name is the model's */
         agent_buf_puts(&result, "Tool error: unknown tool: ");
         agent_buf_puts(&result, call->name);
         agent_buf_puts(&result, "\n");
