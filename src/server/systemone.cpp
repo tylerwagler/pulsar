@@ -374,10 +374,12 @@ bool server_judge_step(server *s) {
     pulsar_session *pool = s->sess;
     pulsar_stall_mark("worker: systemone");
     char err_floor[320] = "";
-    /* L372 (O12 a): the judge's chunk obeys the per-chunk memory floor a chat prefill obeys, with the guard's spills
-     * as its relief; short of it the request is answered 503 with the retry hint.  Before anything is installed: the
-     * bank stays valid where it stands, and the next request resumes on it. */
-    if (!s->floor_admits_chunk(JUDGE_CHUNK_TOKENS, err_floor, sizeof err_floor)) {
+    /* L372 (O12 a): the judge's chunk obeys the per-chunk memory floor a chat prefill obeys, and its prompt the
+     * guard's KV budget a chat prompt's admission obeys (the judge bank's growth is resident KV like any bank's), each
+     * with the guard's spills as its relief; short of either the request is answered 503 with the retry hint.  Before
+     * anything is installed: the bank stays valid where it stands, and the next request resumes on it. */
+    if (!s->floor_admits_chunk(JUDGE_CHUNK_TOKENS, err_floor, sizeof err_floor) ||
+        !s->budget_admits_growth((uint32_t)J->bank, jb->prompts[jb->at].len, err_floor, sizeof err_floor)) {
         server_log(PULSAR_LOG_WARNING, "pulsar-server: /v1/systemone REFUSED (503): %s", err_floor);
         pop();
         jb->busy = true;

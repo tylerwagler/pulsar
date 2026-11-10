@@ -644,6 +644,20 @@ void server::gen_prefill_fail(session_slot *sl) {
     g->phase = GEN_DONE;
 }
 
+void server::live_bindings_settle(session_slot *sl) {
+    auto *s = this;
+    const gen_state *g = sl->gen;
+    /* the job moved nothing on the bank: its history is still the one the bindings were made on, and the owner's
+     * tool results must still find it (a memory refusal before the first chunk is retried, perhaps many times) */
+    if (!g->bank_written) return;
+    /* L372 (O23): a request that did not continue them has put its own rows there, and a binding matches by its call
+     * ids and the bank's position alone (live_state_matches_ids_locked): left valid, the owner's tool results could
+     * match where this prefill happened to stop.  gen_stream_begin's rule, which a prefill that ends early never
+     * reaches. */
+    if (!g->responses_live_continuation) s->responses_live_clear(sl);
+    if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
+}
+
 void server::gen_prefill_abandon(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -668,12 +682,7 @@ void server::gen_prefill_abandon(session_slot *sl) {
     /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
      * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
      * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
-    /* L372: the bank is kept, so the bindings on it must be true of it.  A request that did not continue them has
-     * written its own rows there, and a binding matches by its call ids and the bank's position alone
-     * (live_state_matches_ids_locked): left valid, the owner's tool results could match where this prefill happened
-     * to stop.  gen_stream_begin's rule, which an abandoned prefill never reaches. */
-    if (!g->responses_live_continuation) s->responses_live_clear(sl);
-    if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
+    s->live_bindings_settle(sl);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
     g->phase = GEN_DONE;
@@ -754,6 +763,8 @@ int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images,
 /// @param gr  the restore, already begun (kv_restore_begin)
 static void gen_restore_start(session_slot *sl, gen_restore *gr) {
     gen_state *g = sl->gen;
+    /* the request's chain replaces the bank's history; a spilled bank's own history coming back does not */
+    if (gr->kind == GEN_RESTORE_RESUME) g->bank_written = true;
     g->restore = gr;
     g->phase = GEN_RESTORE;
     sl->state = SLOT_PREFILLING;
@@ -892,6 +903,7 @@ bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
     job *j = g->j;
     char aerr[192] = "";
     const double t_a = server_now_sec();
+    g->bank_written = true;   /* adopted or, refused, invalidated: either way no longer the history it held */
     const pulsar_bank_adopt_result ad =
         pulsar_session_bank_adopt(s->sess, (uint32_t)src, &j->req.prompt, aerr, sizeof(aerr));
     if (ad.status == PULSAR_ADOPT_ADOPTED) {
@@ -1473,6 +1485,7 @@ void server::gen_step_prefill(session_slot *sl) {
     /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
      * share_mark cut too (the chunk after the cut is the next sync's first) */
     pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
+    g->bank_written = true;   /* the sync rewinds to its resume point and writes this prompt's rows */
     int rc;
     {
         const sync_hooks hooks(s->sess, gen_prefill_progress_cb, g, server_progress_cb, &g->progress,
@@ -2024,11 +2037,31 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 
 
+void gen_bank_install_failed(gen_state *g, uint32_t bank) {
+    /* The FIRST error wins: a slot already finishing on an error (a refused forward, a failed tensor-parallel step
+     * -- after which every bank switch refuses too) must report that cause, not this echo of it.  Overwriting it hid
+     * the pair's real refusal behind "bank 0 state restore failed" (L241); the quanta's entry loops and the batched
+     * round's begin still overwrote it (L372). */
+    if (!g->err[0])
+        snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)bank);
+    g->finish = "error";
+    g->phase = GEN_FINISH;
+}
+
 /// @param abandoned     the decode was abandoned (gen_state::abandoned)
 /// @param final_finish  the turn's finish label as the wire carries it
 /// @return the label the server's log lines and trace give the turn: "abandoned" for an abandoned decode
 static const char *gen_said_finish(bool abandoned, const char *final_finish) {
     return abandoned && strcmp(final_finish, "error") != 0 ? "abandoned" : final_finish;
+}
+
+/// @param abandoned     the decode was abandoned (gen_state::abandoned)
+/// @param final_finish  the turn's finish label as the wire carries it
+/// @return true when the turn is one the request histograms count (server::observe_request_timings): it ran to its
+///         own end.  An abandoned decode's times and token count are where the client left; a failed turn's are
+///         where it broke (L372) -- as a turn either would flatter the latency histograms and the finished count.
+static bool gen_turn_is_measured(bool abandoned, const char *final_finish) {
+    return !abandoned && strcmp(final_finish, "error") != 0;
 }
 
 /// @param abandoned     the decode was abandoned (gen_state::abandoned)
@@ -2127,9 +2160,8 @@ void server::gen_step_finish(session_slot *sl) {
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
-         * without scraping every response.  L372: not an abandoned decode's -- its end-to-end time and its token
-         * count are where the client left, not a turn's. */
-        if (!g->abandoned) s->observe_request_timings(t, finish_t - g->t0);
+         * without scraping every response.  L372: only a turn that ran to its own end (gen_turn_is_measured). */
+        if (gen_turn_is_measured(g->abandoned, final_finish)) s->observe_request_timings(t, finish_t - g->t0);
     }
     /* L324: the pool's duplicate-prefix census at each request's end (host carries only, off the decode path) */
     s->kv_dup_census_update();
@@ -2477,14 +2509,8 @@ void server::generate_job_step(session_slot *sl) {
      * mode / when already live. Finding 1: fail the request on a failed spill
      * restore rather than run engine work against the wrong bank's KV. */
     if (!s->bank_switch(sl->bank)) {
-        /* The FIRST error wins: a slot already finishing on an error (a
-         * refused forward, a failed tensor-parallel step -- after which every
-         * bank switch refuses too) must report that cause, not this echo of
-         * it.  Overwriting it here hid the pair's real refusal behind "bank 0
-         * state restore failed" (L241). */
-        if (!g->err[0])
-            snprintf(g->err, sizeof g->err,
-                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        const bool finishing = g->phase == GEN_FINISH;
+        gen_bank_install_failed(g, sl->bank);
         if (!g->parser_st) {
             /* L372: before its first decode attempt (GEN_RESTORE, a prefill phase, GEN_DECODE_INIT) the job has no
              * parser, and gen_step_finish reads the turn through it -- GEN_FINISH from here was a NULL call on the
@@ -2492,17 +2518,12 @@ void server::generate_job_step(session_slot *sl) {
             s->gen_prefill_fail(sl);
             return;
         }
-        g->finish = "error";
-        if (g->phase == GEN_FINISH) {
-            /* Already finishing and the restore STILL fails: run the finish
-             * step anyway — the error epilogue answers the client without
-             * engine work. Returning here re-steps the slot forever (finish
-             * never runs, GEN_DONE never set, slot never freed, client never
-             * answered). */
-            s->gen_step_finish(sl);
-            return;
-        }
-        g->phase = GEN_FINISH;
+        /* Already finishing and the restore STILL fails: run the finish
+         * step anyway — the error epilogue answers the client without
+         * engine work. Returning here re-steps the slot forever (finish
+         * never runs, GEN_DONE never set, slot never freed, client never
+         * answered). */
+        if (finishing) s->gen_step_finish(sl);
         return;
     }
     /* Tier-2: a slot leaving the batched lane (now at GEN_FINISH) has its bank

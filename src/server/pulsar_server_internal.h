@@ -3032,6 +3032,11 @@ struct server {
      * (a Stop and re-send, a client timeout) resumes there instead of re-prefilling it; then gen_prefill_fail. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_prefill_abandon(session_slot *sl);
+    /** L372 (O23): the slot's live tool bindings after a prefill that ended early with its bank kept (the client
+     *  hung up; the memory floor refused the next chunk).  A job that moved nothing on the bank (gen_state::bank_written
+     *  unset) leaves them; otherwise each binding the request did not continue is cleared. */
+    /// @param sl the slot whose job this is (its gen_state)
+    void live_bindings_settle(session_slot *sl);
     /** 2026-10-29: may this prefill quantum start?  MemAvailable must cover one chunk's new KV over the floor; short
      *  of it the guard's remedies run first (spill an idle bank, preempt the newest decoder: server_prefill_mem_step).
      *  false = the request was refused (503) and its gen is done -- the bank keeps what it prefilled. */
@@ -3046,6 +3051,16 @@ struct server {
     /// @param errlen     its size
     /// @return true when the chunk may run; false = the floor still stands (the caller answers 503)
     bool floor_admits_chunk(int rows, char *err, size_t errlen);
+    /** L372 (O12): the guard's KV budget for a prefill that is no slot's -- the judge's.  The bank's growth to
+     *  `end_rows` tokens must fit the budget beside the resident KV and the admitted prompts' reservations (the
+     *  prompt admission's arithmetic, server_prompt_kv_verdict); short of it the idle chat banks the plan names are
+     *  spilled.  No decoder is preempted and no busy bank is waited for. */
+    /// @param bank       the bank that grows (the judge's)
+    /// @param end_rows   the tokens it will hold (the prompt's length)
+    /// @param err        receives the refusal (the numbers, and how many banks were spilled)
+    /// @param errlen     its size
+    /// @return true when the prefill may run; false = the budget still stands (the caller answers 503)
+    bool budget_admits_growth(uint32_t bank, int end_rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -3419,7 +3434,8 @@ struct server {
      */
     void publish_metrics_snapshot();
     /** Fold one finished request's timings into the /metrics histograms. Called by
-     * the worker from generate_job_end, where req_timings has just been computed;
+     * the worker from gen_step_finish, where req_timings has just been computed, for a
+     * turn that ran to its own end (never an abandoned or a failed one, L372);
      * this only reads that struct, so it adds no hot-path work.
      */
     /// @param t      the request's timings (ignored unless t->valid)
@@ -4037,6 +4053,10 @@ struct gen_state {
 
     /* prefill quantum policy (see gen_prefill_cancel_cb) */
     uint32_t prefill_min_suffix;  ///< 0 = interrupting is never exact
+    /** This job has moved the bank's rows: it adopted another bank's state, began loading a chain for its prompt, or
+     *  issued a sync.  Until then the bank holds the history its live tool bindings were made on
+     *  (server::live_bindings_settle). */
+    bool bank_written;
     int prefill_chunks_done;  ///< chunks completed in the current sync call
     int prefill_last_current;  ///< last `current` the progress callback reported
     int prefill_total;         ///< rows this prefill will evaluate in total
@@ -4915,6 +4935,12 @@ const uint32_t *gen_constrain_base_mask(struct server *s, struct gen_state *g);
 
 bool request_exceeds_context(const request *r, int ctx_size);
 bool gen_client_disconnected(int fd);
+/** A decoding job whose bank could not be installed (server::bank_switch refused): it finishes on an error -- the one
+ *  statement of it for generate_job_step, batch_leave, the three quanta's entry and the batched round's begin.  An
+ *  error the job already carries is kept: the first cause is the one the client reads.
+ *  @param g    the job's state; its err (when empty), finish and phase are set
+ *  @param bank the bank, for the message */
+void gen_bank_install_failed(gen_state *g, uint32_t bank);
 bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,

@@ -1847,8 +1847,9 @@ void server::publish_metrics_snapshot() {
 
 
 /* Fold one finished request's timings into the /metrics histograms. Called by
- * the worker from generate_job_end, where req_timings has just been computed;
- * this only reads that struct, so it adds no hot-path work. */
+ * the worker from gen_step_finish, where req_timings has just been computed, for
+ * a turn that ran to its own end (gen_turn_is_measured: never an abandoned or a
+ * failed one); this only reads that struct, so it adds no hot-path work. */
 void server::observe_request_timings(const req_timings *t, double e2e_s) {
     auto *s = this;
     if (!t->valid) return;
@@ -2839,10 +2840,23 @@ bool server::worker_readmit_preempted() {
          * resident bank: park_bank reads residency, and a later spill or preemption would park the pool on it -- a
          * view (the parked history, its carry) over rows it no longer holds.  Excluding a preempted bank in park_bank
          * instead would undo L362: the spills below park on it by design.  Where one of them did, the pool stands on
-         * it and it cannot be freed (free_physical refuses the installed bank): it stays, no step runs on that view
-         * (bank_switch refuses a preempted bank), and the next pass picks up from there. */
+         * it and it cannot be freed (free_physical refuses the installed bank): the pool moves to another resident
+         * bank first when there is one (O26).  With none -- the bank is the pool's only resident one, and the pool
+         * must stand somewhere -- it stays re-backed, installed and empty under the parked history until the next
+         * pass, and nothing steps on that view: a slot's own step installs its bank through bank_switch, which
+         * refuses a preempted bank; the plain and mixed batches' rows are slots that passed bank_switch at their
+         * entry, and a preemption takes its decoder out of the batch first (batch_leave); the batched rounds' rows
+         * are refused by name at their assemble (worker_spec_batched_quantum, "parked under a decode step"). */
         auto give_up = [&]() {
-            if (rebacked && s->live_bank != (int)v->bank) (void)pulsar_session_bank_free_physical(pool, v->bank);
+            if (!rebacked) return false;
+            if (s->live_bank == (int)v->bank) {
+                const int park = s->park_bank((int)v->bank);
+                if (park >= 0 && pulsar_session_bank_state_restore(pool, (uint32_t)park)) {
+                    s->live_bank = park;
+                    s->slots[park].committed_pos = pulsar_session_pos(pool);
+                }
+            }
+            if (s->live_bank != (int)v->bank) (void)pulsar_session_bank_free_physical(pool, v->bank);
             return false;
         };
         for (int k = 0; k < n_spill; k++) {
@@ -3205,6 +3219,47 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
     return false;
 }
 
+bool server::budget_admits_growth(uint32_t bank, int end_rows, char *err, size_t errlen) {
+    auto *s = this;
+    /* no guard, no chat pool, or a host-only server (no session to price a row by): no budget to hold */
+    if (!s->guard_enabled || s->pool_banks <= 0 || !s->sess) return true;
+    pulsar_session *pool = s->sess;
+    const KvBytes want = pulsar_session_quantum_growth_bytes_per_bank(pool, KvRows{(uint32_t)(end_rows > 0 ? end_rows : 0)});
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    KvBytes need{}, base{};
+    int spilled = 0;
+    for (int round = 0; round < 2; round++) {
+        /* the prompt's admission arithmetic (server_prompt_kv_verdict), on the bank's own growth: what it holds is
+         * already in the resident sum.  No busy bank is waited for: the answer short of room is the retry hint. */
+        const KvBytes have = pulsar_session_bank_touched_kv_bytes(pool, bank);
+        need = want > have ? want - have : KvBytes{};
+        base = s->kv_reserved_bytes(NULL);
+        int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
+        KvBytes drop[PULSAR_SESSION_POOL_CAP];
+        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop);
+        const prompt_kv_verdict v = server_prompt_kv_verdict(base, need, s->guard_budget(), drop, n_victims,
+                                                             /*busy_may_free=*/false, &n_spill);
+        if (v == PROMPT_KV_FITS) return true;
+        if (v != PROMPT_KV_SPILL || round > 0) break;   /* a spill that failed leaves the breach: decided once more */
+        server_log(PULSAR_LOG_DEFAULT,
+                   "pulsar-server: kv admission: bank %u's prompt of %d tokens adds %.2f GiB of KV (resident %.2f + "
+                   "%.2f > budget %.2f GiB): spilling %d idle bank(s) first",
+                   bank, end_rows, (double)need.raw() / gib, (double)base.raw() / gib, (double)need.raw() / gib,
+                   (double)s->guard_budget().raw() / gib, n_spill);
+        for (int k = 0; k < n_spill; k++) {
+            if (!s->spill_bank(&s->slots[order[k]])) break;
+            s->count_metric(&s->m_spills);
+            spilled++;
+        }
+    }
+    snprintf(err, errlen,
+             "not enough KV memory for this prompt now: its %d tokens need %.2f GiB of KV beside %.2f GiB the server "
+             "keeps resident (budget %.2f GiB), after %d spill(s); retry later",
+             end_rows, (double)need.raw() / gib, (double)base.raw() / gib, (double)s->guard_budget().raw() / gib,
+             spilled);
+    return false;
+}
+
 bool server::prefill_headroom_ok(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -3260,6 +3315,8 @@ bool server::prefill_headroom_ok(session_slot *sl) {
                    "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank,
                    server_bank_pos(s->sess, (uint32_t)sl->bank).raw(), g->prompt_tokens, why, spilled,
                    preempt_tried ? " and a preemption try" : "", g->err, skipped);
+    /* the bank is kept: the bindings on it stay only while they are still true of it (L372 O23) */
+    s->live_bindings_settle(sl);
     s->trace_event(g->trace_id, "prefill refused: %s", g->err);
     if (g->j->req.stream && g->progress.headers_sent) {
         if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, 503, g->err);
@@ -3556,11 +3613,8 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         /* Finding 1: a failed spill restore must NOT sample this slot's feed token
          * on another bank's KV — fail the slot cleanly and drop it from the batch. */
         if (!s->bank_switch(sl->bank)) {
-            snprintf(g->err, sizeof g->err,
-                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-            g->finish = "error";
+            gen_bank_install_failed(g, sl->bank);
             g->batch_feed_valid = false;
-            g->phase = GEN_FINISH;
             continue;
         }
         float temp, top_p, min_p; int top_k;
@@ -4101,6 +4155,16 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
                 continue;
             }
+            /* L372 (O26): nor is a parked (preempted) decoder ever in a quantum's set (slot_is_batchable_decode), and
+             * this lane's rows are installed by the engine's own bank restore, not bank_switch -- which would take a
+             * parked bank a failed readmission pass left re-backed (worker_readmit_preempted): the parked history
+             * over empty rows.  Refused by name. */
+            if (sl->preempted) {
+                snprintf(g->err, sizeof g->err, "bank %u is parked under a decode step", (unsigned)sl->bank);
+                g->finish = "error";
+                g->phase = GEN_FINISH;
+                continue;
+            }
             if (!rounds[i]) rounds[i] = pulsar_spec_round_new();
             pulsar_spec_step *st = &steps[ns];
             memset(st, 0, sizeof(*st));
@@ -4177,11 +4241,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 g->phase = GEN_FINISH;
                 break;
             case PULSAR_SPEC_STEP_RESTORE_FAILED:
-                snprintf(g->err, sizeof g->err,
-                         "bank %u state restore failed (evicted KV unrecoverable)",
-                         (unsigned)sl->bank);
-                g->finish = "error";
-                g->phase = GEN_FINISH;
+                gen_bank_install_failed(g, sl->bank);
                 break;
             default:
                 if (st->first_token < 0) snprintf(g->err, sizeof g->err, "%s", st->err);
@@ -4635,12 +4695,7 @@ bool server::batch_leave(session_slot *sl) {
     gen_state *g = sl->gen;
     pulsar_session *pool = s->sess;
     if (!s->bank_switch(sl->bank)) {
-        /* the first error wins (generate_job_step's rule, L241): a slot already failing reports that cause */
-        if (!g->err[0])
-            snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
-                     (unsigned)sl->bank);
-        g->finish = "error";
-        g->phase = GEN_FINISH;
+        gen_bank_install_failed(g, sl->bank);
         return false;
     }
     if (g->batch_pending.len > 0)
@@ -4826,9 +4881,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         gen_state *g = sl->gen;
         if (g->batch_feed_valid) continue;
         if (!s->bank_switch(sl->bank)) {
-            snprintf(g->err, sizeof g->err,
-                     "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
-            g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
+            gen_bank_install_failed(g, sl->bank);
+            g->batch_feed_valid = false;
             continue;
         }
         float temp, top_p, min_p; int top_k;
