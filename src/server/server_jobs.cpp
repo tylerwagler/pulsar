@@ -577,9 +577,8 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
  * full teardown/RST).  The deliberate trade: a client that half-closes its write
  * side while still reading the response would be treated as gone.  HTTP clients
  * do not do that while awaiting a response, and the same assumption is standard
- * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
- * run-to-completion behavior without a rebuild if some client ever misbehaves.
- * The env is read ONCE (project rule: no per-token getenv). */
+ * in production servers.  There is no switch for it (this comment named a
+ * PULSAR_ABORT_ON_DISCONNECT that nothing reads). */
 /// @param fd  the client socket (< 0: never disconnected)
 /// @return true when the peer has closed or half-closed (POLLRDHUP) or the socket errored; a non-blocking poll
 bool gen_client_disconnected(int fd) {
