@@ -1315,6 +1315,19 @@ static int spec_round_end_walked(pulsar_session *s, pulsar_spec_round *r,
                           forced_truth, accepted, accepted_cap, err, errlen);
 }
 
+/* L375 O37: a round round_begin has run on -- its base and drafts pushed onto the view (n_batch counts them; a round
+ * never begun holds none and there is nothing of it to undo). */
+/// @param r the round, or NULL
+/// @return true when the round was begun
+static bool spec_round_begun(const pulsar_spec_round *r) { return r && r->n_batch > 0u; }
+
+/* ... and its undo for an end that never reaches spec_round_end (which undoes its own failures): the abort. */
+/// @param s the session (the round's bank installed)
+/// @param r the round, or NULL
+static void spec_round_undo_begun(pulsar_session *s, pulsar_spec_round *r) {
+    if (spec_round_begun(r)) pulsar_session_spec_round_abort_local(s, r);
+}
+
 /* One round against the last shared forward's rows [row0, row0 + n_batch): its walk, then its end.  A round that does
  * not reach spec_round_end (which undoes its own failures) is undone here (L375 O37): its base and drafts leave the
  * view, the target's snapshot goes back, and the view is no position's. */
@@ -1329,14 +1342,14 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
     if (spec_no_drafter(s, "spec round end", err, errlen)) return -1;   /* no round can have begun */
     if (temperature > 0.0f && !rng) {
         snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
-        pulsar_session_spec_round_abort_local(s, r);
+        spec_round_undo_begun(s, r);
         return -1;
     }
     const spec_walk_round w = {r, row0, temperature, top_k, top_p, min_p, greedy_rows, rng ? *rng : 0u,
                                 masks, mask_rows};
     pulsar_gpu_spec_walk_out wv;
     if (!spec_walk_rounds(s, &w, 1, &wv, err, errlen)) {
-        pulsar_session_spec_round_abort_local(s, r);
+        spec_round_undo_begun(s, r);
         return -1;
     }
     return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, greedy_rows, masks, mask_rows,
@@ -1355,7 +1368,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
     if (!truth) {
         snprintf(err, errlen, "spec round_end_forced: no truth");
-        pulsar_session_spec_round_abort_local(s, r);   /* L375 O37: the round is undone, as on every failed end */
+        spec_round_undo_begun(s, r);   /* L375 O37: the round is undone, as on every failed end */
         return -1;
     }
     return spec_round_end_walked(s, r, first_token, temperature, top_k, top_p, min_p, 0u, NULL, 0u, rng, NULL, row0,
@@ -1547,7 +1560,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         spec_step_reset(st);
         st->pos_before = TokPos{pulsar_spec_round_saved_len(st->round)};
         st->pos_after = TokPos::none();   /* until the round ends */
-        const bool begun = st->round && st->round->n_batch > 0u;   /* round_begin pushed its rows onto the view */
+        const bool begun = spec_round_begun(st->round);
         if (!spec_bank_restore(s, st->bank)) {
             /* L375 O37: the bank cannot be installed to undo its round, so its saved view -- which still holds the
              * round's base and unverified drafts -- names no position */
@@ -1560,7 +1573,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             snprintf(st->err, sizeof st->err, "%s", walked ? "spec round: the step's walk did not carry this round"
                                                            : werr);
             /* L375 O37: a round that never reaches spec_round_end is undone here (round_end undoes its own failures) */
-            if (begun) pulsar_session_spec_round_abort_local(s, st->round);
+            spec_round_undo_begun(s, st->round);
         } else
             na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
