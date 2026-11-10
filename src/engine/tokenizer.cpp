@@ -1543,7 +1543,8 @@ static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_token
 /// pulsar_family_tokenizer::encode_rendered for DeepSeek.
 /// @param e       the engine
 /// @param text    the rendered text
-/// @param spans   [n_spans] the trusted spans, or NULL (the whole text is rendered chat)
+/// @param spans   [n_spans] the client-text byte ranges -- plain text: no control token is matched inside one, or
+///                completed by one (L223, L375) -- or NULL (the whole text is the renderer's)
 /// @param n_spans spans
 /// @param out     receives the tokens
 static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,

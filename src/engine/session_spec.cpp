@@ -443,30 +443,13 @@ void spec_lookahead_reset(pulsar_session *s) {
     spec_quench_reset(s);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-/* Fused DSpark loop (P2, PULSAR_DSPARK_FUSED=1): ONE batched target forward per
- * step instead of Step-1 decode + separate verify. The forward runs over
- * [first_token, pending_drafts...] (drafts made LAST step -- EAGLE pipeline
- * inversion), so position 0 is the base decode, positions 1..K verify the
- * drafts, and the batched anchor-hidden capture gives the drafter its
- * conditioning at whatever position ends up last-accepted. Drafting for the
- * NEXT step then conditions on the hidden that PRODUCED the next base token
- * (matching the reference generate.py forward_spec dataflow; the deleted
- * per-round loop conditioned on the hidden AFTER re-evaluating the base token
- * -- a one-position train/inference mismatch this path removed).
- * Greedy-only (generate.cpp gates on temperature<=0).
- * Partial/zero accepts restore the frontier and replay the committed prefix
- * (Stage A; the Stage-B transactional state removes the replay). */
+/* The round, for every drafter and every family: ONE batched target forward per step.  The forward runs over
+ * [first_token, pending_drafts...] (drafts made LAST step -- EAGLE pipeline inversion), so row 0 is the base decode,
+ * rows 1..K verify the drafts, and the forward's per-row captures give the drafter its conditioning at whatever row
+ * ends up last-accepted.  Drafting for the NEXT step then conditions on the hidden that PRODUCED the next base token
+ * (the reference generate.py forward_spec dataflow).  Greedy and sampled requests take the same round (the walk
+ * below); a partial or zero accept leaves the target's state at the last accepted row through the family's commit
+ * (pulsar_spec_target_ops::commit: no row is replayed). */
 
 /* The accept walk (L288 sdet's rule, L302: on the device).  The target draws its own token at every verified row --
  * greedy: the row's argmax; sampled: THE sampler's draw at that token's own key, pulsar_sample_key at its index in

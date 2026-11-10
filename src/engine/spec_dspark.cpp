@@ -880,9 +880,9 @@ static const pulsar_spec_depth_policy k_dspark_depth = {2, 5, 0.70f, 5, 0.90f, 8
  * 31.34 / 30.00 / 31.44; 0.25: 31.08 / 29.97 / 30.61).  The 2026-07-17 sweep under the old rule: tau barely
  * moves GREEDY throughput at depth 3, but clearly wins under T = 1.0 SAMPLING (+25% structured, +10% prose vs
  * verify-all), where the low-confidence tail is real.  The stop is a SCHEDULE knob: it decides which drafts
- * are verified, never a verified row's numerics (verify rows are decode rows; cuda-mixed-neutrality-gate
- * GATE 5/5R) -- a named exception in docs/ENGINEERING-RULES.md; tools/confhead sets --spec-tau off to collect
- * unbiased labels. */
+ * are verified, never a verified row's numerics (verify rows are decode rows; session-contract-gate B6 / F1,
+ * which replaced cuda-mixed-neutrality-gate with L357) -- a named exception in docs/ENGINEERING-RULES.md;
+ * tools/confhead sets --spec-tau off to collect unbiased labels. */
 const pulsar_drafter_ops k_dspark_drafter = {
     /* .name          = */ "DSpark",
     /* .depth         = */ 3u,

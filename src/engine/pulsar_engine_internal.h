@@ -1523,7 +1523,7 @@ typedef struct {
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
     pulsar_gpu_tensor *attn_comp_stage;  ///< staging the attention compressor writes through
-    /** f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
+    /** f32 staging for the packed (MXKV-FP4) indexer cache: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
      * the QAT+pack step stores them MXKV-FP4-packed into the persistent
      * layer_index_comp_cache.  Also reused for session-save dequant and
