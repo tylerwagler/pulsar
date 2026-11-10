@@ -1147,6 +1147,10 @@ int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap);
 /** @param s the session
  *  @return the persistable end; 0 without a valid checkpoint */
 TokPos pulsar_session_persist_end(pulsar_session *s);
+/// Most image blocks one KV records (the engine's pulsar_image_identity), and so the most content hashes a span of
+/// it has: the one size for every hash array a caller of pulsar_session_span_image_hashes holds (L375: the store's and
+/// the server's arrays each restated it as 64).
+#define PULSAR_IMAGE_BLOCKS_MAX 64
 /** L353: the content hashes of the image blocks inside [G_prev, G), in position order: what a segment's key covers.
  *  @param s the session
  *  @param G_prev the span's start

@@ -106,8 +106,8 @@ int main(int argc, char **argv) {
         }
     }
     const bool m1_same = memcmp(y.data(), y1.data(), y.size() * 4) == 0;
-    printf("exl3_dense_xcheck: %d -> %d K=%g M=%d splits %d: vs host authority max rel %.3e, rel Frobenius %.3e; "
-           "rows alone (M=1) %s\n", K, N, k2 / 2.0, M, ds4_exl3_dense_splits(K, N), mx, sqrt(num / den),
+    printf("exl3_dense_xcheck: %d -> %d K=%g M=%d: vs host authority max rel %.3e, rel Frobenius %.3e; "
+           "rows alone (M=1) %s\n", K, N, k2 / 2.0, M, mx, sqrt(num / den),
            m1_same ? "bit-identical to the M-row run" : "DIFFER from the M-row run");
     spill(dir + "/y_pulsar.bin", y.data(), y.size() * 4);
     spill(dir + "/y_pulsar_m1.bin", y1.data(), y1.size() * 4);

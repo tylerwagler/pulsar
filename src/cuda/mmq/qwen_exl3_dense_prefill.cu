@@ -157,13 +157,37 @@ dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ tail, con
 }
 
 /* The arm's device scratch (W_q, the plane, the row scales, the tail), grown to the largest call; never freed.  ONE
- * PER DEVICE (L335: it was one process-wide buffer -- a TP rank on device 1 was handed device 0's memory), and a
- * regrow invalidates the captured graphs (pulsar_gpu_seg_note_device_free: a graph that baked the old pointer would
- * replay into freed memory) and refuses inside a capture (a free / malloc cannot be recorded). */
-/// Per device: the scratch base.
-uint8_t *g_scratch[PULSAR_CUDA_DEVICE_SLOTS] = {};
-/// Per device: its bytes.
-size_t g_scratch_bytes[PULSAR_CUDA_DEVICE_SLOTS] = {};
+ * PER (DEVICE, STREAM).  Per device since L335 (it was one process-wide buffer -- a TP rank on device 1 was handed
+ * device 0's memory); per stream since L375 (O60): launches on two streams of one device run concurrently -- a
+ * riding shared expert's on its lane's stream (exl3_moe_shared_fork) beside the block's on the caller's -- and one
+ * buffer would have the second launch's decode overwrite the W_q the first one's GEMM is still reading.  A regrow
+ * invalidates the captured graphs (pulsar_gpu_seg_note_device_free: a graph that baked the old pointer would replay
+ * into freed memory) and refuses inside a capture (a free / malloc cannot be recorded). */
+/// Streams of one device that may hold a scratch (the caller's and its lanes'; past it a launch refuses).
+constexpr int kScratchStreams = 8;
+/// One (device, stream)'s scratch.
+struct stream_scratch {
+    cudaStream_t stream;   ///< the launch stream it serves (0: the per-thread default, as the caller names it)
+    uint8_t *base;         ///< the scratch, or nullptr before its first call
+    size_t bytes;          ///< its bytes
+};
+/// Per device: its streams' scratches, [0, g_scratch_n[dev]) in use.
+stream_scratch g_scratch[PULSAR_CUDA_DEVICE_SLOTS][kScratchStreams] = {};
+/// Per device: entries of g_scratch in use.
+int g_scratch_n[PULSAR_CUDA_DEVICE_SLOTS] = {};
+
+/// @param dev     the device's slot (pulsar_cuda_device_slot)
+/// @param stream  the launch stream
+/// @return        the (device, stream)'s scratch entry, made on first use; nullptr when the device's
+///                kScratchStreams are taken by other streams
+stream_scratch *scratch_for(int dev, cudaStream_t stream) {
+    for (int i = 0; i < g_scratch_n[dev]; ++i)
+        if (g_scratch[dev][i].stream == stream) return &g_scratch[dev][i];
+    if (g_scratch_n[dev] == kScratchStreams) return nullptr;
+    stream_scratch *e = &g_scratch[dev][g_scratch_n[dev]++];
+    *e = stream_scratch{stream, nullptr, 0};
+    return e;
+}
 
 /// @param b  bytes
 /// @return   b rounded up to a multiple of 256
@@ -185,28 +209,34 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
     const size_t need = wq_b + pl_b + up256((size_t)M * sizeof(float)) + tail_b;
     const int dev = pulsar_cuda_device_slot();
     if (dev < 0) return -1;
-    if (need > g_scratch_bytes[dev]) {
+    stream_scratch *const sc = scratch_for(dev, stream);
+    if (!sc) {
+        fprintf(stderr, "%s: %d streams of this device already hold the arm's scratch; a ninth has none -- refusing\n",
+                tag, kScratchStreams);
+        return -1;
+    }
+    if (need > sc->bytes) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
             (void)cudaGetLastError();
             fprintf(stderr, "%s: the scratch must grow to %zu bytes inside a graph capture -- refusing\n", tag, need);
             return -1;
         }
-        if (g_scratch[dev]) {
+        if (sc->base) {
             pulsar_gpu_seg_note_device_free("the qwen exl3 dense prefill scratch");   /* graphs that baked the old scratch die with it */
-            (void)cudaFree(g_scratch[dev]);
+            (void)cudaFree(sc->base);
         }
-        g_scratch[dev] = nullptr;
-        g_scratch_bytes[dev] = 0;
-        if (cudaMalloc(&g_scratch[dev], need) != cudaSuccess) {
+        sc->base = nullptr;
+        sc->bytes = 0;
+        if (cudaMalloc(&sc->base, need) != cudaSuccess) {
             (void)cudaGetLastError();
-            g_scratch[dev] = nullptr;
+            sc->base = nullptr;
             fprintf(stderr, "%s: scratch of %zu bytes refused -- refusing\n", tag, need);
             return -1;
         }
-        g_scratch_bytes[dev] = need;
+        sc->bytes = need;
     }
-    uint8_t *const scr = g_scratch[dev];
+    uint8_t *const scr = sc->base;
     __half *wq = reinterpret_cast<__half *>(scr);
     __half *xhi = reinterpret_cast<__half *>(scr + wq_b);
     float *inv = reinterpret_cast<float *>(scr + wq_b + pl_b);

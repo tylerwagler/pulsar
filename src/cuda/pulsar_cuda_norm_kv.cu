@@ -709,11 +709,16 @@ __global__ static void indexer_rope_hadamard_fp4_pack_q_kernel(
 int pulsar_gpu_rms_norm_plain_rows_tensor(pulsar_gpu_tensor *out, void *out_b, const pulsar_gpu_tensor *x, uint32_t n, uint32_t rows, float eps,
                                           int skip_f32) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE) return 0;   /* x is an HC residual carrier */
+        x->bytes < (uint64_t)n * rows * PULSAR_HC_ELT_SIZE)   /* x is an HC residual carrier */
+        return cuda_refuse("pulsar_gpu_rms_norm_plain_rows_tensor", "a NULL operand, or %u rows of %u do not fit out "
+                           "(%llu bytes) or the HC carrier x (%llu bytes)", rows, n,
+                           (unsigned long long)(out ? out->bytes : 0), (unsigned long long)(x ? x->bytes : 0));
     /* L157: the f32 rows may be skipped only when the bf16 copy replaces them;
      * a skip with nothing to read instead would leave the consumer converting
      * unwritten bytes, which the bf16 core refuses loudly -- refuse it here too. */
-    if (skip_f32 && !out_b) return 0;
+    if (skip_f32 && !out_b)
+        return cuda_refuse("pulsar_gpu_rms_norm_plain_rows_tensor", "the f32 rows are skipped with no bf16 plane to "
+                           "read instead (%u rows of %u)", rows, n);
     /* The F16 destination that used to sit here went out with the last F16
      * weight (2026-08-16) -- every caller passed NULL, so it could never fire.
      * `out_b` is its BF16 successor and is NOT the same thing: the consumer
@@ -737,9 +742,15 @@ int pulsar_gpu_rms_norm_weight_mx_tensor(pulsar_gpu_tensor *out, const pulsar_gp
     if ((!out && !out_q && !out_b) || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
         (out && out->bytes < (uint64_t)n * sizeof(float)) ||
-        x->bytes < (uint64_t)n * sizeof(float)) return 0;
+        x->bytes < (uint64_t)n * sizeof(float))
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_mx_tensor", "no output plane, a NULL operand, a weight (%llu "
+                           "bytes at %llu) past the mapping's %llu bytes, or a row of %u that does not fit out / x "
+                           "(x %llu bytes)", (unsigned long long)w_bytes, (unsigned long long)weight_offset,
+                           (unsigned long long)model_size, n, (unsigned long long)(x ? x->bytes : 0));
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
-    if (!w) return 0;
+    if (!w)
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_mx_tensor", "no device copy of the %llu-byte norm weight at "
+                           "offset %llu", (unsigned long long)w_bytes, (unsigned long long)weight_offset);
     /* FAIL LOUD, not skip: the caller arms the activation cache off the same
      * slot pointer, so a silently skipped emission leaves the GEMM reading a
      * memset-zero E4M3 buffer -- a well-formed WRONG answer. */
@@ -769,9 +780,16 @@ int pulsar_gpu_rms_norm_weight_rows_tensor(pulsar_gpu_tensor *out, const pulsar_
     if (!out || !x || !model_map || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
         out->bytes < (uint64_t)n * rows * sizeof(float) ||
-        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+        x->bytes < (uint64_t)n * rows * sizeof(float))
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_rows_tensor", "a NULL operand, a weight (%llu bytes at %llu) past "
+                           "the mapping's %llu bytes, or %u rows of %u that do not fit out (%llu bytes) / x (%llu bytes)",
+                           (unsigned long long)w_bytes, (unsigned long long)weight_offset,
+                           (unsigned long long)model_size, rows, n, (unsigned long long)(out ? out->bytes : 0),
+                           (unsigned long long)(x ? x->bytes : 0));
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
-    if (!w) return 0;
+    if (!w)
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_rows_tensor", "no device copy of the %llu-byte norm weight at "
+                           "offset %llu", (unsigned long long)w_bytes, (unsigned long long)weight_offset);
     if (w_bf16)
         rms_norm_weight_kernel<true><<<rows, 256>>>(out ? (float *)out->ptr : NULL, (const float *)x->ptr, w, n, rows, eps,
                                               NULL, NULL, 0, (__nv_bfloat16 *)out_b);
@@ -793,9 +811,15 @@ int pulsar_gpu_rms_norm_weight_rows_mx_tensor(pulsar_gpu_tensor *out, const puls
     if ((!out && !out_q && !out_b) || !x || !model_map || rows == 0 || weight_offset > model_size ||
         model_size - weight_offset < w_bytes ||
         (out && out->bytes < (uint64_t)n * rows * sizeof(float)) ||
-        x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
+        x->bytes < (uint64_t)n * rows * sizeof(float))
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_rows_mx_tensor", "no output plane, a NULL operand, no rows, a "
+                           "weight (%llu bytes at %llu) past the mapping's %llu bytes, or %u rows of %u that do not fit "
+                           "out / x (x %llu bytes)", (unsigned long long)w_bytes, (unsigned long long)weight_offset,
+                           (unsigned long long)model_size, rows, n, (unsigned long long)(x ? x->bytes : 0));
     const void *w = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "rms_weight");
-    if (!w) return 0;
+    if (!w)
+        return cuda_refuse("pulsar_gpu_rms_norm_weight_rows_mx_tensor", "no device copy of the %llu-byte norm weight "
+                           "at offset %llu", (unsigned long long)w_bytes, (unsigned long long)weight_offset);
     if (out_q && (n % 256u) != 0u) {
         fprintf(stderr, "pulsar: rms_norm_weight (rows) cannot emit MX for n=%u "
                         "(needs a multiple of 256)\n", n);
@@ -843,7 +867,11 @@ int pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor(
         q->bytes < (uint64_t)q_n * rows * sizeof(float) ||
         kv_out->bytes < (uint64_t)kv_n * rows * sizeof(float) ||
         kv->bytes < (uint64_t)kv_n * rows * sizeof(float)) {
-        return 0;
+        return cuda_refuse("pulsar_gpu_dsv4_qkv_rms_norm_rows_mx_tensor", "a NULL operand, a norm weight past the "
+                           "mapping's %llu bytes (q %llu at %llu, kv %llu at %llu), or %u rows that do not fit their buffers (q %u wide, kv %u wide)",
+                           (unsigned long long)model_size, (unsigned long long)q_w_bytes,
+                           (unsigned long long)q_weight_offset, (unsigned long long)kv_w_bytes,
+                           (unsigned long long)kv_weight_offset, rows, q_n, kv_n);
     }
     const void *q_w = cuda_model_range_ptr(model_map,
             q_weight_offset, q_w_bytes, "q_rms_weight");
@@ -1422,7 +1450,11 @@ uint64_t pulsar_gpu_kv_row_bytes(pulsar_kv_row_kind kind, uint32_t head_dim) {
 int pulsar_gpu_store_raw_kv_tensor(pulsar_gpu_tensor *raw_cache, const pulsar_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap ||
         raw_cache->bytes < (uint64_t)raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim) ||
-        kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+        kv->bytes < (uint64_t)head_dim * sizeof(float))
+        return cuda_refuse("pulsar_gpu_store_raw_kv_tensor", "a NULL operand, row %u outside a ring of %u, or a ring / "
+                           "kv row too small for head_dim %u (ring %llu bytes, kv %llu bytes)", row, raw_cap, head_dim,
+                           (unsigned long long)(raw_cache ? raw_cache->bytes : 0),
+                           (unsigned long long)(kv ? kv->bytes : 0));
     /* x = NULL: kv is const here; the ring slot is pos % raw_cap with pos = row */
     return pulsar_gpu_kv_ring_pack_tensor(NULL, kv, raw_cache, row, 1u, head_dim, NULL, NULL, 1u, raw_cap);
 }
@@ -1581,7 +1613,12 @@ int pulsar_gpu_store_raw_kv_batch_tensor(pulsar_gpu_tensor *raw_cache, const pul
     const bool descr = positions != NULL;
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (descr ? n_banks : 1u) * (uint64_t)raw_cap * pulsar_gpu_kv_row_bytes(PULSAR_KV_ROW_RING, head_dim) ||
-        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
+        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float))
+        return cuda_refuse("pulsar_gpu_store_raw_kv_batch_tensor", "a NULL operand, an empty ring, or %u banks' rings "
+                           "of %u / %u kv rows too small for head_dim %u (ring %llu bytes, kv %llu bytes)",
+                           descr ? n_banks : 1u, raw_cap, n_tokens, head_dim,
+                           (unsigned long long)(raw_cache ? raw_cache->bytes : 0),
+                           (unsigned long long)(kv ? kv->bytes : 0));
     if (n_tokens == 0) return 1;
     /* x = NULL: kv is const on this entry */
     return pulsar_gpu_kv_ring_pack_tensor(NULL, kv, raw_cache, pos0, n_tokens, head_dim,

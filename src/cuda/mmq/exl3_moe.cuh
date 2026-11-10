@@ -101,6 +101,8 @@ struct exl3_moe_shared {
     __nv_bfloat16 *h;               ///< [T][mid] the SwiGLU rows its down reads
     void *ws;                       ///< the dense arm's workspace:
     size_t ws_bytes;                ///< exl3_moe_shared_ws_bytes
+    /// The fork's token: exl3_moe_shared_fork writes it, the routed launch's join reads it (0 = never forked).
+    uint64_t fork = 0;
 };
 /** The dense-arm workspace a riding shared expert needs for T rows. */
 /// @param T rows.
@@ -114,8 +116,10 @@ size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim);
  *  down(swiglu(gate x, up x)) (unscaled; yg / yu / h hold the intermediates).  The exl3_moe_routed_launch on the same
  *  stream that is given the same `sh` joins it (forks are joined oldest first, at most 8 pending; give each pending
  *  fork its own buffers -- the workspace may be shared).  `prompt`: the rows' kind, as the routed launch's.  Refuses
- *  (-1) on a contract violation; a refused fork leaves nothing running. */
-/// @param sh the shared expert and its buffers.
+ *  (-1) on a contract violation; a refused fork leaves nothing running.  A fork is identified by the token written
+ *  to sh.fork (unique in the process), not by its buffers: the join refuses a pending fork whose token is not its
+ *  descriptor's.  A caller whose step fails between a fork and its join calls exl3_moe_shared_abandon. */
+/// @param sh the shared expert and its buffers; out: sh.fork, this fork's token.
 /// @param x the activation as its producer emitted it (bf16 rows for a riding shared expert).
 /// @param T rows.
 /// @param in_dim the block input width.
@@ -123,8 +127,16 @@ size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim);
 /// @param prompt the rows are a prompt chunk (else decode rows).
 /// @param stream the stream.
 /// @return 0, -1 refused (nothing left running), -3 on a stream / event failure.
-int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
+int exl3_moe_shared_fork(exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
                          cudaStream_t stream);
+
+/** Abandon every fork pending on the calling thread's lane of (current device, `stream`): the lane's stream is
+ *  synchronized (inside a graph capture, where its launches are nodes and not running work, it rejoins `stream`
+ *  instead, so the capture ends with no stream left in it) and its pending list is cleared, so the next step's forks
+ *  start from an empty lane.  For a step that failed between a fork and its join;
+ *  with nothing pending (or no lane) it does nothing. */
+/// @param stream the caller's stream the forks were made on.
+void exl3_moe_shared_abandon(cudaStream_t stream);
 
 /** out [T][out_dim] f32 = sum over each row's top_k picks (sel [T][top_k], wts [T][top_k]) of
  *  w * down(swiglu(gate x, up x)) (up-only: w * down(relu(up x)^2), b.up_z unused), x the activation as its producer emitted it, plus each riding shared expert's

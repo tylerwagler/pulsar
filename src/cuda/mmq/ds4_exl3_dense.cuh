@@ -28,13 +28,14 @@
 //     authority in double at the same ~2e-7 an f32 FMA arm reaches.
 //   * OUTPUT (H128, then svh): a dense Linear has no fold/sum epilogue, and the
 //     output Hadamard mixes 128 outputs a GEMV CTA does not own together (a CTA
-//     owns 32), so the arm's split-K GEMV writes unrotated f32 partials into the
-//     workspace and the last CTA of each 128-output block to finish sums the
-//     splits in split order, rotates the block and scales by svh.
+//     owns 32), so the arm's GEMV writes unrotated f32 partials into the
+//     workspace and the last CTA of each 128-output block to finish rotates
+//     the block and scales by svh.  (No split-K since L338: a CTA covers the
+//     whole of K, so an output has one partial and nothing is summed.)
 //
-// Every row is bit-identical at every M: the split count depends on (K, N)
-// only, every row block is 16 rows (the MMA's M; rows past M are zero), a
-// row's k order, warp order and split order do not depend on its batchmates;
+// Every row is bit-identical at every M: every row block is 16 rows (the
+// MMA's M; rows past M are zero), a row's k order and warp order do not
+// depend on its batchmates;
 // a launch carries up to 32 decode rows as 16-row passes over trellis words it
 // reads once (L341), and rows past 32 run 32-row launches in turn (L288 C1).
 // Prompt chunks take
@@ -63,14 +64,6 @@ bool ds4_exl3_dense_rate_supported(int k2);
 /// @param N logical output width (a multiple of 4).
 /// @return bytes, or 0 for a refused shape.
 size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
-
-/** The number of K splits the arm uses for (K, N) -- a function of the weight's
- *  (stored) shape alone, which is what keeps every row M-independent.  0 on a
- *  refused shape. */
-/// @param K input width (a multiple of 128).
-/// @param N logical output width (a multiple of 4).
-/// @return the split count, or 0 for a refused shape.
-int ds4_exl3_dense_splits(int K, int N);
 
 /** y [M][N] f32 = the complete Linear.  `w` is the [trellis | suh | svh] slice
  *  (16-byte aligned) in exl3_linear_layout(K, N, k2): N is the LOGICAL output

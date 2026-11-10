@@ -9,8 +9,6 @@
 #include <string.h>
 
 namespace {
-/// L353: image blocks a key or a parent lookup covers at most (a request's are capped alike, kv_cache_find_req).
-constexpr int KVCHAIN_IMAGES_MAX = 64;
 /** A non-owning pulsar_tokens over t[from, to); its `v` aliases t's storage and must not be freed.
  *  @param t source tokens
  *  @param from first index (inclusive)
@@ -72,8 +70,8 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
     /* L353: the key covers the span's images: same-size images render the same text */
-    uint64_t hashes[KVCHAIN_IMAGES_MAX];
-    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, KVCHAIN_IMAGES_MAX);
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
     if (n_hashes < 0) {
         free(text);
         snprintf(r->err, sizeof(r->err), "segment [%d,%d): its image records could not be read", G_prev, G);
@@ -255,8 +253,8 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
         /* L353: this history's own images: another image's chain over the same text is not its parent */
-        uint64_t hashes[KVCHAIN_IMAGES_MAX];
-        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, KVCHAIN_IMAGES_MAX);
+        uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
         const int c = full && n_hashes >= 0 ? pulsar_segstore_lookup_images(st, full, full_len, &grid_end, hashes,
                                                                             (uint32_t)n_hashes, chain, PULSAR_KVCHAIN_MAX)
                                             : 0;
@@ -344,11 +342,12 @@ namespace {
  *  @param st  the store
  *  @param e   the segment
  *  @param why PULSAR_SEGMENT_BAD_ROWS, _BAD_RP or _TRANSIENT
- *  @return the slice functions' code: 1 (dropped) or 2 (transient, kept) */
-int kvchain_fault(pulsar_segstore *st, const pulsar_segstore_seg &e, pulsar_segment_status why) {
+ *  @param read_failed a transient failure that was a part's file read (pulsar_segstore_map_part's 3)
+ *  @return the slice functions' code: 1 (dropped), 2 (transient, kept) or 3 (a read that failed now, kept) */
+int kvchain_fault(pulsar_segstore *st, const pulsar_segstore_seg &e, pulsar_segment_status why, bool read_failed) {
     if (why == PULSAR_SEGMENT_BAD_ROWS) pulsar_segstore_drop(st, e.key);
     else if (why == PULSAR_SEGMENT_BAD_RP) (void)pulsar_segstore_drop_rp(st, e.key);
-    return why == PULSAR_SEGMENT_TRANSIENT ? 2 : 1;
+    return why != PULSAR_SEGMENT_TRANSIENT ? 1 : read_failed ? 3 : 2;
 }
 /** What a fault drops, for the message.  @param why the fault  @return a phrase */
 const char *kvchain_fault_word(pulsar_segment_status why) {
@@ -360,20 +359,25 @@ const char *kvchain_fault_word(pulsar_segment_status why) {
  *  read off disk, digest-checked by the store.  The caller unmaps them (kvchain_unmap) when this returns OK.
  *  @param st the store  @param chain the chain  @param n its length  @param i the segment
  *  @param seg receives the rows  @param pb their size  @param rp receives the restore point (last only)
- *  @param rb its size  @param err receives the reason  @param errlen bytes at err
- *  @return PULSAR_SEGMENT_OK; _BAD_ROWS / _BAD_RP (a part missing, unreadable or bad); _TRANSIENT (no RAM room now) */
+ *  @param rb its size  @param read_failed receives whether a _TRANSIENT is a file read that failed now (the store's
+ *  3) rather than the RAM pool's room (its 2)  @param err receives the reason  @param errlen bytes at err
+ *  @return PULSAR_SEGMENT_OK; _BAD_ROWS / _BAD_RP (a part missing or bad, or its read failing again and again);
+ *          _TRANSIENT (no RAM room now, or a read that failed now) */
 pulsar_segment_status kvchain_map(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int i,
-                                  const uint8_t **seg, uint64_t *pb, const uint8_t **rp, uint64_t *rb, char *err,
-                                  size_t errlen) {
+                                  const uint8_t **seg, uint64_t *pb, const uint8_t **rp, uint64_t *rb,
+                                  bool *read_failed, char *err, size_t errlen) {
     *seg = *rp = NULL;
     *pb = *rb = 0;
+    *read_failed = false;
     const int mrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS, seg, pb, NULL, err, errlen);
-    if (mrc != 0) return mrc == 2 ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_ROWS;
+    *read_failed = mrc == 3;
+    if (mrc != 0) return mrc == 1 ? PULSAR_SEGMENT_BAD_ROWS : PULSAR_SEGMENT_TRANSIENT;
     if (i != n - 1) return PULSAR_SEGMENT_OK;
     const int rrc = pulsar_segstore_map_part(st, chain[i].key, PULSAR_SEGSTORE_PART_RP, rp, rb, NULL, err, errlen);
     if (rrc == 0) return PULSAR_SEGMENT_OK;
     pulsar_segstore_unmap_part(st, chain[i].key, PULSAR_SEGSTORE_PART_ROWS);
-    return rrc == 2 ? PULSAR_SEGMENT_TRANSIENT : PULSAR_SEGMENT_BAD_RP;
+    *read_failed = rrc == 3;
+    return rrc == 1 ? PULSAR_SEGMENT_BAD_RP : PULSAR_SEGMENT_TRANSIENT;
 }
 /** End a kvchain_map that returned OK.  @param st the store  @param chain the chain  @param n its length
  *  @param i the segment */
@@ -401,7 +405,8 @@ int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_
         const uint8_t *seg = NULL, *rp = NULL;
         uint64_t pb = 0, rb = 0;
         char lerr[256] = "";
-        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, lerr, sizeof lerr);
+        bool read_failed = false;
+        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, &read_failed, lerr, sizeof lerr);
         if (why == PULSAR_SEGMENT_OK) {
             why = check(ud, seg, pb, i == n - 1, rp, rb, lerr, sizeof lerr);
             kvchain_unmap(st, chain, n, i);
@@ -410,7 +415,7 @@ int pulsar_kvchain_verify_slice_with(pulsar_segstore *st, const pulsar_segstore_
             if (err && errlen)
                 snprintf(err, errlen, "segment %s [%u,%u) failed its check before the load (%s) -- %s", chain[i].key,
                          chain[i].G_prev, chain[i].G, lerr, kvchain_fault_word(why));
-            return kvchain_fault(st, chain[i], why);
+            return kvchain_fault(st, chain[i], why, read_failed);
         }
         *next = i + 1;
     }
@@ -427,7 +432,8 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
         uint64_t pb = 0, rb = 0;
         char lerr[256] = "";
         /* L347 I3a: each part from its RAM copy, or read off disk and digest-checked by the store */
-        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, lerr, sizeof lerr);
+        bool read_failed = false;
+        pulsar_segment_status why = kvchain_map(st, chain, n, i, &seg, &pb, &rp, &rb, &read_failed, lerr, sizeof lerr);
         int G = 0;
         if (why == PULSAR_SEGMENT_OK) {
             why = load(ud, seg, pb, last, rp, rb, &G, chain[i].key, lerr, sizeof(lerr));
@@ -437,7 +443,7 @@ int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_se
             if (err && errlen)
                 snprintf(err, errlen, "segment %s [%u,%u) failed to load (%s) -- %s", chain[i].key, chain[i].G_prev,
                          chain[i].G, lerr, kvchain_fault_word(why));
-            return kvchain_fault(st, chain[i], why);
+            return kvchain_fault(st, chain[i], why, read_failed);
         }
         *next = i + 1;
     }

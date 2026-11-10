@@ -23,6 +23,13 @@ static uint64_t g_model_registered_size;
 /// Nonzero when the whole mapping is device-addressable: every range resolves to g_model_device_base + offset.
 static int g_model_registered;
 
+/// Bytes a host-to-device weight copy moves at a time: the staged fd route's reads, the fd-less device copy's bounce
+/// and the overlay upload (L375: one constant for the three 64 MiB spellings).
+constexpr uint64_t kModelCopyChunkBytes = 64ull << 20;
+/// The weights arena's span alignment: cuda_model_arena_alloc rounds by it and cuda_model_arena_unwind undoes exactly
+/// that rounding (L375: the unwind restated it as 4095).
+constexpr uint64_t kModelArenaAlign = 4096u;
+
 
 
 
@@ -105,7 +112,7 @@ static cudaStream_t g_model_upload_stream;
 
 
 
-/// Every model range placed on the device (arena copies, owned copies, registered spans).
+/// Every model range placed on the device (arena copies and owned copies; a registered mapping makes none).
 static std::vector<cuda_model_range> g_model_ranges;
 
 
@@ -177,8 +184,10 @@ static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 
 
-/// Bytes of each staging buffer as allocated (0: no pool).
+/// Bytes of each staging buffer from its aligned pointer (g_model_stage) to the end of its allocation (0: no pool).
 static uint64_t g_model_stage_bytes;
+/// The alignment the pool's pointers were aligned to: a pool built for a smaller one is rebuilt.
+static uint64_t g_model_stage_align;
 
 
 
@@ -345,7 +354,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     }
 
     const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    const uint64_t chunk = kModelCopyChunkBytes;
 
     /* Bounce through a pinned buffer rather than copying straight from the
      * source mapping.  Historically this path took a partially-registered
@@ -385,7 +394,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
         }
     }
     (void)cudaFreeHost(bounce);
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, 0});
     g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     return (const char *)dev;
@@ -476,11 +485,9 @@ static void verify_resolved_range(const char *dev, const void *model_map,
 const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
 
-    /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
-     * direct HBM reads are ~10% faster than mapped reads through host page
-     * tables (measured on plain decode at GB10).  Cache lookup runs first; the
-     * registered-mapped shortcut below is the cold fallback when an allocation
-     * hasn't been pre-populated. */
+    /* A device copy of the range wins: the cache lookup runs first.  Past it, a mapping the device registered
+     * whole (g_model_registered: an integrated GPU that accepted pulsar_gpu_set_model_map's cudaHostRegister) is
+     * read where it lies; any other mapping takes the staged fd route. */
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find({model_map, offset});
     if (exact != g_model_range_by_offset.end()) {
@@ -495,13 +502,6 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
             verify_resolved_range(r.device_ptr + (offset - r.offset), model_map, offset, bytes, "cache-scan");
             return r.device_ptr + (offset - r.offset);
         }
-        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
-        }
     }
 
     if (g_model_registered) return cuda_model_ptr(model_map, offset);
@@ -515,9 +515,10 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
     /* The staged fd route is the only SUPPORTED way to get model weights onto
      * the GPU here, so failing it is fatal by design (L028, 2026-08-13).
      *
-     * Two fallbacks used to live here -- cudaHostRegister-and-map, and a
-     * chunked device copy.  Host registration reports "operation not supported"
-     * on GB10, and the device copy was measured at HALF the prefill and a THIRD
+     * Two fallbacks used to live here -- a per-range cudaHostRegister-and-map,
+     * and a chunked device copy.  Host registration of a file mapping reports
+     * "operation not supported" on GB10 (set_model_map's attempt prints it at
+     * load), and the device copy was measured at HALF the prefill and a THIRD
      * of the decode throughput of the fd route.  Silently degrading to that is
      * worse than not starting: a server that comes up at a third of decode
      * speed is a support ticket nobody files for weeks.  Both were deleted;
@@ -525,8 +526,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
      *
      * The usual trigger is the weight-cache budget: cuda_model_range_ptr_from_fd
      * returns NULL once g_model_range_bytes exceeds the cache limit (it routes
-     * through cuda_model_direct_fallback_ptr, which yields NULL here because
-     * host registration is unsupported on GB10). */
+     * through cuda_model_direct_fallback_ptr, which yields NULL unless the
+     * device registered the whole mapping -- GB10 does not). */
     /* No model fd at all (synthetic mappings -- the modelless kernel smokes
      * build slabs in memory with no backing file).  There is nothing to stage
      * FROM, so a device copy is the right answer here, not a fatal: the L028
@@ -561,13 +562,8 @@ const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_
 
 
 
-/// @return 1 when any model range is read through registered host pages (the whole mapping or a span), else 0
-int pulsar_gpu_model_reads_host_pages(void) {
-    if (g_model_registered) return 1;
-    for (const cuda_model_range &r : g_model_ranges)
-        if (r.host_registered) return 1;
-    return 0;
-}
+/// @return 1 when the model is read through registered host pages (the whole mapping: the only registration), else 0
+int pulsar_gpu_model_reads_host_pages(void) { return g_model_registered; }
 
 /// @param model_map the host mapping base
 /// @param offset    byte offset in it
@@ -584,16 +580,6 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
             offset >= r.offset &&
             end <= r.offset + r.bytes) {
             return 1;
-        }
-        if (r.host_base == model_map &&
-            r.host_registered &&
-            r.registered_base &&
-            r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return 1;
         }
     }
     return 0;
@@ -621,11 +607,6 @@ static double cuda_wall_sec(void) {
 }
 
 
-
-/// @return 1: the load-progress lines are always on
-static int cuda_model_load_progress_enabled(void) {
-    return 1;
-}
 
 
 
@@ -656,8 +637,6 @@ static void cuda_model_load_progress_finish(void) {
 /// Prints a load-progress line when due (every 2 GiB / 2 s on a tty, 16 GiB / 10 s otherwise).
 /// @param cached_bytes bytes cached on the device so far
 static void cuda_model_load_progress_note(uint64_t cached_bytes) {
-    if (!cuda_model_load_progress_enabled()) return;
-
     const double now = cuda_wall_sec();
     const int tty = isatty(STDERR_FILENO) != 0;
     const uint64_t step = (tty ? 2ull : 16ull) *
@@ -704,10 +683,6 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 
 
-/// @return the staged route's chunk size (64 MiB)
-static uint64_t cuda_model_copy_chunk_bytes(void) {
-    return 64ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
-}
 
 
 
@@ -788,10 +763,14 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
 
 
 /** Ensures the four pinned staging buffers (and the upload stream) hold at least `bytes` each, reallocating them.
- *  @param bytes bytes a buffer
+ *  `bytes` are counted from the ALIGNED pointer (g_model_stage): the raw allocation is longer by the most the
+ *  alignment can shift it (L375, O21 -- it was `bytes` raw, so a full aligned read from a shifted pointer ran past
+ *  the pinned allocation by the shift).
+ *  @param bytes bytes a buffer, usable from its aligned pointer
  *  @return 1 ready, 0 an allocation failed (named on stderr) */
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+    const uint64_t align = model_fd_max_align();
+    if (g_model_stage_bytes >= bytes && g_model_stage_align == align) return 1;
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -812,14 +791,15 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             return 0;
         }
     }
+    const uint64_t shift_max = align > 1 ? align - 1 : 0;   /* cuda_align_ptr moves the pointer up by at most this */
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
+        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)(bytes + shift_max));
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
-        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], model_fd_max_align());
+        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
@@ -828,6 +808,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = bytes;
+    g_model_stage_align = align;
     return 1;
 }
 
@@ -856,10 +837,11 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 
 /** Reads a file range into a staging buffer: the O_DIRECT twin when it can (aligned read, the payload offset into
- *  the buffer), else the buffered fd; a direct fd the filesystem rejects is dropped for this shard.
+ *  the buffer), else the buffered fd; a direct fd the filesystem rejects is dropped for this shard, with one line
+ *  naming the file and the errno (the shard's reads are buffered from then on).
  *  @param e           the container's fd entry
  *  @param stage       the staging buffer (aligned for O_DIRECT)
- *  @param stage_bytes its size
+ *  @param stage_bytes its size, from `stage` to the end of its pinned allocation
  *  @param offset      file byte offset
  *  @param bytes       bytes wanted
  *  @param payload     out: where the wanted bytes start in stage
@@ -885,6 +867,15 @@ static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
+                /* a path switch for the rest of this shard's reads: said once, where it happens (L375, O21) */
+                char link[64], name[512];
+                snprintf(link, sizeof(link), "/proc/self/fd/%d", e->fd);
+                const ssize_t nl = readlink(link, name, sizeof(name) - 1);
+                name[nl > 0 ? nl : 0] = '\0';
+                fprintf(stderr, "pulsar: model upload: the O_DIRECT read of %s (%llu bytes at %llu, alignment %llu) failed: "
+                                "%s -- no direct I/O for this file from here on, its reads are buffered\n",
+                        nl > 0 ? name : "a model file", (unsigned long long)read_size, (unsigned long long)aligned_off,
+                        (unsigned long long)e->direct_align, strerror(direct_errno));
                 (void)close(e->direct_fd);
                 /* The entry is keyed by map and the table is not const here:
                  * drop the direct fd for THIS shard only. */
@@ -998,7 +989,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
      * plain decode (20.91 vs 20.85 @512) for ~900 MB of arena rounding, and
      * the served lane at 3 clients FELL (43.8 -> 41.8 tok/s, one rep) -- the
      * rounding comes out of the same memory the bank pool is sized from. */
-    const uint64_t align = 4096u;
+    const uint64_t align = kModelArenaAlign;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
 
     for (cuda_model_arena &a : g_model_arenas) {
@@ -1037,7 +1028,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  *  @param span  the span cuda_model_arena_alloc returned
  *  @param bytes the size it was asked for (rounded as it rounded it) */
 static void cuda_model_arena_unwind(char *span, uint64_t bytes) {
-    const uint64_t aligned = (bytes + 4095u) & ~(uint64_t)4095u;
+    const uint64_t aligned = (bytes + kModelArenaAlign - 1u) & ~(kModelArenaAlign - 1u);
     for (cuda_model_arena &a : g_model_arenas) {
         if (span >= a.device_ptr && span + aligned == a.device_ptr + a.used) {
             a.used = (uint64_t)(span - a.device_ptr);
@@ -1051,8 +1042,9 @@ static void cuda_model_arena_unwind(char *span, uint64_t bytes) {
 /* A raw host pointer is safe for kernels only once CUDA has registered the
  * mapping.  Otherwise return NULL so the caller stops, rather than handing a
  * kernel an address it cannot read and surfacing an async illegal access
- * later.  On GB10 registration is unsupported, so this returns NULL and the
- * staged fd path is the only route -- see cuda_model_range_ptr (L028/L030). */
+ * later.  GB10 refuses the registration (pulsar_gpu_set_model_map), so there
+ * this returns NULL and the staged fd path is the only route -- see
+ * cuda_model_range_ptr (L028/L030). */
 /// @param model_map the host mapping base
 /// @param offset    byte offset in it
 /// @return the device-addressable pointer when the whole mapping is registered, else NULL
@@ -1101,7 +1093,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 (unsigned long long)bytes, (void *)dev, what ? what : "?");
     cudaError_t err = cudaSuccess;
 
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t chunk = kModelCopyChunkBytes;
     const uint64_t align = model_fd_max_align();
     const uint64_t stage_bytes = chunk + (align > 1 ? align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return unwind();
@@ -1156,7 +1148,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return unwind();
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, 1});
     g_model_range_by_offset[{model_map, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1197,7 +1189,7 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
         fprintf(stderr, "pulsar: expert half: no model fd for the stack's mapping -- refusing\n");
         return 0;
     }
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t chunk = kModelCopyChunkBytes;
     uint32_t per = (uint32_t)(chunk / src_stride);
     if (per == 0) per = 1;
     const uint64_t read_bytes = (uint64_t)per * src_stride;
@@ -1231,7 +1223,7 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
         (void)cudaGetLastError();
         return 0;
     }
-    g_model_ranges.push_back({key_map, key_offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({key_map, key_offset, bytes, (char *)dev, 0});
     g_model_range_by_offset[{key_map, key_offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     return 1;
@@ -1327,11 +1319,7 @@ int pulsar_gpu_register_exl3_expert_half(const void *key_map, uint64_t key_offse
 static void cuda_model_range_release_all(void) {
     cuda_model_load_progress_finish();
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_registered && r.registered_base) {
-            (void)cudaHostUnregister(r.registered_base);
-        } else if (r.device_ptr && !r.arena_allocated) {
-            (void)cudaFree(r.device_ptr);
-        }
+        if (r.device_ptr && !r.arena_allocated) (void)cudaFree(r.device_ptr);
     }
     for (const cuda_model_arena &a : g_model_arenas) {
         if (a.device_ptr) (void)cudaFree(a.device_ptr);
@@ -2541,6 +2529,15 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
 /// @param what the buffer regrown (named in the first post-warmup regrow's line; NULL = unnamed)
 void pulsar_gpu_seg_note_device_free(const char *what) {
     if (g_seg_capturing) {
+        /* L375 (O54): the path nobody announced.  The sites that refuse a grow under capture first
+         * (cuda_grow_refused_under_capture) never get here; the scratch slots and the activation cache do, and
+         * whether a served stretch ever does is what this line settles. */
+        char site[160];
+        snprintf(site, sizeof(site), "regrown inside a capture: %s", what ? what : "unnamed");
+        if (cuda_first_say(site))
+            fprintf(stderr, "pulsar: a device buffer was regrown INSIDE a graph capture (%s): the capture's graph "
+                            "runs once and every captured graph is dropped at its close (said once for this buffer)\n",
+                    what ? what : "unnamed");
         g_seg_reset_pending = true;
         return;
     }
@@ -2798,10 +2795,15 @@ int pulsar_gpu_set_model_map(const void *model_map, uint64_t model_size) {
      * (the old PULSAR_CUDA_HOST_REGISTER_PLAIN) let registration SUCCEED on GB10
      * and then served -12% prefill / -26% decode with DIFFERENT LOGITS, i.e. the
      * weights the GPU read did not match. */
-    /* L321: registration is the INTEGRATED GPU's strategy (GB10: one memory, the mapping is where the weights live).
-     * A discrete card would accept it too and then read every weight over PCIe on every use, ~1/30 of its own
-     * memory's bandwidth -- so a discrete card takes the staged route instead, which copies each span into device
-     * memory once (cuda_model_range_ptr_from_fd).  One question, asked of the device: cudaDevAttrIntegrated. */
+    /* L321: registration is ATTEMPTED on an integrated GPU only (one memory: the mapping is where the weights
+     * live).  A discrete card would accept it too and then read every weight over PCIe on every use, ~1/30 of its
+     * own memory's bandwidth -- so a discrete card takes the staged route instead, which copies each span into device
+     * memory once (cuda_model_range_ptr_from_fd).  One question, asked of the device: cudaDevAttrIntegrated.
+     * GB10 is integrated and its driver REFUSES the read-only registration of a file mapping ("operation not
+     * supported", MAP_SHARED and MAP_PRIVATE alike: docs/history/engine-perf-map.md), so on GB10 the line below is
+     * "host registration skipped" and the staged route serves there too; g_model_registered is set only on an
+     * integrated device that accepts.  It is ONE flag for the mapping last set here (g_model_host_base): a range of
+     * any other mapping is not covered by it (L375, O22: reported, not changed). */
     int integrated = 0;   /* a failed query: the staged route */
     (void)cuda_device_integrated(&integrated);
     cudaError_t err = cudaErrorNotSupported;
@@ -2960,7 +2962,7 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
         return 0;
     }
 
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    const uint64_t chunk = kModelCopyChunkBytes;
     void *stage = NULL;
     err = cudaMallocHost(&stage, (size_t)(bytes < chunk ? bytes : chunk));
     if (err != cudaSuccess) {
@@ -3001,8 +3003,7 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
     }
     (void)cudaFreeHost(stage);
 
-    g_model_ranges.push_back({host_base_key, offset, bytes, (char *)dev,
-                              NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({host_base_key, offset, bytes, (char *)dev, 0});
     g_model_range_by_offset[{host_base_key, offset}] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     return 1;

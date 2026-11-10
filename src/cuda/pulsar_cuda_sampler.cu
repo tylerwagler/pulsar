@@ -2986,6 +2986,24 @@ int pulsar_gpu_logprobs_rows(const pulsar_gpu_tensor *logits, uint64_t logits_of
                 top_k);
         return 0;
     }
+    /* L375 (O57): the two operand bounds pulsar_gpu_sample_rows checks -- each row's mask row inside the mask, and
+     * the rows' operand (there the draws' rows, here the scored tokens) inside its tensor */
+    for (uint32_t r = 0; mask_rows && r < n_rows; r++) {
+        if (mask_rows[r] != PULSAR_GPU_SAMPLE_NO_MASK &&
+            (uint64_t)(mask_rows[r] + 1u) * mask_words * sizeof(uint32_t) > mask->bytes) {
+            fprintf(stderr, "pulsar: device logprobs: row %u names mask row %u outside the mask (%llu bytes, %u words "
+                            "a row) -- refusing\n", r, mask_rows[r], (unsigned long long)mask->bytes, mask_words);
+            return 0;
+        }
+    }
+    if (tokens && (tokens_offset_bytes > tokens->bytes ||
+                   (uint64_t)(n_rows - 1u) * token_stride * sizeof(int32_t) + sizeof(int32_t) >
+                       tokens->bytes - tokens_offset_bytes)) {
+        fprintf(stderr, "pulsar: device logprobs: %u scored tokens at byte %llu, stride %u, run past their tensor (%llu "
+                        "bytes) -- refusing\n", n_rows, (unsigned long long)tokens_offset_bytes, token_stride,
+                (unsigned long long)tokens->bytes);
+        return 0;
+    }
     lp_args a;
     memset(&a, 0, sizeof(a));
     a.logits = (const float *)((const char *)logits->ptr + logits_offset_bytes);

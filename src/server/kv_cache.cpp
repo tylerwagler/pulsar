@@ -850,8 +850,9 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     kv_chain_hit hit;
     /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
      * overstated the gain and logged a warning a persist */
-    uint64_t hashes[64];
-    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes, 64);
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes,
+                                                          PULSAR_IMAGE_BLOCKS_MAX);
     const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
@@ -1106,9 +1107,8 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
 
 int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     /* L281: the chain loads past an image block only when this request brings the same image there */
-    enum { HASHES_MAX = 64 };
-    uint64_t hashes[HASHES_MAX];
-    const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_images = req->n_images < PULSAR_IMAGE_BLOCKS_MAX ? req->n_images : PULSAR_IMAGE_BLOCKS_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
     const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
     /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
@@ -1185,8 +1185,9 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
  *   commits and the persists of other banks between its slices never evict it (nor its restore point).
  * - A failure drops only on a CONTENT fault, and only what the fault invalidates (pulsar_kvchain.h); a TRANSIENT one
  *   (no RAM room, the bank, the device, a TP rank's copy) drops nothing.
- * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and any
- *   later failure leaves it holding nothing (pulsar_session_load_segment).  So when the bank holds a history the
+ * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and a slice
+ *   that fails after it leaves the bank invalidated whatever the fault's class (pulsar_kvchain_load_slice: a
+ *   segment's own content checks run before its first device write, but the segments before it are in).  So when the bank holds a history the
  *   request would otherwise resume from (`verify`: the pick's own depth > 0), the restore first CHECKS the whole chain
  *   -- every part read (RAM or disk, digest-checked by the store) and its bytes checked against the bank's layout
  *   (pulsar_kvchain_verify_slice), a slice per worker turn like the load -- and writes nothing until every part
@@ -1253,7 +1254,8 @@ int server::kv_restore_slice(kv_restore *r, int k) {
             : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
     };
     /* L353 no. 12: images come back to the pool at their commits.  A transient failure with writes in flight waits for
-     * them and tries once more: milliseconds, against a re-prefill from 0 */
+     * them and tries once more: milliseconds, against a re-prefill from 0.  L375 (O25): only the pool's (2) -- a read
+     * that failed (3) is nothing the writer's backlog clears, and the worker does not stand behind it */
     (void)kv_cache_commit_written(&s->kv);
     int rc = slice();
     if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();

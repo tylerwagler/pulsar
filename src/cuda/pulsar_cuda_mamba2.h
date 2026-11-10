@@ -19,7 +19,10 @@
  * mamba_mixer2, the card's serving path -- rounding points mirror it):
  *   xbc        = bf16( SiLU( conv_bias + sum_i w_i * xBC[t - (K-1) + i] ) )    (E3, pulsar_cuda_sconv.h)
  *   x, B, C    = split(xbc, H*P, G*N, G*N);  head h reads group g = h / (H / G)
- *   dt[h]      = softplus(f32(dt_raw[h]) + f32(dt_bias[h]))                 double, rounded to f32
+ *   dt[h]      = max(softplus(f32(dt_raw[h]) + f32(dt_bias[h])), dt_min)    the softplus in double, rounded to f32,
+ *                                                                           then the floor (L363: transformers'
+ *                                                                           time_step_min; the geometry's dt_min,
+ *                                                                           0 = none)
  *   dA[h]      = exp(dt[h] * A[h]),  A[h] = -exp(A_log[h])                   double, rounded to f32
  *   S[h][p][n] = fmaf(dt[h] * B[g][n], x[h][p], dA[h] * S[h][p][n])           f32, each op rounded
  *   y[h][p]    = bf16( fmaf(D[h], x[h][p], sum_n S[h][p][n] * C[g][n]) )      the sum in a fixed tree

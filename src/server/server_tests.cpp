@@ -9411,7 +9411,9 @@ static void test_l353_small_fixes(void) {
         TEST_ASSERT(!s.terminal_checkpoint_step());
         TEST_ASSERT(!s.slots[0].terminal_pending);
     }
-    /* 13: a file that can't be opened now is transient (2): it and its descendants stay; a missing one is a fault (1) */
+    /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
+     * L375 (O25): transient is 3 -- a read that failed now -- not the RAM pool's 2, which the reader waits on the
+     * writer's commits for; a shortage (EMFILE) never counts towards a drop, however often */
     char tmpl[] = "/tmp/pulsar-l353-errno.XXXXXX";
     char *dir = l323_tmpdir(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -9432,15 +9434,46 @@ static void test_l353_small_fixes(void) {
         if (fd < 0) break;
         held.push_back(fd);
     }
-    const int rc_emfile = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
+    int rc_emfile[PULSAR_SEGSTORE_READ_FAILS_MAX + 2];
+    for (int &rc : rc_emfile)
+        rc = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
     for (const int fd : held) close(fd);
     TEST_ASSERT(setrlimit(RLIMIT_NOFILE, &was) == 0);
-    TEST_ASSERT(rc_emfile == 2);
+    for (const int rc : rc_emfile) TEST_ASSERT(rc == 3);
     char path[600];
     snprintf(path, sizeof path, "%s/%.40s.seg", dir, key);
     TEST_ASSERT(access(path, F_OK) == 0 && pulsar_segstore_contains(st, key));
+    TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 0);
+    pulsar_segstore_unmap_part(st, key, PULSAR_SEGSTORE_PART_ROWS);
     TEST_ASSERT(unlink(path) == 0);
     TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 1);
+    /* L375 (O25): a read that keeps failing with a persistent errno (the file's name taken by a directory) is 3 --
+     * through a chain read too, which keeps the segment -- until it has failed PULSAR_SEGSTORE_READ_FAILS_MAX times in
+     * a row: then it is a fault and the chain read drops it.  A read that succeeds starts the count again. */
+    char key2[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second segment", 256, 2, key2) && l323_put_rp(st, key2, 128));
+    pulsar_segstore_seg chain[1];
+    TEST_ASSERT(pulsar_segstore_get(st, key2, &chain[0]));
+    char bak[640];
+    snprintf(path, sizeof path, "%s/%.40s.seg", dir, key2);
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    const pulsar_kvchain_segment_checker pass = [](void *, const uint8_t *, uint64_t, bool, const uint8_t *, uint64_t,
+                                                   char *, size_t) { return PULSAR_SEGMENT_OK; };
+    const auto check = [&]() {
+        int nx = 0;
+        return pulsar_kvchain_verify_slice_with(st, chain, 1, &nx, 1, pass, NULL, err, sizeof err);
+    };
+    const auto break_file = [&]() { return rename(path, bak) == 0 && mkdir(path, 0700) == 0; };
+    TEST_ASSERT(check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && strstr(err, "can't be read now") && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0 && rename(bak, path) == 0 && check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(check() == 1 && strstr(err, "times in a row") && !pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
@@ -9903,6 +9936,57 @@ static void test_l353_eviction_keeps_chain_ends(void) {
     l323_rmdir(dir);
 }
 
+/* L375 (O35): a restore point with ONE child and no flag is superseded (class 2) only when a deeper restore point
+ * exists below it.  With everything below it rows-only and exempt from eviction (a chain a restore is reading: pinned)
+ * it is its conversation's only resume point, and goes no sooner than any other chain end's: here the least recently
+ * used chain end (B's) goes first, and A -- used later -- keeps the restore point its pinned rows need. */
+static void test_l375_only_restore_point_is_a_chain_end(void) {
+    char tmpl[] = "/tmp/pulsar-l375-o35.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char a1[41], a2[41], b1[41], n1[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2));   /* rows only, below A's restore point */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    pulsar_segstore_pin(st, a2);   /* a restore is reading A's chain: its rows may not go */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));   /* over budget: something goes */
+    pulsar_segstore_seg g;
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes > 0u);   /* was class 2: the first restore point to go */
+    TEST_ASSERT(pulsar_segstore_contains(st, a2));
+    TEST_ASSERT(!pulsar_segstore_get(st, b1, &g) || g.rp_bytes == 0u);   /* the older chain end paid */
+    pulsar_segstore_unpin(st, a2);
+    /* with a deeper restore point below it, the same restore point IS superseded and goes before a chain end's */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    char tmpl2[] = "/tmp/pulsar-l375-o35b.XXXXXX";
+    dir = l323_tmpdir(tmpl2);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2) && l323_put_rp(st, a2, 256));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used2 = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used2, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes == 0u);   /* superseded by a2's: class 2, first to go */
+    TEST_ASSERT(pulsar_segstore_get(st, a2, &g) && g.rp_bytes > 0u);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
 /* L353: a full disk evicts as a full budget does, whatever else fills it; with nothing left to take the write is
  * refused and the store still holds what it had.  A failed write is counted. */
 static uint64_t l353_disk_free(void *ud) {
@@ -9933,12 +10017,21 @@ static void test_l353_disk_full_evicts(void) {
     char d[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "after the foreign file", 1000, 4, d));
     TEST_ASSERT(!pulsar_segstore_contains(st, a) && pulsar_segstore_contains(st, d));
-    /* a disk nothing of ours can clear: refused, and what stays stays */
+    /* L375 (O18): foreign bytes fill the disk and the write is short of more than the store could release (c alone:
+     * b went with a above, d is the chain being extended): the persist fails and every stored segment is still there
+     * -- the loop used to take every leaf first and fail anyway */
     disk[1] = disk[0];
     char e[41];
     const int before = pulsar_segstore_count(st);
-    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 1000, 5, e));
-    TEST_ASSERT(before >= 1 && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    const uint64_t held_before = pulsar_segstore_used_bytes(st);
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left, and too big for our own bytes", held_before, 5, e));
+    TEST_ASSERT(before == 2 && pulsar_segstore_count(st) == before && pulsar_segstore_used_bytes(st) == held_before);
+    TEST_ASSERT(pulsar_segstore_contains(st, c) && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    /* a shortfall our own bytes could cover, on a disk an eviction does not free (still full of foreign bytes): the
+     * first eviction that leaves the free space where it was is the last -- refused, one leaf gone, never the store */
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 500, 5, e));
+    TEST_ASSERT(pulsar_segstore_count(st) == before - 1 && pulsar_segstore_contains(st, d) &&
+                !pulsar_segstore_contains(st, e));
     pulsar_segstore_set_disk_free(st, NULL, NULL);
     /* a failed write counts */
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
@@ -15673,6 +15766,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();
+    test_l375_only_restore_point_is_a_chain_end();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
     test_l353_parked_decoder_frees_nothing();

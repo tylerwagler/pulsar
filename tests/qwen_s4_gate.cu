@@ -799,7 +799,7 @@ static void section_moe_at(const int T, const bool split = false, const int k2_e
         pulsar_moe_block_parts p;
         int r = pulsar_moe_block_carve(&bs, T, ws, wsb, &p);
         if (!r) r = qwen_router(dx, router_w, shared_gate_w, T, H, p.logits, p.sel, p.wts, p.gammas);
-        const pulsar_rows_moe_shared sh = shared_desc(p);
+        pulsar_rows_moe_shared sh = shared_desc(p);   /* the fork writes its token (sh.fork) */
         pulsar_rows_moe wr2 = w;
         wr2.shared = &sh;
         wr2.n_shared = 1;

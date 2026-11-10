@@ -285,7 +285,10 @@ typedef pulsar_segment_status (*pulsar_kvchain_segment_checker)(void *ud, const 
  *  fault: what it invalidates is dropped from the store (a segment's rows: it and everything below it, by key; a
  *  restore point: it alone) and `err` says which; *next stays at it.  L347 I3a / I3b (plans/124 D7): 2 on a transient
  *  failure (no room in the RAM pool to read a part now, the bank, the device, a TP rank's copy, a bad slice): nothing
- *  is dropped.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
+ *  is dropped.  L375 (O25): 3 when a part's file could not be read now (pulsar_segstore_map_part's 3): nothing is
+ *  dropped either, and unlike 2 nothing the store's writer finishes changes it -- a caller that waits for the
+ *  writer's commits on 2 does not on 3.  A part whose read keeps failing becomes a content fault in the store
+ *  (PULSAR_SEGSTORE_READ_FAILS_MAX) and is dropped here as one.  Bytes and order are the one-shot's whatever `k` is: a slice ends at a segment boundary, where the bank
  *  stands at the next segment's start. */
 /// @param st     the store (a failed segment is dropped from it)
 /// @param chain  the chain pulsar_kvchain_find returned
@@ -296,12 +299,14 @@ typedef pulsar_segment_status (*pulsar_kvchain_segment_checker)(void *ud, const 
 /// @param ud     context for `load`
 /// @param err    receives which segment failed
 /// @param errlen size of `err`
-/// @return 0 when the slice loaded, 1 on a content fault (dropped), 2 on a transient failure (kept)
+/// @return 0 when the slice loaded, 1 on a content fault (dropped), 2 on a transient failure (kept), 3 on a part's
+///         read that failed now (kept)
 int pulsar_kvchain_load_slice_with(pulsar_segstore *st, const pulsar_segstore_seg *chain, int n, int *next, int k,
                                    pulsar_kvchain_segment_loader load, void *ud, char *err, size_t errlen);
 /** L347 I3b: check the next slice of a chain before any of it is loaded -- segments [*next, *next + k): each part mapped
  *  (from RAM, or read off disk and digest-checked) and its bytes checked by `check`, nothing written -- advancing *next
- *  past each.  Faults as pulsar_kvchain_load_slice_with (1: content, dropped; 2: transient, kept).  A restore that runs
+ *  past each.  Faults as pulsar_kvchain_load_slice_with (1: content, dropped; 2: transient, kept; 3: a read that
+ *  failed now, kept).  A restore that runs
  *  it over the whole chain first leaves the bank untouched by any content fault. */
 /// @param st     the store (a faulty part is dropped from it)
 /// @param chain  the chain pulsar_kvchain_find returned

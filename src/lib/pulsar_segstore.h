@@ -72,6 +72,10 @@
 /// Restore point file format version; v2 (L347 I2): the header's word at 12 is the restore point's flags; v3 (L347
 /// I3a): the payload's digest is pulsar_kvdigest v2.  Older versions are removed at open.
 #define PULSAR_SEGSTORE_RP_VERSION 3u
+/// L375 (O25): a part whose file read fails this many times in a row with a persistent errno (EIO, EACCES, EISDIR,
+/// ...; never ENOENT, which is a fault at once, and never a passing shortage -- EMFILE, ENFILE, ENOMEM, ENOBUFS,
+/// EAGAIN -- which counts nothing: L353 no. 13) is reported as a content fault and dropped by its reader.
+#define PULSAR_SEGSTORE_READ_FAILS_MAX 3
 /// Restore point flag (L347 I2): written at a request's shared-prefix anchor (the second sighting of its preamble)
 #define PULSAR_SEGSTORE_RP_ANCHOR 1u
 /// Restore point flag (L347 I2): written at a periodic grid point (pulsar_kvchain_rp_periodic)
@@ -440,8 +444,11 @@ bool pulsar_segstore_covers(pulsar_segstore *st, const char *text, size_t len, b
  *  @param from_disk receives whether the file was read (NULL: not wanted)
  *  @param err       receives the reason on failure
  *  @param errlen    size of `err`
- *  @return 0 mapped; 1 the part is not stored, or its file is missing, unreadable or bad (a content fault: drop it);
- *          2 no room in the RAM pool to read it now */
+ *  @return 0 mapped; 1 the part is not stored, or its file is missing or bad, or (L375) its read has now failed
+ *          PULSAR_SEGSTORE_READ_FAILS_MAX times in a row with an errno that is not a passing shortage (a content
+ *          fault: drop it); 2 no room in the RAM pool to read it now (images come back at the writer's commits: a
+ *          wait for them can help); 3 (L375) its file is there and could not be read now (EMFILE, ENOMEM, EIO, ...):
+ *          nothing a wait on the writer changes, and nothing to drop */
 int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, const uint8_t **payload,
                              uint64_t *bytes, bool *from_disk, char *err, size_t errlen);
 /** L347 I3a: end a pulsar_segstore_map_part (a lent image is freed).

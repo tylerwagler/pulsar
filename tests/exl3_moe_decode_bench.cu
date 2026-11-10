@@ -246,7 +246,7 @@ int main(int argc, char **argv) {
                 : nemo ? exl3_moe_stacks{nullptr, nullptr, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H, PULSAR_FFN_ACT_RELU2}
                        : exl3_moe_stacks{nullptr, G[l].table, U[l].table, D[l].table, k2gu, k2d, E, H, MID, H, PULSAR_FFN_ACT_SWIGLU};
             const exl3_moe_bufs b{gz, uz, dz, ma};
-            const exl3_moe_shared sh{SG[l].arena, SU[l].arena, SD[l].arena, k2s, k2s, k2s, MID, ssc, syg, syu, sys,
+            exl3_moe_shared sh{SG[l].arena, SU[l].arena, SD[l].arena, k2s, k2s, k2s, MID, ssc, syg, syu, sys,
                                      static_cast<__nv_bfloat16 *>(sh_h), sws, sws_bytes};
             if (k2s && exl3_moe_shared_fork(sh, xa, T, H, H, as_prompt, st) != 0) return -1;   /* the family's order */
             return exl3_moe_routed_launch(w, sel + (size_t)q * maxP, wts + (size_t)q * maxP, T, TOPK, nemo ? 0.0f : 10.0f, xa, b, out,

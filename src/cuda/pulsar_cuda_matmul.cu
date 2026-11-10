@@ -1,10 +1,14 @@
 /** @file
  *  Dense matmul arms: the GEMVs, the FP8 / MXFP8 cuBLASLt GEMMs, the weight resolvers and their caches. */
+#include <array>
 #include <atomic>
+#include <map>
 #include "pulsar_cuda_internal.h"
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
 #include "pulsar_cuda_arch.cuh"
+#include "pulsar_cuda_lt_fixed.h"   /* PULSAR_LT_FIXED_WORKSPACE: the one cuBLASLt workspace size */
+#include "pulsar.h"                 /* PULSAR_PREFILL_CHUNK_DEFAULT: the canonical prefill row count */
 
 
 
@@ -1182,7 +1186,11 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
     fp8_fc_entry *fc = &g_fp8_fc[(uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u))];
     if (offset != 0 && fc->tag.load(std::memory_order_acquire) == offset) {
         const fp8_mx_weight *p = fc->ptr.load(std::memory_order_relaxed);
-        if (p && p->host_base == model_map && p->in_dim == in_dim && p->out_dim == out_dim) return p;
+        /* L375 (O58): the offset too.  The tag and the pointer are two loads: a slot republished between them pairs
+         * this offset's tag with another weight's entry, and layers share (map, in_dim, out_dim) -- the entry's own
+         * offset is what says whose it is. */
+        if (p && p->host_base == model_map && p->offset == offset && p->in_dim == in_dim && p->out_dim == out_dim)
+            return p;
     }
     auto it = g_fp8_mx_by_offset.find({model_map, offset});
     if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
@@ -1890,7 +1898,9 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
     if (!heads || !heads->ptr || n_tokens == 0 || n_groups == 0 ||
         group_dim == 0 || (group_dim % 32) != 0 ||
         !data_out || !scale_out || !sf_pitch || !scale_slab) {
-        return 0;
+        return cuda_refuse("pulsar_gpu_mxfp8_gact_slot", "a NULL operand, no rows or groups, or a group width that is "
+                           "not a positive multiple of 32 (%u tokens, %u groups, group_dim %llu)", n_tokens, n_groups,
+                           (unsigned long long)group_dim);
     }
     const int KBp = pulsar_mx_kbp((int)group_dim);
     const size_t slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
@@ -1904,7 +1914,10 @@ int pulsar_gpu_mxfp8_gact_slot(const pulsar_gpu_tensor *heads, uint32_t n_tokens
      * producers here fill only the (row, kb) pairs they own -- and they own
      * them in TWO passes (attn_f16 the nope blocks, rope_tail the rope tail),
      * so a stale byte between them would survive into the GEMM. */
-    if (cudaMemsetAsync(g_gact.sx, 0, scale_bytes, 0) != cudaSuccess) return 0;
+    if (cudaMemsetAsync(g_gact.sx, 0, scale_bytes, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return cuda_refuse("pulsar_gpu_mxfp8_gact_slot", "the scale slab's clear (%zu bytes) failed", scale_bytes);
+    }
     g_gact.key_ptr     = heads->ptr;
     g_gact.key_ntok    = n_tokens;
     g_gact.key_ngroups = n_groups;
@@ -1944,19 +1957,33 @@ void pulsar_gpu_mxfp8_gact_disarm(void) {
  * when the full activation carries no valid encoding. */
 int pulsar_gpu_mxfp8_act_cache_window(const pulsar_gpu_tensor *x_full, uint64_t row0, uint64_t rows,
                                       uint64_t in_dim, const pulsar_gpu_tensor *x_view) {
-    if (!x_full || !x_view || rows == 0 || in_dim % 32 != 0) return 0;
+    if (!x_full || !x_view || rows == 0 || in_dim % 32 != 0)
+        return cuda_refuse("pulsar_gpu_mxfp8_act_cache_window", "a NULL operand, no rows, or a width that is not a "
+                           "multiple of 32 (rows %llu at %llu, in_dim %llu)", (unsigned long long)rows,
+                           (unsigned long long)row0, (unsigned long long)in_dim);
     mxfp8_act_cache_t *src = act_slot_find_rows(x_full->ptr, row0 + rows, in_dim);
-    if (!src || !src->valid || !src->xq || !src->sx) return 0;
+    if (!src || !src->valid || !src->xq || !src->sx)
+        return cuda_refuse("pulsar_gpu_mxfp8_act_cache_window", "the full activation carries no valid E4M3 encoding "
+                           "covering rows [0, %llu) at in_dim %llu (%s)", (unsigned long long)(row0 + rows),
+                           (unsigned long long)in_dim, !src ? "no slot" : !src->valid ? "its slot is not valid"
+                                                                                      : "its slot has no buffers");
     const int KBp = pulsar_mx_kbp((int)in_dim);
     const size_t sx_bytes = pulsar_mx_sf_slab_bytes((int)rows, KBp);
     /* keep the source's buffers: acquire may evict an LRU slot, never the one
      * we are reading from (it was just touched by the lookup). */
     __nv_fp8_e4m3 *src_q = src->xq; unsigned char *src_sf = src->sx;
     mxfp8_act_cache_t *dst = act_slot_acquire(x_view->ptr, rows, in_dim);
-    if (!dst || dst == src) return 0;
+    if (!dst || dst == src)
+        return cuda_refuse("pulsar_gpu_mxfp8_act_cache_window", "the view's slot is the full activation's own (the "
+                           "view and the full tensor share a key: rows %llu at %llu, in_dim %llu)",
+                           (unsigned long long)rows, (unsigned long long)row0, (unsigned long long)in_dim);
     if (!mxfp8_act_cache_reserve((void **)&dst->xq, &dst->xq_cap, rows * in_dim, "act window data") ||
-        !mxfp8_act_cache_reserve((void **)&dst->sx, &dst->sx_cap, sx_bytes, "act window scale")) return 0;
-    if (cudaMemcpyAsync(dst->xq, src_q + row0 * in_dim, rows * in_dim, cudaMemcpyDeviceToDevice, 0) != cudaSuccess) return 0;
+        !mxfp8_act_cache_reserve((void **)&dst->sx, &dst->sx_cap, sx_bytes, "act window scale")) return 0;   /* said */
+    if (cudaMemcpyAsync(dst->xq, src_q + row0 * in_dim, rows * in_dim, cudaMemcpyDeviceToDevice, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return cuda_refuse("pulsar_gpu_mxfp8_act_cache_window", "the window's data copy (%llu rows x %llu) failed",
+                           (unsigned long long)rows, (unsigned long long)in_dim);
+    }
     cudaMemsetAsync(dst->sx, 0, sx_bytes, 0);
     const long n_pairs = (long)rows * KBp;
     mx_scale_rebase_kernel<<<(unsigned)((n_pairs + 255) / 256), 256>>>(dst->sx, src_sf, (int)row0, (int)rows, KBp, 1,
@@ -2142,21 +2169,33 @@ struct lt_cache_key_hash {
 static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x,
         uint64_t row0, uint64_t n_tok, const char *label) {
-    if (!out || !x || !model_map || in_dim % 32 != 0 || !cublaslt_ensure()) return 0;
+    if (!out || !x || !model_map || in_dim % 32 != 0)
+        return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: a NULL operand, or an input width that is not a multiple "
+                           "of 32 (in_dim %llu, out_dim %llu)", label ? label : "mxfp8", (unsigned long long)in_dim,
+                           (unsigned long long)out_dim);
+    if (!cublaslt_ensure())
+        return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: the cuBLASLt handle is not ready", label ? label : "mxfp8");
     /* Derived from the destination, never passed in: the two cannot
      * disagree if only one of them exists. */
     const int out_f16 = (pulsar_tensor_esz(out) == sizeof(__half));
 
     uint64_t KB = in_dim / 32, weight_bytes = out_dim * KB * 33;
-    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: the weight's %llu bytes at offset %llu run past the "
+                           "mapping's %llu", label ? label : "mxfp8", (unsigned long long)weight_bytes,
+                           (unsigned long long)weight_offset, (unsigned long long)model_size);
     const size_t out_esz = out_f16 ? sizeof(__half) : sizeof(float);
     const uint64_t rows_total = row0 + n_tok;
-    if (x->bytes < rows_total * in_dim * sizeof(float) || out->bytes < rows_total * out_dim * out_esz) return 0;
+    if (x->bytes < rows_total * in_dim * sizeof(float) || out->bytes < rows_total * out_dim * out_esz)
+        return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: rows [%llu, %llu) of %llu -> %llu do not fit x (%llu "
+                           "bytes) or out (%llu bytes, %zu a value)", label ? label : "mxfp8", (unsigned long long)row0,
+                           (unsigned long long)rows_total, (unsigned long long)in_dim, (unsigned long long)out_dim,
+                           (unsigned long long)x->bytes, (unsigned long long)out->bytes, out_esz);
     const fp8_mx_weight *w = cuda_fp8_mx_weight(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
     size_t sx_bytes = pulsar_mx_sf_slab_bytes(ntok, KBp);
-    size_t wz = 32u << 20;
+    size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     /* xq, sx and the cuBLASLt workspace must be DISTINCT buffers, but
      * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
      * realloc/free earlier ones), so these three come from one arena. */
@@ -2199,7 +2238,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
      * it replaces re-ran a dropped shape's heuristic on its next call, which inside a CUDA-graph capture finds no
      * kernel: a captured step refused for a shape it had run before (L306, the warmup's verify walk). */
     struct lt_shape_cache {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulHeuristicResult_t h;
@@ -2247,9 +2286,11 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
         if (hs != CUBLAS_STATUS_SUCCESS || !got) {
             cublasLtMatrixLayoutDestroy(ne.la); cublasLtMatrixLayoutDestroy(ne.lb);
             cublasLtMatrixLayoutDestroy(ne.ld); cublasLtMatmulDescDestroy(ne.op);
-            return 0;
+            return cuda_refuse("cuda_matmul_fp8_mx_window", "%s: cuBLASLt has no fixed-order MXFP8 kernel for %llu -> "
+                               "%llu at %d rows (%s output; heuristic status %d)", label ? label : "mxfp8",
+                               (unsigned long long)in_dim, (unsigned long long)out_dim, ntok, out_f16 ? "f16" : "f32",
+                               (int)hs);
         }
-        ne.valid = 1;
         e = &cache.emplace(ck, ne).first->second;
     }
     cublasLtMatmulDescSetAttribute(e->op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w->scale, sizeof(w->scale));
@@ -2289,9 +2330,10 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
 
 /* The canonical row count at which a prefill GEMM arm chooses its ONE kernel
  * per shape (the production prefill chunk): the plain-weight arm (L183) and
- * the attn-out 'a' arm (L195) both pin here. */
-/// The canonical row count a prefill cuBLASLt arm chooses its one kernel at.
-#define PULSAR_BF16_LT_CANON_ROWS 4096
+ * the attn-out 'a' arm (L195) both pin here.  It IS the default prefill chunk, read from its one definition (L375:
+ * it was a second 4096). */
+/// The canonical row count a prefill cuBLASLt arm chooses its one kernel at: the default prefill chunk.
+#define PULSAR_BF16_LT_CANON_ROWS ((int)PULSAR_PREFILL_CHUNK_DEFAULT)
 
 /* Prefill attn-output "a" projection as n_groups block-scaled MXFP8xMXFP8 GEMMs.
  *
@@ -2337,7 +2379,7 @@ static int cuda_attention_output_a_mx_gemm(
     size_t x_scale_slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
     const size_t w_scale_slab = ((size_t)rank / 128) * (size_t)KBp * 128;
     const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
-    size_t wz = 32u << 20;
+    size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     __nv_fp8_e4m3 *xq;
     unsigned char *sx;
     void *ws;
@@ -2387,22 +2429,20 @@ static int cuda_attention_output_a_mx_gemm(
      * it picks a non-MX algo; the per-group loop re-sets them per call.
      * Prefill rows only: decode rows take the MMA arm (L262). */
     struct lt_group_shape {
-        uint64_t group_dim, rank; uint32_t n_groups; int valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
     };
-    /** thread_local -- same destroy-on-evict hazard as the shape cache above. */
-    static thread_local lt_group_shape shapes[32];
-    static thread_local int shapes_next;
-    lt_group_shape *sh = NULL;
-    for (int i = 0; i < 32; i++) {
-        if (shapes[i].valid && shapes[i].group_dim == group_dim && shapes[i].rank == rank &&
-            shapes[i].n_groups == n_groups) { sh = &shapes[i]; break; }
-    }
+    /* L375 (O55), the L306 rule bf16_lt_matmul took in L335: never evicted.  This was a 32-slot ring (and the
+     * per-row-count entries below another), evicted round-robin: a dropped shape's heuristic, re-run inside a graph
+     * capture, finds no kernel.  Keys: (group_dim, rank, n_groups) here, + ntok below.  thread_local: a second
+     * submitting thread gets its own descriptors. */
+    static thread_local std::unordered_map<lt_cache_key, lt_group_shape, lt_cache_key_hash> shapes;
+    const lt_cache_key sk = {group_dim, rank, 0u, (uint64_t)n_groups};
+    auto shit = shapes.find(sk);
+    lt_group_shape *sh = shit != shapes.end() ? &shit->second : NULL;
     if (!sh) {
         lt_group_shape ns = {};
-        ns.group_dim = group_dim; ns.rank = rank; ns.n_groups = n_groups;
         if (cublasLtMatmulDescCreate(&ns.op, CUBLAS_COMPUTE_32F, CUDA_R_32F)) return 0;
         cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
         cublasLtMatmulMatrixScale_t mo = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
@@ -2437,28 +2477,19 @@ static int cuda_attention_output_a_mx_gemm(
             return 0;
         }
         ns.algo = hr.algo;
-        ns.valid = 1;
-        sh = &shapes[shapes_next];
-        shapes_next = (shapes_next + 1) & 31;
-        if (sh->valid) { cublasLtMatrixLayoutDestroy(sh->la); cublasLtMatmulDescDestroy(sh->op); }
-        *sh = ns;
+        sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct lt_group_call {
-        uint64_t group_dim, rank; uint32_t n_groups; int ntok; int valid;
         cublasLtMatrixLayout_t lb, ld;
     };
-    static thread_local lt_group_call calls[32];
-    static thread_local int calls_next;
-    lt_group_call *e = NULL;
-    for (int i = 0; i < 32; i++) {
-        if (calls[i].valid && calls[i].group_dim == group_dim && calls[i].rank == rank &&
-            calls[i].n_groups == n_groups && calls[i].ntok == (int)n_tokens) { e = &calls[i]; break; }
-    }
+    static thread_local std::unordered_map<lt_cache_key, lt_group_call, lt_cache_key_hash> calls;
+    const lt_cache_key ck = {group_dim, rank, (uint64_t)n_tokens, (uint64_t)n_groups};
+    auto chit = calls.find(ck);
+    lt_group_call *e = chit != calls.end() ? &chit->second : NULL;
     if (!e) {
         lt_group_call ne = {};
-        ne.group_dim = group_dim; ne.rank = rank; ne.n_groups = n_groups; ne.ntok = (int)n_tokens;
         cublasLtMatrixLayoutCreate(&ne.lb, CUDA_R_8F_E4M3, group_dim, n_tokens, group_dim);
         cublasLtMatrixLayoutCreate(&ne.ld, CUDA_R_32F, rank, n_tokens, low_dim);
         cublasLtMatmulHeuristicResult_t chk;
@@ -2471,11 +2502,7 @@ static int cuda_attention_output_a_mx_gemm(
                     (int)PULSAR_BF16_LT_CANON_ROWS, n_tokens);
             return 0;
         }
-        ne.valid = 1;
-        e = &calls[calls_next];
-        calls_next = (calls_next + 1) & 31;
-        if (e->valid) { cublasLtMatrixLayoutDestroy(e->lb); cublasLtMatrixLayoutDestroy(e->ld); }
-        *e = ne;
+        e = &calls.emplace(ck, ne).first->second;
     }
     cublasLtMatmulDesc_t op = sh->op;
     cublasLtMatrixLayout_t la = sh->la, lb = e->lb, ld = e->ld;
@@ -3098,16 +3125,8 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
     {
         const uint64_t n_dec = (uint64_t)g_batch_decode_rows;
         if (n_dec > 0 && n_dec < n_tok) {
-            /* Row strides are BYTES: the output half must follow the OUTPUT
-             * element size, or the suffix lands at the wrong offset. */
-            const uint64_t inb = in_dim * sizeof(float);
-            const uint64_t outb = out_dim * (out_f16 ? sizeof(__half) : sizeof(float));
             pulsar_gpu_tensor out_pre = pulsar_tensor_subview(out, 0, out->bytes);
             pulsar_gpu_tensor x_pre   = pulsar_tensor_subview(x, 0, x->bytes);
-            pulsar_gpu_tensor out_suf = pulsar_tensor_subview(out, n_dec * outb,
-                                                             out->bytes - n_dec * outb);
-            pulsar_gpu_tensor x_suf   = pulsar_tensor_subview(x, n_dec * inb,
-                                                             x->bytes - n_dec * inb);
             const int saved = g_batch_decode_rows;
             g_batch_decode_rows = (int)n_dec;  ///< decode prefix: n_dec == n_tok' => no further split
             int r1 = cuda_matmul_mxfp8_tensor_labeled(&out_pre, model_map, model_size,
@@ -3118,7 +3137,6 @@ static int cuda_matmul_mxfp8_tensor_labeled(pulsar_gpu_tensor *out, const void *
              * the window reads the producer's full-width slot; an offset f32
              * view keyed no slot and used to be quantised here -- that path is
              * gone. */
-            (void)out_suf; (void)x_suf;
             int r2 = cuda_matmul_fp8_mx_window(out, model_map, model_size,
                     weight_offset, in_dim, out_dim, x, n_dec, n_tok - n_dec, label);
             g_batch_decode_rows = saved;
@@ -3413,10 +3431,10 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         fprintf(stderr, "pulsar: bf16 GEMM on prefill rows: cuBLASLt handle not ready -- refusing\n");
         return 0;
     }
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     /* ONE algorithm per weight shape, chosen at the canonical row count. */
     struct bf16_lt_shape {
-        uint64_t in_dim, out_dim; int valid;
+        uint64_t in_dim, out_dim;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la;
         cublasLtMatmulAlgo_t algo;
@@ -3457,13 +3475,12 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
             return 0;
         }
         ns.algo = hr.algo;
-        ns.valid = 1;
         sh = &shapes.emplace(sk, ns).first->second;
     }
     /* per (shape, ntok): the row-count layouts and the check that the shape's
      * kernel supports this row count */
     struct bf16_lt_call {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatrixLayout_t lb, ld;
     };
     static thread_local std::unordered_map<lt_cache_key, bf16_lt_call, lt_cache_key_hash> calls;
@@ -3485,7 +3502,6 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
                     (unsigned long long)in_dim, (unsigned long long)out_dim, PULSAR_BF16_LT_CANON_ROWS, ntok);
             return 0;
         }
-        ne.valid = 1;
         e = &calls.emplace(ck, ne).first->second;
     }
     cuda_arena ar;
@@ -3524,7 +3540,7 @@ int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const
         return 0;
     }
     if (m <= 0 || n <= 0 || k <= 0) return 0;
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     cublasLtMatmulDesc_t op = NULL;
     cublasLtMatrixLayout_t la = NULL, lb = NULL, lc = NULL;
     cublasLtMatmulPreference_t pf = NULL;
@@ -3583,24 +3599,19 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
         return 0;
     }
     struct shape_t {
-        int ldc, lda, ldb, b_trans, m, n, k, batch;
-        int64_t sc, sa, sb;
-        bool valid;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, lc;
         cublasLtMatmulAlgo_t algo;
     };
-    static thread_local shape_t cache[8];
-    static thread_local int next;
-    shape_t *e = nullptr;
-    for (int i = 0; i < 8 && !e; i++) {
-        shape_t &q = cache[i];
-        if (q.valid && q.ldc == ldc && q.lda == lda && q.ldb == ldb && q.b_trans == b_trans && q.m == m && q.n == n &&
-            q.k == k && q.batch == batch && q.sc == stride_c && q.sa == stride_a && q.sb == stride_b)
-            e = &q;
-    }
+    /* L375 (O55), the L306 rule: never evicted.  This was an 8-slot ring evicted round-robin, and 8 was exactly the
+     * shapes the LiLiCorr head runs today with nothing tying the two: a ninth shape would have dropped one whose
+     * heuristic, re-run inside the draft pass's graph capture, finds no kernel.  The key is the whole call shape. */
+    static thread_local std::map<std::array<int64_t, 11>, shape_t> cache;
+    const std::array<int64_t, 11> key = {ldc, lda, ldb, b_trans, m, n, k, batch, stride_c, stride_a, stride_b};
+    auto hit = cache.find(key);
+    shape_t *e = hit != cache.end() ? &hit->second : nullptr;
     if (!e) {
-        shape_t q = {ldc, lda, ldb, b_trans, m, n, k, batch, stride_c, stride_a, stride_b, false, NULL, NULL, NULL, NULL, {}};
+        shape_t q = {NULL, NULL, NULL, NULL, {}};
         const cublasOperation_t ta = b_trans ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
         const uint64_t zero = 0;
         cublasLtMatmulPreference_t pf = NULL;
@@ -3655,16 +3666,7 @@ int pulsar_gpu_bf16_batched_gemm(float *c, int ldc, int64_t stride_c, const uint
                             "cuBLASLt kernel -- refusing\n", m, n, k, b_trans, batch);
             return 0;
         }
-        q.valid = true;
-        e = &cache[next];
-        next = (next + 1) & 7;
-        if (e->valid) {
-            cublasLtMatrixLayoutDestroy(e->lc);
-            cublasLtMatrixLayoutDestroy(e->lb);
-            cublasLtMatrixLayoutDestroy(e->la);
-            cublasLtMatmulDescDestroy(e->op);
-        }
-        *e = q;
+        e = &cache.emplace(key, q).first->second;
     }
     const float al = 1.0f, be = 0.0f;
     /* L298: stream 0 is the engine's per-thread default stream; cuBLAS reads 0 as the LEGACY one, outside a capture
@@ -3712,9 +3714,9 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
         fprintf(stderr, "pulsar: bf16 GEMM on decode rows: cuBLASLt handle not ready -- refusing\n");
         return 0;
     }
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     struct bf16_lt_decode_ent {
-        uint64_t in_dim, out_dim; int ntok; int valid;
+        uint64_t in_dim, out_dim; int ntok;
         cublasLtMatmulDesc_t op;
         cublasLtMatrixLayout_t la, lb, ld;
         cublasLtMatmulAlgo_t algo;
@@ -3769,7 +3771,6 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
             return 0;
         }
         ne.algo = hr.algo;
-        ne.valid = 1;
         static int announced = 0;
         if (!announced) {
             announced = 1;
@@ -3835,9 +3836,14 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
      * untemplated float*, and an oversized narrowed batch buffer at small
      * n_tok would pass a pure byte bound (defect nine's shape). */
     if (pulsar_tensor_esz(x) != sizeof(float) ||
-        pulsar_tensor_esz(out) != sizeof(float)) return 0;
+        pulsar_tensor_esz(out) != sizeof(float))
+        return cuda_refuse("matmul_bf16_wptr", "x and out must be f32 buffers (element sizes %u and %u)",
+                           pulsar_tensor_esz(x), pulsar_tensor_esz(out));
     if (x->bytes < n_tok * in_dim * sizeof(float) ||
-        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+        out->bytes < n_tok * out_dim * sizeof(float))
+        return cuda_refuse("matmul_bf16_wptr", "%llu rows of %llu -> %llu do not fit x (%llu bytes) or out (%llu bytes)",
+                           (unsigned long long)n_tok, (unsigned long long)in_dim, (unsigned long long)out_dim,
+                           (unsigned long long)x->bytes, (unsigned long long)out->bytes);
 
     /* ONE bf16 activation for the whole call, READ before the arm is chosen.
      * Every arm below reads these exact bytes, so "which kernel ran" cannot
@@ -3918,12 +3924,20 @@ static int matmul_bf16_wptr(pulsar_gpu_tensor *out, const uint16_t *w,
 
 
 int pulsar_gpu_matmul_bf16_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0)
+        return cuda_refuse("pulsar_gpu_matmul_bf16_tensor", "a NULL operand or an empty shape (%llu rows of %llu -> "
+                           "%llu)",
+                           (unsigned long long)n_tok, (unsigned long long)in_dim, (unsigned long long)out_dim);
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim ||
+        out_dim * in_dim * sizeof(uint16_t) > model_size - weight_offset)
+        return cuda_refuse("pulsar_gpu_matmul_bf16_tensor", "the %llu x %llu bf16 weight at offset %llu runs past the "
+                           "mapping's %llu bytes", (unsigned long long)out_dim, (unsigned long long)in_dim,
+                           (unsigned long long)weight_offset, (unsigned long long)model_size);
     const uint64_t weight_bytes = out_dim * in_dim * sizeof(uint16_t);
-    if (weight_bytes > model_size - weight_offset) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
-    if (!wptr) return 0;
+    if (!wptr)
+        return cuda_refuse("pulsar_gpu_matmul_bf16_tensor", "no device copy of the %llu-byte bf16 weight at offset %llu",
+                           (unsigned long long)weight_bytes, (unsigned long long)weight_offset);
     return matmul_bf16_wptr(out, (const uint16_t *)wptr, in_dim, out_dim, x, n_tok);
 }
 
@@ -3957,7 +3971,11 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
                                                uint64_t offset,
                                                uint64_t in_dim, uint64_t out_dim) {
     const f32w_key key{model_map, offset, in_dim, out_dim};
-    f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)(offset & (F32W_FC - 1u))];
+    /* L375: a hash of the offset.  The index was `offset & 7`, and weight offsets are aligned: every weight shared
+     * one or two of the eight slots.  The top three bits of a multiplicative hash spread them; a hit is still decided
+     * by the entry's key. */
+    static_assert(F32W_FC == 8u, "the slot index below is a 3-bit hash");
+    f32w_fc_entry *fc = &g_f32w_fc[(uint32_t)((offset * 0x9E3779B97F4A7C15ull) >> 61)];
     const f32w_node *hit = fc->node.load(std::memory_order_acquire);
     if (hit && hit->first == key) return hit->second;
     auto it = g_f32w_bf16.find(key);
@@ -3967,7 +3985,12 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
     }
     const uint64_t n = in_dim * out_dim;
     const uint64_t f32_bytes = n * sizeof(float);
-    if (offset > model_size || f32_bytes > model_size - offset) return NULL;
+    if (offset > model_size || f32_bytes > model_size - offset) {
+        (void)cuda_refuse("f32_weight_bf16_resolve", "the %llu x %llu f32 weight at offset %llu runs past the mapping's "
+                          "%llu bytes", (unsigned long long)out_dim, (unsigned long long)in_dim, (unsigned long long)offset,
+                          (unsigned long long)model_size);
+        return NULL;
+    }
     const float *src = (const float *)cuda_model_range_ptr(model_map, offset,
                                                            f32_bytes, "f32->bf16 src");
     if (!src) return NULL;
@@ -3998,8 +4021,10 @@ static const uint16_t *f32_weight_bf16_resolve(const void *model_map,
 
 
 int pulsar_gpu_matmul_f32_tensor(pulsar_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const pulsar_gpu_tensor *x, uint64_t n_tok) {
-    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-    if (out_dim > UINT64_MAX / in_dim) return 0;
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 || out_dim > UINT64_MAX / in_dim)
+        return cuda_refuse("pulsar_gpu_matmul_f32_tensor", "a NULL operand, an empty shape or one that overflows (%llu "
+                           "rows of %llu -> %llu)", (unsigned long long)n_tok, (unsigned long long)in_dim,
+                           (unsigned long long)out_dim);
     /* L079/L087 phase 1: resolve the once-converted bf16 copy and run the
      * SHARED bf16 core (see matmul_bf16_wptr).  What used to be here -- the
      * f32 NT kernels, cublasSgemm, and the f32 GEMV -- computed in f32 for
@@ -4203,7 +4228,9 @@ int pulsar_gpu_attention_output_a_tensor(
         uint32_t                n_tokens) {
     if (!low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || n_tokens == 0) {
-        return 0;
+        return cuda_refuse("pulsar_gpu_attention_output_a_tensor", "a NULL operand or an empty shape (%u tokens, %u "
+                           "groups of %llu, rank %llu)", n_tokens, n_groups, (unsigned long long)group_dim,
+                           (unsigned long long)rank);
     }
     const uint64_t low_dim = (uint64_t)n_groups * rank;
     /* inc 4 prefix-split: the decode prefix [0,n_dec) in the M-independent
@@ -4230,14 +4257,21 @@ int pulsar_gpu_attention_output_a_tensor(
             return r1 && r2;
         }
     }
-    if (!g_fp8_offsets.count({model_map, out_a_offset})) return 0;
+    if (!g_fp8_offsets.count({model_map, out_a_offset}))
+        return cuda_refuse("pulsar_gpu_attention_output_a_tensor", "the weight at offset %llu is not a registered MXFP8 "
+                           "tensor of this mapping", (unsigned long long)out_a_offset);
     const uint64_t blocks_a = (group_dim + 31) / 32;
     const uint64_t out_a_bytes = (uint64_t)n_groups * rank * blocks_a * 33u;
     if (out_a_offset > model_size ||
         out_a_bytes > model_size - out_a_offset ||
         heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * PULSAR_HEADS_ELT_SIZE ||
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float)) {
-        return 0;
+        return cuda_refuse("pulsar_gpu_attention_output_a_tensor", "the weight (%llu bytes at %llu of %llu), the heads "
+                           "(%llu bytes) or low (%llu bytes) do not hold %u tokens x %u groups of %llu at rank %llu",
+                           (unsigned long long)out_a_bytes, (unsigned long long)out_a_offset,
+                           (unsigned long long)model_size, (unsigned long long)heads->bytes,
+                           (unsigned long long)low->bytes, n_tokens, n_groups, (unsigned long long)group_dim,
+                           (unsigned long long)rank);
     }
     /* "a" projection by row kind (see the header at g_batch_decode_rows; the
      * split above leaves n_dec at 0 or >= n_tokens).  Either arm runs or the
@@ -4296,13 +4330,20 @@ int pulsar_gpu_attention_output_b_tensor(
             return r1 && r2;
         }
     }
-    if (!g_fp8_offsets.count({model_map, out_b_offset})) return 0;
+    if (!g_fp8_offsets.count({model_map, out_b_offset}))
+        return cuda_refuse("pulsar_gpu_attention_output_b_tensor", "the weight at offset %llu is not a registered MXFP8 "
+                           "tensor of this mapping", (unsigned long long)out_b_offset);
     const uint64_t blocks_b = (low_dim + 31) / 32;
     const uint64_t out_b_bytes = out_dim * blocks_b * 33u;
     if (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset ||
         low->bytes < (uint64_t)n_tokens * low_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
-        return 0;
+        return cuda_refuse("pulsar_gpu_attention_output_b_tensor", "the weight (%llu bytes at %llu of %llu), low (%llu "
+                           "bytes) or out (%llu bytes) do not hold %u tokens of %llu -> %llu",
+                           (unsigned long long)out_b_bytes, (unsigned long long)out_b_offset,
+                           (unsigned long long)model_size, (unsigned long long)low->bytes,
+                           (unsigned long long)out->bytes, n_tokens, (unsigned long long)low_dim,
+                           (unsigned long long)out_dim);
     }
     if (!emit_low_e4m3(low, n_tokens, low_dim)) return 0;
     return cuda_matmul_mxfp8_tensor_labeled(out, model_map, model_size, out_b_offset,

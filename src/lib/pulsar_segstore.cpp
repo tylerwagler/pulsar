@@ -124,6 +124,9 @@ struct pulsar_segstore {
     std::unordered_map<std::string, image> loan_rp;
     /// L347 I3a: parts mapped for a load (pulsar_segstore_map_part; hold_name), with their count: RAM eviction skips them
     std::unordered_map<std::string, int> held;
+    /// L375 (O25): consecutive persistent read failures of a part (hold_name), for PULSAR_SEGSTORE_READ_FAILS_MAX;
+    /// erased by a read that succeeds, by the drop, and with the key
+    std::unordered_map<std::string, int> read_fails;
     /** @param key a key  @param rp its restore point (else its rows)  @return the part's name in `held` */
     static std::string hold_name(const std::string &key, bool rp) { return rp ? key + ".rp" : key; }
     /// L347 I3a: restore point writes in flight (pulsar_segstore_reserve_rp): key -> flags joined while it flies
@@ -356,6 +359,8 @@ struct pulsar_segstore {
         heads.erase(key);
         img_drop(ram_rows, key);   /* L347 I3a: its RAM copies go with it */
         img_drop(ram_rp, key);
+        read_fails.erase(hold_name(key, false));
+        read_fails.erase(hold_name(key, true));
         {
             std::lock_guard<std::mutex> lk(segs_mu);
             segs.erase(it);
@@ -438,6 +443,7 @@ struct pulsar_segstore {
         logf("dropped restore point %s at %u, %llu bytes: %s", e.key, e.G, (unsigned long long)e.rp_bytes, why);
         ::unlink(rp_path(e.key).c_str());
         img_drop(ram_rp, e.key);   /* L347 I3a */
+        read_fails.erase(hold_name(e.key, true));
         used -= e.rp_bytes;
         e.rp_bytes = 0;
         e.rp_flags = 0;
@@ -457,16 +463,42 @@ struct pulsar_segstore {
      * (3) a chain end's restore point: where its conversation resumes, its rows useless without it; (4) a flagged (anchor, periodic) or branch-point
      * restore point: where restores of many requests start.  -1: not a candidate (a segment with children and no
      * restore point; L347 I3b: a PINNED anchor's restore point, and so its rows).  Until L353 class (0) was every
-     * unflagged restore point, so a full store drained its conversations' resume points and kept their dead rows. */
-    /** @param e      an index entry
-     *  @param leaf   it has no children
-     *  @param branch it has >= 2 children
+     * unflagged restore point, so a full store drained its conversations' resume points and kept their dead rows.
+     * L375 (O35): "inside a chain" means a deeper restore point EXISTS below it.  The leaves below may be exempt
+     * (a chain a restore reads, a write in flight's parent), so rows-only ones can outlast classes 0 and 1: a restore
+     * point with only such rows below it is its chain's end in every way that matters -- class 3, not 2. */
+    /** @param e        an index entry
+     *  @param leaf     it has no children
+     *  @param branch   it has >= 2 children
+     *  @param rp_below a restore point is stored somewhere below it (rp_below(); read only for an unflagged restore
+     *                  point with exactly one child)
      *  @return its eviction class (above), -1 for none */
-    static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch) {
+    static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch, bool rp_below) {
         if (e.rp_bytes > 0u && (e.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u) return -1;   /* L347 I3b: pinned */
-        if (e.rp_bytes > 0u) return e.rp_flags != 0u || branch ? 4 : leaf && !e.dominated ? 3 : 2;
+        if (e.rp_bytes > 0u) {
+            if (e.rp_flags != 0u || branch) return 4;
+            if (leaf) return e.dominated ? 2 : 3;
+            return rp_below ? 2 : 3;
+        }
         if (!leaf) return -1;
         return e.dominated ? 0 : 1;
+    }
+    /** @param key a stored key
+     *  @return whether any segment below it has a restore point (the walk stops at the first) */
+    bool rp_below(const std::string &key) const {
+        std::vector<const std::string *> stack{&key};
+        while (!stack.empty()) {
+            const auto ch = children.find(*stack.back());
+            stack.pop_back();
+            if (ch == children.end()) continue;
+            for (const std::string &c : ch->second) {
+                const auto it = segs.find(c);
+                if (it == segs.end()) continue;
+                if (it->second.rp_bytes > 0u) return true;
+                stack.push_back(&c);
+            }
+        }
+        return false;
     }
     /** Evict one restore point (file and index), or one leaf (files and index), by the classes above: the lowest class
      *  first, the least recently used within it.  Never `keep` or `keep2`, a parent of a write in flight or a key being
@@ -481,7 +513,8 @@ struct pulsar_segstore {
             if ((keep && kv.first == keep) || (keep2 && kv.first == keep2)) continue;
             if (pinned.count(kv.first) || pending.count(kv.first)) continue;   /* L338: a write in flight */
             const size_t kids = n_children(kv.first);
-            const int c = evict_class(kv.second, kids == 0u, kids >= 2u);
+            const bool chained = kids == 1u && kv.second.rp_bytes > 0u && kv.second.rp_flags == 0u;
+            const int c = evict_class(kv.second, kids == 0u, kids >= 2u, chained && rp_below(kv.first));
             if (c < 0) continue;
             /* last_used is in seconds: a tie goes by key, so the same store evicts the same way every time */
             if (!victim || c < victim_class ||
@@ -504,6 +537,32 @@ struct pulsar_segstore {
         unlink_files(k);
         unlink_index(k);
         return true;
+    }
+    /** The most bytes evict_one(keep, keep2) could ever release, run until it refuses: every restore point but the
+     *  spared keys' (a pinned anchor's too -- it loses its pin last), and the rows of every segment that is neither a
+     *  spared key nor an ancestor of one (a segment with a stored child never goes).  Spared: `keep`, `keep2`, a parent
+     *  of a write in flight and a key being written, as in evict_one.
+     *  @param keep  a key to spare (NULL = none)
+     *  @param keep2 a second key to spare (NULL = none)
+     *  @return the bytes */
+    uint64_t evictable_bytes(const char *keep, const char *keep2) const {
+        std::unordered_set<std::string> held;   /* the spared keys and their stored ancestors: their rows stay */
+        const auto hold_chain = [&](const std::string &k) {
+            for (auto it = segs.find(k); it != segs.end() && held.insert(it->first).second;
+                 it = segs.find(it->second.parent)) {}
+        };
+        for (auto &kv : pinned) hold_chain(kv.first);
+        for (auto &k : pending) hold_chain(k);
+        if (keep) hold_chain(keep);
+        if (keep2) hold_chain(keep2);
+        uint64_t n = 0;
+        for (auto &kv : segs) {
+            const bool spared = (keep && kv.first == keep) || (keep2 && kv.first == keep2) || pinned.count(kv.first) ||
+                                pending.count(kv.first);
+            if (!spared) n += kv.second.rp_bytes;
+            if (!held.count(kv.first)) n += kv.second.file_bytes;
+        }
+        return n;
     }
     /** L347 I3b: set a stored restore point's flags, in its index entry, its file's header (in place) and its RAM copy.
      *  @param e     the entry (rp_bytes > 0)
@@ -884,11 +943,23 @@ static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, cons
     if (st->budget && st->used + st->reserved - freed + need > st->budget) return false;
     /* L353: the budget counts this store's own files; the disk also holds other stores' and anyone's.  A full disk
      * evicts like a full budget -- without this, every later persist copied out, failed and wrote nothing.  The writes
-     * in flight count in full: the disk may already hold some of them, so this can evict a little early, never late. */
+     * in flight count in full: the disk may already hold some of them, so this can evict a little early, never late.
+     * L375 (O18): only while eviction can close the gap.  A disk short of more bytes than this store could release
+     * (someone else's files fill it) fails the write and keeps every chain -- the loop used to take every leaf, restore
+     * point and pinned anchor first and fail anyway -- and an eviction that does not raise the free space (a file
+     * still held open, a filesystem that frees later) is the last one tried. */
     bool said = false;
     for (;;) {
         const uint64_t avail = disk_free_bytes(st);
         if (avail == UINT64_MAX || st->reserved + need <= avail) return true;
+        const uint64_t short_by = st->reserved + need - avail, can = st->evictable_bytes(keep, keep2);
+        if (can < short_by) {
+            st->logf("the disk has %llu MiB free for a %llu MiB write (%llu MiB in flight): %llu bytes short, and this "
+                     "store could release %llu -- the write fails, nothing more is evicted",
+                     (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20),
+                     (unsigned long long)(st->reserved >> 20), (unsigned long long)short_by, (unsigned long long)can);
+            return false;
+        }
         if (!said) {
             st->logf("the disk has %llu MiB free for a %llu MiB write (%llu MiB in flight): evicting",
                      (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20),
@@ -896,6 +967,13 @@ static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, cons
             said = true;
         }
         if (!st->evict_one(keep, keep2)) return false;
+        const uint64_t after = disk_free_bytes(st);
+        if (after != UINT64_MAX && after <= avail) {
+            st->logf("an eviction left the disk's free space at %llu bytes (%llu before): eviction is not what frees "
+                     "this disk -- the write fails, nothing more is evicted",
+                     (unsigned long long)after, (unsigned long long)avail);
+            return false;
+        }
     }
 }
 
@@ -1390,13 +1468,27 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
     }
     if (fd >= 0) close(fd);
     /* L353 no. 13: a file that is there but can't be read now (EMFILE, ENOMEM, EIO) is no fault of its content: 1 would
-     * drop the key and everything under it */
+     * drop the key and everything under it.  L375 (O25): it is 3, not the pool's 2 -- the reader does not wait on the
+     * writer's backlog for it -- and an errno that is not a passing shortage counts: a part that fails
+     * PULSAR_SEGSTORE_READ_FAILS_MAX reads in a row is a fault (it was re-read, failed and re-prefilled on every
+     * request, for ever).  A shortage (EMFILE, ENFILE, ENOMEM, ENOBUFS, EAGAIN) never counts and never drops. */
+    const std::string part_name = pulsar_segstore::hold_name(k, rp);
     if (rd_errno && rd_errno != ENOENT) {
-        snprintf(err, errlen, "%s %s can't be read now: %s", rp ? "restore point" : "segment", path.c_str(),
-                 strerror(rd_errno));
+        const bool shortage = rd_errno == EMFILE || rd_errno == ENFILE || rd_errno == ENOMEM || rd_errno == ENOBUFS ||
+                              rd_errno == EAGAIN;
+        const int fails = shortage ? 0 : ++st->read_fails[part_name];
         st->img_free(img);
-        return 2;
+        if (fails >= PULSAR_SEGSTORE_READ_FAILS_MAX) {
+            st->read_fails.erase(part_name);
+            snprintf(err, errlen, "%s %s: its read failed %d times in a row (%s)", rp ? "restore point" : "segment",
+                     path.c_str(), fails, strerror(rd_errno));
+            return 1;
+        }
+        snprintf(err, errlen, "%s %s can't be read now: %s%s", rp ? "restore point" : "segment", path.c_str(),
+                 strerror(rd_errno), shortage ? "" : " (counted: a part that keeps failing is dropped)");
+        return 3;
     }
+    st->read_fails.erase(part_name);
     const char *why = nullptr;
     if (rd_errno) why = strerror(rd_errno);
     else if (got != file_bytes) why = "its size is not the indexed size";

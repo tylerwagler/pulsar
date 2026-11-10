@@ -266,11 +266,10 @@ const void *const *pulsar_exl3_expert_table(const void *stack, uint32_t n_expert
 /// @param tokens  device int32 [T] token ids, each in [0, n_vocab) -- checked by the caller on the host
 ///                (pulsar_qwen_s4_embed); the kernel indexes the table unclamped
 /// @param T       rows
-/// @param n_vocab rows in the table
 /// @param streams device bf16 [T][4][2560] out
 /// @param stream  stream to launch on
 /// @return 0, -1 refused (said), -3 launch failure
-int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab, uint16_t *streams,
+int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, uint16_t *streams,
                              cudaStream_t stream);
 
 /** L321: y [rows][out] f32 = the complete Linear of f16 rows x_f16 (an fp16 consumer's operand format: the f16 arm
@@ -419,6 +418,8 @@ typedef struct pulsar_rows_moe_shared {
     const uint8_t *lora_rows;            /**< device u8 [T]: the rows the LoRAs apply to, or NULL = every row */
     void *lora_ws;                       /**< the LoRAs' workspace (with any LoRA): pulsar_rows_lora_workspace_bytes */
     size_t lora_ws_bytes;                /**< its bytes */
+    uint64_t fork;                       /**< a riding shared expert's fork token: pulsar_rows_moe_shared_fork writes
+                                          *   it, the routed launch's join reads it (0 = not forked) */
 } pulsar_rows_moe_shared;
 /** The dense-arm workspace a riding shared expert needs for T rows (in -> mid -> out). */
 /// @param T   rows
@@ -430,13 +431,15 @@ size_t pulsar_rows_moe_shared_ws_bytes(int T, int in, int mid, int out);
 /** L288 exl3-dense: fork the riding shared expert of T bf16 rows onto its own stream (exl3_moe_shared_fork) --
  *  call it AHEAD of the router, then pulsar_rows_moe_routed_launch with the same descriptor joins it before its
  *  sum.  Each pending fork needs its own yg / yu / ys / h rows; a block's shared experts fork in their order.
+ *  The fork writes its token to q->fork and the join matches on it: a fork some other step left pending is refused,
+ *  never joined.  A block whose step fails between a fork and its join calls pulsar_rows_moe_lanes_abandon.
  *  0 on success. */
-/// @param q      the shared expert (its buffers)
+/// @param q      the shared expert (its buffers); out: q->fork, this fork's token (0 on a refusal)
 /// @param x_bf16 device bf16 [T][in]
 /// @param T      rows
 /// @param stream the caller's stream
 /// @return 0 on success, negative on a refusal (said) or a failure
-int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
+int pulsar_rows_moe_shared_fork(pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T, cudaStream_t stream);
 /** A shared expert that does not ride (another format, a Tessera or BF16 routed arm, or RELU2), after the routed sum
  *  is in `out`: out += scale * down(act(gate x, up x)), the linears through the front door's references
  *  (pulsar_linear_rows_ref), over q's buffers. */
@@ -476,8 +479,16 @@ typedef cudaStream_t pulsar_rows_stream;   /**< a launch stream, opaque to the e
 /// @return the routed chain's stream, or NULL (refused: a fork already pending)
 pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller);
 /// @param caller the block's stream, made to wait for the routed chain
-/// @return 0 on success, negative when no fork is pending or the wait fails
+/// @return 0 on success, negative when no fork is pending or the wait fails (the fork then stays pending)
 int pulsar_rows_moe_routed_join(cudaStream_t caller);
+/** Abandon what a failed step left on the calling thread's MoE lanes of (current device, `caller`): every riding
+ *  shared expert's fork still pending (pulsar_rows_moe_shared_fork) and a routed-chain fork not yet joined
+ *  (pulsar_rows_moe_routed_fork).  Each lane's stream is synchronized (inside a graph capture it rejoins `caller`
+ *  instead, so the discarded capture ends clean) and its pending state cleared, so the next step forks onto empty lanes instead of joining this step's leftovers or refusing
+ *  forever.  A block calls it on every failure between a fork and its join, and the step's end calls it when the
+ *  step failed; with nothing pending it does nothing and prints nothing. */
+/// @param caller the block's stream the forks were made on
+void pulsar_rows_moe_lanes_abandon(cudaStream_t caller);
 /** A routed-experts descriptor for pulsar_rows_moe_routed_launch: exactly one weight family is set (the EXL3
  *  tables, the Tessera stacks or the BF16 stacks), the shape, and any riding shared experts. */
 typedef struct pulsar_rows_moe {
