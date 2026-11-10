@@ -5227,10 +5227,18 @@ enum class vision_decode {
 };
 /** O34: what a refusal says when it was the budget's (the text of every layer that reports a busy decode). */
 #define PULSAR_VISION_DECODE_BUSY_TEXT "the image decode budget is in use by other requests; retry"
-/** O34: forget this thread's busy decodes.  The image front's layers between a decode and the engine's API report
- *  with a bool and a text, which cannot carry "busy, retry"; the three calls that decode (the placeholder expansion,
- *  an image sync, a page parse) call this on entry and, when they fail, read vision_decode_busy_seen to report the
- *  refusal as busy through their own result.  Per thread: a decode runs on the thread of the call it serves. */
+/** O34: forget this thread's busy decodes.
+ *
+ *  This record is the ONE way a decode refusal's KIND reaches the engine's API.  The layers between a decode and
+ *  the API -- the family fronts' expand / grid / block_rows, the core's walk, the chunk merge inside a prefill step,
+ *  the image identity -- report with a bool and a text, which cannot carry "busy, retry", and are not retyped.  So:
+ *    - vision_decode_rgb sets it when it returns vision_decode::busy (nothing else writes it);
+ *    - the three API calls that decode -- pulsar_expand_image_placeholders, pulsar_session_sync_mm (mirrored or
+ *      not), a parser's parse -- reset it on entry and, when they FAIL, read vision_decode_busy_seen and report
+ *      through their own result (-1, PULSAR_SESSION_SYNC_BUSY, -3) with PULSAR_VISION_DECODE_BUSY_TEXT;
+ *    - a caller that DISCARDS a failed image step and goes on (a reuse licence that reads "not held", a route
+ *      score without images) resets it there, so a later failure of another cause is not reported busy.
+ *  Per thread: a decode runs on the thread of the call it serves.  Nothing outside the engine reads it. */
 void vision_decode_busy_reset(void);
 /** O34: whether a decode on this thread returned vision_decode::busy since vision_decode_busy_reset.
  *  @return true when one did */

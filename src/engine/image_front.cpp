@@ -324,6 +324,7 @@ void pulsar_image_licence_decide(const pulsar_engine *e, const pulsar_tokens *li
     pulsar_image_identity held;
     const bool held_ok = pulsar_image_identity_build(front_of(e), e, prompt->v, prompt->len, images, n_images, ck,
                                                      &held);
+    if (!held_ok) vision_decode_busy_reset();   /* discarded: read as "not held", the sync goes on (O34) */
     out->n_held = held_ok ? (int)held.n : 0;
     out->held_end = held_ok ? pulsar_image_identity_end(&held) : 0u;
     pulsar_image_identity none;
@@ -341,8 +342,10 @@ bool pulsar_image_holds_below(const pulsar_engine *e, const pulsar_image_identit
     pulsar_image_identity want, held;
     held.n = 0;
     if (held_ids) held = *held_ids;
-    if (!pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images, G, &want))
+    if (!pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images, G, &want)) {
+        vision_decode_busy_reset();   /* discarded: read as "not held", the caller goes on (O34) */
         return false;
+    }
     pulsar_image_identity_trim(&held, G);
     return pulsar_image_identity_equal(&held, &want);
 }

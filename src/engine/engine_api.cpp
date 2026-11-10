@@ -828,24 +828,18 @@ void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n) {
     s->checkpoint_valid = s->engine->family->session->sync->state_agrees(s);
 }
 
-int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
-}
-int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
-                           const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    if (!s) return 1;
+/** pulsar_session_sync_mm's body: the family's sync, mirrored to the peers under tensor parallelism.
+ *  @param s the session
+ *  @param prompt the expanded prompt
+ *  @param images the images, start_pos set
+ *  @param n_images their count (0 = text only)
+ *  @param err receives the failure
+ *  @param errlen bytes at err
+ *  @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1 */
+static int session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                           int n_images, char *err, size_t errlen) {
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) {
-        /* O34: an image sync that failed on a decode the shared budget refused is busy, not a failed prefill (a
-         * mirrored sync below fails as 1 either way: a refused step fails the pair) */
-        vision_decode_busy_reset();
-        const int rc = pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
-        if (rc != 1 || n_images <= 0 || !vision_decode_busy_seen()) return rc;
-        if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
-        return PULSAR_SESSION_SYNC_BUSY;
-    }
+    if (!tp) return pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "sync", err, errlen)) return 1;
     if (tp_mirror_dead(tp, err, errlen)) return 1;
     /* The leader's arguments ARE the operation, so an empty prompt is a caller bug. */
@@ -918,6 +912,24 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     const int body_rc = pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
     s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
+}
+
+int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
+}
+int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
+                           const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s) return 1;
+    /* O34: an image sync that failed on a decode the shared budget refused is busy, not a failed prefill -- the
+     * local sync and the mirrored one alike (the leader decodes on this thread; the pair's own handling of the
+     * failed step is the body's and does not change) */
+    vision_decode_busy_reset();
+    const int rc = session_sync_mm(s, prompt, images, n_images, err, errlen);
+    if (rc != 1 || n_images <= 0 || !vision_decode_busy_seen()) return rc;
+    if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+    return PULSAR_SESSION_SYNC_BUSY;
 }
 int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap) {
     if (!e || !tokens || len < 0 || len > tokens->len) return -1;
@@ -1989,6 +2001,8 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
     const bool by_images = n_images > 0 && !m.seamed &&
                            pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images,
                                                        (uint32_t)prompt->len, &want);
+    if (n_images > 0 && !m.seamed && !by_images)
+        vision_decode_busy_reset();   /* discarded: priced from tokens alone (O34) */
     uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL);
     if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want) &&
         !pulsar_image_holds_below(e, held, prompt, images, n_images, G))
