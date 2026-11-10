@@ -463,16 +463,42 @@ struct pulsar_segstore {
      * (3) a chain end's restore point: where its conversation resumes, its rows useless without it; (4) a flagged (anchor, periodic) or branch-point
      * restore point: where restores of many requests start.  -1: not a candidate (a segment with children and no
      * restore point; L347 I3b: a PINNED anchor's restore point, and so its rows).  Until L353 class (0) was every
-     * unflagged restore point, so a full store drained its conversations' resume points and kept their dead rows. */
-    /** @param e      an index entry
-     *  @param leaf   it has no children
-     *  @param branch it has >= 2 children
+     * unflagged restore point, so a full store drained its conversations' resume points and kept their dead rows.
+     * L375 (O35): "inside a chain" means a deeper restore point EXISTS below it.  The leaves below may be exempt
+     * (a chain a restore reads, a write in flight's parent), so rows-only ones can outlast classes 0 and 1: a restore
+     * point with only such rows below it is its chain's end in every way that matters -- class 3, not 2. */
+    /** @param e        an index entry
+     *  @param leaf     it has no children
+     *  @param branch   it has >= 2 children
+     *  @param rp_below a restore point is stored somewhere below it (rp_below(); read only for an unflagged restore
+     *                  point with exactly one child)
      *  @return its eviction class (above), -1 for none */
-    static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch) {
+    static int evict_class(const pulsar_segstore_seg &e, bool leaf, bool branch, bool rp_below) {
         if (e.rp_bytes > 0u && (e.rp_flags & PULSAR_SEGSTORE_RP_PINNED) != 0u) return -1;   /* L347 I3b: pinned */
-        if (e.rp_bytes > 0u) return e.rp_flags != 0u || branch ? 4 : leaf && !e.dominated ? 3 : 2;
+        if (e.rp_bytes > 0u) {
+            if (e.rp_flags != 0u || branch) return 4;
+            if (leaf) return e.dominated ? 2 : 3;
+            return rp_below ? 2 : 3;
+        }
         if (!leaf) return -1;
         return e.dominated ? 0 : 1;
+    }
+    /** @param key a stored key
+     *  @return whether any segment below it has a restore point (the walk stops at the first) */
+    bool rp_below(const std::string &key) const {
+        std::vector<const std::string *> stack{&key};
+        while (!stack.empty()) {
+            const auto ch = children.find(*stack.back());
+            stack.pop_back();
+            if (ch == children.end()) continue;
+            for (const std::string &c : ch->second) {
+                const auto it = segs.find(c);
+                if (it == segs.end()) continue;
+                if (it->second.rp_bytes > 0u) return true;
+                stack.push_back(&c);
+            }
+        }
+        return false;
     }
     /** Evict one restore point (file and index), or one leaf (files and index), by the classes above: the lowest class
      *  first, the least recently used within it.  Never `keep` or `keep2`, a parent of a write in flight or a key being
@@ -487,7 +513,8 @@ struct pulsar_segstore {
             if ((keep && kv.first == keep) || (keep2 && kv.first == keep2)) continue;
             if (pinned.count(kv.first) || pending.count(kv.first)) continue;   /* L338: a write in flight */
             const size_t kids = n_children(kv.first);
-            const int c = evict_class(kv.second, kids == 0u, kids >= 2u);
+            const bool chained = kids == 1u && kv.second.rp_bytes > 0u && kv.second.rp_flags == 0u;
+            const int c = evict_class(kv.second, kids == 0u, kids >= 2u, chained && rp_below(kv.first));
             if (c < 0) continue;
             /* last_used is in seconds: a tie goes by key, so the same store evicts the same way every time */
             if (!victim || c < victim_class ||

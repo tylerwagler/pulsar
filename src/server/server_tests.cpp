@@ -9393,6 +9393,57 @@ static void test_l353_eviction_keeps_chain_ends(void) {
     l323_rmdir(dir);
 }
 
+/* L375 (O35): a restore point with ONE child and no flag is superseded (class 2) only when a deeper restore point
+ * exists below it.  With everything below it rows-only and exempt from eviction (a chain a restore is reading: pinned)
+ * it is its conversation's only resume point, and goes no sooner than any other chain end's: here the least recently
+ * used chain end (B's) goes first, and A -- used later -- keeps the restore point its pinned rows need. */
+static void test_l375_only_restore_point_is_a_chain_end(void) {
+    char tmpl[] = "/tmp/pulsar-l375-o35.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char a1[41], a2[41], b1[41], n1[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2));   /* rows only, below A's restore point */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    pulsar_segstore_pin(st, a2);   /* a restore is reading A's chain: its rows may not go */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));   /* over budget: something goes */
+    pulsar_segstore_seg g;
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes > 0u);   /* was class 2: the first restore point to go */
+    TEST_ASSERT(pulsar_segstore_contains(st, a2));
+    TEST_ASSERT(!pulsar_segstore_get(st, b1, &g) || g.rp_bytes == 0u);   /* the older chain end paid */
+    pulsar_segstore_unpin(st, a2);
+    /* with a deeper restore point below it, the same restore point IS superseded and goes before a chain end's */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    char tmpl2[] = "/tmp/pulsar-l375-o35b.XXXXXX";
+    dir = l323_tmpdir(tmpl2);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2) && l323_put_rp(st, a2, 256));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used2 = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used2, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes == 0u);   /* superseded by a2's: class 2, first to go */
+    TEST_ASSERT(pulsar_segstore_get(st, a2, &g) && g.rp_bytes > 0u);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
 /* L353: a full disk evicts as a full budget does, whatever else fills it; with nothing left to take the write is
  * refused and the store still holds what it had.  A failed write is counted. */
 static uint64_t l353_disk_free(void *ud) {
@@ -15140,6 +15191,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l353_small_fixes();
     test_l353_routing_fixes();
     test_l353_eviction_keeps_chain_ends();
+    test_l375_only_restore_point_is_a_chain_end();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
     test_l353_parked_decoder_frees_nothing();
