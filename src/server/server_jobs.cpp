@@ -1993,7 +1993,11 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
-        pulsar_session_invalidate(s->sess);
+        /* L372: no invalidate here.  The bank keeps the tokens through the stop string; the next request's sync
+         * matches its prompt against them and resumes below where they part, as after any turn.  The call acted on
+         * whatever the pool had installed: in the batched lanes not this slot's bank (a view the slot's own restore
+         * replaces on the driver families; another client's bank, rewound to 0 mid-decode, on DeepSeek), and only on
+         * a decoder leaving the plain batch its own -- whose whole history it then threw away. */
         return true;
     }
 
