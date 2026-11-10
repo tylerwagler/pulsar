@@ -25,6 +25,8 @@
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -503,20 +505,44 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
 /** Rule 9's "once": is this the first time the process says `site`?  A refusal or an announce that can repeat every
  *  step prints behind it, so the log carries each site's line once and the refusal itself stays every call's.
  *  Thread-safe.  The sites are remembered by the label's TEXT (a hash of it), up to a fixed table; past the table
- *  every call answers true -- a line too many, never a refusal nobody saw.  Defined in pulsar_cuda_runtime.cu. */
+ *  every call answers true -- a line too many, never a refusal nobody saw.  Inline, here: the model-free kernel
+ *  gates compile single .cu files of this layer and link no runtime object; one table per program either way. */
 /// @param site the site's label (NULL: unnamed, one label)
 /// @return true the first time `site` is asked about, false after
-bool cuda_first_say(const char *site);
+inline bool cuda_first_say(const char *site) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seen[256];   /* the labels said so far, by FNV-1a of their text (0 never stored: it is 1) */
+    static int n_seen = 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *p = site ? site : "(unnamed)"; *p; ++p) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    if (h == 0) h = 1;
+    bool first = true;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; first && i < n_seen; ++i) first = seen[i] != h;
+    if (first && n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) seen[n_seen++] = h;
+    pthread_mutex_unlock(&mu);
+    return first;
+}
 
 /** Rule 9 for an operand or format refusal (L375): the call refuses every time, its line is printed once per site
  *  -- the site is `site` and the message's FORMAT together, so each refusal of a function says itself once.  The
  *  line names the function, the predicate that failed (the format's prose) and the numbers that failed it.  Not for
- *  a query a correct caller makes on purpose ("does this arm apply"): that stays silent.  Defined in
- *  pulsar_cuda_runtime.cu. */
+ *  a query a correct caller makes on purpose ("does this arm apply"): that stays silent. */
 /// @param site the refusing function's name
 /// @param fmt  printf format: the predicate in words and its numbers
 /// @return 0, always: `return cuda_refuse(...)` is the refusal
-int cuda_refuse(const char *site, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+__attribute__((format(printf, 2, 3))) inline int cuda_refuse(const char *site, const char *fmt, ...) {
+    char label[256];
+    snprintf(label, sizeof(label), "%s: %s", site ? site : "?", fmt);
+    if (!cuda_first_say(label)) return 0;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "pulsar: %s: %s -- refusing (said once for this refusal)\n", site ? site : "?", msg);
+    return 0;
+}
 
 /* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
  * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow

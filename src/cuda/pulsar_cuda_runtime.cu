@@ -6,7 +6,6 @@
 
 #include <list>
 #include <pthread.h>
-#include <stdarg.h>
 
 
 /// Host base of the model mapping set by pulsar_gpu_set_model_map (the one cuda_model_ptr translates).
@@ -158,34 +157,6 @@ static int g_model_load_progress_started;
 /// The progress lines go to a tty (rewritten in place, newline at finish).
 static int g_model_load_progress_tty;
 
-
-bool cuda_first_say(const char *site) {
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-    static uint64_t seen[256];   /* the labels said so far, by FNV-1a of their text (0 never stored: it is 1) */
-    static int n_seen = 0;
-    uint64_t h = 1469598103934665603ull;
-    for (const char *p = site ? site : "(unnamed)"; *p; ++p) h = (h ^ (uint8_t)*p) * 1099511628211ull;
-    if (h == 0) h = 1;
-    bool first = true;
-    pthread_mutex_lock(&mu);
-    for (int i = 0; first && i < n_seen; ++i) first = seen[i] != h;
-    if (first && n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) seen[n_seen++] = h;
-    pthread_mutex_unlock(&mu);
-    return first;
-}
-
-int cuda_refuse(const char *site, const char *fmt, ...) {
-    char label[256];
-    snprintf(label, sizeof(label), "%s: %s", site ? site : "?", fmt);
-    if (!cuda_first_say(label)) return 0;
-    char msg[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-    fprintf(stderr, "pulsar: %s: %s -- refusing (said once for this refusal)\n", site ? site : "?", msg);
-    return 0;
-}
 
 /* One reservation per slot; see pulsar_cuda_scratch.h for why there is more
  * than one.  Indexed by CUDA_SCRATCH_MAIN / CUDA_SCRATCH_MMQ. */
