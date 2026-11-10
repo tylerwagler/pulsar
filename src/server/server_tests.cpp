@@ -9484,6 +9484,43 @@ static void test_l372_empty_banks_are_not_spill_victims(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* L372 (O32): a judge request whose client is gone is ended before its next chunk -- by name, and before anything is
+ * installed (no session here: with the client still there the step goes on to the bank install, which refuses). */
+static void test_l372_judge_ends_a_gone_clients_request(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.live_bank = -1;   /* nothing installed: the step saves no outgoing bank */
+    server_judge *J = new server_judge();
+    J->bank = 1;
+    s.judge = J;
+    for (const bool gone : {true, false}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) break;
+        if (gone) close(sv[1]);
+        judge_job jb;
+        pthread_mutex_init(&jb.mu, NULL);
+        pthread_cond_init(&jb.cv, NULL);
+        jb.fd = sv[0];
+        pulsar_tokens prompt = {0};
+        pulsar_tokens_push(&prompt, 1);
+        jb.prompts.push_back(prompt);
+        J->head = J->tail = &jb;
+        TEST_ASSERT(server_judge_queued(&s));
+        TEST_ASSERT(server_judge_step(&s));
+        TEST_ASSERT(jb.done && !server_judge_queued(&s) && J->tail == NULL && !jb.started);
+        TEST_ASSERT(jb.err == (gone ? "the client disconnected" : "the judge bank could not be installed"));
+        pulsar_tokens_free(&jb.prompts[0]);
+        pthread_cond_destroy(&jb.cv);
+        pthread_mutex_destroy(&jb.mu);
+        close(sv[0]);
+        if (!gone) close(sv[1]);
+    }
+    server_judge_close(&s);
+    pthread_mutex_destroy(&s.mu);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15261,6 +15298,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_gone_client_wait_covers_prefill();
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
+    test_l372_judge_ends_a_gone_clients_request();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

@@ -69,6 +69,7 @@ struct judge_job {
     int pos = 0;                          ///< tokens of prompts[at] the bank holds
     bool started = false;                 ///< prompts[at]'s prefill has begun
     bool done = false;                    ///< the worker has finished with it
+    int fd = -1;                          ///< the client socket (the worker's disconnect poll, L372)
     pthread_mutex_t mu;                   ///< guards done
     pthread_cond_t cv;                    ///< signalled when done
     judge_job *next = nullptr;            ///< next in the queue
@@ -320,6 +321,14 @@ bool server_judge_step(server *s) {
         judge_finish(jb, "the server is shutting down");
         return true;
     }
+    /* L372: a client that is gone gets no prefill -- polled before each chunk, as a chat prefill's is between its own
+     * (gen_prefill_cancel_cb).  Nothing is installed yet, and the bank keeps what the earlier chunks left: a prefix
+     * its next request matches against like any other history. */
+    if (gen_client_disconnected(jb->fd)) {
+        pop();
+        judge_finish(jb, "the client disconnected");
+        return true;
+    }
     pulsar_session *pool = s->sess;
     pulsar_stall_mark("worker: systemone");
     /* L372: a chat job bound or parked mid-prefill leaves its hooks on the shared session; the judge's sync called them
@@ -452,6 +461,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     if (st->kind == pyjson_value::STR) state = st->s;
     else judge_dump_indent1(*st, 0, &state);
     judge_job *jb = new judge_job();
+    jb->fd = fd;
     pthread_mutex_init(&jb->mu, NULL);
     pthread_cond_init(&jb->cv, NULL);
     auto free_job = [&]() {
