@@ -25,6 +25,7 @@
 #include "lib/bpe_tokenizer.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <time.h>
 
@@ -444,6 +445,12 @@ tile_entry g_tile[16];
  *  @var g_tile_next
  *  the round-robin counter (the next slot is g_tile_next % 16) */
 int g_tile_n = 0, g_tile_next = 0;
+/// Guards g_tile and its two counters (L375).  A server's connection threads fill the cache at the parse (the
+/// expansion) and its worker's thread may read or fill it: unlocked, a reader could match an entry's key and length
+/// while a replacement was half written and take the other image's tile (a wrong block length: the prefill then
+/// refuses the tower's row count), and two writers could both take the last free slot and push the count past the
+/// table.  Never held across a decode.
+pthread_mutex_t g_tile_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /// An image's tile, from the cache or by decoding it.
 /// @param v the tower
@@ -453,20 +460,25 @@ int g_tile_n = 0, g_tile_next = 0;
 /// @return false when the image does not decode or has no tile within max_patches
 bool tile_of(const pulsar_nemotron_h_vision *v, const pulsar_image_ref *img, uint32_t *wp, uint32_t *hp) {
     const uint64_t key = pulsar_image_content_hash(img);
+    pthread_mutex_lock(&g_tile_mu);
     for (int i = 0; i < g_tile_n; i++)
         if (g_tile[i].key == key && g_tile[i].len == img->len) {
             *wp = g_tile[i].wp;
             *hp = g_tile[i].hp;
+            pthread_mutex_unlock(&g_tile_mu);
             return true;
         }
+    pthread_mutex_unlock(&g_tile_mu);   /* a miss decodes unlocked: two threads may both decode one image */
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
     if (!img->bytes || vision_decode_rgb(img->bytes, img->len, &rgb, &w, &h) != vision_decode::ok) return false;
     free(rgb);
     pulsar_nemotron_h_tile(&v->shape, w, h, wp, hp);
     if (!*wp || !*hp || *wp * *hp > v->shape.max_patches) return false;
+    pthread_mutex_lock(&g_tile_mu);
     const int slot = g_tile_n < 16 ? g_tile_n++ : (g_tile_next++ % 16);
     g_tile[slot] = {key, img->len, *wp, *hp};
+    pthread_mutex_unlock(&g_tile_mu);
     return true;
 }
 
