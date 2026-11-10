@@ -516,7 +516,10 @@ session_slot *server::live_slot_for_ids(const stop_list *ids,
                                               : &sl->responses_live;
         /* Bank-aware: match against THIS slot's bank frontier, not the pool's
          * live cursor (Tier-2 shared pool). -1 for an unprovisioned slot. */
-        const int pos = sl->provisioned ? s->slot_frontier_pos(sl).raw() : -1;
+        /* L380: a yielded terminal checkpoint left the bank inside its turn; the binding stands at the turn's end,
+         * and the continuation is built from the kept turn (anthropic_live_continuation_prompt) */
+        const pulsar_tokens *turn = s->slot_interrupted_turn(sl);
+        const int pos = !sl->provisioned ? -1 : turn ? turn->len : s->slot_frontier_pos(sl).raw();
         if (live_state_matches_ids_locked(st, ids, pos)) found = sl;
     }
     pthread_mutex_unlock(&s->tool_mu);

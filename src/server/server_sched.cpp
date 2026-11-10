@@ -1348,6 +1348,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
      * them). A later continuation of those ids gets the protocol's 409. */
     s->responses_live_clear(sl);
     s->anthropic_live_clear(sl);
+    s->slot_terminal_clear(sl);   /* L380: and the turn a yielded terminal checkpoint kept for it */
 
     const uint64_t committed = sl->est_cost_bytes;
     uint64_t freed = 0;
@@ -5606,6 +5607,29 @@ static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
+bool server_request_queued(server *s) {
+    pulsar::ScopedLock lk(&s->mu);
+    return s->head != NULL || server_judge_queued(s);
+}
+
+/// Waits on `cv` for at most `seconds` (one pthread_cond_timedwait; a signal, a timeout and a spurious wake all
+/// return).
+/// @param cv       the condition (the default clock: CLOCK_REALTIME)
+/// @param mu       its mutex, held by the caller
+/// @param seconds  the longest wait, >= 0
+static void worker_cond_wait_s(pthread_cond_t *cv, pthread_mutex_t *mu, double seconds) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    const long ns = (long)(seconds * 1e9);
+    deadline.tv_sec += ns / 1000000000L;
+    deadline.tv_nsec += ns % 1000000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(cv, mu, &deadline);
+}
+
 /// @brief The worker thread: the one thread that drives the engine -- it binds queued jobs to slots and steps
 ///        their generations a quantum at a time until the server stops (pulsar_server_internal.h, the CUDA-state
 ///        audit).
@@ -5661,14 +5685,17 @@ void *server_worker_main(void *arg) {
              * that can leave head set with nothing active, this predicate
              * becomes a hard spin — keep the first-bank guarantee. */
             /* L311: an idle worker with no queued job first completes the finished turns' terminal checkpoints, one
-             * a pass (a request that arrives meanwhile binds before the next) */
+             * a pass (a request that arrives meanwhile binds before the next).  L380: each once its idle grace has
+             * passed -- at shutdown without it, so every pending one still runs before the worker leaves -- and a
+             * checkpoint that yields to a request comes back here through the bind above, which serves it first */
             {
-                bool queued;
+                bool stopping;
                 {
                     pulsar::ScopedLock lk(&s->mu);
-                    queued = s->head != NULL;
+                    stopping = s->stopping;
                 }
-                if (!queued && (pulsar_stall_mark("terminal checkpoint"), s->terminal_checkpoint_step())) {
+                if (!server_request_queued(s) &&
+                    (pulsar_stall_mark("terminal checkpoint"), s->terminal_checkpoint_step(server_now_sec(), stopping))) {
                     s->publish_metrics_snapshot();
                     continue;
                 }
@@ -5677,8 +5704,16 @@ void *server_worker_main(void *arg) {
             {
                 pulsar::ScopedLock lk(&s->mu);
                 had_head = s->head != NULL;
-                while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-                quit = !s->head && !server_judge_queued(s) && s->stopping;   /* read shared state under the lock */
+                /* L380: a checkpoint inside its grace is what the worker wakes for; no request and none pending, it
+                 * sleeps until one arrives.  The slots are the worker's own state */
+                const double grace_s = s->terminal_wait_s(server_now_sec());
+                if (grace_s < 0.0) {
+                    while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+                } else if (!s->head && !server_judge_queued(s) && !s->stopping) {
+                    worker_cond_wait_s(&s->cv, &s->mu, grace_s);   /* one wait: any wake goes round the loop */
+                }
+                /* read shared state under the lock; a pending checkpoint runs first (the pass above, grace waived) */
+                quit = !s->head && !server_judge_queued(s) && s->stopping && grace_s < 0.0;
             }
             if (quit) break;
             /* A head that was already queued when nothing is active is a head

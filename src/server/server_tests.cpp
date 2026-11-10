@@ -9408,7 +9408,7 @@ static void test_l353_small_fixes(void) {
         s.slots[0].provisioned = true;
         s.slots[0].terminal_pending = true;
         s.slots[0].hint_dead = true;
-        TEST_ASSERT(!s.terminal_checkpoint_step());
+        TEST_ASSERT(!s.terminal_checkpoint_step(0.0, true));
         TEST_ASSERT(!s.slots[0].terminal_pending);
     }
     /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
@@ -12971,6 +12971,134 @@ static void test_l289_lane_reprobe_evidence(void) {
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS + LANE_PRICE_REPROBE_STEPS, 4, 13, 16, 80.0);
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
+
+/* L380: the terminal checkpoint waits out an idle grace and yields to a queued request.  The decisions are host
+ * functions (the step itself needs a session): the grace and the worker's wait, the cancel predicate, what a sync's
+ * result does to the slot, and where a yielded slot's live binding matches. */
+static void test_l380_terminal_grace_and_yield(void) {
+    const double G = PULSAR_SERVER_TERMINAL_GRACE_MS / 1000.0;
+    /* the grace: not before it has passed since the turn ended, yes from then on */
+    TEST_ASSERT(fabs(server_terminal_grace_left_s(100.0, 100.0) - G) < 1e-9);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G / 2, 100.0) > 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G - 0.001, 100.0) > 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G + 0.001, 100.0) == 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(500.0, 100.0) == 0.0);
+
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.pool_banks = 3;
+    s.n_slots = 3;
+    for (int i = 0; i < 3; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+    }
+    /* the worker's wait: none pending sleeps untimed (< 0); else the earliest pending slot's deadline */
+    TEST_ASSERT(s.terminal_wait_s(100.0) < 0.0);
+    s.slots[0].terminal_pending = true;
+    s.slots[0].turn_ended_at = 100.0;
+    s.slots[2].terminal_pending = true;
+    s.slots[2].turn_ended_at = 100.1;
+    TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G - 0.05)) < 1e-9);    /* slot 0's, the earlier turn */
+    TEST_ASSERT(s.terminal_wait_s(100.0 + G + 0.001) == 0.0 && s.terminal_wait_s(200.0) == 0.0);
+    s.slots[0].hint_dead = true;                                          /* a turn that no longer applies is not waited for */
+    TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G + 0.05)) < 1e-9);
+    s.slots[2].spilled = true;
+    TEST_ASSERT(s.terminal_wait_s(100.05) < 0.0);
+    s.slots[0].hint_dead = false;
+    s.slots[2].spilled = false;
+    /* the step picks nothing inside the grace and leaves both pending; the stale one is dropped whatever the clock */
+    s.slots[1].terminal_pending = true;
+    s.slots[1].turn_ended_at = 100.2;
+    s.slots[1].hint_dead = true;
+    TEST_ASSERT(!s.terminal_checkpoint_step(100.05, false));
+    TEST_ASSERT(s.slots[0].terminal_pending && s.slots[2].terminal_pending && !s.slots[1].terminal_pending);
+    TEST_ASSERT(!s.terminal_checkpoint_step(100.0 + G - 0.01, false) && s.slots[0].terminal_pending);
+
+    /* the cancel predicate: true iff a request is queued -- a job, or a judge call */
+    TEST_ASSERT(!server_request_queued(&s));
+    job queued;
+    memset(&queued, 0, sizeof queued);
+    s.head = &queued;
+    TEST_ASSERT(server_request_queued(&s));
+    s.head = NULL;
+    server_judge *J = new server_judge();
+    s.judge = J;
+    TEST_ASSERT(!server_request_queued(&s));
+    judge_job jb;
+    J->head = J->tail = &jb;
+    TEST_ASSERT(server_request_queued(&s));
+    J->head = J->tail = NULL;
+    /* the sync's hook yields to it only once a chunk has landed: the first progress event is the resume point */
+    terminal_sync_watch w = { &s, -1, 0 };
+    s.head = &queued;
+    TEST_ASSERT(!terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36480, 36700);
+    TEST_ASSERT(w.landed == 0 && !terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36608, 36700);
+    TEST_ASSERT(w.landed == 1 && terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36608, 36701);              /* the second sync's start: no chunk */
+    TEST_ASSERT(w.landed == 1);
+    s.head = NULL;
+    TEST_ASSERT(!terminal_cancel_cb(&w));
+    s.judge = NULL;
+    delete J;
+
+    /* the sync's result: its end persists, a yield re-arms and neither persists nor invalidates, a failure
+     * invalidates */
+    const terminal_outcome done = server_terminal_outcome(0), yielded = server_terminal_outcome(PULSAR_SESSION_SYNC_INTERRUPTED),
+                           failed = server_terminal_outcome(1), busy = server_terminal_outcome(PULSAR_SESSION_SYNC_BUSY);
+    TEST_ASSERT(done.persist && !done.rearm && !done.invalidate);
+    TEST_ASSERT(!yielded.persist && yielded.rearm && !yielded.invalidate);
+    TEST_ASSERT(!failed.persist && !failed.rearm && failed.invalidate);
+    TEST_ASSERT(!busy.persist && !busy.rearm && busy.invalidate);
+
+    /* a yielded slot: pending again with its turn kept, due at once (its turn ended before the checkpoint started) */
+    session_slot *sl = &s.slots[1];
+    sl->hint_dead = false;
+    sl->turn_ended_at = 100.2;
+    TEST_ASSERT(!sl->terminal_pending && s.slot_interrupted_turn(sl) == NULL);
+    pulsar_tokens turn = {0};
+    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, 1000 + i);
+    s.slot_terminal_rearm(sl, &turn, true);
+    TEST_ASSERT(turn.len == 0 && turn.v == NULL);
+    TEST_ASSERT(sl->terminal_pending && sl->terminal_short_first && sl->provisioned);
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == &sl->terminal_turn && sl->terminal_turn.len == 700);
+    s.slots[0].terminal_pending = s.slots[2].terminal_pending = false;
+    TEST_ASSERT(s.terminal_wait_s(100.2 + G + 1.0) == 0.0);
+    /* its live tool binding matches at the turn's end -- where the checkpoint set it -- not at the bank's position
+     * (0 here: no session), so the continuation still finds its owner */
+    id_list_push_unique(&sl->anthropic_live.call_ids, "toolu_l380t");
+    sl->anthropic_live.valid = true;
+    sl->anthropic_live.live_tokens = 700;
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_l380t");
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == sl);
+    /* the bind reads the turn with its job already on the slot (gen_begin) */
+    sl->active_job = &queued;
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == &sl->terminal_turn);
+    sl->active_job = NULL;
+    /* a slot spilled since no longer stands inside the turn: the turn is not read, and the clear frees it */
+    sl->spilled = true;
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == NULL && s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl->spilled = false;
+    s.slot_terminal_clear(sl);
+    TEST_ASSERT(!sl->terminal_pending && !sl->terminal_short_first && sl->terminal_turn.len == 0 &&
+                sl->terminal_turn.v == NULL);
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    id_list_free(&ids);
+    live_tool_state_free(&sl->anthropic_live);
+
+    /* the bank's tokens must be a prefix of the kept turn for the continuation to be built from it */
+    int a3[] = {1, 2, 3}, a4[] = {1, 2, 3, 4}, b3[] = {1, 9, 3};
+    const pulsar_tokens p3 = {a3, 3, 3}, p4 = {a4, 4, 4}, q3 = {b3, 3, 3}, none = {NULL, 0, 0};
+    TEST_ASSERT(server_tokens_prefix_of(&p3, &p4) && server_tokens_prefix_of(&p4, &p4) && server_tokens_prefix_of(&none, &p3));
+    TEST_ASSERT(!server_tokens_prefix_of(&p4, &p3) && !server_tokens_prefix_of(&q3, &p4));
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
 
 /* L380 -- a probe belongs to the decoder count and depth band it began at.  Qwen one stream (2026-11-10): spec 4 tokens
  * a 53.3 ms round = 75 tok/s, plain predicted 1 / 29 ms = 34.5.  (a) The decoders idling between requests ends
@@ -16784,6 +16912,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
     test_l380_lane_probe_key();
+    test_l380_terminal_grace_and_yield();
     test_l380_batch_frontier();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();

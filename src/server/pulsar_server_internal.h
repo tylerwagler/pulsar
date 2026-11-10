@@ -1386,6 +1386,28 @@ typedef struct {
  * a NO-OP at the protocol level for the surface in question. */
 /// Silence on a streaming slot after which the worker sends a protocol no-op keepalive, ms.
 #define PULSAR_SERVER_HEARTBEAT_MS 5000
+/** L380: the idle grace before a finished turn's terminal checkpoint starts, ms.  An agent's tool round trip is
+ *  typically over 100 ms and a two-chunk checkpoint about 300 ms, so a follow-up arriving inside the grace finds the
+ *  bank free and absorbs the reply's rows in its own sync (about 1 ms a token). */
+#define PULSAR_SERVER_TERMINAL_GRACE_MS 300
+/// @param now_sec       server_now_sec() now
+/// @param turn_ended_at server_now_sec() when the slot's turn ended (session_slot::turn_ended_at)
+/// @return seconds of the idle grace (PULSAR_SERVER_TERMINAL_GRACE_MS) still to pass before the turn's terminal
+///         checkpoint may start; 0 once it may
+double server_terminal_grace_left_s(double now_sec, double turn_ended_at);
+/** L380: what the terminal checkpoint does with its sync's result (server::terminal_checkpoint_step). */
+struct terminal_outcome {
+    bool persist;      ///< the sync reached the turn's end: the chain is persisted ("terminal")
+    bool rearm;        ///< the sync yielded to a queued request: the slot stays valid and pending, nothing persisted
+    bool invalidate;   ///< the sync failed: the bank's state is no position's
+};
+/// @param rc the sync's return (0, PULSAR_SESSION_SYNC_INTERRUPTED, or a failure)
+/// @return exactly one of persist / rearm / invalidate
+terminal_outcome server_terminal_outcome(int rc);
+/// The terminal checkpoint's cancel predicate (L380): work the worker would serve before an idle step.
+/// @param s the server (takes server::mu)
+/// @return true iff a request is queued -- a job at the queue's head or a judge call
+bool server_request_queued(struct server *s);
 /** L313: a bank adopts another bank's published state only when it starts its sync this many tokens deeper than its
  *  own state would: the copy (the shared prefix's pool rows + one checkpoint, ~10-15 ms at a few thousand tokens on
  *  GB10, measured on the bank-adopt gate's banks) costs about what prefilling some 50-100 tokens does. */
@@ -2242,6 +2264,18 @@ typedef struct session_slot {
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
      *  there instead of re-prefilling the reply first.  Cleared by the next job's bind. */
     bool         terminal_pending;
+    /** L380: server_now_sec() when the turn that armed terminal_pending ended: its checkpoint starts no sooner than
+     *  PULSAR_SERVER_TERMINAL_GRACE_MS after it (server_terminal_grace_left_s). */
+    double       turn_ended_at;
+    /** L380: the turn of a terminal checkpoint that YIELDED to a queued request (len > 0 only with terminal_pending):
+     *  the history the checkpoint was syncing to, owned.  The bank stands at a prefix of it -- the chunks that
+     *  landed -- so this is what the checkpoint resumes with when the worker is idle again, and what a live tool
+     *  continuation bound first is built from (server::slot_interrupted_turn).  Freed with the flag
+     *  (server::slot_terminal_clear). */
+    pulsar_tokens terminal_turn;
+    /** L380: the yielded checkpoint stopped inside its first of two syncs (the history short of its last token),
+     *  so the resume runs both again in that order. */
+    bool         terminal_short_first;
     /** L314: the slot's running decoder was PREEMPTED for a prompt the KV budget could not otherwise admit: its
      *  bank's exact state (the frontier payload at its consumed count) is on disk at preempt_path, its physical
      *  freed, its job parked with everything the decode loop keeps (stream, budget, stop / grammar / penalty state,
@@ -3087,11 +3121,15 @@ struct server {
      */
     /// @param sl                the candidate slot (its bank installed)
     /// @param req               the request (its anthropic_live_call_ids and live suffix)
-    /// @param live_pos          the live session's token count; must equal the binding's frontier
-    /// @param effective_prompt  receives the live tokens + the tokenized suffix
+    /// @param live_pos          the live session's token count; must equal the binding's frontier (with `turn`: the
+    ///                          prefix of it the bank stands at)
+    /// @param turn              L380: the turn a yielded terminal checkpoint kept for the slot (the bank stands at
+    ///                          its first live_pos tokens; the binding stands at its end), NULL when there is none
+    /// @param effective_prompt  receives the live tokens (with `turn`: the turn's) + the tokenized suffix
     /// @param matched_ids       receives how many tool_use ids matched (may be NULL)
     /// @return tokens reused from the live session, 0 when the continuation does not apply
-    int anthropic_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, pulsar_tokens *effective_prompt, int *matched_ids);
+    int anthropic_live_continuation_prompt(session_slot *sl, const request *req, int live_pos, const pulsar_tokens *turn,
+                                           pulsar_tokens *effective_prompt, int *matched_ids);
     /** Visible-replay Responses continuation.
      * Other clients send the full visible transcript on every turn even though the
      * API semantics still make the request a continuation.  For Responses, exact
@@ -3340,9 +3378,31 @@ struct server {
      *  with terminal_pending has its bank's history -- to its consumed end, a trailing stop row excluded (the next
      *  render re-spells it) -- synced again, so the reply's decode rows become prefill rows and its grid checkpoints,
      *  prompt end and message endpoint land where the next turn resumes (reuse == cold: the sync IS that turn's
-     *  resume, run early), and the chain is persisted ("terminal").  @return true when it ran one (or dropped one
-     *  that no longer applies), false when none is pending. */
-    bool terminal_checkpoint_step();
+     *  resume, run early), and the chain is persisted ("terminal").  L380: a turn is picked only once its idle grace
+     *  has passed, and the sync yields at a chunk end to a request queued meanwhile (server_request_queued, after
+     *  at least one chunk landed): the bank then stands at a valid prefix, nothing is persisted, and the slot stays
+     *  pending with its turn kept (session_slot::terminal_turn) for the next idle moment. */
+    /// @param now_sec       server_now_sec() now
+    /// @param grace_waived  true to pick a turn still inside its grace (shutdown: every pending checkpoint runs)
+    /// @return true when it ran one (to its end or to a yield) or dropped one that no longer applies, false when none
+    ///         is pending and due
+    bool terminal_checkpoint_step(double now_sec, bool grace_waived);
+    /// @param now_sec server_now_sec() now
+    /// @return seconds until the earliest pending terminal checkpoint is due (0: one is due now), < 0 when none is
+    ///         pending -- the idle worker's wait (L380)
+    double terminal_wait_s(double now_sec) const;
+    /// Clears a slot's terminal checkpoint: the flag and a yielded checkpoint's kept turn (L380).
+    /// @param sl the slot
+    void slot_terminal_clear(session_slot *sl);
+    /// A terminal checkpoint yielded: the slot is pending again and keeps the turn it was syncing to (L380).
+    /// @param sl          the slot (its bank stands at a prefix of `turn`)
+    /// @param turn        the turn's history; moved into the slot (left empty)
+    /// @param short_first the yield came inside the first of the checkpoint's two syncs
+    void slot_terminal_rearm(session_slot *sl, pulsar_tokens *turn, bool short_first);
+    /// @param sl the slot
+    /// @return the turn a yielded terminal checkpoint keeps for it (session_slot::terminal_turn) while its bank
+    ///         stands inside that turn, else NULL (L380)
+    const pulsar_tokens *slot_interrupted_turn(const session_slot *sl) const;
     /** Tear down the slot's generation state.
      *
      * Uninstalls every engine callback FIRST: a cancel/progress callback still
@@ -5353,6 +5413,10 @@ int kv_cache_wait_written(kv_disk_cache *kc);
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
+/// @param a  a token vector
+/// @param b  another
+/// @return true when `a` is a prefix of `b` (or equal to it)
+bool server_tokens_prefix_of(const pulsar_tokens *a, const pulsar_tokens *b);
 bool build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,

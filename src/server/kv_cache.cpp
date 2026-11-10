@@ -685,6 +685,10 @@ void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_sto
     for (int i = 0; i < tail->len; i++) pulsar_tokens_push(out, tail->v[i]);
 }
 
+bool server_tokens_prefix_of(const pulsar_tokens *a, const pulsar_tokens *b) {
+    return a->len <= b->len && (a->len == 0 || !memcmp(a->v, b->v, (size_t)a->len * sizeof a->v[0]));
+}
+
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
                                    const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out, char *err,
                                    size_t errlen) {
@@ -1462,17 +1466,25 @@ int server::responses_live_continuation_prompt(session_slot *sl,
 int server::anthropic_live_continuation_prompt(session_slot *sl,
                                               const request *req,
                                               int live_pos,
+                                              const pulsar_tokens *turn,
                                               pulsar_tokens *effective_prompt,
                                               int *matched_ids) {
     auto *s = this;
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
+    /* L380: with a yielded terminal checkpoint's turn the binding stands at the turn's end, the bank inside it */
     if (!s->anthropic_live_matches_request(sl, &req->anthropic_live_call_ids,
-                                        live_pos)) return 0;
+                                        turn ? turn->len : live_pos)) return 0;
 
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (turn) {
+        /* the continuation is the turn's history and the tail, as after the checkpoint; the bank keeps the prefix of
+         * it that it stands at, and the request's sync prefills the rest of the turn with the tail */
+        if (!server_tokens_prefix_of(live_tokens, turn)) return 0;
+        live_tokens = turn;
+    }
 
     char why[256];
     const int common = build_live_continuation_prompt(
@@ -1484,7 +1496,7 @@ int server::anthropic_live_continuation_prompt(session_slot *sl,
         return 0;
     }
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    return common;
+    return common < live_pos ? common : live_pos;
 }
 
 
