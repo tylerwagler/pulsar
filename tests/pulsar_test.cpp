@@ -3800,6 +3800,64 @@ static void test_bank_carry_restore(void) {
     free(e);
 }
 
+/* L375 O15: the live row's validity.  A view nothing wrote a row for has none -- a fresh session, a bank saved
+ * without one, an invalidated bank -- and every reader of the row refuses there through the one gate (live_dev): the
+ * draws, the logprobs, the host mirror.  A bank's saved row carries its own validity across a switch (a restore used
+ * to mark whatever sat in the bank's slot valid), a step row kept for a bank (the mixed lane's prefill end) makes it
+ * valid, and invalidate clears it.  Host only: dry tensors (every copy a no-op that succeeds); no draw is launched,
+ * since each one asserted here refuses before the device. */
+static uint32_t test_live_bank0(pulsar_session *) { return 0u; }
+static void test_live_row_valid(void) {
+    static pulsar_family fam{};
+    static pulsar_family_session_ops sops{};
+    static pulsar_family_bank_ops bops{};
+    bops.live = test_live_bank0;
+    fam.name = "L375 live row test";
+    fam.logits_width = test_carry_width;
+    fam.session = &sops;
+    fam.banks = &bops;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->logits = (float *)xcalloc(8, sizeof(float));
+    pulsar_gpu_tensor_dry_begin();
+    const bool alloc = pulsar_session_dev_alloc(s, 2);
+    pulsar_gpu_tensor *rows = pulsar_gpu_tensor_alloc(2u * 8u * sizeof(float));
+    pulsar_gpu_tensor_dry_end(NULL, NULL);
+    TEST_ASSERT(alloc && rows);
+    if (alloc && rows) {
+        pulsar_token_score sc[2];
+        float out[8];
+        /* a fresh session: no row, every reader refuses */
+        TEST_ASSERT(s->live_dev() == NULL && s->live_host() == NULL);
+        TEST_ASSERT(s->argmax() == PULSAR_SAMPLE_REFUSED && s->argmax_excluding(1) == PULSAR_SAMPLE_REFUSED);
+        TEST_ASSERT(s->top_logprobs(sc, 2) == 0 && s->token_logprob(1, sc) == 0 && s->copy_logits(out, 8) == 0);
+        /* a step heads the row */
+        TEST_ASSERT(s->live_from_rows(rows, 1) && s->live_dev() == s->dev.live);
+        /* bank 0 saved with its row; a view with none saved as bank 1 */
+        TEST_ASSERT(s->live_save_bank(0));
+        s->dev.live_valid = false;   /* pulsar_bank_carry_fresh_view's mark */
+        TEST_ASSERT(s->live_save_bank(1));
+        TEST_ASSERT(s->live_restore_bank(0) && s->live_dev() != NULL);
+        TEST_ASSERT(s->live_restore_bank(1) && s->live_dev() == NULL);   /* the bank had no row: still none */
+        /* a step row kept as bank 1's (the mixed lane's prefill end) is its row */
+        s->dev.step_rows = rows;
+        s->dev.step_n = 2;
+        TEST_ASSERT(s->step_row_to_bank(1, 1) && s->live_restore_bank(1) && s->live_dev() != NULL);
+        TEST_ASSERT(!s->step_row_to_bank(2, 1) && !s->live_restore_bank(2) && !s->live_save_bank(2));   /* out of range */
+        /* invalidate: the row was the forgotten history's */
+        pulsar_session_family_invalidate(s);
+        TEST_ASSERT(s->live_dev() == NULL && s->argmax() == PULSAR_SAMPLE_REFUSED);
+    }
+    pulsar_gpu_tensor_free(rows);
+    pulsar_session_dev_free(s);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s->logits);
+    free(s);
+    free(e);
+}
+
 /* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
  * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
  * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
@@ -5178,6 +5236,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
+    {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},

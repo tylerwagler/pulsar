@@ -88,7 +88,8 @@ bool pulsar_session::live_from_host(const float *row) {
  * invalidated bank -- has no next-token distribution, and dev.live then holds another bank's row or none. */
 const pulsar_gpu_tensor *pulsar_session::live_dev() {
     if (!dev.live_valid) {
-        fprintf(stderr, "pulsar: session: no live row to read (nothing stepped on this bank yet)\n");
+        fprintf(stderr, "pulsar: session: no live row to read (the installed bank's view has none: nothing stepped on "
+                        "it yet, or it was invalidated)\n");
         return NULL;
     }
     return dev.live;
