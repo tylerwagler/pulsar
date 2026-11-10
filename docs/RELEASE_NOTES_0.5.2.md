@@ -96,6 +96,9 @@ the agent, the servers and the disk KV store.  The full list is `git log v0.5.1.
   `pulsar_tokenize_text`, `pulsar_tokenize_rendered_chat`, `pulsar_tokenize_rendered_chat_spans` (which gains
   `err, errlen`), `pulsar_chat_open`, `pulsar_chat_open_tools`, `pulsar_chat_append_turn`,
   `pulsar_chat_end_assistant`.
+- **No chat entry ends the process.**  A think mode or role a family's template cannot express was an exit; it is a
+  refusal now (false, nothing appended, one line ending "-- refusing"), on all five families.  pulsar-agent fails the
+  turn; the CLI's REPL keeps the conversation.
 - `pulsar_session_sync_mm` can return `PULSAR_SESSION_SYNC_BUSY`.
 - `PULSAR_IMAGE_BLOCKS_MAX` is public.  `PULSAR_SESSION_KV_PAYLOAD_VERSION` 8, `PULSAR_SESSION_SEGMENT_VERSION` 9.
 - The speculative round entries refuse by name on an engine with no drafter, at the context's end, and on a round
@@ -120,7 +123,5 @@ the agent, the servers and the disk KV store.  The full list is `git log v0.5.1.
   block entry's refusal) are compiled and unit-tested only: no pair is in the release run.
 - On sm_75 an attention operand too small for fp16 still rounds or flushes to zero, as before; only overflow and
   non-finite operands refuse.
-- A chat template that cannot express a request (a think mode or role it has no form for) still ends the process by
-  name; only tokenizer refusals became results.
 - A readmission that fails while the pool is parked on the pool's only resident bank leaves that bank parked; no step
   runs on it (refused by name).

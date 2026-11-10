@@ -40,7 +40,7 @@ budget = 90   # L373: the bash-job teardown, timeout and atomic-write tests wait
 [[test]]
 name = "cuda-regression"
 tier = "kernels"
-budget = 70
+budget = 150   # L370 / L375: the 1024-key window leg, the widening and grow-under-capture cases (Sparky #692: 113 s)
 
 [[test]]
 name = "cuda-kv-rows-pack-gate"
