@@ -2566,6 +2566,8 @@ bool server::spill_bank(session_slot *victim) {
  * first-preempted first, as soon as the bank's resident KV fits the budget again.  An image request keeps its bank
  * (as Flare's: its image features are not reconstructed). */
 static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out = nullptr);
+static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop,
+                               bool *dominated_out = nullptr);
 static prompt_kv_verdict server_prompt_kv_verdict(KvBytes touched, KvBytes delta, KvBytes bound,
                                                   const KvBytes *drop, int n_victims, bool busy_may_free,
                                                   int *n_spill);
@@ -2763,8 +2765,7 @@ bool server::worker_readmit_preempted() {
          * made for it is not retaken before it lands; the decoder stays parked until a job ends and frees it) */
         int order[PULSAR_SESSION_POOL_CAP], n_spill = 0;
         KvBytes drop[PULSAR_SESSION_POOL_CAP];
-        const int n_victims = guard_victim_order(s, NULL, 0, order);
-        for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+        const int n_victims = guard_spill_victims(s, NULL, 0, order, drop);
         bool busy = false;   /* another job whose end may make room */
         int n_decoding = 0;
         for (int i = 0; i < s->n_slots; i++) {
@@ -2960,6 +2961,31 @@ static int guard_victim_order(server *s, session_slot **dec, int n, int *order, 
     return m;
 }
 
+/* L372: the victims a spill plan is made over -- guard_victim_order's, less the banks that hold no resident KV, each
+ * with the bytes its spill frees.  A bank provisioned and never prefilled, or re-backed empty, frees nothing: counted
+ * in a plan (zero-drop victims ahead of the one that clears the breach) it was spilled with the rest, and a spilled
+ * bank is no longer the empty bank a new conversation takes (empty_bank).  The one statement of "worth a spill" for
+ * the readmission, the prompt's admission, the decode guard and a prefill's memory step. */
+/// @param s the server (worker thread)
+/// @param dec slots never picked (the live decode set)
+/// @param n how many
+/// @param order receives the victims' slot indexes, in pick order
+/// @param drop receives, per victim, the bytes its spill frees (may be NULL)
+/// @param dominated_out receives the dominance facts per slot (may be NULL)
+/// @return victims written
+static int guard_spill_victims(server *s, session_slot **dec, int n, int *order, KvBytes *drop, bool *dominated_out) {
+    const int all = guard_victim_order(s, dec, n, order, dominated_out);
+    int m = 0;
+    for (int k = 0; k < all; k++) {
+        const KvBytes frees = pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank);
+        if (frees == KvBytes{}) continue;
+        order[m] = order[k];
+        if (drop) drop[m] = frees;
+        m++;
+    }
+    return m;
+}
+
 /* L280: the prompt's KV admission, as arithmetic.  touched = the pool's resident KV now, delta = what binding the
  * job adds (its bank's growth to the prompt's length), bound = the guard's budget, drop[] = the idle victims'
  * resident bytes in spill order.  FITS when touched + delta <= bound; SPILL (*n_spill victims, the minimum,
@@ -3013,11 +3039,11 @@ prompt_kv_verdict server::prompt_kv_check(const session_slot *sl, const job *j, 
     /* NULL: an empty bank */
     const KvBytes have = sl ? pulsar_session_bank_touched_kv_bytes(pool, sl->bank) : KvBytes{};
     *need = want > have ? want - have : KvBytes{};
-    /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never a bound or spilled bank) */
+    /* the victims: every idle bank but the job's own (guard_pick_victim's filter: never a bound or spilled bank) that
+     * holds resident KV (guard_spill_victims) */
     session_slot *self[1] = {(session_slot *)sl};
-    const int n_victims = guard_victim_order(s, self, sl ? 1 : 0, order);
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
-    for (int k = 0; k < n_victims; k++) drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+    const int n_victims = guard_spill_victims(s, self, sl ? 1 : 0, order, drop);
     /* a bank bound to a job now is a victim once that job ends */
     bool busy = false;
     for (int i = 0; i < s->n_slots && !busy; i++) busy = &s->slots[i] != sl && server_slot_end_frees_kv(&s->slots[i]);
@@ -3126,13 +3152,10 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
     int spilled = 0;
     for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
-        int order[PULSAR_SESSION_POOL_CAP], useful[PULSAR_SESSION_POOL_CAP];
+        int useful[PULSAR_SESSION_POOL_CAP];
         session_slot *self[1] = {sl};
-        const int n_order = s->guard_enabled && s->pool_banks > 0 ? guard_victim_order(s, self, 1, order) : 0;
-        int n_idle = 0;   /* in the guard's pick order, the idle banks whose spill frees something */
-        for (int k = 0; k < n_order; k++)
-            if (pulsar_session_bank_touched_kv_bytes(s->sess, s->slots[order[k]].bank) > KvBytes{})
-                useful[n_idle++] = order[k];
+        /* in the guard's pick order, the idle banks whose spill frees something */
+        const int n_idle = s->guard_enabled && s->pool_banks > 0 ? guard_spill_victims(s, self, 1, useful, NULL) : 0;
         bool decoders = false;
         for (int i = 0; i < s->n_slots && !preempt_tried; i++)
             decoders |= &s->slots[i] != sl && slot_is_batchable_decode(&s->slots[i]);
@@ -3210,9 +3233,7 @@ int server::guard_maybe_evict(session_slot *const *dec, int n, session_slot **ke
     int order[PULSAR_SESSION_POOL_CAP];
     KvBytes drop[PULSAR_SESSION_POOL_CAP];
     bool dominated[PULSAR_SESSION_POOL_CAP];
-    const int n_victims = guard_victim_order(s, kept, n, order, dominated);
-    for (int k = 0; k < n_victims; k++)
-        drop[k] = pulsar_session_bank_touched_kv_bytes(pool, s->slots[order[k]].bank);
+    const int n_victims = guard_spill_victims(s, kept, n, order, drop, dominated);
     const int plan = guard_spill_plan(base, dpb.times((uint64_t)n), bound, drop, n_victims);
     int spilled_this_quantum = 0;
     for (int k = 0; k < plan; k++) {

@@ -9463,6 +9463,27 @@ static void test_l372_failed_batch_leave_is_still_stepped(void) {
     TEST_ASSERT(!slot_steppable_beside_decode(&sl));
 }
 
+/* L372 (O30): a bank that holds no resident KV is a victim in the guard's order but not one a spill plan is made
+ * over -- its spill frees nothing and takes it out of the empty banks.  No session here: every bank's resident KV
+ * reads 0, so the order has all three idle banks and the plan's victims none. */
+static void test_l372_empty_banks_are_not_spill_victims(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.n_slots = 3;
+    for (int i = 0; i < 3; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].last_serviced_us = (uint64_t)(10 * (i + 1));
+    }
+    int order[PULSAR_SESSION_POOL_CAP];
+    KvBytes drop[PULSAR_SESSION_POOL_CAP];
+    TEST_ASSERT(guard_victim_order(&s, NULL, 0, order) == 3);
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, drop) == 0);
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, NULL) == 0);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15239,6 +15260,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_no_fuse_prefill_is_the_classic_steps();
     test_l372_gone_client_wait_covers_prefill();
     test_l372_failed_batch_leave_is_still_stepped();
+    test_l372_empty_banks_are_not_spill_victims();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
