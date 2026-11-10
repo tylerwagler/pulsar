@@ -151,6 +151,21 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 
 
+bool cuda_first_say(const char *site) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seen[256];   /* the labels said so far, by FNV-1a of their text (0 never stored: it is 1) */
+    static int n_seen = 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *p = site ? site : "(unnamed)"; *p; ++p) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    if (h == 0) h = 1;
+    bool first = true;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; first && i < n_seen; ++i) first = seen[i] != h;
+    if (first && n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) seen[n_seen++] = h;
+    pthread_mutex_unlock(&mu);
+    return first;
+}
+
 /* One reservation per slot; see pulsar_cuda_scratch.h for why there is more
  * than one.  Indexed by CUDA_SCRATCH_MAIN / CUDA_SCRATCH_MMQ. */
 /* thread_local: the scratch arena is per GPU-submitting thread. A second
@@ -2533,6 +2548,15 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
 /// @param what the buffer regrown (named in the first post-warmup regrow's line; NULL = unnamed)
 void pulsar_gpu_seg_note_device_free(const char *what) {
     if (g_seg_capturing) {
+        /* L375 (O54): the path nobody announced.  The sites that refuse a grow under capture first
+         * (cuda_grow_refused_under_capture) never get here; the scratch slots and the activation cache do, and
+         * whether a served stretch ever does is what this line settles. */
+        char site[160];
+        snprintf(site, sizeof(site), "regrown inside a capture: %s", what ? what : "unnamed");
+        if (cuda_first_say(site))
+            fprintf(stderr, "pulsar: a device buffer was regrown INSIDE a graph capture (%s): the capture's graph "
+                            "runs once and every captured graph is dropped at its close (said once for this buffer)\n",
+                    what ? what : "unnamed");
         g_seg_reset_pending = true;
         return;
     }

@@ -500,6 +500,14 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
     return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
 }
 
+/** Rule 9's "once": is this the first time the process says `site`?  A refusal or an announce that can repeat every
+ *  step prints behind it, so the log carries each site's line once and the refusal itself stays every call's.
+ *  Thread-safe.  The sites are remembered by the label's TEXT (a hash of it), up to a fixed table; past the table
+ *  every call answers true -- a line too many, never a refusal nobody saw.  Defined in pulsar_cuda_runtime.cu. */
+/// @param site the site's label (NULL: unnamed, one label)
+/// @return true the first time `site` is asked about, false after
+bool cuda_first_say(const char *site);
+
 /* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
  * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
  * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).
@@ -511,8 +519,9 @@ static inline bool cuda_grow_refused_under_capture(const char *what) {
     if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone)
         return false;
     (void)cudaGetLastError();
-    fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing\n",
-            what);
+    if (cuda_first_say(what))
+        fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing "
+                        "(said once for this buffer)\n", what);
     return true;
 }
 
