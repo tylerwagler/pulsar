@@ -701,7 +701,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 /// @param bytes      range length
 static void cuda_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_MADV_DONTNEED)
-    if (!model_map || bytes == 0 || offset > model_size) return;
+    if (!model_map || bytes == 0 || offset >= model_size) return;
     if (bytes > model_size - offset) bytes = model_size - offset;
     const long page_sz_l = sysconf(_SC_PAGESIZE);
     const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -1126,7 +1126,9 @@ static const char *cuda_model_range_ptr_from_fd(
             return unwind();
         }
         cuda_model_drop_file_pages(model_map, offset + copied, n);
-        cuda_model_discard_source_pages(model_map, g_model_host_size, offset + copied, n);
+        /* clamped by THIS mapping's size -- its file's (the route reads file offsets as mapping offsets).  L375: it
+         * was the size of the mapping last set, so a shard's range past that size kept its host pages */
+        cuda_model_discard_source_pages(model_map, entry->file_size, offset + copied, n);
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
         chunk_idx++;
