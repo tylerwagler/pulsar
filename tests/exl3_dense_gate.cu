@@ -265,8 +265,8 @@ int main(void) {
                 if (!rc) diff_m += memcmp(y.data(), y16.data(), y.size() * sizeof(float)) != 0;
             }
             CHECK(diff_m == 0, "%s K=%d: %zu of 4 widths (M=1,2,4,8) differ from the same rows at M=16", sh.what, k2 / 2, diff_m);
-            printf("  %-26s %5d -> %-5d K=%d splits %d: M=16 max rel %.2e median %.2e; M=1,2,4,8 %s\n",
-                   sh.what, K, N, k2 / 2, ds4_exl3_dense_splits(K, N), mx, med,
+            printf("  %-26s %5d -> %-5d K=%d: M=16 max rel %.2e median %.2e; M=1,2,4,8 %s\n",
+                   sh.what, K, N, k2 / 2, mx, med,
                    diff_m ? "DIFFER" : "bit-identical to M=16's rows");
 
             if (max_rows > 16) {
@@ -443,8 +443,6 @@ int main(void) {
         const slot s = make_slot(16, K);
         for (const head &hd : heads) {
             const int N = hd.N, k2 = hd.k2;
-            CHECK(ds4_exl3_dense_splits(K, N) == ds4_exl3_dense_splits(K, W), "%s: the window's split count is not the "
-                  "head's -- the window comparison below would not be bit-exact by construction", hd.what);
             const weight w = make_weight(K, N, k2);
             dev d;
             upload(w, s, 16, d);
@@ -496,9 +494,9 @@ int main(void) {
             CHECK(wmx < tol, "%s 2560 -> %d K=%d: a window's max rel %.3e (limit %.0e)", hd.what, N, k2 / 2, wmx, tol);
             CHECK(wmed > 1e-10, "%s K=%d: window median rel %.3e -- a degenerate fixture, not a pass", hd.what, k2 / 2, wmed);
             CHECK(wdiff == 0, "%s K=%d: %zu of 48 window rows differ from the head's columns", hd.what, k2 / 2, wdiff);
-            printf("  head %-15s 2560 -> %-6d K=%d splits %d (%d blocks): M=1,5,9 %s; 3 windows of %d cut from it == "
+            printf("  head %-15s 2560 -> %-6d K=%d (%d blocks): M=1,5,9 %s; 3 windows of %d cut from it == "
                    "its columns %s, vs double max rel %.2e (median <= %.2e)\n", hd.what, N, k2 / 2,
-                   ds4_exl3_dense_splits(K, N), N / 128, diff_m ? "DIFFER" : "bit-identical to M=16's rows", W,
+                   N / 128, diff_m ? "DIFFER" : "bit-identical to M=16's rows", W,
                    wdiff ? "DIFFER" : "bit for bit", wmx, wmed);
             /* timed (information, not graded): a call at 1 / 4 / 16 rows, GB/s over the weight's bytes */
             cudaEvent_t e0, e1;
@@ -542,9 +540,8 @@ int main(void) {
             uint64_t lt = 0, lsc = 0, lst = 0;
             CHECK(exl3_linear_layout(K, N, k2, &lt, &lsc, &lst) && lst == w.stride && lt == w.trellis,
                   "%s: exl3_linear_layout(%d, %d) is not the stored %d-wide slice", pc.what, K, N, Ns);
-            CHECK(ds4_exl3_dense_workspace_bytes(16, K, N) == ds4_exl3_dense_workspace_bytes(16, K, Ns) &&
-                  ds4_exl3_dense_splits(K, N) == ds4_exl3_dense_splits(K, Ns),
-                  "%s: the logical width's workspace / splits are not the stored width's", pc.what);
+            CHECK(ds4_exl3_dense_workspace_bytes(16, K, N) == ds4_exl3_dense_workspace_bytes(16, K, Ns),
+                  "%s: the logical width's workspace is not the stored width's", pc.what);
             const slot s = make_slot(MR, K);
             dev d;
             upload(w, s, MR, d);   /* y and the workspace at the stored width: room for the canary */

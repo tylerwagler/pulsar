@@ -319,7 +319,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--allow-outside-workspace", "File tools may leave the directory the agent started in. Default: they refuse.");
-    opt(fp, c, "--allow-bash", "With --non-interactive: allow the bash tool. Default: refused. Interactive bash has no boundary.");
+    opt(fp, c, "--allow-bash", "With --non-interactive (or stdin not a terminal): allow the bash tool. Default: refused. Interactive bash has no boundary.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");

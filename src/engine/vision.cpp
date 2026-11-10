@@ -850,6 +850,11 @@ int vision_preprocess_rgb(const uint8_t *rgb, int width, int height,
 
 /** L354: the bytes the decodes in flight hold. */
 static std::atomic<uint64_t> g_decode_bytes{0};
+/** O34: a decode on this thread was refused by the budget since vision_decode_busy_reset(). */
+static thread_local bool t_decode_busy = false;
+
+void vision_decode_busy_reset(void) { t_decode_busy = false; }
+bool vision_decode_busy_seen(void) { return t_decode_busy; }
 
 bool vision_decode_reserve(uint64_t bytes) {
     const uint64_t before = g_decode_bytes.fetch_add(bytes);
@@ -888,13 +893,13 @@ bool vision_decode_admits(uint64_t width, uint64_t height) {
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
 /// @param[out] w_out width
 /// @param[out] h_out height
-/// @return 1, or 0 when it does not decode or is refused
-static int vision_decode_png(const uint8_t *bytes, size_t len,
-                             uint8_t **rgb_out, int *w_out, int *h_out) {
+/// @return ok; refused when it does not decode or is past the pixel limit; busy when the budget refused it
+static vision_decode vision_decode_png(const uint8_t *bytes, size_t len,
+                                       uint8_t **rgb_out, int *w_out, int *h_out) {
     png_image image;
     memset(&image, 0, sizeof image);
     image.version = PNG_IMAGE_VERSION;
-    if (!png_image_begin_read_from_memory(&image, bytes, len)) return 0;
+    if (!png_image_begin_read_from_memory(&image, bytes, len)) return vision_decode::refused;
     /* Decode to RGBA and drop the alpha HERE rather than asking libpng for
      * PNG_FORMAT_RGB: given an alpha source and a background of NULL, libpng
      * composites (measured: an alpha=200 pixel came back as 69 where the source
@@ -903,24 +908,24 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
     image.format = PNG_FORMAT_RGBA;
     if (!vision_decode_admits(image.width, image.height)) {
         png_image_free(&image);
-        return 0;
+        return vision_decode::refused;
     }
     const decode_hold hold((uint64_t)image.width * image.height * 7u);   /* RGBA, then RGB beside it */
     if (!hold.ok) {
         png_image_free(&image);
-        return 0;
+        return vision_decode::busy;
     }
     const size_t sz = PNG_IMAGE_SIZE(image);
     uint8_t *rgba = (uint8_t *)malloc(sz);
-    if (!rgba) { png_image_free(&image); return 0; }
+    if (!rgba) { png_image_free(&image); return vision_decode::refused; }
     if (!png_image_finish_read(&image, NULL, rgba, 0, NULL)) {
         free(rgba);
         png_image_free(&image);
-        return 0;
+        return vision_decode::refused;
     }
     const size_t npix = (size_t)image.width * (size_t)image.height;
     uint8_t *buf = (uint8_t *)malloc(npix * 3u);
-    if (!buf) { free(rgba); png_image_free(&image); return 0; }
+    if (!buf) { free(rgba); png_image_free(&image); return vision_decode::refused; }
     for (size_t i = 0; i < npix; i++) {
         buf[i * 3 + 0] = rgba[i * 4 + 0];
         buf[i * 3 + 1] = rgba[i * 4 + 1];
@@ -931,7 +936,7 @@ static int vision_decode_png(const uint8_t *bytes, size_t len,
     *h_out = (int)image.height;
     png_image_free(&image);
     *rgb_out = buf;
-    return 1;
+    return vision_decode::ok;
 }
 
 /** libjpeg's error manager extended with a jump back into vision_decode_jpeg (a decode error longjmps, never exits). */
@@ -958,11 +963,12 @@ static void vision_jpeg_output_message(j_common_ptr cinfo) { (void)cinfo; }
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
 /// @param[out] w_out width
 /// @param[out] h_out height
-/// @return 1, or 0 when it does not decode or is refused
 /// @param[out] held_out the decode budget it reserved (the wrapper releases it)
-static int vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
-                              uint8_t **rgb_out, int *w_out, int *h_out,
-                                    uint64_t *held_out) {
+/// @return ok; refused when it does not decode, is CMYK / YCCK or is past the pixel limit; busy when the budget
+///         refused it
+static vision_decode vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
+                                              uint8_t **rgb_out, int *w_out, int *h_out,
+                                              uint64_t *held_out) {
     struct jpeg_decompress_struct cinfo;
     struct vision_jpeg_error jerr;
     memset(&cinfo, 0, sizeof cinfo);   /* so the longjmp path's destroy is a no-op */
@@ -971,49 +977,49 @@ static int vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
     jerr.pub.output_message = vision_jpeg_output_message;
     if (setjmp(jerr.jb)) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     jpeg_create_decompress(&cinfo);
     jpeg_mem_src(&cinfo, bytes, (unsigned long)len);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     if (!vision_decode_admits(cinfo.image_width, cinfo.image_height)) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     /* no destructor may cross libjpeg's longjmp: the wrapper below releases what this reports */
     const uint64_t held = (uint64_t)cinfo.image_width * cinfo.image_height * 3u;
     if (!vision_decode_reserve(held)) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::busy;
     }
     *held_out = held;
     if (cinfo.jpeg_color_space == JCS_CMYK || cinfo.jpeg_color_space == JCS_YCCK) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     cinfo.out_color_space = JCS_RGB;
     if (!jpeg_start_decompress(&cinfo)) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     const int cw = (int)cinfo.output_width, ch = (int)cinfo.output_height;
     if (cinfo.output_components != 3 || cw <= 0 || ch <= 0 ||
         (size_t)cw > SIZE_MAX / 3u / (size_t)ch) {
         jpeg_destroy_decompress(&cinfo);
-        return 0;
+        return vision_decode::refused;
     }
     uint8_t *buf = (uint8_t *)malloc((size_t)cw * (size_t)ch * 3u);
-    if (!buf) { jpeg_destroy_decompress(&cinfo); return 0; }
+    if (!buf) { jpeg_destroy_decompress(&cinfo); return vision_decode::refused; }
     while (cinfo.output_scanline < cinfo.output_height) {
         uint8_t *row = buf + (size_t)cinfo.output_scanline * (size_t)cw * 3u;
         JSAMPROW rows[1] = { row };
         if (jpeg_read_scanlines(&cinfo, rows, 1) != 1) {
             free(buf);
             jpeg_destroy_decompress(&cinfo);
-            return 0;
+            return vision_decode::refused;
         }
     }
     jpeg_finish_decompress(&cinfo);
@@ -1021,7 +1027,7 @@ static int vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
     *w_out = cw;
     *h_out = ch;
     *rgb_out = buf;
-    return 1;
+    return vision_decode::ok;
 }
 
 /// Decode a JPEG to RGB8 (CMYK / YCCK refused).
@@ -1030,11 +1036,11 @@ static int vision_decode_jpeg_inner(const uint8_t *bytes, size_t len,
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
 /// @param[out] w_out width
 /// @param[out] h_out height
-/// @return 1, or 0 when it does not decode or is refused
-static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
-                              uint8_t **rgb_out, int *w_out, int *h_out) {
+/// @return vision_decode_jpeg_inner's
+static vision_decode vision_decode_jpeg(const uint8_t *bytes, size_t len,
+                                        uint8_t **rgb_out, int *w_out, int *h_out) {
     uint64_t held = 0;
-    const int r = vision_decode_jpeg_inner(bytes, len, rgb_out, w_out, h_out, &held);
+    const vision_decode r = vision_decode_jpeg_inner(bytes, len, rgb_out, w_out, h_out, &held);
     if (held) vision_decode_release(held);
     return r;
 }
@@ -1050,14 +1056,18 @@ static int vision_decode_jpeg(const uint8_t *bytes, size_t len,
 /// @param[out] rgb_out RGB8 pixels, malloc'd (caller frees)
 /// @param[out] w_out width
 /// @param[out] h_out height
-/// @return 1, or 0 when refused or undecodable
-int vision_decode_rgb(const uint8_t *bytes, size_t len,
-                      uint8_t **rgb_out, int *w_out, int *h_out) {
-    if (!bytes || len < 8) return 0;
+/// @return ok; refused for an image that is not one this decodes (permanent); busy when the shared decode budget
+///         refused it (the same image decodes once other decodes finish -- also recorded for
+///         vision_decode_busy_seen)
+vision_decode vision_decode_rgb(const uint8_t *bytes, size_t len,
+                                uint8_t **rgb_out, int *w_out, int *h_out) {
+    if (!bytes || len < 8) return vision_decode::refused;
     static const uint8_t png_sig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
-    if (!memcmp(bytes, png_sig, 8)) return vision_decode_png(bytes, len, rgb_out, w_out, h_out);
-    if (bytes[0] == 0xFF && bytes[1] == 0xD8) return vision_decode_jpeg(bytes, len, rgb_out, w_out, h_out);
-    return 0;
+    vision_decode r = vision_decode::refused;
+    if (!memcmp(bytes, png_sig, 8)) r = vision_decode_png(bytes, len, rgb_out, w_out, h_out);
+    else if (bytes[0] == 0xFF && bytes[1] == 0xD8) r = vision_decode_jpeg(bytes, len, rgb_out, w_out, h_out);
+    if (r == vision_decode::busy) t_decode_busy = true;
+    return r;
 }
 
 /* Flatten the engine's bound tower into the CUDA-facing offset contract and run
@@ -1104,7 +1114,7 @@ int vision_prepare_image(const uint8_t *bytes, size_t len, const pulsar_vision_a
     memset(out, 0, sizeof *out);
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
-    if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) return 0;
+    if (vision_decode_rgb(bytes, len, &rgb, &w, &h) != vision_decode::ok) return 0;
 
     pulsar_vision_image img;
     if (!vision_image_grid(w, h, args, &img)) { free(rgb); return 0; }

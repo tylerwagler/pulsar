@@ -3,7 +3,9 @@
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
 #include "gemma4_chat.h"
+#include <algorithm>
 #include <string>
+#include <vector>
 
 
 
@@ -235,28 +237,16 @@ static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64
 
 
 
-/** A heap copy of [ptr, ptr + len) (not NUL-terminated).  @param ptr the bytes  @param len their count
- *  @return the copy (its ptr xmalloc'd; the owner frees it) */
-static owned_str owned_copy(const char *ptr, uint64_t len) {
-    owned_str s;
-    s.ptr = (char *)xmalloc((size_t)len);
-    memcpy(s.ptr, ptr, (size_t)len);
-    s.len = len;
-    return s;
-}
-
-
-
 /* Look up the merge rank for two adjacent BPE symbols. */
-int pulsar_vocab::bpe_rank(const owned_str *a, const owned_str *b) const {
+int pulsar_vocab::bpe_rank(pulsar_str a, pulsar_str b) const {
     const auto *vocab = this;
-    uint64_t len = a->len + 1 + b->len;
+    uint64_t len = a.len + 1 + b.len;
     char stack[512];
     char *buf = len <= sizeof(stack) ? stack : (char *)xmalloc((size_t)len);
 
-    memcpy(buf, a->ptr, (size_t)a->len);
-    buf[a->len] = ' ';
-    memcpy(buf + a->len + 1, b->ptr, (size_t)b->len);
+    memcpy(buf, a.ptr, (size_t)a.len);
+    buf[a.len] = ' ';
+    memcpy(buf + a.len + 1, b.ptr, (size_t)b.len);
 
     int rank = -1;
     table_get(&vocab->merge_rank, buf, len, &rank);
@@ -267,72 +257,105 @@ int pulsar_vocab::bpe_rank(const owned_str *a, const owned_str *b) const {
 
 
 
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
+/** One BPE symbol of a piece: a byte range of the encoded piece and its neighbours in the piece's order.  A merge
+ *  grows the left symbol over the right one and unlinks the right one, so a symbol's index is its first unit's
+ *  and the indices of the live symbols rise along the piece. */
+struct bpe_symbol {
+    uint64_t off;    ///< its first byte in the encoded piece
+    uint64_t len;    ///< its bytes; grows when it absorbs its right neighbour
+    size_t prev;     ///< the live symbol before it, BPE_NO_SYMBOL at the front
+    size_t next;     ///< the live symbol after it, BPE_NO_SYMBOL at the back
+    bool live;       ///< false once a merge folded it into its left neighbour
+};
+
+/** A mergeable adjacent pair as it stood when it was queued.  A symbol only grows or dies, so the pair still
+ *  stands exactly when both lengths still match and the two are still neighbours. */
+struct bpe_candidate {
+    int rank;            ///< the pair's merge rank (>= 0)
+    size_t left;         ///< the left symbol
+    size_t right;        ///< the right symbol
+    uint64_t left_len;   ///< the left symbol's length when queued
+    uint64_t right_len;  ///< the right symbol's length when queued
+};
+
+/** No symbol: the list's ends. */
+static const size_t BPE_NO_SYMBOL = SIZE_MAX;
+
+/** The merge order: the lowest rank first, and among equal ranks the leftmost pair (the heap's top is the
+ *  candidate nothing orders before).  @param a a candidate  @param b another
+ *  @return true when b merges before a */
+static bool bpe_candidate_after(const bpe_candidate &a, const bpe_candidate &b) {
+    return a.rank != b.rank ? a.rank > b.rank : a.left > b.left;
+}
+
+
+
+/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids.
+ *
+ * The merge rule: of every adjacent pair the merge table ranks, merge the ONE of lowest rank, the leftmost
+ * among equals; repeat until no pair is ranked.  (One occurrence a step, not every occurrence of the pair:
+ * "aaa" merges its first two units and the new pair is ranked afresh.)  The rule is run off a heap of the
+ * ranked pairs over a linked list of symbols, O(n log n) in the piece's units -- a rescan of every pair each
+ * merge is the same rule at O(n^2), and a piece has no length bound (L375 O51).  A merge queues the two pairs
+ * it creates; the pairs it destroys stay queued and are dropped when they surface (bpe_candidate). */
 void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
     const auto *vocab = this;
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = (owned_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
-
+    std::vector<bpe_symbol> sym;
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
         if (n == 0) n = 1;
-        if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = (owned_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
-        }
-        sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
+        const size_t i = sym.size();
+        sym.push_back({ off, (uint64_t)n, i ? i - 1 : BPE_NO_SYMBOL, BPE_NO_SYMBOL, true });
+        if (i) sym[i - 1].next = i;
         off += (uint64_t)n;
     }
 
-    for (;;) {
-        int best_i = -1;
-        int best_rank = INT32_MAX;
+    std::vector<bpe_candidate> heap;
+    /* queue the pair (l, its right neighbour) when the merge table ranks it */
+    auto queue_pair = [&](size_t l) {
+        const size_t r = sym[l].next;
+        if (r == BPE_NO_SYMBOL) return;
+        const int rank = vocab->bpe_rank({ encoded + sym[l].off, sym[l].len }, { encoded + sym[r].off, sym[r].len });
+        if (rank < 0) return;
+        heap.push_back({ rank, l, r, sym[l].len, sym[r].len });
+        std::push_heap(heap.begin(), heap.end(), bpe_candidate_after);
+    };
+    for (size_t i = 0; i < sym.size(); i++) queue_pair(i);
 
-        for (int i = 0; i + 1 < n_sym; i++) {
-            int rank = vocab->bpe_rank(&sym[i], &sym[i + 1]);
-            if (rank >= 0 && rank < best_rank) {
-                best_rank = rank;
-                best_i = i;
-            }
-        }
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), bpe_candidate_after);
+        const bpe_candidate c = heap.back();
+        heap.pop_back();
+        bpe_symbol &l = sym[c.left];
+        const bpe_symbol &r = sym[c.right];
+        if (!l.live || l.next != c.right || l.len != c.left_len || r.len != c.right_len) continue;
 
-        if (best_i < 0) break;
-
-        owned_str merged;
-        merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = (char *)xmalloc((size_t)merged.len);
-        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
-        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
-
-        free(sym[best_i].ptr);
-        free(sym[best_i + 1].ptr);
-        sym[best_i] = merged;
-
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
-            sym[j] = sym[j + 1];
-        }
-        n_sym--;
+        /* the right symbol's bytes follow the left's in the encoded piece: the merged symbol is the range */
+        l.len += r.len;
+        l.next = r.next;
+        if (r.next != BPE_NO_SYMBOL) sym[r.next].prev = c.left;
+        sym[c.right].live = false;
+        if (l.prev != BPE_NO_SYMBOL) queue_pair(l.prev);
+        queue_pair(c.left);
     }
 
-    for (int i = 0; i < n_sym; i++) {
+    for (size_t i = sym.empty() ? BPE_NO_SYMBOL : 0; i != BPE_NO_SYMBOL; i = sym[i].next) {
+        const char *ptr = encoded + sym[i].off;
         int token = -1;
-        if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
+        if (table_get(&vocab->token_to_id, ptr, sym[i].len, &token)) {
             token_vec_push(out, token);
         } else {
             for (uint64_t j = 0; j < sym[i].len; j++) {
-                if (table_get(&vocab->token_to_id, sym[i].ptr + j, 1, &token)) {
+                if (table_get(&vocab->token_to_id, ptr + j, 1, &token)) {
                     token_vec_push(out, token);
                 }
             }
         }
-        free(sym[i].ptr);
     }
 
-    free(sym);
     free(encoded);
 }
 
@@ -871,8 +894,7 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token) {
 bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_text");
     if (!t) return false;
-    t->encode_text(e, text, out);
-    return true;
+    return t->encode_text(e, text, out);
 }
 
 
@@ -949,7 +971,10 @@ void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
  * those ranges for every byte it copied from client data, so a client typing
  * `<|Assistant|>` or `｜DSML｜` into a message gets ordinary text tokens instead of
  * a control token.  Ranges are ascending and disjoint; a range is clamped to the
- * string's end. */
+ * string's end.  L375 O52: a match that STARTS in the renderer's text must also end
+ * before the next range begins -- client bytes that complete a control token the
+ * template's last bytes opened (`<thi` + a message starting `nk>`) are as much
+ * client text as a whole spelling is, and stay plain. */
 void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
                                                       const pulsar_text_span *spans,
                                                       uint32_t n_spans,
@@ -975,7 +1000,8 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
         }
         int token = -1;
         size_t len = 0;
-        if (vocab->special_token_at(p, &token, &len)) {
+        /* spans[si], when there is one, is the next client range: off < its lo here */
+        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo)) {
             vocab->tokenize_span(span, (size_t)(p - span), out);
             token_vec_push(out, token);
             p += len;
@@ -990,17 +1016,20 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
 bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat");
     if (!t) return false;
-    t->encode_rendered(e, text, NULL, 0u, out);
-    return true;
+    return t->encode_rendered(e, text, NULL, 0u, out, NULL, 0);
 }
 
 bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
-                                         pulsar_tokens *out) {
+                                         pulsar_tokens *out, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
-    if (!t) return false;
-    t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out);
-    return true;
+    if (!t) {
+        if (err && errlen) snprintf(err, errlen, "the model's family has no tokenizer");
+        return false;
+    }
+    return t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out, err,
+                              errlen);
 }
 
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
@@ -1031,8 +1060,7 @@ bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trust
                       pulsar_think_mode think_mode) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open");
     if (!t) return false;
-    t->chat_open(e, tokens, trusted, system, NULL, think_mode);
-    return true;
+    return t->chat_open(e, tokens, trusted, system, NULL, think_mode);
 }
 
 bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
@@ -1045,16 +1073,14 @@ bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char 
                         "text, passed as trusted)\n");
         return false;
     }
-    t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
-    return true;
+    return t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
 }
 
 bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_append_turn");
     if (!t) return false;
-    t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
-    return true;
+    return t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
 }
 
 bool pulsar_chat_calls_continue_turn(const pulsar_engine *e) {
@@ -1078,15 +1104,17 @@ bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, 
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_end_assistant");
     if (!t) return false;
-    t->chat_end_assistant(e, tokens);
-    return true;
+    return t->chat_end_assistant(e, tokens);
 }
 
 bool pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
                                pulsar_tokens *out) {
+    const int before = out->len;
     if (!pulsar_chat_open(e, out, NULL, system, think_mode)) return false;
     const pulsar_chat_message user = {"user", prompt ? prompt : "", false};
-    return pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
+    if (pulsar_chat_append_turn(e, out, &user, 1, true, think_mode)) return true;
+    out->len = before;   /* a refused turn takes the head back: nothing appended */
+    return false;
 }
 
 
@@ -1142,7 +1170,9 @@ static void ds4_chat_append_trusted(pulsar_vocab *vocab, pulsar_tokens *tokens, 
 /// @param role    the message's role ("system", "user", "assistant", "tool", ...)
 /// @param content the message's text
 /// @param trusted the content is front-end control text in DeepSeek's markers
-static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
+/// @return false (said) for a message this front cannot place: trusted text outside a system message, an assistant
+///         turn.  The caller takes back what the turn appended before it.
+static bool ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
                                     bool trusted) {
     pulsar_vocab *vocab = &e->vocab;
     const bool v41 = pulsar_engine_chat_v41(e);
@@ -1173,7 +1203,9 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
             }
         }
     } else if (trusted) {
-        pulsar_die("pulsar_chat_append_turn: only a system message carries trusted control text");
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: only a system message carries trusted control text -- "
+                        "refusing\n");
+        return false;
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         /* V4.1 joins consecutive user-SIDE messages (user text and tool results in
          * any order) into one turn; V4 opens a fresh turn for each user message
@@ -1190,15 +1222,17 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
          * and the CLI append a SAMPLED turn's tokens, and the server owns the
          * replay rules).  The old branch guessed a stripped replay and could not
          * be right; refuse instead of guessing. */
-        pulsar_die("pulsar_chat_append_turn: an assistant turn cannot be "
-                   "appended here -- append the sampled tokens, or render it "
-                   "through the server's renderer (L185)");
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: an assistant turn cannot be "
+                        "appended here -- append the sampled tokens, or render it "
+                        "through the server's renderer (L185) -- refusing\n");
+        return false;
     } else {
         const bool join = v41 && chat_tmpl_last_marker(vocab, tokens) == vocab->user_id;
         if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
         else chat_tmpl_append_text(vocab, tokens, "\n\n");
         chat_tmpl_append_text(vocab, tokens, content);
     }
+    return true;
 }
 
 
@@ -1215,17 +1249,25 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
 /// @param system     the client's system message, or NULL
 /// @param tools_json unused (refused upstream)
 /// @param think_mode the reasoning effort
-static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+/// @return false (said; nothing appended) for an effort the loaded encoder has no level for (L375: the effort line's
+///         lookup ended the process); the byte-level tokenizer itself refuses no text
+static bool ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                           const char *tools_json, pulsar_think_mode think_mode) {
     (void)tools_json;   /* refused by pulsar_chat_open_tools: DeepSeek's tools are DSML text in `trusted` */
+    char why[256];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, why, sizeof why)) {
+        fprintf(stderr, "pulsar: pulsar_chat_open: %s -- refusing\n", why);
+        return false;
+    }
     pulsar_vocab *vocab = &e->vocab;
     const bool has_system = system && system[0];
     chat_tmpl_push_marker(tokens, vocab->bos_id);
     encode_chat_lead_in(vocab, has_system, think_mode, (token_vec *)tokens);
     if (trusted && trusted[0]) ds4_chat_append_trusted(vocab, tokens, trusted);
-    if (!has_system) return;
+    if (!has_system) return true;
     if (trusted && trusted[0]) vocab->tokenize_span(system, strlen(system), (token_vec *)tokens);
     else chat_tmpl_append_text(vocab, tokens, system);
+    return true;
 }
 
 /** pulsar_family_tokenizer::chat_turn for DeepSeek: the messages, then (generation_prompt) the assistant marker and
@@ -1235,22 +1277,37 @@ static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *t
  *  @param msgs              [n] the messages
  *  @param n                 messages
  *  @param generation_prompt open the assistant's turn
- *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker) */
-static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+ *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker)
+ *  @return false (said; nothing appended) for a message the front cannot place (ds4_chat_append_message); the
+ *          byte-level tokenizer itself refuses no text */
+static bool ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                           bool generation_prompt, pulsar_think_mode think_mode) {
-    for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
-    if (!generation_prompt) return;
+    char why[256];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, why, sizeof why)) {
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: %s -- refusing\n", why);
+        return false;
+    }
+    const int before = tokens->len;
+    for (int i = 0; i < n; i++)
+        if (!ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted)) {
+            tokens->len = before;   /* a refused turn appends nothing */
+            return false;
+        }
+    if (!generation_prompt) return true;
     chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
     chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
                           e->vocab.think_start_id : e->vocab.think_end_id);
+    return true;
 }
 
 /* the sampled turn's stop token is the template's turn end */
 /// pulsar_family_tokenizer::chat_end_assistant for DeepSeek.
 /// @param e      the engine
 /// @param tokens the tokens appended to (EOS)
-static void ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+/// @return true
+static bool ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     chat_tmpl_push_marker(tokens, e->vocab.eos_id);
+    return true;
 }
 
 
@@ -1456,12 +1513,12 @@ void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const ch
     const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
     if (!t || !t->encode_rendered || !opener || !tool_token || m->n_user <= 0) return;
     pulsar_tokens r = {0}, tok = {0};
-    t->encode_rendered(e, opener, NULL, 0, &r);
-    t->encode_rendered(e, tool_token, NULL, 0, &tok);
-    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE added token, so the render's
-     * own text after it cannot merge into it */
+    const bool encoded = t->encode_rendered(e, opener, NULL, 0, &r, NULL, 0) &&
+                         t->encode_rendered(e, tool_token, NULL, 0, &tok, NULL, 0);
+    /* the opener is the user marker, then the suffix, ending in the tool token -- ONE token the render's own text
+     * after it cannot merge into (an added token; DeepSeek: the end of a pre-tokenizer piece) */
     const int suffix = r.len - m->n_user;
-    bool ok = tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
+    bool ok = encoded && tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
               r.v[r.len - 1] == tok.v[0];
     for (int k = 0; ok && k < m->n_user; k++) ok = r.v[k] == m->user[k];
     if (ok) {
@@ -1531,21 +1588,25 @@ const char *pulsar_backend_name(pulsar_backend backend) {
 /* ---- the DeepSeek family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2) ---------------- */
 
 /** pulsar_family_tokenizer::encode_text for DeepSeek: plain BPE.  @param e the engine  @param text the text
- *  (NULL = "")  @param out receives the tokens */
-static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+ *  (NULL = "")  @param out receives the tokens  @return true: the byte-level tokenizer refuses no text */
+static bool ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     e->vocab.bpe_tokenize_text(text ? text : "", out);
+    return true;
 }
 
 /// pulsar_family_tokenizer::encode_rendered for DeepSeek.
 /// @param e       the engine
 /// @param text    the rendered text
-/// @param spans   [n_spans] the trusted spans, or NULL (the whole text is rendered chat)
+/// @param spans   [n_spans] the client-text byte ranges -- plain text: no control token is matched inside one, or
+///                completed by one (L223, L375) -- or NULL (the whole text is the renderer's)
 /// @param n_spans spans
 /// @param out     receives the tokens
-static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
-                                    uint32_t n_spans, pulsar_tokens *out) {
+/// @return true: the byte-level tokenizer refuses no text (the unnamed reason buffer is never written)
+static bool ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                                    uint32_t n_spans, pulsar_tokens *out, char *, size_t) {
     if (!spans || !n_spans) e->vocab.tokenize_rendered_chat_vocab(text, out);
     else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
+    return true;
 }
 
 /** pulsar_family_tokenizer::is_stop: EOS only.  @param e the engine  @param token the id  @return true for EOS */
@@ -1558,14 +1619,22 @@ static char *ds4_tok_token_text(pulsar_engine *e, int token, size_t *len) { retu
 /** pulsar_family_tokenizer::think_close.  @param e the engine  @return the think-end marker id */
 static int ds4_tok_think_close(pulsar_engine *e) { return e->vocab.think_end_id; }
 
-/* DeepSeek names a turn with one special token */
-/** pulsar_family_tokenizer::turn_markers: one special token each.  @param e the engine
+/* DeepSeek names a turn with one special token.  L373 (O64): its template renders a tool message as a user turn
+ * that opens "<tool_result>" (ds4_chat_append_message; the server's renderer writes the same text) -- BPE text, not
+ * an added token.  The tool-result suffix is the tokens of "<tool_result": the pre-tokenizer ends the "_result"
+ * piece at the ">" (a punctuation-led letter run stops at the next non-letter), and no merge crosses a piece, so
+ * those tokens are the same whatever the result's body is -- the ">" is not: it joins what follows (">" + "\n",
+ * "></").  A vocabulary that spells the suffix in more than three tokens, or "_result" in more than one, tells no
+ * tool turn apart (n_tool stays 0), as before.  A user message that itself begins "<tool_result" reads as a tool
+ * result: what the markers feed are anchors and cut choices, never a refusal. */
+/** pulsar_family_tokenizer::turn_markers: one special token each, and the tool-result suffix.  @param e the engine
  *  @param out receives the markers  @return true, always */
 static bool ds4_tok_turn_markers(pulsar_engine *e, pulsar_turn_markers *out) {
     out->user[0] = e->vocab.user_id;
     out->n_user = 1;
     out->assistant[0] = e->vocab.assistant_id;
     out->n_assistant = 1;
+    pulsar_turn_markers_add_tool(e, "<｜User｜><tool_result", "_result", out);
     return true;
 }
 

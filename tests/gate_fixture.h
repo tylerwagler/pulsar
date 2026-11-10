@@ -44,6 +44,7 @@ static inline bool gate_prefill_suffix_classic(pulsar_session *s, const pulsar_t
         return false;
     }
     s->dev.host_stale = true;   /* the head wrote the live row on the device (L302) */
+    s->dev.live_valid = true;   /* ... for this view: the readers' gate (live_dev, L375 O15) */
     pulsar_tokens p = *toks; p.len = end;
     pulsar_tokens_copy(&s->checkpoint, &p);
     s->checkpoint_valid = true;

@@ -128,8 +128,7 @@ bool gemma4_render(pulsar_engine *e, server *s, chat_conversation *c, request *r
         r->force_tool_call = true;
         if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
-    if (e) pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
-    return true;
+    return !e || request_tokenize_rendered(e, r, err, errlen);
 }
 
 /* L338 P4: the forced call's opener -- "<|tool_call>call:" (vLLM's reading of Gemma's call body), and for a named
@@ -161,7 +160,7 @@ void gemma4_forced_call_prefill(const request *r, const char *, size_t *, buf *a
  *  @return the tokens of "<bos>" */
 int gemma4_trivial_header_tokens(pulsar_engine *e) {
     pulsar_tokens t = {0};
-    pulsar_tokenize_rendered_chat(e, "<bos>", &t);
+    if (!pulsar_tokenize_rendered_chat(e, "<bos>", &t)) pulsar_die("gemma4: the tokenizer refused the trivial header");
     const int n = t.len;
     pulsar_tokens_free(&t);
     return n;

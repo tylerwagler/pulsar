@@ -550,11 +550,15 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
 /** The most pools adopt() asks bank_pools for (twice PULSAR_KV_POOLS_MAX). */
 #define CKPT_ADOPT_POOLS (2u * PULSAR_KV_POOLS_MAX)
 
-bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r) {
+bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r,
+                       bool *moved) {
     const char *why = NULL;
     ckpt_place from = {};
+    *moved = false;
     if (dst >= PULSAR_MSEQ_MAX || src >= PULSAR_MSEQ_MAX || dst == src || T == 0u || !st->ops->bank_pools)
         why = "not two banks of the pool";
+    else if (st->bank_adapter && (st->bank_adapter[src] != 0) != (st->bank_adapter[dst] != 0))
+        why = "one bank runs the runtime adapter and the other does not (their states are different models')";
     else if (r) {
         if (r < st->rec || r >= st->rec + st->n_rec || r->bank != src || r->T != T) why = "the record is not the source's at T";
         else from = ckpt_rec_place(st, r);
@@ -585,7 +589,9 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
     }
     /* dst's history is replaced wholesale: its checkpoints and records go; then the counters at T, the source's rows
      * below T, the source's state at T -- the same three moves as a restore on the source itself */
+    *moved = true;   /* L375 O43: from here dst is no longer what its view describes */
     pulsar_ckpt_drop_bank(st, dst);
+    if (st->ops->history_replaced) st->ops->history_replaced(st->state);   /* L375 O42: before the walk below */
     bool ok = r ? st->ops->install_frontier(st->state, T, T) : st->ops->prepare_restore(st->state, T);
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;

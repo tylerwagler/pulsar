@@ -50,7 +50,12 @@ bool pulsar_nemotron_h_image_prepare(const pulsar_nemotron_h_vision_shape *s, co
                                      pulsar_nemotron_h_image *img, char *err, size_t errlen) {
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
-    if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) {
+    const vision_decode dec = vision_decode_rgb(bytes, len, &rgb, &w, &h);
+    if (dec == vision_decode::busy) {
+        snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+        return false;
+    }
+    if (dec != vision_decode::ok) {
         snprintf(err, errlen, "the image could not be decoded (PNG or JPEG, at most %llu pixels)", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }

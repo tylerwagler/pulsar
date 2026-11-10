@@ -579,11 +579,9 @@ uint64_t pulsar_session_fused_digest(pulsar_session *s, uint32_t n_dec, uint32_t
     return dec * 0x100000001b3ull ^ heads;
 }
 
-/* The live row's digest (an eval's, a speculative run's last row). */
-/** The digest of the session's live row, on the device.  @param s the session  @return the digest, 0 on failure */
-static uint64_t live_digest(pulsar_session *s) {
+uint64_t pulsar_session_live_digest(pulsar_session *s) {
     uint64_t d = 0;
-    return s->rows_digest(s->dev.live, 0, 1, &d) ? d : 0u;
+    return s->rows_digest(s->live_dev(), 0, 1, &d) ? d : 0u;
 }
 
 /** Settle a pipelined eval's identity check (pulsar_session_eval defers it,
@@ -815,6 +813,7 @@ void pulsar_session_family_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->logits_stale = true;
+    s->dev.live_valid = false;   /* L375: the live row was the forgotten history's (the readers refuse, live_dev) */
     s->live_images.n = 0;      /* the forgotten history's image records go with it (a run from 0 reads them) */
     spec_lookahead_reset(s);   /* the history the lookahead was conditioned on is gone */
 }
@@ -827,14 +826,16 @@ void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n) {
     s->checkpoint_valid = s->engine->family->session->sync->state_agrees(s);
 }
 
-int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
-}
-int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
-                           const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
-    PULSAR_NVTX_FN();
-    if (!s) return 1;
+/** pulsar_session_sync_mm's body: the family's sync, mirrored to the peers under tensor parallelism.
+ *  @param s the session
+ *  @param prompt the expanded prompt
+ *  @param images the images, start_pos set
+ *  @param n_images their count (0 = text only)
+ *  @param err receives the failure
+ *  @param errlen bytes at err
+ *  @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1 */
+static int session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                           int n_images, char *err, size_t errlen) {
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return pulsar_session_family_sync(s, prompt, images, n_images, err, errlen);
     if (tp_mirror_worker_drives_nothing(tp, "sync", err, errlen)) return 1;
@@ -910,6 +911,24 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
     s->tp_in_sync = false;
     return tp_mirror_leader_ack(s, tp, "sync", body_rc, err, errlen);
 }
+
+int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    return pulsar_session_sync_mm(s, prompt, NULL, 0, err, errlen);
+}
+int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
+                           const pulsar_image_ref *images, int n_images, char *err, size_t errlen) {
+    PULSAR_NVTX_FN();
+    if (!s) return 1;
+    /* O34: an image sync that failed on a decode the shared budget refused is busy, not a failed prefill -- the
+     * local sync and the mirrored one alike (the leader decodes on this thread; the pair's own handling of the
+     * failed step is the body's and does not change) */
+    vision_decode_busy_reset();
+    const int rc = session_sync_mm(s, prompt, images, n_images, err, errlen);
+    if (rc != 1 || n_images <= 0 || !vision_decode_busy_seen()) return rc;
+    if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+    return PULSAR_SESSION_SYNC_BUSY;
+}
 int pulsar_image_block_starts(pulsar_engine *e, const pulsar_tokens *tokens, int len, int *starts, int cap) {
     if (!e || !tokens || len < 0 || len > tokens->len) return -1;
     int n = 0;
@@ -972,9 +991,12 @@ int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prom
         return 0;
     }
     /* L268: the family's front, through the core's walk (image_front.cpp) */
-    const bool ok = pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen);
-    if (!ok) pulsar_tokens_free(out);
-    return ok ? 1 : 0;
+    vision_decode_busy_reset();
+    if (pulsar_image_expand(e, prompt, from, images, n_images, out, err, errlen)) return 1;
+    pulsar_tokens_free(out);
+    if (!vision_decode_busy_seen()) return 0;
+    if (err) snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+    return -1;
 }
 TokCount pulsar_session_common_prefix(pulsar_session *s, const pulsar_tokens *prompt) { return TokCount{s->common_prefix(prompt)}; }
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s) { s->prefix_match(prompt, out); } else if (out) { out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false; } }
@@ -1052,7 +1074,7 @@ int pulsar_session_eval(pulsar_session *s, int token, char *err, size_t errlen) 
     }
     char what[96];
     snprintf(what, sizeof(what), "eval at position %llu", (unsigned long long)pos);
-    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what, live_digest(s))) {
+    if (!pulsar_tp_defer_command_ack_digest(tp, s->tp_session_id, what, pulsar_session_live_digest(s))) {
         pulsar_tp_drain_command_acks(tp);
         if (err) snprintf(err, errlen, "tp: could not defer the eval's identity check");
         return 1;
@@ -1156,6 +1178,23 @@ int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap) {
                 !ops || !ops->hidden ? "the family offers no hidden-state readout" : "no buffer, or a mirrored session");
         return 0;
     }
+    /* L375 O47: the readout is ONE row a session -- the last any step headed, whichever bank and position that was --
+     * so it is served only as what the caller means by it: the live bank's last row, the one its valid view ends on
+     * (a sync's last prompt token).  Another bank's row, a verify's rejected draft row, or a view no row was headed
+     * for (a prompt end restored from its record) is refused by name. */
+    const pulsar_driver_state *d = s->driver;
+    const uint32_t live = pulsar_session_live_bank(s);
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0 || !d->hidden_valid || d->hidden_bank != live ||
+        d->hidden_pos != (uint32_t)s->checkpoint.len - 1u) {
+        if (!d->hidden_valid || !s->checkpoint_valid || s->checkpoint.len <= 0)
+            fprintf(stderr, "pulsar: copy hidden: %s -- refusing\n",
+                    !d->hidden_valid ? "no row has been headed (or the step that last headed one failed)"
+                                     : "the live bank holds no valid history");
+        else
+            fprintf(stderr, "pulsar: copy hidden: the readout holds bank %u's row at %u, not the live bank %u's last "
+                            "row at %d -- refusing\n", d->hidden_bank, d->hidden_pos, live, s->checkpoint.len - 1);
+        return 0;
+    }
     return (int)ops->hidden(s, out, (uint32_t)cap);
 }
 
@@ -1250,7 +1289,7 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     char err[256];
     err[0] = '\0';
     int peers = 0;
-    const uint64_t digest = live_digest(s);
+    const uint64_t digest = pulsar_session_live_digest(s);
     if (!pulsar_tp_wait_command_status_digest(tp, s->tp_session_id, operation, &peers, digest,
                                               err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, operation, err);
@@ -1641,6 +1680,7 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
  * timings (verify_curve.cpp).  Verdict: 0 ran, 1 failed. */
 int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "the verify profile", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "verify_profile", &tp, err, errlen);
@@ -1760,12 +1800,24 @@ static int tp_spec_steps_refuse_masks(pulsar_spec_step *steps, int n) {
     }
     return -1;
 }
+/* L375 O38: the batch entries' capability refusal (their single-round twins return -1 through
+ * PULSAR_FAMILY_REQUIRES_S; a batch's verdict is per step). */
+/** Fail every step: the family declares no speculative decoding.  @param steps [n] the steps  @param n steps
+ *  @return -1, always */
+static int spec_steps_refuse_family(pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++) {
+        steps[i].status = PULSAR_SPEC_STEP_FAILED;
+        snprintf(steps[i].err, sizeof steps[i].err, "the family does not implement speculative decoding");
+    }
+    return -1;
+}
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
                                        uint32_t row_budget, pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     PULSAR_NVTX_FN();
     const char *operation = "spec_assemble_batch";
     *n_rows_out = 0;
     if (!s || n < 0 || (n > 0 && (!steps || !reqs))) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
@@ -1789,6 +1841,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
     PULSAR_NVTX_FN();
     const char *operation = "spec_round_end_batch";
     if (!s || n < 0 || (n > 0 && !steps)) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
@@ -1815,6 +1868,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     PULSAR_NVTX_FN();
     const char *operation = "spec_redraft_commit_batch";
     if (!s || n < 0 || (n > 0 && !steps)) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
@@ -1829,7 +1883,18 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }
-int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int *accepted, int accepted_cap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1); return s ? s->eval_speculative_block(first_token, max_tokens, accepted, accepted_cap, err, errlen) : 0; }
+int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
+    if (!s) return 0;
+    /* L375 O40: no frame mirrors this entry (pulsar_session_generate_speculative is the mirrored one), so on a pair
+     * the leader would run a round its workers never see -- refused by name */
+    if (pulsar_session_is_mirrored(s)) {
+        if (err) snprintf(err, errlen, "eval_speculative_block: a tensor-parallel engine does not mirror it "
+                                       "(pulsar_session_generate_speculative is the mirrored entry)");
+        return -1;
+    }
+    return s->eval_speculative_block(first_token, max_tokens, accepted, accepted_cap, err, errlen);
+}
 void pulsar_session_invalidate(pulsar_session *s) {
     PULSAR_NVTX_FN();
     /* The pair-off shape is untouched: one call, no TP code on the live path. */
@@ -1934,6 +1999,8 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
     const bool by_images = n_images > 0 && !m.seamed &&
                            pulsar_image_identity_build(e->family->vision, e, prompt->v, prompt->len, images, n_images,
                                                        (uint32_t)prompt->len, &want);
+    if (n_images > 0 && !m.seamed && !by_images)
+        vision_decode_busy_reset();   /* discarded: priced from tokens alone (O34) */
     uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL);
     if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want) &&
         !pulsar_image_holds_below(e, held, prompt, images, n_images, G))
@@ -1988,6 +2055,8 @@ pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t s
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     if (tp_mirror_target(s)) return none;
+    /* L375 O46: nor does a bank adopt across the runtime adapter (pulsar_ckpt_adopt refuses it) */
+    if (pulsar_session_bank_adapter(s, src) != pulsar_session_bank_adapter(s, pulsar_session_live_bank(s))) return none;
     const pulsar_ckpt_record *r = NULL;
     int len = 0;
     const TokPos T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
@@ -2032,11 +2101,23 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const bool at_end = r && r->logits && T == (uint32_t)len;
-    if (at_end) memcpy(s->logits, r->logits, (size_t)st->end_width * sizeof(float));
-    s->checkpoint_valid = false;   /* the state moves below */
-    if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
+    /* the record's logits, kept aside before the store moves (dst's own records go, and a capture may recycle one) */
+    std::vector<float> end_row;
+    if (at_end) end_row.assign(r->logits, r->logits + st->end_width);
+    /* L375 O43: dst's view -- its history, its host logits, its validity -- is given up only once the adopt has
+     * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank, banks that differ in
+     * runtime adapter, O46) leaves the bank exactly what its view describes */
+    bool moved = false;
+    bool ok = pulsar_ckpt_adopt(st, dst, src, T, r, &moved);
+    if (moved) s->checkpoint_valid = false;   /* the state moved */
+    if (ok && at_end) {
+        memcpy(s->logits, end_row.data(), end_row.size() * sizeof(float));
+        ok = s->live_from_host(s->logits);
+    }
+    if (!ok) {
         pulsar_tokens_free(&view);
-        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u%s", src, T, dst,
+                          moved ? "" : " (refused before anything moved: the bank keeps its own state)");
         return refused;
     }
     s->checkpoint.len = 0;

@@ -1101,6 +1101,16 @@ static void test_ignored_key_named_once(void) {
     TEST_ASSERT(api_key_first_seen("/test2", "zz_new_key"));
     TEST_ASSERT(api_key_first_seen("/test", "zz_other_key"));
     TEST_ASSERT(!api_key_first_seen("/test2", "zz_new_key"));
+    /* L372 (O36): a pair is the whole key -- two long keys that differ past byte 160 are two */
+    std::string long_a(300, 'k'), long_b(300, 'k');
+    long_a += "_a";
+    long_b += "_b";
+    TEST_ASSERT(api_key_first_seen("/test", long_a.c_str()));
+    TEST_ASSERT(api_key_first_seen("/test", long_b.c_str()));
+    TEST_ASSERT(!api_key_first_seen("/test", long_a.c_str()) && !api_key_first_seen("/test", long_b.c_str()));
+    /* the set is bounded in bytes too: a key that alone passes it is never tracked (and never "first") */
+    std::string huge((size_t)API_SEEN_BYTES_MAX + 1u, 'h');
+    TEST_ASSERT(!api_key_first_seen("/test", huge.c_str()));
 }
 
 
@@ -6372,6 +6382,115 @@ static void test_embeddings_dimensions_compare_as_numbers(void) {
     TEST_ASSERT(read_dimensions(NULL, 1024, &err) && err.empty());   /* absent: the model's width */
 }
 
+/* L374: the encoder server's GPU thread (enc_executor, encode_server.cpp).  The fixture every submitter shares
+ * (in the anonymous namespace, as enc_executor is). */
+namespace {
+struct enc_exec_fixture {
+    enc_executor *x;
+    pthread_mutex_t mu;      /* guards the fields below */
+    pthread_cond_t cv;       /* the gate opening */
+    bool gate_open;          /* job 0 holds the GPU thread until this is set */
+    bool first_running;      /* job 0 has been taken off the queue and is running */
+    std::vector<int> order;  /* the ids of the jobs that ran, in the order they ran */
+};
+struct enc_exec_submit {
+    enc_exec_fixture *f;
+    int id, fd;
+    bool ran;                /* enc_executor_run's result */
+    pthread_t th;
+};
+}  // namespace
+
+static void *enc_exec_submit_thread(void *arg) {
+    enc_exec_submit *s = (enc_exec_submit *)arg;
+    enc_exec_fixture *f = s->f;
+    s->ran = enc_executor_run(f->x, s->fd, [&] {
+        pulsar::ScopedLock lk(&f->mu);
+        if (s->id == 0) {
+            f->first_running = true;
+            while (!f->gate_open) pthread_cond_wait(&f->cv, &f->mu);
+        }
+        f->order.push_back(s->id);
+    });
+    return NULL;
+}
+
+static void *enc_exec_stop_thread(void *arg) {
+    enc_executor_stop((enc_executor *)arg);
+    return NULL;
+}
+
+/* poll (1 ms steps, 10 s at most) until `pred` holds */
+template <class P> static bool enc_exec_wait_for(const P &pred) {
+    const struct timespec nap = {0, 1000000};
+    for (int i = 0; i < 10000; i++) {
+        if (pred()) return true;
+        nanosleep(&nap, NULL);
+    }
+    return false;
+}
+
+/* L374 (O16 / O53): every engine call of the encoder server runs on its engine's ONE long-lived thread.  The queue's
+ * contract, without an engine: jobs run on that one thread in the order they were queued; a job whose client has
+ * gone by its turn is dropped unrun and its waiter told so; a stop with jobs still queued runs them all before the
+ * thread exits; and the waiter of a running job stays until it has finished. */
+static void test_encode_executor_queue(void) {
+    enc_exec_fixture f;
+    f.x = enc_executor_start();
+    TEST_ASSERT(f.x != NULL);
+    if (!f.x) return;
+    pthread_mutex_init(&f.mu, NULL);
+    pthread_cond_init(&f.cv, NULL);
+    f.gate_open = f.first_running = false;
+    int gone[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, gone) == 0);
+    close(gone[1]);   /* gone[0]'s peer has hung up: gen_client_disconnected(gone[0]) */
+    TEST_ASSERT(gen_client_disconnected(gone[0]));
+    enum { N = 6, GONE = 3 };
+    enc_exec_submit s[N];
+    pthread_t self = pthread_self(), ran_on[2] = {self, self};
+    /* job 0 holds the GPU thread; 1 .. N-1 queue behind it one at a time, so their order is known */
+    for (int i = 0; i < N; i++) {
+        s[i] = {&f, i, i == GONE ? gone[0] : -1, false, {}};
+        TEST_ASSERT(pthread_create(&s[i].th, NULL, enc_exec_submit_thread, &s[i]) == 0);
+        TEST_ASSERT(enc_exec_wait_for([&] {
+            pulsar::ScopedLock a(&f.mu);
+            if (i == 0) return f.first_running;
+            pulsar::ScopedLock b(&f.x->mu);
+            return f.x->q.size() == (size_t)i;
+        }));
+    }
+    /* a stop with five jobs queued: it waits for them */
+    enc_executor *x = f.x;
+    pthread_t stopper;
+    TEST_ASSERT(pthread_create(&stopper, NULL, enc_exec_stop_thread, x) == 0);
+    TEST_ASSERT(enc_exec_wait_for([&] {
+        pulsar::ScopedLock b(&x->mu);
+        return x->stop;
+    }));
+    {
+        pulsar::ScopedLock a(&f.mu);
+        TEST_ASSERT(f.order.empty());   /* nothing has finished: job 0 still holds the thread */
+        f.gate_open = true;
+        pthread_cond_broadcast(&f.cv);
+    }
+    for (int i = 0; i < N; i++) pthread_join(s[i].th, NULL);
+    pthread_join(stopper, NULL);   /* the thread has exited and the executor is freed */
+    for (int i = 0; i < N; i++) TEST_ASSERT(s[i].ran == (i != GONE));
+    const std::vector<int> want = {0, 1, 2, 4, 5};
+    TEST_ASSERT(f.order == want);
+    close(gone[0]);
+    pthread_cond_destroy(&f.cv);
+    pthread_mutex_destroy(&f.mu);
+    /* every job of one executor runs on the same thread, and it is not the submitter's */
+    x = enc_executor_start();
+    TEST_ASSERT(x != NULL);
+    if (!x) return;
+    for (pthread_t &t : ran_on) TEST_ASSERT(enc_executor_run(x, -1, [&] { t = pthread_self(); }));
+    TEST_ASSERT(pthread_equal(ran_on[0], ran_on[1]) && !pthread_equal(ran_on[0], self));
+    enc_executor_stop(x);
+}
+
 /* L335: /v1/completions takes ONE text prompt -- a string or an array of one string.  A batch (an array of more than
  * one prompt), token ids, an empty array or a non-string refuse by name; they used to read as their first element
  * (the rest of the batch dropped) or as "". */
@@ -9292,7 +9411,9 @@ static void test_l353_small_fixes(void) {
         TEST_ASSERT(!s.terminal_checkpoint_step());
         TEST_ASSERT(!s.slots[0].terminal_pending);
     }
-    /* 13: a file that can't be opened now is transient (2): it and its descendants stay; a missing one is a fault (1) */
+    /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
+     * L375 (O25): transient is 3 -- a read that failed now -- not the RAM pool's 2, which the reader waits on the
+     * writer's commits for; a shortage (EMFILE) never counts towards a drop, however often */
     char tmpl[] = "/tmp/pulsar-l353-errno.XXXXXX";
     char *dir = l323_tmpdir(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -9313,17 +9434,501 @@ static void test_l353_small_fixes(void) {
         if (fd < 0) break;
         held.push_back(fd);
     }
-    const int rc_emfile = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
+    int rc_emfile[PULSAR_SEGSTORE_READ_FAILS_MAX + 2];
+    for (int &rc : rc_emfile)
+        rc = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
     for (const int fd : held) close(fd);
     TEST_ASSERT(setrlimit(RLIMIT_NOFILE, &was) == 0);
-    TEST_ASSERT(rc_emfile == 2);
+    for (const int rc : rc_emfile) TEST_ASSERT(rc == 3);
     char path[600];
     snprintf(path, sizeof path, "%s/%.40s.seg", dir, key);
     TEST_ASSERT(access(path, F_OK) == 0 && pulsar_segstore_contains(st, key));
+    TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 0);
+    pulsar_segstore_unmap_part(st, key, PULSAR_SEGSTORE_PART_ROWS);
     TEST_ASSERT(unlink(path) == 0);
     TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 1);
+    /* L375 (O25): a read that keeps failing with a persistent errno (the file's name taken by a directory) is 3 --
+     * through a chain read too, which keeps the segment -- until it has failed PULSAR_SEGSTORE_READ_FAILS_MAX times in
+     * a row: then it is a fault and the chain read drops it.  A read that succeeds starts the count again. */
+    char key2[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second segment", 256, 2, key2) && l323_put_rp(st, key2, 128));
+    pulsar_segstore_seg chain[1];
+    TEST_ASSERT(pulsar_segstore_get(st, key2, &chain[0]));
+    char bak[640];
+    snprintf(path, sizeof path, "%s/%.40s.seg", dir, key2);
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    const pulsar_kvchain_segment_checker pass = [](void *, const uint8_t *, uint64_t, bool, const uint8_t *, uint64_t,
+                                                   char *, size_t) { return PULSAR_SEGMENT_OK; };
+    const auto check = [&]() {
+        int nx = 0;
+        return pulsar_kvchain_verify_slice_with(st, chain, 1, &nx, 1, pass, NULL, err, sizeof err);
+    };
+    const auto break_file = [&]() { return rename(path, bak) == 0 && mkdir(path, 0700) == 0; };
+    TEST_ASSERT(check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && strstr(err, "can't be read now") && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0 && rename(bak, path) == 0 && check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(check() == 1 && strstr(err, "times in a row") && !pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
+}
+
+/* L372 (O2): a job whose bank cannot be installed before its first decode attempt has no parser for the finish step
+ * to read a turn through -- GEN_FINISH from there was a NULL call on the next step.  It ends as a failed prefill does:
+ * answered, GEN_DONE, released by the same service call.  No session here: a parked (preempted) bank stands in for
+ * the install bank_switch refuses. */
+static void test_l372_predecode_failure_ends_the_job(void) {
+    static const gen_phase phases[] = {GEN_RESTORE, GEN_PREFILL_COLD, GEN_PREFILL_MAIN, GEN_DECODE_INIT};
+    for (const gen_phase ph : phases) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        s.pool_banks = 2;
+        s.n_slots = 2;
+        s.n_generating = 1;
+        job j;
+        memset(&j, 0, sizeof j);
+        pthread_mutex_init(&j.mu, NULL);
+        pthread_cond_init(&j.cv, NULL);
+        j.fd = sv[0];
+        session_slot *sl = &s.slots[1];
+        sl->provisioned = true;
+        sl->bank = 1;
+        sl->preempted = true;
+        sl->active_job = &j;
+        gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));   /* the slot's own: generate_job_end frees it */
+        memset(g, 0, sizeof(*g));
+        g->j = &j;
+        g->finish = "length";
+        g->phase = ph;
+        slot_writer_init(&g->writer, sv[0]);
+        sl->gen = g;
+        s.worker_service_slot(sl);
+        TEST_ASSERT(sl->gen == NULL && sl->active_job == NULL && j.done && s.n_generating == 0);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, " 500 ") != NULL && strstr(out, "bank 1 state restore failed") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        pthread_mutex_destroy(&s.mu);
+    }
+}
+
+/* L372 (O17): a preempted decoder whose bank cannot be re-backed fails by name, and its bank -- no physical, the
+ * parked history still its carry -- is left marked spilled, so the next install re-backs it empty (bank_unspill)
+ * instead of installing a bank with no pools.  No session here: the re-back refuses, as an allocation failure does. */
+static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.pool_banks = 2;
+    s.n_slots = 2;
+    s.live_bank = -1;   /* nothing installed: the switch below saves no outgoing bank */
+    int dummy = 0;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.finish = "length";
+    g.phase = GEN_DECODE;
+    session_slot *v = &s.slots[1];
+    v->provisioned = true;
+    v->bank = 1;
+    v->active_job = (job *)&dummy;
+    v->gen = &g;
+    v->preempted = true;
+    v->preempt_path = server_xstrdup("/nonexistent/pulsar-l372-preempt-bank-1.kvp");
+    TEST_ASSERT(s.worker_readmit_preempted());
+    TEST_ASSERT(!v->preempted && v->preempt_path == NULL && v->spilled);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "could not be reloaded") != NULL);
+    /* the install is the spilled bank's now: it re-backs (here: refuses) instead of handing out the carry */
+    TEST_ASSERT(!s.bank_switch(1) && v->spilled && s.m_restore_failures == 1);
+    TEST_ASSERT(!s.worker_readmit_preempted());   /* nothing parked any more */
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L372 (O13): what the spec quantum's fix rests on -- a main prefill marked no_fuse is the classic step's beside a
+ * fused quantum, a fusable one is not (it rides the quantum's forwards).  The quantum itself (a rider whose bank
+ * already stands at its prompt's end is marked no_fuse) needs a session: tests/ live legs, not here. */
+static void test_l372_no_fuse_prefill_is_the_classic_steps(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    pulsar_tokens prompt = {0};
+    g.j = &j;
+    g.phase = GEN_PREFILL_MAIN;
+    g.prompt_for_sync = &prompt;
+    sl.provisioned = true;
+    sl.active_job = &j;
+    sl.gen = &g;
+    TEST_ASSERT(slot_fusable_prefill(&sl) && slot_steppable_beside_decode(&sl) && !slot_steppable_beside_fused(&sl));
+    g.no_fuse = "nothing left to prefill: the classic sync hands it to decode";
+    TEST_ASSERT(!slot_fusable_prefill(&sl) && slot_steppable_beside_fused(&sl));
+}
+
+/* L372 (O19): a re-send waits for a busy bank whose client is gone in every phase whose abandon keeps the bank's
+ * history -- since L353 no. 9 a prefill's does -- and in no other (the scan around it reads the session: live legs). */
+static void test_l372_gone_client_wait_covers_prefill(void) {
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    static const struct { gen_phase phase; bool wait; } cases[] = {
+        {GEN_RESTORE, false},    {GEN_PREFILL_COLD, true}, {GEN_PREFILL_MAIN, true}, {GEN_DECODE_INIT, true},
+        {GEN_DECODE, true},      {GEN_FINISH, false},      {GEN_DONE, false},
+    };
+    for (const auto &c : cases) {
+        g.phase = c.phase;
+        TEST_ASSERT(gen_gone_wait_phase(&g) == c.wait);
+    }
+    TEST_ASSERT(!gen_gone_wait_phase(NULL));
+}
+
+/* L372 (O28): a decoder whose batch_leave failed is GEN_FINISH with batch_active still set and in no decode set: the
+ * step beside a decode quantum is what finishes it.  A decoder and a parked one stay out. */
+static void test_l372_failed_batch_leave_is_still_stepped(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    int dummy = 0;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    sl.provisioned = true;
+    sl.active_job = (job *)&dummy;
+    sl.gen = &g;
+    g.phase = GEN_FINISH;
+    g.batch_active = true;
+    TEST_ASSERT(slot_steppable_beside_decode(&sl) && slot_steppable_beside_fused(&sl));
+    g.phase = GEN_DECODE;
+    TEST_ASSERT(!slot_steppable_beside_decode(&sl));
+    g.phase = GEN_FINISH;
+    sl.preempted = true;
+    TEST_ASSERT(!slot_steppable_beside_decode(&sl));
+}
+
+/* L372 (O30): a bank that holds no resident KV is a victim in the guard's order but not one a spill plan is made
+ * over -- its spill frees nothing and takes it out of the empty banks.  No session here: every bank's resident KV
+ * reads 0, so the order has all three idle banks and the plan's victims none. */
+static void test_l372_empty_banks_are_not_spill_victims(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.n_slots = 3;
+    for (int i = 0; i < 3; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].last_serviced_us = (uint64_t)(10 * (i + 1));
+    }
+    int order[PULSAR_SESSION_POOL_CAP];
+    KvBytes drop[PULSAR_SESSION_POOL_CAP];
+    TEST_ASSERT(guard_victim_order(&s, NULL, 0, order) == 3);
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, drop) == 0);
+    TEST_ASSERT(guard_spill_victims(&s, NULL, 0, order, NULL) == 0);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+/* L372 (O32): a judge request whose client is gone is ended before its next chunk -- by name, and before anything is
+ * installed (no session here: with the client still there the step goes on to the bank install, which refuses). */
+static void test_l372_judge_ends_a_gone_clients_request(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.live_bank = -1;   /* nothing installed: the step saves no outgoing bank */
+    server_judge *J = new server_judge();
+    J->bank = 1;
+    s.judge = J;
+    for (const bool gone : {true, false}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) break;
+        if (gone) close(sv[1]);
+        judge_job jb;
+        pthread_mutex_init(&jb.mu, NULL);
+        pthread_cond_init(&jb.cv, NULL);
+        jb.fd = sv[0];
+        pulsar_tokens prompt = {0};
+        pulsar_tokens_push(&prompt, 1);
+        jb.prompts.push_back(prompt);
+        J->head = J->tail = &jb;
+        TEST_ASSERT(server_judge_queued(&s));
+        TEST_ASSERT(server_judge_step(&s));
+        TEST_ASSERT(jb.done && !server_judge_queued(&s) && J->tail == NULL && !jb.started);
+        TEST_ASSERT(jb.err == (gone ? "the client disconnected" : "the judge bank could not be installed"));
+        pulsar_tokens_free(&jb.prompts[0]);
+        pthread_cond_destroy(&jb.cv);
+        pthread_mutex_destroy(&jb.mu);
+        close(sv[0]);
+        if (!gone) close(sv[1]);
+    }
+    server_judge_close(&s);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L372 (O23): an abandoned prefill keeps its bank, so it drops the live tool bindings it did not continue (they match
+ * by ids and position alone); a live continuation's own binding stays.  The memory refusal keeps the bank too and
+ * settles the bindings by the same rule (live_bindings_settle), with one more case: a job refused before it moved
+ * anything on the bank -- no adopt, no chain load, no sync -- leaves every binding, since the bank is still the
+ * history they were made on. */
+static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
+    for (const bool continues : {false, true}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        pthread_mutex_init(&s.tool_mu, NULL);
+        s.pool_banks = 2;
+        s.n_slots = 2;
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        session_slot *sl = &s.slots[1];
+        sl->provisioned = true;
+        sl->bank = 1;
+        sl->active_job = &j;
+        sl->responses_live.valid = sl->anthropic_live.valid = true;
+        sl->responses_live.live_tokens = sl->anthropic_live.live_tokens = 100;
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        g.j = &j;
+        g.phase = GEN_PREFILL_MAIN;
+        g.responses_live_continuation = g.anthropic_live_continuation = continues;
+        slot_writer_init(&g.writer, sv[0]);
+        sl->gen = &g;
+        s.live_bindings_settle(sl);   /* refused before its first chunk: nothing moved, nothing cleared */
+        TEST_ASSERT(sl->responses_live.valid && sl->anthropic_live.valid);
+        g.bank_written = true;        /* a sync was issued (an abandon is its interruption) */
+        s.gen_prefill_abandon(sl);
+        TEST_ASSERT(g.phase == GEN_DONE);
+        TEST_ASSERT(sl->responses_live.valid == continues && sl->anthropic_live.valid == continues);
+        slot_writer_free(&g.writer);
+        close(sv[0]);
+        close(sv[1]);
+        pthread_mutex_destroy(&s.tool_mu);
+        pthread_mutex_destroy(&s.mu);
+    }
+}
+
+/* L372: a decoding job whose bank cannot be installed finishes on an error and keeps the first cause -- one helper
+ * for generate_job_step, batch_leave, the quanta's entry loops and the batched round's begin (the entry loops and
+ * the round's begin overwrote a cause already recorded with "bank N state restore failed"). */
+static void test_l372_bank_install_failure_keeps_the_first_error(void) {
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.phase = GEN_DECODE;
+    gen_bank_install_failed(&g, 3u);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "bank 3 state restore failed") != NULL);
+    memset(&g, 0, sizeof g);
+    g.phase = GEN_DECODE;
+    snprintf(g.err, sizeof g.err, "the pair's step failed");
+    gen_bank_install_failed(&g, 3u);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && !strcmp(g.err, "the pair's step failed"));
+}
+
+/* L372 (O31): an abandoned decode is "abandoned" in the server's records, not the "length" turn its wire label
+ * says, and gets no terminal checkpoint; lane_abandon is what marks it.  (That gen_step_finish skips the request
+ * histograms for it needs a parser and a family: the live legs.) */
+static void test_l372_abandoned_decode_is_not_a_turn(void) {
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "length"), "abandoned"));
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "stop"), "abandoned"));
+    TEST_ASSERT(!strcmp(gen_said_finish(true, "error"), "error"));      /* a failure stays one */
+    TEST_ASSERT(!strcmp(gen_said_finish(false, "length"), "length"));
+    /* the request histograms count a turn that ran to its own end: not an abandoned one, not a failed one */
+    TEST_ASSERT(gen_turn_is_measured(false, "stop") && gen_turn_is_measured(false, "length") &&
+                gen_turn_is_measured(false, "tool_calls"));
+    TEST_ASSERT(!gen_turn_is_measured(false, "error") && !gen_turn_is_measured(true, "length") &&
+                !gen_turn_is_measured(true, "error"));
+    TEST_ASSERT(gen_turn_wants_terminal(false, "length", 5) && gen_turn_wants_terminal(false, "stop", 1));
+    TEST_ASSERT(!gen_turn_wants_terminal(true, "length", 5));
+    TEST_ASSERT(!gen_turn_wants_terminal(false, "error", 5) && !gen_turn_wants_terminal(false, "stop", 0));
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.finish = "length";
+    g.phase = GEN_DECODE;
+    g.batch_feed_valid = true;
+    lane_abandon(&g, /*drop_feed=*/true);
+    TEST_ASSERT(g.abandoned && g.phase == GEN_FINISH && !g.batch_feed_valid && !strcmp(g.finish, "length"));
+}
+
+/* L372 (O24): an eviction says what became of the history -- on disk, not written by a rule (named, no warning), or
+ * not written though a store was expected (the warning's case). */
+static void test_l372_evict_snapshot_word(void) {
+    char w[40];
+    TEST_ASSERT(!server_evict_snapshot_word(true, KV_PERSIST_RULE_NONE, w) && !strcmp(w, "disk"));
+    TEST_ASSERT(server_evict_snapshot_word(false, KV_PERSIST_RULE_NONE, w) && !strcmp(w, "none"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_READ_ONLY, w) && !strcmp(w, "none (read-only)"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_MIRRORED, w) && !strcmp(w, "none (mirrored sync)"));
+    TEST_ASSERT(!server_evict_snapshot_word(false, KV_PERSIST_RULE_DEAD, w) && !strcmp(w, "none (dead prefix)"));
+    /* the persist reports its rule: a read-only history, then a dead prefix (no session: the store is never reached) */
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.kv.enabled = true;
+    session_slot *sl = &s.slots[0];
+    sl->provisioned = true;
+    kv_persist_rule rule = KV_PERSIST_RULE_NONE;
+    bool no_room = true;
+    int end = -1;
+    sl->kv_flags = KV_HDR_READ_ONLY;
+    TEST_ASSERT(s.kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room, &rule) == 0);
+    TEST_ASSERT(rule == KV_PERSIST_RULE_READ_ONLY && !no_room && end == 0);
+    sl->kv_flags = 0;
+    sl->hint_dead = true;
+    TEST_ASSERT(s.kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room, &rule) == 0);
+    TEST_ASSERT(rule == KV_PERSIST_RULE_DEAD && !no_room && end == 0);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L372 (O12): the judge bank in the guard's order, and the judge's own floor.  (a) a judge chunk the memory floor
+ * does not admit, with no idle chat bank to spill, is answered busy -- before anything is installed, the bank as it
+ * stood.  (b) the judge bank is the relief after the idle chat banks (server_prefill_mem_step says "spill" while one
+ * is left) and before a decoder or a refusal -- only while no judge request is running or queued, and once.  No
+ * session here: the bank holds no resident KV, so a release frees nothing and says so. */
+static void test_l372_judge_bank_floor_and_release(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.live_bank = -1;
+    TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s) && !server_judge_holds_kv(&s));   /* no judge */
+    server_judge *J = new server_judge();
+    J->bank = 1;
+    s.judge = J;
+    TEST_ASSERT(server_judge_releasable(&s));
+    TEST_ASSERT(!server_judge_release(&s) && !J->released);   /* nothing resident: nothing freed, nothing to re-back */
+    /* the order: an idle chat bank is spilled first; the judge bank's turn is where the step would preempt or refuse */
+    const uint64_t MiB = 1024ull * 1024ull, F = 4538ull * MiB, need = 52ull * MiB;
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 1, true) == PREFILL_MEM_SPILL);
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, true) == PREFILL_MEM_PREEMPT);
+    TEST_ASSERT(server_prefill_mem_step(KvBytes{F}, KvBytes{need}, KvBytes{F}, 0, false) == PREFILL_MEM_REFUSE);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        judge_job jb;
+        pthread_mutex_init(&jb.mu, NULL);
+        pthread_cond_init(&jb.cv, NULL);
+        jb.fd = sv[0];
+        pulsar_tokens prompt = {0};
+        pulsar_tokens_push(&prompt, 1);
+        jb.prompts.push_back(prompt);
+        J->head = J->tail = &jb;
+        /* a judge request running or queued: the bank is its own */
+        TEST_ASSERT(!server_judge_releasable(&s) && !server_judge_release(&s));
+        J->released = true;
+        TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
+        J->released = false;
+        /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
+        (void)server_mem_floor_init(UINT64_MAX / 4, KvBytes{0});
+        char err[320] = "";
+        TEST_ASSERT(!s.floor_admits_chunk(1024, err, sizeof err) && strstr(err, "not enough memory") != NULL);
+        TEST_ASSERT(server_judge_step(&s));
+        (void)server_mem_floor_init(0, KvBytes{0});
+        TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
+        TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == -1);
+        TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
+        /* the budget's half prices the bank's growth by the session: a host-only server has none to hold */
+        TEST_ASSERT(s.budget_admits_growth(1u, 1024, err, sizeof err));
+        pulsar_tokens_free(&jb.prompts[0]);
+        pthread_cond_destroy(&jb.cv);
+        pthread_mutex_destroy(&jb.mu);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    J->released = true;
+    TEST_ASSERT(!server_judge_releasable(&s));   /* freed once: not again until a request re-backs it */
+    server_judge_close(&s);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L372: raw ill-formed UTF-8 in a request's strings is refused at the parse, by the field, on every surface that
+ * takes client text into a prompt (it reached the tokenizer, which yields no tokens for it, and failed at prefill
+ * with a 500).  The protocol parsers are the ones the endpoints call; a refusal there is the endpoint's 400. */
+static void test_l372_ill_formed_utf8_is_refused_at_parse(void) {
+    char err[320];
+    const auto refused = [&](api_style api, const char *body, const char *field) {
+        request r;
+        test_request_init(&r, REQ_CHAT, 64);
+        r.api = api;
+        chat_conversation c;
+        memset(&c, 0, sizeof c);
+        err[0] = '\0';
+        const bool ok = api == API_RESPONSES   ? parse_chat_conversation_responses(body, &c, &r, err, sizeof err)
+                        : api == API_ANTHROPIC ? parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err)
+                                               : parse_chat_conversation_openai(body, &c, &r, err, sizeof err);
+        chat_conversation_free(&c);
+        request_free(&r);
+        const std::string want = std::string(field) + " is not valid UTF-8 (byte ";
+        return !ok && !strncmp(err, want.c_str(), want.size());
+    };
+    /* chat completions: a user message, the system message, a tool result, a content part, a tool's description */
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":\"ok\"},"
+                                    "{\"role\":\"user\",\"content\":\"a\xff" "b\"}]}", "messages[1].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"system\",\"content\":\"cut \xc3\"}]}",
+                        "messages[0].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"tool\","
+                                    "\"tool_call_id\":\"c1\",\"content\":\"\x80\"}]}", "messages[1].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+                                    "\"text\":\"\xed\xa0\x80\"}]}]}", "messages[0].content[0].text"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+                                    "\"description\":\"\xc0\xaf\"}}],\"messages\":[]}",
+                        "tools[0].function.description"));
+    /* Anthropic Messages: the system prompt, a message, a tool result */
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"system\":\"\xff\",\"messages\":[]}", "system"));
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"messages\":[{\"role\":\"user\",\"content\":\"\xf5\"}]}",
+                        "messages[0].content"));
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+                                       "\"tool_use_id\":\"t1\",\"content\":\"out \xfe\"}]}]}",
+                        "messages[0].content[0].content"));
+    /* Responses: the instructions, an input item, a function call's output */
+    TEST_ASSERT(refused(API_RESPONSES, "{\"instructions\":\"\xff\",\"input\":\"hi\"}", "instructions"));
+    TEST_ASSERT(refused(API_RESPONSES, "{\"input\":[{\"role\":\"user\",\"content\":\"\xe0\x80\x80\"}]}",
+                        "input[0].content"));
+    TEST_ASSERT(refused(API_RESPONSES, "{\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"c\","
+                                       "\"output\":\"\xf4\x90\x80\x80\"}]}", "input[0].output"));
+    /* completions: the raw prompt (no engine: the refusal comes before a family is asked for) */
+    {
+        request r;
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\":\"raw \xff\"}", 64, &r, err, sizeof err));
+        TEST_ASSERT(!strncmp(err, "prompt is not valid UTF-8 (byte 15 ", 35));
+    }
+    /* /v1/systemone: its 400 on the wire */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            server s;
+            memset(&s, 0, sizeof s);
+            s.judge = new server_judge();
+            const char body[] = "{\"state\":\"\xff\",\"questions\":[]}";
+            server_judge_http(&s, sv[0], body, sizeof body - 1);
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            TEST_ASSERT(strstr(out, " 400 ") != NULL && strstr(out, "/v1/systemone: state is not valid UTF-8") != NULL);
+            free(out);
+            server_judge_close(&s);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+    /* the rule itself: well-formed text of every length passes; a key is named as one; a body that stops being JSON
+     * before the byte is still refused, by the offset */
+    const char good[] = "{\"a\":\"caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80\",\"b\":[\"\\ud800\"]}";
+    TEST_ASSERT(request_body_utf8_ok(good, sizeof good - 1, err, sizeof err));
+    const char key[] = "{\"k\xff\":1}";
+    TEST_ASSERT(!request_body_utf8_ok(key, sizeof key - 1, err, sizeof err) && !strncmp(err, "a key is not valid", 18));
+    const char junk[] = "not json \xff";
+    TEST_ASSERT(!request_body_utf8_ok(junk, sizeof junk - 1, err, sizeof err));
+    TEST_ASSERT(!strcmp(err, "the request body is not valid UTF-8 (byte 9 of the request body)"));
 }
 
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
@@ -9360,6 +9965,57 @@ static void test_l353_eviction_keeps_chain_ends(void) {
     l323_rmdir(dir);
 }
 
+/* L375 (O35): a restore point with ONE child and no flag is superseded (class 2) only when a deeper restore point
+ * exists below it.  With everything below it rows-only and exempt from eviction (a chain a restore is reading: pinned)
+ * it is its conversation's only resume point, and goes no sooner than any other chain end's: here the least recently
+ * used chain end (B's) goes first, and A -- used later -- keeps the restore point its pinned rows need. */
+static void test_l375_only_restore_point_is_a_chain_end(void) {
+    char tmpl[] = "/tmp/pulsar-l375-o35.XXXXXX";
+    char *dir = l323_tmpdir(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    char a1[41], a2[41], b1[41], n1[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2));   /* rows only, below A's restore point */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used, 7, NULL, NULL);
+    pulsar_segstore_pin(st, a2);   /* a restore is reading A's chain: its rows may not go */
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));   /* over budget: something goes */
+    pulsar_segstore_seg g;
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes > 0u);   /* was class 2: the first restore point to go */
+    TEST_ASSERT(pulsar_segstore_contains(st, a2));
+    TEST_ASSERT(!pulsar_segstore_get(st, b1, &g) || g.rp_bytes == 0u);   /* the older chain end paid */
+    pulsar_segstore_unpin(st, a2);
+    /* with a deeper restore point below it, the same restore point IS superseded and goes before a chain end's */
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+    char tmpl2[] = "/tmp/pulsar-l375-o35b.XXXXXX";
+    dir = l323_tmpdir(tmpl2);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat A", 300, 1, a1) && l323_put_rp(st, a1, 128));
+    TEST_ASSERT(test_seg_put(st, a1, 128, 256, " goes on", 300, 2, a2) && l323_put_rp(st, a2, 256));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "chat B", 300, 3, b1) && l323_put_rp(st, b1, 128));
+    const uint64_t used2 = pulsar_segstore_used_bytes(st);
+    pulsar_segstore_close(st);
+    l347_set_last_used(dir, a1, 3000);
+    l347_set_last_used(dir, a2, 3000);
+    l347_set_last_used(dir, b1, 1000);
+    st = pulsar_segstore_open(dir, used2, 7, NULL, NULL);
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "N", 16, 9, n1));
+    TEST_ASSERT(pulsar_segstore_get(st, a1, &g) && g.rp_bytes == 0u);   /* superseded by a2's: class 2, first to go */
+    TEST_ASSERT(pulsar_segstore_get(st, a2, &g) && g.rp_bytes > 0u);
+    pulsar_segstore_close(st);
+    l323_rmdir(dir);
+}
+
 /* L353: a full disk evicts as a full budget does, whatever else fills it; with nothing left to take the write is
  * refused and the store still holds what it had.  A failed write is counted. */
 static uint64_t l353_disk_free(void *ud) {
@@ -9390,12 +10046,21 @@ static void test_l353_disk_full_evicts(void) {
     char d[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "after the foreign file", 1000, 4, d));
     TEST_ASSERT(!pulsar_segstore_contains(st, a) && pulsar_segstore_contains(st, d));
-    /* a disk nothing of ours can clear: refused, and what stays stays */
+    /* L375 (O18): foreign bytes fill the disk and the write is short of more than the store could release (c alone:
+     * b went with a above, d is the chain being extended): the persist fails and every stored segment is still there
+     * -- the loop used to take every leaf first and fail anyway */
     disk[1] = disk[0];
     char e[41];
     const int before = pulsar_segstore_count(st);
-    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 1000, 5, e));
-    TEST_ASSERT(before >= 1 && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    const uint64_t held_before = pulsar_segstore_used_bytes(st);
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left, and too big for our own bytes", held_before, 5, e));
+    TEST_ASSERT(before == 2 && pulsar_segstore_count(st) == before && pulsar_segstore_used_bytes(st) == held_before);
+    TEST_ASSERT(pulsar_segstore_contains(st, c) && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    /* a shortfall our own bytes could cover, on a disk an eviction does not free (still full of foreign bytes): the
+     * first eviction that leaves the free space where it was is the last -- refused, one leaf gone, never the store */
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 500, 5, e));
+    TEST_ASSERT(pulsar_segstore_count(st) == before - 1 && pulsar_segstore_contains(st, d) &&
+                !pulsar_segstore_contains(st, e));
     pulsar_segstore_set_disk_free(st, NULL, NULL);
     /* a failed write counts */
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
@@ -14547,6 +15212,26 @@ static void test_stall_watchdog_rules(void) {
         TEST_ASSERT(!server_stall_limit_parse(b, &lim, err, sizeof err));
         TEST_ASSERT(err[0] != '\0');
     }
+    /* L372 (O33): busy is a queued or running job, or a /v1/systemone request (the judge's own queue) */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        TEST_ASSERT(!server_watchdog_busy(&s));
+        s.n_queued = 1;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        s.n_queued = 0;
+        s.n_generating = 1;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        s.n_generating = 0;
+        server_judge *J = new server_judge();
+        s.judge = J;
+        TEST_ASSERT(!server_watchdog_busy(&s));   /* a judge with nothing queued is idle */
+        judge_job jb;
+        J->head = J->tail = &jb;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        J->head = J->tail = NULL;
+        server_judge_close(&s);
+    }
     /* a stall: busy and quiet for at least the limit */
     TEST_ASSERT(server_stall_seconds(200000, 80000, true, 120) == 120);
     TEST_ASSERT(server_stall_seconds(200000, 80001, true, 120) == 0);    /* 119.999 s: not yet */
@@ -15097,7 +15782,21 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_py_unprintable();
     test_l353_small_fixes();
     test_l353_routing_fixes();
+    test_l372_predecode_failure_ends_the_job();
+    test_l372_failed_readmission_marks_the_bank_spilled();
+    test_l372_no_fuse_prefill_is_the_classic_steps();
+    test_l372_gone_client_wait_covers_prefill();
+    test_l372_failed_batch_leave_is_still_stepped();
+    test_l372_bank_install_failure_keeps_the_first_error();
+    test_l372_empty_banks_are_not_spill_victims();
+    test_l372_judge_ends_a_gone_clients_request();
+    test_l372_ill_formed_utf8_is_refused_at_parse();
+    test_l372_judge_bank_floor_and_release();
+    test_l372_evict_snapshot_word();
+    test_l372_abandoned_decode_is_not_a_turn();
+    test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();
+    test_l375_only_restore_point_is_a_chain_end();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
     test_l353_parked_decoder_frees_nothing();
@@ -15280,6 +15979,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_parse_completion_request_refuses_logprobs();
     test_parse_completion_prompt_shapes();
     test_embeddings_dimensions_compare_as_numbers();
+    test_encode_executor_queue();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

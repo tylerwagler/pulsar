@@ -22,6 +22,7 @@
 #include "mmid.cuh"
 #include "ds4_mmid.cuh"
 #include "ds4_mmq_d2r.cuh"
+#include "cuda/pulsar_cuda_arch.cuh"   /* pulsar_cuda_device_slot */
 
 #include <cstdio>
 #include <cstdlib>
@@ -172,6 +173,14 @@ extern "C" int ds4_mmq_init(int device) {
     }
 
     return 0;
+}
+
+extern "C" int ds4_mmq_ready(void) {
+    static int ready_of[PULSAR_CUDA_DEVICE_SLOTS] = {};   /* 0 unasked, 1 ready, -1 refused */
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return 0;
+    if (ready_of[d] == 0) ready_of[d] = ds4_mmq_init(d) == 0 ? 1 : -1;
+    return ready_of[d] > 0;
 }
 
 // ----------------------------------------------------------------------------

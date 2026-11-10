@@ -17,6 +17,7 @@
 #include "family_qwen.h"
 
 #include <math.h>
+#include <pthread.h>
 
 bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, size_t errlen) {
     const int factor = (int)(PULSAR_QWEN_VISION_PATCH * PULSAR_QWEN_VISION_MERGE);
@@ -60,7 +61,12 @@ bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels
     memset(out, 0, sizeof *out);
     uint8_t *rgb = NULL;
     int w = 0, h = 0;
-    if (!vision_decode_rgb(bytes, len, &rgb, &w, &h)) {
+    const vision_decode dec = vision_decode_rgb(bytes, len, &rgb, &w, &h);
+    if (dec == vision_decode::busy) {
+        snprintf(err, errlen, "%s", PULSAR_VISION_DECODE_BUSY_TEXT);
+        return false;
+    }
+    if (dec != vision_decode::ok) {
         snprintf(err, errlen, "the image could not be decoded (PNG or JPEG, at most %llu pixels)", PULSAR_VISION_MAX_DECODED_PIXELS);
         return false;
     }
@@ -320,8 +326,14 @@ struct qwen_grid_entry { uint64_t key; size_t len; uint32_t h, w; };
  *  merged grid height: resized pixels / (patch x merge) */
 /** @var qwen_grid_entry::w
  *  merged grid width: resized pixels / (patch x merge) */
-/// The merged-grid cache, 16 entries, FIFO-replaced; process-global, unlocked.
+/// The merged-grid cache, 16 entries, FIFO-replaced; process-global, read and written under g_qwen_grid_mu.
 static qwen_grid_entry g_qwen_grid[16];
+/// Guards g_qwen_grid and its two counters (L375).  A server's connection threads fill the cache at the parse (the
+/// expansion) while its worker reads it in the prefill (the identity, the rope grid): unlocked, a reader could match
+/// an entry's key and length while a replacement was half written and take the OTHER image's grid -- one whose
+/// h x w still tiles the block passes the identity's check and lays the rope positions out wrong -- and two writers
+/// could both take the last free slot and push the count past the table.  Never held across a decode.
+static pthread_mutex_t g_qwen_grid_mu = PTHREAD_MUTEX_INITIALIZER;
 /// Entries used (<= 16).
 static int g_qwen_grid_n = 0, g_qwen_grid_next = 0;
                                                 ///< replacements made once full (slot = next % 16)
@@ -333,15 +345,18 @@ static int g_qwen_grid_n = 0, g_qwen_grid_next = 0;
 /// @return false when it does not decode or resize
 static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, uint32_t *h, uint32_t *w) {
     const uint64_t key = pulsar_image_content_hash(img);
+    pthread_mutex_lock(&g_qwen_grid_mu);
     for (int i = 0; i < g_qwen_grid_n; i++)
         if (g_qwen_grid[i].key == key && g_qwen_grid[i].len == img->len) {
             *h = g_qwen_grid[i].h;
             *w = g_qwen_grid[i].w;
+            pthread_mutex_unlock(&g_qwen_grid_mu);
             return true;
         }
+    pthread_mutex_unlock(&g_qwen_grid_mu);   /* a miss decodes unlocked: two threads may both decode one image */
     uint8_t *rgb = NULL;
     int iw = 0, ih = 0;
-    if (!img->bytes || !vision_decode_rgb(img->bytes, img->len, &rgb, &iw, &ih)) return false;
+    if (!img->bytes || vision_decode_rgb(img->bytes, img->len, &rgb, &iw, &ih) != vision_decode::ok) return false;
     free(rgb);
     int rh = 0, rw = 0;
     char err[128];
@@ -349,11 +364,13 @@ static bool qwen_image_grid(const pulsar_engine *, const pulsar_image_ref *img, 
     const uint32_t f = PULSAR_QWEN_VISION_PATCH * PULSAR_QWEN_VISION_MERGE;
     *h = (uint32_t)rh / f;
     *w = (uint32_t)rw / f;
+    pthread_mutex_lock(&g_qwen_grid_mu);
     const int slot = g_qwen_grid_n < 16 ? g_qwen_grid_n++ : (g_qwen_grid_next++ % 16);
     g_qwen_grid[slot].key = key;
     g_qwen_grid[slot].len = img->len;
     g_qwen_grid[slot].h = *h;
     g_qwen_grid[slot].w = *w;
+    pthread_mutex_unlock(&g_qwen_grid_mu);
     return true;
 }
 

@@ -271,8 +271,7 @@ int main(int argc, char **argv) {
                        s.stride / (t * 1e-6) / 1e9, t / roof[j], roof[j]);
             }
         }
-        printf("%-22s splits %d, EXL3 rotation replicas %d..%d, MXFP8 %d\n", sh.what, ds4_exl3_dense_splits(K, N),
-               sets.back().n, sets.front().n, n_f8);
+        printf("%-22s EXL3 rotation replicas %d..%d, MXFP8 %d\n", sh.what, sets.back().n, sets.front().n, n_f8);
         for (auto &s : sets) cudaFree(s.arena);
         for (int r = 0; r < n_f8; r++) { pulsar_gpu_tensor_free(f8d[r]); pulsar_gpu_tensor_free(f8s[r]); }
         cudaFree(d_y); cudaFree(d_ws);

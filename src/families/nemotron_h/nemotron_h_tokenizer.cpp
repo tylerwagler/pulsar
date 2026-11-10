@@ -49,32 +49,39 @@ bool read_text(const std::string &path, std::string *out) {
 }
 
 /* `spans` are the client-data ranges where no added token may match.  An encode refusal (text that is not UTF-8, or
- * spans out of order -- a renderer defect) is said by name and yields no tokens, never a different tokenization. */
+ * spans out of order -- a renderer defect) is said by name, appends nothing and returns false: never a different
+ * tokenization, and never an empty one read as the prompt. */
 /** @param e        the engine
  *  @param text     the UTF-8 text (NULL = empty)
  *  @param len      text's length in bytes
  *  @param spans    the client-data byte ranges, ascending (NULL with n_spans 0 = none)
  *  @param n_spans  the number of spans
- *  @param out      the ids are appended here */
-void encode_into(const pulsar_engine *e, const char *text, size_t len, const pulsar_text_span *spans, uint32_t n_spans,
-                 pulsar_tokens *out) {
+ *  @param out      the ids are appended here (nothing on a refusal)
+ *  @param why      receives the refusal's reason (NULL = not wanted; it is on stderr either way)
+ *  @param whylen   why's capacity in bytes
+ *  @return false when the tokenizer refused the text */
+bool encode_into(const pulsar_engine *e, const char *text, size_t len, const pulsar_text_span *spans, uint32_t n_spans,
+                 pulsar_tokens *out, char *why = NULL, size_t whylen = 0) {
     std::vector<int> ids;
     char err[256] = "";
     if (!bpe_tokenizer_encode(TOK(e), text ? text : "", len, spans, n_spans, &ids, err, sizeof(err))) {
         fprintf(stderr, "pulsar: %s tokenizer refused %zu bytes: %s\n", ARCH, len, err);
-        return;
+        if (why && whylen) snprintf(why, whylen, "%s", err);
+        return false;
     }
     for (int id : ids) pulsar_tokens_push(out, id);
+    return true;
 }
 
 /* raw text: all of it is client data, so no added token matches */
 /** pulsar_family_tokenizer::encode_text.
  *  @param e     the engine
  *  @param text  NUL-terminated UTF-8 (NULL = empty)
- *  @param out   the ids are appended here */
-void encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+ *  @param out   the ids are appended here
+ *  @return false when the tokenizer refused the text (encode_into) */
+bool encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
-    encode_into(e, text, all.hi, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
+    return encode_into(e, text, all.hi, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
 }
 
 /** pulsar_family_tokenizer::encode_rendered: added tokens match outside `spans`.
@@ -82,40 +89,47 @@ void encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
  *  @param text     the rendered chat, NUL-terminated (NULL = empty)
  *  @param spans    the client-data byte ranges
  *  @param n_spans  the number of spans
- *  @param out      the ids are appended here */
-void encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
-                     pulsar_tokens *out) {
-    encode_into(e, text, text ? strlen(text) : 0, spans, n_spans, out);
+ *  @param out      the ids are appended here
+ *  @param err      receives the refusal's reason (NULL = not wanted)
+ *  @param errlen   err's capacity in bytes
+ *  @return false when the tokenizer refused the text (encode_into) */
+bool encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                     pulsar_tokens *out, char *err, size_t errlen) {
+    return encode_into(e, text, text ? strlen(text) : 0, spans, n_spans, out, err, errlen);
 }
 
-/* ---- the chat front, turn by turn: nemotron_chat's pieces, tokenized with their client spans.  The entries have
- * no error return, so a refusal (a think mode the template has no level for) ends the process by name. */
+/* ---- the chat front, turn by turn: nemotron_chat's pieces, tokenized with their client spans.  A template refusal
+ * (a think mode the template has no level for) is said by name; an encode refusal is the tokenizer's.
+ * Either appends nothing and returns false. */
 
-/** End the process for a chat-front refusal (the entries have no error return).
+/** Say a template refusal of the chat front (L375: it ended the process).
  *  @param op   the public entry that refused
- *  @param err  the renderer's or the think-mode check's reason */
-[[noreturn]] void chat_refuse(const char *op, const char *err) {
-    fprintf(stderr, "pulsar: %s: %s: %s -- exiting\n", ARCH, op, err);
-    exit(1);
+ *  @param err  the renderer's or the think-mode check's reason
+ *  @return false, always: `return chat_refuse(...)` is the refusal */
+bool chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s: %s -- refusing\n", ARCH, op, err);
+    return false;
 }
 
 /** Tokenize one rendered piece with its client spans and append it.
  *  @param e       the engine
  *  @param r       the renderer's text and spans
- *  @param tokens  the ids are appended here */
-void chat_append(const pulsar_engine *e, const nemotron_render_out &r, pulsar_tokens *tokens) {
-    encode_into(e, r.text.data(), r.text.size(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
+ *  @param tokens  the ids are appended here
+ *  @return false when the tokenizer refused the piece (encode_into) */
+bool chat_append(const pulsar_engine *e, const nemotron_render_out &r, pulsar_tokens *tokens) {
+    return encode_into(e, r.text.data(), r.text.size(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
 }
 
 /* thinking on (the template's default effort) or off -- no other level reaches the turn-by-turn front */
 /** @param e           the engine
- *  @param think_mode  the caller's mode; one the engine does not support ends the process
+ *  @param think_mode  the caller's mode
  *  @param op          the public entry, for the refusal
- *  @return the template's default effort with thinking on, NEMOTRON_EFFORT_NONE with it off */
-nemotron_effort chat_effort(pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
+ *  @param effort      receives the template's default effort with thinking on, NEMOTRON_EFFORT_NONE with it off
+ *  @return false (said) for a mode the engine does not support */
+bool chat_effort(pulsar_engine *e, pulsar_think_mode think_mode, const char *op, nemotron_effort *effort) {
     char err[256];
-    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) chat_refuse(op, err);
-    return pulsar_think_mode_enabled(think_mode) ? nemotron_effort_default() : NEMOTRON_EFFORT_NONE;
+    *effort = pulsar_think_mode_enabled(think_mode) ? nemotron_effort_default() : NEMOTRON_EFFORT_NONE;
+    return pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err) || chat_refuse(op, err);
 }
 
 /* The head: the system turn, its content the trusted text (another family's tool prompt: text here) and the
@@ -126,15 +140,17 @@ nemotron_effort chat_effort(pulsar_engine *e, pulsar_think_mode think_mode, cons
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
  *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
- *  @param think_mode  checked against the engine (an unsupported mode ends the process) */
-void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
+ *  @param think_mode  checked against the engine (an unsupported mode is refused)
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
+bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
-    chat_effort(e, think_mode, "pulsar_chat_open");
+    nemotron_effort effort;   /* the head has no effort line: the mode is only checked */
+    if (!chat_effort(e, think_mode, "pulsar_chat_open", &effort)) return false;
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     nemotron_render_out r;
     char err[256];
-    if (!nemotron_chat_render_head(content.c_str(), tools_json, &r, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
-    chat_append(e, r, tokens);
+    if (!nemotron_chat_render_head(content.c_str(), tools_json, &r, err, sizeof err)) return chat_refuse("pulsar_chat_open", err);
+    return chat_append(e, r, tokens);
 }
 
 /* One turn: the messages as the full render writes them after the head or a sampled turn's close (a system note is
@@ -145,10 +161,12 @@ void chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
  *  @param msgs               the turn's messages (a NULL role reads as "user")
  *  @param n                  the number of messages
  *  @param generation_prompt  append the assistant's opening after the messages
- *  @param think_mode         the effort the generation prompt opens with (an unsupported mode ends the process) */
-void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
+ *  @param think_mode         the effort the generation prompt opens with (an unsupported mode is refused)
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
+bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
                pulsar_think_mode think_mode) {
-    const nemotron_effort effort = chat_effort(e, think_mode, "pulsar_chat_append_turn");
+    nemotron_effort effort;
+    if (!chat_effort(e, think_mode, "pulsar_chat_append_turn", &effort)) return false;
     std::vector<nemotron_msg_in> m((size_t)(n > 0 ? n : 0));
     for (int i = 0; i < n; i++) {
         m[(size_t)i] = {};
@@ -158,15 +176,18 @@ void chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
     nemotron_render_out r;
     char err[256];
     if (!nemotron_chat_render_turn(m.data(), n, effort, generation_prompt, &r, err, sizeof err))
-        chat_refuse("pulsar_chat_append_turn", err);
-    chat_append(e, r, tokens);
+        return chat_refuse("pulsar_chat_append_turn", err);
+    return chat_append(e, r, tokens);
 }
 
 /* the sampled turn's close: the "<|im_end|>\n" a tail opens with (nemotron_chat_render_tail) */
 /** pulsar_family_tokenizer::chat_end_assistant.
  *  @param e       the engine
- *  @param tokens  the close's ids ("<|im_end|>\n") are appended here */
-void chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) { encode_into(e, "<|im_end|>\n", 11, NULL, 0u, tokens); }
+ *  @param tokens  the close's ids ("<|im_end|>\n") are appended here
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
+bool chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    return encode_into(e, "<|im_end|>\n", 11, NULL, 0u, tokens);
+}
 
 /** pulsar_family_tokenizer::is_stop.
  *  @param e      the engine

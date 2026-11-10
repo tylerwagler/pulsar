@@ -33,8 +33,12 @@ bool agent_family_tools_supported(pulsar_engine *e, char *err, size_t errlen) {
     case PULSAR_CHAT_DS4_V41:
     case PULSAR_CHAT_QWEN:
     case PULSAR_CHAT_NEMOTRON_H:
-    case PULSAR_CHAT_GEMMA4:
-        return true;
+    case PULSAR_CHAT_GEMMA4: {
+        pulsar_turn_markers m;
+        if (pulsar_chat_turn_markers(e, &m)) return true;
+        snprintf(err, errlen, "this tokenizer does not spell the chat turn markers pulsar-agent reads turns by");
+        return false;
+    }
     case PULSAR_CHAT_INKLING:
         snprintf(err, errlen, "Inkling's tool calling is not wired into pulsar-agent (the family is parked)");
         return false;
@@ -206,6 +210,61 @@ static void test_agent_family_tools(void) {
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&calls.v[0], "path"), "notes/a b.txt"));
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&calls.v[0], "start_line"), "3"));
     AGENT_TEST_ASSERT(!strcmp(calls.v[1].name, "write") && !strcmp(agent_tool_arg_value(&calls.v[1], "content"), "x\ny"));
+    agent_tool_calls_free(&calls);
+
+    /* L373: an argument of the wrong type is the tool's error, never the default or the value's JSON text */
+    static const struct {
+        const char *name, *arguments, *error;
+    } wrong[] = {
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": \"10s\"}", "Tool error: timeout_sec is not a number\n"},
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": 0}",
+         "Tool error: timeout_sec must be above 0 (seconds; leave it out for the default, 3600)\n"},
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": -5}",
+         "Tool error: timeout_sec must be above 0 (seconds; leave it out for the default, 3600)\n"},
+        {"bash", "{\"command\": \"true\", \"refresh_sec\": 1.5}", "Tool error: refresh_sec is not an integer\n"},
+        {"bash", "{\"command\": [\"true\"]}", "Tool error: command must be a string\n"},
+        {"bash_status", "{\"job\": \"first\"}", "Tool error: job is not an integer\n"},
+        {"read", "{\"path\": null}", "Tool error: path must be a string\n"},
+        {"read", "{\"path\": \"x\", \"start_line\": \"top\"}", "Tool error: start_line is not an integer\n"},
+        {"more", "{\"count\": true}", "Tool error: count is not an integer\n"},
+        {"read", "{\"path\": \"x\", \"whole\": \"maybe\"}", "Tool error: whole must be true or false\n"},
+        {"read", "{\"path\": \"x\", \"raw\": 2}", "Tool error: raw must be true or false\n"},
+        {"search", "{\"query\": \"a\", \"case_sensitive\": null}", "Tool error: case_sensitive must be true or false\n"},
+        {"write", "{\"path\": null, \"content\": \"x\"}", "Tool error: path must be a string\n"},
+        {"write", "{\"path\": \"x\", \"content\": 7}", "Tool error: content must be a string\n"},
+        {"list", "{\"path\": 3}", "Tool error: path must be a string\n"},
+        {"edit", "{\"path\": \"x\", \"old\": \"a\", \"new\": null}", "Tool error: new must be a string\n"},
+        {"search", "{\"query\": \"a\", \"max_results\": \"many\"}", "Tool error: max_results is not an integer\n"},
+    };
+    for (const auto &c : wrong) {
+        AGENT_TEST_ASSERT(agent_family_call_append(&calls, c.name, c.arguments, err, sizeof err) && calls.len == 1);
+        char *res = agent_execute_tool_call_one(NULL, &calls.v[0]);
+        AGENT_TEST_ASSERT(!strcmp(res, c.error));
+        free(res);
+        agent_tool_calls_free(&calls);
+    }
+    AGENT_TEST_ASSERT(access("null", F_OK) != 0);
+    {   /* L373: the bash gate keys on "unattended" (--non-interactive, or stdin not a terminal), not on the flag */
+        agent_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.unattended = true;
+        agent_worker gated;
+        memset(&gated, 0, sizeof(gated));
+        gated.cfg = &cfg;
+        AGENT_TEST_ASSERT(agent_family_call_append(&calls, "bash", "{\"command\": \"touch gate-ran\"}", err, sizeof err));
+        char *res = agent_execute_tool_call_one(&gated, &calls.v[0]);
+        AGENT_TEST_ASSERT(strstr(res, "bash is refused") != NULL && access("gate-ran", F_OK) != 0);
+        free(res);
+        agent_tool_calls_free(&calls);
+    }
+    /* a number written as a string still counts; an absent or empty argument takes the default */
+    AGENT_TEST_ASSERT(agent_family_call_append(&calls, "bash", "{\"timeout_sec\": \"10\", \"refresh_sec\": 7200, \"job\": \"\"}",
+                                               err, sizeof err));
+    int got = 0;
+    AGENT_TEST_ASSERT(!agent_tool_arg_timeout(&calls.v[0], "timeout_sec", &got) && got == 10);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "refresh_sec", 60, 1, 3600, &got) && got == 3600);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "job", 0, 0, INT_MAX, &got) && got == 0);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "pid", 5, 0, INT_MAX, &got) && got == 5);
     agent_tool_calls_free(&calls);
 }
 #endif

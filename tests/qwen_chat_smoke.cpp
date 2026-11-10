@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     if (!qwen_chat_render(in, &r, err, sizeof(err))) { fprintf(stderr, "qwen-chat-smoke: render refused: %s\n", err); return 1; }
 
     pulsar_tokens prompt = {0};
-    pulsar_tokenize_rendered_chat_spans(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), &prompt);
+    pulsar_tokenize_rendered_chat_spans(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), &prompt, NULL, 0);
     printf("qwen-chat-smoke: effort %s, rendered %zu bytes -> %d tokens\n", qwen_effort_name(effort), r.text.size(), prompt.len);
     if (prompt.len <= 0) { fprintf(stderr, "qwen-chat-smoke: the tokenizer produced nothing\n"); return 1; }
 

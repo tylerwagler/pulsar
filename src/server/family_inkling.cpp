@@ -166,7 +166,7 @@ bool inkling_render(pulsar_engine *e, server *s, chat_conversation *c, request *
     free(r->prompt_spans);
     r->prompt_text = inkling_take_render(out, &r->prompt_spans, &r->prompt_n_spans);
     if (e) {
-        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        if (!request_tokenize_rendered(e, r, err, errlen)) return false;
         if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
     }
     return true;
@@ -194,7 +194,8 @@ int inkling_trivial_header_tokens(pulsar_engine *e) {
             pulsar_die("inkling: the trivial header's render refused");
         const std::string hdr = out.text.substr(0, out.spans[0].lo);
         pulsar_tokens t = {0};
-        pulsar_tokenize_rendered_chat(e, hdr.c_str(), &t);
+        if (!pulsar_tokenize_rendered_chat(e, hdr.c_str(), &t))
+            pulsar_die("inkling: the tokenizer refused the trivial header");
         if (t.len > hdr_len) hdr_len = t.len;
         pulsar_tokens_free(&t);
     }

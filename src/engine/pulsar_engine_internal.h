@@ -1523,7 +1523,7 @@ typedef struct {
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
     pulsar_gpu_tensor *attn_comp_stage;  ///< staging the attention compressor writes through
-    /** f32 staging used only when PULSAR_IDX_FP4 is on: the compressor emits new
+    /** f32 staging for the packed (MXKV-FP4) indexer cache: the compressor emits new
      * indexer rows here (comp-cap rows, same row indices as the cache), and
      * the QAT+pack step stores them MXKV-FP4-packed into the persistent
      * layer_index_comp_cache.  Also reused for session-save dequant and
@@ -2080,8 +2080,6 @@ typedef struct {
     uint64_t used;         ///< slots occupied; the load factor numerator
 } str_i32_table;
 
-struct owned_str;  ///< forward decl: bpe_rank() param; full def appears later
-
 /** Byte-level BPE vocabulary and the special ids the chat template needs.
  *
  * ⚠ `n_vocab` here is the TOKENIZER TABLE LENGTH and is not required to equal
@@ -2105,11 +2103,11 @@ struct pulsar_vocab {
     /** ---- methods (C++ port): 1:1 mirror of the vocab verb family in
      * tokenizer.cpp; bodies keep the auto *vocab = this alias, logic verbatim.
      * Names kept as-is (none carry the pulsar_vocab type-name prefix). ---- */
-    /** Merge priority of the pair (a, b); lower merges first. @return rank, or a
-     * sentinel above every real rank when the pair is not in the merge table. */
+    /** Merge priority of the pair (a, b); lower merges first. @return rank, or -1
+     * when the pair is not in the merge table. */
     /// @param a  left symbol of the pair
     /// @param b  right symbol of the pair
-    int bpe_rank(const owned_str *a, const owned_str *b) const;
+    int bpe_rank(pulsar_str a, pulsar_str b) const;
     /** Emit one pre-tokenized piece as ids, running the BPE merge loop over it. */
     /// @param raw_piece  the piece's bytes (borrowed)
     /// @param out        ids are appended
@@ -2422,15 +2420,6 @@ struct pulsar_engine {
     bool has_dspark();
 };
 
-/** A string this struct OWNS, as opposed to ::pulsar_str which borrows.
- * Not NUL-terminated either -- the length is authoritative. */
-typedef struct owned_str {
-    char *ptr;     ///< the bytes, owned
-    uint64_t len;  ///< length in bytes
-} owned_str;
-
-
-
 /** The per-conversation SPECULATIVE / DSpark host shadow, factored into one
  * named aggregate so it can be saved and restored WHOLESALE.  It is embedded
  * BY VALUE in both pulsar_session (the live state) and pulsar_bank_carry (the
@@ -2563,7 +2552,6 @@ typedef struct pulsar_spec_carry_state {
      * generate_speculative already refuses when mseq_dirty). */
     float spec_quench_debt;  ///< cumulative plain-token-equivalents lost
     float spec_quench_ewma;     ///< EWMA of the per-step margin (realized yield - breakeven guard)
-    int spec_round_banks;       ///< banks sharing the round being ended (the flat cost's divisor); 1 in the single lane
     uint32_t spec_quench_steps; ///< fused spec steps taken by this request
     bool spec_quenched;         ///< LATCHED: speculation disabled for the request's remainder
     /** Per-SESSION mirror of the engine's cumulative DSpark counters. The engine
@@ -2613,8 +2601,6 @@ typedef struct {
     /** @var pulsar_image_block::grid_w
      *  The block's 2D layout width, in rows (see grid_h). */
 } pulsar_image_block;
-/// Most image blocks one KV records (pulsar_image_identity).
-#define PULSAR_IMAGE_BLOCKS_MAX 64
 /** The blocks a KV holds, in position order (image_identity.cpp).  Named (L350) so kv_state.h's checkpoint records,
  *  declared before it, can hold one by pointer. */
 typedef struct pulsar_image_identity {
@@ -2902,8 +2888,9 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
 typedef struct pulsar_session_dev_rows {
     pulsar_gpu_tensor *live;        ///< [W] f32: the live row
     bool host_stale;                ///< pulsar_session::logits is behind `live`
-    bool live_valid;                ///< L354: something has written `live` for the view installed
+    bool live_valid;                ///< L354: something has written `live` for the view installed (read by live_dev())
     pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
+    bool *bank_valid;               ///< [n_banks] L375: bank_rows holds that bank's row (its live_valid when saved)
     /// Banks bank_rows holds a row for.
     uint32_t n_banks;
     pulsar_gpu_tensor *scratch;     ///< the sampler's and the logprob passes' (the larger of their scratch bytes)
@@ -3312,14 +3299,18 @@ struct pulsar_session {
     /// @param row  logits-width floats (may be `logits` itself)
     /// @return false when the upload fails.
     bool live_from_host(const float *row);
+    /// The live row on the device, for a reader (L375: the one gate of every draw, logprob and host readback).
+    /// @return dev.live, or NULL (said) when nothing has written a row for the installed view.
+    const pulsar_gpu_tensor *live_dev();
     /// The live row's host mirror, read back first when the device moved past it.
-    /// @return `logits`, or NULL when the readback fails.
+    /// @return `logits`, or NULL when the view has no row (live_dev) or the readback fails.
     const float *live_host();
-    /// Copy the live row into `bank`'s saved row on the device.
+    /// Copy the live row, and whether the view has one, into `bank`'s saved row on the device.
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_save_bank(uint32_t bank);
-    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale).
+    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale); the view has a row
+    /// exactly when the bank's saved one was written (dev.bank_valid).
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_restore_bank(uint32_t bank);
@@ -4724,6 +4715,13 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
 /** L354: whether `bank` has a saved view (a false pulsar_bank_carry_restore_view then is a failure, not a fresh bank).
  *  @param s the session  @param bank the bank  @return true when one is saved */
 bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank);
+/** L375: `bank`'s host view names no position any more -- its device state moved without it (a step that failed and
+ *  reset the bank, a speculative round that could not be undone on it).  The live view when the bank is installed,
+ *  and its saved carry either way, so pulsar_bank_history stops serving the history and the bank's next sync rebuilds
+ *  it. */
+/// @param s     the session
+/// @param bank  the bank, < the pool's count
+void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
  *  synced on).  Every family's restore of such a bank installs it. */
@@ -5198,8 +5196,10 @@ float *vision_torch_bicubic_aa_rgb(const uint8_t *rgb, int w, int h, int dst_w, 
 /** L354: the most pixels a decode allocates: Pillow's own error threshold (2 x Image.MAX_IMAGE_PIXELS), so what the
  *  reference tooling opens decodes here too. */
 #define PULSAR_VISION_MAX_DECODED_PIXELS 178956970ull
-/** L354: the bytes all concurrent decodes may hold: one thread decodes per Parse connection, so the per-image cap alone is
- *  64 x 1.25 GiB.  A chat server decodes on its one worker and never meets it. */
+/** L354: the bytes all concurrent decodes may hold; the per-image cap alone is 1.25 GiB a decode.  Who decodes at
+ *  once: a chat server's connection threads, each expanding its own request's images at parse, beside its worker's
+ *  prefill (a tower-cache miss decodes again); a Parse server decodes on each parser engine's one GPU thread (L374),
+ *  so one decode an engine.  A decode over it is refused busy (vision_decode::busy), never as undecodable. */
 #define PULSAR_VISION_DECODE_BUDGET_BYTES (16ull << 30)
 /** L354: hold `bytes` of the decode budget.  @param bytes what the decode allocates  @return false (said) when over it */
 bool vision_decode_reserve(uint64_t bytes);
@@ -5208,8 +5208,32 @@ void vision_decode_release(uint64_t bytes);
 /** L354: whether an image of these dimensions may be decoded (said on stderr when not).
  *  @param width pixels  @param height pixels  @return true when its pixels are within the limit */
 bool vision_decode_admits(uint64_t width, uint64_t height);
-int vision_decode_rgb(const uint8_t *bytes, size_t len,
-                      uint8_t **rgb_out, int *w_out, int *h_out);
+/** O34: how a decode ended.  A class, so no caller reads `busy` as a success or folds it into `refused`. */
+enum class vision_decode {
+    ok,        ///< decoded
+    refused,   ///< not an image this decodes (not PNG / JPEG, corrupt, CMYK, past the pixel limit): permanent
+    busy,      ///< the shared decode budget is held by other decodes: the same image decodes on a retry
+};
+/** O34: what a refusal says when it was the budget's (the text of every layer that reports a busy decode). */
+#define PULSAR_VISION_DECODE_BUSY_TEXT "the image decode budget is in use by other requests; retry"
+/** O34: forget this thread's busy decodes.
+ *
+ *  This record is the ONE way a decode refusal's KIND reaches the engine's API.  The layers between a decode and
+ *  the API -- the family fronts' expand / grid / block_rows, the core's walk, the chunk merge inside a prefill step,
+ *  the image identity -- report with a bool and a text, which cannot carry "busy, retry", and are not retyped.  So:
+ *    - vision_decode_rgb sets it when it returns vision_decode::busy (nothing else writes it);
+ *    - the three API calls that decode -- pulsar_expand_image_placeholders, pulsar_session_sync_mm (mirrored or
+ *      not), a parser's parse -- reset it on entry and, when they FAIL, read vision_decode_busy_seen and report
+ *      through their own result (-1, PULSAR_SESSION_SYNC_BUSY, -3) with PULSAR_VISION_DECODE_BUSY_TEXT;
+ *    - a caller that DISCARDS a failed image step and goes on (a reuse licence that reads "not held", a route
+ *      score without images) resets it there, so a later failure of another cause is not reported busy.
+ *  Per thread: a decode runs on the thread of the call it serves.  Nothing outside the engine reads it. */
+void vision_decode_busy_reset(void);
+/** O34: whether a decode on this thread returned vision_decode::busy since vision_decode_busy_reset.
+ *  @return true when one did */
+bool vision_decode_busy_seen(void);
+vision_decode vision_decode_rgb(const uint8_t *bytes, size_t len,
+                                uint8_t **rgb_out, int *w_out, int *h_out);
 
 /** One image READY for the model: the reference's per-image half of
  * prepare_vl_inputs.  `span_ids` are the sentinel token ids (vocab_size + type),
@@ -6207,6 +6231,12 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 /// @param[out] len byte count, or NULL
 /// @return the bytes (caller frees)
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
+/** The cross-rank identity digest of the session's live row (an eval's, a speculative run's last row), on the device,
+ *  read through the live row's gate (pulsar_session::live_dev): a view with no row refuses (said) and digests to 0.
+ *  The leader's and the worker's ack both call it (L375 O15).
+ *  @param s the session
+ *  @return the digest, 0 on a refusal or a device failure */
+uint64_t pulsar_session_live_digest(pulsar_session *s);
 /* The identity digest of a batched step's headed rows, on the device (engine_api.cpp; the TP mirror's check). */
 uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows);
 /** L260 fusion: a fused step's digest -- its decode rows', then its `n_heads` headed rows'. */

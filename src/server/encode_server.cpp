@@ -2,11 +2,19 @@
  * and parsers (pulsar_engine_parse_page).
  *
  * Neither has a session, a chat or a decode schedule, so they serve their own small surface beside none of the
- * decoder's machinery: one thread per connection, each request one engine call (a request's inputs ride one encode
- * call, packed into its forwards; a page is one parse call).  One process may serve several (-m repeated:
- * pulsar_engine_open_group, one GPU, the engines taking turns a GPU phase at a time): a request goes to the engine of
- * its endpoint's kind -- an embedder for /v1/embeddings, a reranker for /v1/rerank, a parser for /v1/parse -- and,
- * when two engines share a kind, the one its "model" names (with one, "model" is not read).
+ * decoder's machinery: one thread per connection for the HTTP side, each request one engine call (a request's inputs
+ * ride one encode call, packed into its forwards; a page is one parse call).  One process may serve several (-m
+ * repeated: pulsar_engine_open_group, one GPU, the engines taking turns a GPU phase at a time): a request goes to the
+ * engine of its endpoint's kind -- an embedder for /v1/embeddings, a reranker for /v1/rerank, a parser for /v1/parse
+ * -- and, when two engines share a kind, the one its "model" names (with one, "model" is not read).
+ *
+ * L374: the engine call itself runs on the engine's ONE long-lived GPU thread (enc_executor), never on the
+ * connection thread.  The CUDA side keeps its plans, descriptors, scratch arena and counter slices per submitting
+ * thread (the chat server's rule: one long-lived worker), so a forward on a thread that lives one connection rebuilt
+ * every plan, announced every shape again and left its descriptors and scratch behind at each request.  A connection
+ * thread parses, validates and renders, queues the call on its engine's executor (FIFO) and waits for it, then
+ * writes the response.  One executor an ENGINE, not one a process: engines still interleave a GPU phase at a time
+ * (pulsar_group_gpu_phase), so an embedding does not wait behind a whole page of another engine's parse.
  *
  *   GET  /health, /healthz, /ping, /v1/models
  *   POST /v1/embeddings   (an embedder; OpenAI's shape)
@@ -32,14 +40,16 @@
  * which keeps its first cap tokens. */
 /** @file
  *  pulsar-server for the single-call engines (L321): /v1/embeddings, /v1/rerank and /v1/parse over encoders
- *  and parsers, one thread per connection.
+ *  and parsers, one HTTP thread per connection and one long-lived GPU thread per engine (L374).
  */
 #include "pulsar_server_internal.h"
 #include "lib/pyjson.h"
+#include "pulsar_lock.hpp"
 
 #include <math.h>
 
 #include <algorithm>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -51,10 +61,117 @@ constexpr size_t ENC_INPUTS_MAX = 2048;
 /** What an engine serves: the encoder kinds' values (pulsar_encoder_kind) and the parser. */
 enum srv_kind { K_EMBED = PULSAR_ENCODER_EMBED, K_RERANK = PULSAR_ENCODER_RERANK, K_PARSE, K_COUNT };
 
+/** One engine call queued on an enc_executor.  It lives on its connection thread's stack: that thread waits in
+ *  enc_executor_run until the executor has marked it `finished`, so the executor never holds a job whose owner left
+ *  and a job is never freed while it runs. */
+struct enc_job {
+    /// Calls `work` (enc_executor_run's trampoline over the caller's callable).
+    void (*call)(const void *work);
+    /// The caller's callable, on the caller's stack.
+    const void *work;
+    /// The client socket: a job whose client has gone by its turn is not run (gen_client_disconnected).
+    int fd;
+    /// Set by the executor, under enc_executor::mu, once the job was run or dropped; it does not touch the job after.
+    bool finished;
+    /// Whether `call` ran (false: dropped, the client had gone).  Valid once `finished`.
+    bool ran;
+};
+
+/** An engine's one long-lived GPU thread (L374) and its FIFO queue: every pulsar_engine_encode /
+ *  pulsar_engine_parse_page of that engine runs here, so the CUDA side's per-thread caches (cuBLASLt plans and
+ *  descriptors, the fixed GEMM's shapes, the scratch arena, the EXL3 counter slices) are built once and live as long
+ *  as the server.  Started by enc_executor_start, ended by enc_executor_stop before the engine closes. */
+struct enc_executor {
+    /// Guards `q`, `stop`, `waiters` and every queued job's `finished` / `ran`.
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    /// Signalled when a job is queued or `stop` is set.
+    pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
+    /// Broadcast when a job finishes (its waiter checks its own `finished`) and when `waiters` drops to 0.
+    pthread_cond_t done = PTHREAD_COND_INITIALIZER;
+    /// The jobs waiting their turn, oldest first.
+    std::deque<enc_job *> q;
+    /// Set by enc_executor_stop: the thread runs what is queued, then exits.
+    bool stop = false;
+    /// Threads inside enc_executor_run: enc_executor_stop frees the executor only once they have all left `mu`.
+    int waiters = 0;
+    /// The GPU thread.
+    pthread_t th;
+};
+
+/** An enc_executor's thread: take the oldest job, run it unless its client has gone, mark it finished; exit once
+ *  `stop` is set and the queue is empty.
+ *  @param arg the enc_executor
+ *  @return NULL */
+void *enc_executor_main(void *arg) {
+    enc_executor *x = (enc_executor *)arg;
+    pthread_mutex_lock(&x->mu);
+    for (;;) {
+        while (x->q.empty() && !x->stop) pthread_cond_wait(&x->wake, &x->mu);
+        if (x->q.empty()) break;
+        enc_job *j = x->q.front();
+        x->q.pop_front();
+        pthread_mutex_unlock(&x->mu);
+        const bool run = !gen_client_disconnected(j->fd);
+        if (run) j->call(j->work);
+        pthread_mutex_lock(&x->mu);
+        j->ran = run;
+        j->finished = true;   /* its waiter may free it as soon as `mu` goes: not read again */
+        pthread_cond_broadcast(&x->done);
+    }
+    pthread_mutex_unlock(&x->mu);
+    return NULL;
+}
+
+/** Start an executor's GPU thread.
+ *  @return the executor (ended and freed by enc_executor_stop), or NULL when the thread could not start */
+enc_executor *enc_executor_start(void) {
+    enc_executor *x = new enc_executor();
+    if (pthread_create(&x->th, NULL, enc_executor_main, x) != 0) {
+        delete x;
+        return NULL;
+    }
+    return x;
+}
+
+/** End an executor: its thread runs every job still queued, then exits; joined here, and the executor freed once
+ *  every waiter of those jobs has left enc_executor_run.  No job may be queued after this is called (encode_serve
+ *  calls it once every connection thread has finished).
+ *  @param x the executor (freed) */
+void enc_executor_stop(enc_executor *x) {
+    pthread_mutex_lock(&x->mu);
+    x->stop = true;
+    pthread_cond_broadcast(&x->wake);
+    pthread_mutex_unlock(&x->mu);
+    pthread_join(x->th, NULL);
+    pthread_mutex_lock(&x->mu);
+    while (x->waiters > 0) pthread_cond_wait(&x->done, &x->mu);
+    pthread_mutex_unlock(&x->mu);
+    delete x;
+}
+
+/** Run `work()` on the executor's GPU thread, in FIFO order behind the jobs already queued, and wait for it.
+ *  @tparam F a callable taking no arguments; its captures carry the call's inputs and results
+ *  @param x the executor
+ *  @param fd the client socket (< 0: none); checked at the job's turn
+ *  @param work the engine call
+ *  @return true when `work` ran; false when the client had gone by the job's turn and it was dropped unrun */
+template <class F> bool enc_executor_run(enc_executor *x, int fd, const F &work) {
+    enc_job j = {[](const void *w) { (*(const F *)w)(); }, &work, fd, false, false};
+    pulsar::ScopedLock lk(&x->mu);
+    x->waiters++;
+    x->q.push_back(&j);
+    pthread_cond_signal(&x->wake);
+    while (!j.finished) pthread_cond_wait(&x->done, &x->mu);
+    if (--x->waiters == 0) pthread_cond_broadcast(&x->done);
+    return j.ran;
+}
+
 /** One served engine.  Built once in encode_serve before the accept loop; read-only after, by every client thread. */
 struct enc_ctx {
     /// The engine (owned by encode_serve's caller).
     pulsar_engine *e;
+    /// The engine's GPU thread: every forward of `e` runs there (started and stopped by encode_serve).
+    enc_executor *gpu;
     /// The endpoint it serves.
     srv_kind kind;
     /** dim: floats an embedding (a reranker's 1); cap: an input's token limit (pulsar_engine_encode_max_tokens).
@@ -64,8 +181,8 @@ struct enc_ctx {
     const char *id;
 };
 
-/** Every engine the process serves, and the connections in flight (shutdown waits for them: the engines close
- *  after encode_serve returns). */
+/** Every engine the process serves, and the connections in flight (shutdown waits for them, then ends the
+ *  engines' GPU threads: the engines close after encode_serve returns). */
 struct enc_server {
     /// The engines, in -m order; fixed before the first accept.
     std::vector<enc_ctx> m;
@@ -195,9 +312,22 @@ void free_all(std::vector<pulsar_tokens> *v) {
     for (pulsar_tokens &t : *v) pulsar_tokens_free(&t);
 }
 
+/** Run a request's engine call on its engine's GPU thread (enc_executor_run) and wait for it; a call dropped
+ *  because the client left while it was queued is logged.
+ *  @tparam F a callable taking no arguments
+ *  @param c the engine
+ *  @param fd the client socket
+ *  @param work the engine call
+ *  @return false when the call was dropped unrun: the client is gone and no response is owed */
+template <class F> bool on_gpu_thread(const enc_ctx *c, int fd, const F &work) {
+    if (enc_executor_run(c->gpu, fd, work)) return true;
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: %s: the client left while its request was queued; not run", c->id);
+    return false;
+}
+
 /** Serve POST /v1/embeddings (the shape in the file comment): validate, render every input, one encode call, reply.
  *  @param c the embedder
- *  @param fd the client socket (a response or an error is always sent)
+ *  @param fd the client socket (a response or an error is sent unless the client left while the call was queued)
  *  @param o the request body */
 void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
     std::string err;
@@ -242,8 +372,12 @@ void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
     }
     std::vector<float> out(texts.size() * c->dim);
     char why[384];
-    const int rc = pulsar_engine_encode(c->e, toks.data(), (uint32_t)toks.size(), out.data(), why, sizeof why);
+    int rc = 0;
+    const bool ran = on_gpu_thread(c, fd, [&] {
+        rc = pulsar_engine_encode(c->e, toks.data(), (uint32_t)toks.size(), out.data(), why, sizeof why);
+    });
     free_all(&toks);
+    if (!ran) return;
     if (rc != 0) {
         http_error(fd, 500, why);
         return;
@@ -275,7 +409,7 @@ void embeddings(const enc_ctx *c, int fd, const pyjson_value &o) {
 /** Serve POST /v1/rerank: one (query, document) pair an input, one encode call; results sorted by logit, best
  *  first (stable: ties keep document order), cut to top_n.
  *  @param c the reranker
- *  @param fd the client socket (a response or an error is always sent)
+ *  @param fd the client socket (a response or an error is sent unless the client left while the call was queued)
  *  @param o the request body */
 void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     std::string err;
@@ -329,8 +463,12 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
     }
     std::vector<float> logit(texts.size());
     char why[384];
-    const int rc = pulsar_engine_encode(c->e, toks.data(), (uint32_t)toks.size(), logit.data(), why, sizeof why);
+    int rc = 0;
+    const bool ran = on_gpu_thread(c, fd, [&] {
+        rc = pulsar_engine_encode(c->e, toks.data(), (uint32_t)toks.size(), logit.data(), why, sizeof why);
+    });
     free_all(&toks);
+    if (!ran) return;
     if (rc != 0) {
         http_error(fd, 500, why);
         return;
@@ -358,9 +496,10 @@ void rerank(const enc_ctx *c, int fd, const pyjson_value &o) {
 }
 
 /** Serve POST /v1/parse: decode the data: URL image, one pulsar_engine_parse_page call, reply with its text.
- *  An engine rc of -2 (the input) answers 400, any other failure 500.
+ *  An engine rc of -2 (the input) answers 400, -3 (the image-decode budget held by other decodes) 503 with
+ *  Retry-After, any other failure 500.
  *  @param c the parser
- *  @param fd the client socket (a response or an error is always sent)
+ *  @param fd the client socket (a response or an error is sent unless the client left while the call was queued)
  *  @param o the request body */
 void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     const pyjson_value *im = o.get("image");
@@ -400,11 +539,16 @@ void parse(const enc_ctx *c, int fd, const pyjson_value &o) {
     pulsar_tokens ids = {};
     char *text = NULL;
     pulsar_parse_stats st = {};
-    const int rc = pulsar_engine_parse_page(c->e, bytes, n, &po, &ids, &text, &st, why, sizeof why);
+    int rc = 0;
+    const bool ran = on_gpu_thread(c, fd, [&] {
+        rc = pulsar_engine_parse_page(c->e, bytes, n, &po, &ids, &text, &st, why, sizeof why);
+    });
     free(bytes);
+    if (!ran) return;
     if (rc != 0) {
         pulsar_tokens_free(&ids);
-        http_error(fd, rc == -2 ? 400 : 500, why);
+        if (rc == -3) http_error_retry(fd, 503, why, HTTP_RETRY_BUSY_S);
+        else http_error(fd, rc == -2 ? 400 : 500, why);
         return;
     }
     buf b = {0};
@@ -549,13 +693,23 @@ void *client(void *arg) {
     return NULL;
 }
 
+/** End every engine's GPU thread (enc_executor_stop).  Called with no connection thread left.
+ *  @param srv the server; each started engine's `gpu` is freed and cleared */
+void stop_executors(enc_server *srv) {
+    for (enc_ctx &c : srv->m)
+        if (c.gpu) {
+            enc_executor_stop(c.gpu);
+            c.gpu = NULL;
+        }
+}
+
 }  // namespace
 
 int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg) {
     enc_server srv;
     for (int i = 0; i < n; i++) {
         pulsar_engine *e = engines[i];
-        srv.m.push_back({e, pulsar_engine_is_parser(e) ? K_PARSE : (srv_kind)pulsar_engine_encoder(e),
+        srv.m.push_back({e, NULL, pulsar_engine_is_parser(e) ? K_PARSE : (srv_kind)pulsar_engine_encoder(e),
                          pulsar_engine_encode_dim(e), pulsar_engine_encode_max_tokens(e), pulsar_engine_served_model_id(e)});
         for (int j = 0; j < i; j++)
             if (!strcmp(srv.m[j].id, srv.m[i].id)) {
@@ -564,10 +718,17 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
                 return 1;
             }
     }
+    for (enc_ctx &c : srv.m)
+        if (!(c.gpu = enc_executor_start())) {
+            server_log(PULSAR_LOG_DEFAULT, "pulsar-server: the GPU thread of %s could not start", c.id);
+            stop_executors(&srv);
+            return 1;
+        }
     const int lfd = listen_on(cfg->host, cfg->port);
     if (lfd < 0) {
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: failed to listen on %s:%d: %s", cfg->host, cfg->port,
                    strerror(errno));
+        stop_executors(&srv);
         return 1;
     }
     g_listen_fd = lfd;
@@ -621,5 +782,6 @@ int encode_serve(pulsar_engine *const *engines, int n, const server_config *cfg)
     pthread_mutex_lock(&srv.mu);
     while (srv.clients > 0) pthread_cond_wait(&srv.idle, &srv.mu);
     pthread_mutex_unlock(&srv.mu);
+    stop_executors(&srv);   /* the GPU threads end here, before the caller closes the engines */
     return 0;
 }

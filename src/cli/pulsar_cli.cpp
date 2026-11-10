@@ -296,17 +296,23 @@ static void token_printer_write_text(token_printer *p, const char *text, size_t 
 }
 
 
+/** @brief End the tool: the family's chat front (its template or its tokenizer) refused `what` (it said why).  A refused encode is
+ *  never read as an empty prompt.
+ *  @param what the text that was refused, for the line */
+[[noreturn]] static void tokenizer_refused(const char *what) {
+    fprintf(stderr, "%s: the chat front refused %s -- exiting\n", "pulsar", what);
+    exit(1);
+}
+
 /** @brief Tokenize the prompt: a pre-rendered chat as is, else the system + user prompt in the family's template.
  *  @param engine the loaded engine
  *  @param gen    the prompt, system prompt and think mode
  *  @param out    receives the tokens (appended) */
 static void build_prompt(pulsar_engine *engine, const cli_generation_options *gen, pulsar_tokens *out) {
-    if (is_rendered_chat_prompt(gen->prompt)) {
-        pulsar_tokenize_rendered_chat(engine, gen->prompt, out);
-    } else {
-        pulsar_encode_chat_prompt(engine, gen->system, gen->prompt,
-                               gen->think_mode, out);
-    }
+    const bool ok = is_rendered_chat_prompt(gen->prompt)
+                        ? pulsar_tokenize_rendered_chat(engine, gen->prompt, out)
+                        : pulsar_encode_chat_prompt(engine, gen->system, gen->prompt, gen->think_mode, out);
+    if (!ok) tokenizer_refused("the prompt");
 }
 
 /** @brief Prefill the prompt in a new session and stream up to n_predict tokens (speculative when the engine
@@ -703,7 +709,7 @@ static int run_logprob_dump(pulsar_engine *engine, const cli_config *cfg, const 
 static int run_perplexity_file(pulsar_engine *engine, const cli_config *cfg) {
     char *text = read_prompt_file(cfg->gen.perplexity_file_path, true);
     pulsar_tokens tokens = {0};
-    pulsar_tokenize_text(engine, text, &tokens);
+    if (!pulsar_tokenize_text(engine, text, &tokens)) tokenizer_refused("the perplexity file's text");
     free(text);
 
     /* Seed the graph with enough real context to stay on the normal GPU
@@ -860,7 +866,7 @@ static int run_kl_file(pulsar_engine *engine, const cli_config *cfg) {
      * ids exactly as the served model (and the vLLM reference) do. Identical to
      * plain BPE on text without special markers, so calibration text is
      * unaffected; teacher-forced KL over reasoning/tool content now aligns. */
-    pulsar_tokenize_rendered_chat(engine, text, &tokens);
+    if (!pulsar_tokenize_rendered_chat(engine, text, &tokens)) tokenizer_refused("the KL file's text");
     free(text);
     }
 tokens_ready:
@@ -1209,17 +1215,22 @@ static void tokens_remove(pulsar_tokens *dst, int pos, int n) {
 /// @param engine the loaded engine
 /// @param chat   the REPL conversation
 /// @param mode   the think mode the head carries
-static void repl_chat_apply_head(pulsar_engine *engine, repl_chat *chat, pulsar_think_mode mode) {
-    if (chat->head_applied && mode == chat->head_mode) return;
-    tokens_remove(&chat->transcript, 0, chat->head_len);
+/// @return false when the chat front refused the head (said by the engine): the conversation keeps the head it had
+static bool repl_chat_apply_head(pulsar_engine *engine, repl_chat *chat, pulsar_think_mode mode) {
+    if (chat->head_applied && mode == chat->head_mode) return true;
     pulsar_tokens head = {0};
-    pulsar_chat_open(engine, &head, NULL, chat->system, mode);
+    if (!pulsar_chat_open(engine, &head, NULL, chat->system, mode)) {
+        pulsar_tokens_free(&head);
+        return false;
+    }
+    tokens_remove(&chat->transcript, 0, chat->head_len);
     tokens_insert(&chat->transcript, 0, &head);
     chat->head_len = head.len;
     chat->head_mode = mode;
     chat->head_applied = true;
     pulsar_tokens_free(&head);
     if (chat->session) pulsar_session_invalidate(chat->session);
+    return true;
 }
 
 /** @brief Create a session of ctx_size positions and install it in chat, freeing the old one on success.
@@ -1247,7 +1258,7 @@ static int repl_chat_create_session(pulsar_engine *engine, repl_chat *chat, int 
 static int repl_chat_init(pulsar_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
     chat->system = cfg->gen.system && cfg->gen.system[0] ? cfg->gen.system : NULL;
-    repl_chat_apply_head(engine, chat, cfg->gen.think_mode);
+    if (!repl_chat_apply_head(engine, chat, cfg->gen.think_mode)) tokenizer_refused("the system prompt");
     return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
 }
 
@@ -1290,10 +1301,17 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     }
 
     const pulsar_think_mode think_mode = cfg->gen.think_mode;
-    repl_chat_apply_head(engine, chat, think_mode);
+    if (!repl_chat_apply_head(engine, chat, think_mode)) {
+        fprintf(stderr, "pulsar: the message was not taken (the chat front refused the conversation's head)\n");
+        return 1;
+    }
     const int rollback_len = chat->transcript.len;
     const pulsar_chat_message user = {"user", user_text, false};
-    pulsar_chat_append_turn(engine, &chat->transcript, &user, 1, true, think_mode);
+    if (!pulsar_chat_append_turn(engine, &chat->transcript, &user, 1, true, think_mode)) {
+        /* said by the engine; nothing was appended, so the conversation stands where it was */
+        fprintf(stderr, "pulsar: the message was not taken (the chat front refused it)\n");
+        return 1;
+    }
 
     const TokPos old_pos = pulsar_session_pos(chat->session);
     const TokCount common = pulsar_session_common_prefix(chat->session, &chat->transcript);
@@ -1403,8 +1421,11 @@ static int run_chat_turn(pulsar_engine *engine, cli_config *cfg, repl_chat *chat
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
         pulsar_session_invalidate(chat->session);
-    } else {
-        pulsar_chat_end_assistant(engine, &chat->transcript);
+    } else if (!pulsar_chat_end_assistant(engine, &chat->transcript)) {
+        /* said by the engine: the turn cannot be closed, so it is taken back and the conversation stands before it */
+        fprintf(stderr, "pulsar: the reply was not kept (the chat front refused the turn's close)\n");
+        chat->transcript.len = rollback_len;
+        pulsar_session_invalidate(chat->session);
     }
 
     const double prefill_s = t_prefill1 - t_prefill0;
@@ -1489,14 +1510,20 @@ static int run_repl(pulsar_engine *engine, cli_config *cfg) {
             if (!ok) {
                 fprintf(stderr, "pulsar: /think takes an effort in [1, 100] or -low/-high/-max\n");
             } else {
-                cfg->gen.think_mode = mode;
-                repl_chat_apply_head(engine, &chat, mode);
-                printf("Thinking mode: %s (effort %d).\n", pulsar_think_mode_name(mode), mode);
+                if (repl_chat_apply_head(engine, &chat, mode)) {
+                    cfg->gen.think_mode = mode;
+                    printf("Thinking mode: %s (effort %d).\n", pulsar_think_mode_name(mode), mode);
+                } else {
+                    fprintf(stderr, "pulsar: /think: the chat front refused the head; the mode is unchanged\n");
+                }
             }
         } else if (!strcmp(cmd, "/nothink")) {
-            cfg->gen.think_mode = PULSAR_THINK_NONE;
-            repl_chat_apply_head(engine, &chat, PULSAR_THINK_NONE);
-            puts("Thinking mode: none.");
+            if (repl_chat_apply_head(engine, &chat, PULSAR_THINK_NONE)) {
+                cfg->gen.think_mode = PULSAR_THINK_NONE;
+                puts("Thinking mode: none.");
+            } else {
+                fprintf(stderr, "pulsar: /nothink: the chat front refused the head; the mode is unchanged\n");
+            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {

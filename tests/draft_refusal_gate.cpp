@@ -22,11 +22,11 @@
 static const pulsar_drafter_ops *g_block;   /* the engine's block drafter */
 
 /* the block drafter's draft with the session's lane detached: its own refusal path */
-static uint32_t refusing_draft(pulsar_session *s, int next_base, bool features_ready, float temperature, int top_k,
-                               float top_p, float min_p, uint64_t *rng) {
+static uint32_t refusing_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+                               uint64_t *rng) {
     pulsar_block_lane *lane = s->driver->block;
     s->driver->block = NULL;
-    const uint32_t k = g_block->draft(s, next_base, features_ready, temperature, top_k, top_p, min_p, rng);
+    const uint32_t k = g_block->draft(s, next_base, temperature, top_k, top_p, min_p, rng);
     s->driver->block = lane;
     return k;
 }

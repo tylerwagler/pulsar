@@ -10,8 +10,10 @@
  * WHY THESE SHAPES.  Every candidate path the host had: greedy (temperature <= 0 and the GREEDY flag), top-k (k =
  * 1 .. 1024, clamps), the min-p prefilter (full-nucleus arm and the id-order-sum arm), the full sort (min_p tiny),
  * the row kernel's shared store and the slot kernel's global sort (flat and near-flat rows overflow it); knob
- * clamps and non-finite knobs; rows with NaN / +-inf holes, no finite value, -0 / +0 and exact ties (the order and
- * the argmax's lowest id), probabilities in the subnormal range (wide rows at low temperature), two tied leaders;
+ * clamps and non-finite knobs; rows with -inf holes, no finite value, -0 / +0 and exact ties (the order and
+ * the argmax's lowest id); BROKEN rows (L375: one NaN, one +Inf, NaN / +Inf among -inf holes, a NaN under a cleared
+ * mask bit) that must refuse with PULSAR_GPU_SAMPLE_REFUSED_NONFINITE while the other rows of the launch draw their
+ * host bytes, probabilities in the subnormal range (wide rows at low temperature), two tied leaders;
  * the token mask (dense random, a tool-name-like handful, everything masked); row strides wider than the sampled
  * width (a draft vocabulary inside a wider row).  Every case at each vocabulary a family serves.
  *
@@ -51,7 +53,8 @@ uint32_t urand(uint32_t n) { return (uint32_t)(g_rng() % n); }
 float frand() { return (float)((g_rng() >> 40) * (1.0 / 16777216.0)); }
 
 const char *k_shapes[] = {"lm", "peaked", "flat", "near-flat", "holes", "no-finite", "signed-zeros", "tied-leaders",
-                          "wide", "quantized", "few-finite"};
+                          "wide", "quantized", "nan-hole", "posinf-hole", "broken-holes", "nan-masked", "few-finite"};
+constexpr uint32_t SHAPE_NAN_MASKED = 13;   /* its mask clears exactly the NaN's bit (main) */
 constexpr uint32_t N_SHAPES = sizeof(k_shapes) / sizeof(k_shapes[0]);
 
 void gen_row(uint32_t shape, uint32_t n, std::vector<float> &x) {
@@ -74,15 +77,12 @@ void gen_row(uint32_t shape, uint32_t n, std::vector<float> &x) {
     case 3:
         for (uint32_t i = 0; i < n; i++) x[i] = 0.01f * gauss();
         break;
-    case 4:
+    case 4:   /* -inf holes: the legitimate mask value, drawn around */
         for (uint32_t i = 0; i < n; i++) x[i] = 2.0f * gauss();
-        for (uint32_t j = 0; j < n / 20; j++) {
-            const uint32_t k = urand(3);
-            x[urand(n)] = k == 0 ? NN : k == 1 ? PI : NI;
-        }
+        for (uint32_t j = 0; j < n / 20; j++) x[urand(n)] = NI;
         break;
     case 5:
-        for (uint32_t i = 0; i < n; i++) x[i] = (i & 1) ? NI : NN;
+        for (uint32_t i = 0; i < n; i++) x[i] = NI;
         break;
     case 6: {
         const float v[4] = {0.0f, -0.0f, 1.0f, -1.0f};
@@ -102,6 +102,23 @@ void gen_row(uint32_t shape, uint32_t n, std::vector<float> &x) {
         break;
     case 9:
         for (uint32_t i = 0; i < n; i++) x[i] = std::round(2.0f * gauss() * 2.0f) / 2.0f;
+        break;
+    case 10:   /* L375: an LM-like row with ONE NaN (either sign): broken */
+    case SHAPE_NAN_MASKED:
+        gen_row(0, n, x);
+        x[urand(n)] = urand(2) ? NN : -NN;
+        break;
+    case 11:   /* one +Inf: broken */
+        gen_row(0, n, x);
+        x[urand(n)] = PI;
+        break;
+    case 12:   /* NaN and +Inf among -inf holes: broken (at least one of each kind of bad value) */
+        for (uint32_t i = 0; i < n; i++) x[i] = 2.0f * gauss();
+        for (uint32_t j = 0; j < n / 20; j++) {
+            const uint32_t k = urand(3);
+            x[urand(n)] = k == 0 ? NN : k == 1 ? PI : NI;
+        }
+        x[urand(n)] = urand(2) ? NN : PI;
         break;
     default:
         for (uint32_t i = 0; i < n; i++) x[i] = NI;
@@ -184,8 +201,14 @@ uint32_t fbits(float f) {
     return u;
 }
 
+/* every knob finite, by its bits (the sampler's own test) */
+bool knobs_finite(const pulsar_gpu_sample_req &q) {
+    auto fin = [](float f) { return (fbits(f) & 0x7f800000u) != 0x7f800000u; };
+    return fin(q.temperature) && fin(q.top_p) && fin(q.min_p);
+}
+
 struct gate {
-    uint32_t cases = 0, fails = 0, overflow_rows = 0;
+    uint32_t cases = 0, fails = 0, overflow_rows = 0, broken_rows = 0, broken_masked = 0;
     uint32_t by_path[4] = {};
     void fail(const char *what, uint32_t v, const case_row &c, uint32_t r, const char *detail) {
         if (fails++ < 25)
@@ -251,10 +274,12 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
     for (uint32_t r = 0; r < nr; r++) {
         sref::pulsar_sample_scratch sc;
         memset(&sc, 0, sizeof(sc));
+        /* the masked view; a NaN or +Inf stays under a cleared bit (L375: it breaks the row wherever it sits) */
         view[r].assign(rows[r].x.begin(), rows[r].x.begin() + n_vocab);
         if (!rows[r].mask.empty())
             for (uint32_t i = 0; i < n_vocab; i++)
-                if (!((rows[r].mask[i >> 5] >> (i & 31u)) & 1u)) view[r][i] = -INFINITY;
+                if (!((rows[r].mask[i >> 5] >> (i & 31u)) & 1u) && !sref::sample_row_broken(&view[r][i], 1))
+                    view[r][i] = -INFINITY;
         ho[r] = host_sample(view[r].data(), n_vocab, reqs[r], &sc, hm);
         sref::pulsar_sample_scratch_free(&sc);
     }
@@ -269,6 +294,30 @@ bool run_batch(gate &g, uint32_t n_vocab, std::vector<case_row> &rows, pulsar_gp
             g.fail("determinism", n_vocab, rows[r], r, det);
         }
         const bool dev_ok = st == PULSAR_GPU_SAMPLE_OK && t1 >= 0;
+        {   /* L375: a row with a NaN or +Inf logit refuses BY NAME (a non-finite knob on a sampled row refuses first),
+             * and no other row carries that status */
+            const pulsar_gpu_sample_req &q = reqs[r];
+            const bool knob = !(q.flags & PULSAR_GPU_SAMPLE_GREEDY) && !knobs_finite(q);
+            const bool broken = sref::sample_row_broken(rows[r].x.data(), n_vocab);
+            if (broken && !knob) {
+                g.broken_rows++;
+                bool masked_out = false;   /* every bad value under a cleared mask bit: still broken */
+                if (!rows[r].mask.empty()) {
+                    masked_out = true;
+                    for (uint32_t i = 0; i < n_vocab && masked_out; i++)
+                        if (sref::sample_row_broken(&rows[r].x[i], 1) && ((rows[r].mask[i >> 5] >> (i & 31u)) & 1u))
+                            masked_out = false;
+                }
+                g.broken_masked += masked_out ? 1u : 0u;
+            }
+            if ((broken && !knob) != (st == PULSAR_GPU_SAMPLE_REFUSED_NONFINITE) ||
+                (st == PULSAR_GPU_SAMPLE_REFUSED_NONFINITE && t1 != -1)) {
+                snprintf(det, sizeof(det), "broken row %d (knob refusal %d): device token %d status %u", (int)broken,
+                         (int)knob, t1, st);
+                g.fail("nonfinite", n_vocab, rows[r], r, det);
+                continue;
+            }
+        }
         if (dev_ok != (h.tok >= 0) || (dev_ok && t1 != h.tok)) {
             snprintf(det, sizeof(det), "token: device %d (status %u), host %d", t1, st, h.tok);
             g.fail("token", n_vocab, rows[r], r, det);
@@ -479,7 +528,7 @@ static void test_chains(gate &g, uint32_t V, uint32_t rounds) {
     pulsar_gpu_tensor *dc = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * TK * 4u);
     pulsar_gpu_tensor *ds = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * TK * TK * 4u);
     pulsar_gpu_tensor *dout = pulsar_gpu_tensor_alloc((uint64_t)NC * SL * 4u);
-    uint32_t cases = 0, bad = 0;
+    uint32_t cases = 0, bad = 0, broken = 0;
     std::vector<float> row(V);
     for (uint32_t it = 0; it < rounds; it++) {
         std::vector<int32_t> cand((size_t)NC * SL * TK);
@@ -536,6 +585,12 @@ static void test_chains(gate &g, uint32_t V, uint32_t rounds) {
                     memset(&scr, 0, sizeof(scr));
                     want = host_sample(row.data(), V, q, &scr).tok;
                     sref::pulsar_sample_scratch_free(&scr);
+                    /* L375: a NaN or +Inf among the slot's scores is the chain's named refusal (finite knobs) */
+                    if (knobs_finite(q) && sref::sample_row_broken(row.data(), V)) {
+                        if (want != -1) { bad++; fprintf(stderr, "  FAIL chain: the host drew from a broken slot\n"); }
+                        want = PULSAR_GPU_CHAIN_NONFINITE;
+                        broken++;
+                    }
                     uint32_t pick = 0;
                     while (pick < TK && ci[j * TK + pick] != want) pick++;
                     if (want < 0 || pick == TK) stopped = true;
@@ -552,12 +607,63 @@ static void test_chains(gate &g, uint32_t V, uint32_t rounds) {
             }
         }
     }
-    printf("  chains V=%-6u %u slots, %u failures\n", V, cases, bad);
+    printf("  chains V=%-6u %u slots (%u refused for a NaN / +Inf score), %u failures\n", V, cases, broken, bad);
+    if (broken == 0) { bad++; fprintf(stderr, "  FAIL chains: no slot with a NaN / +Inf score was exercised\n"); }
     g.cases += cases;
     g.fails += bad;
     pulsar_gpu_tensor_free(dc);
     pulsar_gpu_tensor_free(ds);
     pulsar_gpu_tensor_free(dout);
+}
+
+/* L375: the walk over a launch with a broken row.  Three rows, the middle one with a NaN: its neighbours draw the
+ * host's tokens, and a run whose first draft agrees stops at the broken row with ITS status and no carry. */
+static void test_walk_refusal(gate &g, uint32_t V, pulsar_gpu_tensor *dl, pulsar_gpu_tensor *scratch,
+                              pulsar_gpu_tensor *dout, pulsar_gpu_tensor *dwalk) {
+    std::vector<float> host((size_t)3 * V);
+    pulsar_gpu_sample_req reqs[3];
+    host_out ho[3];
+    for (uint32_t r = 0; r < 3; r++) {
+        std::vector<float> x;
+        gen_row(0, V, x);
+        if (r == 1) x[urand(V)] = NAN;
+        memcpy(&host[(size_t)r * V], x.data(), (size_t)V * 4);
+        reqs[r] = pulsar_gpu_sample_req{r == 2 ? 0.0f : 0.7f, 0.95f, 0.05f, r == 0 ? 20 : 0, g_rng(), 0u,
+                                        PULSAR_GPU_SAMPLE_NO_MASK, -1, r};
+        sref::pulsar_sample_scratch sc;
+        memset(&sc, 0, sizeof(sc));
+        ho[r] = host_sample(x.data(), V, reqs[r], &sc);
+        sref::pulsar_sample_scratch_free(&sc);
+    }
+    pulsar_gpu_spec_run run{};
+    run.row0 = 0;
+    run.k = 2;
+    run.pend[0] = ho[0].tok;   /* agrees: the walk moves on to the broken row */
+    run.pend[1] = 7;
+    pulsar_gpu_sample_out out[3];
+    pulsar_gpu_spec_walk_out wo;
+    g.cases++;
+    if (!pulsar_gpu_tensor_write(dl, 0, host.data(), host.size() * 4) ||
+        !pulsar_gpu_sample_rows(dl, 0, V, V, 3, 3, reqs, nullptr, 0, nullptr, scratch, dout, 0, nullptr, 0) ||
+        !pulsar_gpu_spec_walk(dout, 0, 3, &run, 1, dwalk, 0) || !pulsar_gpu_synchronize() ||
+        !pulsar_gpu_tensor_read(dout, 0, out, sizeof(out)) || !pulsar_gpu_tensor_read(dwalk, 0, &wo, sizeof(wo))) {
+        g.fails++;
+        fprintf(stderr, "  FAIL walk refusal V=%u: a launch failed\n", V);
+        return;
+    }
+    const bool ok = ho[0].tok >= 0 && ho[1].tok == -1 && ho[2].tok >= 0 && out[0].token == ho[0].tok &&
+                    out[0].status == PULSAR_GPU_SAMPLE_OK && out[1].token == -1 &&
+                    out[1].status == PULSAR_GPU_SAMPLE_REFUSED_NONFINITE && out[2].token == ho[2].tok &&
+                    out[2].status == PULSAR_GPU_SAMPLE_OK && wo.commit == 1 && wo.carry == -1 &&
+                    wo.status == PULSAR_GPU_SAMPLE_REFUSED_NONFINITE;
+    if (!ok) {
+        g.fails++;
+        fprintf(stderr, "  FAIL walk refusal V=%u: rows (%d/%u, %d/%u, %d/%u) host (%d, %d, %d); walk commit %u carry %d "
+                        "status %u\n", V, out[0].token, out[0].status, out[1].token, out[1].status, out[2].token,
+                out[2].status, ho[0].tok, ho[1].tok, ho[2].tok, wo.commit, wo.carry, wo.status);
+    }
+    pulsar_gpu_sample_refusal_say(out[1].status, V);   /* the engine's line for it, once per width */
+    printf("  walk refusal V=%-6u a NaN row between two drawn rows: %s\n", V, ok ? "refused by name" : "FAIL");
 }
 
 /* The TP mirror's cross-rank identity digest (L243; on the device since L302): deterministic, sensitive to one bit
@@ -655,6 +761,11 @@ int main(int argc, char **argv) {
                 memcpy(c.x.data(), x.data(), (size_t)v * 4);
                 gen_req(c.req);
                 if (urand(5) == 0) gen_mask(urand(10) == 0 ? 3u : urand(3), v, x, c.mask);
+                if (shape == SHAPE_NAN_MASKED) {   /* everything allowed but the NaN: the row is broken all the same */
+                    c.mask.assign((v + 31u) / 32u, ~0u);
+                    for (uint32_t i = 0; i < v; i++)
+                        if (sref::sample_row_broken(&x[i], 1)) c.mask[i >> 5] &= ~(1u << (i & 31u));
+                }
             }
             /* every seventh batch draws through a draft vocabulary: an ascending subset of a vocabulary twice as wide */
             std::vector<int32_t> map;
@@ -675,6 +786,7 @@ int main(int argc, char **argv) {
         }
         printf("  V=%-6u %5u cases, %u failures\n", v, g.cases - c0, g.fails - f0);
         if (!bench_only) test_chains(g, v, quick ? 4u : 24u);
+        if (!bench_only) test_walk_refusal(g, v, dl, scratch, dout, dwalk);
         if (do_bench) bench(v, dl, scratch, dout);
         pulsar_gpu_tensor_free(dl); pulsar_gpu_tensor_free(dm); pulsar_gpu_tensor_free(scratch);
         pulsar_gpu_tensor_free(dout); pulsar_gpu_tensor_free(ddist); pulsar_gpu_tensor_free(dlp);
@@ -683,7 +795,13 @@ int main(int argc, char **argv) {
     }
     if (!bench_only) test_rows_digest(g);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    printf("sampler-device-gate: %u cases (%u rows past the shared store), %u failures, %.1f s -- %s\n", g.cases,
-           g.overflow_rows, g.fails, s, g.fails ? "FAIL" : "PASS");
+    if (!bench_only && (g.broken_rows == 0 || g.broken_masked == 0)) {   /* rule 5: the refusal lane ran */
+        g.fails++;
+        fprintf(stderr, "  FAIL: no broken row (%u) or no broken row under a mask (%u) was exercised\n", g.broken_rows,
+                g.broken_masked);
+    }
+    printf("sampler-device-gate: %u cases (%u rows past the shared store; %u rows refused for a NaN / +Inf logit, %u "
+           "of them with it under a cleared mask bit), %u failures, %.1f s -- %s\n", g.cases, g.overflow_rows,
+           g.broken_rows, g.broken_masked, g.fails, s, g.fails ? "FAIL" : "PASS");
     return g.fails ? 1 : 0;
 }

@@ -120,7 +120,8 @@ void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m) {
                                                 false);
     }
     pulsar_tokens end = {0};
-    pulsar_chat_end_assistant(e, &end);
+    /* a family with no chat front spells no close (refused, said once): the marker stays empty, as the two above */
+    if (!pulsar_chat_end_assistant(e, &end)) end.len = 0;
     m->end_len = agent_turn_mark_text(e, end.v, end.len, m->end, sizeof m->end, true);
     pulsar_tokens_free(&end);
 }
@@ -462,18 +463,6 @@ static void agent_history_render_compaction_summary(agent_worker *w,
 
 
 
-/** @brief Skip UTF-8 continuation bytes, so a cut lands on a character boundary.
- *  @param p   the position
- *  @param end the end (exclusive)
- *  @return the first non-continuation byte at or after `p` (or `end`) */
-static const char *agent_history_skip_utf8_continuation(const char *p,
-                                                        const char *end) {
-    while (p < end && (((unsigned char)*p) & 0xc0) == 0x80) p++;
-    return p;
-}
-
-
-
 /** @brief Where the tail of [p, end) that fits `max_lines` lines and `max_bytes` bytes starts.
  *  @param p         the text's start
  *  @param end       its end (exclusive)
@@ -510,7 +499,7 @@ static const char *agent_history_tail_start(const char *p, const char *end,
         if (line_start > start) start = line_start;
     }
 
-    return agent_history_skip_utf8_continuation(start, end);
+    return agent_utf8_skip_continuation(start, end);
 }
 
 

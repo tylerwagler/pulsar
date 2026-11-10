@@ -51,8 +51,10 @@ static void sync_note_images(pulsar_session *s, const pulsar_tokens *prompt, con
         return;
     }
     if (!pulsar_image_identity_build(s->engine->family->vision, s->engine, prompt->v, prompt->len, images, n_images,
-                                     limit, &s->live_images))
+                                     limit, &s->live_images)) {
         s->live_images.n = 0;
+        vision_decode_busy_reset();   /* discarded: the bank records no image, the sync's result stands (O34) */
+    }
 }
 
 bool pulsar_session_seam_stitch(pulsar_session *s, const pulsar_tokens *prompt, const pulsar_image_ref *images,

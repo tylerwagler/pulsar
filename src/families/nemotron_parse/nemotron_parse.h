@@ -272,7 +272,8 @@ typedef struct {
 } pulsar_nemotron_parse_page;
 
 /** Decode (PNG / JPEG), resize (Pillow BILINEAR, only when larger than the canvas), pad, normalise, patch.  false +
- *  `err` on an image the model does not take. */
+ *  `err` on an image the model does not take, or one the decode budget refused (vision_decode_busy_seen says
+ *  which). */
 bool pulsar_nemotron_parse_page_prepare(const pulsar_nemotron_parse_shape *s, const uint8_t *bytes, size_t len,
                                         pulsar_nemotron_parse_page *page, char *err, size_t errlen);
 /** The position rows of a (canvas, content) geometry: f32 [(h / 16) * (w / 16)][vit_width] from the field (torch's
