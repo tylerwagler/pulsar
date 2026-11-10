@@ -2482,8 +2482,11 @@ bool server::bank_unspill(int bank, spilled_history *was) {
     s->slots[bank].spilled = false;
     s->slots[bank].committed_pos = TokPos{0};
     s->count_metric(&s->m_restores);
-    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: guard: spilled bank %d re-backed empty (its history %s)", bank,
-               was && was->text ? "restores from its segment chain in slices" : "stays on disk");
+    /* L372: true of a bank the guard spilled (its chain was written) and of one a failed readmission left marked
+     * (no chain was written for it; the store may hold an older one, or none) */
+    server_log(PULSAR_LOG_DEFAULT, "pulsar-server: bank %d re-backed empty: %s", bank,
+               was && was->text ? "the job bound to it restores what the store holds of its history, in slices"
+                                : "what the store holds of its history stays on disk");
     return true;
 }
 
