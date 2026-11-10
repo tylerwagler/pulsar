@@ -4728,6 +4728,13 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank);
 /** L354: whether `bank` has a saved view (a false pulsar_bank_carry_restore_view then is a failure, not a fresh bank).
  *  @param s the session  @param bank the bank  @return true when one is saved */
 bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank);
+/** L375: `bank`'s host view names no position any more -- its device state moved without it (a step that failed and
+ *  reset the bank, a speculative round that could not be undone on it).  The live view when the bank is installed,
+ *  and its saved carry either way, so pulsar_bank_history stops serving the history and the bank's next sync rebuilds
+ *  it. */
+/// @param s     the session
+/// @param bank  the bank, < the pool's count
+void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank);
 /** L322: the host view of a bank nothing was saved for -- empty and INVALID, so its first sync resets the bank and
  *  prefills cold (never continues another bank's history: the host view the caller held describes the bank it was
  *  synced on).  Every family's restore of such a bank installs it. */
