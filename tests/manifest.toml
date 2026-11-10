@@ -8,12 +8,12 @@
 # budget is seconds; a test over budget is flagged, not failed.  [sections] budgets what one test reports for each model.
 
 [limits]
-release = 3600   # L357 2026-11-08: #676 measured 3446 s (21 -> 11 server starts; Gemma + Nemotron reference gates added)
+release = 4000   # L371 2026-11-10: #695 measured 3775 s (the state contract on Gemma 4 and Nemotron, gemma4-jev-gate); L357: #676 3446 s
 
 [sections]
 "cuda-runner-gate [Qwen4-exp]" = 1200
-"cuda-runner-gate [Nemotron-H]" = 450   # its two reference gates since L357 (#676: 409 s)
-"cuda-runner-gate [Gemma 4]" = 90
+"cuda-runner-gate [Nemotron-H]" = 550   # L371: + session-contract and bank-isolation (#695: 491 s); L357: its two reference gates
+"cuda-runner-gate [Gemma 4]" = 200   # L371: the state contract beside its reference gates (#695: 143 s)
 "live-legs [qwen]" = 1500
 "live-legs [nemotron]" = 420
 
