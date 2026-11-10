@@ -23,3 +23,10 @@
 # PULSAR_REF_DIR ?= /path/to/...
 # QWEN_GEN_MODEL ?= /path/to/...
 # QWEN_GEN_TOKENS ?= /path/to/...
+
+# ---- gemma4-jev-gate (release tier, L371): the BF16 decision reference, the JEV snapshot (head + calibration) and a
+# python with torch + safetensors for the grader.
+# GEMMA4_JEV_MODEL = /path/to/the/Gemma-4/pack
+# GEMMA4_JEV_REF   = /path/to/decision_ref.pt
+# GEMMA4_JEV_SNAP  = /path/to/jev-adapter
+# JEV_PYTHON       = /path/to/venv/bin/python

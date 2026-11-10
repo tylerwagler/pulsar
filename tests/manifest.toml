@@ -35,7 +35,7 @@ budget = 240
 [[test]]
 name = "agent-test-gate"
 tier = "check"
-budget = 10
+budget = 90   # L373: the bash-job teardown, timeout and atomic-write tests wait on real children (Sparky: 52 s)
 
 [[test]]
 name = "cuda-regression"
@@ -56,6 +56,11 @@ budget = 30
 name = "cuda-chat-smoke-gate"
 tier = "release"
 budget = 35
+
+[[test]]
+name = "gemma4-jev-gate"
+tier = "release"
+budget = 120   # L371: the JEV adapter on Gemma 4 against the BF16 decision reference (Sparky #690: about 60 s)
 
 [[test]]
 name = "agent-tools-gate"

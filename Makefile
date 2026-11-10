@@ -1096,12 +1096,14 @@ GEMMA4_JEV_MODEL ?= $(call need_path,GEMMA4_JEV_MODEL)
 GEMMA4_JEV_REF ?= $(call need_path,GEMMA4_JEV_REF)
 GEMMA4_JEV_SNAP ?= $(call need_path,GEMMA4_JEV_SNAP)
 GEMMA4_JEV_WORK ?= /tmp/gemma4-jev
+# The python that runs the grader: it needs torch and safetensors (local.mk names a venv that has them).
+JEV_PYTHON ?= python3
 .PHONY: gemma4-jev-gate
 gemma4-jev-gate: tests/gemma4_jev_gate
 	mkdir -p $(GEMMA4_JEV_WORK)
-	python3 tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
+	$(JEV_PYTHON) tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
 	./tests/gemma4_jev_gate $(GEMMA4_JEV_MODEL) $(GEMMA4_JEV_WORK)/cases.bin $(GEMMA4_JEV_WORK)/out.bin
-	python3 tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
+	$(JEV_PYTHON) tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
 # L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
 # every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
