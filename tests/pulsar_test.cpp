@@ -4773,8 +4773,10 @@ static void test_ckpt_records(void) {
     for (uint32_t i = 0; i < st->n_rec; i++)
         TEST_ASSERT((st->rec[i].kind == PULSAR_CKPT_REC_END) == (st->rec[i].logits != NULL));
     /* L313: an adopt between banks refuses without paired pools (this store has none), and from the bank itself */
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL));
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL));
+    bool moved = true;
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, 101, NULL, &moved) && !moved);   /* L375 O43: refused before dst moved */
+    moved = true;
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, 100, NULL, &moved) && !moved);
     pulsar_ckpt_drop_bank(st, 0);
     pulsar_ckpt_drop_bank(st, 1);
     /* L326: lending a record stamps it used.  Dry tensors (every copy a no-op that succeeds) give the banks paired
@@ -4790,7 +4792,7 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, 250, toks, lg, 4, NULL));
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, 240, toks, NULL, 0, NULL));
     r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
-    TEST_ASSERT(r && pulsar_ckpt_adopt(st, 1, 0, 300, r));
+    TEST_ASSERT(r && pulsar_ckpt_adopt(st, 1, 0, 300, r, &moved) && moved);
     TEST_ASSERT(pulsar_ckpt_end(st, 1) == 300u && pulsar_ckpt_end(st, 0) == 300u);   /* dst's copy, the lender's own */
     TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, 290, toks, NULL, 0, NULL));
     TEST_ASSERT(pulsar_ckpt_end(st, 0) == 300u);                                    /* still the lender's */

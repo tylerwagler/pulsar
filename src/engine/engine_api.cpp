@@ -2048,11 +2048,23 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     for (uint32_t i = 0; i < T; i++) pulsar_tokens_push(&view, h->v[i]);   /* h is src's carry: copy before moving */
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const bool at_end = r && r->logits && T == (uint32_t)len;
-    if (at_end) memcpy(s->logits, r->logits, (size_t)st->end_width * sizeof(float));
-    s->checkpoint_valid = false;   /* the state moves below */
-    if (!pulsar_ckpt_adopt(st, dst, src, T, r) || (at_end && !s->live_from_host(s->logits))) {
+    /* the record's logits, kept aside before the store moves (dst's own records go, and a capture may recycle one) */
+    std::vector<float> end_row;
+    if (at_end) end_row.assign(r->logits, r->logits + st->end_width);
+    /* L375 O43: dst's view -- its history, its host logits, its validity -- is given up only once the adopt has
+     * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank) leaves the bank exactly
+     * what its view describes */
+    bool moved = false;
+    bool ok = pulsar_ckpt_adopt(st, dst, src, T, r, &moved);
+    if (moved) s->checkpoint_valid = false;   /* the state moved */
+    if (ok && at_end) {
+        memcpy(s->logits, end_row.data(), end_row.size() * sizeof(float));
+        ok = s->live_from_host(s->logits);
+    }
+    if (!ok) {
         pulsar_tokens_free(&view);
-        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u", src, T, dst);
+        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u%s", src, T, dst,
+                          moved ? "" : " (refused before anything moved: the bank keeps its own state)");
         return refused;
     }
     s->checkpoint.len = 0;

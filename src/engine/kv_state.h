@@ -405,16 +405,19 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
  *  walked into dst, exactly what a restore on src would leave there (a published checkpoint is any bank's to restore
  *  while its own bank's history still reaches T, the frontier rule).  dst's own checkpoints and records go (its
  *  history is replaced); it keeps a copy of the one it now stands at.  A lent record is stamped used (the pool's LRU,
- *  L326).  False, said, when the banks' pools do not pair, one is freed, or a copy failed (dst's state then describes
- *  no position). */
-/// @param st  the store
-/// @param dst the installed bank to overwrite
-/// @param src the bank whose state is adopted
-/// @param T   the position adopted, in tokens
-/// @param r   src's record at T, or NULL for src's grid checkpoint at T
+ *  L326).  False, said, when the banks' pools do not pair, one is freed, or a copy failed.  `*moved` tells the two kinds of refusal apart
+ *  (L375 O43): false = refused before anything of dst was touched (dst is still what its view describes), true = dst's
+ *  checkpoints went and its state was being written (on a failure it then describes no position). */
+/// @param st    the store
+/// @param dst   the installed bank to overwrite
+/// @param src   the bank whose state is adopted
+/// @param T     the position adopted, in tokens
+/// @param r     src's record at T, or NULL for src's grid checkpoint at T
+/// @param moved receives whether dst was touched (see above); never NULL
 /// @return true when dst stands at T.  A record is copied when a slot holds it; a recycled slot too small keeps no copy, and
 ///         the bank's next resume at T then falls to its grid checkpoint (L354: a miss, never other state)
-bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r);
+bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r,
+                       bool *moved);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
  *  caller keeps an image block whole around it. */
