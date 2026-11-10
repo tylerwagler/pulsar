@@ -676,24 +676,19 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
 
 /* ---- shared types ---- */
 
-/** A span of the memory-mapped model file, and where it lives on the device.
+/** A span of the memory-mapped model file, and where its device copy lives.
  *
- * A range can reach the GPU two ways: copied into the arena, or the host pages
- * registered so the device addresses them directly. The `registered_*` fields
- * describe the second case and the `arena_allocated` flag the first; they are
- * mutually exclusive, and the flags are what tell teardown which cleanup a
- * given range needs.
+ * Every range is a COPY in device memory: a span of the weights arena (the staged fd route) or an allocation of its
+ * own (a device copy of a mapping with no fd, an expert half, an overlay).  `arena_allocated` tells teardown which.
+ * There is no per-range host registration (L375, O22: its arm had no writer); the one registration is the whole
+ * mapping's, on an integrated GPU that accepts it (pulsar_gpu_set_model_map), and it makes no range.
  */
 struct cuda_model_range {
     const void *host_base;          ///< mapping base this range is an offset into
     uint64_t offset;                ///< byte offset of the range within the mapping
     uint64_t bytes;                 ///< range length
     char *device_ptr;               ///< device address of the range's first byte
-    void *registered_base;          ///< page-aligned host base actually registered
-    char *registered_device_base;   ///< device address corresponding to registered_base
-    uint64_t registered_bytes;      ///< bytes registered (>= `bytes`, page-rounded)
-    int host_registered;            ///< the host pages are registered and must be unregistered
-    int arena_allocated;            ///< the bytes were copied into the arena instead
+    int arena_allocated;            ///< a span of the weights arena (freed with it); 0: its own cudaMalloc
 };
 
 /** Bump allocator holding model weights on the device. One allocation, carved
