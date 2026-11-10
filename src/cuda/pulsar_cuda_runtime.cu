@@ -24,6 +24,13 @@ static uint64_t g_model_registered_size;
 /// Nonzero when the whole mapping is device-addressable: every range resolves to g_model_device_base + offset.
 static int g_model_registered;
 
+/// Bytes a host-to-device weight copy moves at a time: the staged fd route's reads, the fd-less device copy's bounce
+/// and the overlay upload (L375: one constant for the three 64 MiB spellings).
+constexpr uint64_t kModelCopyChunkBytes = 64ull << 20;
+/// The weights arena's span alignment: cuda_model_arena_alloc rounds by it and cuda_model_arena_unwind undoes exactly
+/// that rounding (L375: the unwind restated it as 4095).
+constexpr uint64_t kModelArenaAlign = 4096u;
+
 
 
 
@@ -376,7 +383,7 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
     }
 
     const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    const uint64_t chunk = kModelCopyChunkBytes;
 
     /* Bounce through a pinned buffer rather than copying straight from the
      * source mapping.  Historically this path took a partially-registered
@@ -712,10 +719,6 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
 
 
 
-/// @return the staged route's chunk size (64 MiB)
-static uint64_t cuda_model_copy_chunk_bytes(void) {
-    return 64ull * 1048576ull;   /* the env knob had no caller (L159 inc 4) */
-}
 
 
 
@@ -1022,7 +1025,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
      * plain decode (20.91 vs 20.85 @512) for ~900 MB of arena rounding, and
      * the served lane at 3 clients FELL (43.8 -> 41.8 tok/s, one rep) -- the
      * rounding comes out of the same memory the bank pool is sized from. */
-    const uint64_t align = 4096u;
+    const uint64_t align = kModelArenaAlign;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
 
     for (cuda_model_arena &a : g_model_arenas) {
@@ -1061,7 +1064,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
  *  @param span  the span cuda_model_arena_alloc returned
  *  @param bytes the size it was asked for (rounded as it rounded it) */
 static void cuda_model_arena_unwind(char *span, uint64_t bytes) {
-    const uint64_t aligned = (bytes + 4095u) & ~(uint64_t)4095u;
+    const uint64_t aligned = (bytes + kModelArenaAlign - 1u) & ~(kModelArenaAlign - 1u);
     for (cuda_model_arena &a : g_model_arenas) {
         if (span >= a.device_ptr && span + aligned == a.device_ptr + a.used) {
             a.used = (uint64_t)(span - a.device_ptr);
@@ -1126,7 +1129,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 (unsigned long long)bytes, (void *)dev, what ? what : "?");
     cudaError_t err = cudaSuccess;
 
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t chunk = kModelCopyChunkBytes;
     const uint64_t align = model_fd_max_align();
     const uint64_t stage_bytes = chunk + (align > 1 ? align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return unwind();
@@ -1222,7 +1225,7 @@ static int cuda_register_expert_half(const void *key_map, uint64_t key_offset, c
         fprintf(stderr, "pulsar: expert half: no model fd for the stack's mapping -- refusing\n");
         return 0;
     }
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t chunk = kModelCopyChunkBytes;
     uint32_t per = (uint32_t)(chunk / src_stride);
     if (per == 0) per = 1;
     const uint64_t read_bytes = (uint64_t)per * src_stride;
@@ -2995,7 +2998,7 @@ int pulsar_gpu_cache_external_range(const void *host_base_key, int fd,
         return 0;
     }
 
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    const uint64_t chunk = kModelCopyChunkBytes;
     void *stage = NULL;
     err = cudaMallocHost(&stage, (size_t)(bytes < chunk ? bytes : chunk));
     if (err != cudaSuccess) {

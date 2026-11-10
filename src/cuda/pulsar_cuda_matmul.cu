@@ -7,6 +7,8 @@
 #include "pulsar_cuda_mx.cuh"   /* the single source for pulsar_mx_sfoff */
 #include "pulsar_cuda_bf16_rows.cuh"   /* PULSAR_GPU_BATCHED_GEMM_CANON */
 #include "pulsar_cuda_arch.cuh"
+#include "pulsar_cuda_lt_fixed.h"   /* PULSAR_LT_FIXED_WORKSPACE: the one cuBLASLt workspace size */
+#include "pulsar.h"                 /* PULSAR_PREFILL_CHUNK_DEFAULT: the canonical prefill row count */
 
 
 
@@ -2193,7 +2195,7 @@ static int cuda_matmul_fp8_mx_window(pulsar_gpu_tensor *out, const void *model_m
     if (!w) return 0;
     int ntok = (int)n_tok, KBp = mx_rup((int)KB, 4);
     size_t sx_bytes = pulsar_mx_sf_slab_bytes(ntok, KBp);
-    size_t wz = 32u << 20;
+    size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     /* xq, sx and the cuBLASLt workspace must be DISTINCT buffers, but
      * cuda_tmp_alloc hands out one shared scratch region (later calls alias or
      * realloc/free earlier ones), so these three come from one arena. */
@@ -2329,9 +2331,10 @@ static int cuda_matmul_fp8_mx_tensor_labeled(pulsar_gpu_tensor *out, const void 
 
 /* The canonical row count at which a prefill GEMM arm chooses its ONE kernel
  * per shape (the production prefill chunk): the plain-weight arm (L183) and
- * the attn-out 'a' arm (L195) both pin here. */
-/// The canonical row count a prefill cuBLASLt arm chooses its one kernel at.
-#define PULSAR_BF16_LT_CANON_ROWS 4096
+ * the attn-out 'a' arm (L195) both pin here.  It IS the default prefill chunk, read from its one definition (L375:
+ * it was a second 4096). */
+/// The canonical row count a prefill cuBLASLt arm chooses its one kernel at: the default prefill chunk.
+#define PULSAR_BF16_LT_CANON_ROWS ((int)PULSAR_PREFILL_CHUNK_DEFAULT)
 
 /* Prefill attn-output "a" projection as n_groups block-scaled MXFP8xMXFP8 GEMMs.
  *
@@ -2377,7 +2380,7 @@ static int cuda_attention_output_a_mx_gemm(
     size_t x_scale_slab = pulsar_mx_sf_slab_bytes((int)n_tokens, KBp);
     const size_t w_scale_slab = ((size_t)rank / 128) * (size_t)KBp * 128;
     const size_t scale_bytes = (size_t)n_groups * x_scale_slab;
-    size_t wz = 32u << 20;
+    size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     __nv_fp8_e4m3 *xq;
     unsigned char *sx;
     void *ws;
@@ -3438,7 +3441,7 @@ static int bf16_lt_matmul(void *out, const uint16_t *w, const uint16_t *xb, cuda
         fprintf(stderr, "pulsar: bf16 GEMM on prefill rows: cuBLASLt handle not ready -- refusing\n");
         return 0;
     }
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     /* ONE algorithm per weight shape, chosen at the canonical row count. */
     struct bf16_lt_shape {
         uint64_t in_dim, out_dim; int valid;
@@ -3549,7 +3552,7 @@ int pulsar_cuda_vision_gemm(float *c, int ldc, const uint16_t *a, int lda, const
         return 0;
     }
     if (m <= 0 || n <= 0 || k <= 0) return 0;
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     cublasLtMatmulDesc_t op = NULL;
     cublasLtMatrixLayout_t la = NULL, lb = NULL, lc = NULL;
     cublasLtMatmulPreference_t pf = NULL;
@@ -3723,7 +3726,7 @@ static int bf16_lt_decode_matmul(void *out, const uint16_t *w, const uint16_t *x
         fprintf(stderr, "pulsar: bf16 GEMM on decode rows: cuBLASLt handle not ready -- refusing\n");
         return 0;
     }
-    const size_t wz = 32u << 20;
+    const size_t wz = PULSAR_LT_FIXED_WORKSPACE;
     struct bf16_lt_decode_ent {
         uint64_t in_dim, out_dim; int ntok; int valid;
         cublasLtMatmulDesc_t op;
