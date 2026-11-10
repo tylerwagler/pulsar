@@ -4067,6 +4067,307 @@ static void test_tokenizer_refusals(void) {
     free(e);
 }
 
+/* L375 (O51): DeepSeek's BPE merge.  bpe_emit_piece ran the merge rule by rescanning every adjacent pair per merge
+ * (O(n^2) in the piece, and a piece has no length bound); it now runs the same rule off a heap.  The proof that the
+ * rule did not move is this frozen copy of the old loop (the body bpe_emit_piece had before L375, its symbols owned
+ * strings, its byte map and UTF-8 writer copied with it so the reference shares nothing with the engine but the
+ * vocabulary's two tables), run beside the engine's on the same pieces. */
+static void bpe_ref_utf8_put(char **p, uint32_t cp) {
+    if (cp <= 0x7f) {
+        *(*p)++ = (char)cp;
+    } else if (cp <= 0x7ff) {
+        *(*p)++ = (char)(0xc0 | (cp >> 6));
+        *(*p)++ = (char)(0x80 | (cp & 0x3f));
+    } else {
+        *(*p)++ = (char)(0xe0 | (cp >> 12));
+        *(*p)++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+        *(*p)++ = (char)(0x80 | (cp & 0x3f));
+    }
+}
+
+static uint32_t bpe_ref_byte_to_codepoint(uint8_t b) {
+    if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174)) return b;
+    uint32_t n = 0;
+    for (uint32_t x = 0; x < 256; x++) {
+        if ((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174)) continue;
+        if (x == b) return 256 + n;
+        n++;
+    }
+    return b;
+}
+
+typedef struct {
+    char *ptr;
+    uint64_t len;
+} bpe_ref_str;
+
+static void bpe_ref_emit_piece(const pulsar_vocab *vocab, pulsar_str raw_piece, token_vec *out) {
+    char *encoded = (char *)xmalloc((size_t)raw_piece.len * 4 + 1);
+    char *ep = encoded;
+    for (uint64_t i = 0; i < raw_piece.len; i++) bpe_ref_utf8_put(&ep, bpe_ref_byte_to_codepoint((uint8_t)raw_piece.ptr[i]));
+    *ep = '\0';
+    const uint64_t encoded_len = (uint64_t)(ep - encoded);
+
+    int n_sym = 0;
+    int cap_sym = 32;
+    bpe_ref_str *sym = (bpe_ref_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
+
+    for (uint64_t off = 0; off < encoded_len;) {
+        int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
+        if (n == 0) n = 1;
+        if (n_sym == cap_sym) {
+            cap_sym *= 2;
+            sym = (bpe_ref_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+        }
+        sym[n_sym].ptr = (char *)xmalloc((size_t)n);
+        memcpy(sym[n_sym].ptr, encoded + off, (size_t)n);
+        sym[n_sym++].len = (uint64_t)n;
+        off += (uint64_t)n;
+    }
+
+    for (;;) {
+        int best_i = -1;
+        int best_rank = INT32_MAX;
+
+        for (int i = 0; i + 1 < n_sym; i++) {
+            int rank = vocab->bpe_rank({ sym[i].ptr, sym[i].len }, { sym[i + 1].ptr, sym[i + 1].len });
+            if (rank >= 0 && rank < best_rank) {
+                best_rank = rank;
+                best_i = i;
+            }
+        }
+
+        if (best_i < 0) break;
+
+        bpe_ref_str merged;
+        merged.len = sym[best_i].len + sym[best_i + 1].len;
+        merged.ptr = (char *)xmalloc((size_t)merged.len);
+        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
+        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
+
+        free(sym[best_i].ptr);
+        free(sym[best_i + 1].ptr);
+        sym[best_i] = merged;
+
+        for (int j = best_i + 1; j + 1 < n_sym; j++) {
+            sym[j] = sym[j + 1];
+        }
+        n_sym--;
+    }
+
+    for (int i = 0; i < n_sym; i++) {
+        const std::string whole(sym[i].ptr, (size_t)sym[i].len);   /* the encoding has no NUL: byte 0 maps to U+0100 */
+        int token = vocab->vocab_find(whole.c_str());
+        if (token >= 0) {
+            token_vec_push(out, token);
+        } else {
+            for (uint64_t j = 0; j < sym[i].len; j++) {
+                const char one[2] = { sym[i].ptr[j], '\0' };
+                token = vocab->vocab_find(one);
+                if (token >= 0) token_vec_push(out, token);
+            }
+        }
+        free(sym[i].ptr);
+    }
+
+    free(sym);
+    free(encoded);
+}
+
+/** One piece through both merges: false (and the piece named) when the ids differ. */
+static bool bpe_merge_same(const pulsar_vocab *v, const char *what, const std::string &piece, uint64_t *n_tokens) {
+    token_vec got = {0}, want = {0};
+    v->bpe_emit_piece({ piece.data(), piece.size() }, &got);
+    bpe_ref_emit_piece(v, { piece.data(), piece.size() }, &want);
+    const bool same = got.len == want.len && (got.len == 0 || !memcmp(got.v, want.v, (size_t)got.len * sizeof(got.v[0])));
+    if (!same) {
+        fprintf(stderr, "bpe-merge: %s: a %zu-byte piece tokenizes to %d ids, the old merge loop's %d: \"", what,
+                piece.size(), got.len, want.len);
+        pulsar_dump_piece_quoted(stderr, piece.data(), piece.size() < 120 ? piece.size() : 120);
+        fprintf(stderr, "\"\n");
+    }
+    *n_tokens += (uint64_t)got.len;
+    token_vec_free(&got);
+    token_vec_free(&want);
+    return same;
+}
+
+static double bpe_test_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+/* Host: the DeepSeek container's vocabulary and merge table (PULSAR_TEST_DS4_TOKENIZER, the container the engine
+ * would load -- only its metadata is read). */
+static void test_bpe_merge(void) {
+    const char *path = getenv("PULSAR_TEST_DS4_TOKENIZER");
+    if (!path || !path[0]) {
+        fprintf(stderr, "bpe-merge: PULSAR_TEST_DS4_TOKENIZER is not set (the DeepSeek container whose merge table "
+                        "the test reads)\n");
+        TEST_ASSERT(path && path[0]);
+        return;
+    }
+    pulsar_model model;
+    const bool opened = model_open(&model, path, false);
+    TEST_ASSERT(opened);
+    if (!opened) {
+        model_close(&model);
+        return;
+    }
+    pulsar_vocab v;
+    v.vocab_load(&model);
+
+    uint64_t n_tokens = 0;
+    /* (a) the repo's text fixtures, each cut three ways: at whitespace (a word with the whitespace before it), by
+     * line, and in fixed 1500-byte chunks -- the pre-tokenizer's pieces are a fourth cut of the same bytes, and the
+     * merge is a function of the piece alone */
+    static const char *const corpora[] = {
+        "tests/teacher_forced_corpus.txt", "tests/long_context_story_prompt.txt", "tests/api-golden/corpus.jsonl",
+        "tests/test-vectors/kl-budget-code.txt", "tests/test-vectors/kl-budget-story.txt",
+        "tests/test-vectors/render-bytes-3ed8f4b7.txt", "tests/test-vectors/prompts/long_code_audit.txt",
+        "tests/test-vectors/prompts/long_memory_archive.txt", "tests/test-vectors/prompts/short_italian_fact.txt",
+        "tests/test-vectors/prompts/short_code_completion.txt", "tests/test-vectors/prompts/short_reasoning_plain.txt",
+    };
+    uint64_t n_corpus = 0, bad = 0;
+    for (const char *file : corpora) {
+        std::string text;
+        FILE *f = fopen(file, "rb");
+        TEST_ASSERT(f != NULL);
+        if (!f) {
+            fprintf(stderr, "bpe-merge: %s: %s (run from the engine root)\n", file, strerror(errno));
+            continue;
+        }
+        char b[65536];
+        size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) text.append(b, n);
+        fclose(f);
+        for (size_t at = 0; at < text.size();) {   /* words */
+            size_t end = at;
+            while (end < text.size() && isspace((unsigned char)text[end])) end++;
+            while (end < text.size() && !isspace((unsigned char)text[end])) end++;
+            bad += !bpe_merge_same(&v, file, text.substr(at, end - at), &n_tokens);
+            n_corpus++;
+            at = end;
+        }
+        for (size_t at = 0; at < text.size();) {   /* lines, the newline with its line */
+            size_t end = text.find('\n', at);
+            end = end == std::string::npos ? text.size() : end + 1;
+            bad += !bpe_merge_same(&v, file, text.substr(at, end - at), &n_tokens);
+            n_corpus++;
+            at = end;
+        }
+        for (size_t at = 0; at < text.size(); at += 1500) {   /* chunks: a cut may fall inside a UTF-8 sequence */
+            bad += !bpe_merge_same(&v, file, text.substr(at, 1500), &n_tokens);
+            n_corpus++;
+        }
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* (b) randomized pieces built from the vocabulary's own tokens (their raw bytes), so merges chain and overlap:
+     * plain concatenations, one token repeated, two alternated, a token's bytes doubled unit by unit, and runs of
+     * one character of several scripts spliced between tokens.  A fixed seed: the same pieces every run. */
+    uint64_t rng = 0x4c333735ull;
+    auto next = [&rng]() {
+        rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)(rng >> 33);
+    };
+    auto token_bytes = [&](std::string *to) {
+        size_t len = 0;
+        char *t = vocab_token_text(&v, (int)(next() % (uint32_t)v.n_vocab), &len);
+        if (t) to->append(t, len);
+        free(t);
+    };
+    static const char *const runs[] = { "a", "e", " ", "\n", "=", "-", "0", ".", "\xc3\xa9", "\xe4\xb8\xad",
+                                        "\xd0\xb6", "\xe3\x81\x82", "\xf0\x9f\x98\x80", "\xff", "ab", "aab", "\t" };
+    const uint32_t n_runs = (uint32_t)(sizeof(runs) / sizeof(runs[0]));
+    const uint32_t n_random = 12000;
+    uint32_t longest = 0;
+    bad = 0;
+    for (uint32_t i = 0; i < n_random; i++) {
+        std::string piece;
+        const uint32_t shape = i % 6u;
+        if (shape == 0) {                                   /* 1..12 tokens */
+            for (uint32_t k = 1 + next() % 12u; k > 0; k--) token_bytes(&piece);
+        } else if (shape == 1) {                            /* one token, 2..40 times */
+            std::string t;
+            token_bytes(&t);
+            for (uint32_t k = 2 + next() % 39u; k > 0; k--) piece += t;
+        } else if (shape == 2) {                            /* two tokens alternated */
+            std::string t, u;
+            token_bytes(&t);
+            token_bytes(&u);
+            for (uint32_t k = 2 + next() % 20u; k > 0; k--) piece += (k & 1u) ? t : u;
+        } else if (shape == 3) {                            /* a long run of one character: 1..2000 units */
+            const char *r = runs[next() % n_runs];
+            for (uint32_t k = 1 + next() % ((i % 60u == 3u) ? 2000u : 200u); k > 0; k--) piece += r;
+        } else if (shape == 4) {                            /* mixed scripts: runs spliced between tokens */
+            for (uint32_t k = 2 + next() % 6u; k > 0; k--) {
+                token_bytes(&piece);
+                const char *r = runs[next() % n_runs];
+                for (uint32_t j = next() % 9u; j > 0; j--) piece += r;
+            }
+        } else {                                            /* overlaps: every byte of a few tokens doubled or tripled */
+            std::string t;
+            for (uint32_t k = 1 + next() % 4u; k > 0; k--) token_bytes(&t);
+            const uint32_t times = 2u + next() % 2u;
+            for (char c : t) piece.append(times, c);
+        }
+        if (piece.size() > longest) longest = (uint32_t)piece.size();
+        bad += !bpe_merge_same(&v, "random", piece, &n_tokens);
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* (c) every length 1..64 of each repeated character or unit */
+    uint32_t n_lengths = 0;
+    bad = 0;
+    for (const char *r : runs) {
+        std::string piece;
+        for (uint32_t len = 1; len <= 64u; len++) {
+            piece += r;
+            bad += !bpe_merge_same(&v, "repeat", piece, &n_tokens);
+            n_lengths++;
+        }
+    }
+    TEST_ASSERT(bad == 0);
+
+    /* the bound: one 200,000-character run is one piece (the pre-tokenizer's letter rule), and it tokenizes in well
+     * under a second; the old loop's cost at a tenth of that, for the log */
+    const std::string run(200000u, 'a');
+    token_vec out = {0};
+    double t0 = bpe_test_seconds();
+    v.bpe_tokenize_text(run.c_str(), &out);
+    const double run_s = bpe_test_seconds() - t0;
+    TEST_ASSERT(out.len > 0 && run_s < 0.5);
+    size_t back = 0;
+    for (int i = 0; i < out.len; i++) {
+        size_t len = 0;
+        free(vocab_token_text(&v, out.v[i], &len));
+        back += len;
+    }
+    TEST_ASSERT(back == run.size());
+    std::string mixed;
+    for (uint32_t i = 0; i < 200000u; i++) mixed += (char)('a' + next() % 26u);
+    token_vec out_mixed = {0};
+    t0 = bpe_test_seconds();
+    v.bpe_tokenize_text(mixed.c_str(), &out_mixed);
+    const double mixed_s = bpe_test_seconds() - t0;
+    TEST_ASSERT(out_mixed.len > 0 && mixed_s < 0.5);
+    token_vec ref = {0};
+    t0 = bpe_test_seconds();
+    bpe_ref_emit_piece(&v, { run.data(), 20000u }, &ref);
+    const double ref_s = bpe_test_seconds() - t0;
+    printf("bpe-merge: %" PRIu64 " corpus pieces, %u randomized (the longest %u bytes), %u repeat lengths: "
+           "%" PRIu64 " ids identical to the old merge loop's; a 200000-character run %.3f s (%d ids), 200000 random "
+           "letters %.3f s (%d ids); the old loop on a 20000-character run %.3f s\n",
+           n_corpus, n_random, longest, n_lengths, n_tokens, run_s, out.len, mixed_s, out_mixed.len, ref_s);
+    token_vec_free(&out);
+    token_vec_free(&out_mixed);
+    token_vec_free(&ref);
+    v.vocab_free();
+    model_close(&model);
+}
+
 /* L335: the library's say-once table (family.cpp pulsar_refusal_first) -- an op is said the first time only; past
  * PULSAR_REFUSAL_OPS_MAX ops every refusal is said (the table never silently drops one), and that fact once. */
 static void test_refusal_once(void) {
@@ -5350,6 +5651,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
+    {"--bpe-merge", "bpe-merge", "DeepSeek's BPE merge off a heap: the ids of the old rescanning loop on the text fixtures, randomized vocabulary pieces and every short repeat; a 200k-character run in well under a second (L375)", test_bpe_merge},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},
@@ -5386,6 +5688,7 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  PULSAR_TEST_MODEL=PATH        Checkpoint path (a shard directory or a");
     puts("                                single file). Default: model.safetensors");
+    puts("  PULSAR_TEST_DS4_TOKENIZER=PATH  The DeepSeek checkpoint whose vocabulary --bpe-merge reads.");
     puts("  PULSAR_TEST_VECTOR_FILE=FILE  Simple official-vector fixture.");
     puts("  PULSAR_TEST_MPP_EQ_CASE=NAME  Run only Tensor equivalence cases whose id contains NAME.");
 }

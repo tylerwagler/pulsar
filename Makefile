@@ -2446,8 +2446,10 @@ cuda-runner-gate: tests/gates_runner
 # served Qwen while the image tests ran only on DeepSeek, which is smoke-only since 2026-11-07.  --gating runs the image
 # tests (--image-chain among them), so they need no target of their own.  PULSAR_TEST_QWEN_TOKENIZER names the same
 # checkpoint for the server unit tests' host-side tokenizer (src/server/server_tests.cpp reads it on its own).
+# L375: PULSAR_TEST_DS4_TOKENIZER names the DeepSeek container (FRONTIER_MODEL) for --bpe-merge, which reads only its
+# vocabulary and merge table (host; the weights are mapped, never read).
 unit-test-gate: pulsar_test
-	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
+	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" PULSAR_TEST_DS4_TOKENIZER="$(FRONTIER_MODEL)" ./pulsar_test --gating
 
 # The AGENT's host-only unit suite (the DSML parser/detector over every syntax
 # row, the edit anchors, and the KV store's stripped-checkpoint refusal).  It is
@@ -3513,7 +3515,7 @@ tp-dmabuf-probe: tests/tp_dmabuf_probe
 	@echo "built tests/tp_dmabuf_probe; run on the pair (GDR negative on GB10/610)"
 
 test: pulsar_test seam-check
-	PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test
+	PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" PULSAR_TEST_DS4_TOKENIZER="$(FRONTIER_MODEL)" ./pulsar_test
 
 clean:
 	rm -rf .build

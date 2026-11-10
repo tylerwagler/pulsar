@@ -3,7 +3,9 @@
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
 #include "gemma4_chat.h"
+#include <algorithm>
 #include <string>
+#include <vector>
 
 
 
@@ -235,28 +237,16 @@ static uint32_t utf8_decode_at(const char *s, uint64_t len, uint64_t pos, uint64
 
 
 
-/** A heap copy of [ptr, ptr + len) (not NUL-terminated).  @param ptr the bytes  @param len their count
- *  @return the copy (its ptr xmalloc'd; the owner frees it) */
-static owned_str owned_copy(const char *ptr, uint64_t len) {
-    owned_str s;
-    s.ptr = (char *)xmalloc((size_t)len);
-    memcpy(s.ptr, ptr, (size_t)len);
-    s.len = len;
-    return s;
-}
-
-
-
 /* Look up the merge rank for two adjacent BPE symbols. */
-int pulsar_vocab::bpe_rank(const owned_str *a, const owned_str *b) const {
+int pulsar_vocab::bpe_rank(pulsar_str a, pulsar_str b) const {
     const auto *vocab = this;
-    uint64_t len = a->len + 1 + b->len;
+    uint64_t len = a.len + 1 + b.len;
     char stack[512];
     char *buf = len <= sizeof(stack) ? stack : (char *)xmalloc((size_t)len);
 
-    memcpy(buf, a->ptr, (size_t)a->len);
-    buf[a->len] = ' ';
-    memcpy(buf + a->len + 1, b->ptr, (size_t)b->len);
+    memcpy(buf, a.ptr, (size_t)a.len);
+    buf[a.len] = ' ';
+    memcpy(buf + a.len + 1, b.ptr, (size_t)b.len);
 
     int rank = -1;
     table_get(&vocab->merge_rank, buf, len, &rank);
@@ -267,72 +257,105 @@ int pulsar_vocab::bpe_rank(const owned_str *a, const owned_str *b) const {
 
 
 
-/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
+/** One BPE symbol of a piece: a byte range of the encoded piece and its neighbours in the piece's order.  A merge
+ *  grows the left symbol over the right one and unlinks the right one, so a symbol's index is its first unit's
+ *  and the indices of the live symbols rise along the piece. */
+struct bpe_symbol {
+    uint64_t off;    ///< its first byte in the encoded piece
+    uint64_t len;    ///< its bytes; grows when it absorbs its right neighbour
+    size_t prev;     ///< the live symbol before it, BPE_NO_SYMBOL at the front
+    size_t next;     ///< the live symbol after it, BPE_NO_SYMBOL at the back
+    bool live;       ///< false once a merge folded it into its left neighbour
+};
+
+/** A mergeable adjacent pair as it stood when it was queued.  A symbol only grows or dies, so the pair still
+ *  stands exactly when both lengths still match and the two are still neighbours. */
+struct bpe_candidate {
+    int rank;            ///< the pair's merge rank (>= 0)
+    size_t left;         ///< the left symbol
+    size_t right;        ///< the right symbol
+    uint64_t left_len;   ///< the left symbol's length when queued
+    uint64_t right_len;  ///< the right symbol's length when queued
+};
+
+/** No symbol: the list's ends. */
+static const size_t BPE_NO_SYMBOL = SIZE_MAX;
+
+/** The merge order: the lowest rank first, and among equal ranks the leftmost pair (the heap's top is the
+ *  candidate nothing orders before).  @param a a candidate  @param b another
+ *  @return true when b merges before a */
+static bool bpe_candidate_after(const bpe_candidate &a, const bpe_candidate &b) {
+    return a.rank != b.rank ? a.rank > b.rank : a.left > b.left;
+}
+
+
+
+/* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids.
+ *
+ * The merge rule: of every adjacent pair the merge table ranks, merge the ONE of lowest rank, the leftmost
+ * among equals; repeat until no pair is ranked.  (One occurrence a step, not every occurrence of the pair:
+ * "aaa" merges its first two units and the new pair is ranked afresh.)  The rule is run off a heap of the
+ * ranked pairs over a linked list of symbols, O(n log n) in the piece's units -- a rescan of every pair each
+ * merge is the same rule at O(n^2), and a piece has no length bound (L375 O51).  A merge queues the two pairs
+ * it creates; the pairs it destroys stay queued and are dropped when they surface (bpe_candidate). */
 void pulsar_vocab::bpe_emit_piece(pulsar_str raw_piece, token_vec *out) const {
     const auto *vocab = this;
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = (owned_str *)xcalloc((size_t)cap_sym, sizeof(sym[0]));
-
+    std::vector<bpe_symbol> sym;
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_seq_ok((const unsigned char *)encoded + off, (size_t)(encoded_len - off));
         if (n == 0) n = 1;
-        if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = (owned_str *)xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
-        }
-        sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
+        const size_t i = sym.size();
+        sym.push_back({ off, (uint64_t)n, i ? i - 1 : BPE_NO_SYMBOL, BPE_NO_SYMBOL, true });
+        if (i) sym[i - 1].next = i;
         off += (uint64_t)n;
     }
 
-    for (;;) {
-        int best_i = -1;
-        int best_rank = INT32_MAX;
+    std::vector<bpe_candidate> heap;
+    /* queue the pair (l, its right neighbour) when the merge table ranks it */
+    auto queue_pair = [&](size_t l) {
+        const size_t r = sym[l].next;
+        if (r == BPE_NO_SYMBOL) return;
+        const int rank = vocab->bpe_rank({ encoded + sym[l].off, sym[l].len }, { encoded + sym[r].off, sym[r].len });
+        if (rank < 0) return;
+        heap.push_back({ rank, l, r, sym[l].len, sym[r].len });
+        std::push_heap(heap.begin(), heap.end(), bpe_candidate_after);
+    };
+    for (size_t i = 0; i < sym.size(); i++) queue_pair(i);
 
-        for (int i = 0; i + 1 < n_sym; i++) {
-            int rank = vocab->bpe_rank(&sym[i], &sym[i + 1]);
-            if (rank >= 0 && rank < best_rank) {
-                best_rank = rank;
-                best_i = i;
-            }
-        }
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), bpe_candidate_after);
+        const bpe_candidate c = heap.back();
+        heap.pop_back();
+        bpe_symbol &l = sym[c.left];
+        const bpe_symbol &r = sym[c.right];
+        if (!l.live || l.next != c.right || l.len != c.left_len || r.len != c.right_len) continue;
 
-        if (best_i < 0) break;
-
-        owned_str merged;
-        merged.len = sym[best_i].len + sym[best_i + 1].len;
-        merged.ptr = (char *)xmalloc((size_t)merged.len);
-        memcpy(merged.ptr, sym[best_i].ptr, (size_t)sym[best_i].len);
-        memcpy(merged.ptr + sym[best_i].len, sym[best_i + 1].ptr, (size_t)sym[best_i + 1].len);
-
-        free(sym[best_i].ptr);
-        free(sym[best_i + 1].ptr);
-        sym[best_i] = merged;
-
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
-            sym[j] = sym[j + 1];
-        }
-        n_sym--;
+        /* the right symbol's bytes follow the left's in the encoded piece: the merged symbol is the range */
+        l.len += r.len;
+        l.next = r.next;
+        if (r.next != BPE_NO_SYMBOL) sym[r.next].prev = c.left;
+        sym[c.right].live = false;
+        if (l.prev != BPE_NO_SYMBOL) queue_pair(l.prev);
+        queue_pair(c.left);
     }
 
-    for (int i = 0; i < n_sym; i++) {
+    for (size_t i = sym.empty() ? BPE_NO_SYMBOL : 0; i != BPE_NO_SYMBOL; i = sym[i].next) {
+        const char *ptr = encoded + sym[i].off;
         int token = -1;
-        if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
+        if (table_get(&vocab->token_to_id, ptr, sym[i].len, &token)) {
             token_vec_push(out, token);
         } else {
             for (uint64_t j = 0; j < sym[i].len; j++) {
-                if (table_get(&vocab->token_to_id, sym[i].ptr + j, 1, &token)) {
+                if (table_get(&vocab->token_to_id, ptr + j, 1, &token)) {
                     token_vec_push(out, token);
                 }
             }
         }
-        free(sym[i].ptr);
     }
 
-    free(sym);
     free(encoded);
 }
 
