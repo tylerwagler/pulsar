@@ -2311,9 +2311,37 @@ static void test_l334_bank_pos_and_adopt_result(void) {
     TEST_ASSERT(q.status == PULSAR_ADOPT_REFUSED && q.at.is_none() && err[0] != '\0');
 }
 
+/* L372 (O7): a job's hooks are on the shared session for the length of one sync and no longer -- so the judge's
+ * prefill, the terminal checkpoint and a finishing job's own syncs never run another job's cancel or progress.  A bare
+ * session: the setters only write its fields (here, not in server_tests.cpp: the session's layout is the engine's). */
+static void test_l372_sync_hooks_last_one_sync(void) {
+    pulsar_session *sess = (pulsar_session *)calloc(1, sizeof(pulsar_session));
+    TEST_ASSERT(sess != NULL);
+    if (!sess) return;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    {
+        const sync_hooks hooks(sess, gen_prefill_progress_cb, &g, server_progress_cb, &g.progress,
+                               gen_prefill_cancel_cb, &g);
+        TEST_ASSERT(sess->progress == gen_prefill_progress_cb && sess->progress_ud == &g);
+        TEST_ASSERT(sess->display_progress == server_progress_cb && sess->display_progress_ud == &g.progress);
+        TEST_ASSERT(sess->cancel == gen_prefill_cancel_cb && sess->cancel_ud == &g);
+    }
+    TEST_ASSERT(sess->progress == NULL && sess->progress_ud == NULL);
+    TEST_ASSERT(sess->display_progress == NULL && sess->display_progress_ud == NULL);
+    TEST_ASSERT(sess->cancel == NULL && sess->cancel_ud == NULL);
+    {   /* a sync with no cancel (the canonical rewrite's) arms none -- and inherits none */
+        const sync_hooks hooks(sess, server_progress_cb, &g.progress, server_progress_cb, &g.progress, NULL, NULL);
+        TEST_ASSERT(sess->progress == server_progress_cb && sess->cancel == NULL);
+    }
+    TEST_ASSERT(sess->progress == NULL && sess->display_progress == NULL);
+    free(sess);
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
     test_l334_bank_pos_and_adopt_result();
+    test_l372_sync_hooks_last_one_sync();
 }
 
 /* L325: a render case's protocol ("_api": "openai" | "anthropic" | "responses" (L326), default openai) and family

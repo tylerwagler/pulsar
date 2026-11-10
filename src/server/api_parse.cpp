@@ -7,39 +7,139 @@
 
 
 /* The set of ignored top-level keys already named in the log.  Keys are client
- * input, so the set is bounded: past the cap, further new keys are not
- * tracked, and that is said once. */
+ * input, so the set is bounded -- in entries and in bytes: past either, further
+ * new keys are not tracked, and that is said once.  L372: a pair is its whole
+ * "endpoint/key" (it was cut at 160 bytes, so two long keys with one head were
+ * one entry and the second was never named). */
 /// The most (endpoint, key) pairs api_key_first_seen tracks; past it new keys are not named (said once).
 #define API_SEEN_KEYS_MAX 256
+/// The most bytes of "endpoint/key" names the set holds; a pair that would pass it is not tracked (said once).
+#define API_SEEN_BYTES_MAX (64u * 1024u)
 /// Guards the ignored-key set below (the parsers run on client threads).
 static pthread_mutex_t api_seen_mu = PTHREAD_MUTEX_INITIALIZER;
 /// The "endpoint/key" names already logged, heap strings, never freed (process lifetime).
 static char *api_seen_keys[API_SEEN_KEYS_MAX];
 /// Entries used in api_seen_keys.
 static int api_seen_n = 0;
+/// Bytes of the names in api_seen_keys.
+static size_t api_seen_bytes = 0;
 /// The set-is-full line was said.
 static bool api_seen_full_warned = false;
 
 bool api_key_first_seen(const char *api, const char *key) {
-    char name[160];
-    snprintf(name, sizeof(name), "%s/%s", api, key);
+    const size_t la = strlen(api), lk = strlen(key);
     bool first = false;
     pthread_mutex_lock(&api_seen_mu);
     int i = 0;
-    while (i < api_seen_n && strcmp(api_seen_keys[i], name)) i++;
+    for (; i < api_seen_n; i++) {
+        const char *e = api_seen_keys[i];
+        if (!strncmp(e, api, la) && e[la] == '/' && !strcmp(e + la + 1, key)) break;
+    }
     if (i == api_seen_n) {
-        if (api_seen_n < API_SEEN_KEYS_MAX) {
-            api_seen_keys[api_seen_n++] = server_xstrdup(name);
+        const size_t bytes = la + 1 + lk;
+        if (api_seen_n < API_SEEN_KEYS_MAX && bytes <= API_SEEN_BYTES_MAX - api_seen_bytes) {
+            char *name = (char *)server_xmalloc(bytes + 1);
+            memcpy(name, api, la);
+            name[la] = '/';
+            memcpy(name + la + 1, key, lk + 1);
+            api_seen_keys[api_seen_n++] = name;
+            api_seen_bytes += bytes;
             first = true;
         } else if (!api_seen_full_warned) {
             api_seen_full_warned = true;
             server_log(PULSAR_LOG_WARNING,
-                       "ignored-key log is full (%d keys); further new keys are not named",
-                       API_SEEN_KEYS_MAX);
+                       "pulsar-server: ignored-key log is full (%d keys, %zu bytes; at most %d and %u); further new "
+                       "keys are not named", api_seen_n, api_seen_bytes, API_SEEN_KEYS_MAX, API_SEEN_BYTES_MAX);
         }
     }
     pthread_mutex_unlock(&api_seen_mu);
     return first;
+}
+
+/* L372: a request body is UTF-8 (RFC 8259), and the server holds it to that at the parse.  The JSON reader copies a
+ * string's raw bytes through unchecked (it repairs only a lone \\u escape), so an ill-formed byte in a message reached
+ * the tokenizer: the BPE families refuse the text and yield no tokens, the parse still returned true, the context
+ * check passed a prompt of length 0, and the engine's sync refused it at prefill -- HTTP 500 for a client's mistake.
+ * One check for every surface and every string of it (messages, system, tool results, tool definitions, a raw
+ * prompt), by the engine's one well-formedness rule (utf8_seq_ok); every family alike, DeepSeek's byte-level
+ * tokenizer included (it would take the bytes: one answer for one body, whatever is loaded).  Once the body's bytes
+ * are well-formed, so is every string read from it: an escape decodes to a scalar value or U+FFFD. */
+
+/// Append the path of the value holding byte `bad` to `path`, walking the JSON value at `*p` with the server's own
+/// reader (stops where the body stops being JSON: the path so far stands).
+/// @param p     the value's first byte (leading whitespace allowed)
+/// @param bad   the byte looked for
+/// @param path  receives the path ("messages[2].content")
+static void body_path_of(const char *p, const char *bad, std::string *path) {
+    json_ws(&p);
+    if (*p == '{') {
+        p++;
+        for (;;) {
+            json_ws(&p);
+            if (*p != '"') return;
+            const char *kstart = p;
+            char *key = NULL;
+            if (!json_string(&p, &key)) return;
+            const std::string name = key;
+            free(key);
+            if (bad >= kstart && bad < p) {
+                path->append(path->empty() ? "a key" : " (a key of it)");
+                return;
+            }
+            json_ws(&p);
+            if (*p != ':') return;
+            p++;
+            json_ws(&p);
+            const char *end = p;
+            if (!json_skip_value(&end) || bad < end) {
+                if (!path->empty()) path->push_back('.');
+                path->append(name);
+                body_path_of(p, bad, path);
+                return;
+            }
+            p = end;
+            json_ws(&p);
+            if (*p != ',') return;
+            p++;
+        }
+    }
+    if (*p == '[') {
+        p++;
+        for (int i = 0;; i++) {
+            json_ws(&p);
+            const char *end = p;
+            if (!json_skip_value(&end) || bad < end) {
+                path->append("[" + std::to_string(i) + "]");
+                body_path_of(p, bad, path);
+                return;
+            }
+            p = end;
+            json_ws(&p);
+            if (*p != ',') return;
+            p++;
+        }
+    }
+}
+
+bool request_body_utf8_ok(const char *body, size_t len, char *err, size_t errlen) {
+    const unsigned char *u = (const unsigned char *)body;
+    size_t i = 0;
+    while (i < len) {
+        const int k = utf8_seq_ok(u + i, len - i);
+        if (k == 0) break;
+        i += (size_t)k;
+    }
+    if (i == len) return true;
+    std::string path;
+    body_path_of(body, body + i, &path);
+    /* the path is client text: only printable ASCII of it reaches the message */
+    for (char &c : path)
+        if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7f) c = '?';
+    if (path.size() > 200) path.resize(200);
+    if (err && errlen)
+        snprintf(err, errlen, "%s%snot valid UTF-8 (byte %zu of the request body)", path.c_str(),
+                 path.empty() ? "the request body is " : " is ", i);
+    return false;
 }
 
 /* The default arm of every top-level body parser: skip the value, and name the
@@ -60,7 +160,7 @@ static bool skip_ignored_key(const char *api, const char *key, const char **p) {
         }
         shown[n] = '\0';
         server_log(PULSAR_LOG_WARNING,
-                   "%s: ignoring request key \"%s\"%s (named once per process)",
+                   "pulsar-server: %s: ignoring request key \"%s\"%s (named once per process)",
                    api, shown, key[n] ? "..." : "");
     }
     return json_skip_value(p);
@@ -322,6 +422,7 @@ static bool parse_openai_tool_choice(const char **p, chat_conversation *c, reque
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err,
                                     size_t errlen) {
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_messages = false;
     bool got_top_logprobs = false;
@@ -492,6 +593,7 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
                                        size_t errlen) {
     r->api = API_ANTHROPIC;
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_messages = false;
     int skr = 0;
@@ -1513,6 +1615,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
                                        size_t errlen) {
     r->api = API_RESPONSES;
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_input = false;
     int skr = 0;
@@ -1769,6 +1872,10 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     request_init(r, REQ_COMPLETION, def_tokens);
     r->family = e ? server_family_for_engine(e) : NULL;   /* L335: no engine, no family (never DeepSeek's) */
     if (errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) {   /* L372 */
+        request_free(r);
+        return false;
+    }
     const char *p = body;
     char *prompt = NULL;
     int skr = 0;

@@ -1309,6 +1309,23 @@ typedef enum {
 } kv_persist_trigger;
 /// The triggers' log words, by kv_persist_trigger
 extern const char *const kv_persist_trigger_names[KV_PERSIST_TRIGGERS];
+/** L372: the rule by which a persist wrote nothing ON PURPOSE (server::kv_cache_persist's early returns) -- not a
+ *  loss: a caller that names what became of the history (an eviction's line) says the rule instead of warning. */
+typedef enum {
+    KV_PERSIST_RULE_NONE,       ///< no rule applied: the persist ran (or was short of memory or room)
+    KV_PERSIST_RULE_READ_ONLY,  ///< the bank's history is read-only (X-Pulsar-KV)
+    KV_PERSIST_RULE_MIRRORED,   ///< inside a mirrored sync (a TP group's workers read chunk verdicts only)
+    KV_PERSIST_RULE_DEAD,       ///< a dead prefix, or a compaction request's prompt (server_hint_persist_skips)
+    KV_PERSIST_RULES            ///< count
+} kv_persist_rule;
+/// The rules' log words, by kv_persist_rule ("" for KV_PERSIST_RULE_NONE)
+extern const char *const kv_persist_rule_names[KV_PERSIST_RULES];
+/** L372: what an eviction's log line says of its disk snapshot.
+ *  @param stored  the store holds a chain of the history
+ *  @param rule    the rule its persist stopped on
+ *  @param word    receives the word: "disk", "none (<rule>)" or "none" (room for 40 bytes)
+ *  @return true when a store was expected and nothing was written (the caller warns) */
+bool server_evict_snapshot_word(bool stored, kv_persist_rule rule, char word[40]);
 /** L347 I2: what a persist for `t` writes (PULSAR_KVCHAIN_TAIL / _RP / _ANCHOR; rows up to the deepest grid point and
  *  the periodic restore points always).  Restore points are written where a restore starts: at the chain's end when
  *  the history is about to be lost (evict, spill, abandon, shutdown) and at an anchor -- never on the request path of
@@ -2067,7 +2084,9 @@ typedef struct session_slot {
      * bound here; L330: the next job bound to it re-backs it empty
      * (server::bank_unspill) and restores the chain a slice per worker turn
      * before it resolves. Distinct from SLOT_EVICTED (which frees the bank for a
-     * DIFFERENT conversation). */
+     * DIFFERENT conversation).  L372: also set for a preempted bank whose readmission
+     * could not re-back it (server::worker_readmit_preempted) -- no chain was written
+     * for it, the flag is what gets it re-backed empty. */
     bool         spilled;
     /** L311: the slot's last turn finished with decode rows past its prefill: when the worker is idle, its bank's
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
@@ -2503,6 +2522,11 @@ struct server {
     int m_slot_depth[PULSAR_SESSION_POOL_CAP];  ///< L112: adaptive draft depth per slot (0 = n/a)
     int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  ///< tokens synced so far
     int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP];  ///< prefill target, 0 if not prefilling
+    /** L372: what the stall dump names of a slot beside the fields above -- its bank and whether it is guard-spilled
+     *  or parked (preempted).  The dump runs on the watchdog thread and read these from the worker's own slots. */
+    int m_slot_bank[PULSAR_SESSION_POOL_CAP];
+    bool m_slot_spilled[PULSAR_SESSION_POOL_CAP];    ///< session_slot::spilled, as published
+    bool m_slot_preempted[PULSAR_SESSION_POOL_CAP];  ///< session_slot::preempted, as published
     pulsar_spec_metrics m_spec;  ///< engine spec-decode counters
     /* Request-latency histograms. req_timings is already computed for every
      * request (generate_job_end) and was previously only serialized into the
@@ -2714,7 +2738,9 @@ struct server {
     /// @param no_room    L347: receives whether the history is NOT stored -- no host pool room for a copy-out, the
     ///                   memory floor skipped the persist, or the persist failed (a spill that sees it keeps its bank);
     ///                   may be NULL
-    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr);
+    /// @param by_rule    L372: receives the rule the persist wrote nothing by (KV_PERSIST_RULE_NONE: none); may be NULL
+    int kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end = nullptr, bool *no_room = nullptr,
+                         kv_persist_rule *by_rule = nullptr);
     /** L347: what a persist for `why` writes: kv_persist_writes, less the chain end's restore point when kv_rp_worth
      *  says no (a prompt's or turn's end, or a loss; an anchor always writes its own).  @param why the trigger  @param kv_flags the bank's
      *  X-Pulsar-KV tokens (L347 I3b)  @param what receives the PULSAR_KVCHAIN_* mask  @return false when nothing is
@@ -2976,8 +3002,9 @@ struct server {
     /// @param reasoning  the turn's parsed reasoning (may be NULL)
     /// @param calls      the turn's calls (none: nothing to do)
     void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
-    /** Shared failure epilogue for both prefill phases (the old duplicated blocks
-     * after each pulsar_session_sync failure). Token vectors and the disk path are
+    /** The failure epilogue of a job that has no decode attempt yet -- both prefill phases (the old duplicated blocks
+     * after each pulsar_session_sync failure), the restore, a bank that cannot be installed, a decode init that
+     * could not start (L372): the client is answered and the job is GEN_DONE.  Token vectors and the disk path are
      * freed centrally by gen_state_free.  The disk chain this request loaded is kept
      * whatever failed (L347 I3b, plans/124 D7: a chain is dropped only on a content
      * fault, and a loaded one passed its digests and its checks; a refused prefill
@@ -3011,6 +3038,14 @@ struct server {
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     /// @return true when the quantum may start; false = refused (503 sent, gen done)
     bool prefill_headroom_ok(session_slot *sl);
+    /** L372 (O12): the per-chunk memory floor for a prefill that is no slot's -- the judge's.  MemAvailable must cover
+     *  `rows` new KV rows over the floor (prefill_headroom_ok's rule, server_prefill_mem_step); short of it the idle
+     *  chat banks are spilled, least recently used first, until it does.  No decoder is preempted for it. */
+    /// @param rows       the chunk's rows
+    /// @param err        receives the refusal (the numbers, and how many banks were spilled)
+    /// @param errlen     its size
+    /// @return true when the chunk may run; false = the floor still stands (the caller answers 503)
+    bool floor_admits_chunk(int rows, char *err, size_t errlen);
     /** The fused / mixed lanes' form: no remedy (banks would move under the step being assembled) and no refusal --
      *  short of the floor the prompt leaves the fused lane (gen->no_fuse) and its classic quantum decides. */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
@@ -3085,7 +3120,8 @@ struct server {
     bool gen_emit_token(session_slot *sl, int token);
     /** Post-decode epilogue: tool repair/recovery, final parse, protocol live
      * state, checkpoints, the final response, and logging. Recovery paths loop
-     * back to GEN_DECODE_INIT (the old goto decode_again).
+     * back to GEN_DECODE_INIT (the old goto decode_again).  The turn is read through the decode attempt's parser
+     * (gen_state::parser_st): a job that fails before it has one ends in gen_prefill_fail, never in GEN_FINISH (L372).
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_step_finish(session_slot *sl);
@@ -3329,7 +3365,8 @@ struct server {
     bool preempt_newest_decoder(const session_slot *keep, KvBytes need);
     /** L314: reload the first-preempted decoder (FIFO: only the first is considered) once its KV fits the budget
      *  again by the admission arithmetic on kv_reserved_bytes (L326: a prompt admitted but not yet prefilled holds
-     *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name.
+     *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name, and
+     *  a bank it could not re-back is left marked spilled (L372).
      *  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT in the live decode set, no active job, not
@@ -4033,6 +4070,10 @@ struct gen_state {
      * it, and this is that backed-up position. */
     size_t stop_scan_from;
     const char *finish;       ///< finish reason once known ("stop", "length", ...); NULL while running
+    /** L372: the decode was abandoned (its client gone: lane_abandon).  The wire keeps a valid finish reason
+     *  (`finish`, for a half-closed reader); the server's own records say "abandoned" -- the log lines and the trace --
+     *  and the turn is neither observed in the request histograms nor given a terminal checkpoint. */
+    bool abandoned;
     char *stop_sequence;      ///< the client stop sequence that ended generation, when one did; owned
     int completion;           ///< tokens generated this attempt
     int max_tokens;           ///< cap for this attempt
@@ -4636,6 +4677,16 @@ bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *
 /// @param errlen  size of `err`
 /// @return false when refused
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err, size_t errlen);
+/** L372: is a request body well-formed UTF-8 (utf8_seq_ok, the engine's one rule)?  Every surface that takes client
+ *  text into a prompt asks first -- chat completions, completions, Responses, Anthropic Messages and its token count,
+ *  /v1/systemone -- and refuses (400) by the field: "messages[2].content is not valid UTF-8 (byte N of the request
+ *  body)".
+ *  @param body    the body
+ *  @param len     its bytes
+ *  @param err     receives the refusal, naming the JSON path of the value that holds the first ill-formed byte
+ *  @param errlen  size of `err`
+ *  @return false when a byte of it is not well-formed UTF-8 */
+bool request_body_utf8_ok(const char *body, size_t len, char *err, size_t errlen);
 bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
                                        size_t errlen);
 bool parse_chat_conversation_responses(const char *body, chat_conversation *c, request *r, char *err,
@@ -4749,6 +4800,24 @@ bool server_judge_queued(const struct server *s);
  *  @param s the server
  *  @return true when it did work */
 bool server_judge_step(struct server *s);
+/** L372 (O12): may the judge bank's physical KV be freed for chat -- a judge exists, its bank is backed, and no judge
+ *  request is running or queued (a running one stays at the queue's head until it is answered).
+ *  @param s the server
+ *  @return true when server_judge_release may free it */
+bool server_judge_releasable(struct server *s);
+/** L372 (O12): free the judge bank's physical KV, for chat's use: the last relief before a decoder is preempted or a
+ *  request answered 503, after the idle chat banks.  The pool is parked on a resident chat bank first when nothing
+ *  is installed (free_physical refuses the installed bank; the judge's step leaves its own installed).  The next
+ *  judge request re-backs the bank empty and prefills again (server_judge_step).  Worker thread.
+ *  @param s the server
+ *  @return true when resident KV was freed */
+bool server_judge_release(struct server *s);
+/** L372 (O12): is the judge bank's KV held by a judge request now -- resident and not releasable until that request
+ *  ends?  Its end makes room as a busy chat bank's does, so a verdict that finds no victim waits instead of
+ *  refusing.
+ *  @param s the server
+ *  @return true when a running or queued judge request keeps resident judge KV */
+bool server_judge_holds_kv(struct server *s);
 /** POST /v1/systemone on a client thread: parse, render, tokenize, queue, wait, answer.
  *  @param s    the server
  *  @param fd   the client socket (the answer is written here)
@@ -5185,6 +5254,12 @@ bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t err
 /// @param limit_s  the limit, seconds
 /// @return the stall, seconds (0 = none)
 int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s);
+/** Whether the worker owes the watchdog a mark: jobs queued or running, or (L372) a /v1/systemone request -- the
+ *  judge's queue is its own, counted in neither, so a stall in judge work on an otherwise idle server was no stall.
+ *  The caller holds server::mu. */
+/// @param s the server
+/// @return true when there is work
+bool server_watchdog_busy(const server *s);
 /* Log priced-vs-actual for a freshly created session and return the bytes the
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller

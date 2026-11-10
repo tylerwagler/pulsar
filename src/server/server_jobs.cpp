@@ -324,6 +324,39 @@ void server::send_prefill_failure_response(const job *j,
 
 
 
+/** L372: a job's hooks on the shared pool session, for the length of ONE sync.  The hooks are the session's, not a
+ * bank's, and every slot shares s->sess.  Armed once per job, a long prefill lost its own to the next request, never
+ * counted a chunk, and its cancel never yielded -- a 202k prompt held another slot's decode for 214 s (L260).  Armed
+ * before each sync and left there (L260 to L372), they were still on the session when another step synced -- the
+ * judge's prefill, the terminal checkpoint, a finishing job's tool-error retry or canonical rewrite -- and that sync
+ * ran THIS job's cancel and progress: its continued store written from the other bank, the other sync interrupted
+ * (the judge answered 503), its chunks counted from the other's numbers.  Armed here and cleared when the scope ends:
+ * no sync runs with hooks that are not its own, and no gen_state pointer stays installed past the sync that reads
+ * it. */
+struct sync_hooks {
+    pulsar_session *sess;   ///< the pool session the hooks are on
+    /// @param sess        the pool session
+    /// @param progress    the chunk-boundary progress hook (NULL: none)
+    /// @param progress_ud its userdata
+    /// @param display     the display-progress hook (NULL: none)
+    /// @param display_ud  its userdata
+    /// @param cancel      the cancel hook polled between chunks (NULL: the sync runs to its end)
+    /// @param cancel_ud   its userdata
+    sync_hooks(pulsar_session *sess, pulsar_session_progress_fn progress, void *progress_ud,
+               pulsar_session_progress_fn display, void *display_ud, pulsar_session_cancel_fn cancel, void *cancel_ud)
+        : sess(sess) {
+        pulsar_session_set_progress(sess, progress, progress_ud);
+        pulsar_session_set_display_progress(sess, display, display_ud);
+        pulsar_session_set_cancel(sess, cancel, cancel_ud);
+    }
+    /// Clears the three hooks.
+    ~sync_hooks() {
+        pulsar_session_set_cancel(sess, NULL, NULL);
+        pulsar_session_set_progress(sess, NULL, NULL);
+        pulsar_session_set_display_progress(sess, NULL, NULL);
+    }
+};
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -421,12 +454,12 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .headers_sent = true,
         };
         snprintf(progress.ctx, sizeof(progress.ctx), "%s", sync_ctx);
-        pulsar_session_set_progress(s->sess, server_progress_cb, &progress);
-        pulsar_session_set_display_progress(s->sess, server_progress_cb, &progress);
         char sync_err[160] = {0};
-        const int rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
-        pulsar_session_set_progress(s->sess, NULL, NULL);
-        pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        int rc;
+        {
+            const sync_hooks hooks(s->sess, server_progress_cb, &progress, server_progress_cb, &progress, NULL, NULL);
+            rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
+        }
         if (rc == 0) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: tool checkpoint canonicalized ctx=%s source=%s cached=%d target=%d %.3fs",
@@ -514,7 +547,7 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
         g->prefill_total = total;
         /* L281: publish the snapshot here as well as per quantum.  An image prompt's mm sync
          * yields only at the planner's exact resume points (its cancel hook is armed like any
-         * prefill's, gen_arm_prefill_callbacks), so the worker can stay inside one sync for a
+         * prefill's, sync_hooks), so the worker can stay inside one sync for a
          * long stretch, and the per-slot gauges (/metrics slot_prefill_*, slot_position; the
          * TUI's bar) stood still for minutes while the chunk lines logged.  One mutex + copy
          * per chunk (~3 s apart) is host noise. */
@@ -544,9 +577,8 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
  * full teardown/RST).  The deliberate trade: a client that half-closes its write
  * side while still reading the response would be treated as gone.  HTTP clients
  * do not do that while awaiting a response, and the same assumption is standard
- * in production servers — but PULSAR_ABORT_ON_DISCONNECT=0 restores the old
- * run-to-completion behavior without a rebuild if some client ever misbehaves.
- * The env is read ONCE (project rule: no per-token getenv). */
+ * in production servers.  There is no switch for it (this comment named a
+ * PULSAR_ABORT_ON_DISCONNECT that nothing reads). */
 /// @param fd  the client socket (< 0: never disconnected)
 /// @return true when the peer has closed or half-closed (POLLRDHUP) or the socket errored; a non-blocking poll
 bool gen_client_disconnected(int fd) {
@@ -577,32 +609,16 @@ static bool gen_prefill_cancel_cb(void *ud) {
     return (uint32_t)(g->prefill_total - g->prefill_last_current) >= g->prefill_min_suffix;
 }
 
-/* Bind THIS slot's prefill callbacks to the shared pool session.  Every slot
- * shares s->sess and the callbacks are per-session, so any other slot's
- * begin (which binds its own) or stream begin (which clears them) replaces
- * them: armed once per job, a long prefill lost its progress callback to the
- * next request, never counted a chunk, and the cancel callback never yielded
- * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
- * before every sync this slot issues. */
-/// @param sess  the pool session
-/// @param g     the slot's generation state the callbacks read
-static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
-    pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
-    pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
-    pulsar_session_set_cancel(sess, gen_prefill_cancel_cb, g);
-}
 
 
 
-/* Shared failure epilogue for both prefill phases (the old duplicated blocks
- * after each pulsar_session_sync failure). Token vectors and the disk path are
- * freed centrally by gen_state_free. */
+/* The failure epilogue of a job that has no decode attempt yet (both prefill
+ * phases, the restore, a decode init that could not start): the old duplicated
+ * blocks after each pulsar_session_sync failure. Token vectors and the disk path
+ * are freed centrally by gen_state_free. */
 void server::gen_prefill_fail(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     if (g->disk_cache_path) {
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept segment=%s (prefill ended: %s)",
                    g->disk_cache_path, g->err);
@@ -620,6 +636,9 @@ void server::gen_prefill_fail(session_slot *sl) {
                    "pulsar-server: bank %d not installed after a failed prefill; left as is "
                    "(no other bank is invalidated)", sl->bank);
     s->trace_event(g->trace_id, "prefill failed: %s", g->err);
+    /* the answer goes behind whatever this slot's writer still holds: a caller in a batched quantum, or one that
+     * failed before generate_job_step installed it, has another slot's writer installed (L372) */
+    slot_writer_install(&g->writer);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
     g->phase = GEN_DONE;
@@ -649,9 +668,12 @@ void server::gen_prefill_abandon(session_slot *sl) {
     /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
      * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
      * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    /* L372: the bank is kept, so the bindings on it must be true of it.  A request that did not continue them has
+     * written its own rows there, and a binding matches by its call ids and the bank's position alone
+     * (live_state_matches_ids_locked): left valid, the owner's tool results could match where this prefill happened
+     * to stop.  gen_stream_begin's rule, which an abandoned prefill never reaches. */
+    if (!g->responses_live_continuation) s->responses_live_clear(sl);
+    if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
     g->phase = GEN_DONE;
@@ -1312,8 +1334,6 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
                g->ctx_span,
                g->req_flags[0] ? " " : "",
                g->req_flags);
-    pulsar_session_set_progress(s->sess, gen_prefill_progress_cb, g);
-    pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
     /* The one cold checkpoint is the shared preamble (system prompt + tools,
      * before the task message): worth a separate prefill phase however long
@@ -1386,7 +1406,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
      * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
-     * cancel callback itself is armed per-sync in gen_step_prefill, NOT here: in
+     * job's hooks are armed for each sync in gen_step_prefill (sync_hooks), NOT here: in
      * pool mode every slot shares the one pool session (s->sess), so a once-per-job set would be
      * clobbered by the next job the worker binds before prefilling this one. */
     g->prefill_min_suffix = pulsar_session_prefill_quantum_min_suffix(s->sess);
@@ -1413,7 +1433,7 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
-    /* Arm the callbacks on THIS slot's gen_state right before the sync.
+    /* Arm the callbacks on THIS slot's gen_state for the sync below (sync_hooks: cleared when it returns).
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
      * jobs (each of which would set the callback) before prefilling any of them,
      * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
@@ -1435,7 +1455,6 @@ void server::gen_step_prefill(session_slot *sl) {
      * checkpoint it leaves is one the main image sync extends. */
     const int n_images = cold ? 0 : g->j->req.n_images;
     if (!s->prefill_headroom_ok(sl)) return;   /* refused loudly (503); the bank keeps what it prefilled */
-    gen_arm_prefill_callbacks(s->sess, g);
     /* L329 (a): a queued request waits for this prefill to stand at share_mark (a resume-grid point inside the
      * target): the sync goes to it first, so its last chunk ends there and captures the grid checkpoint the waiter
      * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
@@ -1454,10 +1473,15 @@ void server::gen_step_prefill(session_slot *sl) {
     /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
      * share_mark cut too (the chunk after the cut is the next sync's first) */
     pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
-    const int rc = n_images > 0
-        ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
-                                 g->err, sizeof(g->err))
-        : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    int rc;
+    {
+        const sync_hooks hooks(s->sess, gen_prefill_progress_cb, g, server_progress_cb, &g->progress,
+                               gen_prefill_cancel_cb, g);
+        rc = n_images > 0
+            ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
+                                     g->err, sizeof(g->err))
+            : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    }
     pulsar_session_set_prefill_ahead(s->sess, NULL);
     pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
@@ -1497,7 +1521,6 @@ void server::gen_step_prefill(session_slot *sl) {
         return; /* the cold store is a quantum boundary of its own */
     }
 
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
     s->gen_stream_begin(sl);
 }
 
@@ -1514,8 +1537,6 @@ void server::gen_stream_begin(session_slot *sl) {
      * a binding only when this request explicitly continued from it. */
     if (!g->responses_live_continuation) s->responses_live_clear(sl);
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     s->kv_cache_persist(sl, KV_PERSIST_PROMPT);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -1625,6 +1646,7 @@ void server::gen_decode_init(session_slot *sl) {
     g->plain_stream_pos = 0;
     g->stop_scan_from = 0;
     g->finish = "length";
+    g->abandoned = false;
     g->completion = 0;
     /* Continued attempts (tool-error recovery) spend the request's ONE
      * max_tokens budget: completion_total holds what earlier attempts already
@@ -1669,8 +1691,9 @@ void server::gen_decode_init(session_slot *sl) {
     if (g->parser_st) g->parser->destroy(g->parser_st);
     g->parser_st = g->parser->create(s, g, g->err, sizeof(g->err));
     if (!g->parser_st) {
-        g->finish = "error";
-        g->phase = GEN_FINISH;
+        /* L372: no parser, so no turn for gen_step_finish to read (it dereferenced the NULL state): the attempt
+         * never started, and the request ends where every failure before a decode attempt does */
+        s->gen_prefill_fail(sl);
         return;
     }
     /* tool_choice="required": the prompt was prefilled into an open tool-call block (thinking
@@ -1970,7 +1993,11 @@ bool server::gen_emit_token(session_slot *sl, int token) {
         g->finish = "stop";
         g->text.len = stop_pos;
         g->text.ptr[g->text.len] = '\0';
-        pulsar_session_invalidate(s->sess);
+        /* L372: no invalidate here.  The bank keeps the tokens through the stop string; the next request's sync
+         * matches its prompt against them and resumes below where they part, as after any turn.  The call acted on
+         * whatever the pool had installed: in the batched lanes not this slot's bank (a view the slot's own restore
+         * replaces on the driver families; another client's bank, rewound to 0 mid-decode, on DeepSeek), and only on
+         * a decoder leaving the plain batch its own -- whose whole history it then threw away. */
         return true;
     }
 
@@ -1997,9 +2024,27 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 
 
+/// @param abandoned     the decode was abandoned (gen_state::abandoned)
+/// @param final_finish  the turn's finish label as the wire carries it
+/// @return the label the server's log lines and trace give the turn: "abandoned" for an abandoned decode
+static const char *gen_said_finish(bool abandoned, const char *final_finish) {
+    return abandoned && strcmp(final_finish, "error") != 0 ? "abandoned" : final_finish;
+}
+
+/// @param abandoned     the decode was abandoned (gen_state::abandoned)
+/// @param final_finish  the turn's finish label
+/// @param generated     tokens the request generated, every attempt
+/// @return true when the idle worker should prefill the turn's reply (L311): it decoded, did not fail and its client
+///         heard it out
+static bool gen_turn_wants_terminal(bool abandoned, const char *final_finish, int generated) {
+    return !abandoned && strcmp(final_finish, "error") != 0 && generated > 0;
+}
+
 /* Post-decode epilogue: tool repair/recovery, final parse, protocol live
  * state, checkpoints, the final response, and logging. Recovery paths loop
- * back to GEN_DECODE_INIT (the old goto decode_again). */
+ * back to GEN_DECODE_INIT (the old goto decode_again).  Only a job with a decode
+ * attempt (g->parser_st) gets here; one that fails before it ends in
+ * gen_prefill_fail. */
 void server::gen_step_finish(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -2052,6 +2097,9 @@ void server::gen_step_finish(session_slot *sl) {
     char *parsed_content = turn.content;
     char *parsed_reasoning = turn.reasoning;
     const char *final_finish = !strcmp(g->finish, "error") ? g->finish : turn.finish;
+    /* L372: what the server's records call the turn -- an abandoned decode (lane_abandon) is not the "length" its
+     * wire label says (kept valid for a half-closed reader) */
+    const char *said_finish = gen_said_finish(g->abandoned, final_finish);
     if (j->req.kind == REQ_CHAT && !parsed_calls.len && j->req.api == API_RESPONSES) s->responses_live_clear(sl);
     log_tool_calls_summary(g->ctx_span, &parsed_calls,
                            g->responses_protocol);
@@ -2079,15 +2127,16 @@ void server::gen_step_finish(session_slot *sl) {
         t->valid = true;
         /* Same numbers the response body already carries, folded into the
          * /metrics histograms so TTFT and per-token latency are observable
-         * without scraping every response. */
-        s->observe_request_timings(t, finish_t - g->t0);
+         * without scraping every response.  L372: not an abandoned decode's -- its end-to-end time and its token
+         * count are where the client left, not a turn's. */
+        if (!g->abandoned) s->observe_request_timings(t, finish_t - g->t0);
     }
     /* L324: the pool's duplicate-prefix census at each request's end (host carries only, off the decode path) */
     s->kv_dup_census_update();
 
     bool tool_open = false, tool_closed = false;
     if (g->parser->tool_progress) g->parser->tool_progress(g->parser_st, &tool_open, &tool_closed);
-    s->trace_finish(g->trace_id, &j->req, final_finish, g->completion,
+    s->trace_finish(g->trace_id, &j->req, said_finish, g->completion,
                  tool_open, tool_closed,
                  parsed_content ? parsed_content : (g->text.ptr ? g->text.ptr : ""),
                  parsed_reasoning, &parsed_calls, server_now_sec() - g->t0);
@@ -2240,7 +2289,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
@@ -2250,7 +2299,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        server_now_sec() - g->t0);
         }
     } else {
@@ -2269,7 +2318,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        g->err,
                        server_now_sec() - g->t0);
         } else {
@@ -2280,7 +2329,7 @@ void server::gen_step_finish(session_slot *sl) {
                        g->completion,
                        flags[0] ? " " : "",
                        flags,
-                       final_finish,
+                       said_finish,
                        server_now_sec() - g->t0);
         }
     }
@@ -2288,7 +2337,8 @@ void server::gen_step_finish(session_slot *sl) {
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
-    sl->terminal_pending = strcmp(final_finish, "error") != 0 && g->completion_total + g->completion > 0;
+    /* L372: not an abandoned one -- its partial reply is no turn the client will send back */
+    sl->terminal_pending = gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion);
     g->phase = GEN_DONE;
 }
 
@@ -2326,9 +2376,6 @@ bool server::terminal_checkpoint_step() {
     pulsar_tokens target = {0};
     tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
     const int old_len = pulsar_session_pos(s->sess).raw();
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     const double t0 = server_now_sec();
     char err[192] = "";
     /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
@@ -2369,10 +2416,6 @@ void server::gen_state_free(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     if (!g) return;
-    /* Callback safety: no gen_state pointer may remain installed anywhere. */
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     if (g->parser_st) g->parser->destroy(g->parser_st);
     gen_constrain_end(g);
     responses_stream_free(&g->responses_live);
@@ -2442,6 +2485,13 @@ void server::generate_job_step(session_slot *sl) {
         if (!g->err[0])
             snprintf(g->err, sizeof g->err,
                      "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        if (!g->parser_st) {
+            /* L372: before its first decode attempt (GEN_RESTORE, a prefill phase, GEN_DECODE_INIT) the job has no
+             * parser, and gen_step_finish reads the turn through it -- GEN_FINISH from here was a NULL call on the
+             * next step, every client down.  It ends as gen_begin's failed install does: answered, GEN_DONE. */
+            s->gen_prefill_fail(sl);
+            return;
+        }
         g->finish = "error";
         if (g->phase == GEN_FINISH) {
             /* Already finishing and the restore STILL fails: run the finish

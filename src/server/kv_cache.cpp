@@ -874,11 +874,15 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     return true;
 }
 
-int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end, bool *no_room) {
+const char *const kv_persist_rule_names[KV_PERSIST_RULES] = { "", "read-only", "mirrored sync", "dead prefix" };
+
+int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end, bool *no_room,
+                             kv_persist_rule *by_rule) {
     auto *s = this;
     const char *reason = kv_persist_trigger_names[why];
     if (chain_end) *chain_end = 0;
     if (no_room) *no_room = false;
+    if (by_rule) *by_rule = KV_PERSIST_RULE_NONE;
     if (!s->kv.enabled) return 0;
     /* L347 I3b (D10): the bank's history is read-only (X-Pulsar-KV): nothing is written for it -- its pinned anchor
      * alone -- and a spill of it may free the bank (the history is disposable by the request's word) */
@@ -888,18 +892,23 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         if (kv_persist_writes(why, 0u, &what_probe) && (what_probe & PULSAR_KVCHAIN_RP))   /* a loss: said */
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache persist reason=%s: bank %u's history is read-only "
                        "(X-Pulsar-KV) -- nothing written", reason, sl->bank);
+        if (by_rule) *by_rule = KV_PERSIST_RULE_READ_ONLY;
         return 0;
     }
     /* A "continued" store fires from the prefill's progress callback; on a TP
      * group that is inside the mirrored sync, where the workers read only
      * chunk verdicts.  The prompt-end store after it persists the same
      * checkpoints. */
-    if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
+    if (pulsar_session_in_mirrored_sync(s->sess)) {
+        if (by_rule) *by_rule = KV_PERSIST_RULE_MIRRORED;
+        return 0;
+    }
     /* L249 D: a dead prefix (its session compacted) or a compaction request's prompt is not worth a disk copy */
     if (sl && server_hint_persist_skips(sl->hint_dead,
                                         sl->active_job && sl->active_job->req.hints.cls == REQ_CLASS_COMPACTION,
                                         reason)) {
         s->count_metric(&s->m_hint_persist_skipped);
+        if (by_rule) *by_rule = KV_PERSIST_RULE_DEAD;
         return 0;
     }
     /* 2026-10-29 (a production hang under memory pressure: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
