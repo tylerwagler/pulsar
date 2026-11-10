@@ -1693,7 +1693,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED
-uint32_t block_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p, float min_p,
+uint32_t block_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
                      uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);

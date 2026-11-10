@@ -112,10 +112,10 @@ typedef struct pulsar_drafter_ops {
      *  target's draw for that token reads; `rng` is read, never advanced (L288 sdet) -- stamped into the bank's
      *  pendings.
      *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
-     *  the round refuses with it (L306) -- it never continues as a plain round.  `features_ready` = the drafter's
-     *  conditioning features are those of the last committed row. */
-    uint32_t (*draft)(struct pulsar_session *s, int next_base, bool features_ready, float temperature,
-                      int top_k, float top_p, float min_p, uint64_t *rng);
+     *  the round refuses with it (L306) -- it never continues as a plain round.  The drafter's conditioning
+     *  features are those of the last committed row: the round's absorb ran before this. */
+    uint32_t (*draft)(struct pulsar_session *s, int next_base, float temperature, int top_k, float top_p,
+                      float min_p, uint64_t *rng);
     /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
     void (*harvest)(struct pulsar_session *s);
     /** N banks' drafts in one pass, no bank switch, each result into rounds[i]->redraft; byte-exact with

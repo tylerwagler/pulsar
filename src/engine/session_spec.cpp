@@ -947,8 +947,6 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         return -1;
     }
 
-    /* the drafter's conditioning features follow the last committed row through the absorbs below */
-    const bool features_ready = true;
     /* The target leaves the installed bank's state at saved_len + 1 + commit (a full accept needs
      * nothing of DeepSeek; a partial one restores its snapshot and rolls the recurrent state forward
      * from the inputs saved during the verify -- bit-identical, no replay), then the drafter absorbs
@@ -1019,13 +1017,12 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
         pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
-        q->valid = features_ready;
         return n_accept;
     }
     uint32_t keep;
     {
         PULSAR_NVTX("spec: draft");
-        keep = spec_drafter(s)->draft(s, next_base, features_ready, carry_temp, top_k, top_p, min_p, rng);
+        keep = spec_drafter(s)->draft(s, next_base, carry_temp, top_k, top_p, min_p, rng);
     }
     if (keep == PULSAR_DRAFT_REFUSED) {   /* L306: the drafter refused the next chain (its line says why) */
         snprintf(err, errlen, "spec round: the drafter refused the next chain");

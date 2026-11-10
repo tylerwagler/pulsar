@@ -556,8 +556,8 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED (said) when the drafting pass failed
-static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p,
-                             float min_p, uint64_t *rng) {
+static uint32_t dspark_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+                             uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);

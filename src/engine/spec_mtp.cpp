@@ -492,8 +492,8 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
 }
 
 /* The single lane's draft: the chain into a record, the record stamped into the bank's pendings. */
-uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p,
-                          float min_p, uint64_t *rng) {
+uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+                          uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
