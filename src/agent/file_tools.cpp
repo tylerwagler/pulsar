@@ -272,14 +272,11 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
 
 
 
-bool agent_tool_result_fits_context(agent_worker *w, const char *result,
-                                           int reserve_tokens,
-                                           int *tokens_out) {
+bool agent_turn_fits_context(agent_worker *w, int reserve_tokens, int *tokens_out) {
     pulsar_tokens tmp = {0};
     pulsar_tokens_copy(&tmp, &w->transcript);
-    const pulsar_chat_message tool = {"tool", result ? result : "", false};
     /* a refused render leaves the transcript's own length, which fits: agent_turn_flush then fails the turn */
-    agent_turn_render(w, &tmp, &tool, 1, w->cfg->gen.think_mode);
+    agent_turn_render(w, &tmp, NULL, 0, w->cfg->gen.think_mode);
     int tokens = tmp.len;
     pulsar_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;

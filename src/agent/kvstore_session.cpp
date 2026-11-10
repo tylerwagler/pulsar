@@ -248,12 +248,16 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
 
 
 
-void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted) {
+void agent_turn_push(agent_worker *w, pulsar_chat_message msg) {
     if (w->turn_len == w->turn_cap) {
         w->turn_cap = w->turn_cap ? w->turn_cap * 2 : 4;
         w->turn = (pulsar_chat_message *)agent_xrealloc(w->turn, (size_t)w->turn_cap * sizeof(w->turn[0]));
     }
-    w->turn[w->turn_len++] = {role, xstrdup(content ? content : ""), trusted, NULL};
+    w->turn[w->turn_len++] = msg;
+}
+
+void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted) {
+    agent_turn_push(w, {role, xstrdup(content ? content : ""), trusted, NULL});
 }
 
 void agent_turn_add_tool(agent_worker *w, const char *name, const char *content) {
@@ -261,11 +265,33 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
     w->turn[w->turn_len - 1].name = name ? xstrdup(name) : NULL;
 }
 
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+        const int role = pulsar_turn_marker_at(m, v, n, i);
+        if (!role) continue;
+        if (role != 2) return false;
+        const bool closed = n_end > 0 && n - n_end >= i + m->n_assistant &&
+                            !memcmp(v + n - n_end, end, (size_t)n_end * sizeof(v[0]));
+        return !closed;
+    }
+    return false;
+}
+
+bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens) {
+    pulsar_turn_markers m;
+    if (!pulsar_chat_turn_markers(w->engine, &m)) return false;   /* refused at startup (agent_family_tools_supported) */
+    pulsar_tokens end = {0};
+    pulsar_chat_end_assistant(w->engine, &end);
+    const bool open = agent_tokens_turn_open(&m, end.v, end.len, tokens->v, tokens->len);
+    pulsar_tokens_free(&end);
+    return open;
+}
+
 void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
-    if (!w->model_turn_open) return;
-    if (w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;   /* the turn being built answers it */
+    if (!agent_worker_turn_open(w, tokens)) return;
+    /* where calls continue the turn (Gemma), a turn being built that opens with tool messages answers it */
+    if (pulsar_chat_calls_continue_turn(w->engine) && w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;
     pulsar_chat_end_assistant(w->engine, tokens);
-    if (tokens == &w->transcript) w->model_turn_open = false;
 }
 
 
@@ -348,7 +374,6 @@ void agent_turn_clear(agent_worker *w) {
 bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
     agent_worker_close_open_turn(w, &w->transcript);
     const bool taken = agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
-    if (taken) w->model_turn_open = false;   /* answered by the turn's tool messages, or closed above */
     agent_turn_clear(w);
     return taken;
 }

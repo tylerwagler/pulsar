@@ -33,8 +33,12 @@ bool agent_family_tools_supported(pulsar_engine *e, char *err, size_t errlen) {
     case PULSAR_CHAT_DS4_V41:
     case PULSAR_CHAT_QWEN:
     case PULSAR_CHAT_NEMOTRON_H:
-    case PULSAR_CHAT_GEMMA4:
-        return true;
+    case PULSAR_CHAT_GEMMA4: {
+        pulsar_turn_markers m;
+        if (pulsar_chat_turn_markers(e, &m)) return true;
+        snprintf(err, errlen, "this tokenizer does not spell the chat turn markers pulsar-agent reads turns by");
+        return false;
+    }
     case PULSAR_CHAT_INKLING:
         snprintf(err, errlen, "Inkling's tool calling is not wired into pulsar-agent (the family is parked)");
         return false;

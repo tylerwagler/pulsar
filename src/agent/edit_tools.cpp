@@ -909,6 +909,54 @@ static void test_agent_write_and_edit_are_atomic(void) {
     AGENT_TEST_ASSERT(system(cmd) == 0);
 }
 
+/* L373: whether a transcript ends inside an open assistant turn is read off its tokens (the one authority), so it is
+ * the same before a save and after the reload; Gemma-shaped two-token markers here. */
+static void test_agent_turn_open_is_the_transcripts(void) {
+    pulsar_turn_markers m;
+    memset(&m, 0, sizeof(m));
+    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
+    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
+    const int end[2] = {13, 14};
+    const auto open = [&](std::initializer_list<int> v) {
+        return agent_tokens_turn_open(&m, end, 2, v.begin(), (int)v.size());
+    };
+    AGENT_TEST_ASSERT(!open({}));
+    AGENT_TEST_ASSERT(!open({1, 2, 3}));                                         /* the head alone */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14}));                            /* a user turn */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12}));                     /* the generation prompt */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12, 6, 7}));               /* a turn that made calls */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12, 6, 13, 14, 7}));       /* ... and holds a response */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14, 10, 12, 6, 7, 13, 14}));      /* closed */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14, 10, 12, 13, 14}));            /* closed, empty */
+    AGENT_TEST_ASSERT(!open({1, 10, 12, 6, 13, 14, 10, 11, 5, 13, 14}));         /* a user turn after it */
+    AGENT_TEST_ASSERT(!open({1, 10, 12, 6, 13, 14, 10, 99, 5, 13, 14}));         /* an unnamed (system) turn after it */
+
+    char dir[] = "/tmp/pulsar-agent-open-test.XXXXXX";
+    if (!mkdtemp(dir)) {
+        AGENT_TEST_ASSERT(!"mkdtemp failed");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s/s.session", dir);
+    int ids[] = {1, 10, 11, 5, 13, 14, 10, 12, 6, 7};
+    for (int leg = 0; leg < 2; leg++) {   /* open, then closed: each reloads as it was saved */
+        agent_session_file f;
+        memset(&f, 0, sizeof(f));
+        f.title = (char *)"t";
+        f.tokens.v = ids;
+        f.tokens.len = f.tokens.cap = leg ? 8 : 10;
+        if (leg) ids[6] = 13, ids[7] = 14;
+        char err[160] = {0};
+        AGENT_TEST_ASSERT(agent_session_file_write(path, &f, err, sizeof err));
+        agent_session_file got;
+        AGENT_TEST_ASSERT(agent_session_file_read(path, &got, err, sizeof err));
+        AGENT_TEST_ASSERT(agent_tokens_turn_open(&m, end, 2, got.tokens.v, got.tokens.len) == !leg);
+        agent_session_file_free(&got);
+    }
+    unlink(path);
+    rmdir(dir);
+}
+
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
 static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
 static void test_agent_bash_teardown(void);           /* bash_jobs.cpp */
@@ -917,6 +965,7 @@ static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
     test_agent_tool_call_display_is_sanitized();
     test_agent_write_and_edit_are_atomic();
+    test_agent_turn_open_is_the_transcripts();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();

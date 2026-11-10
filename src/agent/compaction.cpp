@@ -316,7 +316,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     if (bash_update) {
         /* L365: a tool message answers an open turn's calls where calls continue the turn (Gemma); with none
          * open there, the observation is the user's note */
-        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) || w->model_turn_open;
+        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) ||
+                             agent_worker_turn_open(w, &w->transcript);
         agent_turn_add(w, as_tool ? "tool" : "user", bash_update, false);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));

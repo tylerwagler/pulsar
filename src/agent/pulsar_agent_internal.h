@@ -343,10 +343,6 @@ typedef struct {
     char *queued_user_drain_text;     ///< drained queue contents, owned by the worker once taken
 
     bool datetime_context_injected;   ///< the current date/time was already stated in this transcript
-    /** L365: the transcript ends inside a sampled model turn that made calls and awaits their responses (a family
-     *  whose calls continue the turn: pulsar_chat_calls_continue_turn).  The next turn rendered must open with the
-     *  "tool" messages; anything else closes the turn first (agent_worker_close_open_turn). */
-    bool model_turn_open;
 
     /** Continuation cursor for a truncated file read, so the `more` tool can
      * resume where the last read stopped. `more_valid` is false when there is
@@ -1045,7 +1041,8 @@ bool agent_engine_dsml(pulsar_engine *e);
 /** @param w the worker
  *  @return agent_engine_dsml of its engine */
 bool agent_worker_dsml(const agent_worker *w);
-/** Whether pulsar-agent can call tools on the loaded family (DeepSeek, Qwen, Nemotron-H, Gemma 4).
+/** Whether pulsar-agent can call tools on the loaded family (DeepSeek, Qwen, Nemotron-H, Gemma 4) and its tokenizer
+ *  spells the chat turn markers the agent reads turns by (agent_worker_turn_open, the compaction tail).
  *  @param e      the engine
  *  @param err    receives why not
  *  @param errlen size of `err`
@@ -1363,6 +1360,10 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]);
  *  @param out receives the head's tokens (appended) */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 /** Add a message to the turn being built (agent_worker::turn); `content` is copied. */
+/** Append a message to the turn being built, taking it as it is.
+ *  @param w   the worker
+ *  @param msg the message; its `content` and `name` are malloc'd and now the turn's */
+void agent_turn_push(agent_worker *w, pulsar_chat_message msg);
 /** @param w       the worker
  *  @param role    the message role ("system", "user", "tool")
  *  @param content the text, copied
@@ -1373,9 +1374,25 @@ void agent_turn_add(agent_worker *w, const char *role, const char *content, bool
  *  @param name    the call's function, copied; NULL = none
  *  @param content the result text, copied */
 void agent_turn_add_tool(agent_worker *w, const char *name, const char *content);
-/** L365: when the transcript ends in an open model turn (model_turn_open) and the turn being built does not answer
- *  it, close it (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never
- *  lands inside it.
+/** L373: whether a token sequence ends inside an assistant turn: its last turn marker is the assistant's and it does
+ *  not end with the turn's close.  Pure host code.
+ *  @param m     the family's turn markers
+ *  @param end   the ids pulsar_chat_end_assistant appends
+ *  @param n_end their count
+ *  @param v     the tokens
+ *  @param n     their count
+ *  @return true when the last turn is an assistant turn left open */
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n);
+/** L373: whether the transcript ends inside an open assistant turn (agent_tokens_turn_open with the loaded family's
+ *  markers).  The transcript is the ONE authority: a turn that made calls where calls continue the turn (Gemma, L365),
+ *  or one an error left unclosed, reads the same live, after /new, a session switch or a reload.
+ *  @param w      the worker (its engine)
+ *  @param tokens the transcript, or a copy of it
+ *  @return true when its last turn is an assistant turn left open */
+bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens);
+/** L365: when the transcript ends in an open assistant turn (agent_worker_turn_open) and the turn being built does
+ *  not answer it (tool messages first, on a family whose calls continue the turn), close it
+ *  (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never lands inside it.
  *  @param w      the worker
  *  @param tokens the transcript (or a copy of it) to close */
 void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
@@ -1641,16 +1658,13 @@ char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
                                        const char *new_data, size_t new_len,
                                        const char *kind);
-/** Whether the transcript plus the pending turn plus `result` as a tool message still leaves reserve_tokens
- *  free in the context.
+/** Whether the transcript plus the turn being built (rendered as agent_turn_flush will) still leaves
+ *  reserve_tokens free in the context.
  *  @param w              the worker
- *  @param result         the tool result
  *  @param reserve_tokens tokens to keep free
  *  @param tokens_out     receives the projected prompt length, or NULL
  *  @return true when it fits */
-bool agent_tool_result_fits_context(agent_worker *w, const char *result,
-                                           int reserve_tokens,
-                                           int *tokens_out);
+bool agent_turn_fits_context(agent_worker *w, int reserve_tokens, int *tokens_out);
 /** The read tool (path, start_line, max_lines, whole, raw).
  *  @param w    the worker (records the `more` continuation)
  *  @param call the call
