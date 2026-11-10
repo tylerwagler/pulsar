@@ -6372,6 +6372,115 @@ static void test_embeddings_dimensions_compare_as_numbers(void) {
     TEST_ASSERT(read_dimensions(NULL, 1024, &err) && err.empty());   /* absent: the model's width */
 }
 
+/* L374: the encoder server's GPU thread (enc_executor, encode_server.cpp).  The fixture every submitter shares
+ * (in the anonymous namespace, as enc_executor is). */
+namespace {
+struct enc_exec_fixture {
+    enc_executor *x;
+    pthread_mutex_t mu;      /* guards the fields below */
+    pthread_cond_t cv;       /* the gate opening */
+    bool gate_open;          /* job 0 holds the GPU thread until this is set */
+    bool first_running;      /* job 0 has been taken off the queue and is running */
+    std::vector<int> order;  /* the ids of the jobs that ran, in the order they ran */
+};
+struct enc_exec_submit {
+    enc_exec_fixture *f;
+    int id, fd;
+    bool ran;                /* enc_executor_run's result */
+    pthread_t th;
+};
+}  // namespace
+
+static void *enc_exec_submit_thread(void *arg) {
+    enc_exec_submit *s = (enc_exec_submit *)arg;
+    enc_exec_fixture *f = s->f;
+    s->ran = enc_executor_run(f->x, s->fd, [&] {
+        pulsar::ScopedLock lk(&f->mu);
+        if (s->id == 0) {
+            f->first_running = true;
+            while (!f->gate_open) pthread_cond_wait(&f->cv, &f->mu);
+        }
+        f->order.push_back(s->id);
+    });
+    return NULL;
+}
+
+static void *enc_exec_stop_thread(void *arg) {
+    enc_executor_stop((enc_executor *)arg);
+    return NULL;
+}
+
+/* poll (1 ms steps, 10 s at most) until `pred` holds */
+template <class P> static bool enc_exec_wait_for(const P &pred) {
+    const struct timespec nap = {0, 1000000};
+    for (int i = 0; i < 10000; i++) {
+        if (pred()) return true;
+        nanosleep(&nap, NULL);
+    }
+    return false;
+}
+
+/* L374 (O16 / O53): every engine call of the encoder server runs on its engine's ONE long-lived thread.  The queue's
+ * contract, without an engine: jobs run on that one thread in the order they were queued; a job whose client has
+ * gone by its turn is dropped unrun and its waiter told so; a stop with jobs still queued runs them all before the
+ * thread exits; and the waiter of a running job stays until it has finished. */
+static void test_encode_executor_queue(void) {
+    enc_exec_fixture f;
+    f.x = enc_executor_start();
+    TEST_ASSERT(f.x != NULL);
+    if (!f.x) return;
+    pthread_mutex_init(&f.mu, NULL);
+    pthread_cond_init(&f.cv, NULL);
+    f.gate_open = f.first_running = false;
+    int gone[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, gone) == 0);
+    close(gone[1]);   /* gone[0]'s peer has hung up: gen_client_disconnected(gone[0]) */
+    TEST_ASSERT(gen_client_disconnected(gone[0]));
+    enum { N = 6, GONE = 3 };
+    enc_exec_submit s[N];
+    pthread_t self = pthread_self(), ran_on[2] = {self, self};
+    /* job 0 holds the GPU thread; 1 .. N-1 queue behind it one at a time, so their order is known */
+    for (int i = 0; i < N; i++) {
+        s[i] = {&f, i, i == GONE ? gone[0] : -1, false, {}};
+        TEST_ASSERT(pthread_create(&s[i].th, NULL, enc_exec_submit_thread, &s[i]) == 0);
+        TEST_ASSERT(enc_exec_wait_for([&] {
+            pulsar::ScopedLock a(&f.mu);
+            if (i == 0) return f.first_running;
+            pulsar::ScopedLock b(&f.x->mu);
+            return f.x->q.size() == (size_t)i;
+        }));
+    }
+    /* a stop with five jobs queued: it waits for them */
+    enc_executor *x = f.x;
+    pthread_t stopper;
+    TEST_ASSERT(pthread_create(&stopper, NULL, enc_exec_stop_thread, x) == 0);
+    TEST_ASSERT(enc_exec_wait_for([&] {
+        pulsar::ScopedLock b(&x->mu);
+        return x->stop;
+    }));
+    {
+        pulsar::ScopedLock a(&f.mu);
+        TEST_ASSERT(f.order.empty());   /* nothing has finished: job 0 still holds the thread */
+        f.gate_open = true;
+        pthread_cond_broadcast(&f.cv);
+    }
+    for (int i = 0; i < N; i++) pthread_join(s[i].th, NULL);
+    pthread_join(stopper, NULL);   /* the thread has exited and the executor is freed */
+    for (int i = 0; i < N; i++) TEST_ASSERT(s[i].ran == (i != GONE));
+    const std::vector<int> want = {0, 1, 2, 4, 5};
+    TEST_ASSERT(f.order == want);
+    close(gone[0]);
+    pthread_cond_destroy(&f.cv);
+    pthread_mutex_destroy(&f.mu);
+    /* every job of one executor runs on the same thread, and it is not the submitter's */
+    x = enc_executor_start();
+    TEST_ASSERT(x != NULL);
+    if (!x) return;
+    for (pthread_t &t : ran_on) TEST_ASSERT(enc_executor_run(x, -1, [&] { t = pthread_self(); }));
+    TEST_ASSERT(pthread_equal(ran_on[0], ran_on[1]) && !pthread_equal(ran_on[0], self));
+    enc_executor_stop(x);
+}
+
 /* L335: /v1/completions takes ONE text prompt -- a string or an array of one string.  A batch (an array of more than
  * one prompt), token ids, an empty array or a non-string refuse by name; they used to read as their first element
  * (the rest of the batch dropped) or as "". */
@@ -15280,6 +15389,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_parse_completion_request_refuses_logprobs();
     test_parse_completion_prompt_shapes();
     test_embeddings_dimensions_compare_as_numbers();
+    test_encode_executor_queue();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();

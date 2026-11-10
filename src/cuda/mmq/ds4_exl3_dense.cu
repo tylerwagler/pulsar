@@ -509,7 +509,9 @@ exl3_dense_kernel(const dense_set P, int M, int K) {
 
 /** The calling thread's counter slice for (device, stream): kernels on one
  *  stream are serialised and two threads never share a slice, so no two live
- *  launches meet on a counter.  nullptr once the pool is spent (a refusal). */
+ *  launches meet on a counter.  nullptr once the pool is spent (a refusal).
+ *  A slice is never handed back: the pool is sized for LONG-LIVED submitting threads (the chat server's worker, the
+ *  encoder server's one GPU thread an engine -- encode_server.cpp, L374), never for a thread a request. */
 /// @param stream  the stream the launch will run on
 /// @return         that slice's kMaxCounters counters, or nullptr when the pool is spent
 unsigned *counter_slice(cudaStream_t stream) {
