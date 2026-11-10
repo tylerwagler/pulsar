@@ -1244,7 +1244,8 @@ int server::kv_restore_slice(kv_restore *r, int k) {
             : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
     };
     /* L353 no. 12: images come back to the pool at their commits.  A transient failure with writes in flight waits for
-     * them and tries once more: milliseconds, against a re-prefill from 0 */
+     * them and tries once more: milliseconds, against a re-prefill from 0.  L375 (O25): only the pool's (2) -- a read
+     * that failed (3) is nothing the writer's backlog clears, and the worker does not stand behind it */
     (void)kv_cache_commit_written(&s->kv);
     int rc = slice();
     if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();

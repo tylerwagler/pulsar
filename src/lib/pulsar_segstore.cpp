@@ -124,6 +124,9 @@ struct pulsar_segstore {
     std::unordered_map<std::string, image> loan_rp;
     /// L347 I3a: parts mapped for a load (pulsar_segstore_map_part; hold_name), with their count: RAM eviction skips them
     std::unordered_map<std::string, int> held;
+    /// L375 (O25): consecutive persistent read failures of a part (hold_name), for PULSAR_SEGSTORE_READ_FAILS_MAX;
+    /// erased by a read that succeeds, by the drop, and with the key
+    std::unordered_map<std::string, int> read_fails;
     /** @param key a key  @param rp its restore point (else its rows)  @return the part's name in `held` */
     static std::string hold_name(const std::string &key, bool rp) { return rp ? key + ".rp" : key; }
     /// L347 I3a: restore point writes in flight (pulsar_segstore_reserve_rp): key -> flags joined while it flies
@@ -356,6 +359,8 @@ struct pulsar_segstore {
         heads.erase(key);
         img_drop(ram_rows, key);   /* L347 I3a: its RAM copies go with it */
         img_drop(ram_rp, key);
+        read_fails.erase(hold_name(key, false));
+        read_fails.erase(hold_name(key, true));
         {
             std::lock_guard<std::mutex> lk(segs_mu);
             segs.erase(it);
@@ -438,6 +443,7 @@ struct pulsar_segstore {
         logf("dropped restore point %s at %u, %llu bytes: %s", e.key, e.G, (unsigned long long)e.rp_bytes, why);
         ::unlink(rp_path(e.key).c_str());
         img_drop(ram_rp, e.key);   /* L347 I3a */
+        read_fails.erase(hold_name(e.key, true));
         used -= e.rp_bytes;
         e.rp_bytes = 0;
         e.rp_flags = 0;
@@ -1435,13 +1441,27 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
     }
     if (fd >= 0) close(fd);
     /* L353 no. 13: a file that is there but can't be read now (EMFILE, ENOMEM, EIO) is no fault of its content: 1 would
-     * drop the key and everything under it */
+     * drop the key and everything under it.  L375 (O25): it is 3, not the pool's 2 -- the reader does not wait on the
+     * writer's backlog for it -- and an errno that is not a passing shortage counts: a part that fails
+     * PULSAR_SEGSTORE_READ_FAILS_MAX reads in a row is a fault (it was re-read, failed and re-prefilled on every
+     * request, for ever).  A shortage (EMFILE, ENFILE, ENOMEM, ENOBUFS, EAGAIN) never counts and never drops. */
+    const std::string part_name = pulsar_segstore::hold_name(k, rp);
     if (rd_errno && rd_errno != ENOENT) {
-        snprintf(err, errlen, "%s %s can't be read now: %s", rp ? "restore point" : "segment", path.c_str(),
-                 strerror(rd_errno));
+        const bool shortage = rd_errno == EMFILE || rd_errno == ENFILE || rd_errno == ENOMEM || rd_errno == ENOBUFS ||
+                              rd_errno == EAGAIN;
+        const int fails = shortage ? 0 : ++st->read_fails[part_name];
         st->img_free(img);
-        return 2;
+        if (fails >= PULSAR_SEGSTORE_READ_FAILS_MAX) {
+            st->read_fails.erase(part_name);
+            snprintf(err, errlen, "%s %s: its read failed %d times in a row (%s)", rp ? "restore point" : "segment",
+                     path.c_str(), fails, strerror(rd_errno));
+            return 1;
+        }
+        snprintf(err, errlen, "%s %s can't be read now: %s%s", rp ? "restore point" : "segment", path.c_str(),
+                 strerror(rd_errno), shortage ? "" : " (counted: a part that keeps failing is dropped)");
+        return 3;
     }
+    st->read_fails.erase(part_name);
     const char *why = nullptr;
     if (rd_errno) why = strerror(rd_errno);
     else if (got != file_bytes) why = "its size is not the indexed size";

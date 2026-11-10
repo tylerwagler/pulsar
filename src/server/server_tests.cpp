@@ -9292,7 +9292,9 @@ static void test_l353_small_fixes(void) {
         TEST_ASSERT(!s.terminal_checkpoint_step());
         TEST_ASSERT(!s.slots[0].terminal_pending);
     }
-    /* 13: a file that can't be opened now is transient (2): it and its descendants stay; a missing one is a fault (1) */
+    /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
+     * L375 (O25): transient is 3 -- a read that failed now -- not the RAM pool's 2, which the reader waits on the
+     * writer's commits for; a shortage (EMFILE) never counts towards a drop, however often */
     char tmpl[] = "/tmp/pulsar-l353-errno.XXXXXX";
     char *dir = l323_tmpdir(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -9313,15 +9315,46 @@ static void test_l353_small_fixes(void) {
         if (fd < 0) break;
         held.push_back(fd);
     }
-    const int rc_emfile = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
+    int rc_emfile[PULSAR_SEGSTORE_READ_FAILS_MAX + 2];
+    for (int &rc : rc_emfile)
+        rc = pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err);
     for (const int fd : held) close(fd);
     TEST_ASSERT(setrlimit(RLIMIT_NOFILE, &was) == 0);
-    TEST_ASSERT(rc_emfile == 2);
+    for (const int rc : rc_emfile) TEST_ASSERT(rc == 3);
     char path[600];
     snprintf(path, sizeof path, "%s/%.40s.seg", dir, key);
     TEST_ASSERT(access(path, F_OK) == 0 && pulsar_segstore_contains(st, key));
+    TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 0);
+    pulsar_segstore_unmap_part(st, key, PULSAR_SEGSTORE_PART_ROWS);
     TEST_ASSERT(unlink(path) == 0);
     TEST_ASSERT(pulsar_segstore_map_part(st, key, PULSAR_SEGSTORE_PART_ROWS, &payload, &bytes, NULL, err, sizeof err) == 1);
+    /* L375 (O25): a read that keeps failing with a persistent errno (the file's name taken by a directory) is 3 --
+     * through a chain read too, which keeps the segment -- until it has failed PULSAR_SEGSTORE_READ_FAILS_MAX times in
+     * a row: then it is a fault and the chain read drops it.  A read that succeeds starts the count again. */
+    char key2[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "a second segment", 256, 2, key2) && l323_put_rp(st, key2, 128));
+    pulsar_segstore_seg chain[1];
+    TEST_ASSERT(pulsar_segstore_get(st, key2, &chain[0]));
+    char bak[640];
+    snprintf(path, sizeof path, "%s/%.40s.seg", dir, key2);
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    const pulsar_kvchain_segment_checker pass = [](void *, const uint8_t *, uint64_t, bool, const uint8_t *, uint64_t,
+                                                   char *, size_t) { return PULSAR_SEGMENT_OK; };
+    const auto check = [&]() {
+        int nx = 0;
+        return pulsar_kvchain_verify_slice_with(st, chain, 1, &nx, 1, pass, NULL, err, sizeof err);
+    };
+    const auto break_file = [&]() { return rename(path, bak) == 0 && mkdir(path, 0700) == 0; };
+    TEST_ASSERT(check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && strstr(err, "can't be read now") && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0 && rename(bak, path) == 0 && check() == 0);
+    TEST_ASSERT(break_file());
+    for (int i = 0; i < PULSAR_SEGSTORE_READ_FAILS_MAX - 1; i++)
+        TEST_ASSERT(check() == 3 && pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(check() == 1 && strstr(err, "times in a row") && !pulsar_segstore_contains(st, key2));
+    TEST_ASSERT(rmdir(path) == 0);
     pulsar_segstore_close(st);
     l323_rmdir(dir);
 }
