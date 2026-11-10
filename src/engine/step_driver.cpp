@@ -506,10 +506,13 @@ int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32
 /* The family's sync is the core's (sync_driver.cpp, L272 P2) over these: the bank's position is the declared state's
  * authority, a reset clears the bank's state, the prefill is pulsar_driver_prefill, and the shape is the session's
  * cap with no alignment (a cut anywhere is the cold bytes: the plan's split_invariant). */
-/** The sync's agreement test: the live bank's declared position is the view's length.  @param s the session
+/** The sync's agreement test: the live bank's declared position is the view's length and its frontier is not stale
+ *  (L375 O45: a segment chain without its last restore wrote the pools, not the lanes -- the counters say G, the
+ *  state is no position's, and only a restore or a reset makes it one).  @param s the session
  *  @return true when they agree */
 bool pulsar_driver_sync_state_agrees(pulsar_session *s) {
-    return s->states->bank_pos[s->states->live_bank] == (uint32_t)s->checkpoint.len;
+    const pulsar_state_set *ss = s->states;
+    return ss->bank_pos[ss->live_bank] == (uint32_t)s->checkpoint.len && !ss->frontier_stale[ss->live_bank];
 }
 
 /** The sync's bank reset: the live bank's declared state starts over.  @param s the session
@@ -552,6 +555,22 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
     return 0;
 }
 
+/* L375 O45: a decode or verify row on a bank whose frontier is stale (pulsar_state_set::frontier_stale: a segment
+ * chain's pools without the lanes its last restore brings) would run on a state that is no position's -- the position
+ * counter alone says the bank stands where the row asks.  Refused by name; a restore or a reset clears the mark. */
+/// @param s      the session
+/// @param bank   the row's bank, < the pool's count
+/// @param what   the step's kind, for the message
+/// @param err    receives the refusal when non-NULL
+/// @param errlen bytes of `err`
+/// @return true (err filled) when the bank is stale
+static bool driver_bank_stale(pulsar_session *s, uint32_t bank, const char *what, char *err, size_t errlen) {
+    if (!s->states->frontier_stale[bank]) return false;
+    if (err) snprintf(err, errlen, "%s: a %s row on bank %u, whose frontier is stale (a segment chain without its "
+                                   "last restore); re-sync the bank first", ARCH(s->engine), what, bank);
+    return true;
+}
+
 /* L334 P2a: a request row's position is typed at the API (pulsar_multiseq_req.pos, TokPos); the driver bodies below
  * read it raw (.raw()) into their int32 rows until P2b types them. */
 /** pulsar_family_session_ops::decode_multiseq for a driver family: one row per bank, each at its bank's next
@@ -582,6 +601,7 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
                               reqs[i].bank, reqs[i].pos.raw());
             return 1;
         }
+        if (driver_bank_stale(s, reqs[i].bank, "decode", err, errlen)) return 1;
         for (uint32_t j = 0; j < i; j++) {
             if (reqs[j].bank == reqs[i].bank) {
                 if (err) snprintf(err, errlen, "%s: bank %u has two rows in one decode step", ARCH(e), reqs[i].bank);
@@ -633,6 +653,7 @@ static bool driver_verify_rows(pulsar_session *s, const pulsar_multiseq_req *req
                               ARCH(s->engine), i, b, reqs[i].pos.raw());
             return false;
         }
+        if (run_start && driver_bank_stale(s, b, "verify", err, errlen)) return false;
         tok[i] = reqs[i].token;
         pos[i] = reqs[i].pos.raw();
         bk[i] = (int32_t)b;
@@ -781,6 +802,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         const pulsar_image_identity *img = b < ss->n_banks ? pulsar_session_bank_images(s, b, ss->live_bank) : NULL;
         const char *why = b >= ss->n_banks                            ? "is outside the pool"
                           : p0 != 0 && (uint32_t)p0 != ss->bank_pos[b] ? "holds a different position"
+                          : p0 != 0 && ss->frontier_stale[b]           ? "has a stale frontier (a segment chain "
+                                                                         "without its last restore)"
                           : (uint64_t)p0 + m > ss->ctx                 ? "has no room"
                           : p0 == 0 && img && img->n                   ? "still holds image blocks (invalidate it first)"
                                                                        : NULL;
@@ -799,7 +822,8 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
             if (err) snprintf(err, errlen, "%s: fused step: bank %u could not be reset", ARCH(e), b);
             return -1;
         }
-        canonical[r] = ss->prefill_pos[b] == (uint32_t)reqs[first[r]].pos.raw() && !ss->frontier_stale[b];
+        /* (no stale bank reaches here: a run from 0 just reset its bank, any other was refused above) */
+        canonical[r] = ss->prefill_pos[b] == (uint32_t)reqs[first[r]].pos.raw();
     }
     pulsar_driver_heads hl = pulsar_driver_heads_span(0, n_dec);
     for (uint32_t r = 0; r < n_pf; r++)
