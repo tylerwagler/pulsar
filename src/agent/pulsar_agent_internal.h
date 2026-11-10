@@ -135,6 +135,8 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 /// Bytes of output a bash job's first observation shows from the head.
 #define AGENT_BASH_HEAD_BYTES (8*1024)
+/// Sampled tokens between two polls of the bash jobs while a turn generates (agent_bash_jobs_poll).
+#define AGENT_BASH_POLL_TOKENS 64
 /// Bash jobs tracked at once (running, or finished and not yet observed); agent_bash_start refuses one more.
 #define AGENT_BASH_JOBS_MAX 64
 /// Lines of output a bash job's first observation shows from the head.
@@ -1758,7 +1760,8 @@ void agent_bash_teardown_install(bool with_sigint);
 void agent_bash_jobs_free(agent_worker *w);
 /** L373: poll every job once (agent_bash_job::poll: drain its pipe, reap it, apply its timeout_sec), so a job the
  *  model stopped asking about neither blocks on a full pipe nor outlives its timeout.  The worker thread calls it
- *  at the top of every tool round and once a second while it idles with a job running.
+ *  at the top of every tool round, at every prefill chunk of a turn, every AGENT_BASH_POLL_TOKENS sampled tokens,
+ *  and once a second while it idles with a job running.
  *  @param w the worker
  *  @return true while any job is still running */
 bool agent_bash_jobs_poll(agent_worker *w);

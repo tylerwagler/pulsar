@@ -79,6 +79,20 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 
 
 
+/** @brief A turn's prefill progress hook: worker_progress_cb, after polling the bash jobs at each prefill chunk (the
+ *  session calls it from pulsar_session_sync, on this thread), so a long prefill keeps them drained and timed out.
+ *  @param ud      the worker
+ *  @param event   the progress event
+ *  @param current tokens prefilled so far
+ *  @param total   the prompt's tokens */
+static void worker_turn_progress_cb(void *ud, const char *event, int current, int total) {
+    agent_worker *w = (agent_worker *)ud;
+    if (w->bash_jobs && !strcmp(event, "prefill_chunk")) agent_bash_jobs_poll(w);
+    worker_progress_cb(ud, event, current, total);
+}
+
+
+
 /** @brief End a turn whose compaction did not complete: idle after an interrupt, else the error.
  *  @param w   the worker
  *  @param err the compaction's reason ("interrupted", or why it failed; empty = a generic message)
@@ -226,7 +240,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         char err[160];
-        pulsar_session_set_progress(w->session, worker_progress_cb, w);
+        pulsar_session_set_progress(w->session, worker_turn_progress_cb, w);
         pulsar_session_set_display_progress(w->session, worker_progress_cb, w);
         pulsar_session_set_cancel(w->session, worker_cancel_session_cb, w);
         int sync_rc = pulsar_session_sync(w->session, prompt_for_sync, err, sizeof(err));
@@ -298,6 +312,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
+            /* L373: a long generation keeps running jobs drained and timed out too */
+            if (w->bash_jobs && generated % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
