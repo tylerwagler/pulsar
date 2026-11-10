@@ -8,7 +8,12 @@
  * host path left the engine (L302), this file kept its compiled behaviour as the oracle; the gate's first run
  * proved it byte-identical to the engine's own sampler on every case before the engine's copy was deleted.
  *
- * Do not "fix" or modernise anything here: it is a record of what the engine did. */
+ * Do not "fix" or modernise anything here: it is a record of what the engine did.
+ *
+ * ONE RULE WAS ADDED SINCE (L375, audit O61): a row holding a NaN or a +Inf logit is a broken row and refuses
+ * (sample_row_broken), where the frozen sampler skipped such a value like a -inf hole and drew from the rest.  The
+ * test runs ahead of the frozen code, on the row's bits, so every row it lets through takes the frozen arithmetic
+ * unchanged. */
 #include "sampler_host_ref.h"
 
 #include <math.h>
@@ -38,7 +43,17 @@ static inline bool sample_finite_bits(float v) {
     return (b & 0x7f800000u) != 0x7f800000u;
 }
 
+bool sample_row_broken(const float *logits, uint32_t n_vocab) {
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        uint32_t b;
+        memcpy(&b, &logits[i], sizeof(b));
+        if ((b & 0x7f800000u) == 0x7f800000u && b != 0xff800000u) return true;   /* NaN or +Inf; -inf is the mask */
+    }
+    return false;
+}
+
 int sample_argmax(const float *logits, uint32_t n_vocab) {
+    if (sample_row_broken(logits, n_vocab)) return -1;   /* L375: a broken row has no argmax */
     constexpr uint32_t BLOCK = 256u, LANES = 8u;
     int best = -1;
     float best_v = 0.0f;
@@ -385,6 +400,8 @@ int pulsar_sample_dist_build(const float *logits, uint32_t n_vocab,
      * once, for all three. */
     if (!isfinite(temperature) || !isfinite(top_p) || !isfinite(min_p))
         return sample_dist_refuse(out, n_vocab, "a sampling knob is not finite");
+    if (sample_row_broken(logits, n_vocab))   /* L375 */
+        return sample_dist_refuse(out, n_vocab, "a NaN or +Inf logit");
     if (temperature <= 0.0f) {
         const int best = sample_argmax(logits, n_vocab);
         if (best < 0) return sample_dist_refuse(out, n_vocab, "no finite logit");

@@ -91,12 +91,17 @@ static void agent_tool_calls_push(agent_tool_calls *calls, agent_tool_call *call
 
 
 
-const char *agent_tool_arg_value(const agent_tool_call *call, const char *name) {
+const agent_tool_arg *agent_tool_arg_find(const agent_tool_call *call, const char *name) {
     for (int i = 0; i < call->argc; i++) {
-        if (call->args[i].name && !strcmp(call->args[i].name, name))
-            return call->args[i].value ? call->args[i].value : "";
+        if (call->args[i].name && !strcmp(call->args[i].name, name)) return &call->args[i];
     }
     return NULL;
+}
+
+const char *agent_tool_arg_value(const agent_tool_call *call, const char *name) {
+    const agent_tool_arg *a = agent_tool_arg_find(call, name);
+    if (!a) return NULL;
+    return a->value ? a->value : "";
 }
 
 

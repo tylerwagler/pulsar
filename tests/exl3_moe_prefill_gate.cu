@@ -442,7 +442,9 @@ static void section_case(const shape &sh, bool gate, int k2, int n_tok, int fmt,
             ac.format = a.format; ac.K = K;
             const int r0 = per_pair ? t0 * sh.topk : t0, r1 = per_pair ? t1 * sh.topk : t1;
             ac.rows = r1 - r0;
-            ac.v.assign(a.v.begin() + (size_t)r0 * K, a.v.begin() + (size_t)r1 * K);
+            /* constructed, not assign()ed: GCC 15 on x86 reads assign() into the empty vector as a memmove to null
+             * (-Wnonnull, a false positive; L366 CI) */
+            ac.v = std::vector<float>(a.v.begin() + (size_t)r0 * K, a.v.begin() + (size_t)r1 * K);
             if (fmt == EXL3_MOE_ACT_E4M3_SLOT) {
                 ac.kbp = a.kbp;
                 ac.q.assign(a.q.begin() + (size_t)r0 * K, a.q.begin() + (size_t)r1 * K);

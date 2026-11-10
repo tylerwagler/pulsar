@@ -41,21 +41,31 @@ static bool agent_worker_should_compact(agent_worker *w) {
 /// @return its id, or -1 when it is not exactly one token
 static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
-    pulsar_tokenize_rendered_chat(engine, rendered, &t);
-    int id = t.len == 1 ? t.v[0] : -1;
+    const bool encoded = pulsar_tokenize_rendered_chat(engine, rendered, &t);
+    int id = encoded && t.len == 1 ? t.v[0] : -1;
     pulsar_tokens_free(&t);
     return id;
 }
 
 
 
-/* Pick a recent verbatim tail for the compacted transcript.  Prefer a user
- * boundary inside the budget so the rebuilt context starts at a natural turn. */
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom) {
+    for (int i = target; m && i < bottom; i++) {
+        if (pulsar_turn_marker_at(m, v, bottom, i) == 1) return i;
+    }
+    return bottom;
+}
+
+
+
+/* Pick a recent verbatim tail for the compacted transcript: it starts at a user turn inside the budget, so the
+ * rebuilt context continues at a turn the summary can stand in front of. */
 /// @brief Where the verbatim tail of a compacted transcript starts (see above).
 /// @param w       the worker (its transcript and ctx_size)
 /// @param bottom  end of the region to keep, token index (exclusive)
 /// @param sys_len tokens of the system prompt, never cut into
-/// @return the first user-turn marker in [bottom - budget, bottom), else bottom - budget (clamped to sys_len)
+/// @return agent_compact_tail_cut over [bottom - budget, bottom) (clamped to sys_len): `bottom`, no tail, when no
+///         user turn starts there
 static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int tail_budget = w->cfg->gen.ctx_size / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
@@ -66,12 +76,8 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     if (target < sys_len) target = sys_len;
 
     pulsar_turn_markers markers;
-    if (!pulsar_chat_turn_markers(w->engine, &markers)) return target;
-
-    for (int i = target; i < bottom; i++) {
-        if (pulsar_turn_marker_at(&markers, w->transcript.v, bottom, i) == 1) return i;
-    }
-    return target;
+    const bool spelled = pulsar_chat_turn_markers(w->engine, &markers);
+    return agent_compact_tail_cut(spelled ? &markers : NULL, w->transcript.v, target, bottom);
 }
 
 
@@ -142,10 +148,18 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char *prompt_text = agent_compact_make_prompt(reason);
     pulsar_tokens prompt = {0};
     pulsar_tokens_copy(&prompt, &w->transcript);
-    agent_worker_close_open_turn(w, &prompt);   /* L365: the private request never lands inside an open turn */
     const pulsar_chat_message request = {"user", prompt_text, false};
-    agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
+    /* L365: the private request never lands inside an open turn */
+    const bool request_taken = agent_worker_close_open_turn(w, &prompt) &&
+                               agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
+    if (!request_taken) {
+        snprintf(err, err_len, "the chat front refused the compaction request (its reason is on stderr)");
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&sys);
+        agent_publish(w, "\x1b[0m\n", 5);
+        return false;
+    }
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -218,6 +232,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
             worker_clear_interrupt(w);
             return false;
         }
+        /* L373: the summary's decode polls the bash jobs as a turn's does (a compaction runs on the worker thread) */
+        if (w->bash_jobs && i > 0 && i % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
         int token = pulsar_session_argmax(w->session);
         if (pulsar_token_is_stop(w->engine, token)) break;
         if (token == think_end_id || token == dsml_id) {
@@ -274,9 +290,16 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
     const pulsar_chat_message summary_note = {"system", summary_msg.ptr, false};
-    pulsar_chat_append_turn(w->engine, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
+    const bool summary_taken = agent_chat_append_turn(w, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
     free(summary_msg.ptr);
     free(summary.ptr);
+    if (!summary_taken) {
+        snprintf(err, err_len, "the tokenizer refused the compaction summary (its reason is on stderr)");
+        pulsar_session_invalidate(w->session);
+        pulsar_tokens_free(&compacted);
+        pulsar_tokens_free(&sys);
+        return false;
+    }
 
     agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
 
@@ -302,7 +325,8 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     if (bash_update) {
         /* L365: a tool message answers an open turn's calls where calls continue the turn (Gemma); with none
          * open there, the observation is the user's note */
-        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) || w->model_turn_open;
+        const bool as_tool = !pulsar_chat_calls_continue_turn(w->engine) ||
+                             agent_worker_turn_open(w, &w->transcript);
         agent_turn_add(w, as_tool ? "tool" : "user", bash_update, false);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
@@ -365,7 +389,11 @@ int worker_force_generated_text(agent_worker *w,
                                        char *err,
                                        size_t err_len) {
     pulsar_tokens tokens = {0};
-    pulsar_tokenize_text(w->engine, text, &tokens);
+    if (!pulsar_tokenize_text(w->engine, text, &tokens)) {
+        snprintf(err, err_len, "the tokenizer refused the forced text %s", text);
+        pulsar_tokens_free(&tokens);
+        return 1;
+    }
     if (tokens.len > max_tokens - *generated) {
         snprintf(err, err_len, "not enough generation room to force %s", text);
         pulsar_tokens_free(&tokens);

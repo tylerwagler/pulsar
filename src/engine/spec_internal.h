@@ -58,6 +58,13 @@ typedef struct pulsar_spec_round {
     spec_redraft_req redraft;   ///< L150: batched-lane deferred redraft (see the typedef)
 } pulsar_spec_round;
 
+/** The batch round end's deferred banked absorb (session_spec.cpp): the drafter absorbs every bank's committed rows
+ *  in one pass; on a refusal each bank that had rows fails its step and loses its view.
+ *  @param s     the session, seed_defer filled by the round ends
+ *  @param steps [n] the batch's steps
+ *  @param n     steps */
+void pulsar_spec_absorb_deferred(pulsar_session *s, pulsar_spec_step *steps, int n);
+
 /* ---- the core's helpers the implementations use ---- */
 /** The width of every host logits row the round API reads or stores (the engine's logits width). */
 /// @param s the session
@@ -71,6 +78,16 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s);
 /// @param e the engine
 /// @return the threshold in force, in [0, 1]; 0 = no stop
 float pulsar_spec_tau(const pulsar_engine *e);
+/** One environment override of the draft schedule (PULSAR_SPEC_DEPTH, PULSAR_SPEC_TAU), read at the engine's open:
+ *  the ONE parse of both.  A value that is not a number (an integer when `integer`) nor `word` is refused by name --
+ *  it never reads as 0, the drafter's own.
+ *  @param name    the variable
+ *  @param word    a word accepted in place of a number ("off"), or NULL
+ *  @param integer the number must be an integer in int's range
+ *  @param set     receives true when the variable is set (not empty)
+ *  @param value   receives the number; 0 when unset or `word`
+ *  @return false (said) when the variable is set to something else */
+bool pulsar_spec_env_number(const char *name, const char *word, bool integer, bool *set, double *value);
 /** THE stop rule (spec_ops.h): a draft whose confidence is under tau is its chain's last (tau <= 0: none is). */
 /// @param conf the draft's confidence (negative = none: never stops)
 /// @param tau the threshold

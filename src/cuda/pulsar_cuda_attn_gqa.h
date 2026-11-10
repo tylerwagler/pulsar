@@ -177,7 +177,24 @@ typedef struct {
      *  any group (each row's arithmetic is the one-row CTA's); rows of different sequences in a group each load their
      *  own keys. */
     int           decode_group;
+    /** O59 (L375): the non-finite flag of the step this call belongs to -- a device uint32 the caller zeroes before
+     *  the step and reads after it (the routed experts' flag: one word a step).  Where the tensor-core arms widen
+     *  their bf16 operands to fp16 for the MMA (a build below sm_80: pulsar_gqa_widens), a q / k / v operand -- or a
+     *  relative bias's r / table -- that is not finite as fp16 (a finite bf16 above 65504 in magnitude, or one that
+     *  was inf / NaN already) CASes nf_code into it, first writer wins, and the caller refuses the step: the call's
+     *  output is not the attention's.  In-range operands widen exactly and the bytes are what they were.  A build for
+     *  sm_80+ carries bf16 operands exactly and never writes it.  pulsar_gqa_launch needs it on a widening build
+     *  (NULL, or a zero code, refuses); pulsar_gqa_forward given NULL keeps the word in its own workspace and reads
+     *  it back itself (-4).  The flash-decoding arm (f32 on the CUDA cores) and pulsar_gqa_store widen nothing. */
+    uint32_t     *nf_flag;
+    /** The code a flagged call records in *nf_flag: nonzero, the caller's (it names the layer). */
+    uint32_t      nf_code;
 } pulsar_gqa_io;
+
+/** Whether this build's tensor-core arms widen bf16 operands to fp16 (device code below sm_80), i.e. whether a
+ *  launch can write pulsar_gqa_io::nf_flag: a caller that owns the flag need not read it back otherwise.
+ *  @return 1 on a widening build, else 0 */
+int pulsar_gqa_widens(void);
 
 /** L338: an instrument's forced flash-decoding CTA shape -- `rows` rows x `heads` query heads of one KV head (1 x 1,
  *  1 x 2, 1 x 4, 2 x 2: the pick's shapes; a call whose layer's G the heads do not divide refuses); 0, 0 = the
@@ -212,7 +229,9 @@ uint64_t pulsar_gqa_workspace_bytes(const pulsar_gqa_layer *layer, uint32_t n_ro
  *  at its frontier (every earlier position was written by an earlier call).
  *  Writes the rows' KV into the sequences' pools.
  *  @return 0 on success, -1 on a refused contract (named on stderr, nothing
- *  launched), -3 on a launch failure. */
+ *  launched), -3 on a launch failure, -4 when the call was given no nf_flag and
+ *  an operand left fp16's range on a widening build (named; the output and the
+ *  rows it stored are not the attention's). */
 /// @param layer the layer's declaration.
 /// @param seqs the sequences' pools (host array).
 /// @param n_seqs entries in seqs.

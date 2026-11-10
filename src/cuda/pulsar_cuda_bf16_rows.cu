@@ -403,13 +403,7 @@ int pulsar_bf16_moe_routed_launch(const pulsar_bf16_moe &w, const int32_t *sel, 
     fprintf(stderr, "%s: built without the MMQ drivers whose schedule it rides -- refusing\n", tag);
     return -1;
 #else
-    static int mmq_ready = -1;   /* the schedule's device-info singleton */
-    if (mmq_ready < 0) {
-        int dev = 0;
-        (void)cudaGetDevice(&dev);
-        mmq_ready = ds4_mmq_init(dev) == 0 ? 1 : 0;
-    }
-    if (!mmq_ready) {
+    if (!ds4_mmq_ready()) {   /* the schedule's device-info singleton, asked of the current device (L375, O56) */
         fprintf(stderr, "%s: the MMQ drivers are unavailable on this device -- refusing\n", tag);
         return -1;
     }

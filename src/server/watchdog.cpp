@@ -33,6 +33,10 @@ int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int lim
     return s >= limit_s ? s : 0;
 }
 
+bool server_watchdog_busy(const server *s) {
+    return s->n_generating > 0 || s->n_queued > 0 || server_judge_queued(s);
+}
+
 namespace {
 
 /* The worker's backtrace, written by the worker itself from the signal (backtrace_symbols_fd allocates nothing).
@@ -108,9 +112,9 @@ const char *phase_name(int ph) {
 }
 
 /** The watchdog thread: once a second, compare the worker's mark count (g_pulsar_stall.beats) with the last seen;
- *  with jobs queued or running (read under server::mu by trylock: a held mu keeps the last answer) and no mark
- *  for server::stall_limit_s seconds, publish server::stall_s and dump once (server::watchdog_dump) until a mark
- *  clears it.  Runs until server::watchdog_quit.
+ *  with work for the worker (server_watchdog_busy, read under server::mu by trylock: a held mu keeps the last
+ *  answer) and no mark for server::stall_limit_s seconds, publish server::stall_s and dump once
+ *  (server::watchdog_dump) until a mark clears it.  Runs until server::watchdog_quit.
  *  @param arg the server
  *  @return NULL */
 void *watchdog_main(void *arg) {
@@ -134,7 +138,7 @@ void *watchdog_main(void *arg) {
         /* jobs queued or running?  The worker does not hold mu across a CUDA call, but if it ever does, a mu that
          * stays taken is itself a sign: keep the last answer, busy unless it was known idle */
         if (pthread_mutex_trylock(&s->mu) == 0) {
-            busy = s->n_generating > 0 || s->n_queued > 0;
+            busy = server_watchdog_busy(s);
             pthread_mutex_unlock(&s->mu);
         }
         const int64_t stalled = server_stall_seconds(now, beat_ms, busy, s->stall_limit_s);
@@ -232,9 +236,10 @@ void server::watchdog_dump(int64_t stalled_s) {
         server_log(PULSAR_LOG_DEFAULT, "pulsar-server: STALL:   mu is held (by the worker?): no queue / slot snapshot");
     } else {
         server_log(PULSAR_LOG_DEFAULT,
-                   "pulsar-server: STALL:   queue %d waiting, %d running; KV touched %.2f GiB, reserved %.2f GiB, "
+                   "pulsar-server: STALL:   queue %d waiting, %d running%s; KV touched %.2f GiB, reserved %.2f GiB, "
                    "guard budget %.2f GiB (ceiling %.2f); MemAvailable %.2f GiB, floor %.2f GiB, %s",
-                   s->n_queued, s->n_generating, (double)s->m_kv_touched.raw() / gib,
+                   s->n_queued, s->n_generating, server_judge_queued(s) ? ", a /v1/systemone request with the judge" : "",
+                   (double)s->m_kv_touched.raw() / gib,
                    (double)s->m_kv_reserved.raw() / gib, (double)s->m_kv_budget.raw() / gib,
                    (double)s->guard_touched_ceiling.raw() / gib, (double)avail / gib,
                    (double)server_mem_floor().raw() / gib, swap);
@@ -243,9 +248,9 @@ void server::watchdog_dump(int64_t stalled_s) {
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: STALL:   slot %d bank %d: %s, position %d of %d, prefill %d/%d%s%s", i,
-                       s->slots[i].bank, phase_name(ph), s->m_slot_pos[i],
+                       s->m_slot_bank[i], phase_name(ph), s->m_slot_pos[i],
                        s->m_slot_ctx[i], s->m_slot_prefill_done[i], s->m_slot_prefill_total[i],
-                       s->slots[i].spilled ? ", spilled" : "", s->slots[i].preempted ? ", preempted" : "");
+                       s->m_slot_spilled[i] ? ", spilled" : "", s->m_slot_preempted[i] ? ", preempted" : "");
         }
         pthread_mutex_unlock(&s->mu);
     }

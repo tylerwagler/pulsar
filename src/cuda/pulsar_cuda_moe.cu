@@ -1242,13 +1242,12 @@ static int routed_moe_try_mmq_gate_up(
      * 42 (our Phase-0 SoA) is a DIFFERENT layout and is not MMQ-consumable. */
     if (gate_type != (uint32_t)PULSAR_TENSOR_IQ2_XXS_MMQ_K) return 0;   /* the only MMQ type */
     if (!mid || !mid->ptr || (expert_mid_dim % 32u) != 0u) return 0;
-    /* One-shot: ds4_mmq_init selects the device and populates the ggml
-     * device-info singleton the MMQ launchers read. */
-    static int mmq_ready = -1;
-    if (mmq_ready < 0) {
-        int dev = 0;
-        (void)cudaGetDevice(&dev);
-        mmq_ready = (ds4_mmq_init(dev) == 0) ? 1 : 0;
+    /* ds4_mmq_init populates the ggml device-info singleton the MMQ launchers read: once per device (L375, O56 --
+     * it was one process-wide flag), said the first time. */
+    const int mmq_ready = ds4_mmq_ready();
+    static bool mmq_said = false;
+    if (!mmq_said) {
+        mmq_said = true;
         fprintf(stderr, "pulsar: MMQ routed gate/up %s\n", mmq_ready ? "ready" : "unavailable");
     }
     if (!mmq_ready) return 0;

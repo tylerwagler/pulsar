@@ -179,6 +179,13 @@ bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank) {
     return s && s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid;
 }
 
+void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank) {
+    if (bank == pulsar_session_live_bank(s)) s->checkpoint_valid = false;
+    /* the carry too, also the live bank's: a caller that drops the live view (installs a bank without saving this one)
+     * brings the carry back */
+    if (pulsar_bank_carry_saved(s, bank)) s->bank_carry[bank].checkpoint_valid = false;
+}
+
 bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
     if (!s || !s->bank_carry || bank >= s->bank_carry_n || !s->bank_carry[bank].valid) return false;
     const pulsar_bank_carry *c = &s->bank_carry[bank];

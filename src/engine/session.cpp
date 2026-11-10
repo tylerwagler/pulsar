@@ -172,7 +172,13 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
         char *prompt_text = imatrix_trim_block(start, end);
         if (prompt_text[0] != '\0') {
             token_vec prompt = {0};
-            pulsar_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (!pulsar_tokenize_rendered_chat(e, prompt_text, &prompt)) {
+                fprintf(stderr, "pulsar: imatrix: the tokenizer refused prompt %d\n", prompts_done + 1);
+                token_vec_free(&prompt);
+                *end = saved;
+                ok = false;
+                break;
+            }
             if (prompt.len > ctx_size) prompt.len = ctx_size;
             if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
                 prompt.len = max_tokens - tokens_done;
@@ -650,15 +656,27 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
     /* The draft schedule's overrides (the numbers are the drafter's, spec_ops.h): the options, else the
      * environment pair, else 0 = the drafter's own. */
     e->spec_depth = opt->spec_depth;
+    e->spec_tau = opt->spec_tau;
+    bool env_set = false;
+    double env_value = 0.0;
     if (e->spec_depth <= 0) {
-        const char *v = getenv("PULSAR_SPEC_DEPTH");
-        e->spec_depth = v && v[0] ? atoi(v) : 0;
+        if (!pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &env_set, &env_value)) {
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        e->spec_depth = (int)env_value;   /* <= 0: the drafter's own */
     }
     if (e->spec_depth > 16) e->spec_depth = 16;
-    e->spec_tau = opt->spec_tau;
     if (e->spec_tau == 0.0f) {
-        const char *v = getenv("PULSAR_SPEC_TAU");
-        e->spec_tau = !v || !v[0] ? 0.0f : !strcmp(v, "off") ? -1.0f : (float)atof(v);
+        if (!pulsar_spec_env_number("PULSAR_SPEC_TAU", "off", false, &env_set, &env_value)) {
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        /* unset: the drafter's own; "off" or 0: no stop, as --spec-tau reads them (a numeric 0 used to read as
+         * unset here, against the flag and docs/SERVER.md); else the threshold */
+        e->spec_tau = !env_set ? 0.0f : env_value == 0.0 ? -1.0f : (float)env_value;
     }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))

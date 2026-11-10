@@ -164,21 +164,25 @@ bool pulsar_kvtext_text_ends_with_live(pulsar_engine *engine, const char *text,
     return text_eos == live_eos;
 }
 
-void pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
+bool pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
         const pulsar_text_span *spans,
         uint32_t n_spans,
-        pulsar_tokens *out) {
-    pulsar_tokens_copy(out, exact_prefix);
-
+        pulsar_tokens *out,
+        char *err, size_t errlen) {
     pulsar_tokens suffix = {};
     /* The suffix may start with DS4 chat markers such as <｜User｜> or
      * </think>, so use the rendered-chat tokenizer, not plain text BPE -- but
      * its CLIENT-DATA ranges stay plain text (L223). */
-    pulsar_tokenize_rendered_chat_spans(engine, suffix_text ? suffix_text : "",
-                                        spans, n_spans, &suffix);
+    if (!pulsar_tokenize_rendered_chat_spans(engine, suffix_text ? suffix_text : "", spans, n_spans, &suffix, err,
+                                             errlen)) {
+        pulsar_tokens_free(&suffix);
+        return false;   /* never the prefix alone: that is a truncated prompt */
+    }
+    pulsar_tokens_copy(out, exact_prefix);
     for (int i = 0; i < suffix.len; i++) pulsar_tokens_push(out, suffix.v[i]);
     pulsar_tokens_free(&suffix);
+    return true;
 }

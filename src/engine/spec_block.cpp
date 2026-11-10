@@ -550,16 +550,18 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
         kf.tokens = std::max(d->window, PULSAR_BLOCK_FULL_KEYS);
         d->decl_kv_full = pulsar_state_plan_add(p, kf);
     }
+    /* L375 O48: each layer's slot through the plan's bounded append -- a trunk that leaves too few slots writes none
+     * past the table and the family's load refuses the model (pulsar_state_plan_slots_fit) */
+    const uint32_t first = p->n_slots;
     for (uint32_t l = 0; l < d->n_layer; l++)
-        p->slot[p->n_slots + l] = 1u << (((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv);
+        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv));
     d->decl_anchor = UINT32_MAX;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {   /* the candidate head reads cn of the last committed row */
         pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
                                  (uint64_t)d->hidden * 2u, 0, 0, NULL, NULL, NULL};
         d->decl_anchor = pulsar_state_plan_add(p, anchor);
-        p->slot[p->n_slots] |= 1u << d->decl_anchor;
+        if (p->n_slots > first) p->slot[first] |= 1u << d->decl_anchor;   /* on the drafter's first layer slot */
     }
-    p->n_slots += d->n_layer;
     /* no lane counters to keep with the walk: the ring and the anchor ARE the drafter's state at the bank's frontier
      * (a draft writes neither) */
     p->drafter_at = NULL;
@@ -696,6 +698,8 @@ struct draft_layout {
      *  Bytes of the whole region. */
     /// SELECTOR: bf16 [R][rank], the selector's projected rows.
     uint64_t hp, anchor_ids, total;
+    /// u32: the pass's non-finite flag (pulsar_gqa_io::nf_flag, O59), zeroed with the pass's uploads.
+    uint64_t nf;
 };
 
 /// The rows front door's workspace for one multi-Linear call.
@@ -790,6 +794,7 @@ draft_layout draft_of(const pulsar_block_drafter *d) {
     L.scores = o; o += a256(NB * SL * d->topk * d->topk * 4u);
     L.chain_ids = o; o += a256(NB * SL * 4u);
     L.chain_rows = o; o += a256(NB * SL * 4u);
+    L.nf = o; o += 256u;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {
         L.pass = o; o += a256(NB * SL * E * 2u);
         L.anchor = o; o += a256(NB * E * 2u);
@@ -1234,6 +1239,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
     uint32_t bound = 256u;   /* the attention's bound: a graph is recaptured once per doubling of the context */
     while (bound <= last) bound *= 2u;
     bool ok = pulsar_gpu_tensor_write_async(l->arena, D.ids, l->h_tok, (uint64_t)R * 4u) != 0;
+    static const uint32_t nf_clear = 0u;   /* O59: the pass's non-finite flag starts clear */
+    ok = ok && pulsar_gpu_tensor_write_async(l->arena, D.nf, &nf_clear, sizeof(nf_clear)) != 0;
     if (lili) {   /* the candidate head's anchor rows (cn of each bank's last committed row) and their validity */
         pulsar_gpu_tensor *anchor = pulsar_state_tensor(ss, ss->plan->n_trunk, d->decl_anchor);
         ok = ok && anchor && pulsar_gpu_tensor_write_async(l->arena, D.valid, l->h_valid, nb) != 0;
@@ -1318,6 +1325,8 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
             io.ld_out = Q;
             io.workspace = base + D.gqa;
             io.workspace_bytes = D.gqa_bytes;
+            io.nf_flag = (uint32_t *)(base + D.nf);   /* O59: read back after the pass, on a widening build */
+            io.nf_code = 0x42000000u | li;
             if (pulsar_gqa_launch(&G[li], &l->call[li], base + D.desc + (uint64_t)li * D.desc_stride, &io, 0) != 0)
                 return fail("the block attention refused");
             {
@@ -1456,6 +1465,16 @@ bool draft_pass(pulsar_session *s, const uint32_t *banks, const uint32_t *pos, c
                !pulsar_gpu_tensor_read(l->arena, D.scores, l->scores.data(), (uint64_t)nb * SL * K * K * 4u) ||
                !pulsar_gpu_tensor_read(l->arena, D.chain_ids, l->chain_ids.data(), (uint64_t)nb * SL * 4u)) {
         return fail("could not read the head's chain");
+    }
+    if (pulsar_gqa_widens()) {   /* O59: the tensor-core arms widened bf16 operands to fp16 (sm_75): were all in range? */
+        uint32_t nf = 0;
+        if (!pulsar_gpu_tensor_read(l->arena, D.nf, &nf, sizeof(nf))) return fail("could not read the pass's non-finite flag");
+        if (nf) {
+            fprintf(stderr, "pulsar: block drafter: an attention operand (q / k / v) of drafter layer %u is outside "
+                            "fp16's range, which this build's tensor-core arms widen bf16 to (code 0x%08x) -- "
+                            "refusing the pass\n", nf & 0xffffffu, nf);
+            return fail("a drafter attention operand left fp16's range");
+        }
     }
     if (dump_dir()) {
         static int passes = -1;
@@ -1612,7 +1631,9 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 } else {
                     const int dt = drawn[(size_t)chain_of[b] * SL + j - 1];   /* THE sampler's draw over the slot's candidates */
                     if (dt < 0) {
-                        snprintf(err, errlen, "a draft slot's candidates have no distribution");
+                        snprintf(err, errlen, dt == PULSAR_GPU_CHAIN_NONFINITE
+                                                  ? "a draft slot's candidate scores hold a NaN or +Inf"
+                                                  : "a draft slot's candidates have no distribution");
                         return false;
                     }
                     q->refined[j] = dt;
@@ -1642,7 +1663,13 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
     const float tau = pulsar_spec_tau(s->engine);
     for (spec_redraft_req *q : chains) q->keep = pulsar_spec_conf_keep(q->conf, q->keep, tau);
     static int unpriced = -1;   /* diagnostic (PULSAR_BLOCK_UNPRICED set, read once): the sweep's rule-off arm */
-    if (unpriced < 0) unpriced = getenv("PULSAR_BLOCK_UNPRICED") ? 1 : 0;
+    if (unpriced < 0) {
+        unpriced = getenv("PULSAR_BLOCK_UNPRICED") ? 1 : 0;
+        /* rule 5: a schedule switch says once that it is the path taken */
+        if (unpriced)
+            fprintf(stderr, "pulsar: block drafter: PULSAR_BLOCK_UNPRICED is set -- the priced chain cut (the verify "
+                            "pick) is off for this process: every chain is verified up to its tau stop\n");
+    }
     if (!unpriced && !chains.empty()) pulsar_spec_keep_picked(s, n, reqs, n);
     return true;
 }
@@ -1691,7 +1718,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED
-uint32_t block_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p, float min_p,
+uint32_t block_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
                      uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);

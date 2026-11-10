@@ -1096,12 +1096,14 @@ GEMMA4_JEV_MODEL ?= $(call need_path,GEMMA4_JEV_MODEL)
 GEMMA4_JEV_REF ?= $(call need_path,GEMMA4_JEV_REF)
 GEMMA4_JEV_SNAP ?= $(call need_path,GEMMA4_JEV_SNAP)
 GEMMA4_JEV_WORK ?= /tmp/gemma4-jev
+# The python that runs the grader: it needs torch and safetensors (local.mk names a venv that has them).
+JEV_PYTHON ?= python3
 .PHONY: gemma4-jev-gate
 gemma4-jev-gate: tests/gemma4_jev_gate
 	mkdir -p $(GEMMA4_JEV_WORK)
-	python3 tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
+	$(JEV_PYTHON) tests/gemma4/jev_grade.py prep $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/cases.bin
 	./tests/gemma4_jev_gate $(GEMMA4_JEV_MODEL) $(GEMMA4_JEV_WORK)/cases.bin $(GEMMA4_JEV_WORK)/out.bin
-	python3 tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
+	$(JEV_PYTHON) tests/gemma4/jev_grade.py grade $(GEMMA4_JEV_REF) $(GEMMA4_JEV_WORK)/out.bin $(GEMMA4_JEV_SNAP)
 # L296 N1: the Nemotron-H family's load on a built container (tests/nemotron_family_gate.{cpp,py}), as Inkling's above:
 # every tensor bound by its bind record, every byte priced, the grouped plan ({Mamba-2 | attention} x {MoE | none}), the
 # drafter, the facts, the tokenizer + chat front, the session refusals -- on the container and its header clone; then
@@ -1346,6 +1348,7 @@ host-checks: attn-layout-check engram-hash-check compressor-pool-check \
              indexer-score-check attn-pack-fixture-check tp-core-test tp-command-free-test container-tests pulsar-eval
 	./pulsar-eval --self-test-extractors
 	python3 tools/coverage_matrix.py   # L278: every contract x family has a battery gate or a declared gap
+	python3 tests/decode_floor_gate.py --self-test   # L367: per-workload grading + the shipped per-model baselines
 
 # L199/L200 candidate #3 picked up for L210: does the expert GEMV's ADDRESS
 # ORDER cost bandwidth?  Model-free and standalone -- it allocates one real IQ2
@@ -1635,16 +1638,17 @@ sse-decode-bench:
 	python3 tests/sse_decode_bench.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
 	  --kv-disk-state disabled
 
-# Five workloads, 512 tokens, C1; scores the WORST one against a recorded floor.
-# Capture the floor once on a known-good build:
-#   make decode-floor-baseline
+# Five workloads, 512 tokens, C1, greedy, median of 3 (L367): each workload against its own baseline for the
+# SERVED model (tests/test-vectors/decode_floor_baseline.json, one entry per model id).  Record a model's baseline on
+# the release build:  make decode-floor-baseline RELEASE=v0.5.1 ENGINE=52bc947e SERVER_ARGS="--ctx 1048576 ..."
 decode-floor-gate:
 	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
 	  --kv-disk-state disabled
 
 decode-floor-baseline:
+	@[ -n "$(RELEASE)" ] || { echo "RELEASE=vX.Y.Z is required: a baseline belongs to a release"; exit 2; }
 	python3 tests/decode_floor_gate.py --host $(SERVE_HOST) --port $(SERVE_PORT) \
-	  --kv-disk-state disabled --write-baseline
+	  --kv-disk-state disabled --write-baseline --release $(RELEASE) --engine "$(ENGINE)" --server-args "$(SERVER_ARGS)"
 
 # Facts planted at begin/middle/end of a long context, asked back in free prose
 # (no grammar mask) plus a checksum that needs all three at once.
@@ -2377,7 +2381,7 @@ GATE_RUNNER_FLAGS ?=
 # L317: Nemotron's LiLiCorr pack is hosted for the legs that loaded it themselves (block-spec, scratch-poison,
 # bank-adopt): --gates restricts it to them.  Models are hosted one at a time (each closed before the next opens).
 # L357: and graph-eager-gate, whose graphed driver steps Qwen does not take (its driver stages none: SKIPped there).
-# L357 (2026-11-08): Gemma 4 is hosted for its two reference gates only (smoke otherwise): its first reference
+# L357 (2026-11-08): Gemma 4's first reference
 # (tools/reference/capture.py, 1492bd71, fp32, the K6 head) matched top-1 10 of 10 (gpuq #665); every story depth past
 # 512 and code 4094 sit above the tolerance -- known-high, graded by the budgets.
 # Nemotron 3.5 Super: its first reference (6faf460d, fp32, the K6 head) found L363 -- the engine had no dt floor in its
@@ -2391,10 +2395,16 @@ NEMOTRON_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(LILICORR_GATE_MODEL)) --re
 GEMMA4_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(GEMMA4_GATE_MODEL)) --ref-tol 1e-3 \
 	--kl-story tests/test-vectors/kl-budget-gemma-story.txt --kl-code tests/test-vectors/kl-budget-gemma-code.txt \
 	--story-known-high 2048,4096,4102,6144,16388,30339 --code-known-high 4094
+# L371 (2026-11-09): the state contract runs on every hosted family.  Gemma 4 had its reference gates only, and
+# L370's two attention faults (a bounded split grid one chunk short; the arm chosen by the call, not the row) had no
+# instrument: session-contract (C1 restore == cold, B6 / F1 verify == decode), bank-adopt, bank-isolation,
+# block-spec, scratch-poison and graph-eager now run on its pack; session-contract and bank-isolation on Nemotron's.
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
-	--gates=block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
+	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
 	$(NEMOTRON_REF_ANCHORS) \
-	--model $(GEMMA4_GATE_MODEL) --gates=cuda-reference-gate-story,cuda-reference-gate-code $(GEMMA4_REF_ANCHORS)
+	--model $(GEMMA4_GATE_MODEL) \
+	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
+	$(GEMMA4_REF_ANCHORS)
 # Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
 # itself and is unaffected.
 RUNNER_PRIMARY_ARGS ?=
@@ -2438,8 +2448,10 @@ cuda-runner-gate: tests/gates_runner
 # served Qwen while the image tests ran only on DeepSeek, which is smoke-only since 2026-11-07.  --gating runs the image
 # tests (--image-chain among them), so they need no target of their own.  PULSAR_TEST_QWEN_TOKENIZER names the same
 # checkpoint for the server unit tests' host-side tokenizer (src/server/server_tests.cpp reads it on its own).
+# L375: PULSAR_TEST_DS4_TOKENIZER names the DeepSeek container (FRONTIER_MODEL) for --bpe-merge, which reads only its
+# vocabulary and merge table (host; the weights are mapped, never read).
 unit-test-gate: pulsar_test
-	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test --gating
+	PULSAR_TEST_MODEL="$(QWEN_GATE_MODEL)" PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" PULSAR_TEST_DS4_TOKENIZER="$(FRONTIER_MODEL)" ./pulsar_test --gating
 
 # The AGENT's host-only unit suite (the DSML parser/detector over every syntax
 # row, the edit anchors, and the KV store's stripped-checkpoint refusal).  It is
@@ -3505,7 +3517,7 @@ tp-dmabuf-probe: tests/tp_dmabuf_probe
 	@echo "built tests/tp_dmabuf_probe; run on the pair (GDR negative on GB10/610)"
 
 test: pulsar_test seam-check
-	PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" ./pulsar_test
+	PULSAR_TEST_QWEN_TOKENIZER="$(QWEN_GATE_MODEL)" PULSAR_TEST_DS4_TOKENIZER="$(FRONTIER_MODEL)" ./pulsar_test
 
 clean:
 	rm -rf .build

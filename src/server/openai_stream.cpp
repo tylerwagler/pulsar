@@ -146,20 +146,43 @@ const char *anthropic_error_type(int code) {
     }
 }
 
-/// Send an error in Anthropic's envelope ({"type":"error","error":{...}}), its type the status's
-/// (anthropic_error_type); a capacity refusal (429 / 503 / 529) carries Retry-After and X-Should-Retry.
+/// Anthropic's error envelope ({"type":"error","error":{...}}) for a status, its type the status's
+/// (anthropic_error_type).
+/// @param b     receives the body
+/// @param code  the HTTP status
+/// @param msg   the message
+static void anthropic_error_body(buf *b, int code, const char *msg) {
+    buf_printf(b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", anthropic_error_type(code));
+    json_escape(b, msg);
+    buf_puts(b, "}}\n");
+}
+
+/// Send an error in Anthropic's envelope (anthropic_error_body); a capacity refusal (429 / 503 / 529) carries
+/// Retry-After and X-Should-Retry.
 /// @param fd    the client socket
 /// @param code  the HTTP status
 /// @param msg   the message
 /// @return false when a write failed
 bool http_error_anthropic(int fd, int code, const char *msg) {
     buf b = {0};
-    buf_printf(&b, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", anthropic_error_type(code));
-    json_escape(&b, msg);
-    buf_puts(&b, "}}\n");
+    anthropic_error_body(&b, code, msg);
     const bool retry = code == 429 || code == 503 || code == 529;
     bool ok = retry ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_GOING_AWAY_S)
                     : http_response(fd, code, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+bool http_parse_error(int fd, bool anthropic, const char *err) {
+    const parse_refusal kind = parse_refusal_get();
+    const int code = kind == PARSE_REFUSED_BUSY ? 503 : kind == PARSE_REFUSED_RENDER ? 500 : 400;
+    buf b = {0};
+    if (anthropic) anthropic_error_body(&b, code, err);
+    else openai_error_body(&b, err);
+    /* busy: the same request passes once other requests' decodes finish -- a second, not the going-away wait */
+    const bool ok = kind == PARSE_REFUSED_BUSY
+                        ? http_response_retry(fd, code, "application/json", b.ptr, HTTP_RETRY_BUSY_S)
+                        : http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
 }

@@ -25,6 +25,8 @@
 #include <limits.h>
 #include <math.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -500,20 +502,46 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
     return (pulsar_elt_fmt)(t ? t->fmt : (uint32_t)PULSAR_ELT_F32);
 }
 
-/* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
- * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
- * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).
- * The grow sites call this first. */
-/// @param what the buffer, for the refusal line
-/// @return true when the calling thread's stream is capturing: the caller refuses (said, once per site label)
-static inline bool cuda_grow_refused_under_capture(const char *what) {
-    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(cudaStreamPerThread, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone)
-        return false;
-    (void)cudaGetLastError();
-    fprintf(stderr, "pulsar: %s must grow inside a graph capture (a free / malloc is not capturable) -- refusing\n",
-            what);
-    return true;
+/** Rule 9's "once": is this the first time the process says `site`?  A refusal or an announce that can repeat every
+ *  step prints behind it, so the log carries each site's line once and the refusal itself stays every call's.
+ *  Thread-safe.  The sites are remembered by the label's TEXT (a hash of it), up to a fixed table; past the table
+ *  every call answers true -- a line too many, never a refusal nobody saw.  Inline, here: the model-free kernel
+ *  gates compile single .cu files of this layer and link no runtime object; one table per program either way. */
+/// @param site the site's label (NULL: unnamed, one label)
+/// @return true the first time `site` is asked about, false after
+inline bool cuda_first_say(const char *site) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seen[256];   /* the labels said so far, by FNV-1a of their text (0 never stored: it is 1) */
+    static int n_seen = 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *p = site ? site : "(unnamed)"; *p; ++p) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    if (h == 0) h = 1;
+    bool first = true;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; first && i < n_seen; ++i) first = seen[i] != h;
+    if (first && n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) seen[n_seen++] = h;
+    pthread_mutex_unlock(&mu);
+    return first;
+}
+
+/** Rule 9 for an operand or format refusal (L375): the call refuses every time, its line is printed once per site
+ *  -- the site is `site` and the message's FORMAT together, so each refusal of a function says itself once.  The
+ *  line names the function, the predicate that failed (the format's prose) and the numbers that failed it.  Not for
+ *  a query a correct caller makes on purpose ("does this arm apply"): that stays silent. */
+/// @param site the refusing function's name
+/// @param fmt  printf format: the predicate in words and its numbers
+/// @return 0, always: `return cuda_refuse(...)` is the refusal
+__attribute__((format(printf, 2, 3))) inline int cuda_refuse(const char *site, const char *fmt, ...) {
+    char label[256];
+    snprintf(label, sizeof(label), "%s: %s", site ? site : "?", fmt);
+    if (!cuda_first_say(label)) return 0;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "pulsar: %s: %s -- refusing (said once for this refusal)\n", site ? site : "?", msg);
+    return 0;
 }
 
 /* Stack sub-view that INHERITS the base's element size.  The hand-rolled
@@ -676,24 +704,20 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
 
 /* ---- shared types ---- */
 
-/** A span of the memory-mapped model file, and where it lives on the device.
+/** A span of the memory-mapped model file, and where its device copy lives.
  *
- * A range can reach the GPU two ways: copied into the arena, or the host pages
- * registered so the device addresses them directly. The `registered_*` fields
- * describe the second case and the `arena_allocated` flag the first; they are
- * mutually exclusive, and the flags are what tell teardown which cleanup a
- * given range needs.
+ * Every range is a COPY in device memory: a span of the weights arena (the staged fd route) or an allocation of its
+ * own (a device copy of a mapping with no fd, an expert half, an overlay).  `arena_allocated` tells teardown which.
+ * There is no per-range host registration (L375, O22: its arm had no writer); the one registration is a whole
+ * mapping's, on an integrated GPU that accepts it (pulsar_gpu_set_model_map): it makes no range, and only a range
+ * inside that mapping resolves through it.
  */
 struct cuda_model_range {
     const void *host_base;          ///< mapping base this range is an offset into
     uint64_t offset;                ///< byte offset of the range within the mapping
     uint64_t bytes;                 ///< range length
     char *device_ptr;               ///< device address of the range's first byte
-    void *registered_base;          ///< page-aligned host base actually registered
-    char *registered_device_base;   ///< device address corresponding to registered_base
-    uint64_t registered_bytes;      ///< bytes registered (>= `bytes`, page-rounded)
-    int host_registered;            ///< the host pages are registered and must be unregistered
-    int arena_allocated;            ///< the bytes were copied into the arena instead
+    int arena_allocated;            ///< a span of the weights arena (freed with it); 0: its own cudaMalloc
 };
 
 /** Bump allocator holding model weights on the device. One allocation, carved

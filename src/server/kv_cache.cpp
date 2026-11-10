@@ -648,8 +648,10 @@ void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
 /// @param suffix_text   the text past the prefix
 /// @param spans         the suffix's text spans
 /// @param n_spans       spans in `spans`
-/// @param out           receives the prompt
-void build_prompt_from_exact_prefix_and_text_suffix(
+/// @param out           receives the prompt (untouched on false)
+/// @return false (logged) when the tokenizer refused the suffix: there is no prompt -- the caller serves the
+///         request's own rendered prompt, never the prefix alone
+bool build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
@@ -657,8 +659,13 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out)
 {
-    pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, spans, n_spans, out);
+    char why[200] = "";
+    if (pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(engine, exact_prefix, suffix_text, spans, n_spans,
+                                                                     out, why, sizeof why))
+        return true;
+    server_log(PULSAR_LOG_ERROR, "pulsar-server: the tokenizer refused the rendered prompt: %s (the text past a "
+               "%d-token stored prefix) -- the prefix is not continued", why, exact_prefix->len);
+    return false;
 }
 
 /* L290: where a family tail joins the live history.  Every family's tail (tool_result_tail, tool_error_suffix)
@@ -679,10 +686,17 @@ void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_sto
 }
 
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
-                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out) {
+                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out, char *err,
+                                   size_t errlen) {
     pulsar_tokens tail = {};
     /* the tail opens with chat markers: the rendered-chat tokenizer, its client ranges plain text (L223) */
-    pulsar_tokenize_rendered_chat_spans(engine, tail_text ? tail_text : "", spans, n_spans, &tail);
+    char why[200] = "";
+    if (!pulsar_tokenize_rendered_chat_spans(engine, tail_text ? tail_text : "", spans, n_spans, &tail, why,
+                                             sizeof why)) {
+        pulsar_tokens_free(&tail);
+        if (err && errlen) snprintf(err, errlen, "the tokenizer refused the rendered prompt: %s", why);
+        return -1;   /* never the history alone: that is a prompt without its tail */
+    }
     join_live_history_and_tail(live, live->len > 0 && pulsar_token_is_stop(engine, live->v[live->len - 1]), &tail,
                                out);
     pulsar_tokens_free(&tail);
@@ -850,8 +864,9 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     kv_chain_hit hit;
     /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
      * overstated the gain and logged a warning a persist */
-    uint64_t hashes[64];
-    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes, 64);
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes,
+                                                          PULSAR_IMAGE_BLOCKS_MAX);
     const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
@@ -874,11 +889,15 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     return true;
 }
 
-int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end, bool *no_room) {
+const char *const kv_persist_rule_names[KV_PERSIST_RULES] = { "", "read-only", "mirrored sync", "dead prefix" };
+
+int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chain_end, bool *no_room,
+                             kv_persist_rule *by_rule) {
     auto *s = this;
     const char *reason = kv_persist_trigger_names[why];
     if (chain_end) *chain_end = 0;
     if (no_room) *no_room = false;
+    if (by_rule) *by_rule = KV_PERSIST_RULE_NONE;
     if (!s->kv.enabled) return 0;
     /* L347 I3b (D10): the bank's history is read-only (X-Pulsar-KV): nothing is written for it -- its pinned anchor
      * alone -- and a spill of it may free the bank (the history is disposable by the request's word) */
@@ -888,18 +907,23 @@ int server::kv_cache_persist(session_slot *sl, kv_persist_trigger why, int *chai
         if (kv_persist_writes(why, 0u, &what_probe) && (what_probe & PULSAR_KVCHAIN_RP))   /* a loss: said */
             server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache persist reason=%s: bank %u's history is read-only "
                        "(X-Pulsar-KV) -- nothing written", reason, sl->bank);
+        if (by_rule) *by_rule = KV_PERSIST_RULE_READ_ONLY;
         return 0;
     }
     /* A "continued" store fires from the prefill's progress callback; on a TP
      * group that is inside the mirrored sync, where the workers read only
      * chunk verdicts.  The prompt-end store after it persists the same
      * checkpoints. */
-    if (pulsar_session_in_mirrored_sync(s->sess)) return 0;
+    if (pulsar_session_in_mirrored_sync(s->sess)) {
+        if (by_rule) *by_rule = KV_PERSIST_RULE_MIRRORED;
+        return 0;
+    }
     /* L249 D: a dead prefix (its session compacted) or a compaction request's prompt is not worth a disk copy */
     if (sl && server_hint_persist_skips(sl->hint_dead,
                                         sl->active_job && sl->active_job->req.hints.cls == REQ_CLASS_COMPACTION,
                                         reason)) {
         s->count_metric(&s->m_hint_persist_skipped);
+        if (by_rule) *by_rule = KV_PERSIST_RULE_DEAD;
         return 0;
     }
     /* 2026-10-29 (a production hang under memory pressure: a "continued" persist at ~188k under the kernel's min watermark): a persist runs
@@ -1097,9 +1121,8 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
 
 int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     /* L281: the chain loads past an image block only when this request brings the same image there */
-    enum { HASHES_MAX = 64 };
-    uint64_t hashes[HASHES_MAX];
-    const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_images = req->n_images < PULSAR_IMAGE_BLOCKS_MAX ? req->n_images : PULSAR_IMAGE_BLOCKS_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
     const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
     /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
@@ -1176,8 +1199,9 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
  *   commits and the persists of other banks between its slices never evict it (nor its restore point).
  * - A failure drops only on a CONTENT fault, and only what the fault invalidates (pulsar_kvchain.h); a TRANSIENT one
  *   (no RAM room, the bank, the device, a TP rank's copy) drops nothing.
- * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and any
- *   later failure leaves it holding nothing (pulsar_session_load_segment).  So when the bank holds a history the
+ * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and a slice
+ *   that fails after it leaves the bank invalidated whatever the fault's class (pulsar_kvchain_load_slice: a
+ *   segment's own content checks run before its first device write, but the segments before it are in).  So when the bank holds a history the
  *   request would otherwise resume from (`verify`: the pick's own depth > 0), the restore first CHECKS the whole chain
  *   -- every part read (RAM or disk, digest-checked by the store) and its bytes checked against the bank's layout
  *   (pulsar_kvchain_verify_slice), a slice per worker turn like the load -- and writes nothing until every part
@@ -1244,7 +1268,8 @@ int server::kv_restore_slice(kv_restore *r, int k) {
             : pulsar_kvchain_load_slice(s->kv.st, s->sess, r->hit->chain, r->hit->n, &r->next, k, err, sizeof err);
     };
     /* L353 no. 12: images come back to the pool at their commits.  A transient failure with writes in flight waits for
-     * them and tries once more: milliseconds, against a re-prefill from 0 */
+     * them and tries once more: milliseconds, against a re-prefill from 0.  L375 (O25): only the pool's (2) -- a read
+     * that failed (3) is nothing the writer's backlog clears, and the worker does not stand behind it */
     (void)kv_cache_commit_written(&s->kv);
     int rc = slice();
     if (rc == 2 && kv_cache_wait_written(&s->kv) > 0) rc = slice();
@@ -1325,9 +1350,10 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
         uint32_t tail_n = 0;
         pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, (uint32_t)text_end,
                                                          (uint32_t)(text_bytes - text_end), &tail_n);
-        build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail, tail_n,
-                                                       effective_prompt);
+        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail,
+                                                                          tail_n, effective_prompt);
         free(tail);
+        if (!built) return 0;   /* a failed restore: the request's own prompt is synced (the bank was touched) */
     }
     if (loaded_key_out) *loaded_key_out = server_xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
@@ -1405,10 +1431,15 @@ int server::responses_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
+    char why[256];
     const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->responses_live_suffix_text,
         req->responses_live_suffix_spans, req->responses_live_suffix_n_spans,
-        effective_prompt);
+        effective_prompt, why, sizeof why);
+    if (common < 0) {   /* no continuation: the request's own rendered prompt is served */
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: responses live continuation not taken: %s", why);
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     return common;
 }
@@ -1436,10 +1467,15 @@ int server::anthropic_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
+    char why[256];
     const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         req->anthropic_live_suffix_spans, req->anthropic_live_suffix_n_spans,
-        effective_prompt);
+        effective_prompt, why, sizeof why);
+    if (common < 0) {   /* no continuation: the request's own rendered prompt is served */
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: anthropic live continuation not taken: %s", why);
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return common;
 }
@@ -1494,11 +1530,11 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
     pulsar_text_span *tail_spans =
         pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
                                 prompt_len - visible_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
+    const bool built = build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,
         tail_spans, tail_n, effective_prompt);
     free(tail_spans);
-    return live_tokens->len;
+    return built ? live_tokens->len : 0;
 }
 
 

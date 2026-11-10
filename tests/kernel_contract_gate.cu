@@ -32,8 +32,15 @@
  *                       bits, every NaN stays NaN (the old rounding add turned some into Inf and wrapped others to 0).
  *   12. seg-reset-capture pulsar_gpu_seg_reset inside a capture is the FULL reset at its close (a catalog key is
  *                       forgotten), not the regrow's partial drop that kept the catalog.
- *   13. grow-under-capture a grow-on-demand cache (an expert address table's first build) refuses inside a graph
- *                       capture and leaves the capture valid; outside, the same table builds.
+ *   13. grow-under-capture (O54, L375: the one rule, pulsar_gpu_seg_grow) a kept device buffer that must grow or
+ *                       be created INSIDE a segment capture breaks the capture off: the nodes recorded before the
+ *                       grow run once on the buffers as they were (their bytes are checked), the rest of the
+ *                       stretch runs eager, the stretch succeeds, and the key warms up again, captures at the new
+ *                       capacity and replays.  Three grow sites: an expert address table's first build, a scratch
+ *                       slot's regrow (cuda_tmp_alloc), an MXFP8 activation slot's regrow after an LRU eviction
+ *                       (its encode decoded against an eager encode's, byte for byte).  cudaMalloc / cudaFree on
+ *                       a capturing thread invalidate the capture: before the rule each of these stretches failed,
+ *                       and failed again on every later use of its key.
  *   14. named-refusals the dspark HC mean over a short carrier and the 0731 packed scatter into a short ring refuse
  *                       and SAY so on stderr (both returned 0 silently).
  *
@@ -614,29 +621,168 @@ static void case_seg_reset_capture(void) {
 
 /* ---- 13. grow-under-capture ------------------------------------------------------------------------------------ */
 
-/// Case 13: a grow-on-demand cache refuses to allocate inside a graph capture, and the capture survives it.  An
-/// expert address table for a base never seen (its first use allocates) is asked for inside a capture on this
-/// thread's stream: NULL, and the capture still ends cleanly; outside the capture the same table builds.
+/// Reads `n` device bytes back and says whether every one is `v`.
+/// @param d the device bytes
+/// @param n how many
+/// @param v the byte expected
+/// @return true when all n bytes equal v
+static bool dev_all(const unsigned char *d, size_t n, unsigned char v) {
+    std::vector<unsigned char> h(n);
+    if (cudaMemcpy(h.data(), d, n, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    for (const unsigned char b : h)
+        if (b != v) return false;
+    return true;
+}
+
+/// One use of a segment key as a step driver makes it: eager, captured or replayed around `body`.
+/// @param key  the segment key
+/// @param body the stretch's launches (returns false to refuse)
+/// @return seg_enter's verdict (0 eager, 1 captured, 2 replayed), or -1 when the stretch refused or failed
+template <class F> static int seg_use(uint64_t key, F body) {
+    const int seg = pulsar_gpu_seg_enter(key);
+    if (seg < 0) return -1;
+    if (seg == 2) return 2;
+    if (seg == 1) return pulsar_gpu_seg_exit(key, body() ? 1 : 0) ? 1 : -1;
+    return body() ? 0 : -1;
+}
+
+/// Case 13 (O54): a grow inside a segment capture.  Each leg declares a catalog key, warms it once with a body that
+/// needs no grow, then captures it with a body that DOES grow a kept buffer after recording nodes that touch the
+/// buffers as they were: the capture is broken off at the grow (pulsar_gpu_seg_stats::capture_breaks moves), those
+/// nodes' bytes and the eager rest's are checked, and the key then warms (0), captures (1) and replays (2) at the new
+/// capacity.
 static void case_grow_under_capture(void) {
-    unsigned char *base = nullptr;
-    if (!ok(cudaMalloc(&base, 1u << 16), "grow-under-capture malloc")) return;
-    if (!ok(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "grow-under-capture begin")) {
-        cudaFree(base);
+    constexpr size_t SMALL = 4096u, BIG = 1u << 20;
+    unsigned char *d1 = nullptr, *d2 = nullptr, *base = nullptr;
+    if (!ok(cudaMalloc(&d1, BIG), "grow-under-capture malloc") || !ok(cudaMalloc(&d2, BIG), "grow-under-capture malloc") ||
+        !ok(cudaMalloc(&base, 1u << 16), "grow-under-capture malloc"))
         return;
+    pulsar_gpu_seg_reset();
+    pulsar_gpu_seg_stats st0, st1;
+    pulsar_gpu_seg_stats_get(&st0);
+    pulsar_gpu_seg_catalog_open();
+    const cudaStream_t S = cudaStreamPerThread;
+
+    /* (a) the scratch slot: recorded nodes fill the OLD block and copy it out; then the slot must grow */
+    const uint64_t ka = 0x4c3337354f353401ull;
+    size_t want = SMALL;   /* the stretch's scratch need: SMALL on the warm use, BIG under the capture */
+    unsigned char fill = 0;
+    auto scratch_body = [&]() {
+        unsigned char *p = (unsigned char *)cuda_tmp_alloc(SMALL, "gate scratch (small)");
+        if (!p) return false;
+        if (cudaMemsetAsync(p, fill, SMALL, S) != cudaSuccess) return false;
+        if (cudaMemcpyAsync(d1, p, SMALL, cudaMemcpyDeviceToDevice, S) != cudaSuccess) return false;
+        unsigned char *q = (unsigned char *)cuda_tmp_alloc(want, "gate scratch (grown)");   /* a new arena: p is dead */
+        if (!q) return false;
+        if (cudaMemsetAsync(q, (unsigned char)(fill + 1u), want, S) != cudaSuccess) return false;
+        return cudaMemcpyAsync(d2, q, want, cudaMemcpyDeviceToDevice, S) == cudaSuccess;
+    };
+    fill = 0x10;
+    const int a0 = seg_use(ka, scratch_body);          /* catalog warm use, eager, no grow: 0 */
+    want = BIG;
+    fill = 0x20;
+    (void)cudaMemset(d1, 0, BIG);
+    (void)cudaMemset(d2, 0, BIG);
+    const int a1 = seg_use(ka, scratch_body);          /* the capture, broken off at the grow: 1 */
+    const bool a_sync = pulsar_gpu_synchronize() != 0;
+    const bool a_bytes = dev_all(d1, SMALL, 0x20) && dev_all(d2, BIG, 0x21);
+    fill = 0x30;
+    const int a2 = seg_use(ka, scratch_body);          /* the key warms up again, eager: 0 */
+    fill = 0x40;
+    const int a3 = seg_use(ka, scratch_body);          /* captures at the new capacity: 1 */
+    (void)cudaMemset(d1, 0, BIG);
+    (void)cudaMemset(d2, 0, BIG);
+    const int a4 = seg_use(ka, scratch_body);          /* replays the 0x40 graph: 2 */
+    const bool a_replay = pulsar_gpu_synchronize() != 0 && dev_all(d1, SMALL, 0x40) && dev_all(d2, BIG, 0x41);
+    pulsar_gpu_seg_stats_get(&st1);
+    const uint64_t a_breaks = st1.capture_breaks - st0.capture_breaks;
+    printf("  13 grow-under-capture (scratch slot): uses %d %d %d %d %d (want 0 1 0 1 2), %llu capture break(s), the "
+           "nodes before the grow %s, the replay %s, device %s\n", a0, a1, a2, a3, a4, (unsigned long long)a_breaks,
+           a_bytes ? "read live memory" : "READ WRONG BYTES", a_replay ? "right" : "WRONG", a_sync ? "clean" : "FAULT");
+    if (a0 != 0 || a1 != 1 || a2 != 0 || a3 != 1 || a4 != 2 || a_breaks != 1u || !a_bytes || !a_replay || !a_sync)
+        fail("grow-under-capture: a scratch slot's regrow inside a capture");
+
+    /* (b) the MXFP8 activation cache: every slot holds a one-row encode, so a 64-row encode under the capture evicts
+     * the least recently used slot and must grow its buffers */
+    const uint64_t kb = 0x4c3337354f353402ull;
+    constexpr uint64_t ROWS = 64u, DIM = 256u;
+    pulsar_gpu_tensor *tiny[8] = {}, *x = pulsar_gpu_tensor_alloc(ROWS * DIM * 4u), *xr = pulsar_gpu_tensor_alloc(ROWS * DIM * 4u);
+    pulsar_gpu_tensor *dec = pulsar_gpu_tensor_alloc(ROWS * DIM * 4u), *decr = pulsar_gpu_tensor_alloc(ROWS * DIM * 4u);
+    std::vector<float> hx(ROWS * DIM);
+    for (size_t i = 0; i < hx.size(); i++) hx[i] = (float)((int)((i * 2654435761u) >> 20 & 1023) - 512) * (1.0f / 64.0f);
+    bool b_setup = x && xr && dec && decr && pulsar_gpu_tensor_write(x, 0, hx.data(), hx.size() * 4u) &&
+                   pulsar_gpu_tensor_write(xr, 0, hx.data(), hx.size() * 4u);
+    for (int i = 0; b_setup && i < 8; i++) {
+        tiny[i] = pulsar_gpu_tensor_alloc(32u * 4u);
+        b_setup = tiny[i] && pulsar_gpu_tensor_write(tiny[i], 0, hx.data(), 32u * 4u) &&
+                  pulsar_gpu_mxfp8_act_cache_encode_f32(tiny[i], 1u, 32u);
     }
-    const uint8_t *const *in_cap = mxfp4_expert_table(base, 4096u, 8u);
-    cudaGraph_t gr = nullptr;
-    const cudaError_t ec = cudaStreamEndCapture(cudaStreamPerThread, &gr);
-    if (gr) cudaGraphDestroy(gr);
-    (void)cudaGetLastError();
-    const uint8_t *const *out_cap = mxfp4_expert_table(base, 4096u, 8u);
-    const bool synced = pulsar_gpu_synchronize() != 0;
-    printf("  13 grow-under-capture: table inside a capture %s, capture end %s; outside %s\n",
-           in_cap ? "BUILT" : "refused", ec == cudaSuccess ? "clean" : cudaGetErrorString(ec),
-           out_cap ? "built" : "REFUSED");
-    if (in_cap || ec != cudaSuccess || !out_cap || !synced) fail("grow-under-capture: an allocation under capture");
+    bool grow_now = false;
+    auto act_body = [&]() {
+        if (cudaMemsetAsync(d1, 0x55, SMALL, S) != cudaSuccess) return false;   /* a node recorded before the grow */
+        if (!pulsar_gpu_mxfp8_act_cache_encode_f32(grow_now ? x : tiny[7], grow_now ? ROWS : 1u, grow_now ? DIM : 32u))
+            return false;
+        return cudaMemsetAsync(d2, 0x66, SMALL, S) == cudaSuccess;
+    };
+    const int b0 = b_setup ? seg_use(kb, act_body) : -9;   /* warm, no grow: 0 */
+    grow_now = true;
+    (void)cudaMemset(d1, 0, SMALL);
+    (void)cudaMemset(d2, 0, SMALL);
+    const int b1 = b_setup ? seg_use(kb, act_body) : -9;   /* the capture, broken off at the slot's grow: 1 */
+    bool b_bytes = b_setup && pulsar_gpu_synchronize() != 0 && dev_all(d1, SMALL, 0x55) && dev_all(d2, SMALL, 0x66);
+    /* the encode that ran across the break against an eager encode of the same rows, through the decode */
+    std::vector<float> g1(hx.size()), g2(hx.size());
+    b_bytes = b_bytes && pulsar_gpu_mxfp8_act_cache_decode_f32(x, ROWS, DIM, dec) &&
+              pulsar_gpu_mxfp8_act_cache_encode_f32(xr, ROWS, DIM) &&
+              pulsar_gpu_mxfp8_act_cache_decode_f32(xr, ROWS, DIM, decr) &&
+              pulsar_gpu_tensor_read(dec, 0, g1.data(), g1.size() * 4u) &&
+              pulsar_gpu_tensor_read(decr, 0, g2.data(), g2.size() * 4u) &&
+              memcmp(g1.data(), g2.data(), g1.size() * 4u) == 0;
+    const int b2 = b_setup ? seg_use(kb, act_body) : -9;   /* warms again: 0 */
+    const int b3 = b_setup ? seg_use(kb, act_body) : -9;   /* captures (the slot fits now): 1 */
+    const int b4 = b_setup ? seg_use(kb, act_body) : -9;   /* replays: 2 */
+    const bool b_sync = pulsar_gpu_synchronize() != 0;
+    pulsar_gpu_seg_stats_get(&st0);
+    const uint64_t b_breaks = st0.capture_breaks - st1.capture_breaks;
+    printf("  13 grow-under-capture (MXFP8 act slot): uses %d %d %d %d %d (want 0 1 0 1 2), %llu capture break(s), the "
+           "encode across the break %s, device %s\n", b0, b1, b2, b3, b4, (unsigned long long)b_breaks,
+           b_bytes ? "== an eager encode" : "DIFFERS", b_sync ? "clean" : "FAULT");
+    if (b0 != 0 || b1 != 1 || b2 != 0 || b3 != 1 || b4 != 2 || b_breaks != 1u || !b_bytes || !b_sync)
+        fail("grow-under-capture: an MXFP8 activation slot's regrow inside a capture");
+    for (pulsar_gpu_tensor *t : tiny) pulsar_gpu_tensor_free(t);
+    pulsar_gpu_tensor_free(x); pulsar_gpu_tensor_free(xr); pulsar_gpu_tensor_free(dec); pulsar_gpu_tensor_free(decr);
+
+    /* (c) a first allocation: an expert address table for a base never seen, asked for under the capture */
+    const uint64_t kc = 0x4c3337354f353403ull;
+    bool want_table = false;
+    const uint8_t *const *tab = nullptr;
+    auto table_body = [&]() {
+        if (cudaMemsetAsync(d1, 0x77, SMALL, S) != cudaSuccess) return false;
+        if (want_table && !(tab = mxfp4_expert_table(base, 4096u, 8u))) return false;
+        return cudaMemsetAsync(d2, 0x78, SMALL, S) == cudaSuccess;
+    };
+    const int c0 = seg_use(kc, table_body);   /* warm: 0 */
+    want_table = true;
+    (void)cudaMemset(d1, 0, SMALL);
+    (void)cudaMemset(d2, 0, SMALL);
+    const int c1 = seg_use(kc, table_body);   /* the capture, broken off at the table's first build: 1 */
+    const bool c_bytes = pulsar_gpu_synchronize() != 0 && tab && dev_all(d1, SMALL, 0x77) && dev_all(d2, SMALL, 0x78);
+    const int c2 = seg_use(kc, table_body), c3 = seg_use(kc, table_body), c4 = seg_use(kc, table_body);
+    const bool c_sync = pulsar_gpu_synchronize() != 0;
+    pulsar_gpu_seg_stats_get(&st1);
+    const uint64_t c_breaks = st1.capture_breaks - st0.capture_breaks;
+    printf("  13 grow-under-capture (expert table, first build): uses %d %d %d %d %d (want 0 1 0 1 2), %llu capture "
+           "break(s), table %s, bytes %s, device %s\n", c0, c1, c2, c3, c4, (unsigned long long)c_breaks,
+           tab ? "built" : "REFUSED", c_bytes ? "right" : "WRONG", c_sync ? "clean" : "FAULT");
+    if (c0 != 0 || c1 != 1 || c2 != 0 || c3 != 1 || c4 != 2 || c_breaks != 1u || !c_bytes || !c_sync)
+        fail("grow-under-capture: a first allocation inside a capture");
+
+    (void)pulsar_gpu_seg_catalog_close();
+    pulsar_gpu_seg_reset();
     mxfp4_expert_tables_clear();
     cudaFree(base);
+    cudaFree(d1);
+    cudaFree(d2);
 }
 
 /* ---- 14. named-refusals ---------------------------------------------------------------------------------------- */

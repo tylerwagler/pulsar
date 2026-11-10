@@ -32,6 +32,8 @@ typedef struct {
     float logprob;
 } pulsar_token_score;
 
+/* L375: a row with a NaN or +Inf logit (-inf is the mask's value); such a row has no argmax and no distribution */
+bool sample_row_broken(const float *logits, uint32_t n_vocab);
 int sample_argmax(const float *logits, uint32_t n_vocab);
 uint64_t pulsar_sample_key(uint64_t rng, uint32_t ahead);
 void pulsar_sample_advance(uint64_t *rng, uint32_t n);

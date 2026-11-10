@@ -883,10 +883,10 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
 #define KVP_RETIRED_DSV4_MAGIC UINT32_C(0x34565344)
 
 /* The session's draft-depth controller (spec_depth.h) -- the speculation state a frontier carries, every family's
- * (a drafter without an adaptive policy holds it at zero).  It persists across a session's requests on purpose
- * (pulsar_spec_carry_state::spec_adaptive_depth), so a restored session drafts at the saved one's depth and runs
- * its controller from the saved counters -- not from whatever its bank served last.  So does the copy drafter's
- * measured acceptance (pulsar_spec_carry_state::copy_accept, L288): it prices the copy rounds, and the request it was
+ * (a drafter without an adaptive policy holds it at zero).  The frontier saves it so a restored session resumes a
+ * request mid-flight exactly as the live one would; a new request restarts it either way (spec_lookahead_reset,
+ * L368).  So does the copy drafter's measured acceptance (pulsar_spec_carry_state::copy_accept, L288): it prices
+ * the copy rounds, and the request it was
  * measured in goes on past the frontier (a new request resets it, as it would have).  The rest of the speculation
  * state is a request's lookahead (the carry, the pendings, the quench): a load resets it as every request
  * boundary does (spec_lookahead_reset), and a live session voids it on its next plain step, so neither side

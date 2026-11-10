@@ -78,8 +78,8 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
   (`image_*.cpp`, `vision*.cpp`), TP slicing (`tp_*.cpp`), imatrix collection,
   steering, and the shared host math TUs.
 - `src/families/` — the family modules added as plugins (L295): `inkling/`,
-  `nemotron_h/`, `nemotron_enc/`, `nemotron_parse/`. A new family adds a
-  directory; the Makefile globs it.
+  `nemotron_h/`, `nemotron_enc/`, `nemotron_parse/`, `gemma4/`. A new family
+  adds a directory; the Makefile globs it.
 - `src/cuda/` — 43 kernel TUs + `pulsar_cuda_internal.h`: runtime/memory
   (`pulsar_cuda_runtime.cu`), matmuls incl. the cuBLASLt MXFP8 path
   (`pulsar_cuda_matmul.cu`), attention (MLA, GQA, QSA, GDN, Mamba-2), MoE,
@@ -88,7 +88,7 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
   `pulsar_cuda_fmha.cu` (over the vendored CUTLASS FMHA in `fmha/`), the
   `mmq/` directory (the D2R 2-bit MoE kernels, the EXL3 kernels, the vendored
   Tessera kernel) and `pulsar_iq2_tables_cuda.inc`.
-- `src/server/` — 28 TUs + `pulsar_server_internal.h`: HTTP server,
+- `src/server/` — 31 TUs + `pulsar_server_internal.h`: HTTP server,
   OpenAI/Responses/Anthropic endpoints and streaming, per-family chat
   rendering and output parsing, the scheduler (banks, preemption, admission),
   disk KV cache, structured output (`constrain.cpp`), the encoder/parser
@@ -96,7 +96,7 @@ Public headers: `src/pulsar.h` (engine API) and `src/pulsar_gpu.h` (GPU graph AP
   exact-DSML tool replay.
 - `src/tp/` — the tensor-parallel transport (TCP / RDMA), gate scheduler and
   verify.
-- `src/agent/` — 19 TUs + `pulsar_agent_internal.h`: native coding agent (tools,
+- `src/agent/` — 20 TUs + `pulsar_agent_internal.h`: native coding agent (tools,
   terminal UI, sessions, compaction).
 - `src/cli/` — `pulsar_cli.cpp`, `pulsar_bench.cpp`, `pulsar_eval.cpp` entry points.
 - `src/lib/` — shared pieces: help text, the disk KV segment store and chains
@@ -236,7 +236,7 @@ refused there with the repack named, and unsupported types are refused again by
 
 ## Environment Variables
 
-44 `PULSAR_*` names are read under `src/` (2026-10-30); only five carry the
+47 `PULSAR_*` names are read under `src/` (2026-11-09); only five carry the
 `PULSAR_CUDA_*` prefix (`PULSAR_CUDA_PREFILL_CHUNK` and the four
 `PULSAR_CUDA_GRAPH_DUMP_*`). Engine and server knobs sit directly under
 `PULSAR_` — `PULSAR_MSEQ_BANKS`, `PULSAR_OVERCOMMIT`, `PULSAR_MIXED_BATCH`,

@@ -161,6 +161,10 @@ typedef bool (*pulsar_session_cancel_fn)(void *ud);
 /** pulsar_session_sync's return when the cancel callback stopped it at a chunk boundary (the checkpoint is a valid
  *  prefix; re-issue the sync to resume). */
 #define PULSAR_SESSION_SYNC_INTERRUPTED 2
+/** pulsar_session_sync_mm's return when an image of the request could not be decoded because the image-decode budget
+ *  every decode of the process shares is held by other decodes: a failed sync (the bank is to be invalidated as after
+ *  a 1), and the same request succeeds on a retry. */
+#define PULSAR_SESSION_SYNC_BUSY 3
 
 /** Options for pulsar_engine_open(). Zero-initialise, then set what you need:
  * every field's 0/NULL is a working default except `model_path`. */
@@ -451,7 +455,8 @@ bool pulsar_engine_is_parser(const pulsar_engine *e);
 /** Parse one page (`image`: PNG or JPEG bytes).  `ids` (appended): the whole sequence, prompt and generated, eos
  *  included when reached; `*text`: its decode (malloc'd; the model's tokenizer, special tokens kept); `stats` may be
  *  NULL.  0; -2 + `err`: the request refused (an image the model does not take, a prompt that is not its tokens);
- *  -1 + `err`: the engine failed (a device failure). */
+ *  -3 + `err`: the image-decode budget every decode of the process shares is held by other decodes -- the same call
+ *  succeeds on a retry; -1 + `err`: the engine failed (a device failure). */
 /** @param e the parser engine
  *  @param image the encoded page (PNG or JPEG), borrowed
  *  @param len bytes at image
@@ -461,7 +466,7 @@ bool pulsar_engine_is_parser(const pulsar_engine *e);
  *  @param stats receives the call's stats; may be NULL
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return 0, -2 (refused) or -1 (engine failure) */
+ *  @return 0, -2 (refused), -3 (busy: retry) or -1 (engine failure) */
 int pulsar_engine_parse_page(pulsar_engine *e, const uint8_t *image, size_t len, const pulsar_parse_options *opt,
                              pulsar_tokens *ids, char **text, pulsar_parse_stats *stats, char *err, size_t errlen);
 
@@ -751,13 +756,15 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
  *  @param e the engine
  *  @param text NUL-terminated UTF-8
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8; said): a false is never an empty tokenization */
 bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out);
 /** Tokenize a rendered chat prompt: its special-token spellings become control tokens.  Appends to `out`.
  *  @param e the engine
  *  @param text the rendered prompt
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8; said) */
 bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
 /** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt.
  * The renderer produces these; the tokeniser treats them as plain text. */
@@ -777,10 +784,13 @@ typedef struct {
  *  @param spans client-data byte ranges of text
  *  @param n_spans their count
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @param err receives the reason on false (may be NULL)
+ *  @param errlen bytes at err
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8, or spans that are not ascending and disjoint -- a renderer defect; said) */
 bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
-                                         pulsar_tokens *out);
+                                         pulsar_tokens *out, char *err, size_t errlen);
 
 /** The client-data ranges of `text[skip .. skip+len)` (a suffix slice of the
  * same string the ranges were recorded against), rebased to the slice and
@@ -829,8 +839,11 @@ typedef struct {
  * these on every family, each piece rendered WHOLE by the family's own renderer (DeepSeek's marker template;
  * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
  * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
- * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.  Each returns
- * false, `tokens` untouched, when the family has no chat front (said once per entry).
+ * (pulsar_engine_think_mode_supported); any other is refused, never rendered at a neighbouring effort.  Each
+ * returns false, `tokens` untouched, when the family has no chat front (said once per entry), when its template
+ * cannot express the request (a think mode it has no level for, a role it cannot place, tools it cannot read;
+ * said), or when its tokenizer refused the rendered piece (text that is not UTF-8; said): a caller never reads a
+ * refused piece as an empty one, and no entry ends the process.
  *
  * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
  * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
@@ -840,21 +853,21 @@ typedef struct {
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
 /** pulsar_chat_open with TOOLS (L365): the head also declares `tools_json`, an OpenAI tools array as JSON text
  * (NULL or [] = none), the way the family's template declares a request's tools -- the model then calls them in its
  * own syntax, which the family's output parser reads (the server's path).  DeepSeek has no tools head: its tools
  * are front-end DSML prompt text in `trusted`, so a non-NULL `tools_json` is refused there (false, `tokens`
- * untouched).  A tools array the renderer cannot read ends the process, as any refused render does. */
+ * untouched).  A tools array the renderer cannot read is refused (false), as any refused render is. */
 /** @param e the engine
  *  @param tokens the transcript (start empty); the head is appended
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
  *  @param tools_json the tools array, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front, or tools on DeepSeek) */
+ *  @return false when refused (no chat front, tools on DeepSeek, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                             const char *tools_json, pulsar_think_mode think_mode);
 /** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
@@ -865,14 +878,14 @@ bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char 
  *  @param n their count
  *  @param generation_prompt also open the assistant turn
  *  @param think_mode the mode the assistant turn opens for
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode);
 /** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
  * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
 /** @param e the engine
  *  @param tokens the transcript, appended to
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
 /** L365: whether the loaded family answers tool calls INSIDE the model turn that made them (Gemma 4: the response
  * follows the call, then the same turn continues).  There a sampled turn that made calls is NOT closed with
@@ -895,7 +908,7 @@ bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, 
  *  @param prompt the user message
  *  @param think_mode the think mode
  *  @param out the prompt's tokens are appended here
- *  @return false when refused (no chat front: nothing appended) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece): nothing appended */
 bool pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,
@@ -935,8 +948,9 @@ typedef struct {
     /** Tokens in `assistant` (1 or 2; 0 when the tokenizer does not spell the marker). */
     int n_assistant;
     /** L351: the tokens that follow a user marker when that turn is a TOOL RESULT (Qwen's and Nemotron's templates
-     *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"), n_tool of them -- so the anchors
-     *  can tell the client's own turns from an agent loop's tool results. */
+     *  render a tool message as a user turn: "<|im_start|>user\n<tool_response>"; DeepSeek's as a user turn that opens
+     *  `<tool_result`, L373), n_tool of them -- so the anchors can tell the client's own turns from an agent loop's
+     *  tool results. */
     int tool[3];
     /** Tokens in `tool` (0: the template has no such turn, or the tokenizer does not spell it). */
     int n_tool;
@@ -1074,7 +1088,7 @@ int pulsar_session_sync(pulsar_session *s, const pulsar_tokens *prompt, char *er
  *  @param n_images their count (0 = text only)
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return as pulsar_session_sync */
+ *  @return as pulsar_session_sync, or PULSAR_SESSION_SYNC_BUSY */
 int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
                            const pulsar_image_ref *images, int n_images,
                            char *err, size_t errlen);
@@ -1105,7 +1119,8 @@ int pulsar_session_sync_mm(pulsar_session *s, const pulsar_tokens *prompt,
  *  @param out receives the expanded prompt (freed on a refusal)
  *  @param err receives the refusal
  *  @param errlen bytes at err
- *  @return 1 on success, 0 on a refusal (note: not the 0-is-success convention) */
+ *  @return 1 on success, 0 on a refusal, -1 on a refusal that is the image-decode budget's (busy: the same call
+ *          succeeds on a retry).  Not the 0-is-success convention: compare with 1 */
 int pulsar_expand_image_placeholders(pulsar_engine *e, const pulsar_tokens *prompt, int from,
                                      pulsar_image_ref *images, int n_images,
                                      pulsar_tokens *out, char *err, size_t errlen);
@@ -1147,6 +1162,10 @@ int pulsar_session_image_hashes(pulsar_session *s, uint64_t *hashes, int cap);
 /** @param s the session
  *  @return the persistable end; 0 without a valid checkpoint */
 TokPos pulsar_session_persist_end(pulsar_session *s);
+/// Most image blocks one KV records (the engine's pulsar_image_identity), and so the most content hashes a span of
+/// it has: the one size for every hash array a caller of pulsar_session_span_image_hashes holds (L375: the store's and
+/// the server's arrays each restated it as 64).
+#define PULSAR_IMAGE_BLOCKS_MAX 64
 /** L353: the content hashes of the image blocks inside [G_prev, G), in position order: what a segment's key covers.
  *  @param s the session
  *  @param G_prev the span's start
@@ -1271,7 +1290,8 @@ int pulsar_session_argmax(pulsar_session *s);
  *  @param excluded_id the id to skip */
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
 /** Returned by the draws (pulsar_session_draw, _draw_rows, _sample) when the row is DEGENERATE (no finite logit,
- * a probability mass that is not a positive finite number, a non-finite knob): no token is drawn and the caller
+ * a NaN or +Inf logit anywhere in it, a probability mass that is not a positive finite number, a non-finite knob):
+ * no token is drawn and the caller
  * must fail its request (L188).  Never a valid id. */
 #define PULSAR_SAMPLE_REFUSED (-1)
 /** L302: one draw (THE sampler, on the device: src/cuda/pulsar_cuda_sampler.cu).  `rng` is the request's sampler
@@ -1372,7 +1392,8 @@ int pulsar_session_copy_logits(pulsar_session *s, float *out, int cap);
  *  @param s the session
  *  @param out receives the model's hidden width of floats
  *  @param cap floats at out
- *  @return floats copied (the hidden width), or 0 when the family offers none, cap is short or nothing was headed */
+ *  @return floats copied (the hidden width), or 0 (said) when the family offers none, cap is short, or the row the
+ *          readout holds is not the installed bank's last row (nothing headed, another bank's row, a view that moved) */
 int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap);
 /** Overwrite the live logits row (mirrored on a TP group).
  *  @param s the session
@@ -2038,7 +2059,8 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
  *  @param accepted_cap slots at accepted
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return tokens emitted (0 on bad arguments), or -1 */
+ *  @return tokens emitted (0 on bad arguments), or -1 (a failure; a tensor-parallel session, which no frame mirrors
+ *          this entry for) */
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int max_tokens,
                                         int *accepted, int accepted_cap,
@@ -2445,10 +2467,12 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * restored session prices its copy rounds as the saved one does; v4 refuses on the version.
  * v6 (L308): the copy acceptance's age (tokens since its last verdict) joins it (6 u32), so a restored session
  * re-probes a stale copy estimate when the saved one would; v5 refuses on the version.
- * v7 (L347 I3a): the trailing digest is lib/pulsar_kvdigest.h's v2 (four lanes); v6 refuses on the version. */
+ * v7 (L347 I3a): the trailing digest is lib/pulsar_kvdigest.h's v2 (four lanes); v6 refuses on the version.
+ * v8 (L370): no format change -- Gemma 4's window layers wrote wrong K / V on some short prompt steps (a bounded
+ * GQA split grid one chunk short), so every older payload is refused rather than trusted. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-/** The kv-state payload's format version (the v2..v7 history above); a payload of another version is refused. */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(7)
+/** The kv-state payload's format version (the v2..v8 history above); a payload of another version is refused. */
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(8)
 
 /** @param s the session (a family with payloads; else 0)
  *  @return the serialized payload's size, bytes */
@@ -2505,7 +2529,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
 /** The disk segment format's version (history beside it); a segment of another version is refused. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(8)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state; v7 (L347): rows only; the state at G is the key's restore point file (header word 8 carries no flag, 0); v8 (L347 I3a): the digest is pulsar_kvdigest v2 (four lanes) */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(9)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state; v7 (L347): rows only; the state at G is the key's restore point file (header word 8 carries no flag, 0); v8 (L347 I3a): the digest is pulsar_kvdigest v2 (four lanes); v9 (L370): no format change -- rows written by Gemma 4's short-grid window attention are refused, not trusted */
 /** L347: a RESTORE POINT -- the state at a grid point G: the installed bank's
  * grid checkpoint slot at G behind a header (magic, version, the segment layout
  * digest, the slot size, the resume grid, G, flags 0) and its own digest.  The

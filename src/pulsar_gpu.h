@@ -481,13 +481,20 @@ int pulsar_gpu_seg_enter(uint64_t key);
  *  @param body_ok nonzero when the body enqueued its work without refusing
  *  @return 1 when the captured work ran, 0 when nothing ran (the step refuses) */
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
-/** @brief Drop every cached segment graph (they bake device pointers); deferred to seg_exit mid-capture. */
+/** @brief Drop every cached segment graph (they bake device pointers); deferred to the capture's close mid-capture. */
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
-/** @brief Note a scratch free: every cached graph is dropped (deferred to seg_exit mid-capture); catalog keys
- *  recapture on use.  `what` names the buffer regrown (in the first post-warmup regrow's line). */
-void pulsar_gpu_seg_note_device_free(const char *what); /* REQUIRED at every grow-realloc
-                                    * scratch free: baked pointers go stale */
+/** @brief The one rule for a device buffer kept across calls that must grow or be created (O54, L375): call this
+ *  BEFORE the cudaFree / cudaMalloc.  If a segment capture is open it is broken off here -- its nodes so far run
+ *  once from their own graph, the stream is eager for the rest of the stretch, the key warms up again and captures
+ *  at the new capacity (cudaMalloc / cudaFree are refused on a capturing thread and invalidate its capture).  With
+ *  `frees_old`, every cached graph is dropped (they bake the old pointer; when the open capture is another
+ *  thread's, at that capture's close); catalog keys recapture on use.
+ *  @param what      names the buffer (in the break's and the first post-warmup regrow's lines)
+ *  @param frees_old nonzero when the grow frees a block a captured graph may have baked
+ *  @return 1 go ahead; 0 the open capture could not be broken off (said): refuse the call, nothing ran */
+int pulsar_gpu_seg_grow(const char *what, int frees_old);   /* REQUIRED at every grow-realloc and first allocation
+                                                              * of a kept device buffer a graphed stretch can reach */
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */
 /** @param replays  receives graphs replayed
@@ -506,6 +513,7 @@ typedef struct pulsar_gpu_seg_stats {
     uint64_t regrows;         ///< scratch regrows outside the warmup that dropped every graph
     uint64_t dead;            ///< keys whose capture or replay failed (each refuses from then on)
     uint64_t refusals;        ///< uses refused
+    uint64_t capture_breaks;  ///< captures broken off at a grow (pulsar_gpu_seg_grow): the stretch ran, eager from there
 } pulsar_gpu_seg_stats;
 /** @brief Snapshot every segment counter.
  *  @param out receives them */
@@ -543,8 +551,9 @@ int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n
  *  @param bytes receives bytes filled */
 void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes);
 
-/** @brief Make the model mapping device-readable: an integrated GPU host-registers it (read-only); a discrete card
- *  stages spans into device memory on use, through the fd of pulsar_gpu_set_model_fd_for_map.
+/** @brief Make the model mapping device-readable: an integrated GPU host-registers it (read-only; one mapping at a
+ *  time -- a mapping set while another is registered is staged); a discrete card stages spans into device memory on
+ *  use, through the fd of pulsar_gpu_set_model_fd_for_map.
  *  @param model_map  the host mapping of the model file
  *  @param model_size its size in bytes
  *  @return 1 on success, 0 when it cannot be served (said) */
@@ -1219,7 +1228,7 @@ void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offse
 /** Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
- * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
+ * cuBLASLt directly at the range's device pointer. Done once at load. */
 /** @param model_map     the mapping the weight lives in
  *  @param weight_offset its byte offset, already registered with pulsar_gpu_register_fp8_weight */
 void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset);
@@ -1393,11 +1402,11 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
  * f32-store skips read it too: the split's offset views key no slot, so the
  * skips apply only while no decode prefix is in flight.
  * Returns 0 and refuses when n exceeds PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
-/** Does any kernel read the model through its HOST mapping (a host-registered
- * whole model or range)?  When it does not, every weight byte the device reads
- * lives in device memory, and the engine may release the checkpoint's host
- * pages after load (pulsar_model_release_host_pages). */
-/** @return 1 when some kernel reads host-mapped model pages, else 0 */
+/** Does any kernel read a model mapping through its HOST pages?  One mapping at most is host-registered, whole
+ * (an integrated GPU that accepted pulsar_gpu_set_model_map's registration); there is no per-range registration.
+ * When none is, every weight byte the device reads lives in device memory, and the engine may release the
+ * checkpoint's host pages after load (pulsar_model_release_host_pages). */
+/** @return 1 when a mapping is host-registered (its ranges are read where they lie), else 0 */
 int pulsar_gpu_model_reads_host_pages(void);
 
 /** @brief Declare the calling thread's leading decode rows (ROW KIND, above), capped at PULSAR_GPU_MNEUTRAL_ROWS_MAX.
@@ -3928,13 +3937,23 @@ int pulsar_gpu_hc_expand_add_split_tensor(
 /** pulsar_gpu_sample_req::flags: draw this row's argmax whatever its temperature (L296 toolsample positions). */
 #define PULSAR_GPU_SAMPLE_GREEDY 1u
 
-/** A row's status: OK, or why no token was drawn (the host sampler's three refusals). */
+/** A row's status: OK, or why no token was drawn (the host sampler's three refusals, and L375's broken row). */
 enum {
     PULSAR_GPU_SAMPLE_OK = 0,
     PULSAR_GPU_SAMPLE_REFUSED_KNOB = 1,    ///< a sampling knob is not finite
     PULSAR_GPU_SAMPLE_REFUSED_EMPTY = 2,   ///< no finite logit (after the mask)
     PULSAR_GPU_SAMPLE_REFUSED_MASS = 3,    ///< the candidate mass is not a positive finite number
+    /** The row's logits hold a NaN or +Inf (anywhere, under a cleared mask bit too): the forward that wrote the row
+     *  is broken, so nothing is drawn from the rest.  -inf is the mask's value and refuses nothing. */
+    PULSAR_GPU_SAMPLE_REFUSED_NONFINITE = 4,
 };
+
+/** Says a refused row's status by name on stderr, once per status and row width (rule 9); nothing for
+ *  PULSAR_GPU_SAMPLE_OK.  The kernels cannot print: whoever reads a pulsar_gpu_sample_out or a
+ *  pulsar_gpu_spec_walk_out back calls this with what it read. */
+/** @param status  a row's (or a walk's) PULSAR_GPU_SAMPLE_* status
+ *  @param n_vocab the width of the rows the launch drew from */
+void pulsar_gpu_sample_refusal_say(uint32_t status, uint32_t n_vocab);
 
 /** One row's draw: the request's knobs as it carries them (the sampler clamps them as the host's always did), the
  *  key (pulsar_sample_key at the token's index), the flags, and the row of the token mask it reads. */
@@ -4097,12 +4116,16 @@ uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab);
  *  candidates cand[c][j][0..topk) scored by scores[c][j][prev][0..topk) (prev: the slot before's pick, 0 at slot 0)
  *  -- a sparse row of `vocab` (every other id -inf, a repeated id keeps its last score, an id outside the vocabulary
  *  none) drawn by THE sampler under the chain's knobs at key[j]; the pick is the first candidate equal to the draw.
- *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there). */
+ *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there; a slot whose
+ *  scores hold a NaN or +Inf is PULSAR_GPU_CHAIN_NONFINITE, the slots after it -1). */
 #define PULSAR_GPU_CHAIN_SLOTS_MAX 16u
 /** The most candidates per chain slot. */
 #define PULSAR_GPU_CHAIN_TOPK_MAX 64u
 /** The most chains one launch walks. */
 #define PULSAR_GPU_CHAINS_MAX 16u
+/** pulsar_gpu_sample_chains' out at a slot whose candidate scores hold a NaN or +Inf: a broken drafter row, not
+ *  drawn (the sampler's PULSAR_GPU_SAMPLE_REFUSED_NONFINITE rule on the slot's sparse row). */
+#define PULSAR_GPU_CHAIN_NONFINITE (-2)
 /** One chain's draw request for pulsar_gpu_sample_chains. */
 typedef struct pulsar_gpu_chain_req {
     float temperature, top_p, min_p;

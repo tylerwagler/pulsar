@@ -79,7 +79,7 @@ release; see the [release notes](RELEASE_NOTES_0.5.0.md#removed).
 | `PULSAR_MIXED_BATCH` | on | `0`/`off`: disable the fused mixed lane, in which queued prompt chunks ride decode steps (families that support it). |
 | `PULSAR_SERVER_PREFIX_WAIT_MS` | 60000 | How long a queued request waits for another prompt's prefill of a shared prefix before computing it itself. `0` turns it off; a malformed value refuses startup. |
 | `PULSAR_STALL_WATCHDOG_S` | 120 | Stall watchdog threshold in seconds (0 = off, at most 86400); a malformed value refuses startup. |
-| `PULSAR_SPEC_DEPTH`, `PULSAR_SPEC_TAU` | | Env forms of `--spec-depth` / `--spec-tau`; the flags win. |
+| `PULSAR_SPEC_DEPTH`, `PULSAR_SPEC_TAU` | | Env forms of `--spec-depth` / `--spec-tau`; the flags win. An unparsable value refuses the load; `PULSAR_SPEC_TAU=0` disables the stop, as `--spec-tau 0` does. |
 | `PULSAR_CUDA_PREFILL_CHUNK` | 4096 | Prefill chunk in tokens; `0` prefills a prompt as one batch. Changing it changes the KV checkpoint grid, so compare runs at the same value. |
 | `PULSAR_PLE_READ_AHEAD` | 1 | Qwen: read the next prompt chunk's PLE rows while this chunk computes. `0` turns it off (no byte changes); any other value refuses the load. |
 | `PULSAR_TP_TIMEOUT_SEC` | 300 | Tensor-parallel connect and exchange timeout. |
@@ -96,7 +96,9 @@ in the log when set.
 | `PULSAR_GRAMMAR_FAIL_AFTER` | Inject a grammar-matcher failure after N tokens of a constrained region. |
 | `PULSAR_SERVER_TEST_ROUTES` | `1`: answer the test routes -- `POST /test/guard-budget` (body: bytes) sets the guard's KV budget at run time, `0` restores it (L357).  Said at startup; never set in production. |
 | `PULSAR_SCRATCH_POISON` | Poison disposable scratch buffers (`scratch-poison-gate`). |
-| `PULSAR_BLOCK_UNPRICED` | Block drafter: turn off the priced chain cut (a sweep's control arm). |
+| `PULSAR_BLOCK_UNPRICED` | Block drafter: turn off the priced chain cut (a sweep's control arm). Said once when set. |
+| `PULSAR_LANE_PIN` | `spec`: hold every decode sweep the spec lane can carry on the spec lane -- no plain-lane measuring at a fresh bank, no re-measure (L368). A measurement switch: the lane changes which kernel computes a token. Said at startup; any other value refuses. |
+| `PULSAR_SPEC_CARRY` | `1`: the draft depth carries across requests, as before L368 (it restarts every request by default). A measurement switch; said once. |
 | `PULSAR_QWEN_MTP_DRAFT_EXTRA` | Qwen MTP draft-vocabulary extra width (must agree with the container). |
 | `PULSAR_TP_TEST_TINY_BUFFERS` | TP transport tests: tiny exchange buffers. |
 | `PULSAR_TEST_QWEN_TOKENIZER` | Server unit tests: the Qwen tokenizer to load. |

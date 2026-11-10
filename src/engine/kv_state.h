@@ -129,6 +129,13 @@ typedef struct pulsar_kv_state_ops {
     /** L313: every append-only row pool of ANY bank -- pools() then trailing_pools(), the same order -- each
      *  bank's own tensor (a NULL `rows` while the bank's physical is freed).  What a cross-bank restore copies. */
     uint32_t (*bank_pools)(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap);
+    /** Optional (L375 O42).  The installed bank's history is being replaced by another bank's (pulsar_ckpt_adopt):
+     *  drop what described the OLD history and that no checkpoint walk carries, so nothing of it is read as the new
+     *  one's.  DeepSeek: the DSpark drafter's committed-row window and its prompt capture -- a grid checkpoint does
+     *  not carry them, and the capture's contiguity guard would join the old conversation's rows to a prefill that
+     *  starts where its capture ended.  NULL = the walk carries every such piece (the declared families: a
+     *  drafter's rings and rows are slots of the plan). */
+    void (*history_replaced)(void *state);
 } pulsar_kv_state_ops;
 
 /** The kinds of record (pulsar_ckpt_store::rec). */
@@ -405,16 +412,20 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
  *  walked into dst, exactly what a restore on src would leave there (a published checkpoint is any bank's to restore
  *  while its own bank's history still reaches T, the frontier rule).  dst's own checkpoints and records go (its
  *  history is replaced); it keeps a copy of the one it now stands at.  A lent record is stamped used (the pool's LRU,
- *  L326).  False, said, when the banks' pools do not pair, one is freed, or a copy failed (dst's state then describes
- *  no position). */
-/// @param st  the store
-/// @param dst the installed bank to overwrite
-/// @param src the bank whose state is adopted
-/// @param T   the position adopted, in tokens
-/// @param r   src's record at T, or NULL for src's grid checkpoint at T
+ *  L326).  False, said, when the banks' pools do not pair, one is freed, the banks differ in runtime adapter (L375
+ *  O46: an adapted bank's state is another model's), or a copy failed.  `*moved` tells the two kinds of refusal apart
+ *  (L375 O43): false = refused before anything of dst was touched (dst is still what its view describes), true = dst's
+ *  checkpoints went and its state was being written (on a failure it then describes no position). */
+/// @param st    the store
+/// @param dst   the installed bank to overwrite
+/// @param src   the bank whose state is adopted
+/// @param T     the position adopted, in tokens
+/// @param r     src's record at T, or NULL for src's grid checkpoint at T
+/// @param moved receives whether dst was touched (see above); never NULL
 /// @return true when dst stands at T.  A record is copied when a slot holds it; a recycled slot too small keeps no copy, and
 ///         the bank's next resume at T then falls to its grid checkpoint (L354: a miss, never other state)
-bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r);
+bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32_t T, const pulsar_ckpt_record *r,
+                       bool *moved);
 /** Where a walk's FINAL chunk [pos0, end) ends (P13, every walk's): at the prompt's last grid point when that lies
  *  strictly inside it -- so the prefill leaves the checkpoint the next turn resumes from -- else at `end`.  The
  *  caller keeps an image block whole around it. */

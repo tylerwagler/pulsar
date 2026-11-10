@@ -45,9 +45,9 @@ extern "C" const void *const *pulsar_exl3_expert_table(const void *stack, uint32
     return exl3_expert_table(stack, n_expert, stride, split);
 }
 
-extern "C" int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, int n_vocab,
-                                        uint16_t *streams, cudaStream_t stream) {
-    if (!table || !tokens || !streams || T <= 0 || n_vocab <= 0 || (((uintptr_t)table | (uintptr_t)streams) & 15u)) {
+extern "C" int pulsar_qwen_embed_launch(const uint16_t *table, const int32_t *tokens, int T, uint16_t *streams,
+                                        cudaStream_t stream) {
+    if (!table || !tokens || !streams || T <= 0 || (((uintptr_t)table | (uintptr_t)streams) & 15u)) {
         fprintf(stderr, "pulsar: qwen embed: a null or misaligned pointer, or no rows -- refusing\n");
         return -1;
     }
