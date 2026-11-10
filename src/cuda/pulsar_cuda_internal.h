@@ -725,8 +725,9 @@ __host__ __device__ __forceinline__ static uint64_t pulsar_w_elt_bytes(int w_bf1
  *
  * Every range is a COPY in device memory: a span of the weights arena (the staged fd route) or an allocation of its
  * own (a device copy of a mapping with no fd, an expert half, an overlay).  `arena_allocated` tells teardown which.
- * There is no per-range host registration (L375, O22: its arm had no writer); the one registration is the whole
- * mapping's, on an integrated GPU that accepts it (pulsar_gpu_set_model_map), and it makes no range.
+ * There is no per-range host registration (L375, O22: its arm had no writer); the one registration is a whole
+ * mapping's, on an integrated GPU that accepts it (pulsar_gpu_set_model_map): it makes no range, and only a range
+ * inside that mapping resolves through it.
  */
 struct cuda_model_range {
     const void *host_base;          ///< mapping base this range is an offset into

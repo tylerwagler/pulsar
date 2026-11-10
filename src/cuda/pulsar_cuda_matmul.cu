@@ -1028,7 +1028,7 @@ static std::unordered_map<map_offset_key, fp8_mx_weight, map_offset_key_hash> g_
 /* Offsets whose MXFP8 weight is PRE-STORED in the mmap in the exact device
  * layout (de-interleaved E4M3 data + pulsar_mx_sfoff-swizzled E8M0 scale, contiguous:
  * [data (in*out B)][scale]). For these the resolver skips cudaMalloc+convert and
- * points cuBLASLt straight at g_model_device_base+offset. Populated once at load
+ * points cuBLASLt straight at the range's device pointer (cuda_model_range_ptr). Populated once at load
  * (cold path); the resolved fp8_mx_weight is then cached in g_fp8_mx_by_offset
  * exactly like a converted weight, so the per-token hot path never probes this
  * set. */
@@ -1206,7 +1206,7 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
     /* Pre-stored MXFP8_LT: the de-interleaved E4M3 data and swizzled E8M0 scale
      * are already laid out contiguously in the mmap at [offset .. offset+data ..
      * +scale]. Skip the cudaMalloc+convert entirely and hand cuBLASLt the
-     * device-accessible mmap pointers (g_model_device_base+offset). Byte-for-byte
+     * device pointers of those ranges (cuda_model_range_ptr). Byte-for-byte
      * identical to what mxfp8_weight_convert_kernel would have produced. */
     /* A registered ROW SLICE (4g): the data rows start at this offset, the scale
      * band sits inside the PARENT's scale plane.  Dims are asserted against the

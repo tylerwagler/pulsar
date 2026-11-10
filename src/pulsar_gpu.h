@@ -543,8 +543,9 @@ int pulsar_gpu_scratch_poison_step(pulsar_gpu_tensor *const *regions, uint32_t n
  *  @param bytes receives bytes filled */
 void pulsar_gpu_scratch_poison_counts(uint64_t *steps, uint64_t *bytes);
 
-/** @brief Make the model mapping device-readable: an integrated GPU host-registers it (read-only); a discrete card
- *  stages spans into device memory on use, through the fd of pulsar_gpu_set_model_fd_for_map.
+/** @brief Make the model mapping device-readable: an integrated GPU host-registers it (read-only; one mapping at a
+ *  time -- a mapping set while another is registered is staged); a discrete card stages spans into device memory on
+ *  use, through the fd of pulsar_gpu_set_model_fd_for_map.
  *  @param model_map  the host mapping of the model file
  *  @param model_size its size in bytes
  *  @return 1 on success, 0 when it cannot be served (said) */
@@ -1219,7 +1220,7 @@ void pulsar_gpu_register_fp8_weight(const void *model_map, uint64_t weight_offse
 /** Mark an already-fp8-registered offset as a pre-stored MXFP8_LT weight: the
  * device layout (de-interleaved E4M3 data + swizzled E8M0 scale) is already in
  * the mmap, so the matmul resolver skips the cudaMalloc+convert and points
- * cuBLASLt directly at g_model_device_base+offset. Done once at load. */
+ * cuBLASLt directly at the range's device pointer. Done once at load. */
 /** @param model_map     the mapping the weight lives in
  *  @param weight_offset its byte offset, already registered with pulsar_gpu_register_fp8_weight */
 void pulsar_gpu_register_fp8_lt_weight(const void *model_map, uint64_t weight_offset);
@@ -1393,11 +1394,11 @@ void pulsar_gpu_mxfp8_act_cache_disarm(void);
  * f32-store skips read it too: the split's offset views key no slot, so the
  * skips apply only while no decode prefix is in flight.
  * Returns 0 and refuses when n exceeds PULSAR_GPU_MNEUTRAL_ROWS_MAX. */
-/** Does any kernel read the model through its HOST mapping (a host-registered
- * whole model or range)?  When it does not, every weight byte the device reads
- * lives in device memory, and the engine may release the checkpoint's host
- * pages after load (pulsar_model_release_host_pages). */
-/** @return 1 when some kernel reads host-mapped model pages, else 0 */
+/** Does any kernel read a model mapping through its HOST pages?  One mapping at most is host-registered, whole
+ * (an integrated GPU that accepted pulsar_gpu_set_model_map's registration); there is no per-range registration.
+ * When none is, every weight byte the device reads lives in device memory, and the engine may release the
+ * checkpoint's host pages after load (pulsar_model_release_host_pages). */
+/** @return 1 when a mapping is host-registered (its ranges are read where they lie), else 0 */
 int pulsar_gpu_model_reads_host_pages(void);
 
 /** @brief Declare the calling thread's leading decode rows (ROW KIND, above), capped at PULSAR_GPU_MNEUTRAL_ROWS_MAX.
