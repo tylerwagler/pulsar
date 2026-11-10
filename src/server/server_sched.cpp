@@ -3195,9 +3195,6 @@ bool server::prefill_headroom_ok(session_slot *sl) {
                    "%d spill(s)%s: %s (%u more refused since the last line)", sl->bank,
                    server_bank_pos(s->sess, (uint32_t)sl->bank).raw(), g->prompt_tokens, why, spilled,
                    preempt_tried ? " and a preemption try" : "", g->err, skipped);
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     s->trace_event(g->trace_id, "prefill refused: %s", g->err);
     if (g->j->req.stream && g->progress.headers_sent) {
         if (!g->progress.stream_failed) (void)sse_error_event(g->j->fd, &g->j->req, 503, g->err);

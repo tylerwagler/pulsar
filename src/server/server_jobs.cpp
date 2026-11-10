@@ -324,6 +324,39 @@ void server::send_prefill_failure_response(const job *j,
 
 
 
+/** L372: a job's hooks on the shared pool session, for the length of ONE sync.  The hooks are the session's, not a
+ * bank's, and every slot shares s->sess.  Armed once per job, a long prefill lost its own to the next request, never
+ * counted a chunk, and its cancel never yielded -- a 202k prompt held another slot's decode for 214 s (L260).  Armed
+ * before each sync and left there (L260 to L372), they were still on the session when another step synced -- the
+ * judge's prefill, the terminal checkpoint, a finishing job's tool-error retry or canonical rewrite -- and that sync
+ * ran THIS job's cancel and progress: its continued store written from the other bank, the other sync interrupted
+ * (the judge answered 503), its chunks counted from the other's numbers.  Armed here and cleared when the scope ends:
+ * no sync runs with hooks that are not its own, and no gen_state pointer stays installed past the sync that reads
+ * it. */
+struct sync_hooks {
+    pulsar_session *sess;   ///< the pool session the hooks are on
+    /// @param sess        the pool session
+    /// @param progress    the chunk-boundary progress hook (NULL: none)
+    /// @param progress_ud its userdata
+    /// @param display     the display-progress hook (NULL: none)
+    /// @param display_ud  its userdata
+    /// @param cancel      the cancel hook polled between chunks (NULL: the sync runs to its end)
+    /// @param cancel_ud   its userdata
+    sync_hooks(pulsar_session *sess, pulsar_session_progress_fn progress, void *progress_ud,
+               pulsar_session_progress_fn display, void *display_ud, pulsar_session_cancel_fn cancel, void *cancel_ud)
+        : sess(sess) {
+        pulsar_session_set_progress(sess, progress, progress_ud);
+        pulsar_session_set_display_progress(sess, display, display_ud);
+        pulsar_session_set_cancel(sess, cancel, cancel_ud);
+    }
+    /// Clears the three hooks.
+    ~sync_hooks() {
+        pulsar_session_set_cancel(sess, NULL, NULL);
+        pulsar_session_set_progress(sess, NULL, NULL);
+        pulsar_session_set_display_progress(sess, NULL, NULL);
+    }
+};
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -421,12 +454,12 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
             .headers_sent = true,
         };
         snprintf(progress.ctx, sizeof(progress.ctx), "%s", sync_ctx);
-        pulsar_session_set_progress(s->sess, server_progress_cb, &progress);
-        pulsar_session_set_display_progress(s->sess, server_progress_cb, &progress);
         char sync_err[160] = {0};
-        const int rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
-        pulsar_session_set_progress(s->sess, NULL, NULL);
-        pulsar_session_set_display_progress(s->sess, NULL, NULL);
+        int rc;
+        {
+            const sync_hooks hooks(s->sess, server_progress_cb, &progress, server_progress_cb, &progress, NULL, NULL);
+            rc = pulsar_session_sync(s->sess, sync_prompt, sync_err, sizeof(sync_err));
+        }
         if (rc == 0) {
             server_log(PULSAR_LOG_KVCACHE,
                        "pulsar-server: tool checkpoint canonicalized ctx=%s source=%s cached=%d target=%d %.3fs",
@@ -514,7 +547,7 @@ void gen_prefill_progress_cb(void *ud, const char *event, int current, int total
         g->prefill_total = total;
         /* L281: publish the snapshot here as well as per quantum.  An image prompt's mm sync
          * yields only at the planner's exact resume points (its cancel hook is armed like any
-         * prefill's, gen_arm_prefill_callbacks), so the worker can stay inside one sync for a
+         * prefill's, sync_hooks), so the worker can stay inside one sync for a
          * long stretch, and the per-slot gauges (/metrics slot_prefill_*, slot_position; the
          * TUI's bar) stood still for minutes while the chunk lines logged.  One mutex + copy
          * per chunk (~3 s apart) is host noise. */
@@ -577,26 +610,6 @@ static bool gen_prefill_cancel_cb(void *ud) {
     return (uint32_t)(g->prefill_total - g->prefill_last_current) >= g->prefill_min_suffix;
 }
 
-/* Bind THIS slot's prefill callbacks to the shared pool session.  Every slot
- * shares s->sess and the callbacks are per-session, so any other slot's
- * begin (which binds its own) or stream begin (which clears them) replaces
- * them: armed once per job, a long prefill lost its progress callback to the
- * next request, never counted a chunk, and the cancel callback never yielded
- * -- a 202k prompt held another slot's decode for 214 s (L260).  Called
- * before every sync this slot issues. */
-/// @param sess  the pool session
-/// @param g     the slot's generation state the callbacks read
-static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
-    pulsar_session_set_progress(sess, gen_prefill_progress_cb, g);
-    pulsar_session_set_display_progress(sess, server_progress_cb, &g->progress);
-    pulsar_session_set_cancel(sess, gen_prefill_cancel_cb, g);
-}
-
-void server::job_hooks_clear() {
-    pulsar_session_set_cancel(sess, NULL, NULL);
-    pulsar_session_set_progress(sess, NULL, NULL);
-    pulsar_session_set_display_progress(sess, NULL, NULL);
-}
 
 
 
@@ -607,9 +620,6 @@ void server::job_hooks_clear() {
 void server::gen_prefill_fail(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     if (g->disk_cache_path) {
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv cache kept segment=%s (prefill ended: %s)",
                    g->disk_cache_path, g->err);
@@ -659,9 +669,6 @@ void server::gen_prefill_abandon(session_slot *sl) {
     /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
      * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
      * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
     g->phase = GEN_DONE;
@@ -1322,8 +1329,6 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
                g->ctx_span,
                g->req_flags[0] ? " " : "",
                g->req_flags);
-    pulsar_session_set_progress(s->sess, gen_prefill_progress_cb, g);
-    pulsar_session_set_display_progress(s->sess, server_progress_cb, &g->progress);
 
     /* The one cold checkpoint is the shared preamble (system prompt + tools,
      * before the task message): worth a separate prefill phase however long
@@ -1396,7 +1401,7 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
 
     /* Prefill quantum policy: interrupt the engine's chunk loop only when
      * resumption is bit-exact for this session (see gen_prefill_cancel_cb). The
-     * cancel callback itself is armed per-sync in gen_step_prefill, NOT here: in
+     * job's hooks are armed for each sync in gen_step_prefill (sync_hooks), NOT here: in
      * pool mode every slot shares the one pool session (s->sess), so a once-per-job set would be
      * clobbered by the next job the worker binds before prefilling this one. */
     g->prefill_min_suffix = pulsar_session_prefill_quantum_min_suffix(s->sess);
@@ -1423,7 +1428,7 @@ void server::gen_step_prefill(session_slot *sl) {
     const bool cold = g->phase == GEN_PREFILL_COLD;
     const pulsar_tokens *target = cold ? &g->cold_prefix : g->prompt_for_sync;
 
-    /* Arm the callbacks on THIS slot's gen_state right before the sync.
+    /* Arm the callbacks on THIS slot's gen_state for the sync below (sync_hooks: cleared when it returns).
      * In pool mode every slot shares the one pool session (s->sess), and the worker binds several
      * jobs (each of which would set the callback) before prefilling any of them,
      * so a once-per-job set in gen_begin leaves the LAST-bound slot's callback on
@@ -1445,7 +1450,6 @@ void server::gen_step_prefill(session_slot *sl) {
      * checkpoint it leaves is one the main image sync extends. */
     const int n_images = cold ? 0 : g->j->req.n_images;
     if (!s->prefill_headroom_ok(sl)) return;   /* refused loudly (503); the bank keeps what it prefilled */
-    gen_arm_prefill_callbacks(s->sess, g);
     /* L329 (a): a queued request waits for this prefill to stand at share_mark (a resume-grid point inside the
      * target): the sync goes to it first, so its last chunk ends there and captures the grid checkpoint the waiter
      * adopts -- the cold phase's mechanism, for a cut a sibling request named.  A text prefill only (a waiter never
@@ -1464,10 +1468,15 @@ void server::gen_step_prefill(session_slot *sl) {
     /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
      * share_mark cut too (the chunk after the cut is the next sync's first) */
     pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
-    const int rc = n_images > 0
-        ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
-                                 g->err, sizeof(g->err))
-        : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    int rc;
+    {
+        const sync_hooks hooks(s->sess, gen_prefill_progress_cb, g, server_progress_cb, &g->progress,
+                               gen_prefill_cancel_cb, g);
+        rc = n_images > 0
+            ? pulsar_session_sync_mm(s->sess, target, g->j->req.images, n_images,
+                                     g->err, sizeof(g->err))
+            : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
+    }
     pulsar_session_set_prefill_ahead(s->sess, NULL);
     pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
@@ -1507,7 +1516,6 @@ void server::gen_step_prefill(session_slot *sl) {
         return; /* the cold store is a quantum boundary of its own */
     }
 
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
     s->gen_stream_begin(sl);
 }
 
@@ -1524,8 +1532,6 @@ void server::gen_stream_begin(session_slot *sl) {
      * a binding only when this request explicitly continued from it. */
     if (!g->responses_live_continuation) s->responses_live_clear(sl);
     if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     s->kv_cache_persist(sl, KV_PERSIST_PROMPT);
     server_log(PULSAR_LOG_PREFILL,
                "pulsar-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -2339,7 +2345,6 @@ bool server::terminal_checkpoint_step() {
     pulsar_tokens target = {0};
     tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
     const int old_len = pulsar_session_pos(s->sess).raw();
-    s->job_hooks_clear();
     const double t0 = server_now_sec();
     char err[192] = "";
     /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
@@ -2380,10 +2385,6 @@ void server::gen_state_free(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
     if (!g) return;
-    /* Callback safety: no gen_state pointer may remain installed anywhere. */
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
     if (g->parser_st) g->parser->destroy(g->parser_st);
     gen_constrain_end(g);
     responses_stream_free(&g->responses_live);
