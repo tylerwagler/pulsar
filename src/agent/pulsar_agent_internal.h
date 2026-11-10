@@ -1737,7 +1737,8 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
  *  @return the result text, malloc'd; caller frees */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
 /** L373: the bash jobs' ONE teardown -- SIGKILL every running job's process group and unlink every job's output
- *  file.  Reached from the normal return (agent_bash_jobs_free), from exit() (atexit) and from SIGTERM / SIGHUP /
+ *  file.  A job whose child exists but is not yet in the table has not started its command and never will
+ *  (agent_bash_start's gate), on whichever thread the teardown runs.  Reached from the normal return (agent_bash_jobs_free), from exit() (atexit) and from SIGTERM / SIGHUP /
  *  SIGINT (agent_bash_teardown_install), so it calls only kill and unlink (async-signal-safe) and reads only the
  *  fixed table agent_bash_start fills. */
 void agent_bash_teardown(void);

@@ -6,7 +6,8 @@
 
 
 /** L373: one job's entry in the exit teardown's table: plain words a signal handler can read.  `path` is written
- *  before `used` is set and never changes while it is. */
+ *  before `used` is set and never changes while it is; `used` is set before the job's fork, `pgid` before its
+ *  command starts (agent_bash_start). */
 struct agent_bash_live_slot {
     volatile sig_atomic_t used;   ///< the slot holds a job's output file
     volatile sig_atomic_t pgid;   ///< the job's process group while it runs; 0 once reaped
@@ -257,25 +258,47 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         return NULL;
     }
 
-    int pipefd[2];
+    /* L373: no child runs a command the teardown cannot see.  The output file is in the table before the fork; the
+     * child waits on `gate` until the parent has written its process group there, and exits without running anything
+     * when the parent is gone first (a signal's teardown on any thread between the fork and that write). */
+    int pipefd[2], gate[2];
     if (pipe(pipefd) != 0) {
         snprintf(err, err_len, "failed to create pipe: %s", strerror(errno));
         close(tmpfd);
         unlink(tmp_path);
         return NULL;
     }
-    pid_t pid = fork();
-    if (pid < 0) {
-        snprintf(err, err_len, "failed to fork: %s", strerror(errno));
+    if (pipe2(gate, O_CLOEXEC) != 0) {
+        snprintf(err, err_len, "failed to create pipe: %s", strerror(errno));
         close(pipefd[0]);
         close(pipefd[1]);
         close(tmpfd);
         unlink(tmp_path);
         return NULL;
     }
+    snprintf(g_bash_live[slot].path, sizeof(g_bash_live[slot].path), "%s", tmp_path);
+    g_bash_live[slot].pgid = 0;
+    g_bash_live[slot].used = 1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(err, err_len, "failed to fork: %s", strerror(errno));
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(gate[0]);
+        close(gate[1]);
+        close(tmpfd);
+        unlink(tmp_path);
+        g_bash_live[slot].used = 0;
+        return NULL;
+    }
     if (pid == 0) {
         setpgid(0, 0);
         close(tmpfd);
+        close(gate[1]);
+        char go;
+        ssize_t got;
+        while ((got = read(gate[0], &go, 1)) < 0 && errno == EINTR) {}
+        if (got != 1) _exit(127);   /* the parent ended before it could track this job */
         /* The bash tool is not interactive.  Give the shell /dev/null as
          * stdin so it does not inherit the live linenoise terminal and reset
          * it from raw mode to cooked mode behind the agent's back. */
@@ -297,10 +320,11 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     }
 
     close(pipefd[1]);
+    close(gate[0]);
     setpgid(pid, pid);
-    snprintf(g_bash_live[slot].path, sizeof(g_bash_live[slot].path), "%s", tmp_path);
     g_bash_live[slot].pgid = pid;
-    g_bash_live[slot].used = 1;
+    write_all(gate[1], "x", 1);
+    close(gate[1]);
     int old_flags;
     set_nonblock(pipefd[0], true, &old_flags);
 
@@ -740,6 +764,27 @@ static void test_agent_bash_teardown(void) {
     AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) == NULL && strstr(err, "already tracked") != NULL);
     agent_bash_jobs_free(&w);
     AGENT_TEST_ASSERT(w.bash_jobs == NULL && agent_bash_live_free_slot() == 0);
+
+    {   /* the fork-to-table window: a job's child whose parent is gone before it is told to go runs nothing */
+        char mark[64];
+        snprintf(mark, sizeof mark, "/tmp/pulsar-agent-gate-%ld", (long)getpid());
+        char cmd[128];
+        snprintf(cmd, sizeof cmd, "touch %s", mark);
+        fflush(NULL);
+        const pid_t child = fork();
+        if (child == 0) {
+            /* the handler's teardown at the worst moment: the instant the job's child exists */
+            pthread_atfork(NULL, [] { agent_bash_teardown(); _exit(0); }, NULL);
+            (void)agent_bash_start(&w, cmd, 600, err, sizeof err);
+            _exit(97);   /* not reached: the fork's parent side exits */
+        }
+        int status = 0;
+        AGENT_TEST_ASSERT(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                          WEXITSTATUS(status) == 0);
+        usleep(200000);   /* the orphaned job child reads EOF on its gate and exits */
+        AGENT_TEST_ASSERT(access(mark, F_OK) != 0);
+        unlink(mark);
+    }
 
     static const int ways[] = {0, SIGTERM, SIGHUP, SIGINT};   /* 0: exit(), the atexit path */
     for (int sig : ways) {
