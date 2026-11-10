@@ -1642,6 +1642,7 @@ void pulsar_session_spec_arm_capture(pulsar_session *s, uint32_t n_rows) {
  * timings (verify_curve.cpp).  Verdict: 0 ran, 1 failed. */
 int pulsar_session_verify_profile(pulsar_session *s, uint32_t rows_max, double *base, char *err, size_t errlen) {
     PULSAR_NVTX_FN();
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "the verify profile", -1);
     if (!s) return -1;
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, "verify_profile", &tp, err, errlen);
@@ -1761,12 +1762,24 @@ static int tp_spec_steps_refuse_masks(pulsar_spec_step *steps, int n) {
     }
     return -1;
 }
+/* L375 O38: the batch entries' capability refusal (their single-round twins return -1 through
+ * PULSAR_FAMILY_REQUIRES_S; a batch's verdict is per step). */
+/** Fail every step: the family declares no speculative decoding.  @param steps [n] the steps  @param n steps
+ *  @return -1, always */
+static int spec_steps_refuse_family(pulsar_spec_step *steps, int n) {
+    for (int i = 0; i < n; i++) {
+        steps[i].status = PULSAR_SPEC_STEP_FAILED;
+        snprintf(steps[i].err, sizeof steps[i].err, "the family does not implement speculative decoding");
+    }
+    return -1;
+}
 int pulsar_session_spec_assemble_batch(pulsar_session *s, pulsar_spec_step *steps, int n,
                                        uint32_t row_budget, pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     PULSAR_NVTX_FN();
     const char *operation = "spec_assemble_batch";
     *n_rows_out = 0;
     if (!s || n < 0 || (n > 0 && (!steps || !reqs))) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
@@ -1790,6 +1803,7 @@ int pulsar_session_spec_round_end_batch(pulsar_session *s, pulsar_spec_step *ste
     PULSAR_NVTX_FN();
     const char *operation = "spec_round_end_batch";
     if (!s || n < 0 || (n > 0 && !steps)) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));
@@ -1816,6 +1830,7 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     PULSAR_NVTX_FN();
     const char *operation = "spec_redraft_commit_batch";
     if (!s || n < 0 || (n > 0 && !steps)) return -1;
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", spec_steps_refuse_family(steps, n));
     char err[256];
     pulsar_tp *tp = NULL;
     const int route = tp_spec_route(s, operation, &tp, err, sizeof(err));

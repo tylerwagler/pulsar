@@ -180,6 +180,21 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     }
 }
 
+/* L375 O38: the round API is the drafter's lane -- begin primes it, the end absorbs into it and drafts with it -- so
+ * an engine that loaded none (a spec-capable family served drafter-off) refuses every entry by name, before anything
+ * of the round is touched; the caller's plain lane (pulsar_session_generate_speculative routes there itself) is the
+ * one path for such an engine. */
+/// @param s the session
+/// @param what the entry's name, for the message
+/// @param err receives the refusal
+/// @param errlen its size
+/// @return true (err filled) when the engine has no drafter
+static bool spec_no_drafter(const pulsar_session *s, const char *what, char *err, size_t errlen) {
+    if (spec_drafter(s)) return false;
+    snprintf(err, errlen, "%s: no drafter is loaded (the round API needs one)", what);
+    return true;
+}
+
 /* The target's undo of a round: the snapshot back on the installed bank, then released. */
 /// @param s the session
 /// @param r the round (its snapshot is released)
@@ -602,6 +617,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
                             float temperature, int top_k, float top_p, float min_p,
                             pulsar_spec_round *r,
                             char *err, size_t errlen) {
+    if (spec_no_drafter(s, "spec round begin", err, errlen)) return -1;
     if (first_token < 0 || (uint32_t)first_token >= spec_vocab(s)) {
         /* -1 is what pulsar_session_spec_next_base returns when the sampler
          * refused the row; the base token feeds the embedding gather, so a
@@ -1336,6 +1352,7 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
                                uint32_t row0,
                                int *accepted, int accepted_cap,
                                char *err, size_t errlen) {
+    if (spec_no_drafter(s, "spec round end", err, errlen)) return -1;   /* no round can have begun */
     if (temperature > 0.0f && !rng) {
         snprintf(err, errlen, "spec round: a sampled walk needs the request's stream");
         pulsar_session_spec_round_abort_local(s, r);
@@ -1361,6 +1378,7 @@ int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r
                                       const int32_t *truth,
                                       int *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
+    if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
     if (!truth) {
         snprintf(err, errlen, "spec round_end_forced: no truth");
         pulsar_session_spec_round_abort_local(s, r);   /* L375 O37: the round is undone, as on every failed end */
@@ -1399,10 +1417,7 @@ int pulsar_session_spec_redraft_batch_local(pulsar_session *s, pulsar_spec_round
                                       const uint32_t *banks, uint64_t **rngs, int n,
                                       char *err, size_t errlen) {
     if (!rounds || !banks || !rngs || n <= 0) return 0;
-    if (!spec_drafter(s)) {
-        snprintf(err, errlen, "redraft batch: no drafter is loaded");
-        return -1;
-    }
+    if (spec_no_drafter(s, "redraft batch", err, errlen)) return -1;
     return spec_drafter(s)->draft_batch(s, rounds, banks, rngs, n, err, errlen);
 }
 
@@ -1445,10 +1460,36 @@ static void spec_step_reset(pulsar_spec_step *st) {
     st->err[0] = '\0';
 }
 
+/* L375 O38: a batch phase on an engine with no drafter -- every step fails by name, no bank is installed and nothing
+ * (a carry, a base draw) is consumed. */
+/// @param s the session
+/// @param steps [n] the steps (each reset, then failed, when there is no drafter)
+/// @param n steps
+/// @param what the phase's name, for the message
+/// @return true when the engine has no drafter (the steps are failed)
+static bool spec_steps_no_drafter(const pulsar_session *s, pulsar_spec_step *steps, int n, const char *what) {
+    if (spec_drafter(s)) return false;
+    for (int i = 0; i < n; i++) {
+        spec_step_reset(&steps[i]);
+        steps[i].status = PULSAR_SPEC_STEP_FAILED;
+        (void)spec_no_drafter(s, what, steps[i].err, sizeof steps[i].err);
+    }
+    return true;
+}
+
 void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n,
                                               uint32_t row_budget,
                                               pulsar_multiseq_req *reqs, uint32_t *n_rows_out) {
     uint32_t rows = 0;
+    *n_rows_out = 0;
+    if (spec_steps_no_drafter(s, steps, n, "spec assemble batch")) {
+        for (int i = 0; i < n; i++) {   /* the phase's outputs, as a step that drew nothing leaves them */
+            steps[i].first_token = -1;
+            steps[i].row0 = 0;
+            steps[i].n_rows = 0;
+        }
+        return;
+    }
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
@@ -1502,6 +1543,10 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
 }
 
 void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_step *steps, int n) {
+    if (spec_steps_no_drafter(s, steps, n, "spec round end batch")) {
+        for (int i = 0; i < n; i++) steps[i].pos_before = steps[i].pos_after = TokPos::none();   /* the phase's outputs */
+        return;
+    }
     /* L302: every round's walk over the shared forward's rows in one launch, before any bank switch (the walk reads
      * each round's drafts and its stream, both host-side in the step) */
     spec_walk_round w[PULSAR_GPU_SAMPLE_ROWS_MAX];
