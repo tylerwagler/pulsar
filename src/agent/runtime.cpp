@@ -602,6 +602,16 @@ static int run_agent(pulsar_engine *engine, agent_config *cfg) {
  *  @return the process exit code */
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    /* L373: the terminal UI needs a terminal.  Without one the line editor cannot start; said here, before the model
+     * loads, with the way to run without one.  LINENOISE_ASSUME_TTY (the editor's own test switch) drives the UI
+     * through a pipe: that run is unattended, as --non-interactive is. */
+    const bool stdin_tty = isatty(STDIN_FILENO) != 0;
+    if (!cfg.non_interactive && !stdin_tty && !getenv("LINENOISE_ASSUME_TTY")) {
+        fprintf(stderr, "pulsar-agent: stdin is not a terminal -- run with --non-interactive (bash then needs "
+                        "--allow-bash)\n");
+        return 2;
+    }
+    cfg.unattended = cfg.non_interactive || !stdin_tty;
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "pulsar-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));

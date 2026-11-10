@@ -200,7 +200,11 @@ typedef struct {
     const char *chdir_path;         ///< directory to run tools from; NULL = inherit the caller's cwd
     bool non_interactive;           ///< one-shot: run the prompt to completion and exit, no TUI
     bool allow_outside_workspace;   ///< L354: file tools may leave the directory the agent started in
-    bool allow_bash;                ///< L354: non-interactive runs may use the bash tool
+    bool allow_bash;                ///< L354: unattended runs may use the bash tool
+    /** L373: nobody is at a terminal watching the model's commands: --non-interactive, or stdin is not a terminal
+     *  (the terminal UI driven through a pipe under LINENOISE_ASSUME_TTY).  The bash gate's one test; set once in
+     *  main. */
+    bool unattended;
 } agent_config;
 
 /** L354: fix the workspace the file tools stay inside: the working directory now (after --chdir), resolved.

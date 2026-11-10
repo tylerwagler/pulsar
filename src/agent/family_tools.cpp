@@ -237,6 +237,19 @@ static void test_agent_family_tools(void) {
         agent_tool_calls_free(&calls);
     }
     AGENT_TEST_ASSERT(access("null", F_OK) != 0);
+    {   /* L373: the bash gate keys on "unattended" (--non-interactive, or stdin not a terminal), not on the flag */
+        agent_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.unattended = true;
+        agent_worker gated;
+        memset(&gated, 0, sizeof(gated));
+        gated.cfg = &cfg;
+        AGENT_TEST_ASSERT(agent_family_call_append(&calls, "bash", "{\"command\": \"touch gate-ran\"}", err, sizeof err));
+        char *res = agent_execute_tool_call_one(&gated, &calls.v[0]);
+        AGENT_TEST_ASSERT(strstr(res, "bash is refused") != NULL && access("gate-ran", F_OK) != 0);
+        free(res);
+        agent_tool_calls_free(&calls);
+    }
     /* a number written as a string still counts; an absent or empty argument takes the default */
     AGENT_TEST_ASSERT(agent_family_call_append(&calls, "bash", "{\"timeout_sec\": \"10\", \"refresh_sec\": 7200, \"job\": \"\"}",
                                                err, sizeof err));

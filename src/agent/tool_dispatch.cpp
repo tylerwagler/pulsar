@@ -34,9 +34,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         if (char *bad = agent_tool_arg_timeout(call, "timeout_sec", &timeout)) return bad;
         if (char *bad = agent_tool_arg_int(call, "refresh_sec", 60, 1, 3600, &refresh)) return bad;
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
-        /* L354: nobody is watching a non-interactive run: running a model's commands is asked for by name */
-        if (w->cfg->non_interactive && !w->cfg->allow_bash)
-            return xstrdup("Tool error: bash is refused in a non-interactive run (--allow-bash permits it)\n");
+        /* L354: nobody is watching an unattended run: running a model's commands is asked for by name */
+        if (w->cfg->unattended && !w->cfg->allow_bash)
+            return xstrdup("Tool error: bash is refused in a run with no terminal (--allow-bash permits it)\n");
         char err[160] = {0};
         agent_bash_job *job = agent_bash_start(w, cmd, timeout, err, sizeof(err));
         if (!job) {
