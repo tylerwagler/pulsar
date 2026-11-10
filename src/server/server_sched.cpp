@@ -2601,7 +2601,20 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     (A fit's misprediction seen so far was optimistic for the other lane -- DeepSeek N8, plain 111 predicted
  *     against 80 measured -- and the clearance is 25%: a cleared prediction does not hide a faster lane.)  (L288, Qwen one stream: spec 51-78 tok/s against
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
- *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.) */
+ *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.)
+ *   - the measured prices' key -- the decoder count and the depth band -- is the decoders', whichever lane carries
+ *     them (L380, lane_decoder_depth): a decoder in the plain batch stands at its feed position.  Read from its
+ *     bank, the installed bank's position is 0 from the batch's first step until the decoder leaves it (the step
+ *     leaves the session's own history invalid), so a lone decoder's band fell to 0 on the plain lane and came back
+ *     on the spec lane: each move dropped both lanes' measured prices, a plain probe never kept more than the steps
+ *     of one request, and the plain price it took was dropped as the decoder returned.  (Qwen one stream at 36.5K,
+ *     2026-11-10: five requests of 11-22 tokens decoded on the plain lane at ~33 tok/s, the spec lane predicted at
+ *     64; the 48-token request that completed the probe handed back a spec lane with no measured price.)
+ *   - a probe belongs to the count and band it began at (L380): it keeps its steps while the decoders idle between
+ *     requests, and it ends, unweighed, when the count or the band moves -- the measured prices it was started on
+ *     and the steps it had are dropped there, so the pick falls to the rule for an unmeasured lane in force (the
+ *     better-predicted lane is measured first) and the re-measure waits for a measured lane in force and its clock
+ *     again.  Every move is said in the next pick's reason, old and new ("depth band 3 -> 0"). */
 /// How much faster (fraction) the other lane must price before a probe or a switch.
 #define LANE_PRICE_MARGIN        0.04
 /// Steps the lane in force runs after it is chosen or weighed before a probe or a switch.
@@ -2621,6 +2634,33 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
 const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT] = {"plan", "forward", "round_end", "emit",
                                                                        "draft", "commit"};
 
+/* The measured prices are for `n` decoders in depth band `band` from here on: what was measured at another count or
+ * band prices it no longer, and a probe begun there ends unweighed (L380: it was started on those prices).  What
+ * moved is noted for the next pick's reason (lane_price::moved) -- not from the start state, where nothing was
+ * measured for any count. */
+/// @param lp the lane prices
+/// @param n the decoder count
+/// @param band the depth band (lane_depth_band)
+static void lane_price_rekey(lane_price *lp, int n, int band) {
+    if (lp->meas_n != 0) {
+        const size_t cap = sizeof lp->moved;
+        size_t at = strlen(lp->moved);
+        auto note = [&](const char *what, int from, int to) {
+            const int w = snprintf(lp->moved + at, cap - at, "%s%s %d -> %d", at ? ", " : "", what, from, to);
+            at = w < 0 || (size_t)w >= cap - at ? cap - 1u : at + (size_t)w;
+        };
+        if (n != lp->meas_n) note("decoders", lp->meas_n, n);
+        if (band != lp->meas_depth) note("depth band", lp->meas_depth, band);
+        if (lp->probe) (void)snprintf(lp->moved + at, cap - at, ", the probe ends");
+    }
+    memset(lp->meas_tok, 0, sizeof lp->meas_tok);
+    memset(lp->meas_ms, 0, sizeof lp->meas_ms);
+    memset(lp->meas_steps, 0, sizeof lp->meas_steps);
+    lp->meas_n = n;
+    lp->meas_depth = band;
+    lp->probe = 0;
+}
+
 /* One decode step on lane `li` (PULSAR_LANE_PLAIN / _SPEC) by `n` decoders: `tokens` committed in `ms`. */
 /// @param lp the lane prices (worker thread)
 /// @param li the lane (PULSAR_LANE_PLAIN / PULSAR_LANE_SPEC)
@@ -2629,12 +2669,7 @@ const char *const server_round_phase_name[SERVER_ROUND_PHASE_COUNT] = {"plan", "
 /// @param ms the step's wall time, ms
 static void lane_price_measure(lane_price *lp, int li, int n, int tokens, double ms) {
     if (n <= 0 || tokens < 0 || !(ms > 0.0)) return;
-    if (n != lp->meas_n) {   /* another decoder count: what was measured prices it no longer */
-        memset(lp->meas_tok, 0, sizeof lp->meas_tok);
-        memset(lp->meas_ms, 0, sizeof lp->meas_ms);
-        memset(lp->meas_steps, 0, sizeof lp->meas_steps);
-        lp->meas_n = n;
-    }
+    if (n != lp->meas_n) lane_price_rekey(lp, n, lp->meas_depth);
     const double a = lp->meas_steps[li] ? (double)LANE_PRICE_ALPHA : 1.0;
     lp->meas_tok[li] += a * ((double)tokens - lp->meas_tok[li]);
     lp->meas_ms[li] += a * (ms - lp->meas_ms[li]);
@@ -2715,24 +2750,15 @@ static int lane_depth_band(uint32_t depth) {
     return b;
 }
 
-/* The priced lane (2 plain, 3 spec) for `n` decoders the spec lane could carry; called once a quantum.  The
- * fits' step counts (pulsar_lane_cost::n) time the hold and the probes.  Updates lp's prices and reason. */
+/* lane_price_pick's weighing, on measured prices already keyed to the `n` decoders and their band. */
 /// @param lp the lane prices (updated)
 /// @param plain the plain lane's cost fit
 /// @param spec the spec lane's cost fit
 /// @param n decoders
 /// @param verify_rows the verify width
-/// @param depth the decoders' mean frontier, tokens (a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
-static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
-                           uint32_t verify_rows, uint32_t depth) {
-    const int band = lane_depth_band(depth);
-    if (band != lp->meas_depth) {   /* another context band: what was measured prices it no longer */
-        memset(lp->meas_tok, 0, sizeof lp->meas_tok);
-        memset(lp->meas_ms, 0, sizeof lp->meas_ms);
-        memset(lp->meas_steps, 0, sizeof lp->meas_steps);
-        lp->meas_depth = band;
-    }
+static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
+                            uint32_t verify_rows) {
     if (lp->lane == 0) {   /* the spec lane until a price says otherwise */
         lp->lane = 3;
         lp->held_n0 = spec->n;
@@ -2809,8 +2835,43 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         lp->why = "clears the other lane: the re-measure waits";
         return inc;
     }
-    lp->why = "priced";
+    lp->why = clears ? "priced: clears the other lane" : "priced";
     return inc;
+}
+
+/* The priced lane (2 plain, 3 spec) for `n` decoders the spec lane could carry; called once a quantum.  The
+ * fits' step counts (pulsar_lane_cost::n) time the hold and the probes.  Updates lp's prices and reason; a reason
+ * that follows a moved count or band names the move first (lane_price::rekeyed). */
+/// @param lp the lane prices (updated)
+/// @param plain the plain lane's cost fit
+/// @param spec the spec lane's cost fit
+/// @param n decoders
+/// @param verify_rows the verify width
+/// @param depth the decoders' mean depth, tokens (lane_decoder_depth; a new band drops the measured prices)
+/// @return the lane: 2 plain or 3 spec
+static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
+                           uint32_t verify_rows, uint32_t depth) {
+    const int band = lane_depth_band(depth);
+    if (n != lp->meas_n || band != lp->meas_depth) lane_price_rekey(lp, n, band);
+    const int lane = lane_price_weigh(lp, plain, spec, n, verify_rows);
+    lp->rekeyed = lp->moved[0] != '\0';
+    if (lp->rekeyed) {
+        (void)snprintf(lp->why_moved, sizeof lp->why_moved, "%s: %s", lp->moved, lp->why);
+        lp->why = lp->why_moved;
+        lp->moved[0] = '\0';
+    }
+    return lane;
+}
+
+/* L380: where a decoder stands for the lane prices' depth band, whichever lane carries it.  In the plain batch that
+ * is its feed position: its tokens join its bank's history only as it leaves the batch, and until then the installed
+ * bank's position reads 0 (a batch step leaves the session's own history invalid: pulsar_session_bank_pos). */
+/// @param s the server
+/// @param sl the decoder's slot
+/// @return its depth, tokens
+static uint32_t lane_decoder_depth(const server *s, const session_slot *sl) {
+    const gen_state *g = sl->gen;
+    return (uint32_t)(g && g->batch_active ? g->batch_feed_pos : s->slot_frontier_pos(sl)).raw();
 }
 
 /// @brief The decode lane for this sweep (the rule above): 0 idle, 2 batched, 3 spec-batched (1, the retired
@@ -5691,8 +5752,8 @@ void *server_worker_main(void *arg) {
         } else if (spec_carries) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
-            uint64_t dsum = 0;   /* L338: the decoders' mean frontier: the depth band the prices are measured in */
-            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
+            uint64_t dsum = 0;   /* L338: the decoders' mean depth: the depth band the prices are measured in */
+            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)lane_decoder_depth(s, dec[i]);
             priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
                                      (uint32_t)(dsum / (uint64_t)n_dec));
         }
@@ -5717,6 +5778,14 @@ void *server_worker_main(void *arg) {
                 server_log(PULSAR_LOG_GENERATION,
                            "pulsar-server: decode lane %d -> %d (%d decoders, %d in the plain batch)",
                            s->w_decode_lane, lane, n_dec, n_batched);
+        } else if (priced && s->w_lane_price.rekeyed && lane >= 2) {
+            /* L380: the measured prices dropped under a lane that holds -- said too, with what moved */
+            const lane_price *lp = &s->w_lane_price;
+            server_log(PULSAR_LOG_GENERATION,
+                       "pulsar-server: decode lane %d holds (%d decoders, %d in the plain batch; spec %.1f%s vs plain "
+                       "%.1f%s tok/s: %s)",
+                       lane, n_dec, n_batched, lp->t_spec, lp->meas_spec ? "" : " predicted", lp->t_plain,
+                       lp->meas_plain ? "" : " predicted", lp->why);
         }
         /* L289: a deferred re-measure is a decision the lane line does not show (the lane holds): said once a
          * weighing, with the prices that cleared it */

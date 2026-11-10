@@ -2351,6 +2351,13 @@ typedef struct {
     int lane;             ///< the priced lane while spec could carry the decoders: 2 or 3 (0: none yet -> 3)
     int probe;            ///< the lane being measured against `lane` (0: none)
     uint32_t probe_n0;    ///< that lane's step count when the probe began
+    /** L380: what moved under the measured prices since the last pick, old and new ("decoders 1 -> 2", "depth band
+     *  3 -> 0", ", the probe ends" when it ended one): the next pick's reason starts with it ("": nothing moved) */
+    char moved[128];
+    /// L380: that pick's reason, `moved` in front (`why` points here then)
+    char why_moved[224];
+    /// L380: the last pick's reason names a move (the caller announces it even where the lane holds)
+    bool rekeyed;
     uint32_t held_n0;     ///< `lane`'s step count when it was chosen or last weighed (hold and re-probe count from it)
     int meas_n;           ///< the decoder count the measured prices below are for
     int meas_depth;       ///< L338: the depth band they are for (lane_depth_band: a new band drops them)

@@ -12971,6 +12971,139 @@ static void test_l289_lane_reprobe_evidence(void) {
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
 
+/* L380 -- a probe belongs to the decoder count and depth band it began at.  Qwen one stream (2026-11-10): spec 4 tokens
+ * a 53.3 ms round = 75 tok/s, plain predicted 1 / 29 ms = 34.5.  (a) The decoders idling between requests ends
+ * nothing: the probe's steps so far count and it completes after the rest.  (b) A new band or count ends it unweighed
+ * and the lane in force is measured first; the pick's reason names what moved, old and new, once -- with or without
+ * a probe in flight.  (c) With the plain lane cleared on a
+ * predicted price no probe starts on the way -- spec measured or itself predicted -- and the re-measure still comes at
+ * LANE_PRICE_CLEAR_SPAN re-probe periods.  (d) A plain lane with no price at all is probed as soon as the hold is
+ * over, and that probe keeps its steps over an idle gap too. */
+static void test_l380_lane_probe_key(void) {
+    lane_price lp;
+    memset(&lp, 0, sizeof lp);
+    pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
+    pulsar_lane_cost plain = l284_cost(28000, 1000, true, 100u, 1.0f, 29.0f);
+    const uint32_t cleared = LANE_PRICE_REPROBE_STEPS * LANE_PRICE_CLEAR_SPAN;
+    /* (c) spec measured, plain predicted and cleared x2.2: no probe, request after request, until the cleared clock */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lp.t_spec >= lp.t_plain * LANE_PRICE_CLEAR && lp.t_plain > 34.0 && lp.t_plain < 35.0);
+    TEST_ASSERT(!strcmp(lp.why, "priced: clears the other lane"));
+    for (uint32_t k = LANE_PRICE_PROBE_STEPS; k + 16u < cleared; k += 16u) {
+        l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 16u, 1, 4, 5, 53.3);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0);
+    }
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 16u, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2 && lp.lane == 3);
+    TEST_ASSERT(!strcmp(lp.why, "re-measuring"));
+    /* (a) 11 plain steps and the request ends; nothing runs while the decoders idle, and the next request's first
+     * pick carries the probe on with spec's price still measured */
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 11u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2 && lp.meas_spec && !lp.meas_plain);
+    TEST_ASSERT(lp.meas_steps[PULSAR_LANE_PLAIN] == 11u && !strcmp(lp.why, "measuring"));
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS - 12u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.meas_plain && lp.lane == 3);
+    TEST_ASSERT(!strcmp(lp.why, "measured: the lane in force holds") && lp.held_n0 == spec.n);
+    /* (b) the next cleared re-measure is 11 steps in when a request arrives in another depth band: the probe ends
+     * with the prices it was started on, and the lane in force is measured there -- no plain step */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, cleared, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 11u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 26000u) == 3 && lp.probe == 0 && lp.lane == 3);
+    TEST_ASSERT(!lp.meas_spec && !lp.meas_plain && lp.meas_steps[PULSAR_LANE_PLAIN] == 0u && lp.rekeyed);
+    TEST_ASSERT(!strcmp(lp.why, "depth band 0 -> 2, the probe ends: measuring the lane in force"));
+    /* (c) spec only predicted there (its yield over its fit, 72.5) against plain predicted: still no probe, and the
+     * reason is the plain one from the second pick on */
+    TEST_ASSERT(lp.t_spec >= lp.t_plain * LANE_PRICE_CLEAR);
+    for (uint32_t k = 1u; k < LANE_PRICE_PROBE_STEPS; k++) {
+        l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 26000u) == 3 && lp.probe == 0 && !lp.meas_spec);
+        TEST_ASSERT(!strcmp(lp.why, "measuring the lane in force") && !lp.rekeyed);
+    }
+    /* ...and once spec is measured in the band, the re-measure the probe did not finish is still owed: the cleared
+     * clock ran out before it began and nothing has been weighed since */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, 1u, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 26000u) == 2 && lp.probe == 2 && lp.meas_spec);
+    TEST_ASSERT(!strcmp(lp.why, "re-measuring"));
+    /* (b) a second decoder joins five plain steps in: the count ends the probe the same way, whether the pick sees
+     * the new count first... */
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 5u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, 16u, 26000u) == 3 && lp.probe == 0 && lp.meas_n == 2);
+    TEST_ASSERT(!strcmp(lp.why, "decoders 1 -> 2, the probe ends: measuring the lane in force"));
+    TEST_ASSERT(lp.meas_steps[PULSAR_LANE_PLAIN] == 0u);
+    /* ...or a step does, inside a quantum (the decoder finishes: one left) */
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 2, 8, 10, 76.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 2, 16u, 26000u) == 2 && lp.probe == 2);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 5u, 2, 2, 2, 30.0);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 1u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lp.probe == 0 && lp.meas_n == 1 && lp.meas_steps[PULSAR_LANE_PLAIN] == 1u);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 26000u) == 3 && lp.rekeyed);
+    TEST_ASSERT(!strcmp(lp.why, "decoders 2 -> 1, the probe ends: measuring the lane in force"));
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 26000u) == 3 && !lp.rekeyed &&
+                !strcmp(lp.why, "measuring the lane in force"));
+    /* no probe in flight: the move is named all the same, both parts when both moved, and the start state (nothing
+     * measured for any count) names none */
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 3, 16u, 100u) == 3 && lp.rekeyed);
+    TEST_ASSERT(!strcmp(lp.why, "decoders 1 -> 3, depth band 2 -> 0: measuring the lane in force"));
+    /* (d) a plain lane with no price at all (no fit yet) is probed once spec is measured and held, however fast
+     * spec is, and that probe keeps its steps over an idle gap as well */
+    memset(&lp, 0, sizeof lp);
+    spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
+    plain = l284_cost(0, 0, false, 0u, 0.0f, 0.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.t_plain == 0.0 && !lp.rekeyed);
+    TEST_ASSERT(!strcmp(lp.why, "measuring the lane in force"));
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2 && lp.t_plain == 0.0);
+    TEST_ASSERT(!strcmp(lp.why, "no price here: measuring"));
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 20u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 2 && lp.probe == 2);
+    l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, LANE_PRICE_PROBE_STEPS - 20u, 1, 1, 1, 29.0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 0u) == 3 && lp.probe == 0 && lp.meas_plain);
+    TEST_ASSERT(fabs(lp.t_plain - 1000.0 / 29.0) < 1e-6);
+}
+
+/* L380 -- the depth the lane prices are keyed by is the decoder's, whichever lane carries it: in the plain batch
+ * its feed position, not its bank's (the installed bank's position reads 0 from the batch's first step until the
+ * decoder leaves: one Qwen stream at 36.5K fell from band 3 to band 0 on the plain lane and came back on the spec
+ * lane, dropping both lanes' measured prices each way).  No engine: the bank's position reads 0 here, as the
+ * installed bank's does in the batch. */
+static void test_l380_lane_decoder_depth(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    sl.provisioned = true;
+    sl.gen = &g;
+    g.phase = GEN_DECODE;
+    TEST_ASSERT(lane_decoder_depth(&s, &sl) == 0u);   /* on the spec lane: its bank's position */
+    g.batch_active = true;
+    g.batch_feed_valid = true;
+    g.batch_feed_pos = TokPos{36600};
+    TEST_ASSERT(s.slot_frontier_pos(&sl).raw() == 0 && lane_decoder_depth(&s, &sl) == 36600u);
+    TEST_ASSERT(lane_depth_band(lane_decoder_depth(&s, &sl)) == 3);
+    /* so a plain probe's steps count over its quanta: band 3 at every pick */
+    lane_price lp;
+    memset(&lp, 0, sizeof lp);
+    pulsar_lane_cost spec = l284_cost(34400, 4150, true, 100u, 4.0f, 51.0f);
+    pulsar_lane_cost plain = l284_cost(0, 0, false, 0u, 0.0f, 0.0f);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 36600u) == 3);
+    l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 36632u) == 2 && lp.probe == 2);
+    for (uint32_t k = 0; k < 4u; k++) {   /* four quanta of eight plain steps */
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 2 && !lp.rekeyed);
+        l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 8u, 1, 1, 1, 29.0);
+        g.batch_feed_pos += TokCount{8};
+    }
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 3 && lp.probe == 0);
+    TEST_ASSERT(lp.meas_plain && lp.meas_spec && !strcmp(lp.why, "measured: the lane in force holds"));
+}
+
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
  * three batched lanes (lane_should_abandon). Invariant: a slot is abandoned
  * iff its gen state is GEN_DECODE, its client fd reports a hang-up
@@ -16599,6 +16732,8 @@ static void pulsar_server_unit_tests_run(void) {
     test_l284_lane_price_pick();
     test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
+    test_l380_lane_probe_key();
+    test_l380_lane_decoder_depth();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();
