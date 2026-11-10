@@ -1125,7 +1125,8 @@ static int spec_base_draw(pulsar_session *s, float temperature, int top_k, float
     q.probe = -1;
     const uint32_t row = 0;
     pulsar_gpu_sample_out o;
-    return s->draw_rows(s->dev.live, &row, 1, &q, &mask, &o) ? o.token : PULSAR_SAMPLE_REFUSED;   /* L303: through its mask */
+    const pulsar_gpu_tensor *live = s->live_dev();   /* L375: refused (said) when the view has no row */
+    return live && s->draw_rows(live, &row, 1, &q, &mask, &o) ? o.token : PULSAR_SAMPLE_REFUSED;   /* L303: through its mask */
 }
 
 /* Speculative generation that OWNS sampling: draws the base token from the

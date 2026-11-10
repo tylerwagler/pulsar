@@ -2902,8 +2902,9 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
 typedef struct pulsar_session_dev_rows {
     pulsar_gpu_tensor *live;        ///< [W] f32: the live row
     bool host_stale;                ///< pulsar_session::logits is behind `live`
-    bool live_valid;                ///< L354: something has written `live` for the view installed
+    bool live_valid;                ///< L354: something has written `live` for the view installed (read by live_dev())
     pulsar_gpu_tensor *bank_rows;   ///< [n_banks][W] f32: each bank's live row while another bank is installed
+    bool *bank_valid;               ///< [n_banks] L375: bank_rows holds that bank's row (its live_valid when saved)
     /// Banks bank_rows holds a row for.
     uint32_t n_banks;
     pulsar_gpu_tensor *scratch;     ///< the sampler's and the logprob passes' (the larger of their scratch bytes)
@@ -3312,14 +3313,18 @@ struct pulsar_session {
     /// @param row  logits-width floats (may be `logits` itself)
     /// @return false when the upload fails.
     bool live_from_host(const float *row);
+    /// The live row on the device, for a reader (L375: the one gate of every draw, logprob and host readback).
+    /// @return dev.live, or NULL (said) when nothing has written a row for the installed view.
+    const pulsar_gpu_tensor *live_dev();
     /// The live row's host mirror, read back first when the device moved past it.
-    /// @return `logits`, or NULL when the readback fails.
+    /// @return `logits`, or NULL when the view has no row (live_dev) or the readback fails.
     const float *live_host();
-    /// Copy the live row into `bank`'s saved row on the device.
+    /// Copy the live row, and whether the view has one, into `bank`'s saved row on the device.
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_save_bank(uint32_t bank);
-    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale).
+    /// Make `bank`'s saved row the live row (on the device; the host mirror becomes stale); the view has a row
+    /// exactly when the bank's saved one was written (dev.bank_valid).
     /// @param bank  bank index, < dev.n_banks
     /// @return false for an out-of-range bank or a failed copy.
     bool live_restore_bank(uint32_t bank);

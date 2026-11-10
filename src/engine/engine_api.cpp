@@ -815,6 +815,7 @@ void pulsar_session_family_invalidate(pulsar_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->logits_stale = true;
+    s->dev.live_valid = false;   /* L375: the live row was the forgotten history's (the readers refuse, live_dev) */
     s->live_images.n = 0;      /* the forgotten history's image records go with it (a run from 0 reads them) */
     spec_lookahead_reset(s);   /* the history the lookahead was conditioned on is gone */
 }
