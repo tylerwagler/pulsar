@@ -42,6 +42,23 @@ uint32_t pulsar_state_plan_add(pulsar_state_plan *p, const pulsar_state_decl &d)
     return p->n_decl++;
 }
 
+uint32_t pulsar_state_plan_add_slot(pulsar_state_plan *p, uint32_t mask) {
+    if (p->n_slots >= PULSAR_STATE_SLOTS_MAX) {   /* counted: the load refuses the model (pulsar_state_plan_slots_fit) */
+        p->slot_overflow++;
+        return PULSAR_STATE_SLOTS_MAX;
+    }
+    p->slot[p->n_slots] = mask;
+    return p->n_slots++;
+}
+
+bool pulsar_state_plan_slots_fit(const pulsar_state_plan *p, const char *arch) {
+    if (!p->slot_overflow) return true;
+    fprintf(stderr, "pulsar: %s: the %u trunk layers and the drafter's need %u layer slots, the state plan holds %u "
+                    "(PULSAR_STATE_SLOTS_MAX) -- refusing the model\n", arch, p->n_trunk,
+            p->n_slots + p->slot_overflow, (unsigned)PULSAR_STATE_SLOTS_MAX);
+    return false;
+}
+
 /* The bytes a capture row of decl d takes. */
 /// @param d the decl
 /// @return bytes of one capture row: the whole state for SNAPSHOT, else capture_bytes
@@ -63,6 +80,11 @@ static const char *plan_refusal(const pulsar_state_plan *p) {
     if (p->n_overflow) {
         snprintf(why, sizeof why, "the decl table is full: %u decl(s) past its PULSAR_STATE_DECLS_MAX (%u) entries",
                  p->n_overflow, (unsigned)PULSAR_STATE_DECLS_MAX);
+        return why;
+    }
+    if (p->slot_overflow) {   /* L375 O48: the load refuses this first (pulsar_state_plan_slots_fit) */
+        snprintf(why, sizeof why, "the slot table is full: %u drafter slot(s) past its PULSAR_STATE_SLOTS_MAX (%u) "
+                 "entries", p->slot_overflow, (unsigned)PULSAR_STATE_SLOTS_MAX);
         return why;
     }
     if (p->n_decl > PULSAR_STATE_DECLS_MAX || p->n_slots > PULSAR_STATE_SLOTS_MAX || p->n_trunk > p->n_slots)

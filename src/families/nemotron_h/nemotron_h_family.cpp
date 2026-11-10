@@ -134,6 +134,7 @@ bool load(pulsar_engine *e, const pulsar_engine_options *opt) {
     /* the session's declared state (N3, F3) and the digest its disk segments are keyed by: the directory's names,
      * types and sizes */
     pulsar_nemotron_h_state_plan(e);
+    if (!pulsar_state_plan_slots_fit(&e->state_plan, ARCH)) return false;   /* L375 O48: a drafter past the slot table */
     {
         uint64_t h = 1469598103934665603ull;
         auto mix = [&h](const void *p, size_t n) {

@@ -3917,6 +3917,25 @@ static void test_state_plan_overflow(void) {
     }
     TEST_ASSERT(p.n_decl == PULSAR_STATE_DECLS_MAX && p.n_overflow == 2u);
     TEST_ASSERT(pulsar_state_create(NULL, &p, NULL, 1u, 64u, 0u) == NULL);   /* refused by name, nothing allocated */
+    /* L375 O48: the slot table.  A drafter's slots append through pulsar_state_plan_add_slot; past
+     * PULSAR_STATE_SLOTS_MAX nothing is written (the words after slot[] keep their value), the overflow is counted,
+     * the load's check refuses the model, and so does the create. */
+    pulsar_state_plan q{};
+    q.name = "slot-overflow-test";
+    q.resume_grid = 1u;
+    q.ckpt_slots = 1u;
+    const uint32_t id = pulsar_state_plan_add(&q, d);
+    q.n_trunk = q.n_slots = PULSAR_STATE_SLOTS_MAX - 2u;
+    for (uint32_t k = 0; k < q.n_trunk; k++) q.slot[k] = 1u << id;
+    q.session = 0xA5A5A5A5u;   /* the word after slot[]: a write past the table would land here */
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 2u);
+    TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX - 1u);
+    TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 0u && pulsar_state_plan_slots_fit(&q, "test"));
+    for (uint32_t i = 0; i < 3u; i++) TEST_ASSERT(pulsar_state_plan_add_slot(&q, 1u << id) == PULSAR_STATE_SLOTS_MAX);
+    TEST_ASSERT(q.n_slots == PULSAR_STATE_SLOTS_MAX && q.slot_overflow == 3u && q.session == 0xA5A5A5A5u);
+    TEST_ASSERT(!pulsar_state_plan_slots_fit(&q, "test"));
+    q.session = 0u;
+    TEST_ASSERT(pulsar_state_create(NULL, &q, NULL, 1u, 64u, 0u) == NULL);   /* the create's backstop names it too */
 }
 
 /* L301: the verify pick, its online correction and the lockstep chains' continuation (verify_curve.cpp; the
@@ -5134,7 +5153,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--tokenizer-refusals", "tokenizer-refusals", "the tokenizer and chat entries refuse a family without them by name and return their failure values, never exit (L335)", test_tokenizer_refusals},
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
-    {"--state-plan", "state-plan", "the state plan's decl table: a full table counts the overflow and the create refuses it by name (L335)", test_state_plan_overflow},
+    {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},
     {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
     {"--ckpt-host-tier", "ckpt-host-tier", "the checkpoint store's tiers: a dry price carries no host-tier checkpoint, a discrete card places them in pinned RAM and GB10 does not, each tier's capture / reader / reuse / claim / record round trip on this device (L347 I4)", test_ckpt_host_tier},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},

@@ -1533,7 +1533,7 @@ void pulsar_nemotron_h_state_plan(pulsar_engine *e) {
     /* N9, the drafter's slot when the session drafts: the MTP module's attention K|V (one geometry with the trunk's)
      * and each bank's parked conditioning row; the chained-MTP lane's hooks keep its counters with the walk */
     if (W(e)->drafting) {
-        p->slot[p->n_slots++] = 1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND;
+        (void)pulsar_state_plan_add_slot(p, 1u << PULSAR_NEMOTRON_H_STATE_KV | 1u << PULSAR_NEMOTRON_H_STATE_MTP_PEND);
         p->drafter_at = pulsar_mtp_drafter_at;
         p->drafter_frontier = pulsar_mtp_drafter_frontier;
     } else if (W(e)->block) {

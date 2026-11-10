@@ -974,6 +974,7 @@ static bool qwen_family_load(pulsar_engine *e, const pulsar_engine_options *opt)
         fprintf(stderr, "pulsar: %s: %s\n", PULSAR_QWEN_ARCH, desc);
     }
     qwen_state_plan(e);   /* L295 F3: the shape is the rank's, the MTP layer known */
+    if (!pulsar_state_plan_slots_fit(&e->state_plan, PULSAR_QWEN_ARCH)) return false;   /* L375 O48 */
     fprintf(stderr, "pulsar: %s: %s, %u GDN + %u QSA layers, PLE at layer %u\n",
             PULSAR_QWEN_ARCH, g_qwen_shape.name,
             pulsar_layer_plan_count(&e->plan, PULSAR_LAYER_QWEN_GDN),
@@ -1185,7 +1186,7 @@ void qwen_state_plan(pulsar_engine *e) {
     p->n_slots = lp->n_layer;
     /* the MTP layer's slot and the chained-MTP lane's hooks (L296 N9: its parked row and stage kept with the walk) */
     if (e->qwen_weights->mtp.present) {
-        p->slot[p->n_slots++] = qsa | 1u << PULSAR_QWEN_STATE_MTP_PEND;
+        (void)pulsar_state_plan_add_slot(p, qsa | 1u << PULSAR_QWEN_STATE_MTP_PEND);
         p->drafter_at = pulsar_mtp_drafter_at;
         p->drafter_frontier = pulsar_mtp_drafter_frontier;
     }

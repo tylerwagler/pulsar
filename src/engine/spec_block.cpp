@@ -550,16 +550,18 @@ void pulsar_block_drafter_plan(pulsar_engine *e, pulsar_state_plan *p) {
         kf.tokens = std::max(d->window, PULSAR_BLOCK_FULL_KEYS);
         d->decl_kv_full = pulsar_state_plan_add(p, kf);
     }
+    /* L375 O48: each layer's slot through the plan's bounded append -- a trunk that leaves too few slots writes none
+     * past the table and the family's load refuses the model (pulsar_state_plan_slots_fit) */
+    const uint32_t first = p->n_slots;
     for (uint32_t l = 0; l < d->n_layer; l++)
-        p->slot[p->n_slots + l] = 1u << (((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv);
+        (void)pulsar_state_plan_add_slot(p, 1u << (((d->full_layers >> l) & 1u) ? d->decl_kv_full : d->decl_kv));
     d->decl_anchor = UINT32_MAX;
     if (d->head_kind == PULSAR_BLOCK_HEAD_LILICORR) {   /* the candidate head reads cn of the last committed row */
         pulsar_state_decl anchor{"draft_anchor", PULSAR_STATE_FIXED, PULSAR_STATE_CAPTURE_NONE, false, false, 0,
                                  (uint64_t)d->hidden * 2u, 0, 0, NULL, NULL, NULL};
         d->decl_anchor = pulsar_state_plan_add(p, anchor);
-        p->slot[p->n_slots] |= 1u << d->decl_anchor;
+        if (p->n_slots > first) p->slot[first] |= 1u << d->decl_anchor;   /* on the drafter's first layer slot */
     }
-    p->n_slots += d->n_layer;
     /* no lane counters to keep with the walk: the ring and the anchor ARE the drafter's state at the bank's frontier
      * (a draft writes neither) */
     p->drafter_at = NULL;
