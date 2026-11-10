@@ -658,7 +658,21 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
     e->spec_tau = opt->spec_tau;
     if (e->spec_tau == 0.0f) {
         const char *v = getenv("PULSAR_SPEC_TAU");
-        e->spec_tau = !v || !v[0] ? 0.0f : !strcmp(v, "off") ? -1.0f : (float)atof(v);
+        if (v && v[0] && strcmp(v, "off")) {
+            /* L375: a value that is not a number used to parse as 0 -- the drafter's own tau, silently (rule 9) */
+            char *end = NULL;
+            const double t = strtod(v, &end);
+            if (end == v || *end != '\0' || !isfinite(t)) {
+                fprintf(stderr, "pulsar: PULSAR_SPEC_TAU=\"%s\" is neither a number nor \"off\" -- refusing (it would "
+                                "have run the drafter's default threshold unannounced)\n", v);
+                free(e);
+                *out = NULL;
+                return 1;
+            }
+            e->spec_tau = (float)t;
+        } else {
+            e->spec_tau = v && v[0] ? -1.0f : 0.0f;   /* "off": no stop; unset: the drafter's own */
+        }
     }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
