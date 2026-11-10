@@ -1204,8 +1204,13 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
         /* L264 S4: persisting is idempotent -- a chain the store already holds
          * writes nothing -- so "stored" is "the store holds this history". */
         bool no_room = false;
-        s->kv_cache_persist(sl, KV_PERSIST_EVICT, nullptr, &no_room);
-        stored = !no_room;   /* L353 no. 14: skipped or short, the history is not on disk, and the log says so */
+        int end = 0;
+        s->kv_cache_persist(sl, KV_PERSIST_EVICT, &end, &no_room);
+        /* L353 no. 14: skipped or short, the history is not on disk, and the log says so.  L372: nor is it when the
+         * persist writes nothing by rule (a read-only history, a dead prefix, a mirrored sync) or finds no grid
+         * checkpoint to end a chain on: none of those is short of room, and each read "snapshot=disk".  The chain's
+         * end is the fact: 0 when the store holds none of this history. */
+        stored = !no_room && end > 0;
     }
     if (!stored && live_tokens > 0) {
         server_log(PULSAR_LOG_WARNING,
@@ -1215,7 +1220,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
                    !s->kv.enabled ? "kv disk cache disabled"
                    : live_tokens < s->kv.opt.min_tokens
                        ? "conversation below kv-cache min-tokens"
-                       : "snapshot write failed");
+                       : "the persist stored nothing");
     }
     /* The live protocol bindings describe a sampled frontier that is about to
      * lose its GPU state; clear them AFTER the store (snapshot keying reads
