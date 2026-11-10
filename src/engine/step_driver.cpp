@@ -865,9 +865,7 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
  *            with heads on every row).  k + 1 <= PULSAR_DRIVER_HEADS_MAX, so every kernel takes its decode arm (in 16-row
  *            blocks past 16, L288 C1) and each row's logits are the bytes a one-token decode would give.
  *   commit   the bank's declared state is set to the last kept row's (pulsar_state_commit), its position counter
- *            moves, the logits are the kept row's.
- *   cut      the L155 trim: a recurrent state has no rewind, so the bank's view is invalidated and its next sync
- *            prefills it (a grid checkpoint at or below the cut would do). */
+ *            moves, the logits are the kept row's. */
 
 /* The single lane's verify: the trunk over the round's rows, every row headed into the driver's slab (the session's
  * step rows: the walk reads them on the device, L302). */
@@ -912,15 +910,6 @@ static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t
     return true;
 }
 
-/** pulsar_spec_target_ops::cut: invalidate the session's view (the cut position is unused); the next sync
- *  prefills.
- *  @param s the session */
-static void driver_spec_cut(pulsar_session *s, int) {
-    s->checkpoint_valid = false;
-    s->checkpoint.len = 0;
-    s->logits_stale = true;
-}
-
 const pulsar_spec_target_ops PULSAR_DRIVER_SPEC_TARGET = {
     /* .snapshot      = */ NULL,   /* the verify step captures its own undo state (the declared state's capture) */
     /* .restore       = */ NULL,
@@ -928,5 +917,4 @@ const pulsar_spec_target_ops PULSAR_DRIVER_SPEC_TARGET = {
     /* .arm_verify    = */ NULL,   /* a heads-on-every-row decode_mixed IS the verify */
     /* .verify_single = */ driver_verify_single,
     /* .commit        = */ driver_spec_commit,
-    /* .cut           = */ driver_spec_cut,
 };

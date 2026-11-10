@@ -758,6 +758,19 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
     int32_t (&pend)[16] = r->pend;
     float (&pend_conf)[16] = r->pend_conf;
     (void)pend_conf; (void)t0; (void)dspark_stats;
+    /* L155: the round hands back every position it commits, so accepted[] must hold the base and all K drafts it
+     * verified.  round_begin cut K to its own accepted_cap; an end given a smaller one could commit tokens its caller
+     * never receives (the old answer was to commit, then rewind or invalidate the bank), so it is refused here, before
+     * anything is committed, and the round undone.  With room for 1 + K the emit below never stops short of the
+     * commit: the stop clamp cuts the commit AT the first stop token, the only other thing that ends the emit. */
+    if (accepted_cap < 1 + (int)K) {
+        s->checkpoint.len = saved_len;
+        spec_round_undo(s, r);
+        snprintf(err, errlen, "spec round end: accepted[] holds %d tokens, the round verified %u drafts (it needs %u)",
+                 accepted_cap, K, 1u + K);
+        s->checkpoint_valid = false;
+        return -1;
+    }
     /* Accept the longest prefix the target agrees with: row i's own token --
      * its argmax (greedy) or its draw at that token's key under the
      * request's FILTERED target distribution (sampled) -- must equal pend[i];
@@ -973,55 +986,25 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * chain's drafts past it (L288 sdet; a teacher-forced end draws nothing and leaves the stream alone) */
     if (rng && !forced_truth) pulsar_sample_advance(rng, (uint32_t)n_accept);
 
-    /* L155 guard: the committed frontier (saved_len + 1 + commit) must equal
-     * what the caller receives.  EOS is already handled -- the ghost-token
-     * guard above clamps commit at an accepted EOS, so no post-EOS draft is
-     * ever committed (I first read this as a live leak; it is not).  The one
-     * way the two can still differ is accepted_cap binding below 1 + commit,
-     * which no current caller does (the server passes its array size).  Enforce
-     * the invariant anyway, where both counts are known: rewind() clamps the
-     * compressor frontier and drops the carry and drafter window (right -- the
-     * carry was conditioned on positions that no longer exist).  `exposed_end`
-     * is an arbitrary position, so the bank is left stale (L264): a further
-     * block on this session refuses until a sync restores a grid checkpoint,
-     * which is the fail-closed answer for a caller that bound accepted_cap.
-     * The server's tripwire (server_sched.cpp) checks the same equality after
-     * every round. */
-    const int exposed_end = saved_len + n_accept;
-    const bool trimmed = exposed_end < s->checkpoint.len;
-    if (trimmed) {
-        /* rewind() drops the drafter window, so this bank's seed rows go too:
-         * the deferred batch must not advance counters the rewind has reset. */
-        if (s->seed_defer.active) {
-            const uint32_t cur = pulsar_session_live_bank(s);
-            uint32_t k = 0;
-            for (uint32_t i = 0; i < s->seed_defer.n; i++) {
-                if (s->seed_defer.bank[i] == cur) continue;
-                s->seed_defer.src_row[k] = s->seed_defer.src_row[i];
-                s->seed_defer.bank[k] = s->seed_defer.bank[i];
-                k++;
-            }
-            s->seed_defer.n = k;
-        }
-        spec_target(s)->cut(s, exposed_end);
-    }
+    /* L155: the committed frontier (saved_len + 1 + commit) is what the caller received -- the stop clamp cut the
+     * commit at an accepted stop token and the entry check gave accepted[] room for the whole round, so n_accept is
+     * 1 + commit.  The server's tripwire (server_sched.cpp) checks the same equality after every round. */
 
     /* The carry IS the next base (already correctly distributed). Persist it
      * so the next generate_speculative call forwards it as batch position 0;
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
     s->spec.spec_carry_token = (int32_t)carry_tok;
-    s->spec.spec_carry_valid = !hit_eos && !trimmed;
+    s->spec.spec_carry_valid = !hit_eos;
     s->spec.spec_carry_pos = (int32_t)s->checkpoint.len;
     s->spec.spec_carry_temp = carry_temp;
     s->spec.spec_carry_top_k = top_k;
     s->spec.spec_carry_top_p = top_p;
     s->spec.spec_carry_min_p = min_p;
-    if (hit_eos || trimmed || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
+    if (hit_eos || pulsar_token_is_stop(e, next_base) || s->spec.spec_quenched) {
         /* Quenched: don't draft the next chain — the carry persisted above is
          * still the correctly-distributed next base, which the next
-         * generate_speculative call consumes before routing plain.  (After an
-         * L155 trim there is no carry: the generation ended at the cap.) */
+         * generate_speculative call consumes before routing plain. */
         if (dspark_stats && t0 > 0.0)
             fprintf(stderr, "pulsar: dspark fused n_batch=%u committed=%d nodraft step_ms=%.1f\n",
                     n_batch, commit, (now_sec() - t0) * 1000.0);

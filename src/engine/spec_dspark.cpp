@@ -836,13 +836,6 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
                                                    (uint32_t)r->saved_len, 1u + commit, row0);
 }
 
-/* The L155 trim: rewind() clamps the compressor frontier and drops the carry and the drafter window
- * (the carry was conditioned on positions that no longer exist). */
-/// pulsar_spec_target_ops::cut.
-/// @param s the session
-/// @param pos the position to rewind to
-static void ds4_cut(pulsar_session *s, int pos) { s->rewind(pos); }
-
 const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .snapshot      = */ ds4_spec_snapshot,
     /* .restore       = */ ds4_spec_restore,
@@ -850,7 +843,6 @@ const pulsar_spec_target_ops k_ds4_spec_target = {
     /* .arm_verify    = */ ds4_arm_verify,
     /* .verify_single = */ ds4_verify_single,
     /* .commit        = */ ds4_commit,
-    /* .cut           = */ ds4_cut,
 };
 
 /* ---- the DSpark drafter -------------------------------------------------------------------------- */
