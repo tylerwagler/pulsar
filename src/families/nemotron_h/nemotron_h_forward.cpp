@@ -1052,8 +1052,9 @@ bool attention(const nh_step *st, uint32_t il, uint8_t *base, const mix_scratch 
  *  @param fo    the f32 output, [n_rows][n_embd]
  *  @param base  the FFN arena's device base
  *  @param F     the FFN arena's layout
- *  @return true = launched; false = refused (said; a forked routed chain is joined first) */
-bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
+ *  @return true = launched; false = refused (said); a decode step's routed chain may then be forked and not joined
+ *          (moe abandons it) */
+bool moe_block(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
     const pulsar_nemotron_h_shape &s = st->w->shape;
     const pulsar_nemotron_h_block &L = LW(st, il);
     const uint32_t n = st->n_rows;
@@ -1085,11 +1086,6 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
             pulsar_rows_moe_shared_ys_launch(&q, xn, (int)n, NULL) != 0)
             return failf("the shared expert alongside the routed experts refused", il);
     }
-    /* a refusal past the fork joins first: nothing of the routed chain outlives the call */
-    const auto refuse = [&](const char *what) {
-        if (rs) (void)pulsar_rows_moe_routed_join(NULL);
-        return failf(what, il);
-    };
     /* the router: f32 logits over the routed rows (no gate rows), then the select */
     const pulsar_router_cfg rc = router_cfg(s);
     pulsar_router_layer rl{};
@@ -1103,7 +1099,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
                                                parts.logits + r0 * lg_ld, rs) == 0;
         }) ||
         pulsar_router_select_launch(&rc, &rl, parts.logits, NULL, (int)n, parts.sel, parts.wts, NULL, NULL, rs) != 0)
-        return refuse("the router refused");
+        return failf("the router refused", il);
     /* the routed experts through the core's front door (moe.cpp): up-only relu^2 on the latent, wrapped in the two
      * latent projections */
     const rows_scratch R = rows_layout(st->st->max_rows);
@@ -1135,7 +1131,7 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
             c.prompt = prompt;
             return pulsar_moe_routed_rows(&c);
         }))
-        return refuse("the routed experts refused");
+        return failf("the routed experts refused", il);
     /* the shared expert added after the routed sum: a decode step's ys (above) once the routed chain is joined, else
      * the whole shared expert per row-kind segment */
     if (split) {
@@ -1150,6 +1146,20 @@ bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scr
                pulsar_rows_moe_shared_launch(&q, xn + (size_t)r0 * E, (int)rows, fo + (size_t)r0 * E, 0) == 0;
     });
     return ok || failf("the shared expert refused", il);
+}
+
+/* The MoE block; a refusal anywhere between the routed chain's fork and its join abandons the fork, so nothing of
+ * the routed chain outlives the call and the next step's fork finds the lane free. */
+/** @param st    the step
+ *  @param il    the layer (its weights)
+ *  @param fo    the f32 output, [n_rows][n_embd]
+ *  @param base  the FFN arena's device base
+ *  @param F     the FFN arena's layout
+ *  @return true = launched; false = refused (said), with no fork left pending */
+bool moe(const nh_step *st, uint32_t il, float *fo, uint8_t *base, const ffn_scratch &F) {
+    if (moe_block(st, il, fo, base, F)) return true;
+    pulsar_rows_moe_lanes_abandon(NULL);   /* the block's stream: the per-thread default */
+    return false;
 }
 
 /* ---- the layer --------------------------------------------------------------------------------------------------- */
@@ -1283,7 +1293,10 @@ bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out
  *  @param ok   the forward's verdict
  *  @return ok and no MoE layer went non-finite (said) */
 bool step_end(const pulsar_driver_step *st0, bool ok) {
-    if (!ok) return false;
+    if (!ok) {
+        pulsar_rows_moe_lanes_abandon(NULL);   /* a failed step leaves no MoE fork pending (a no-op when none is) */
+        return false;
+    }
     const nh_step *st = S(st0);
     uint32_t nf = 0;
     if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf, &nf, sizeof(nf)))

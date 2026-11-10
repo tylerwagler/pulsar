@@ -906,7 +906,10 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok) {
         (void)pulsar_engram_gather_wait(io->pending);
         io->pending = NULL;
     }
-    if (!ok) return false;
+    if (!ok) {
+        pulsar_rows_moe_lanes_abandon(0);   /* a failed step leaves no MoE fork pending (a no-op when none is) */
+        return false;
+    }
     pulsar_gpu_tensor *sc = st->st->scratch[PULSAR_QWEN_OP_MOE];
     uint32_t nf = 0;
     if (!sc || !pulsar_gpu_tensor_read(sc, moe_layout(st->shape, st->st->max_rows).nf, &nf, sizeof(nf)))
@@ -1046,7 +1049,12 @@ static bool tessera_proj(const pulsar_qwen_step *st, pulsar_tensor *const P[PULS
     return o->words && o->table && o->init && o->has_init && o->wscale && o->runs && o->bdesc;
 }
 
-bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
+/* The MoE block's launches.  A `false` from here may leave riding shared experts forked and not joined (the forks
+ * are made ahead of the router, each joined by its segment's routed launch): pulsar_qwen_s4_moe abandons them. */
+/// @param st the step
+/// @param il the layer
+/// @return false (said) on any refusal; forks may then be pending on the shared expert's lane
+static bool moe_block(const pulsar_qwen_step *st, uint32_t il) {
     const uint32_t n = st->n_rows;
     const pulsar_qwen_shape *s = st->shape;
     const int H = (int)s->n_embd, SMID = (int)s->n_ff_shexp;
@@ -1188,6 +1196,14 @@ bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
         }
         return true;
     });
+}
+
+bool pulsar_qwen_s4_moe(const pulsar_qwen_step *st, uint32_t il) {
+    if (moe_block(st, il)) return true;
+    /* every refusal between a shared expert's fork and its join ends here: nothing of this step stays pending for
+     * the next step's join to find (the block launches on the default stream, 0) */
+    pulsar_rows_moe_lanes_abandon(0);
+    return false;
 }
 
 /* L251 MTP: the draft head (pulsar_qwen_weights::draft_head_mx), gathered once from the bf16 head over the ids the

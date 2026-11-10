@@ -92,21 +92,24 @@ struct shared_lane {
     /// Each pending fork's completion on the lane, oldest first (rotated on join).
     cudaEvent_t done[kLanePending];
     const float *ys[kLanePending];   ///< the pending forks' outputs, oldest first
+    uint64_t tok[kLanePending];      ///< the pending forks' tokens (exl3_moe_shared::fork), oldest first
     /// Pending forks.
     int n;
 };
 
 /// The calling thread's lane for (current device, caller), created on first use (at most 8 per thread).
 /// @param caller  the caller's stream
-/// @return        the lane, or nullptr when the thread's 8 are spent or stream / event creation failed
-shared_lane *shared_lane_for(cudaStream_t caller) {
+/// @param create  make the lane when the thread has none for (device, caller); false: look up only
+/// @return        the lane, or nullptr when there is none and `create` is false, the thread's 8 are spent or stream /
+///                event creation failed
+shared_lane *shared_lane_for(cudaStream_t caller, bool create) {
     thread_local shared_lane t_lanes[8];
     thread_local int t_n = 0;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
     for (int i = 0; i < t_n; ++i)
         if (t_lanes[i].dev == dev && t_lanes[i].caller == caller) return &t_lanes[i];
-    if (t_n == 8) return nullptr;
+    if (!create || t_n == 8) return nullptr;
     shared_lane l{};
     l.dev = dev;
     l.caller = caller;
@@ -153,7 +156,7 @@ size_t exl3_moe_shared_ws_bytes(int T, int in_dim, int mid, int out_dim) {
     return gu > d ? gu : d;
 }
 
-int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
+int exl3_moe_shared_fork(exl3_moe_shared &sh, const exl3_moe_act &x, int T, int in_dim, int out_dim, bool prompt,
                          cudaStream_t stream) {
     const char *tag = "exl3_moe_shared_fork";
     if (!sh.gate || !sh.up || !sh.down || !sh.yg || !sh.yu || !sh.ys || !sh.h || !sh.ws || sh.mid <= 0 || T <= 0 ||
@@ -162,7 +165,8 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
                         "arm reads bf16; act format %d) -- refusing\n", tag, x.format);
         return -1;
     }
-    shared_lane *lane = shared_lane_for(stream);
+    sh.fork = 0;   /* a refused fork leaves a descriptor no join accepts */
+    shared_lane *lane = shared_lane_for(stream, true);
     if (!lane || lane->n == kLanePending) {
         fprintf(stderr, "%s: no lane, or %d forks already pending on it -- refusing\n", tag, lane ? lane->n : 0);
         return -1;
@@ -190,30 +194,65 @@ int exl3_moe_shared_fork(const exl3_moe_shared &sh, const exl3_moe_act &x, int T
         (void)cudaStreamSynchronize(lane->s);   /* nothing of a refused fork outlives the call */
         return -1;
     }
+    static uint64_t next_token = 0;   /* process-wide: a token names one fork, on whichever lane */
+    sh.fork = __atomic_add_fetch(&next_token, 1, __ATOMIC_RELAXED);
+    lane->tok[lane->n] = sh.fork;
     lane->ys[lane->n++] = sh.ys;
     return 0;
 }
 
+void exl3_moe_shared_abandon(cudaStream_t stream) {
+    shared_lane *lane = shared_lane_for(stream, false);
+    if (!lane || lane->n == 0) return;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(lane->s, &cap) != cudaSuccess || cap == cudaStreamCaptureStatusNone) {
+        const cudaError_t err = cudaStreamSynchronize(lane->s);
+        if (err != cudaSuccess)
+            fprintf(stderr, "exl3_moe_shared_abandon: the lane's stream did not synchronize: %s\n", cudaGetErrorString(err));
+    } else {
+        /* inside a capture the lane is part of it: it rejoins the caller (each pending fork's done event) so the
+         * capture -- which the failed step discards -- ends with no stream left in it */
+        for (int i = 0; i < lane->n; ++i) (void)cudaStreamWaitEvent(stream, lane->done[i], 0);
+    }
+    (void)cudaGetLastError();
+    fprintf(stderr, "exl3_moe_shared_abandon: %d fork%s of a failed step abandoned (the lane is empty again)\n", lane->n,
+            lane->n == 1 ? "" : "s");
+    lane->n = 0;
+}
+
 namespace {
 
-/* The caller's stream waits for the OLDEST pending fork, which must be the one whose output is `ys`. */
-/// @param ys      the output the oldest pending fork must have
+/* The caller's stream waits for the OLDEST pending fork, which must be the descriptor's own: its token (the fork
+ * wrote it to sh.fork) and its output. */
+/// @param sh      the shared expert the oldest pending fork must be of
 /// @param stream  the caller's stream, made to wait for that fork
 /// @param tag     the caller's name for the refusal message
-/// @return        0, -1 when the oldest fork is not ys (or none is pending), -3 on a CUDA failure
-int shared_join(const float *ys, cudaStream_t stream, const char *tag) {
-    shared_lane *lane = shared_lane_for(stream);
-    if (!lane || lane->n == 0 || lane->ys[0] != ys) {
+/// @return        0, -1 when the oldest fork is not sh's (or none is pending), -3 on a CUDA failure
+int shared_join(const exl3_moe_shared &sh, cudaStream_t stream, const char *tag) {
+    shared_lane *lane = shared_lane_for(stream, false);
+    if (!lane || lane->n == 0 || sh.fork == 0) {
         fprintf(stderr, "%s: a riding shared expert was not forked first (exl3_moe_shared_fork) on this stream -- "
                         "refusing\n", tag);
         return -1;
     }
-    if (cudaStreamWaitEvent(stream, lane->done[0], 0) != cudaSuccess) return -3;
+    if (lane->tok[0] != sh.fork || lane->ys[0] != sh.ys) {
+        fprintf(stderr, "%s: the oldest of the %d forks pending on this stream is fork %llu (ys %p), not this shared "
+                        "expert's fork %llu (ys %p): a fork left by another step, or joined out of order -- refusing\n",
+                tag, lane->n, (unsigned long long)lane->tok[0], (const void *)lane->ys[0], (unsigned long long)sh.fork,
+                (const void *)sh.ys);
+        return -1;
+    }
+    if (cudaStreamWaitEvent(stream, lane->done[0], 0) != cudaSuccess) {
+        fprintf(stderr, "%s: the wait on the shared expert's fork failed: %s -- refusing\n", tag,
+                cudaGetErrorString(cudaGetLastError()));
+        return -3;
+    }
     /* pop: the events rotate with their entries */
     const cudaEvent_t e = lane->done[0];
     for (int i = 1; i < lane->n; ++i) {
         lane->done[i - 1] = lane->done[i];
         lane->ys[i - 1] = lane->ys[i];
+        lane->tok[i - 1] = lane->tok[i];
     }
     lane->done[--lane->n] = e;
     return 0;
@@ -331,7 +370,7 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
     /* the sum adds the shared experts' outputs: their forks join here, oldest first */
     exl3_moe_shared_add add{};
     for (int j = 0; j < n_shared; ++j) {
-        if (shared_join(shared[j].ys, stream, tag) != 0) return -1;
+        if (shared_join(shared[j], stream, tag) != 0) return -1;
         add.y[j] = shared[j].ys;
         add.scale[j] = shared[j].scale;
     }

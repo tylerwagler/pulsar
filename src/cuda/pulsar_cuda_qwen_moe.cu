@@ -462,21 +462,24 @@ static bool rows_moe_shared(const pulsar_rows_moe_shared *q, int H, exl3_moe_sha
         return false;
     }
     *sh = exl3_moe_shared{q->gate.w, q->up.w, q->down.w, q->gate.k2, q->up.k2, q->down.k2, smid, q->scale, q->yg, q->yu,
-                          q->ys, reinterpret_cast<__nv_bfloat16 *>(q->h), q->ws, q->ws_bytes};
+                          q->ys, reinterpret_cast<__nv_bfloat16 *>(q->h), q->ws, q->ws_bytes, q->fork};
     return true;
 }
 
-extern "C" int pulsar_rows_moe_shared_fork(const pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
+extern "C" int pulsar_rows_moe_shared_fork(pulsar_rows_moe_shared *q, const uint16_t *x_bf16, int T,
                                            cudaStream_t stream) {
     exl3_moe_shared sh{};
+    if (q) q->fork = 0;   /* a refused fork leaves a descriptor no join accepts */
     if (!q || !x_bf16 || T <= 0 || !rows_moe_shared(q, q->gate.in, &sh)) return -1;
 #ifndef PULSAR_HAVE_MMQ
     (void)stream;
     fprintf(stderr, "pulsar: shared expert fork: built without the MMQ drivers the front door rides -- refusing\n");
     return -1;
 #else
-    return exl3_moe_shared_fork(sh, exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, x_bf16, nullptr, 0}, T, q->gate.in, q->down.out,
-                                q->gate.prompt, stream);
+    const int rc = exl3_moe_shared_fork(sh, exl3_moe_act{EXL3_MOE_ACT_BF16_ROWS, x_bf16, nullptr, 0}, T, q->gate.in,
+                                        q->down.out, q->gate.prompt, stream);
+    q->fork = sh.fork;
+    return rc;
 #endif
 }
 
@@ -736,15 +739,17 @@ struct routed_lane {
 
 /** The calling thread's lane for (current device, caller), created on first use (at most 8 per thread).
  *  @param caller the caller stream
- *  @return the lane, or nullptr when the device query or stream / event creation fails or the 8 slots are used */
-routed_lane *routed_lane_for(cudaStream_t caller) {
+ *  @param create make the lane when the thread has none for (device, caller); false: look up only
+ *  @return the lane, or nullptr when there is none and `create` is false, the device query or stream / event creation
+ *          fails or the 8 slots are used */
+routed_lane *routed_lane_for(cudaStream_t caller, bool create) {
     thread_local routed_lane t_lanes[8];
     thread_local int t_n = 0;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
     for (int i = 0; i < t_n; ++i)
         if (t_lanes[i].dev == dev && t_lanes[i].caller == caller) return &t_lanes[i];
-    if (t_n == 8) return nullptr;
+    if (!create || t_n == 8) return nullptr;
     routed_lane l{};
     l.dev = dev;
     l.caller = caller;
@@ -772,7 +777,7 @@ routed_lane *routed_lane_for(cudaStream_t caller) {
 } // namespace
 
 extern "C" pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller) {
-    routed_lane *lane = routed_lane_for(caller);
+    routed_lane *lane = routed_lane_for(caller, true);
     if (!lane || lane->pending) {
         fprintf(stderr, "pulsar: MoE routed fork: no priority stream, or a fork already pending on it -- refusing\n");
         return nullptr;
@@ -786,12 +791,38 @@ extern "C" pulsar_rows_stream pulsar_rows_moe_routed_fork(cudaStream_t caller) {
 }
 
 extern "C" int pulsar_rows_moe_routed_join(cudaStream_t caller) {
-    routed_lane *lane = routed_lane_for(caller);
+    routed_lane *lane = routed_lane_for(caller, false);
     if (!lane || !lane->pending) {
         fprintf(stderr, "pulsar: MoE routed join: no fork pending on this stream -- refusing\n");
         return -1;
     }
+    if (cudaEventRecord(lane->done, lane->s) != cudaSuccess || cudaStreamWaitEvent(caller, lane->done, 0) != cudaSuccess) {
+        /* the fork stays pending: the caller's failure path abandons it (pulsar_rows_moe_lanes_abandon) */
+        fprintf(stderr, "pulsar: MoE routed join: the join event failed: %s -- refusing\n",
+                cudaGetErrorString(cudaGetLastError()));
+        return -3;
+    }
     lane->pending = false;
-    return cudaEventRecord(lane->done, lane->s) == cudaSuccess && cudaStreamWaitEvent(caller, lane->done, 0) == cudaSuccess
-               ? 0 : -3;
+    return 0;
+}
+
+extern "C" void pulsar_rows_moe_lanes_abandon(cudaStream_t caller) {
+#ifdef PULSAR_HAVE_MMQ
+    exl3_moe_shared_abandon(caller);
+#endif
+    routed_lane *lane = routed_lane_for(caller, false);
+    if (!lane || !lane->pending) return;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(lane->s, &cap) != cudaSuccess || cap == cudaStreamCaptureStatusNone) {
+        const cudaError_t err = cudaStreamSynchronize(lane->s);
+        if (err != cudaSuccess)
+            fprintf(stderr, "pulsar: MoE routed lane abandon: its stream did not synchronize: %s\n", cudaGetErrorString(err));
+    } else if (cudaEventRecord(lane->done, lane->s) == cudaSuccess) {
+        /* inside a capture the lane is part of it: it rejoins the caller, as the join would, so the capture -- which
+         * the failed step discards -- ends with no stream left in it */
+        (void)cudaStreamWaitEvent(caller, lane->done, 0);
+    }
+    (void)cudaGetLastError();
+    fprintf(stderr, "pulsar: MoE routed lane: the fork of a failed step abandoned (the lane is free again)\n");
+    lane->pending = false;
 }
