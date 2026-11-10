@@ -145,7 +145,8 @@ static void renderer_write_complete_char_raw(agent_token_renderer *r, const char
     char safe[4];
     if (n <= sizeof safe) {
         memcpy(safe, s, n);
-        agent_terminal_sanitize(safe, n);
+        n = agent_terminal_sanitize(safe, n);
+        if (!n) return;   /* a carriage return: not shown */
         s = safe;
     }
     bool styled = r->use_color && renderer_has_text_attrs(r);
@@ -912,8 +913,7 @@ static bool renderer_code_line_can_repaint(agent_token_renderer *r) {
         return false;
     for (size_t i = 0; i < r->md_code_line_len; i++) {
         unsigned char c = (unsigned char)r->md_code_line[i];
-        if (c == '\t' || c == 0x1b || c >= 0x80 || (c < 0x20 && c != '\r'))
-            return false;
+        if (c < 0x20 || c >= 0x7f) return false;
     }
     return true;
 }
@@ -999,9 +999,10 @@ void renderer_code_byte(agent_token_renderer *r, char c) {
         renderer_code_emit_buffered_line(r, true);
         return;
     }
+    if (c == '\r') return;   /* L373: not shown (agent_terminal_sanitize), so not buffered for the repaint either */
     renderer_code_line_append(r, &c, 1);
     renderer_write_plain_byte(r, c);
-    if (c != ' ' && c != '\t' && c != '\r') r->md_code_line_start = false;
+    if (c != ' ' && c != '\t') r->md_code_line_start = false;
 }
 
 
@@ -1075,8 +1076,7 @@ void renderer_code_stream_set_upto_marker(agent_token_renderer *r,
 void renderer_code_end(agent_token_renderer *r) {
     bool only_space = true;
     for (size_t i = 0; i < r->md_code_line_len; i++) {
-        if (r->md_code_line[i] != ' ' && r->md_code_line[i] != '\t' &&
-            r->md_code_line[i] != '\r') {
+        if (r->md_code_line[i] != ' ' && r->md_code_line[i] != '\t') {
             only_space = false;
             break;
         }

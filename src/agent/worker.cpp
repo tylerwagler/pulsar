@@ -79,6 +79,77 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 
 
 
+/** @brief A turn's prefill progress hook: worker_progress_cb, after polling the bash jobs at each prefill chunk (the
+ *  session calls it from pulsar_session_sync, on this thread), so a long prefill keeps them drained and timed out.
+ *  @param ud      the worker
+ *  @param event   the progress event
+ *  @param current tokens prefilled so far
+ *  @param total   the prompt's tokens */
+static void worker_turn_progress_cb(void *ud, const char *event, int current, int total) {
+    agent_worker *w = (agent_worker *)ud;
+    if (w->bash_jobs && !strcmp(event, "prefill_chunk")) agent_bash_jobs_poll(w);
+    worker_progress_cb(ud, event, current, total);
+}
+
+
+
+/** @brief End a turn whose compaction did not complete: idle after an interrupt, else the error.
+ *  @param w   the worker
+ *  @param err the compaction's reason ("interrupted", or why it failed; empty = a generic message)
+ *  @return worker_run_turn's status: 0 after an interrupt, 1 on an error */
+static int worker_compaction_stopped(agent_worker *w, const char *err) {
+    if (agent_err_is_interrupted(err)) {
+        worker_clear_interrupt(w);
+        agent_set_status(w, AGENT_WORKER_IDLE);
+        return 0;
+    }
+    agent_set_error(w, err[0] ? err : "context compaction failed");
+    return 1;
+}
+
+
+
+/** @brief L373: make the turn being built fit the context before it is rendered, when it carries tool results:
+ *  compact (the pending turn set aside, so the summary request does not carry it), and if the results still do not
+ *  fit, answer each call with a short error instead.  Tool results are in the pending turn from the moment their
+ *  calls ran, so a compaction that fails or is interrupted leaves them there for the next turn -- never dropped,
+ *  and (Gemma) the open model turn still gets its responses.
+ *  @param w       the worker
+ *  @param err     receives why the turn cannot go on ("interrupted", a compaction failure, context full)
+ *  @param err_len its capacity
+ *  @return true when the turn may be rendered */
+static bool worker_fit_tool_turn(agent_worker *w, char *err, size_t err_len) {
+    bool has_tool = false;
+    for (int i = 0; i < w->turn_len; i++) has_tool = has_tool || !strcmp(w->turn[i].role, "tool");
+    int projected = 0;
+    if (!has_tool || agent_turn_fits_context(w, AGENT_TOOL_RESULT_RESERVE_TOKENS, &projected)) return true;
+
+    std::vector<pulsar_chat_message> pending(w->turn, w->turn + w->turn_len);
+    w->turn_len = 0;
+    const bool compacted = agent_worker_compact(w, "tool result would exceed context", err, err_len);
+    for (const pulsar_chat_message &m : pending) agent_turn_push(w, m);   /* after a bash update the compaction added */
+    if (!compacted) return false;
+    if (agent_turn_fits_context(w, AGENT_TOOL_RESULT_RESERVE_TOKENS, &projected)) return true;
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "Tool error: tool result still does not fit after context compaction "
+             "(projected_prompt=%d tokens, ctx=%d, reserve=%d). "
+             "Retry with a smaller read/search/bash output.\n",
+             projected, w->cfg->gen.ctx_size, AGENT_TOOL_RESULT_RESERVE_TOKENS);
+    for (int i = 0; i < w->turn_len; i++) {
+        if (strcmp(w->turn[i].role, "tool")) continue;
+        free((char *)w->turn[i].content);
+        w->turn[i].content = xstrdup(msg);
+    }
+    if (agent_turn_fits_context(w, 16, NULL)) return true;
+    agent_turn_clear(w);   /* nothing of it can be rendered: said, not carried into every later turn */
+    snprintf(err, err_len, "context full after compaction; the pending turn was dropped");
+    return false;
+}
+
+
+
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
@@ -98,15 +169,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     char compact_err[160] = {0};
     if (!agent_worker_compact_if_needed(w, "soft limit before user turn",
                                         compact_err, sizeof(compact_err)))
-    {
-        if (agent_err_is_interrupted(compact_err)) {
-            worker_clear_interrupt(w);
-            agent_set_status(w, AGENT_WORKER_IDLE);
-            return 0;
-        }
-        agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
-        return 1;
-    }
+        return worker_compaction_stopped(w, compact_err);
     agent_worker_maybe_append_datetime_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
@@ -139,17 +202,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
                                             compact_err, sizeof(compact_err)))
-        {
-            if (agent_err_is_interrupted(compact_err)) {
-                worker_clear_interrupt(w);
-                agent_set_status(w, AGENT_WORKER_IDLE);
-                return 0;
-            }
-            agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
+            return worker_compaction_stopped(w, compact_err);
+        agent_bash_jobs_poll(w);   /* L373: once a round, whether or not the model asks */
+        agent_worker_maybe_append_system_prompt_reminder(w);
+        if (!worker_fit_tool_turn(w, compact_err, sizeof(compact_err)))
+            return worker_compaction_stopped(w, compact_err);
+        if (!agent_turn_flush(w, think_mode)) {   /* L373: never sample after a turn that is not there */
+            agent_set_error(w, "the tokenizer refused the turn (its reason is on stderr); nothing was appended");
             return 1;
         }
-        agent_worker_maybe_append_system_prompt_reminder(w);
-        agent_turn_flush(w, think_mode);
 
         const pulsar_tokens *prompt_for_sync = &w->transcript;
         const TokPos old_pos = pulsar_session_pos(w->session);
@@ -179,7 +240,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         char err[160];
-        pulsar_session_set_progress(w->session, worker_progress_cb, w);
+        pulsar_session_set_progress(w->session, worker_turn_progress_cb, w);
         pulsar_session_set_display_progress(w->session, worker_progress_cb, w);
         pulsar_session_set_cancel(w->session, worker_cancel_session_cb, w);
         int sync_rc = pulsar_session_sync(w->session, prompt_for_sync, err, sizeof(err));
@@ -251,6 +312,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
+            /* L373: a long generation keeps running jobs drained and timed out too */
+            if (w->bash_jobs && generated % AGENT_BASH_POLL_TOKENS == 0) agent_bash_jobs_poll(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
@@ -348,10 +411,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
         }
 
-        /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses */
-        if (family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine))
-            w->model_turn_open = true;
-        else
+        /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses
+         * (agent_worker_turn_open reads that off the transcript) */
+        if (!(family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine)))
             pulsar_chat_end_assistant(w->engine, &w->transcript);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
@@ -360,12 +422,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 0;
         }
 
-        std::vector<char *> each;   /* the family path's per-call results (owned) */
-        struct each_guard {
-            std::vector<char *> *v;
-            ~each_guard() { for (char *s : *v) free(s); }
-        } each_free = {&each};
-        char *tool_result;
+        /* The results join the turn being built as soon as their calls have run: whatever ends this turn early
+         * (a compaction that fails or is interrupted, worker_fit_tool_turn at the top of the next round), they
+         * are rendered with the next one. */
         if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -373,76 +432,29 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            stream.tool_preflight_error_msg :
                            "edit old selector failed before new was generated");
             agent_buf_puts(&b, "\n");
-            tool_result = agent_buf_take(&b);
+            agent_turn_add_tool(w, NULL, b.ptr);
+            free(b.ptr);
         } else if (malformed_tool) {
             agent_buf b = {0};
             agent_buf_puts(&b, family.p ? "Tool error: invalid tool call: " : "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
             if (!family.p) agent_buf_puts(&b, agent_dsml_syntax_reminder);
-            tool_result = agent_buf_take(&b);
+            agent_turn_add_tool(w, family.p && dsml.calls.len > 0 ? dsml.calls.v[0].name : NULL, b.ptr);
+            free(b.ptr);
         } else if (family.p) {
             /* L365: one result per call, each its own tool message naming its function (the templates answer calls
-             * one by one); `tool_result` is their concatenation, for the context check */
-            agent_buf b = {0};
+             * one by one) */
             for (int i = 0; i < dsml.calls.len; i++) {
                 char *res = agent_execute_tool_call_one(w, &dsml.calls.v[i]);
-                each.push_back(res);
-                agent_buf_puts(&b, res);
+                agent_turn_add_tool(w, dsml.calls.v[i].name, res);
+                free(res);
             }
-            tool_result = agent_buf_take(&b);
         } else {
-            tool_result = agent_execute_tool_calls(w, &dsml.calls);
+            char *res = agent_execute_tool_calls(w, &dsml.calls);
+            agent_turn_add_tool(w, NULL, res);
+            free(res);
         }
-        int projected_tokens = 0;
-        if (!agent_tool_result_fits_context(w, tool_result,
-                                            AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                            &projected_tokens))
-        {
-            if (!agent_worker_compact(w, "tool result would exceed context",
-                                      compact_err, sizeof(compact_err)))
-            {
-                free(tool_result);
-                agent_dsml_parser_free(&dsml);
-                if (agent_err_is_interrupted(compact_err)) {
-                    worker_clear_interrupt(w);
-                    agent_set_status(w, AGENT_WORKER_IDLE);
-                    return 0;
-                }
-                agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
-                return 1;
-            }
-            if (!agent_tool_result_fits_context(w, tool_result,
-                                                AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                                &projected_tokens))
-            {
-                free(tool_result);
-                agent_buf b = {0};
-                char msg[256];
-                snprintf(msg, sizeof(msg),
-                         "Tool error: tool result still does not fit after context compaction "
-                         "(projected_prompt=%d tokens, ctx=%d, reserve=%d). "
-                         "Retry with a smaller read/search/bash output.\n",
-                         projected_tokens, w->cfg->gen.ctx_size,
-                         AGENT_TOOL_RESULT_RESERVE_TOKENS);
-                agent_buf_puts(&b, msg);
-                tool_result = agent_buf_take(&b);
-                for (char *s : each) free(s);
-                each.clear();   /* the one error answers the round's calls */
-                if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
-                    free(tool_result);
-                    agent_dsml_parser_free(&dsml);
-                    agent_set_error(w, "context full after compaction");
-                    return 1;
-                }
-            }
-        }
-        if (!each.empty()) {
-            for (size_t i = 0; i < each.size(); i++) agent_turn_add_tool(w, dsml.calls.v[i].name, each[i]);
-        } else {
-            agent_turn_add_tool(w, family.p && dsml.calls.len > 0 ? dsml.calls.v[0].name : NULL, tool_result);
-        }
-        free(tool_result);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
@@ -578,9 +590,23 @@ void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
+        bool jobs_running = w->bash_jobs != NULL;   /* the list is this thread's: read without w->mu too */
         while (!w->stop && !w->cmd_text && !w->save_requested &&
                !w->compact_requested)
-            pthread_cond_wait(&w->cond, &w->mu);
+        {
+            if (!jobs_running) {
+                pthread_cond_wait(&w->cond, &w->mu);
+                continue;
+            }
+            /* L373: an idle worker with a bash job running wakes once a second to drain it and apply its timeout */
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            if (pthread_cond_timedwait(&w->cond, &w->mu, &until) != ETIMEDOUT) continue;
+            pthread_mutex_unlock(&w->mu);   /* a job that ends takes w->mu itself */
+            jobs_running = agent_bash_jobs_poll(w);
+            pthread_mutex_lock(&w->mu);
+        }
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;

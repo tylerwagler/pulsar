@@ -76,13 +76,23 @@ static const char *agent_tool_param_color(agent_tool_param_kind kind) {
 
 
 
-/** @brief Write visualizer bytes through the renderer (plain, no markdown) and track the line start.
+/** @brief Write visualizer text through the renderer (plain, no markdown) and track the line start.  The text is
+ *  the model's wherever it is not a literal (a call's name, parameter names and values, a rejected block), so it
+ *  goes through agent_terminal_sanitize; values arrive a byte at a time, so a trailing 0xC2 waits for the next
+ *  write, where a C1 control's two bytes are seen together.
  *  @param sr the stream renderer
  *  @param s  bytes
  *  @param n  byte count */
 static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_t n) {
-    renderer_plain(sr->renderer, s, n);
-    for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
+    agent_tool_visualizer *v = &sr->viz;
+    std::string text(v->held_c2 ? "\xc2" : "");
+    text.append(s, n);
+    v->held_c2 = !text.empty() && text.back() == '\xc2';
+    if (v->held_c2) text.pop_back();
+    text.resize(agent_terminal_sanitize(text.data(), text.size()));
+    if (text.empty()) return;
+    renderer_plain(sr->renderer, text.data(), text.size());
+    v->last_output_newline = text.back() == '\n';
 }
 
 
@@ -112,7 +122,7 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
         /* The raw DSML start marker may arrive after ordinary text on the
          * current row.  Clear that row only for the live terminal UI; plain
          * stdout mode must never leak cursor-control escapes into pipes. */
-        agent_tool_viz_puts(sr, "\r\x1b[2K");
+        renderer_plain(sr->renderer, "\r\x1b[2K", 5);   /* the agent's own control bytes: not sanitized */
     } else if (line_open) {
         agent_tool_viz_puts(sr, "\n");
     }

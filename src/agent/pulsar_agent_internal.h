@@ -135,6 +135,10 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 /// Bytes of output a bash job's first observation shows from the head.
 #define AGENT_BASH_HEAD_BYTES (8*1024)
+/// Sampled tokens between two polls of the bash jobs while a turn generates (agent_bash_jobs_poll).
+#define AGENT_BASH_POLL_TOKENS 64
+/// Bash jobs tracked at once (running, or finished and not yet observed); agent_bash_start refuses one more.
+#define AGENT_BASH_JOBS_MAX 64
 /// Lines of output a bash job's first observation shows from the head.
 #define AGENT_BASH_HEAD_LINES 100
 /// Bytes at the end of a bash job's output file a tail read scans.
@@ -198,21 +202,36 @@ typedef struct {
     const char *chdir_path;         ///< directory to run tools from; NULL = inherit the caller's cwd
     bool non_interactive;           ///< one-shot: run the prompt to completion and exit, no TUI
     bool allow_outside_workspace;   ///< L354: file tools may leave the directory the agent started in
-    bool allow_bash;                ///< L354: non-interactive runs may use the bash tool
+    bool allow_bash;                ///< L354: unattended runs may use the bash tool
+    /** L373: nobody is at a terminal watching the model's commands: --non-interactive, or stdin is not a terminal
+     *  (the terminal UI driven through a pipe under LINENOISE_ASSUME_TTY).  The bash gate's one test; set once in
+     *  main. */
+    bool unattended;
 } agent_config;
 
 /** L354: fix the workspace the file tools stay inside: the working directory now (after --chdir), resolved.
  *  @param allow_outside true turns the boundary off */
 void agent_workspace_init(bool allow_outside);
 /** L354: the file tools' boundary: a path resolved through its symlinks must lie inside the workspace.  A path that doesn't
- *  exist yet is judged by its deepest existing parent.
+ *  exist yet is judged by its deepest existing parent, and the part below it may not hold a ".." component.  A symlink
+ *  that does not resolve (dangling, a loop) is refused wherever it points, inside or out: the path is not absent, and
+ *  an open would create the link's target.
+ *  @param path   the tool's path
+ *  @param err    receives why it is refused ("<path> is outside the workspace ...")
+ *  @param errlen its capacity
+ *  @return true when the path is refused */
+bool agent_workspace_refuses(const char *path, char *err, size_t errlen);
+/** agent_workspace_refuses as a tool result.
  *  @param path the tool's path
  *  @return NULL when allowed, else the tool's error text (malloc'd; the caller returns it) */
 char *agent_workspace_refusal(const char *path);
-/** L354: overwrite in place the bytes a terminal would obey (ESC and the other controls but newline, tab and return; the
- *  UTF-8 form of the C1 controls) with '?', so model or tool text can't move the cursor or reach OSC 52.
- *  @param s the bytes  @param n how many */
-void agent_terminal_sanitize(char *s, size_t n);
+/** L354: rewrite in place the bytes a terminal would obey, so model or tool text can't move the cursor or reach OSC 52:
+ *  ESC and the other controls but newline and tab, and the UTF-8 form of the C1 controls, become '?'; a carriage
+ *  return is dropped unless a newline follows it in the same call (L373: a bare one overwrites the row), so a caller
+ *  that writes a byte at a time drops every one.
+ *  @param s the bytes  @param n how many
+ *  @return the bytes kept (<= n), at the front of `s` */
+size_t agent_terminal_sanitize(char *s, size_t n);
 
 /** Lifecycle state of the agent's single worker thread. Drives what the TUI
  * shows in the status line, so every long-running phase gets its own value
@@ -330,10 +349,6 @@ typedef struct {
     char *queued_user_drain_text;     ///< drained queue contents, owned by the worker once taken
 
     bool datetime_context_injected;   ///< the current date/time was already stated in this transcript
-    /** L365: the transcript ends inside a sampled model turn that made calls and awaits their responses (a family
-     *  whose calls continue the turn: pulsar_chat_calls_continue_turn).  The next turn rendered must open with the
-     *  "tool" messages; anything else closes the turn first (agent_worker_close_open_turn). */
-    bool model_turn_open;
 
     /** Continuation cursor for a truncated file read, so the `more` tool can
      * resume where the last read stopped. `more_valid` is false when there is
@@ -546,6 +561,7 @@ typedef struct {
     bool param_active;                  ///< inside a parameter value
     bool at_line_start;                 ///< the cursor is at column 0 of a fresh row
     bool last_output_newline;           ///< last byte emitted was '\n'
+    bool held_c2;                       ///< a 0xC2 byte waits for its second byte (a C1 control is sanitized whole)
 
     agent_tool_param_kind param_kind;   ///< how the current parameter is displayed
     char tool_name[64];                 ///< name of the tool being visualised
@@ -774,9 +790,8 @@ struct agent_bash_job {
     pid_t pid;      ///< child process id
     int pipe_fd;    ///< read end of the child's output pipe; -1 once closed
     int tmp_fd;     ///< write end into the temp output file; -1 once closed
-    /** Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
-     * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
-     * never lengthen.  Sized for exactly that, not PATH_MAX. */
+    /** Always the mkstemp template "/tmp/ds4_agent_output_XXXXXX" (28 chars + NUL) from agent_bash_start -- mkstemp
+     *  only substitutes the X's, so it can never lengthen.  Sized for that, not PATH_MAX. */
     char path[32];
     char *cmd;            ///< the command line, owned
     double start_time;    ///< wall-clock at spawn, for elapsed_sec
@@ -789,6 +804,7 @@ struct agent_bash_job {
     int exit_status;      ///< waitpid status once `running` is false
     bool running;         ///< the child has not been reaped yet
     bool timed_out;       ///< the job was killed by its timeout
+    int live_slot;        ///< the job's slot in the exit teardown's table (bash_jobs.cpp)
     struct agent_bash_job *next;  ///< next job in the worker's list
     agent_worker *worker;  ///< back-pointer for terminal state restoration
 
@@ -957,6 +973,31 @@ char *xstrndup(const char *s, size_t n);
  *  @param n   the new size, bytes
  *  @return the (possibly moved) block, never NULL */
 void *agent_xrealloc(void *ptr, size_t n);
+/** Skip UTF-8 continuation bytes, so a cut that drops a text's front lands on a character boundary.
+ *  @param p   the position
+ *  @param end the end (exclusive)
+ *  @return the first non-continuation byte at or after `p` (or `end`) */
+const char *agent_utf8_skip_continuation(const char *p, const char *end);
+/** L373: the length a byte cap may keep of s[0, n): `n`, less a trailing sequence the cap cut short (a lead byte
+ *  with fewer continuation bytes after it than it calls for), so the cut lands on a character boundary.
+ *  @param s the bytes
+ *  @param n their count
+ *  @return the length to keep (n - 3 .. n) */
+size_t agent_utf8_complete_len(const char *s, size_t n);
+/** L373: replace a file's contents atomically -- the bytes go to a new file beside it (created O_EXCL | O_NOFOLLOW),
+ *  fsync'd, then renamed over it, so a failed or interrupted write leaves the old contents whole.  A `path` that
+ *  resolves (realpath) is written at its target, so a symlink to a file stays a link; one that does not is replaced.
+ *  The new file takes the existing file's permission bits, else `create_mode` under the umask; it is a new inode
+ *  (the caller's ownership, hard links to the old file not followed).
+ *  @param path        the file
+ *  @param data        the new contents
+ *  @param len         their byte count
+ *  @param create_mode the mode of a file that did not exist (before the umask)
+ *  @param err         receives the failed step and its errno text
+ *  @param err_len     its capacity
+ *  @return true on success; false with `path` as it was */
+bool agent_write_file_atomic(const char *path, const void *data, size_t len, mode_t create_mode,
+                             char *err, size_t err_len);
 /** write(2) until all n bytes are written, retrying EINTR; any other error drops the rest silently.
  *  @param fd the descriptor
  *  @param p  the bytes
@@ -1005,7 +1046,8 @@ bool agent_engine_dsml(pulsar_engine *e);
 /** @param w the worker
  *  @return agent_engine_dsml of its engine */
 bool agent_worker_dsml(const agent_worker *w);
-/** Whether pulsar-agent can call tools on the loaded family (DeepSeek, Qwen, Nemotron-H, Gemma 4).
+/** Whether pulsar-agent can call tools on the loaded family (DeepSeek, Qwen, Nemotron-H, Gemma 4) and its tokenizer
+ *  spells the chat turn markers the agent reads turns by (agent_worker_turn_open, the compaction tail).
  *  @param e      the engine
  *  @param err    receives why not
  *  @param errlen size of `err`
@@ -1103,6 +1145,11 @@ void agent_trace_tokens(agent_worker *w, const char *label,
  *  @param len   byte count */
 void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
+/** Find a call's argument by name.
+ *  @param call the call
+ *  @param name the argument
+ *  @return the argument (owned by the call), or NULL when absent */
+const agent_tool_arg *agent_tool_arg_find(const agent_tool_call *call, const char *name);
 /** The value of a tool call's named argument (the first one of that name).
  *  @param call the call
  *  @param name the argument name
@@ -1277,7 +1324,7 @@ void agent_worker_clear_session_identity(agent_worker *w);
 /** Free a session file's title and tokens and zero it.
  *  @param f the file contents */
 void agent_session_file_free(agent_session_file *f);
-/** Write a session file atomically (a temp file renamed over `path`).
+/** Write a session file atomically (agent_write_file_atomic, mode 0600).
  *  @param path    the destination
  *  @param f       the contents
  *  @param err     receives the reason on failure
@@ -1318,6 +1365,10 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]);
  *  @param out receives the head's tokens (appended) */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
 /** Add a message to the turn being built (agent_worker::turn); `content` is copied. */
+/** Append a message to the turn being built, taking it as it is.
+ *  @param w   the worker
+ *  @param msg the message; its `content` and `name` are malloc'd and now the turn's */
+void agent_turn_push(agent_worker *w, pulsar_chat_message msg);
 /** @param w       the worker
  *  @param role    the message role ("system", "user", "tool")
  *  @param content the text, copied
@@ -1328,25 +1379,62 @@ void agent_turn_add(agent_worker *w, const char *role, const char *content, bool
  *  @param name    the call's function, copied; NULL = none
  *  @param content the result text, copied */
 void agent_turn_add_tool(agent_worker *w, const char *name, const char *content);
-/** L365: when the transcript ends in an open model turn (model_turn_open) and the turn being built does not answer
- *  it, close it (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never
- *  lands inside it.
+/** L373: whether a token sequence ends inside an assistant turn: its last turn marker is the assistant's and it does
+ *  not end with the turn's close.  Pure host code.
+ *  @param m     the family's turn markers
+ *  @param end   the ids pulsar_chat_end_assistant appends
+ *  @param n_end their count
+ *  @param v     the tokens
+ *  @param n     their count
+ *  @return true when the last turn is an assistant turn left open */
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n);
+/** L373: whether the transcript ends inside an open assistant turn (agent_tokens_turn_open with the loaded family's
+ *  markers).  The transcript is the ONE authority: a turn that made calls where calls continue the turn (Gemma, L365),
+ *  or one an error left unclosed, reads the same live, after /new, a session switch or a reload.
+ *  @param w      the worker (its engine)
+ *  @param tokens the transcript, or a copy of it
+ *  @return true when its last turn is an assistant turn left open */
+bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens);
+/** L365: when the transcript ends in an open assistant turn (agent_worker_turn_open) and the turn being built does
+ *  not answer it (tool messages first, on a family whose calls continue the turn), close it
+ *  (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never lands inside it.
  *  @param w      the worker
  *  @param tokens the transcript (or a copy of it) to close */
 void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
+/** L373: text as well-formed UTF-8 (pulsar_utf8.h's rule): each byte that is not part of a well-formed sequence
+ *  becomes U+FFFD.
+ *  @param s the text (NUL-terminated)
+ *  @return NULL when `s` is already well-formed, else the repaired copy (malloc'd; caller frees) */
+char *agent_utf8_repaired(const char *s);
+/** L373: the agent's ONE door to pulsar_chat_append_turn.  Every message's content and name is made well-formed
+ *  UTF-8 first (agent_utf8_repaired): a tool result, a file's bytes or a pasted prompt is arbitrary bytes, and the
+ *  Qwen, Nemotron and Gemma tokenizers refuse a turn that is not UTF-8.  A refusal that remains (the engine says why
+ *  on stderr and appends nothing) is returned, never read as an empty turn.
+ *  @param w                 the worker (its engine)
+ *  @param tokens            the transcript, appended to
+ *  @param msgs              the turn's messages
+ *  @param n                 their count
+ *  @param generation_prompt also open the assistant turn
+ *  @param think_mode        the mode the assistant turn opens for
+ *  @return false when the turn was refused: `tokens` is unchanged */
+bool agent_chat_append_turn(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                            bool generation_prompt, pulsar_think_mode think_mode);
 /** The turn being built plus `extra` (n_extra messages after it), rendered as ONE turn onto `tokens`, with the
  *  assistant turn opened for `think_mode` -- what the next prefill will hold. */
 /** @param w          the worker
  *  @param tokens     receives the rendering (appended)
  *  @param extra      messages after the turn, or NULL
  *  @param n_extra    entries in `extra`
- *  @param think_mode the think mode the assistant turn opens with */
-void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+ *  @param think_mode the think mode the assistant turn opens with
+ *  @return false when the turn was refused (agent_chat_append_turn): `tokens` is unchanged */
+bool agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
                        pulsar_think_mode think_mode);
 /** Render the turn being built onto the transcript with the assistant turn opened, and empty it. */
 /** @param w          the worker
- *  @param think_mode the think mode the assistant turn opens with */
-void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode);
+ *  @param think_mode the think mode the assistant turn opens with
+ *  @return false when the turn was refused (agent_chat_append_turn): the transcript is unchanged and the turn's
+ *          messages are dropped */
+bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode);
 /** Drop the turn being built (a new or switched session starts without one). */
 /** @param w the worker */
 void agent_turn_clear(agent_worker *w);
@@ -1492,10 +1580,34 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,
                                         char *err, size_t err_len);
-/** Parse a tool's timeout argument in seconds.
- *  @param s the text, or NULL
- *  @return seconds clamped to [1, 86400]; 3600 when absent, unparsable or <= 0 */
-int agent_parse_timeout(const char *s);
+/** A tool call's integer argument (L373: a value that is not an integer is the tool's error, never the default).
+ *  @param call the call
+ *  @param name the argument
+ *  @param def  the value when the argument is absent or empty
+ *  @param min  lower clamp
+ *  @param max  upper clamp
+ *  @param out  receives the clamped value, or def
+ *  @return NULL, or "Tool error: <name> is not an integer" (malloc'd; the caller returns it) */
+char *agent_tool_arg_int(const agent_tool_call *call, const char *name, int def, int min, int max, int *out);
+/** A tool call's timeout argument, seconds (a number; fractions truncate).
+ *  @param call the call
+ *  @param name the argument
+ *  @param out  receives seconds clamped to [1, 86400]; 3600 when absent, empty or <= 0
+ *  @return NULL, or "Tool error: <name> is not a number" (malloc'd; the caller returns it) */
+char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int *out);
+/** A tool call's boolean argument: true/yes/1 or false/no/0 (case-insensitive words).
+ *  @param call the call
+ *  @param name the argument
+ *  @param def  the value when the argument is absent or empty
+ *  @param out  receives the value, or def
+ *  @return NULL, or "Tool error: <name> must be true or false" (malloc'd; the caller returns it) */
+char *agent_tool_arg_bool(const agent_tool_call *call, const char *name, bool def, bool *out);
+/** A tool call's string argument (L373: a JSON null, number or object is the tool's error, never its JSON text).
+ *  @param call the call
+ *  @param name the argument
+ *  @param out  receives the value, or NULL when the argument is absent
+ *  @return NULL, or "Tool error: <name> must be a string" (malloc'd; the caller returns it) */
+char *agent_tool_arg_string(const agent_tool_call *call, const char *name, const char **out);
 /** Parse a whole-string decimal integer (trailing whitespace allowed).
  *  @param s   the text, or NULL
  *  @param def returned when absent or unparsable
@@ -1558,16 +1670,13 @@ char *agent_edit_result(const char *path,
                                        int start_line, int end_line, int delta,
                                        const char *new_data, size_t new_len,
                                        const char *kind);
-/** Whether the transcript plus the pending turn plus `result` as a tool message still leaves reserve_tokens
- *  free in the context.
+/** Whether the transcript plus the turn being built (rendered as agent_turn_flush will) still leaves
+ *  reserve_tokens free in the context.
  *  @param w              the worker
- *  @param result         the tool result
  *  @param reserve_tokens tokens to keep free
  *  @param tokens_out     receives the projected prompt length, or NULL
  *  @return true when it fits */
-bool agent_tool_result_fits_context(agent_worker *w, const char *result,
-                                           int reserve_tokens,
-                                           int *tokens_out);
+bool agent_turn_fits_context(agent_worker *w, int reserve_tokens, int *tokens_out);
 /** The read tool (path, start_line, max_lines, whole, raw).
  *  @param w    the worker (records the `more` continuation)
  *  @param call the call
@@ -1601,7 +1710,8 @@ void agent_edit_result_append_context(agent_buf *b,
                                              int anchor_start,
                                              int anchor_end);
 /** While an edit's old argument streams, whether the next sampled token should be replaced by an [upto]
- *  marker line because the emitted prefix is already a unique anchor in the file.
+ *  marker line because the emitted prefix is already a unique anchor in the file.  A path outside the workspace
+ *  is never read: no marker.
  *  @param forcer   the forcer's state (reset when the parser is outside edit/old)
  *  @param p        the DSML parser
  *  @param next_text the next token's text
@@ -1611,7 +1721,8 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
                                                   agent_dsml_parser *p,
                                                   const char *next_text,
                                                   size_t next_len);
-/** Check, before the edit runs, that its old text matches the file uniquely (the [upto] rules included).
+/** Check, before the edit runs, that its path is inside the workspace (agent_workspace_refuses: nothing is read
+ *  from a refused path) and its old text matches the file uniquely (the [upto] rules included).
  *  @param w       the worker (unused)
  *  @param call    the edit call
  *  @param err     receives the reason on failure
@@ -1633,9 +1744,27 @@ char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
  *  @param call the search call
  *  @return the result text, malloc'd; caller frees */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
-/** Free every bash job (killing running ones) and empty the list.
+/** L373: the bash jobs' ONE teardown -- SIGKILL every running job's process group and unlink every job's output
+ *  file.  A job whose child exists but is not yet in the table has not started its command and never will
+ *  (agent_bash_start's gate), on whichever thread the teardown runs.  Reached from the normal return (agent_bash_jobs_free), from exit() (atexit) and from SIGTERM / SIGHUP /
+ *  SIGINT (agent_bash_teardown_install), so it calls only kill and unlink (async-signal-safe) and reads only the
+ *  fixed table agent_bash_start fills. */
+void agent_bash_teardown(void);
+/** L373: register agent_bash_teardown with atexit and as the handler of SIGTERM and SIGHUP (the teardown, then the
+ *  signal's default action, so the process still dies by the signal).
+ *  @param with_sigint also SIGINT: a run with no terminal UI, where Ctrl-C ends the process (the interactive UI
+ *                     keeps its own SIGINT handler, which interrupts the turn) */
+void agent_bash_teardown_install(bool with_sigint);
+/** Free every bash job (agent_bash_teardown, then each job reaped and freed) and empty the list.
  *  @param w the worker */
 void agent_bash_jobs_free(agent_worker *w);
+/** L373: poll every job once (agent_bash_job::poll: drain its pipe, reap it, apply its timeout_sec), so a job the
+ *  model stopped asking about neither blocks on a full pipe nor outlives its timeout.  The worker thread calls it
+ *  at the top of every tool round, at every prefill chunk of a turn, every AGENT_BASH_POLL_TOKENS sampled tokens,
+ *  and once a second while it idles with a job running.
+ *  @param w the worker
+ *  @return true while any job is still running */
+bool agent_bash_jobs_poll(agent_worker *w);
 /** Find a job by id, or by pid when id <= 0.
  *  @param w   the worker
  *  @param id  the job id; <= 0 = match by pid
@@ -1647,7 +1776,7 @@ agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid);
  *  @param target the job; no-op when not in the list */
 void agent_bash_remove_job(agent_worker *w, agent_bash_job *target);
 /** Spawn `cmd` under /bin/sh in its own process group, output to a pipe and a /tmp file, and add it to the
- *  worker's job list.
+ *  worker's job list and the exit teardown's table (at most AGENT_BASH_JOBS_MAX jobs).
  *  @param w           the worker
  *  @param cmd         the shell command (copied)
  *  @param timeout_sec seconds before the job is killed
@@ -1668,12 +1797,6 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
                                         bool stop, bool remove_if_done);
-/** @param call a bash tool call
- *  @return its job argument, 0 when absent */
-int agent_tool_job_id(const agent_tool_call *call);
-/** @param call a bash tool call
- *  @return its pid argument, 0 when absent */
-pid_t agent_tool_pid(const agent_tool_call *call);
 /** Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls.
  */
@@ -1703,6 +1826,17 @@ char *agent_bash_jobs_compaction_observation(agent_worker *w);
  *  @return true on success (or an empty transcript) */
 bool agent_worker_compact(agent_worker *w, const char *reason,
                                  char *err, size_t err_len);
+/** L373: where a compacted transcript's verbatim tail may start: the first USER turn marker in v[target, bottom).
+ *  Only there -- a cut anywhere else starts the tail mid-turn (a tool result without its call, half a reply), and a
+ *  tool result rendered as a user turn (pulsar_turn_marker_at's role 3: Qwen's and Nemotron's "<tool_response>"
+ *  turns) is not a user turn.  Gemma's responses sit inside the model turn, so its user markers are the user's own.
+ *  Pure host code.
+ *  @param m      the family's turn markers; NULL = not spelled
+ *  @param v      the transcript's tokens
+ *  @param target the first index the tail may start at
+ *  @param bottom the tail's end (exclusive)
+ *  @return the tail's start, or `bottom` (no tail) when the window holds no user turn marker */
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom);
 /** agent_worker_compact when the transcript passes AGENT_COMPACT_SOFT_PERCENT or leaves too few tokens free.
  *  @param w       the worker
  *  @param reason  why, for the status line

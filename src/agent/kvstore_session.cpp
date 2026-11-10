@@ -1,6 +1,8 @@
 /** @file
  *  pulsar-agent: the KV segment store and session persistence (save, load, list, titles). */
+#include <vector>
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -80,26 +82,7 @@ bool agent_session_file_write(const char *path, const agent_session_file *f, cha
         agent_put32(buf + AGENT_SESSION_HEADER + title_len + (size_t)i * 4u, (uint32_t)f->tokens.v[i]);
     agent_put64(buf + bytes, agent_fnv(1469598103934665603ull, buf, bytes));
 
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    const int fd = mkstemp(tmp);
-    bool ok = fd >= 0;
-    int saved_errno = ok ? 0 : errno;
-    if (ok) {
-        size_t off = 0;
-        while (ok && off < bytes + 8u) {
-            const ssize_t w = write(fd, buf + off, bytes + 8u - off);
-            if (w <= 0) { saved_errno = errno; ok = false; } else off += (size_t)w;
-        }
-        if (ok && fsync(fd) != 0) { saved_errno = errno; ok = false; }
-        if (close(fd) != 0 && ok) { saved_errno = errno; ok = false; }
-        if (ok && rename(tmp, path) != 0) { saved_errno = errno; ok = false; }
-        if (!ok) unlink(tmp);
-    }
-    if (!ok) snprintf(err, err_len, "%s", saved_errno ? strerror(saved_errno) : "failed to write session file");
-    free(tmp);
+    const bool ok = agent_write_file_atomic(path, buf, bytes + 8u, 0600, err, err_len);
     free(buf);
     return ok;
 }
@@ -239,7 +222,7 @@ void agent_kv_system_tip(agent_worker *w, char tip[41]) {
 
 
 /* The transcript's head, through the family's chat front: the built-in tool prompt is trusted control text
- * (DeepSeek keeps its DSML markers native); the -sys text is client text after it.  Every other family's head
+ * (DeepSeek keeps its DSML markers native); the -sys text (UTF-8: main refuses any other) is client text after it.  Every other family's head
  * also declares the tools in its own template (L365, pulsar_chat_open_tools). */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
     const bool dsml = agent_worker_dsml(w);
@@ -265,12 +248,16 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
 
 
 
-void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted) {
+void agent_turn_push(agent_worker *w, pulsar_chat_message msg) {
     if (w->turn_len == w->turn_cap) {
         w->turn_cap = w->turn_cap ? w->turn_cap * 2 : 4;
         w->turn = (pulsar_chat_message *)agent_xrealloc(w->turn, (size_t)w->turn_cap * sizeof(w->turn[0]));
     }
-    w->turn[w->turn_len++] = {role, xstrdup(content ? content : ""), trusted, NULL};
+    w->turn[w->turn_len++] = msg;
+}
+
+void agent_turn_add(agent_worker *w, const char *role, const char *content, bool trusted) {
+    agent_turn_push(w, {role, xstrdup(content ? content : ""), trusted, NULL});
 }
 
 void agent_turn_add_tool(agent_worker *w, const char *name, const char *content) {
@@ -278,23 +265,98 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
     w->turn[w->turn_len - 1].name = name ? xstrdup(name) : NULL;
 }
 
+bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_end, const int *v, int n) {
+    for (int i = n - 1; i >= 0; i--) {
+        const int role = pulsar_turn_marker_at(m, v, n, i);
+        if (!role) continue;
+        if (role != 2) return false;
+        const bool closed = n_end > 0 && n - n_end >= i + m->n_assistant &&
+                            !memcmp(v + n - n_end, end, (size_t)n_end * sizeof(v[0]));
+        return !closed;
+    }
+    return false;
+}
+
+bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens) {
+    pulsar_turn_markers m;
+    if (!pulsar_chat_turn_markers(w->engine, &m)) return false;   /* refused at startup (agent_family_tools_supported) */
+    pulsar_tokens end = {0};
+    pulsar_chat_end_assistant(w->engine, &end);
+    const bool open = agent_tokens_turn_open(&m, end.v, end.len, tokens->v, tokens->len);
+    pulsar_tokens_free(&end);
+    return open;
+}
+
 void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
-    if (!w->model_turn_open) return;
-    if (w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;   /* the turn being built answers it */
+    if (!agent_worker_turn_open(w, tokens)) return;
+    /* where calls continue the turn (Gemma), a turn being built that opens with tool messages answers it */
+    if (pulsar_chat_calls_continue_turn(w->engine) && w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;
     pulsar_chat_end_assistant(w->engine, tokens);
-    if (tokens == &w->transcript) w->model_turn_open = false;
 }
 
 
 
-void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+char *agent_utf8_repaired(const char *s) {
+    const size_t len = strlen(s);
+    size_t bad = 0;
+    for (size_t i = 0; i < len;) {
+        const int k = utf8_seq_ok((const unsigned char *)s + i, len - i);
+        bad += k == 0;
+        i += k ? (size_t)k : 1;
+    }
+    if (!bad) return NULL;
+    char *out = (char *)agent_xmalloc(len + 2 * bad + 1);   /* each bad byte becomes U+FFFD's three */
+    size_t o = 0;
+    for (size_t i = 0; i < len;) {
+        const int k = utf8_seq_ok((const unsigned char *)s + i, len - i);
+        if (k) {
+            memcpy(out + o, s + i, (size_t)k);
+            o += (size_t)k;
+            i += (size_t)k;
+        } else {
+            memcpy(out + o, "\xef\xbf\xbd", 3);
+            o += 3;
+            i++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/** @brief Point each message's content and name at well-formed UTF-8 (agent_utf8_repaired), in place.
+ *  @param msgs  the messages; a repaired field is replaced by its copy
+ *  @param n     their count
+ *  @param owned receives the copies made; the caller frees each after the messages' last use */
+static void agent_chat_messages_repair(pulsar_chat_message *msgs, int n, std::vector<char *> *owned) {
+    for (int i = 0; i < n; i++) {
+        for (const char **field : {&msgs[i].content, &msgs[i].name}) {
+            char *fixed = *field ? agent_utf8_repaired(*field) : NULL;
+            if (!fixed) continue;
+            *field = fixed;
+            owned->push_back(fixed);
+        }
+    }
+}
+
+bool agent_chat_append_turn(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                            bool generation_prompt, pulsar_think_mode think_mode) {
+    std::vector<pulsar_chat_message> turn(msgs, msgs + n);
+    std::vector<char *> owned;
+    agent_chat_messages_repair(turn.data(), n, &owned);
+    /* a family whose tokenizer refuses the rendered turn says so on stderr and appends NOTHING (the chat front has
+     * no error return); a turn that was taken always adds its markers */
+    const int before = tokens->len;
+    const bool taken = pulsar_chat_append_turn(w->engine, tokens, turn.data(), n, generation_prompt, think_mode) &&
+                       tokens->len > before;
+    for (char *p : owned) free(p);
+    return taken;
+}
+
+bool agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
                        pulsar_think_mode think_mode) {
-    const int n = w->turn_len + n_extra;
-    pulsar_chat_message *msgs = (pulsar_chat_message *)agent_xmalloc((size_t)(n > 0 ? n : 1) * sizeof(msgs[0]));
-    for (int i = 0; i < w->turn_len; i++) msgs[i] = w->turn[i];
-    for (int i = 0; i < n_extra; i++) msgs[w->turn_len + i] = extra[i];
-    pulsar_chat_append_turn(w->engine, tokens, msgs, n, true, think_mode);
-    free(msgs);
+    std::vector<pulsar_chat_message> msgs(w->turn, w->turn + w->turn_len);
+    msgs.insert(msgs.end(), extra, extra + n_extra);
+    return agent_chat_append_turn(w, tokens, msgs.data(), (int)msgs.size(), true, think_mode);
 }
 
 
@@ -309,11 +371,11 @@ void agent_turn_clear(agent_worker *w) {
 
 
 
-void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
+bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
     agent_worker_close_open_turn(w, &w->transcript);
-    agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
-    w->model_turn_open = false;   /* answered by the turn's tool messages, or closed above */
+    const bool taken = agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
     agent_turn_clear(w);
+    return taken;
 }
 
 

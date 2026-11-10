@@ -9,35 +9,6 @@
  * ============================================================================
  */
 
-/** @brief Write `len` bytes to `path`, truncating it.
- *  @param path   the file
- *  @param data   bytes to write
- *  @param len    byte count
- *  @param err    receives the failure (open / write / close and errno text)
- *  @param errlen bytes at `err`
- *  @return 0, or -1 with `err` set */
-static int agent_write_file_bytes(const char *path, const char *data, size_t len,
-                                  char *err, size_t errlen) {
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        snprintf(err, errlen, "open %s: %s", path, strerror(errno));
-        return -1;
-    }
-    size_t wr = fwrite(data, 1, len, fp);
-    if (wr != len) {
-        snprintf(err, errlen, "write %s: %s", path, strerror(errno));
-        fclose(fp);
-        return -1;
-    }
-    if (fclose(fp) != 0) {
-        snprintf(err, errlen, "close %s: %s", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-
-
 /** @brief Append one numbered line ("<line> <text>\n", the line's content without its terminator) to `b`.
  *  @param b    the result buffer
  *  @param data the file's bytes
@@ -343,7 +314,8 @@ bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
     char err[256];
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0)
+    if (agent_workspace_refuses(path, err, sizeof(err)) ||
+        agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0)
         return false;
 
     const char *match = NULL;
@@ -743,6 +715,66 @@ static void test_agent_workspace_and_terminal(void) {
     AGENT_TEST_ASSERT(refused("missing/../../x"));
     AGENT_TEST_ASSERT(refused("out/passwd"));
     AGENT_TEST_ASSERT(refused("out/new.txt"));
+    /* L373: a symlink that does not resolve is refused (an open would create its target), inside or out, as the
+     * last component or a parent; ".." is a component, not a substring */
+    AGENT_TEST_ASSERT(symlink("/tmp/pulsar-agent-ws-absent/x.desktop", "dangling-out") == 0);
+    AGENT_TEST_ASSERT(symlink("../pulsar-agent-ws-absent.txt", "dangling-up") == 0);
+    AGENT_TEST_ASSERT(symlink("sub/absent.txt", "dangling-in") == 0);
+    AGENT_TEST_ASSERT(symlink("loop", "loop") == 0);
+    AGENT_TEST_ASSERT(refused("dangling-out"));
+    AGENT_TEST_ASSERT(refused("dangling-up"));
+    AGENT_TEST_ASSERT(refused("dangling-in"));
+    AGENT_TEST_ASSERT(refused("dangling-out/new.txt"));
+    AGENT_TEST_ASSERT(refused("loop"));
+    AGENT_TEST_ASSERT(!refused("a..b.txt"));
+    AGENT_TEST_ASSERT(!refused("sub/..hidden/new..txt"));
+    AGENT_TEST_ASSERT(refused("missing/.."));
+    AGENT_TEST_ASSERT(!refused("sub/../new.txt"));
+    {   /* the write tool leaves the link's target absent */
+        agent_tool_arg args[2] = {{(char *)"path", (char *)"dangling-up", true}, {(char *)"content", (char *)"x", true}};
+        agent_tool_call call = {(char *)"write", args, 2, 2};
+        char *res = agent_tool_write(NULL, &call);
+        AGENT_TEST_ASSERT(strstr(res, "outside the workspace") != NULL);
+        free(res);
+        AGENT_TEST_ASSERT(access("../pulsar-agent-ws-absent.txt", F_OK) != 0);
+    }
+    {   /* L373: the edit preflight and the [upto] forcer read nothing outside the workspace */
+        static const char body[] = "first line of the anchor text, long enough to count\n"
+                                   "second line of the anchor text, long enough too\nrest\n";
+        static const char mature[] = "first line of the anchor text, long enough to count\n"
+                                     "second line of the anchor text, long enough too\n";
+        char outside[PATH_MAX];
+        snprintf(outside, sizeof outside, "%s-outside.txt", dir);
+        for (const char *f : {"inside.txt", (const char *)outside}) {
+            FILE *fp = fopen(f, "wb");
+            AGENT_TEST_ASSERT(fp != NULL);
+            if (fp) { fputs(body, fp); fclose(fp); }
+        }
+        for (int leg = 0; leg < 2; leg++) {
+            const char *path = leg ? outside : "inside.txt";
+            agent_tool_arg args[2] = {{(char *)"path", (char *)path, true}, {(char *)"old", (char *)"rest", true}};
+            agent_tool_call call = {(char *)"edit", args, 2, 2};
+            char err[2 * PATH_MAX] = {0};
+            AGENT_TEST_ASSERT(agent_preflight_edit_old(NULL, &call, err, sizeof err) == !leg);
+            AGENT_TEST_ASSERT((strstr(err, "outside the workspace") != NULL) == (leg == 1));
+            args[1].value = (char *)"absent text";   /* inside: the file is read, the text not found */
+            AGENT_TEST_ASSERT(!agent_preflight_edit_old(NULL, &call, err, sizeof err));
+            AGENT_TEST_ASSERT((strstr(err, "outside the workspace") != NULL) == (leg == 1));
+
+            agent_dsml_parser p;
+            memset(&p, 0, sizeof p);
+            agent_dsml_start(&p);
+            std::string text = std::string("\n" PULSAR_INVOKE_START " name=\"edit\">\n"
+                                           PULSAR_PARAM_START " name=\"path\" string=\"true\">") + path +
+                               PULSAR_PARAM_END "\n" PULSAR_PARAM_START " name=\"old\" string=\"true\">" + mature;
+            agent_dsml_feed(&p, text.data(), text.size());
+            AGENT_TEST_ASSERT(p.state == AGENT_DSML_PARAM_VALUE);
+            agent_edit_upto_forcer forcer = {0};
+            AGENT_TEST_ASSERT(agent_edit_upto_forcer_should_replace(&forcer, &p, "x", 1) == !leg);
+            agent_dsml_parser_free(&p);
+        }
+        unlink(outside);
+    }
     agent_workspace_init(true);
     AGENT_TEST_ASSERT(!refused("/etc/passwd"));
     AGENT_TEST_ASSERT(chdir(old) == 0);
@@ -750,20 +782,221 @@ static void test_agent_workspace_and_terminal(void) {
     snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
     AGENT_TEST_ASSERT(system(cmd) == 0);
     char t[] = "a\x1b[2Jb\n\tc\r\x07\x7f\xc2\x9b" "1m\xc3\xa9";
-    agent_terminal_sanitize(t, strlen(t));
-    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc\r????" "1m\xc3\xa9"));
+    t[agent_terminal_sanitize(t, strlen(t))] = '\0';
+    AGENT_TEST_ASSERT(!strcmp(t, "a?[2Jb\n\tc????" "1m\xc3\xa9"));
+    char cr[] = "x\r\ny\rz\r";   /* L373: a return stays only in front of its newline */
+    cr[agent_terminal_sanitize(cr, strlen(cr))] = '\0';
+    AGENT_TEST_ASSERT(!strcmp(cr, "x\r\nyz"));
+}
+
+/* L373: a tool call's name, parameter names and values are the model's text: nothing a terminal obeys (ESC, a bare
+ * CR, a C1 control split over two one-byte writes) reaches the UI from the call's display or the unknown-tool
+ * header, on the family path (JSON arguments) and the DSML path. */
+static void test_agent_tool_call_display_is_sanitized(void) {
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe */
+    const auto shown_clean = [&w](const char *must_show) {
+        AGENT_TEST_ASSERT(w.out != NULL && strstr(w.out, must_show) != NULL);
+        for (size_t i = 0; i < w.out_len; i++) {
+            const unsigned char c = (unsigned char)w.out[i];
+            AGENT_TEST_ASSERT(c != 0x1b && c != '\r' && c != 0x07);
+            AGENT_TEST_ASSERT(!(c == 0xc2 && i + 1 < w.out_len && (unsigned char)w.out[i + 1] < 0xa0));
+        }
+        w.out_len = 0;
+    };
+    for (int leg = 0; leg < 2; leg++) {
+        agent_token_renderer renderer = {.worker = &w, .last_output_newline = true};
+        agent_dsml_parser dsml = {.state = AGENT_DSML_SEARCH};
+        agent_stream_renderer stream = {.renderer = &renderer, .parser = &dsml};
+        if (leg == 0) {
+            agent_stream_family_call(&stream, "re\x1b[2Jad",
+                                     "{\"pa\\u001bth\": \"a\\u001b]52;c;eA==\\u0007b\\rc\\u009b" "0m.txt\", "
+                                     "\"content\": \"one\\rtwo\\u001b[1A\\r\\nthree\"}");
+            shown_clean("]52;c;eA==");
+        } else {
+            static const char text[] =
+                PULSAR_TOOL_CALLS_START "\n" PULSAR_INVOKE_START " name=\"bash\">\n"
+                PULSAR_PARAM_START " name=\"command\" string=\"true\">echo \x1b]52;c;eA==\x07 hi\rbye \xc2\x9b" "0m"
+                PULSAR_PARAM_END "\n" PULSAR_INVOKE_END "\n" PULSAR_TOOL_CALLS_END;
+            for (const char *s = text; *s; s++) agent_stream_text(&stream, s, 1, false);
+            agent_stream_text(&stream, NULL, 0, true);
+            AGENT_TEST_ASSERT(dsml.state == AGENT_DSML_DONE);
+            shown_clean("]52;c;eA==");
+        }
+        renderer_finish(&renderer);
+        agent_dsml_parser_free(&dsml);
+        w.out_len = 0;
+    }
+    agent_tool_call call = {(char *)"no\x1b[2Jsuch\rtool", NULL, 0, 0};
+    char *res = agent_execute_tool_call_one(&w, &call);
+    AGENT_TEST_ASSERT(strstr(res, "unknown tool") != NULL);
+    free(res);
+    shown_clean("unknown tool");
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* L373: write and edit replace the file by rename -- the mode is kept, a link that resolves is written through, no
+ * temporary file is left, and a write that cannot complete leaves the old contents whole. */
+static void test_agent_write_and_edit_are_atomic(void) {
+    char tmpl[] = "/tmp/pulsar-agent-atomic.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    AGENT_TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char file[PATH_MAX], link[PATH_MAX], fresh[PATH_MAX];
+    snprintf(file, sizeof file, "%s/a.sh", dir);
+    snprintf(link, sizeof link, "%s/link", dir);
+    snprintf(fresh, sizeof fresh, "%s/new.txt", dir);
+    const auto run = [](const char *tool, const char *path, const char *a, const char *b) {
+        agent_tool_arg args[3] = {{(char *)"path", (char *)path, true},
+                                  {(char *)(b ? "old" : "content"), (char *)a, true},
+                                  {(char *)"new", (char *)b, true}};
+        agent_tool_call call = {(char *)tool, args, b ? 3 : 2, 3};
+        return b ? agent_tool_edit(NULL, &call) : agent_tool_write(NULL, &call);
+    };
+    const auto holds = [](const char *path, const char *want) {
+        char err[256];
+        char *data = NULL;
+        size_t len = 0;
+        if (agent_read_file_bytes(path, &data, &len, err, sizeof err) != 0) return false;
+        const bool same = !strcmp(data, want);
+        free(data);
+        return same;
+    };
+    const auto entries = [dir]() {
+        int n = 0;
+        DIR *d = opendir(dir);
+        for (struct dirent *de; d && (de = readdir(d)) != NULL;) n += de->d_name[0] != '.';
+        if (d) closedir(d);
+        return n;
+    };
+    agent_workspace_init(true);
+    struct stat before, after;
+    char *res = run("write", file, "echo one\n", NULL);
+    AGENT_TEST_ASSERT(strstr(res, "Wrote 9 bytes") != NULL && holds(file, "echo one\n"));
+    free(res);
+    AGENT_TEST_ASSERT(chmod(file, 0751) == 0 && stat(file, &before) == 0);
+    res = run("edit", file, "one", "two");
+    AGENT_TEST_ASSERT(strstr(res, "Edited ") != NULL && holds(file, "echo two\n"));
+    free(res);
+    AGENT_TEST_ASSERT(stat(file, &after) == 0 && (after.st_mode & 07777) == 0751 && after.st_ino != before.st_ino);
+    AGENT_TEST_ASSERT(symlink("a.sh", link) == 0);
+    res = run("write", link, "echo three\n", NULL);
+    AGENT_TEST_ASSERT(strstr(res, "Wrote ") != NULL && holds(file, "echo three\n"));
+    free(res);
+    AGENT_TEST_ASSERT(lstat(link, &after) == 0 && S_ISLNK(after.st_mode));
+    AGENT_TEST_ASSERT(stat(file, &after) == 0 && (after.st_mode & 07777) == 0751);
+    res = run("write", fresh, "x", NULL);
+    const mode_t mask = umask(0);
+    umask(mask);
+    AGENT_TEST_ASSERT(stat(fresh, &after) == 0 && (after.st_mode & 07777) == (0666 & ~mask));
+    free(res);
+    AGENT_TEST_ASSERT(entries() == 3);   /* a.sh, link, new.txt: no temporary file */
+    if (geteuid() != 0) {   /* a directory that takes no new file: the write fails, the old contents stay */
+        AGENT_TEST_ASSERT(chmod(dir, 0500) == 0);
+        res = run("write", file, "lost\n", NULL);
+        AGENT_TEST_ASSERT(strstr(res, "Tool error: ") == res && holds(file, "echo three\n"));
+        free(res);
+        res = run("edit", file, "three", "four");
+        AGENT_TEST_ASSERT(strstr(res, "Tool error: ") == res && holds(file, "echo three\n"));
+        free(res);
+        AGENT_TEST_ASSERT(chmod(dir, 0700) == 0);
+    }
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "rm -rf -- '%s'", dir);
+    AGENT_TEST_ASSERT(system(cmd) == 0);
+}
+
+/* L373: whether a transcript ends inside an open assistant turn is read off its tokens (the one authority), so it is
+ * the same before a save and after the reload; Gemma-shaped two-token markers here. */
+static void test_agent_turn_open_is_the_transcripts(void) {
+    pulsar_turn_markers m;
+    memset(&m, 0, sizeof(m));
+    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
+    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
+    const int end[2] = {13, 14};
+    const auto open = [&](std::initializer_list<int> v) {
+        return agent_tokens_turn_open(&m, end, 2, v.begin(), (int)v.size());
+    };
+    AGENT_TEST_ASSERT(!open({}));
+    AGENT_TEST_ASSERT(!open({1, 2, 3}));                                         /* the head alone */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14}));                            /* a user turn */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12}));                     /* the generation prompt */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12, 6, 7}));               /* a turn that made calls */
+    AGENT_TEST_ASSERT(open({1, 10, 11, 5, 13, 14, 10, 12, 6, 13, 14, 7}));       /* ... and holds a response */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14, 10, 12, 6, 7, 13, 14}));      /* closed */
+    AGENT_TEST_ASSERT(!open({1, 10, 11, 5, 13, 14, 10, 12, 13, 14}));            /* closed, empty */
+    AGENT_TEST_ASSERT(!open({1, 10, 12, 6, 13, 14, 10, 11, 5, 13, 14}));         /* a user turn after it */
+    AGENT_TEST_ASSERT(!open({1, 10, 12, 6, 13, 14, 10, 99, 5, 13, 14}));         /* an unnamed (system) turn after it */
+
+    char dir[] = "/tmp/pulsar-agent-open-test.XXXXXX";
+    if (!mkdtemp(dir)) {
+        AGENT_TEST_ASSERT(!"mkdtemp failed");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof path, "%s/s.session", dir);
+    int ids[] = {1, 10, 11, 5, 13, 14, 10, 12, 6, 7};
+    for (int leg = 0; leg < 2; leg++) {   /* open, then closed: each reloads as it was saved */
+        agent_session_file f;
+        memset(&f, 0, sizeof(f));
+        f.title = (char *)"t";
+        f.tokens.v = ids;
+        f.tokens.len = f.tokens.cap = leg ? 8 : 10;
+        if (leg) ids[6] = 13, ids[7] = 14;
+        char err[160] = {0};
+        AGENT_TEST_ASSERT(agent_session_file_write(path, &f, err, sizeof err));
+        agent_session_file got;
+        AGENT_TEST_ASSERT(agent_session_file_read(path, &got, err, sizeof err));
+        AGENT_TEST_ASSERT(agent_tokens_turn_open(&m, end, 2, got.tokens.v, got.tokens.len) == !leg);
+        agent_session_file_free(&got);
+    }
+    unlink(path);
+    rmdir(dir);
+}
+
+/* L373: the compaction tail starts at a user turn marker or there is no tail -- never mid-turn, never at a tool
+ * result rendered as a user turn (Qwen-shaped markers: "<|im_start|> user" and the "\n <tool_response>" after it). */
+static void test_agent_compact_tail_starts_at_a_user_turn(void) {
+    pulsar_turn_markers m;
+    memset(&m, 0, sizeof(m));
+    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
+    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
+    m.tool[0] = 20, m.tool[1] = 21, m.n_tool = 2;
+    /*              0  1   2   3  4   5   6   7  8   9  10  11  12 13  14  15  16 17  18  19  20 */
+    const int v[] = {1, 10, 11, 5, 13, 10, 12, 6, 13, 10, 11, 20, 21, 7, 13, 10, 12, 8, 13, 10, 11, 9, 13};
+    const int n = (int)(sizeof v / sizeof v[0]);
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 0, n) == 1);     /* the first user turn */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 19);    /* not the assistant turn, not the tool result */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 9, n) == 19);    /* a window that opens ON the tool result */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 20, n) == n);    /* mid-turn only: no tail */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, 19) == 19);   /* no user turn before bottom: no tail */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, 20) == 20);   /* a marker cut by bottom does not count */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(NULL, v, 2, n) == n);   /* markers not spelled: no tail */
+    m.n_tool = 0;   /* Gemma: no tool-result turns; every user marker is the user's */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 9);
 }
 
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
+static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
+static void test_agent_bash_teardown(void);           /* bash_jobs.cpp */
 
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
+    test_agent_tool_call_display_is_sanitized();
+    test_agent_write_and_edit_are_atomic();
+    test_agent_turn_open_is_the_transcripts();
+    test_agent_compact_tail_starts_at_a_user_turn();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
     test_agent_family_tools();
+    test_agent_tool_results_are_utf8();
+    test_agent_bash_teardown();
     test_agent_session_file_round_trip();
     test_parse_u64_refuses_sign_and_range();
 }
@@ -786,7 +1019,8 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
+    if (agent_workspace_refuses(path, err, err_len) ||
+        agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
         return false;
 
     const char *match = NULL;
@@ -800,7 +1034,8 @@ bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
 
 
 
-/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file.
+/** @brief Replace bytes [offset, offset + remove_len) of the file's contents with `insert` and write the file
+ *  (agent_write_file_atomic).
  *  @param path       the file
  *  @param data       its current bytes
  *  @param len        bytes at `data`
@@ -824,8 +1059,7 @@ static char *agent_apply_file_splice(const char *path,
            len - offset - remove_len);
     out[out_len] = '\0';
 
-    int rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
-    if (rc != 0) {
+    if (!agent_write_file_atomic(path, out, out_len, 0666, err, sizeof(err))) {
         free(out);
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
@@ -851,11 +1085,12 @@ static char *agent_apply_file_splice(const char *path,
  * replaced. */
 char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     (void)w;
-    const char *path = agent_tool_arg_value(call, "path");
+    const char *path, *old, *new_text;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "old", &old)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "new", &new_text)) return bad;
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
     if (char *refused = agent_workspace_refusal(path)) return refused;
-    const char *old = agent_tool_arg_value(call, "old");
-    const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
     if (!new_text) return xstrdup("Tool error: edit requires new text\n");
 
@@ -1044,19 +1279,26 @@ static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth
 /* Implement the search tool using either literal matching or POSIX regex. */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     (void)w;
-    const char *query = agent_tool_arg_value(call, "query");
+    const char *query, *path, *mode, *glob;
+    int context, max_results;
+    bool case_sensitive;
+    if (char *bad = agent_tool_arg_string(call, "query", &query)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "mode", &mode)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "glob", &glob)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "context", 0, 0, 5, &context)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "max_results", 50, 1, 500, &max_results)) return bad;
+    if (char *bad = agent_tool_arg_bool(call, "case_sensitive", true, &case_sensitive)) return bad;
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
-    const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
     if (char *refused = agent_workspace_refusal(path)) return refused;
-    const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,
-        .glob = agent_tool_arg_value(call, "glob"),
+        .glob = glob,
         .use_regex = mode && !strcmp(mode, "regex"),
-        .case_sensitive = agent_parse_bool_default(agent_tool_arg_value(call, "case_sensitive"), true),
-        .context = agent_parse_int_default(agent_tool_arg_value(call, "context"), 0, 0, 5),
-        .max_results = agent_parse_int_default(agent_tool_arg_value(call, "max_results"), 50, 1, 500),
+        .case_sensitive = case_sensitive,
+        .context = context,
+        .max_results = max_results,
     };
     if (ctx.use_regex) {
         int flags = REG_EXTENDED | REG_NOSUB;

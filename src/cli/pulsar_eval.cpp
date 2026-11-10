@@ -3827,12 +3827,74 @@ static int regrade_status_self_test_case(void) {
     return failed;
 }
 
+/** A run's outcome counts (eval_tally_run). */
+typedef struct {
+    int passed;      ///< cases graded PASSED
+    int failed;      ///< cases graded FAILED
+    int incomplete;  ///< cases that ended without an answer line
+    int run;         ///< passed + failed + incomplete: the cases that ran to a result
+    int not_run;     ///< cases the run was asked for that have no result (pending, quit, skipped, stopped)
+} eval_tally;
+
+/** @brief Count a run's outcomes.  The cases asked for are all of them, or with a case sequence the ones it names.
+ *  @param status       each case's state
+ *  @param ncases       cases in the set
+ *  @param sequence     the case sequence's indices, or NULL
+ *  @param sequence_len entries in `sequence`; 0 = every case was asked for
+ *  @return the counts */
+static eval_tally eval_tally_run(const eval_status *status, int ncases, const int *sequence, int sequence_len) {
+    eval_tally t = {0, 0, 0, 0, 0};
+    for (int i = 0; i < ncases; i++) {
+        if (status[i] == EVAL_PASSED) t.passed++;
+        else if (status[i] == EVAL_FAILED) t.failed++;
+        else if (status[i] == EVAL_INCOMPLETE) t.incomplete++;
+        else {
+            bool asked = sequence_len == 0;
+            for (int k = 0; !asked && k < sequence_len; k++) asked = sequence[k] == i;
+            t.not_run += asked;
+        }
+    }
+    t.run = t.passed + t.failed + t.incomplete;
+    return t;
+}
+
+/** @brief The process exit status of a run: 0 only when it had no error and every case asked for passed.
+ *  @param rc the run loop's error status (0 = none)
+ *  @param t  the run's counts
+ *  @return 0 or 1 */
+static int eval_exit_status(int rc, const eval_tally *t) {
+    return rc || t->failed || t->incomplete || t->not_run ? 1 : 0;
+}
+
+/** @brief Self-test of the run's counts and exit status: a case never run is not a pass.
+ *  @return failures (0 or 1; said on stderr) */
+static int tally_self_test_case(void) {
+    const eval_status all[4] = {EVAL_PASSED, EVAL_PASSED, EVAL_PASSED, EVAL_PASSED};
+    const eval_status quit[4] = {EVAL_PASSED, EVAL_STOPPED, EVAL_PENDING, EVAL_PENDING};
+    const eval_status mixed[4] = {EVAL_PASSED, EVAL_FAILED, EVAL_INCOMPLETE, EVAL_SKIPPED};
+    const int first[1] = {0}, two[2] = {0, 2};
+    const eval_tally a = eval_tally_run(all, 4, NULL, 0);
+    const eval_tally q = eval_tally_run(quit, 4, NULL, 0);
+    const eval_tally m = eval_tally_run(mixed, 4, NULL, 0);
+    const eval_tally s1 = eval_tally_run(quit, 4, first, 1);   /* the sequence's one case ran: the rest were not asked for */
+    const eval_tally s2 = eval_tally_run(quit, 4, two, 2);     /* the sequence was cut short */
+    const bool ok =
+        a.run == 4 && a.not_run == 0 && eval_exit_status(0, &a) == 0 && eval_exit_status(1, &a) == 1 &&
+        q.passed == 1 && q.run == 1 && q.not_run == 3 && eval_exit_status(0, &q) == 1 &&
+        m.passed == 1 && m.failed == 1 && m.incomplete == 1 && m.run == 3 && m.not_run == 1 &&
+        s1.run == 1 && s1.not_run == 0 && eval_exit_status(0, &s1) == 0 &&
+        s2.run == 1 && s2.not_run == 1 && eval_exit_status(0, &s2) == 1;
+    if (!ok) fprintf(stderr, "pulsar-eval: tally self-test failed: cases not run must be counted and fail the run\n");
+    return ok ? 0 : 1;
+}
+
 /** @brief --self-test-extractors: run every grading, extractor and trace self-test.
  *  @return 0 when all pass (printed), else 1 */
 static int run_extractor_self_tests(void) {
     int failed = 0;
 
     failed += trace_copy_self_test_case();
+    failed += tally_self_test_case();
     failed += regrade_status_self_test_case();
 
     /* --- The grading contract: last visible line decides INCOMPLETE vs graded. */
@@ -4555,19 +4617,18 @@ static const char *report_status_name(eval_status st) {
 }
 
 /** @brief Print the end-of-run summary and a per-case table (state, token counts, given and correct answers).
- *  @param ui         the UI (per-case arrays)
- *  @param ncases     cases in the run
- *  @param passed     cases passed
- *  @param failed     cases failed
- *  @param incomplete cases incomplete */
-static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed,
-                              int incomplete) {
+ *  @param ui     the UI (per-case arrays)
+ *  @param ncases cases in the set
+ *  @param t      the run's counts */
+static void print_eval_report(const eval_ui *ui, int ncases, const eval_tally *t) {
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
-    printf("pulsar-eval: %d/%d passed", passed, ncases);
-    if (failed) printf(", %d failed", failed);
-    if (incomplete) printf(", %d incomplete", incomplete);
+    printf("pulsar-eval: %d/%d passed", t->passed, ncases);
+    if (t->failed) printf(", %d failed", t->failed);
+    if (t->incomplete) printf(", %d incomplete", t->incomplete);
+    printf(", %d run", t->run);
+    if (t->not_run) printf(", %d not run", t->not_run);
     printf(", runtime %s\n", elapsed);
     printf("%-3s %-10s %8s %8s %8s %-8s %-8s %s\n",
            "#", "state", "prompt", "gen", "total", "given", "correct", "test");
@@ -4760,25 +4821,23 @@ int main(int argc, char **argv) {
         }
     }
 
-    int passed = 0;
-    int failed = 0;
-    int incomplete = 0;
-    for (int i = 0; i < ncases; i++) {
-        if (ui.status[i] == EVAL_PASSED) passed++;
-        else if (ui.status[i] == EVAL_FAILED) failed++;
-        else if (ui.status[i] == EVAL_INCOMPLETE) incomplete++;
-    }
+    const eval_tally tally = eval_tally_run(ui.status, ncases, case_sequence, case_sequence_len);
 
     if (ui.active) tui_restore();
-    print_eval_report(&ui, ncases, passed, failed, incomplete);
+    print_eval_report(&ui, ncases, &tally);
+    if (tally.not_run)
+        fprintf(stderr, "pulsar-eval: %d case%s asked for %s not run: the run fails\n", tally.not_run,
+                tally.not_run == 1 ? "" : "s", tally.not_run == 1 ? "was" : "were");
     if (trace) {
         fprintf(trace,
                 "===== SUMMARY =====\n"
                 "passed: %d\n"
                 "failed: %d\n"
                 "incomplete: %d\n"
+                "run: %d\n"
+                "not_run: %d\n"
                 "total: %d\n",
-                passed, failed, incomplete, ncases);
+                tally.passed, tally.failed, tally.incomplete, tally.run, tally.not_run, ncases);
         fflush(trace);
     }
 
@@ -4787,5 +4846,5 @@ int main(int argc, char **argv) {
     pulsar_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);
-    return rc || failed || incomplete ? 1 : 0;
+    return eval_exit_status(rc, &tally);
 }
