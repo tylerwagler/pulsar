@@ -363,7 +363,23 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     if (s->sync_n_images > 0 || s->live_images.n == 0) {
         const uint32_t E = pulsar_prompt_endpoint(s->engine, ckpt, prompt);
         uint32_t bs = 0, be = 0;
-        plan.endpoint = E > start && !prefill_plan_block_across(&plan, E, &bs, &be) ? E : 0u;
+        if (E > start && !prefill_plan_block_across(&plan, E, &bs, &be)) {
+            /* L380: unless the caller waived it (pulsar_session_set_endpoint_waive: its request resumed at or past
+             * the bank's previous prompt end) and the prompt's last grid point stands in for the record
+             * (pulsar_prefill_endpoint_waived): one chunk fewer and no record, the same bytes (the family is
+             * split-invariant).  The bank's older endpoint record stays as it is. */
+            const bool waived = pulsar_prefill_endpoint_waived(ckpt, E, end, s->endpoint_waive);
+            plan.endpoint = waived ? 0u : E;
+            s->endpoint_plan = waived ? PULSAR_ENDPOINT_WAIVED : PULSAR_ENDPOINT_CUT;
+            static bool announced = false;   /* rule 5: the path taken, once */
+            if (waived && !announced) {
+                announced = true;
+                fprintf(stderr, "pulsar: L380 endpoint cut waived: bank %u prefills [%u, %u) without the cut at its "
+                                "message endpoint %u (the request resumed at or past the bank's previous prompt end; "
+                                "counted per request: kv req epcut=0)\n",
+                        pulsar_session_live_bank(s), start, end, E);
+            }
+        }
     }
     if (plan.n_images > 0) {
         /* every block must fit one chunk of THIS walk (a resume's chunks may be narrower than the cold pass's) */

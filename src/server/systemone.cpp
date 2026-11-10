@@ -478,6 +478,23 @@ bool server_judge_step(server *s) {
     return true;
 }
 
+/** L378: one /v1/systemone request's log line, written when the handler returns (its destructor): the questions
+ *  asked, the tokens their prompts rendered (the state once per question), how many of those the judge bank already
+ *  held, how many were prefilled, the wall time and the HTTP status. */
+struct judge_req_log {
+    double t0 = 0.0;     ///< server_now_sec at the handler's start
+    int status = 0;      ///< the HTTP status answered
+    int questions = 0;   ///< questions queued (0: refused before the queue)
+    int tokens = 0;      ///< their prompts' tokens, summed
+    int cached = 0;      ///< of those, held by the bank when each question began
+    int prefilled = 0;   ///< tokens the worker prefilled for it
+    ~judge_req_log() {
+        server_log(PULSAR_LOG_KVCACHE,
+                   "pulsar-server: systemone req: questions=%d tokens=%d cached=%d prefilled=%d ms=%.1f status=%d",
+                   questions, tokens, cached, prefilled, (server_now_sec() - t0) * 1e3, status);
+    }
+};
+
 /** L354: the questions one request may ask the judge.  Every question renders the whole state, so without a bound a body
  *  of small questions under one large state holds questions x state tokens and queues as many prefills. */
 #define PULSAR_JUDGE_MAX_QUESTIONS 64
@@ -493,26 +510,33 @@ static bool judge_total_tokens_ok(uint64_t total_tokens, int ctx) {
 
 void server_judge_http(server *s, int fd, const char *body, size_t len) {
     server_judge *J = s->judge;
+    /* L378: one line a request at its end, whatever the end -- the judge's calls left no line before */
+    judge_req_log lg;
+    lg.t0 = server_now_sec();
+    const auto refuse = [&](int code, const char *msg) {
+        lg.status = code;
+        http_error(fd, code, msg);
+    };
     if (!J) {
-        http_error(fd, 404, "/v1/systemone: this server has no judge (no adapter in the container, or --judge-banks 0)");
+        refuse(404, "/v1/systemone: this server has no judge (no adapter in the container, or --judge-banks 0)");
         return;
     }
     char uerr[320];
     if (!request_body_utf8_ok(body, len, uerr, sizeof uerr)) {   /* L372: as every surface */
         const std::string msg = std::string("/v1/systemone: ") + uerr;
-        http_error(fd, 400, msg.c_str());
+        refuse(400, msg.c_str());
         return;
     }
     pyjson_value req;
     char perr[160];
     if (!pyjson_parse(body, len, &req, perr, sizeof perr) || req.kind != pyjson_value::OBJ) {
-        http_error(fd, 400, "/v1/systemone: the body is not a JSON object");
+        refuse(400, "/v1/systemone: the body is not a JSON object");
         return;
     }
     const pyjson_value *st = req.get("state"), *qs = req.get("questions");
     if (!st || (st->kind != pyjson_value::STR && st->kind != pyjson_value::OBJ) || !qs ||
         qs->kind != pyjson_value::ARR || qs->a.empty()) {
-        http_error(fd, 400, "/v1/systemone: wants \"state\" (a string, or an object serialized as json.dumps(state, "
+        refuse(400, "/v1/systemone: wants \"state\" (a string, or an object serialized as json.dumps(state, "
                             "indent=1)) and a non-empty \"questions\" array");
         return;
     }
@@ -520,7 +544,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         char e[128];
         snprintf(e, sizeof e, "/v1/systemone: %zu questions; a request asks at most %d", qs->a.size(),
                  PULSAR_JUDGE_MAX_QUESTIONS);
-        http_error(fd, 400, e);
+        refuse(400, e);
         return;
     }
     std::string state;
@@ -546,15 +570,15 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
             qq->kind != pyjson_value::STR) {
             snprintf(e, sizeof e, "/v1/systemone: question %zu wants a \"kind\" the head answers and a \"question\" "
                                   "string", i);
-            http_error(fd, 400, e);
+            refuse(400, e);
             free_job();
             return;
         }
         const judge_kind &k = J->kinds[(size_t)q.kind];
         if (ov) {
-            if (ov->kind != pyjson_value::ARR) { http_error(fd, 400, "/v1/systemone: \"options\" is not an array"); free_job(); return; }
+            if (ov->kind != pyjson_value::ARR) { refuse(400, "/v1/systemone: \"options\" is not an array"); free_job(); return; }
             for (const auto &o : ov->a) {
-                if (o.kind != pyjson_value::STR) { http_error(fd, 400, "/v1/systemone: an option is not a string"); free_job(); return; }
+                if (o.kind != pyjson_value::STR) { refuse(400, "/v1/systemone: an option is not a string"); free_job(); return; }
                 q.options.push_back(o.s);
             }
         } else if (k.name == "noul") {
@@ -565,7 +589,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         if (q.options.size() < 2 || q.options.size() > k.hi - k.lo) {
             snprintf(e, sizeof e, "/v1/systemone: question %zu (%s) has %zu options; the head answers 2 .. %u", i,
                      k.name.c_str(), q.options.size(), k.hi - k.lo);
-            http_error(fd, 400, e);
+            refuse(400, e);
             free_job();
             return;
         }
@@ -580,7 +604,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         if (!pulsar_tokenize_rendered_chat(s->engine, "<bos>", &t) || t.len != 1 ||
             !pulsar_tokenize_text(s->engine, text.c_str(), &t)) {
             pulsar_tokens_free(&t);
-            http_error(fd, 500, "/v1/systemone: the prompt could not be tokenized");
+            refuse(500, "/v1/systemone: the prompt could not be tokenized");
             free_job();
             return;
         }
@@ -588,7 +612,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
             snprintf(e, sizeof e, "/v1/systemone: question %zu is %d tokens; the context is %d", i, t.len,
                      s->pool_ctx_size);
             pulsar_tokens_free(&t);
-            http_error(fd, 400, e);
+            refuse(400, e);
             free_job();
             return;
         }
@@ -597,7 +621,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
             snprintf(e, sizeof e, "/v1/systemone: the questions render %llu tokens; a request holds at most %llu",
                      (unsigned long long)total_tokens, 4ull * (unsigned long long)s->pool_ctx_size);
             pulsar_tokens_free(&t);
-            http_error(fd, 400, e);
+            refuse(400, e);
             free_job();
             return;
         }
@@ -617,9 +641,22 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     pthread_mutex_lock(&jb->mu);
     while (!jb->done) pthread_cond_wait(&jb->cv, &jb->mu);
     pthread_mutex_unlock(&jb->mu);
+    lg.questions = (int)jb->prompts.size();
+    for (size_t i = 0; i < jb->prompts.size(); i++) {
+        lg.tokens += jb->prompts[i].len;
+        lg.cached += jb->cached[i];
+    }
+    /* what the worker prefilled: the questions it finished in full, the one in progress to where it stood */
+    for (size_t i = 0; i < jb->at && i < jb->prompts.size(); i++) lg.prefilled += jb->prompts[i].len - jb->cached[i];
+    if (jb->at < jb->prompts.size() && jb->started) lg.prefilled += jb->pos - jb->cached[jb->at];
     if (!jb->err.empty()) {
-        if (jb->busy) http_error_retry(fd, 503, jb->err.c_str(), HTTP_RETRY_BUSY_S);
-        else http_error(fd, 503, jb->err.c_str());
+        s->count_503(SERVER_503_SYSTEMONE);
+        if (jb->busy) {
+            lg.status = 503;
+            http_error_retry(fd, 503, jb->err.c_str(), HTTP_RETRY_BUSY_S);
+        } else {
+            refuse(503, jb->err.c_str());
+        }
         free_job();
         return;
     }
@@ -665,6 +702,7 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
     snprintf(tail, sizeof tail, "],\"usage\":{\"prompt_tokens\":%d,\"cached_tokens\":%d},\"ms\":%.1f}\n", prompt_tokens,
              cached, (server_now_sec() - t0) * 1e3);
     out += tail;
+    lg.status = 200;
     http_response(fd, 200, "application/json", out.c_str());
     free_job();
 }

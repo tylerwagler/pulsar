@@ -114,7 +114,8 @@ const char *phase_name(int ph) {
 /** The watchdog thread: once a second, compare the worker's mark count (g_pulsar_stall.beats) with the last seen;
  *  with work for the worker (server_watchdog_busy, read under server::mu by trylock: a held mu keeps the last
  *  answer) and no mark for server::stall_limit_s seconds, publish server::stall_s and dump once
- *  (server::watchdog_dump) until a mark clears it.  Runs until server::watchdog_quit.
+ *  (server::watchdog_dump) until a mark clears it.  L378: it also writes the hourly `kv ledger:` line
+ *  (server::kv_ledger_log).  Runs until server::watchdog_quit.
  *  @param arg the server
  *  @return NULL */
 void *watchdog_main(void *arg) {
@@ -122,9 +123,13 @@ void *watchdog_main(void *arg) {
     uint64_t seen = g_pulsar_stall.beats.load(std::memory_order_relaxed);
     int64_t beat_ms = pulsar_stall_now_ms();
     bool dumped = false, busy = false;
+    int64_t ledger_s = beat_ms / 1000;   /* L378: when the last hourly `kv ledger:` line was written (the start) */
     while (!__atomic_load_n(&s->watchdog_quit, __ATOMIC_RELAXED)) {
         usleep(1000000);
         const int64_t now = pulsar_stall_now_ms();
+        /* L378: the hourly ledger line, from the variables /metrics reads (under mu, tried once: a held mu leaves it
+         * due for the next second) */
+        if (kv_ledger_due(now / 1000, ledger_s) && s->kv_ledger_log(false)) ledger_s = now / 1000;
         const uint64_t beats = g_pulsar_stall.beats.load(std::memory_order_relaxed);
         if (beats != seen) {
             seen = beats;

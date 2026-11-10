@@ -1707,6 +1707,7 @@ int main(int argc, char **argv) {
         if (!at_cap) s.clients++;
         pthread_mutex_unlock(&s.mu);
         if (at_cap) {
+            s.count_503(SERVER_503_CONNECTIONS);   /* L378 */
             http_error_retry(fd, 503, "too many connections", HTTP_RETRY_BUSY_S);
             close(fd);
             continue;
@@ -1776,6 +1777,9 @@ int main(int argc, char **argv) {
             s.kv_cache_persist(sl, KV_PERSIST_SHUTDOWN);
         }
     }
+    /* L378: the run's last ledger line, after the shutdown persists (the store's I/O published first) */
+    s.kv_cache_publish_store();
+    (void)s.kv_ledger_log(true);
     s.close_resources();
     free(tp_kv_dir);
     return 0;

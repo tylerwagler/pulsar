@@ -14,8 +14,10 @@ the agent, the servers and the disk KV store.  The full list is `git log v0.5.1.
 - **Gemma 4: a verify row's attention arm no longer depends on what rides in its step** (L370).  In a step that mixed
   a speculative round's verify rows with another conversation's prompt rows, the verify rows took the prompt rows'
   arm, so their bytes differed from the same rows verified alone.  The attention is now one call a row kind.
-- **Stored KV is refused once** (payload v8, segment v9; no format change).  Chains written by the faulty attention
-  cannot be told from sound ones, so every family's disk KV store starts empty on the first run of 0.5.2.
+- **Stored KV from before is refused** (payload v8, segment v9; no format change).  Chains written by the faulty
+  attention cannot be told from sound ones, so every older segment is refused when it is read and its chain dropped
+  then; chains nothing reads leave by eviction.  The store is not emptied at open: to reclaim the space at once,
+  clear the `--kv-disk-dir` directory before the first start (the 0.5.2 deploys did).
 
 ## Fixed: crashes and wrong answers
 
@@ -73,7 +75,7 @@ the agent, the servers and the disk KV store.  The full list is `git log v0.5.1.
 
 ## Upgrade notes
 
-- **Every disk KV store is wiped by the first start** (above).
+- **Older disk KV is refused on read** (above); clear the store's directory when upgrading to free its space.
 - **HTTP statuses.**  A request body that is not valid UTF-8 is a 400 naming the JSON path (it was a 500 at prefill).
   An image refused because the shared decode budget is in use is a 503 with `Retry-After` (it was a 400).  The judge
   answers 503 with `Retry-After` when its prefill would cross the memory floor or the KV budget (it always ran).

@@ -654,6 +654,8 @@ void server::gen_prefill_fail(session_slot *sl) {
     slot_writer_install(&g->writer);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err, g->prefill_busy);
+    if (g->prefill_busy) s->count_503(SERVER_503_IMAGE_BUSY);   /* L378 */
+    gen_kv_finish(g, g->prefill_busy ? "busy" : "failed");
     g->phase = GEN_DONE;
 }
 
@@ -698,6 +700,7 @@ void server::gen_prefill_abandon(session_slot *sl) {
     s->live_bindings_settle(sl);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err, false);
+    gen_kv_finish(g, "gone");   /* L378 */
     g->phase = GEN_DONE;
 }
 
@@ -839,8 +842,10 @@ void server::gen_step_restore(session_slot *sl) {
     }
     if (rc == 0) return;   /* the next slice is the next quantum's */
     g->restore = NULL;
+    j->kvr.restore_ms += r->read_ms;   /* L378: the chain reads this request waited for */
     if (gr->kind == GEN_RESTORE_SPILLED) {
         const int G = rc > 0 ? s->kv_restore_finish(r, gr->text, NULL, 0, NULL, NULL, false) : 0;
+        j->kvr.spill_restored = G > 0;
         s->kv_restore_end(r);
         pulsar_session_bank_state_save(s->sess, sl->bank);
         server_log(PULSAR_LOG_DEFAULT,
@@ -923,6 +928,7 @@ bool server::gen_resume_adopt(session_slot *sl, int src, gen_resolution *res) {
         res->cached = pulsar_session_bank_prompt_held(s->sess, sl->bank, &j->req.prompt, ad.at).raw();
         res->resumed_at = ad.at;
         res->cache_source = "bank-adopt";
+        j->kvr.from = src;   /* L378 */
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: bank %u adopted bank %d's state at %d of %d (%.1f ms)",
                    sl->bank, src, ad.at.raw(), j->req.prompt.len, (server_now_sec() - t_a) * 1e3);
         return true;
@@ -1071,6 +1077,7 @@ void server::gen_begin(session_slot *sl) {
         pulsar_tokens_free(&effective_prompt);
         job_reply_error(j, g->progress.headers_sent, 409,
                         "Responses continuation state is not available; retry by replaying the full input history");
+        gen_kv_finish(g, "conflict");   /* L378 */
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
@@ -1079,6 +1086,7 @@ void server::gen_begin(session_slot *sl) {
         pulsar_tokens_free(&effective_prompt);
         job_reply_error(j, g->progress.headers_sent, 409,
                         "Anthropic continuation state is not available; retry by replaying the full messages history");
+        gen_kv_finish(g, "conflict");   /* L378 */
         g->phase = GEN_DONE;
         return;
     } else if (cached == 0) {
@@ -1184,12 +1192,11 @@ void server::gen_begin(session_slot *sl) {
     }
     /* L347 I3b: this request takes the bank's history from here (the old one's persist above read the old tokens):
      * every later persist of the bank reads its X-Pulsar-KV tokens */
-    sl->kv_flags = j->req.kv_flags;
     /* L249 D: the bank's history is this job's from here -- a replaced dead prefix is gone (its bank reused), a
-     * continued one revived -- and so is its session */
+     * continued one revived -- and so is its session.  L379: and its X-Pulsar-KV tokens: a read-only request's
+     * history is scratch until a request without the token takes the bank (server_slot_take_history) */
     if (sl->hint_dead && (sync_from_zero || pick != RESUME_OWN)) s->count_metric(&s->m_hint_dead_reuse);
-    sl->hint_dead = false;
-    snprintf(sl->hint_session, sizeof sl->hint_session, "%s", j->req.hints.session);
+    server_slot_take_history(sl, &j->req);
     if (pick == RESUME_ADOPT) {
         gen_resolution ar = {};
         ar.cached = cached;
@@ -1282,6 +1289,15 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    /* L378: the resolution as the sync will run it, for the `kv req:` line (the adopt's source bank was set where
+     * the adopt happened; a failed restore's fallback arrives here like any pick) */
+    j->kvr.pick = kv_pick_of_source(cache_source, j->kvr.spill_restored);
+    if (j->kvr.pick != KV_PICK_ADOPT) j->kvr.from = -1;
+    j->kvr.at = resumed_at.raw();
+    j->kvr.reused = cached;
+    /* L380: read before any sync of this request moves the bank's prompt-end record */
+    g->endpoint_waive = server_endpoint_waive(j->kvr.pick, resumed_at.raw(),
+                                              pulsar_session_bank_prompt_end(s->sess, sl->bank).raw());
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by pulsar_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -1497,6 +1513,7 @@ void server::gen_step_prefill(session_slot *sl) {
     /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
      * share_mark cut too (the chunk after the cut is the next sync's first) */
     pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
+    pulsar_session_set_endpoint_waive(s->sess, g->endpoint_waive);   /* L380: the request's, for each of its syncs */
     g->bank_written = true;   /* the sync rewinds to its resume point and writes this prompt's rows */
     int rc;
     {
@@ -1508,6 +1525,11 @@ void server::gen_step_prefill(session_slot *sl) {
             : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
     }
     pulsar_session_set_prefill_ahead(s->sess, NULL);
+    /* L380: what the walk did with the message endpoint ahead of it, for the `kv req:` line -- the last quantum that
+     * had one (a later quantum starts past it) */
+    const pulsar_endpoint_plan ep = pulsar_session_endpoint_plan(s->sess);
+    if (ep != PULSAR_ENDPOINT_NONE) g->j->kvr.epcut = ep == PULSAR_ENDPOINT_CUT ? 1 : 0;
+    pulsar_session_set_endpoint_waive(s->sess, false);
     pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {
@@ -1588,6 +1610,7 @@ void server::gen_stream_begin(session_slot *sl) {
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
                        g->req_flags);
+            gen_kv_finish(g, "stream-failed");   /* L378 */
             g->phase = GEN_DONE;
             return;
         }
@@ -1601,6 +1624,7 @@ void server::gen_stream_begin(session_slot *sl) {
                        g->ctx_span,
                        g->req_flags[0] ? " " : "",
                        g->req_flags);
+            gen_kv_finish(g, "stream-failed");   /* L378 */
             g->phase = GEN_DONE;
             return;
         }
@@ -1609,12 +1633,14 @@ void server::gen_stream_begin(session_slot *sl) {
             !anthropic_sse_start_live(j->fd, &j->req, g->id,
                                       g->prompt_tokens, &g->anthropic_live)) {
             server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s anthropic stream start failed", g->ctx_span);
+            gen_kv_finish(g, "stream-failed");   /* L378 */
             g->phase = GEN_DONE;
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, g->id, NULL, NULL)) {
             server_log(PULSAR_LOG_GENERATION, "pulsar-server: chat ctx=%s openai role chunk failed", g->ctx_span);
+            gen_kv_finish(g, "stream-failed");   /* L378 */
             g->phase = GEN_DONE;
             return;
         }
@@ -1633,6 +1659,7 @@ void server::gen_stream_begin(session_slot *sl) {
                            g->ctx_span,
                            g->req_flags[0] ? " " : "",
                            g->req_flags);
+                gen_kv_finish(g, "stream-failed");   /* L378 */
                 g->phase = GEN_DONE;
                 return;
             }
@@ -2384,6 +2411,7 @@ void server::gen_step_finish(session_slot *sl) {
     /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
     /* L372: not an abandoned one -- its partial reply is no turn the client will send back */
     sl->terminal_pending = gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion);
+    gen_kv_finish(g, said_finish);   /* L378 */
     g->phase = GEN_DONE;
 }
 
@@ -2507,6 +2535,7 @@ void server::generate_job_begin(session_slot *sl, job *j) {
         slot_writer_mark_written(&g->writer);
     }
     g->progress.stream_failed = dead;
+    j->kvr.qwait_ms = (server_now_sec() - j->accepted_at) * 1e3;   /* L378: acceptance to bind */
     s->gen_begin(sl);
 }
 

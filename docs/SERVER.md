@@ -313,6 +313,17 @@ Scheduling (`src/server/server_sched.cpp`, `server_jobs.cpp`):
 - **Routing.** A request goes to the bank whose history shares the longest
   token prefix with it. A prefix no longer than the template header counts as no
   match. Side calls stay on their conversation's bank.
+- **Making room (L379).** A request that wants a fresh bank when none is empty
+  evicts one idle bank: a dominated or dead one first, then a *scratch* one, then
+  the least recently used conversation. A bank is scratch when its history was
+  written by a read-only request (`X-Pulsar-KV: read-only`, the gate's judge) or
+  is shorter than the disk tier's minimum (512 tokens); a request without the
+  token that takes the bank makes it a conversation's again. A queued request's
+  usable warm match is spared, unless it is scratch; a queued live tool
+  continuation's bank is never taken. A request never evicts the bank it matched
+  best: when that is the bank an eviction would free, it runs in place on it
+  (`route: ... -> in place (the only bank to free is the matched one)`). The
+  guard's spill order ranks banks the same way.
 - **Resume.** A request resumes from the deepest valid state, whichever is
   deepest: its own bank, another bank's published checkpoint (adopt), or a disk
   chain. A disk chain is loaded only when reading it beats recomputing.
@@ -435,6 +446,88 @@ every scrape.
 The cache is disposable: stop the server and delete the directory to reset it.
 Segment files contain the conversation text in clear.
 
+## KV evidence: the `kv req:` and `kv ledger:` lines
+
+The log is the durable record of what routing and the disk tier do (L378): `/metrics` resets with the process, the
+log does not. Three line kinds, all `key=value` separated by one blank, no blank inside a value, `-` for a value that
+does not exist. They are printed in the KV log class, which is always on (the log has no class filter; a class only
+picks the colour on a terminal). Nothing in them decides anything.
+
+### One line a generation request: `pulsar-server: kv req:`
+
+Written once, when the request's job ends: at the end of its turn, at its failure, or when it leaves the queue
+unserved. A request that never bound to a bank has `bank=-` and `-` in every field the worker never learned.
+
+| Field | Meaning |
+|---|---|
+| `id` | the job's number (from 1, per process) |
+| `ep` | the endpoint: `chat`, `completions`, `responses`, `messages` |
+| `class` | the `x-claude-code-request-class` hint: `main`, `subagent`, `workflow`, `compaction`, `auxiliary`, `other` |
+| `ro` | 1 when the request carried `X-Pulsar-KV: read-only` |
+| `sess`, `agent`, `parent` | the `x-claude-code-session-id`, `-agent-id` and `-parent-agent-id` hints as received, cut to 16 characters |
+| `pre` | hex16: FNV-1a 64 of the prompt's token ids from 0 to the preamble's end, the first user marker (the shared system prompt and tools). `-` when the prompt has no user marker before its first assistant marker |
+| `conv` | hex16: the same hash from 0 to the first assistant marker: the preamble and the user turns before the first reply. The same on every turn of one conversation, different for two conversations behind one preamble. The whole prompt when it has no assistant marker (a completion) |
+| `prompt` | the prompt's tokens |
+| `bank` | the bank it ran on |
+| `route` | the router's verdict: `in-place` (continues on its best bank), `fresh` (an empty, dead, newly provisioned or just evicted bank), `clobber` (its best bank over another conversation's history, no fresh bank to be had), `owner` (the bank that owns its live tool call ids), `matched` (its best bank, in place: no fresh bank could be had and the only bank an eviction would free was that one, L379), `none` (never routed) |
+| `best`, `common`, `score`, `anchor`, `frontier`, `prefilled` | the numbers of the `route:` line: the best-scoring free bank, the tokens shared with it, where its sync would resume, its route anchor, its frontier and its prefill frontier |
+| `noresume` | only when `score=0` and `common>0`: why the best bank has no resume point inside the match. `ckpt-above`: every checkpoint it holds lies above what it may resume. `no-ckpt`: it holds no checkpoint at all. `not-continued`: the request extends its whole history, but the bank does not continue it (decode rows past its prefill, an end off the grid, stale rows) and no checkpoint lies below. `images`: a checkpoint within the match was refused, the bank's images are not the request's. `no-match` cannot print (it has `common=0`) |
+| `pick` | the state the sync started from: `own` (the bank's history), `adopt` (another bank's state, copied), `disk` (a disk chain), `live` (a live Responses / Anthropic tool continuation), `spilled` (the bank's own history, read back from its spill chain), `none` (token 0) |
+| `from` | the bank an adopt copied from; `disk` for a disk chain |
+| `at` | the position the sync started computing at |
+| `reused` | the request's tokens served from state (the cache read) |
+| `prefilled_now` | tokens this request prefilled |
+| `below` | tokens between `at` and the deepest match any free bank had when the request was routed: what a resume at that match would have saved |
+| `epcut` | the prefill's cut at the prompt's message endpoint (the start of its generation header; the cut leaves the record a later prompt resumes from when it re-renders that header differently, and costs a prefill chunk): `1` made and recorded, `0` waived, `-` no endpoint lay ahead of the prefill (a tool round past it, a family that makes no such cut, a prefill in the fused lane, no prefill). Waived when the request starts computing (`at`) at or past the end of the last prompt its bank prefilled whole, from the bank's own state (`pick=own` or `live`), and no resume-grid point lies between the endpoint and the prompt's end; a request on a bank with no prompt end standing, one that resumes below it, an adopt and a disk chain all cut |
+| `evict` | the bank this request's bind evicted (the last one, when it evicted several) |
+| `evict_tokens`, `evict_conv`, `evict_ro` | that bank's history: its tokens, its `conv` key (the same rule over its tokens), and 1 when it was a read-only request's |
+| `snapshot` | the eviction line's word with its blank removed: `disk`, `none`, `none(<rule>)` |
+| `qwait_ms` | acceptance to bind |
+| `restore_ms` | disk chain reads the request waited for |
+| `prefill_ms` | prefill start to decode start (after a retried attempt: to the last attempt's decode start) |
+| `ttft_ms` | acceptance to the first generated token |
+| `out` | tokens generated, every attempt |
+| `finish` | the turn's finish label (`stop`, `length`, `tool_calls`, `abandoned`, `error`, ...), or the server's word for an end that is no turn: `failed`, `busy`, `gone`, `conflict` (409), `stream-failed`, `refused-memory` (a 503 mid-prefill), and for a request that never bound `gone-queued`, `refused-context` (400), `refused-bank` (500), `refused-kv` (503) |
+
+```text
+pulsar-server: kv req: id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 prefilled_now=29708 below=29356 epcut=1 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop
+```
+
+### The cumulative ledger: `pulsar-server: kv ledger:`
+
+Written every hour while the server runs (by the stall watchdog's thread, so not with `PULSAR_STALL_WATCHDOG_S=0`) and
+once at shutdown, after the shutdown persists. Every value counts from the process start and is a variable `/metrics`
+publishes: the line and `/metrics` are two prints of the same counters.
+
+| Field | Meaning | `/metrics` |
+|---|---|---|
+| `uptime_s` | seconds since the listener came up | `/health` |
+| `requests` | `kv req:` lines written | `pulsar:kv_requests_total` |
+| `route_in-place`, `route_fresh`, `route_clobber`, `route_owner`, `route_matched`, `route_none` | ... by `route` | `pulsar:kv_routes_total{route}` |
+| `pick_own`, `pick_adopt`, `pick_disk`, `pick_live`, `pick_spilled`, `pick_none` | ... by `pick` | `pulsar:kv_request_picks_total{pick}` |
+| `evictions` | banks evicted | `pulsar:slot_evictions_total` |
+| `evict_<victim>_by_<requester>` | of them, by the evicted history (`conv`: a conversation's, `ro`: a read-only request's) and the request it was evicted for | `pulsar:kv_evictions_by_total{victim,requester}` |
+| `evict_own_best` | evictions whose victim was the requester's own best bank (0 since L379: such a request runs in place, `route=matched`) | `pulsar:kv_evictions_own_best_total` |
+| `disk` | 1 when the disk tier is on (the disk fields are 0 when it is off) | |
+| `seg_written_bytes`, `rp_written_bytes`, `segs_written`, `rps_written` | row segments and restore points committed: file bytes and files | `pulsar:kv_disk_io_bytes_total{op="written"}`, `pulsar:kv_disk_io_files_total{op="written"}` |
+| `seg_read_bytes`, `rp_read_bytes`, `segs_read`, `rps_read` | files mapped for a load, from the RAM tier or the disk, each map | `...{op="read"}` |
+| `removed_bytes` | file bytes removed, any reason | `pulsar:kv_disk_io_bytes_total{op="removed"}` |
+| `removed_budget_bytes` | ... of them, evicted for room (the budget, a full disk) | `...{op="removed_budget"}` |
+| `removed_unread_bytes` | ... of `removed_bytes`, files no load had mapped since the process started. The store keeps the bit in memory only, so a file left by an earlier run counts as unread until this run reads it | `...{op="removed_unread"}` |
+| `restores_begun`, `restores_done`, `restores_failed` | disk chain restores; the rest are running or were cancelled | `pulsar:kv_disk_restores_total{outcome}` |
+| `restored_tokens` | tokens the loaded chains added past the banks' own resumes | `pulsar:kv_disk_restored_tokens_total` |
+| `dup_banks`, `dup_pages_resident`, `dup_pages_shared`, `dup_bytes`, `dup_bytes_peak`, `dup_deep_pairs`, `dup_deep_longest` | the duplicate census as last taken: resident banks with a whole page, pages held, distinct pages two banks share, the bytes held twice and their peak, bank pairs sharing more than the preamble and their longest shared prefix | `pulsar:kv_dup_*` |
+| `spills`, `preemptions`, `readmissions` | guard spills, decoders preempted and readmitted | `pulsar:bank_spills_total`, `pulsar:decoder_preemptions_total`, `pulsar:decoder_readmissions_total` |
+| `refused_<cause>` | 503 answers: `admission` (the prompt's KV does not fit), `image_busy`, `parse_busy`, `connections`, `shutdown`, `systemone` | `pulsar:refused_503_total{cause}` |
+| `refused_prefill` | prefills stopped by the memory floor (503) | `pulsar:prefill_mem_refusals_total` |
+
+### One line a `/v1/systemone` request: `pulsar-server: systemone req:`
+
+Written when the handler returns, whatever the answer: `questions` (0 when it was refused before the queue), `tokens`
+(the questions' rendered prompts, summed: the state once per question), `cached` (of those, held by the judge bank
+when each question began), `prefilled` (tokens the worker prefilled for it), `ms` (the handler's wall time) and
+`status` (the HTTP status).
+
 ## Memory floor and stall watchdog
 
 The GB10 shares one memory pool between CPU and GPU, and the kernel's own
@@ -539,6 +632,11 @@ Everything else is in the `pulsar:` namespace. The main groups:
   - `pulsar:kv_eager_floor_bytes`, `pulsar:kv_touched_bytes`,
     `pulsar:kv_touched_ceiling_bytes`, `pulsar:kv_ledger_*`
   - `pulsar:queue_blocked_reason`, `pulsar:worker_stalled_seconds`
+- **KV evidence (L378):** `pulsar:kv_requests_total`, `pulsar:kv_routes_total`,
+  `pulsar:kv_request_picks_total`, `pulsar:kv_evictions_by_total`,
+  `pulsar:kv_evictions_own_best_total`, `pulsar:kv_disk_io_bytes_total`,
+  `pulsar:kv_disk_io_files_total`, `pulsar:kv_disk_restores_total`,
+  `pulsar:refused_503_total` -- the counters of the hourly `kv ledger:` line.
 - **Scheduling:** `pulsar:decoder_preemptions_total`,
   `pulsar:decoder_readmissions_total`, `pulsar:resume_decisions_total`,
   `pulsar:prefix_waits_total`, `pulsar:prefix_wait_gain_tokens_total`,
