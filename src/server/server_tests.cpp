@@ -9678,6 +9678,88 @@ static void test_l372_judge_bank_floor_and_release(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* L372: raw ill-formed UTF-8 in a request's strings is refused at the parse, by the field, on every surface that
+ * takes client text into a prompt (it reached the tokenizer, which yields no tokens for it, and failed at prefill
+ * with a 500).  The protocol parsers are the ones the endpoints call; a refusal there is the endpoint's 400. */
+static void test_l372_ill_formed_utf8_is_refused_at_parse(void) {
+    char err[320];
+    const auto refused = [&](api_style api, const char *body, const char *field) {
+        request r;
+        test_request_init(&r, REQ_CHAT, 64);
+        r.api = api;
+        chat_conversation c;
+        memset(&c, 0, sizeof c);
+        err[0] = '\0';
+        const bool ok = api == API_RESPONSES   ? parse_chat_conversation_responses(body, &c, &r, err, sizeof err)
+                        : api == API_ANTHROPIC ? parse_chat_conversation_anthropic(body, &c, &r, err, sizeof err)
+                                               : parse_chat_conversation_openai(body, &c, &r, err, sizeof err);
+        chat_conversation_free(&c);
+        request_free(&r);
+        const std::string want = std::string(field) + " is not valid UTF-8 (byte ";
+        return !ok && !strncmp(err, want.c_str(), want.size());
+    };
+    /* chat completions: a user message, the system message, a tool result, a content part, a tool's description */
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":\"ok\"},"
+                                    "{\"role\":\"user\",\"content\":\"a\xff" "b\"}]}", "messages[1].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"system\",\"content\":\"cut \xc3\"}]}",
+                        "messages[0].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"tool\","
+                                    "\"tool_call_id\":\"c1\",\"content\":\"\x80\"}]}", "messages[1].content"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+                                    "\"text\":\"\xed\xa0\x80\"}]}]}", "messages[0].content[0].text"));
+    TEST_ASSERT(refused(API_OPENAI, "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\","
+                                    "\"description\":\"\xc0\xaf\"}}],\"messages\":[]}",
+                        "tools[0].function.description"));
+    /* Anthropic Messages: the system prompt, a message, a tool result */
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"system\":\"\xff\",\"messages\":[]}", "system"));
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"messages\":[{\"role\":\"user\",\"content\":\"\xf5\"}]}",
+                        "messages[0].content"));
+    TEST_ASSERT(refused(API_ANTHROPIC, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+                                       "\"tool_use_id\":\"t1\",\"content\":\"out \xfe\"}]}]}",
+                        "messages[0].content[0].content"));
+    /* Responses: the instructions, an input item, a function call's output */
+    TEST_ASSERT(refused(API_RESPONSES, "{\"instructions\":\"\xff\",\"input\":\"hi\"}", "instructions"));
+    TEST_ASSERT(refused(API_RESPONSES, "{\"input\":[{\"role\":\"user\",\"content\":\"\xe0\x80\x80\"}]}",
+                        "input[0].content"));
+    TEST_ASSERT(refused(API_RESPONSES, "{\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"c\","
+                                       "\"output\":\"\xf4\x90\x80\x80\"}]}", "input[0].output"));
+    /* completions: the raw prompt (no engine: the refusal comes before a family is asked for) */
+    {
+        request r;
+        err[0] = '\0';
+        TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\":\"raw \xff\"}", 64, &r, err, sizeof err));
+        TEST_ASSERT(!strncmp(err, "prompt is not valid UTF-8 (byte 15 ", 35));
+    }
+    /* /v1/systemone: its 400 on the wire */
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            server s;
+            memset(&s, 0, sizeof s);
+            s.judge = new server_judge();
+            const char body[] = "{\"state\":\"\xff\",\"questions\":[]}";
+            server_judge_http(&s, sv[0], body, sizeof body - 1);
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            TEST_ASSERT(strstr(out, " 400 ") != NULL && strstr(out, "/v1/systemone: state is not valid UTF-8") != NULL);
+            free(out);
+            server_judge_close(&s);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+    /* the rule itself: well-formed text of every length passes; a key is named as one; a body that stops being JSON
+     * before the byte is still refused, by the offset */
+    const char good[] = "{\"a\":\"caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80\",\"b\":[\"\\ud800\"]}";
+    TEST_ASSERT(request_body_utf8_ok(good, sizeof good - 1, err, sizeof err));
+    const char key[] = "{\"k\xff\":1}";
+    TEST_ASSERT(!request_body_utf8_ok(key, sizeof key - 1, err, sizeof err) && !strncmp(err, "a key is not valid", 18));
+    const char junk[] = "not json \xff";
+    TEST_ASSERT(!request_body_utf8_ok(junk, sizeof junk - 1, err, sizeof err));
+    TEST_ASSERT(!strcmp(err, "the request body is not valid UTF-8 (byte 9 of the request body)"));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15476,6 +15558,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
+    test_l372_ill_formed_utf8_is_refused_at_parse();
     test_l372_judge_bank_floor_and_release();
     test_l372_evict_snapshot_word();
     test_l372_abandoned_decode_is_not_a_turn();

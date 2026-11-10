@@ -495,6 +495,12 @@ void server_judge_http(server *s, int fd, const char *body, size_t len) {
         http_error(fd, 404, "/v1/systemone: this server has no judge (no adapter in the container, or --judge-banks 0)");
         return;
     }
+    char uerr[320];
+    if (!request_body_utf8_ok(body, len, uerr, sizeof uerr)) {   /* L372: as every surface */
+        const std::string msg = std::string("/v1/systemone: ") + uerr;
+        http_error(fd, 400, msg.c_str());
+        return;
+    }
     pyjson_value req;
     char perr[160];
     if (!pyjson_parse(body, len, &req, perr, sizeof perr) || req.kind != pyjson_value::OBJ) {

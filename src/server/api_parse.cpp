@@ -56,6 +56,92 @@ bool api_key_first_seen(const char *api, const char *key) {
     return first;
 }
 
+/* L372: a request body is UTF-8 (RFC 8259), and the server holds it to that at the parse.  The JSON reader copies a
+ * string's raw bytes through unchecked (it repairs only a lone \\u escape), so an ill-formed byte in a message reached
+ * the tokenizer: the BPE families refuse the text and yield no tokens, the parse still returned true, the context
+ * check passed a prompt of length 0, and the engine's sync refused it at prefill -- HTTP 500 for a client's mistake.
+ * One check for every surface and every string of it (messages, system, tool results, tool definitions, a raw
+ * prompt), by the engine's one well-formedness rule (utf8_seq_ok); every family alike, DeepSeek's byte-level
+ * tokenizer included (it would take the bytes: one answer for one body, whatever is loaded).  Once the body's bytes
+ * are well-formed, so is every string read from it: an escape decodes to a scalar value or U+FFFD. */
+
+/// Append the path of the value holding byte `bad` to `path`, walking the JSON value at `*p` with the server's own
+/// reader (stops where the body stops being JSON: the path so far stands).
+/// @param p     the value's first byte (leading whitespace allowed)
+/// @param bad   the byte looked for
+/// @param path  receives the path ("messages[2].content")
+static void body_path_of(const char *p, const char *bad, std::string *path) {
+    json_ws(&p);
+    if (*p == '{') {
+        p++;
+        for (;;) {
+            json_ws(&p);
+            if (*p != '"') return;
+            const char *kstart = p;
+            char *key = NULL;
+            if (!json_string(&p, &key)) return;
+            const std::string name = key;
+            free(key);
+            if (bad >= kstart && bad < p) {
+                path->append(path->empty() ? "a key" : " (a key of it)");
+                return;
+            }
+            json_ws(&p);
+            if (*p != ':') return;
+            p++;
+            json_ws(&p);
+            const char *end = p;
+            if (!json_skip_value(&end) || bad < end) {
+                if (!path->empty()) path->push_back('.');
+                path->append(name);
+                body_path_of(p, bad, path);
+                return;
+            }
+            p = end;
+            json_ws(&p);
+            if (*p != ',') return;
+            p++;
+        }
+    }
+    if (*p == '[') {
+        p++;
+        for (int i = 0;; i++) {
+            json_ws(&p);
+            const char *end = p;
+            if (!json_skip_value(&end) || bad < end) {
+                path->append("[" + std::to_string(i) + "]");
+                body_path_of(p, bad, path);
+                return;
+            }
+            p = end;
+            json_ws(&p);
+            if (*p != ',') return;
+            p++;
+        }
+    }
+}
+
+bool request_body_utf8_ok(const char *body, size_t len, char *err, size_t errlen) {
+    const unsigned char *u = (const unsigned char *)body;
+    size_t i = 0;
+    while (i < len) {
+        const int k = utf8_seq_ok(u + i, len - i);
+        if (k == 0) break;
+        i += (size_t)k;
+    }
+    if (i == len) return true;
+    std::string path;
+    body_path_of(body, body + i, &path);
+    /* the path is client text: only printable ASCII of it reaches the message */
+    for (char &c : path)
+        if ((unsigned char)c < 0x20 || (unsigned char)c >= 0x7f) c = '?';
+    if (path.size() > 200) path.resize(200);
+    if (err && errlen)
+        snprintf(err, errlen, "%s%snot valid UTF-8 (byte %zu of the request body)", path.c_str(),
+                 path.empty() ? "the request body is " : " is ", i);
+    return false;
+}
+
 /* The default arm of every top-level body parser: skip the value, and name the
  * key in the log the first time this process ignores it.  The key is client
  * text, so only printable ASCII reaches the log. */
@@ -336,6 +422,7 @@ static bool parse_openai_tool_choice(const char **p, chat_conversation *c, reque
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err,
                                     size_t errlen) {
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_messages = false;
     bool got_top_logprobs = false;
@@ -506,6 +593,7 @@ bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, r
                                        size_t errlen) {
     r->api = API_ANTHROPIC;
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_messages = false;
     int skr = 0;
@@ -1527,6 +1615,7 @@ bool parse_chat_conversation_responses(const char *body, chat_conversation *c, r
                                        size_t errlen) {
     r->api = API_RESPONSES;
     if (err && errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) return false;   /* L372 */
     const char *p = body;
     bool got_input = false;
     int skr = 0;
@@ -1783,6 +1872,10 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
     request_init(r, REQ_COMPLETION, def_tokens);
     r->family = e ? server_family_for_engine(e) : NULL;   /* L335: no engine, no family (never DeepSeek's) */
     if (errlen) err[0] = '\0';
+    if (!request_body_utf8_ok(body, strlen(body), err, errlen)) {   /* L372 */
+        request_free(r);
+        return false;
+    }
     const char *p = body;
     char *prompt = NULL;
     int skr = 0;

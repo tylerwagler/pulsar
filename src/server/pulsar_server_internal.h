@@ -4677,6 +4677,16 @@ bool render_chat_conversation(pulsar_engine *e, pulsar_chat_format fmt, server *
 /// @param errlen  size of `err`
 /// @return false when refused
 bool parse_chat_conversation_openai(const char *body, chat_conversation *c, request *r, char *err, size_t errlen);
+/** L372: is a request body well-formed UTF-8 (utf8_seq_ok, the engine's one rule)?  Every surface that takes client
+ *  text into a prompt asks first -- chat completions, completions, Responses, Anthropic Messages and its token count,
+ *  /v1/systemone -- and refuses (400) by the field: "messages[2].content is not valid UTF-8 (byte N of the request
+ *  body)".
+ *  @param body    the body
+ *  @param len     its bytes
+ *  @param err     receives the refusal, naming the JSON path of the value that holds the first ill-formed byte
+ *  @param errlen  size of `err`
+ *  @return false when a byte of it is not well-formed UTF-8 */
+bool request_body_utf8_ok(const char *body, size_t len, char *err, size_t errlen);
 bool parse_chat_conversation_anthropic(const char *body, chat_conversation *c, request *r, char *err,
                                        size_t errlen);
 bool parse_chat_conversation_responses(const char *body, chat_conversation *c, request *r, char *err,
