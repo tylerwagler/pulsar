@@ -4582,7 +4582,10 @@ bool server::batch_leave(session_slot *sl) {
     gen_state *g = sl->gen;
     pulsar_session *pool = s->sess;
     if (!s->bank_switch(sl->bank)) {
-        snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        /* the first error wins (generate_job_step's rule, L241): a slot already failing reports that cause */
+        if (!g->err[0])
+            snprintf(g->err, sizeof g->err, "bank %u state restore failed (evicted KV unrecoverable)",
+                     (unsigned)sl->bank);
         g->finish = "error";
         g->phase = GEN_FINISH;
         return false;
@@ -4606,7 +4609,7 @@ bool server::batch_leave(session_slot *sl) {
     g->batch_feed_valid = false;
     char err[160] = "";
     if (pulsar_session_eval(pool, tok, err, sizeof err) != 0) {
-        snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
+        if (!g->err[0]) snprintf(g->err, sizeof g->err, "leaving the batch: %s", err);
         g->finish = "error";
         g->phase = GEN_FINISH;
         return false;
