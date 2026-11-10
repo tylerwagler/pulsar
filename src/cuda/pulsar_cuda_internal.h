@@ -508,6 +508,16 @@ static inline pulsar_elt_fmt pulsar_tensor_fmt(const pulsar_gpu_tensor *t) {
 /// @return true the first time `site` is asked about, false after
 bool cuda_first_say(const char *site);
 
+/** Rule 9 for an operand or format refusal (L375): the call refuses every time, its line is printed once per site
+ *  -- the site is `site` and the message's FORMAT together, so each refusal of a function says itself once.  The
+ *  line names the function, the predicate that failed (the format's prose) and the numbers that failed it.  Not for
+ *  a query a correct caller makes on purpose ("does this arm apply"): that stays silent.  Defined in
+ *  pulsar_cuda_runtime.cu. */
+/// @param site the refusing function's name
+/// @param fmt  printf format: the predicate in words and its numbers
+/// @return 0, always: `return cuda_refuse(...)` is the refusal
+int cuda_refuse(const char *site, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
 /* L335: a grow-on-demand device buffer kept across calls (a static or thread_local cache) must not grow inside a
  * graph capture -- cudaFree / cudaMalloc are not capturable, and a free mid-capture invalidates it -- and a regrow
  * outside one must drop the captured graphs that baked the old pointer (pulsar_gpu_seg_note_device_free, L119).

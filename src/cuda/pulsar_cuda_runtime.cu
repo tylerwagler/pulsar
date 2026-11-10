@@ -6,6 +6,7 @@
 
 #include <list>
 #include <pthread.h>
+#include <stdarg.h>
 
 
 /// Host base of the model mapping set by pulsar_gpu_set_model_map (the one cuda_model_ptr translates).
@@ -164,6 +165,19 @@ bool cuda_first_say(const char *site) {
     if (first && n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) seen[n_seen++] = h;
     pthread_mutex_unlock(&mu);
     return first;
+}
+
+int cuda_refuse(const char *site, const char *fmt, ...) {
+    char label[256];
+    snprintf(label, sizeof(label), "%s: %s", site ? site : "?", fmt);
+    if (!cuda_first_say(label)) return 0;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "pulsar: %s: %s -- refusing (said once for this refusal)\n", site ? site : "?", msg);
+    return 0;
 }
 
 /* One reservation per slot; see pulsar_cuda_scratch.h for why there is more
