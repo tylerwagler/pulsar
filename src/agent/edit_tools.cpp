@@ -957,6 +957,28 @@ static void test_agent_turn_open_is_the_transcripts(void) {
     rmdir(dir);
 }
 
+/* L373: the compaction tail starts at a user turn marker or there is no tail -- never mid-turn, never at a tool
+ * result rendered as a user turn (Qwen-shaped markers: "<|im_start|> user" and the "\n <tool_response>" after it). */
+static void test_agent_compact_tail_starts_at_a_user_turn(void) {
+    pulsar_turn_markers m;
+    memset(&m, 0, sizeof(m));
+    m.user[0] = 10, m.user[1] = 11, m.n_user = 2;
+    m.assistant[0] = 10, m.assistant[1] = 12, m.n_assistant = 2;
+    m.tool[0] = 20, m.tool[1] = 21, m.n_tool = 2;
+    /*              0  1   2   3  4   5   6   7  8   9  10  11  12 13  14  15  16 17  18  19  20 */
+    const int v[] = {1, 10, 11, 5, 13, 10, 12, 6, 13, 10, 11, 20, 21, 7, 13, 10, 12, 8, 13, 10, 11, 9, 13};
+    const int n = (int)(sizeof v / sizeof v[0]);
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 0, n) == 1);     /* the first user turn */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 19);    /* not the assistant turn, not the tool result */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 9, n) == 19);    /* a window that opens ON the tool result */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 20, n) == n);    /* mid-turn only: no tail */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, 19) == 19);   /* no user turn before bottom: no tail */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, 20) == 20);   /* a marker cut by bottom does not count */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(NULL, v, 2, n) == n);   /* markers not spelled: no tail */
+    m.n_tool = 0;   /* Gemma: no tool-result turns; every user marker is the user's */
+    AGENT_TEST_ASSERT(agent_compact_tail_cut(&m, v, 2, n) == 9);
+}
+
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
 static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
 static void test_agent_bash_teardown(void);           /* bash_jobs.cpp */
@@ -966,6 +988,7 @@ static void pulsar_agent_unit_tests_run(void) {
     test_agent_tool_call_display_is_sanitized();
     test_agent_write_and_edit_are_atomic();
     test_agent_turn_open_is_the_transcripts();
+    test_agent_compact_tail_starts_at_a_user_turn();
     test_worker_progress_uses_session_total();
     test_agent_turn_marks_family_neutral();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();

@@ -1812,6 +1812,17 @@ char *agent_bash_jobs_compaction_observation(agent_worker *w);
  *  @return true on success (or an empty transcript) */
 bool agent_worker_compact(agent_worker *w, const char *reason,
                                  char *err, size_t err_len);
+/** L373: where a compacted transcript's verbatim tail may start: the first USER turn marker in v[target, bottom).
+ *  Only there -- a cut anywhere else starts the tail mid-turn (a tool result without its call, half a reply), and a
+ *  tool result rendered as a user turn (pulsar_turn_marker_at's role 3: Qwen's and Nemotron's "<tool_response>"
+ *  turns) is not a user turn.  Gemma's responses sit inside the model turn, so its user markers are the user's own.
+ *  Pure host code.
+ *  @param m      the family's turn markers; NULL = not spelled
+ *  @param v      the transcript's tokens
+ *  @param target the first index the tail may start at
+ *  @param bottom the tail's end (exclusive)
+ *  @return the tail's start, or `bottom` (no tail) when the window holds no user turn marker */
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom);
 /** agent_worker_compact when the transcript passes AGENT_COMPACT_SOFT_PERCENT or leaves too few tokens free.
  *  @param w       the worker
  *  @param reason  why, for the status line

@@ -49,13 +49,23 @@ static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
 
 
 
-/* Pick a recent verbatim tail for the compacted transcript.  Prefer a user
- * boundary inside the budget so the rebuilt context starts at a natural turn. */
+int agent_compact_tail_cut(const pulsar_turn_markers *m, const int *v, int target, int bottom) {
+    for (int i = target; m && i < bottom; i++) {
+        if (pulsar_turn_marker_at(m, v, bottom, i) == 1) return i;
+    }
+    return bottom;
+}
+
+
+
+/* Pick a recent verbatim tail for the compacted transcript: it starts at a user turn inside the budget, so the
+ * rebuilt context continues at a turn the summary can stand in front of. */
 /// @brief Where the verbatim tail of a compacted transcript starts (see above).
 /// @param w       the worker (its transcript and ctx_size)
 /// @param bottom  end of the region to keep, token index (exclusive)
 /// @param sys_len tokens of the system prompt, never cut into
-/// @return the first user-turn marker in [bottom - budget, bottom), else bottom - budget (clamped to sys_len)
+/// @return agent_compact_tail_cut over [bottom - budget, bottom) (clamped to sys_len): `bottom`, no tail, when no
+///         user turn starts there
 static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     int tail_budget = w->cfg->gen.ctx_size / AGENT_COMPACT_TAIL_DIVISOR;
     if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
@@ -66,12 +76,8 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     if (target < sys_len) target = sys_len;
 
     pulsar_turn_markers markers;
-    if (!pulsar_chat_turn_markers(w->engine, &markers)) return target;
-
-    for (int i = target; i < bottom; i++) {
-        if (pulsar_turn_marker_at(&markers, w->transcript.v, bottom, i) == 1) return i;
-    }
-    return target;
+    const bool spelled = pulsar_chat_turn_markers(w->engine, &markers);
+    return agent_compact_tail_cut(spelled ? &markers : NULL, w->transcript.v, target, bottom);
 }
 
 
