@@ -625,6 +625,16 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         snprintf(err, errlen, "spec round: base token %d is not a vocab id", first_token);
         return -1;
     }
+    /* L375 O39: the round's rows sit at positions [len, len + K], and the context holds positions below ctx.  A bank
+     * that stands at the context has no row for the base -- refused here, with nothing consumed, as the plain eval
+     * refuses it (pulsar_session_family_eval); the drafts are cut to the room below.  The block and MTP drafters
+     * already stop their chains at the pools' end and the server caps a request's tokens at the room, so on those
+     * lanes the cut never binds; DSpark drafts at its depth whatever the room. */
+    const int room = s->ctx() - s->checkpoint.len;
+    if (room <= 0) {
+        snprintf(err, errlen, "spec round: the context is full (%d of %d tokens)", s->checkpoint.len, s->ctx());
+        return -1;
+    }
     {
         /* the round is reused across rounds; its target snapshot handle
          * survives the reset, everything else is cleared */
@@ -669,6 +679,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     if (K && !pending_params_match) K = 0;
     if ((int)K > accepted_cap - 1) K = accepted_cap > 1 ? (uint32_t)(accepted_cap - 1) : 0;
     if ((int)K > max_tokens - 1) K = max_tokens > 1 ? (uint32_t)(max_tokens - 1) : 0;
+    if ((int)K > room - 1) K = (uint32_t)(room - 1);   /* L375 O39: no verify row at or past the context */
     for (uint32_t i = 0; i < K; i++) pend[i] = s->spec.pend[i];
     /* Conf carried unconditionally (L107 controller). */
     for (uint32_t i = 0; i < K; i++) pend_conf[i] = s->spec.pend_conf[i];
