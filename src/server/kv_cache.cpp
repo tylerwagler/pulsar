@@ -1176,8 +1176,9 @@ static int server_restore_slice_segments(const double *pred_ms, int next, int n,
  *   commits and the persists of other banks between its slices never evict it (nor its restore point).
  * - A failure drops only on a CONTENT fault, and only what the fault invalidates (pulsar_kvchain.h); a TRANSIENT one
  *   (no RAM room, the bank, the device, a TP rank's copy) drops nothing.
- * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and any
- *   later failure leaves it holding nothing (pulsar_session_load_segment).  So when the bank holds a history the
+ * - The bank's own history cannot be kept once a load writes into it: the root segment clears the bank, and a slice
+ *   that fails after it leaves the bank invalidated whatever the fault's class (pulsar_kvchain_load_slice: a
+ *   segment's own content checks run before its first device write, but the segments before it are in).  So when the bank holds a history the
  *   request would otherwise resume from (`verify`: the pick's own depth > 0), the restore first CHECKS the whole chain
  *   -- every part read (RAM or disk, digest-checked by the store) and its bytes checked against the bank's layout
  *   (pulsar_kvchain_verify_slice), a slice per worker turn like the load -- and writes nothing until every part
