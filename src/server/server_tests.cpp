@@ -9373,6 +9373,37 @@ static void test_l372_predecode_failure_ends_the_job(void) {
     }
 }
 
+/* L372 (O17): a preempted decoder whose bank cannot be re-backed fails by name, and its bank -- no physical, the
+ * parked history still its carry -- is left marked spilled, so the next install re-backs it empty (bank_unspill)
+ * instead of installing a bank with no pools.  No session here: the re-back refuses, as an allocation failure does. */
+static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.pool_banks = 2;
+    s.n_slots = 2;
+    s.live_bank = -1;   /* nothing installed: the switch below saves no outgoing bank */
+    int dummy = 0;
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    g.finish = "length";
+    g.phase = GEN_DECODE;
+    session_slot *v = &s.slots[1];
+    v->provisioned = true;
+    v->bank = 1;
+    v->active_job = (job *)&dummy;
+    v->gen = &g;
+    v->preempted = true;
+    v->preempt_path = server_xstrdup("/nonexistent/pulsar-l372-preempt-bank-1.kvp");
+    TEST_ASSERT(s.worker_readmit_preempted());
+    TEST_ASSERT(!v->preempted && v->preempt_path == NULL && v->spilled);
+    TEST_ASSERT(g.phase == GEN_FINISH && !strcmp(g.finish, "error") && strstr(g.err, "could not be reloaded") != NULL);
+    /* the install is the spilled bank's now: it re-backs (here: refuses) instead of handing out the carry */
+    TEST_ASSERT(!s.bank_switch(1) && v->spilled && s.m_restore_failures == 1);
+    TEST_ASSERT(!s.worker_readmit_preempted());   /* nothing parked any more */
+    pthread_mutex_destroy(&s.mu);
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15145,6 +15176,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l353_small_fixes();
     test_l353_routing_fixes();
     test_l372_predecode_failure_ends_the_job();
+    test_l372_failed_readmission_marks_the_bank_spilled();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

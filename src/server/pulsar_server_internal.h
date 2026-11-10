@@ -2067,7 +2067,9 @@ typedef struct session_slot {
      * bound here; L330: the next job bound to it re-backs it empty
      * (server::bank_unspill) and restores the chain a slice per worker turn
      * before it resolves. Distinct from SLOT_EVICTED (which frees the bank for a
-     * DIFFERENT conversation). */
+     * DIFFERENT conversation).  L372: also set for a preempted bank whose readmission
+     * could not re-back it (server::worker_readmit_preempted) -- no chain was written
+     * for it, the flag is what gets it re-backed empty. */
     bool         spilled;
     /** L311: the slot's last turn finished with decode rows past its prefill: when the worker is idle, its bank's
      *  history is prefilled again to its consumed end (server::terminal_checkpoint_step), so the next turn resumes
@@ -3331,7 +3333,8 @@ struct server {
     bool preempt_newest_decoder(const session_slot *keep, KvBytes need);
     /** L314: reload the first-preempted decoder (FIFO: only the first is considered) once its KV fits the budget
      *  again by the admission arithmetic on kv_reserved_bytes (L326: a prompt admitted but not yet prefilled holds
-     *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name.
+     *  its room, so the decoder stays parked until a job ends); a reload that fails fails that request by name, and
+     *  a bank it could not re-back is left marked spilled (L372).
      *  @return true when one was readmitted (or failed). */
     bool worker_readmit_preempted();
     /** LRU-idle smallest-frontier victim: NOT in the live decode set, no active job, not

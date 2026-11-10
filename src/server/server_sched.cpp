@@ -2785,6 +2785,8 @@ bool server::worker_readmit_preempted() {
                 s->live_bank = (int)v->bank;
                 pulsar_session_invalidate(pool);
                 pulsar_session_bank_state_save(pool, v->bank);
+            } else {
+                v->spilled = true;   /* L372: not re-backed -- its next install does it (see the reload below) */
             }
             return true;
         }
@@ -2830,7 +2832,18 @@ bool server::worker_readmit_preempted() {
         g->finish = "error";
         g->phase = GEN_FINISH;
         server_log(PULSAR_LOG_WARNING, "pulsar-server: bank %u: %s", v->bank, g->err);
-        if (installed) pulsar_session_invalidate(pool);   /* only the bank's own state, never another's */
+        if (installed) {
+            pulsar_session_invalidate(pool);   /* only the bank's own state, never another's */
+        } else {
+            /* L372: a bank that could not be re-backed or installed is where the preemption left it -- no physical,
+             * its carry the parked decode's history -- and no longer `preempted`.  The declared families' restore
+             * installs such a bank (decl_bank_restore reads the carry, not the pools), routing scores it by that
+             * history, and every request it then takes fails in its first forward ("a pool is evicted"): nothing
+             * re-backs a bank that is not marked.  Marked spilled, its next install re-backs it empty or refuses by
+             * name (bank_unspill; its alloc_physical is idempotent, so a bank re-backed here whose restore failed is
+             * covered too). */
+            v->spilled = true;
+        }
     }
     unlink(v->preempt_path);
     free(v->preempt_path);
