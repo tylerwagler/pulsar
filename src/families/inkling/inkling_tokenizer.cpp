@@ -102,15 +102,16 @@ bool encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span 
 
 /* ---- the chat front, turn by turn (pulsar.h pulsar_chat_open): inkling_chat's pieces, tokenized with their client
  * spans.  A template refusal (a think mode the template has no level for, a role it
- * cannot place) ends the process by name; an encode
- * refusal returns false. */
+ * cannot place) is said by name; an encode
+ * refusal is the tokenizer's.  Either appends nothing and returns false. */
 
-/** End the process for a template refusal of the chat front.
+/** Say a template refusal of the chat front (L375: it ended the process).
  *  @param op   the public entry that refused
- *  @param err  the renderer's or the think-mode check's reason */
-[[noreturn]] void chat_refuse(const char *op, const char *err) {
-    fprintf(stderr, "pulsar: %s: %s: %s -- exiting\n", ARCH, op, err);
-    exit(1);
+ *  @param err  the renderer's or the think-mode check's reason
+ *  @return false, always: `return chat_refuse(...)` is the refusal */
+bool chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s: %s -- refusing\n", ARCH, op, err);
+    return false;
 }
 
 /** Tokenize one rendered piece with its client spans and append it.
@@ -131,12 +132,12 @@ bool chat_append(const pulsar_engine *e, const inkling_render_out &r, pulsar_tok
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
  *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
- *  @param think_mode  picks the effort line (the default effort, or none); an unsupported mode ends the process
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @param think_mode  picks the effort line (the default effort, or none); an unsupported mode is refused
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
     char err[256];
-    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
+    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) return chat_refuse("pulsar_chat_open", err);
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     inkling_msg_in sys = {};
     sys.role = "system";
@@ -148,7 +149,7 @@ bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
     in.add_generation_prompt = false;
     in.tools_json = tools_json;
     inkling_render_out r;
-    if (!inkling_chat_render(in, &r, err, sizeof err)) chat_refuse("pulsar_chat_open", err);
+    if (!inkling_chat_render(in, &r, err, sizeof err)) return chat_refuse("pulsar_chat_open", err);
     return chat_append(e, r, tokens);
 }
 
@@ -160,13 +161,13 @@ bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
  *  @param msgs               the turn's messages (a NULL role reads as "user")
  *  @param n                  the number of messages
  *  @param generation_prompt  append the assistant's opening after the messages
- *  @param think_mode         checked against the engine (an unsupported mode ends the process)
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @param think_mode         checked against the engine (an unsupported mode is refused)
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
                pulsar_think_mode think_mode) {
     char err[256];
     if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err))
-        chat_refuse("pulsar_chat_append_turn", err);
+        return chat_refuse("pulsar_chat_append_turn", err);
     std::vector<inkling_msg_in> m((size_t)(n > 0 ? n : 0));
     for (int i = 0; i < n; i++) {
         m[(size_t)i] = {};
@@ -175,7 +176,7 @@ bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
     }
     inkling_render_out r;
     if (!inkling_chat_render_turn(m.data(), n, 0, false, generation_prompt, &r, err, sizeof err))
-        chat_refuse("pulsar_chat_append_turn", err);
+        return chat_refuse("pulsar_chat_append_turn", err);
     return chat_append(e, r, tokens);
 }
 
@@ -183,12 +184,12 @@ bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
 /** pulsar_family_tokenizer::chat_end_assistant.
  *  @param e       the engine
  *  @param tokens  the close's ids are appended here
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     inkling_render_out r;
     char err[256];
     if (!inkling_chat_render_turn(NULL, 0, 0, true, false, &r, err, sizeof err))
-        chat_refuse("pulsar_chat_end_assistant", err);
+        return chat_refuse("pulsar_chat_end_assistant", err);
     return chat_append(e, r, tokens);
 }
 

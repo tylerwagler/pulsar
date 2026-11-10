@@ -165,7 +165,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    agent_worker_close_open_turn(w, &w->transcript);   /* L365: a turn left open by an earlier failure */
+    if (!agent_worker_close_open_turn(w, &w->transcript)) {   /* L365: a turn left open by an earlier failure */
+        agent_set_error(w, AGENT_CHAT_REFUSED_TEXT);
+        return 1;
+    }
     agent_turn_add(w, "user", user_text, false);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
@@ -194,7 +197,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (!worker_fit_tool_turn(w, compact_err, sizeof(compact_err)))
             return worker_compaction_stopped(w, compact_err);
         if (!agent_turn_flush(w, think_mode)) {   /* L373: never sample after a turn that is not there */
-            agent_set_error(w, "the tokenizer refused the turn (its reason is on stderr); nothing was appended");
+            agent_set_error(w, AGENT_CHAT_REFUSED_TEXT);
             return 1;
         }
 
@@ -236,8 +239,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
-            agent_chat_end_assistant(w->engine, &w->transcript);
+            const bool closed = agent_chat_end_assistant(w->engine, &w->transcript);
             worker_clear_interrupt(w);
+            if (!closed) {
+                agent_set_error(w, AGENT_CHAT_REFUSED_TEXT);
+                return 1;
+            }
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
@@ -362,10 +369,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
         if (interrupted) {
-            agent_chat_end_assistant(w->engine, &w->transcript);
+            const bool closed = agent_chat_end_assistant(w->engine, &w->transcript);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
+            if (!closed) {
+                agent_set_error(w, AGENT_CHAT_REFUSED_TEXT);
+                return 1;
+            }
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
@@ -399,8 +410,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses
          * (agent_worker_turn_open reads that off the transcript) */
-        if (!(family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine)))
-            agent_chat_end_assistant(w->engine, &w->transcript);
+        if (!(family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine)) &&
+            !agent_chat_end_assistant(w->engine, &w->transcript)) {
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, AGENT_CHAT_REFUSED_TEXT);
+            return 1;
+        }
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);

@@ -246,16 +246,16 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
     free(system);
     free(tools_prompt);
     if (!opened) {
-        fprintf(stderr, "pulsar-agent: the chat front refused the transcript's head (the tool prompt and the -sys "
-                        "text) -- exiting\n");
+        fprintf(stderr, "pulsar-agent: the chat front refused the transcript's head (the tool prompt, the -sys text "
+                        "and the think mode; its reason is above) -- exiting\n");
         exit(1);
     }
 }
 
-void agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
-    if (pulsar_chat_end_assistant(e, tokens)) return;
-    fprintf(stderr, "pulsar-agent: the chat front refused the template's assistant close -- exiting\n");
-    exit(1);
+bool agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    if (pulsar_chat_end_assistant(e, tokens)) return true;
+    fprintf(stderr, "pulsar-agent: the chat front refused the template's assistant close\n");
+    return false;
 }
 
 
@@ -293,17 +293,17 @@ bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens) 
     pulsar_turn_markers m;
     if (!pulsar_chat_turn_markers(w->engine, &m)) return false;   /* refused at startup (agent_family_tools_supported) */
     pulsar_tokens end = {0};
-    agent_chat_end_assistant(w->engine, &end);
-    const bool open = agent_tokens_turn_open(&m, end.v, end.len, tokens->v, tokens->len);
+    const bool open = agent_chat_end_assistant(w->engine, &end) &&
+                      agent_tokens_turn_open(&m, end.v, end.len, tokens->v, tokens->len);
     pulsar_tokens_free(&end);
     return open;
 }
 
-void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
-    if (!agent_worker_turn_open(w, tokens)) return;
+bool agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
+    if (!agent_worker_turn_open(w, tokens)) return true;
     /* where calls continue the turn (Gemma), a turn being built that opens with tool messages answers it */
-    if (pulsar_chat_calls_continue_turn(w->engine) && w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;
-    agent_chat_end_assistant(w->engine, tokens);
+    if (pulsar_chat_calls_continue_turn(w->engine) && w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return true;
+    return agent_chat_end_assistant(w->engine, tokens);
 }
 
 
@@ -381,8 +381,8 @@ void agent_turn_clear(agent_worker *w) {
 
 
 bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
-    agent_worker_close_open_turn(w, &w->transcript);
-    const bool taken = agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
+    const bool taken = agent_worker_close_open_turn(w, &w->transcript) &&
+                       agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
     agent_turn_clear(w);
     return taken;
 }

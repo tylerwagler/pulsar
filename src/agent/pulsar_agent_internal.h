@@ -1372,16 +1372,20 @@ void agent_kv_persist(agent_worker *w, const char *what);
 void agent_kv_system_tip(agent_worker *w, char tip[41]);
 /** Render the transcript's head through the family's chat front (pulsar_chat_open): the built-in tool prompt as
  *  trusted text, then the configured -sys text.  Both are UTF-8 (the tool prompt is the agent's own text; main
- *  refuses a -sys text that is not), so a tokenizer that refuses the head is a defect: said, and the process ends.
+ *  refuses a -sys text that is not) and the think mode is the configuration's, so a chat front that refuses the head
+ *  is a defect of the setup, not of a turn: said, and the process ends.
  *  @param w   the worker
  *  @param out receives the head's tokens (appended) */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
-/** L375 (O4): the agent's door to pulsar_chat_end_assistant.  The close is the template's own fixed text, so a
- *  refusal (no chat front: refused at startup; a tokenizer that cannot encode its own marker) is a defect: said, and
- *  the process ends -- never a transcript whose turn was silently left open.
+/** L375 (O4): the agent's door to pulsar_chat_end_assistant.  A refusal (the engine says why) is returned and said
+ *  here too; the caller fails its turn (agent_set_error) -- never a transcript whose turn was silently left open,
+ *  and never the process's end.
  *  @param e      the engine
- *  @param tokens the transcript; the close is appended */
-void agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+ *  @param tokens the transcript; the close is appended
+ *  @return false when the chat front refused the close: nothing appended */
+bool agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
+/** What agent_set_error says when the chat front refused a turn or its close (the reason is the engine's line). */
+#define AGENT_CHAT_REFUSED_TEXT "the chat front refused the turn (its reason is on stderr); nothing was appended"
 /** Add a message to the turn being built (agent_worker::turn); `content` is copied. */
 /** Append a message to the turn being built, taking it as it is.
  *  @param w   the worker
@@ -1411,14 +1415,16 @@ bool agent_tokens_turn_open(const pulsar_turn_markers *m, const int *end, int n_
  *  or one an error left unclosed, reads the same live, after /new, a session switch or a reload.
  *  @param w      the worker (its engine)
  *  @param tokens the transcript, or a copy of it
- *  @return true when its last turn is an assistant turn left open */
+ *  @return true when its last turn is an assistant turn left open (false also when the family's close cannot be
+ *          rendered: nothing can then be closed) */
 bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens);
 /** L365: when the transcript ends in an open assistant turn (agent_worker_turn_open) and the turn being built does
  *  not answer it (tool messages first, on a family whose calls continue the turn), close it
  *  (pulsar_chat_end_assistant) -- so a user turn, a compaction request or a rebuilt transcript never lands inside it.
  *  @param w      the worker
- *  @param tokens the transcript (or a copy of it) to close */
-void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
+ *  @param tokens the transcript (or a copy of it) to close
+ *  @return false when the chat front refused the close (agent_chat_end_assistant): the caller fails its turn */
+bool agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
 /** L373: text as well-formed UTF-8 (pulsar_utf8.h's rule): each byte that is not part of a well-formed sequence
  *  becomes U+FFFD.
  *  @param s the text (NUL-terminated)

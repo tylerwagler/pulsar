@@ -148,12 +148,13 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     char *prompt_text = agent_compact_make_prompt(reason);
     pulsar_tokens prompt = {0};
     pulsar_tokens_copy(&prompt, &w->transcript);
-    agent_worker_close_open_turn(w, &prompt);   /* L365: the private request never lands inside an open turn */
     const pulsar_chat_message request = {"user", prompt_text, false};
-    const bool request_taken = agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
+    /* L365: the private request never lands inside an open turn */
+    const bool request_taken = agent_worker_close_open_turn(w, &prompt) &&
+                               agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
     if (!request_taken) {
-        snprintf(err, err_len, "the tokenizer refused the compaction request (its reason is on stderr)");
+        snprintf(err, err_len, "the chat front refused the compaction request (its reason is on stderr)");
         pulsar_tokens_free(&prompt);
         pulsar_tokens_free(&sys);
         agent_publish(w, "\x1b[0m\n", 5);

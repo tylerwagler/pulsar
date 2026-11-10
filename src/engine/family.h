@@ -255,8 +255,9 @@ typedef struct {
  * branched on the Qwen tokenizer's pointer at every site. */
 typedef struct pulsar_family_tokenizer {
     /* The five encoding entries return false when the tokenizer refuses the text (not UTF-8, or client spans out
-     * of order): said on stderr, NOTHING appended.  The public wrappers (tokenizer.cpp) return it; no caller reads a
-     * refused encode as an empty prompt (L375, O4). */
+     * of order) and, the chat three, when the template cannot express the request (a think mode it has no level
+     * for, a role it cannot place): said on stderr, NOTHING appended, the process goes on.  The public wrappers
+     * (tokenizer.cpp) return it; no caller reads a refusal as an empty prompt (L375, O4). */
     /** Raw text, all of it client data (no added token matches). */
     bool (*encode_text)(pulsar_engine *e, const char *text, pulsar_tokens *out);
     /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none).  `err`

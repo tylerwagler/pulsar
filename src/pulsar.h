@@ -839,9 +839,11 @@ typedef struct {
  * these on every family, each piece rendered WHOLE by the family's own renderer (DeepSeek's marker template;
  * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
  * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
- * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.  Each returns
- * false, `tokens` untouched, when the family has no chat front (said once per entry) or its tokenizer refused the
- * rendered piece (text that is not UTF-8; said): a caller never reads a refused piece as an empty one.
+ * (pulsar_engine_think_mode_supported); any other is refused, never rendered at a neighbouring effort.  Each
+ * returns false, `tokens` untouched, when the family has no chat front (said once per entry), when its template
+ * cannot express the request (a think mode it has no level for, a role it cannot place, tools it cannot read;
+ * said), or when its tokenizer refused the rendered piece (text that is not UTF-8; said): a caller never reads a
+ * refused piece as an empty one, and no entry ends the process.
  *
  * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
  * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
@@ -851,21 +853,21 @@ typedef struct {
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front, or the tokenizer refused the text) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
 /** pulsar_chat_open with TOOLS (L365): the head also declares `tools_json`, an OpenAI tools array as JSON text
  * (NULL or [] = none), the way the family's template declares a request's tools -- the model then calls them in its
  * own syntax, which the family's output parser reads (the server's path).  DeepSeek has no tools head: its tools
  * are front-end DSML prompt text in `trusted`, so a non-NULL `tools_json` is refused there (false, `tokens`
- * untouched).  A tools array the renderer cannot read ends the process, as any refused render does. */
+ * untouched).  A tools array the renderer cannot read is refused (false), as any refused render is. */
 /** @param e the engine
  *  @param tokens the transcript (start empty); the head is appended
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
  *  @param tools_json the tools array, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front, tools on DeepSeek, or the tokenizer refused the text) */
+ *  @return false when refused (no chat front, tools on DeepSeek, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                             const char *tools_json, pulsar_think_mode think_mode);
 /** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
@@ -876,14 +878,14 @@ bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char 
  *  @param n their count
  *  @param generation_prompt also open the assistant turn
  *  @param think_mode the mode the assistant turn opens for
- *  @return false when refused (no chat front, or the tokenizer refused the text) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode);
 /** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
  * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
 /** @param e the engine
  *  @param tokens the transcript, appended to
- *  @return false when refused (no chat front, or the tokenizer refused the text) */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece) */
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
 /** L365: whether the loaded family answers tool calls INSIDE the model turn that made them (Gemma 4: the response
  * follows the call, then the same turn continues).  There a sampled turn that made calls is NOT closed with
@@ -906,7 +908,7 @@ bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, 
  *  @param prompt the user message
  *  @param think_mode the think mode
  *  @param out the prompt's tokens are appended here
- *  @return false when refused (no chat front, or the tokenizer refused the text): nothing appended */
+ *  @return false when refused (no chat front, or the template or the tokenizer refused the piece): nothing appended */
 bool pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,

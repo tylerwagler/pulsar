@@ -64,30 +64,32 @@ static bool qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const p
 }
 
 /* ---- the chat front, turn by turn (pulsar.h pulsar_chat_open, L284 P14): qwen_chat's head and turn, the
- * pieces the full render is made of, tokenized with their client spans.  A template refusal (an effort the
- * template has no level for, a role it cannot place: a caller defect) ends the process by name; an encode
- * refusal returns false. */
+ * pieces the full render is made of, tokenized with their client spans.  A refusal -- the template's (an effort
+ * it has no level for, a role it cannot place) or the tokenizer's -- is said by name, appends nothing and returns
+ * false (L375: a template refusal ended the process). */
 
-/// Print the refusal and exit(1).
+/// Say a template refusal of the chat front.
 /// @param op the entry
 /// @param err the reason
-static void qwen_chat_refuse(const char *op, const char *err) {
-    fprintf(stderr, "pulsar: %s: %s -- exiting\n", op, err);
-    exit(1);
+/// @return false, always: `return qwen_chat_refuse(...)` is the refusal
+static bool qwen_chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s -- refusing\n", op, err);
+    return false;
 }
 
 /* the template's effort for a think mode: on (its default effort) or off -- no other level */
 /// @param e the engine
 /// @param think_mode the request's mode
 /// @param op the entry, for the refusal
-/// @return the effort (exits on an unsupported mode)
-static qwen_effort qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
+/// @param[out] qe the effort
+/// @return false (said) on a mode the template has no level for
+static bool qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode think_mode, const char *op, qwen_effort *qe) {
     char err[256];
-    qwen_effort qe = QWEN_EFFORT_NONE;
+    *qe = QWEN_EFFORT_NONE;
     if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err) ||
-        !qwen_effort_resolve(NULL, pulsar_think_mode_enabled(think_mode) ? 1 : 0, &qe, err, sizeof err))
-        qwen_chat_refuse(op, err);
-    return qe;
+        !qwen_effort_resolve(NULL, pulsar_think_mode_enabled(think_mode) ? 1 : 0, qe, err, sizeof err))
+        return qwen_chat_refuse(op, err);
+    return true;
 }
 
 /// Tokenize a render with its client spans.
@@ -107,15 +109,16 @@ static bool qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, p
 /// @param system system text, or NULL
 /// @param tools_json the tools array as JSON text, or NULL (pulsar_chat_open_tools)
 /// @param think_mode the mode
-/// @return false when the tokenizer refused the rendered head (said; nothing appended)
+/// @return false when the template or the tokenizer refused the head (said; nothing appended)
 static bool qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                            const char *tools_json, pulsar_think_mode think_mode) {
-    const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_open");
+    qwen_effort qe;
+    if (!qwen_chat_effort(e, think_mode, "pulsar_chat_open", &qe)) return false;
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     qwen_render_out r;
     char err[256];
     if (!qwen_chat_render_head(content.c_str(), tools_json, qe, &r, err, sizeof err))
-        qwen_chat_refuse("pulsar_chat_open", err);
+        return qwen_chat_refuse("pulsar_chat_open", err);
     return qwen_chat_append(e, r, tokens);
 }
 
@@ -127,10 +130,11 @@ static bool qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *
 /// @param n their count
 /// @param generation_prompt append the assistant prompt
 /// @param think_mode the mode
-/// @return false when the tokenizer refused the rendered turn (said; nothing appended)
+/// @return false when the template or the tokenizer refused the turn (said; nothing appended)
 static bool qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                            bool generation_prompt, pulsar_think_mode think_mode) {
-    const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_append_turn");
+    qwen_effort qe;
+    if (!qwen_chat_effort(e, think_mode, "pulsar_chat_append_turn", &qe)) return false;
     std::vector<std::string> notes((size_t)(n > 0 ? n : 0));
     std::vector<qwen_msg_in> qm;
     for (int i = 0; i < n; i++) {
@@ -145,7 +149,7 @@ static bool qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar
     qwen_render_out r;
     char err[256];
     if (!qwen_chat_render_turn(qm.data(), (int)qm.size(), qe, generation_prompt, &r, err, sizeof err))
-        qwen_chat_refuse("pulsar_chat_append_turn", err);
+        return qwen_chat_refuse("pulsar_chat_append_turn", err);
     return qwen_chat_append(e, r, tokens);
 }
 

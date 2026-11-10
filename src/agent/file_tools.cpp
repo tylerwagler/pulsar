@@ -294,7 +294,7 @@ bool agent_turn_fits_context(agent_worker *w, int reserve_tokens, int *tokens_ou
     pulsar_tokens tmp = {0};
     pulsar_tokens_copy(&tmp, &w->transcript);
     /* a refused render leaves the transcript's own length, which fits: agent_turn_flush then fails the turn */
-    agent_turn_render(w, &tmp, NULL, 0, w->cfg->gen.think_mode);
+    (void)agent_turn_render(w, &tmp, NULL, 0, w->cfg->gen.think_mode);
     int tokens = tmp.len;
     pulsar_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;

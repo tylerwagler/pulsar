@@ -99,15 +99,16 @@ bool encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span 
 }
 
 /* ---- the chat front, turn by turn: gemma4_chat's pieces, tokenized with their client spans.  A template refusal
- * (a caller defect: a think mode or a role the template cannot express) ends the process by name; an encode refusal
- * returns false. */
+ * (a caller defect: a think mode or a role the template cannot express) is said by name; an encode refusal
+ * is the tokenizer's.  Either appends nothing and returns false. */
 
-/** End the process for a template refusal of the chat front.
+/** Say a template refusal of the chat front (L375: it ended the process).
  *  @param op   the public entry that refused
- *  @param err  the renderer's or the think-mode check's reason */
-[[noreturn]] void chat_refuse(const char *op, const char *err) {
-    fprintf(stderr, "pulsar: %s: %s: %s -- exiting\n", ARCH, op, err);
-    exit(1);
+ *  @param err  the renderer's or the think-mode check's reason
+ *  @return false, always: `return chat_refuse(...)` is the refusal */
+bool chat_refuse(const char *op, const char *err) {
+    fprintf(stderr, "pulsar: %s: %s: %s -- refusing\n", ARCH, op, err);
+    return false;
 }
 
 /** Tokenize one rendered piece with its client spans and append it.
@@ -121,13 +122,14 @@ bool chat_append(const pulsar_engine *e, const gemma4_render_out &r, pulsar_toke
 
 /* thinking on or off (the template has no effort level) */
 /** @param e           the engine
- *  @param think_mode  the caller's mode; one the engine does not support ends the process
+ *  @param think_mode  the caller's mode
  *  @param op          the public entry, for the refusal
- *  @return thinking on */
-bool chat_thinking(pulsar_engine *e, pulsar_think_mode think_mode, const char *op) {
+ *  @param thinking    receives thinking on / off
+ *  @return false (said) for a mode the engine does not support */
+bool chat_thinking(pulsar_engine *e, pulsar_think_mode think_mode, const char *op, bool *thinking) {
     char err[256];
-    if (!pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err)) chat_refuse(op, err);
-    return pulsar_think_mode_enabled(think_mode);
+    *thinking = pulsar_think_mode_enabled(think_mode);
+    return pulsar_engine_think_mode_supported(e, think_mode, err, sizeof err) || chat_refuse(op, err);
 }
 
 /* The head: <bos> and the system turn, its content the trusted text (another family's tool prompt: text here) and
@@ -138,16 +140,17 @@ bool chat_thinking(pulsar_engine *e, pulsar_think_mode think_mode, const char *o
  *  @param trusted     the trusted system prefix (NULL = none)
  *  @param system      the client's system text (NULL = none)
  *  @param tools_json  the tools array as JSON text (NULL = none; pulsar_chat_open_tools)
- *  @param think_mode  thinking on or off (an unsupported mode ends the process)
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @param think_mode  thinking on or off (an unsupported mode is refused)
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system, const char *tools_json,
                pulsar_think_mode think_mode) {
-    const bool thinking = chat_thinking(e, think_mode, "pulsar_chat_open");
+    bool thinking;
+    if (!chat_thinking(e, think_mode, "pulsar_chat_open", &thinking)) return false;
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
     gemma4_render_out r;
     char err[256];
     if (!gemma4_chat_render_head(content.empty() ? NULL : content.c_str(), tools_json, thinking, &r, err, sizeof err))
-        chat_refuse("pulsar_chat_open", err);
+        return chat_refuse("pulsar_chat_open", err);
     return chat_append(e, r, tokens);
 }
 
@@ -160,11 +163,12 @@ bool chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, con
  *  @param msgs               the turn's messages (a NULL role reads as "user")
  *  @param n                  the number of messages
  *  @param generation_prompt  append the model's opening after the messages
- *  @param think_mode         the generation prompt's thinking (an unsupported mode ends the process)
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @param think_mode         the generation prompt's thinking (an unsupported mode is refused)
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n, bool generation_prompt,
                pulsar_think_mode think_mode) {
-    const bool thinking = chat_thinking(e, think_mode, "pulsar_chat_append_turn");
+    bool thinking;
+    if (!chat_thinking(e, think_mode, "pulsar_chat_append_turn", &thinking)) return false;
     std::vector<gemma4_msg_in> m((size_t)(n > 0 ? n : 0));
     for (int i = 0; i < n; i++) {
         m[(size_t)i] = {};
@@ -177,7 +181,7 @@ bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
     const bool answers = n > 0 && !strcmp(m[0].role, "tool");
     if (answers ? !gemma4_chat_render_tool_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err)
                 : !gemma4_chat_render_turn(m.data(), n, thinking, generation_prompt, &r, err, sizeof err))
-        chat_refuse("pulsar_chat_append_turn", err);
+        return chat_refuse("pulsar_chat_append_turn", err);
     return chat_append(e, r, tokens);
 }
 
@@ -185,7 +189,7 @@ bool chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_messag
 /** pulsar_family_tokenizer::chat_end_assistant.
  *  @param e       the engine
  *  @param tokens  the close's ids are appended here
- *  @return false when the tokenizer refused the rendered piece (said; nothing appended) */
+ *  @return false when the template or the tokenizer refused the piece (said; nothing appended) */
 bool chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     const char *close = gemma4_chat_assistant_close();
     return encode_into(e, close, strlen(close), NULL, 0u, tokens);

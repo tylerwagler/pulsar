@@ -2532,6 +2532,100 @@ static void test_l375_refused_render_fails_the_request(void) {
     free(e);
 }
 
+/* L375 (O4, third pass): a TEMPLATE refusal of the chat front -- a think mode the family has no level for, a role
+ * the template cannot place -- is the public entry's false with nothing appended, on every family: it ended the
+ * process (chat_refuse's exit, pulsar_die), so one bad turn took an agent or a REPL down with it.  The four BPE
+ * families over the test checkpoint's tokenizer (the refusal comes before any encode); DeepSeek over its own
+ * container's vocabulary (PULSAR_TEST_DS4_TOKENIZER). */
+static pulsar_chat_format test_ds4_chat_v4(const pulsar_engine *) { return PULSAR_CHAT_DS4_V4; }
+static void test_l375_template_refusal_is_a_result(void) {
+    bpe_tokenizer *tok = (bpe_tokenizer *)qwen_test_tokenizer();
+    if (!tok) return;   /* failed by name inside */
+    struct fam_case {
+        const char *name;
+        const pulsar_family_tokenizer *table;
+        pulsar_chat_format fmt;
+    };
+    static const fam_case cases[] = {
+        {"qwen", &k_qwen_tokenizer, PULSAR_CHAT_QWEN},
+        {"gemma4", &PULSAR_GEMMA4_TOKENIZER, PULSAR_CHAT_GEMMA4},
+        {"nemotron-h", &PULSAR_NEMOTRON_H_TOKENIZER, PULSAR_CHAT_NEMOTRON_H},
+        {"inkling", &PULSAR_INKLING_TOKENIZER, PULSAR_CHAT_INKLING},
+    };
+    static pulsar_chat_format g_fmt;
+    pulsar_gemma4_model *gm = new pulsar_gemma4_model();
+    pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
+    pulsar_inkling_model *im = new pulsar_inkling_model();
+    gm->tok = nm->tok = im->tok = tok;
+    void *const state[] = {NULL, gm, nm, im};
+    const pulsar_chat_message hi = {"user", "hello", false, NULL};
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        pulsar_family fam{};
+        fam.arch = fam.name = cases[c].name;
+        fam.caps = PULSAR_FAMILY_CAP_CHAT;
+        fam.tokenizer = cases[c].table;
+        g_fmt = cases[c].fmt;
+        fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
+        pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+        e->family = &fam;
+        e->qwen_tok = tok;
+        e->family_state = state[c];
+        pulsar_tokens out = {0};
+        /* these templates render thinking on (their default effort) or off: "low" is no level of theirs */
+        TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, "be brief", PULSAR_THINK_LOW) && out.len == 0);
+        TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &hi, 1, true, PULSAR_THINK_LOW) && out.len == 0);
+        TEST_ASSERT(!pulsar_encode_chat_prompt(e, "be brief", "hello", PULSAR_THINK_LOW, &out) && out.len == 0);
+        /* the same pieces at a mode the template has are taken, and the engine is still here to take them */
+        TEST_ASSERT(pulsar_chat_open(e, &out, NULL, "be brief", PULSAR_THINK_NONE) && out.len > 0);
+        const int head = out.len;
+        TEST_ASSERT(pulsar_chat_append_turn(e, &out, &hi, 1, true, PULSAR_THINK_NONE) && out.len > head);
+        const int turn = out.len;
+        TEST_ASSERT(pulsar_chat_end_assistant(e, &out) && out.len > turn);
+        pulsar_tokens_free(&out);
+        e->qwen_tok = NULL;
+        free(e);
+    }
+    delete gm;
+    delete nm;
+    delete im;
+
+    const char *path = getenv("PULSAR_TEST_DS4_TOKENIZER");
+    if (!path || !path[0]) {
+        fprintf(stderr, "template-refusal: PULSAR_TEST_DS4_TOKENIZER is not set (the DeepSeek container whose "
+                        "vocabulary the test reads)\n");
+        TEST_ASSERT(path && path[0]);
+        return;
+    }
+    static pulsar_family fam{};
+    fam.arch = fam.name = "l375-ds4-template";
+    fam.tokenizer = &k_ds4_tokenizer;
+    fam.chat_format = test_ds4_chat_v4;   /* the 0731 encoder: three effort levels */
+    fam.caps = PULSAR_FAMILY_CAP_CHAT;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_model model;
+    const bool opened = model_open(&model, path, false);
+    TEST_ASSERT(opened);
+    if (opened) {
+        e->vocab.vocab_load(&model);
+        pulsar_tokens out = {0};
+        const pulsar_think_mode between = (pulsar_think_mode)60;   /* an effort, but none of low / high / max */
+        TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, "be brief", between) && out.len == 0);
+        TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &hi, 1, true, between) && out.len == 0);
+        TEST_ASSERT(pulsar_chat_open(e, &out, NULL, "be brief", PULSAR_THINK_HIGH) && out.len > 0);
+        const int head = out.len;
+        /* a turn whose SECOND message the front cannot place takes the first back with it */
+        const pulsar_chat_message bad[2] = {{"user", "hello", false, NULL}, {"assistant", "hi", false, NULL}};
+        TEST_ASSERT(!pulsar_chat_append_turn(e, &out, bad, 2, true, PULSAR_THINK_HIGH) && out.len == head);
+        const pulsar_chat_message trusted_user = {"user", "hello", true, NULL};
+        TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &trusted_user, 1, true, PULSAR_THINK_HIGH) && out.len == head);
+        TEST_ASSERT(pulsar_chat_append_turn(e, &out, &hi, 1, true, PULSAR_THINK_HIGH) && out.len > head);
+        pulsar_tokens_free(&out);
+    }
+    model_close(&model);
+    free(e);
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
     test_l334_bank_pos_and_adopt_result();
@@ -2539,6 +2633,7 @@ static void test_server_unit_group(void) {
     test_o34_decode_busy_is_not_undecodable();
     test_l375_tokenizer_refusal_is_a_result();
     test_l375_refused_render_fails_the_request();
+    test_l375_template_refusal_is_a_result();
 }
 
 /* L325: a render case's protocol ("_api": "openai" | "anthropic" | "responses" (L326), default openai) and family

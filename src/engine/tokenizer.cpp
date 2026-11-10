@@ -1170,7 +1170,9 @@ static void ds4_chat_append_trusted(pulsar_vocab *vocab, pulsar_tokens *tokens, 
 /// @param role    the message's role ("system", "user", "assistant", "tool", ...)
 /// @param content the message's text
 /// @param trusted the content is front-end control text in DeepSeek's markers
-static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
+/// @return false (said) for a message this front cannot place: trusted text outside a system message, an assistant
+///         turn.  The caller takes back what the turn appended before it.
+static bool ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, const char *role, const char *content,
                                     bool trusted) {
     pulsar_vocab *vocab = &e->vocab;
     const bool v41 = pulsar_engine_chat_v41(e);
@@ -1201,7 +1203,9 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
             }
         }
     } else if (trusted) {
-        pulsar_die("pulsar_chat_append_turn: only a system message carries trusted control text");
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: only a system message carries trusted control text -- "
+                        "refusing\n");
+        return false;
     } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         /* V4.1 joins consecutive user-SIDE messages (user text and tool results in
          * any order) into one turn; V4 opens a fresh turn for each user message
@@ -1218,15 +1222,17 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
          * and the CLI append a SAMPLED turn's tokens, and the server owns the
          * replay rules).  The old branch guessed a stripped replay and could not
          * be right; refuse instead of guessing. */
-        pulsar_die("pulsar_chat_append_turn: an assistant turn cannot be "
-                   "appended here -- append the sampled tokens, or render it "
-                   "through the server's renderer (L185)");
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: an assistant turn cannot be "
+                        "appended here -- append the sampled tokens, or render it "
+                        "through the server's renderer (L185) -- refusing\n");
+        return false;
     } else {
         const bool join = v41 && chat_tmpl_last_marker(vocab, tokens) == vocab->user_id;
         if (!join) chat_tmpl_push_marker(tokens, vocab->user_id);
         else chat_tmpl_append_text(vocab, tokens, "\n\n");
         chat_tmpl_append_text(vocab, tokens, content);
     }
+    return true;
 }
 
 
@@ -1243,10 +1249,16 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
 /// @param system     the client's system message, or NULL
 /// @param tools_json unused (refused upstream)
 /// @param think_mode the reasoning effort
-/// @return true: DeepSeek's byte-level tokenizer refuses no text
+/// @return false (said; nothing appended) for an effort the loaded encoder has no level for (L375: the effort line's
+///         lookup ended the process); the byte-level tokenizer itself refuses no text
 static bool ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                           const char *tools_json, pulsar_think_mode think_mode) {
     (void)tools_json;   /* refused by pulsar_chat_open_tools: DeepSeek's tools are DSML text in `trusted` */
+    char why[256];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, why, sizeof why)) {
+        fprintf(stderr, "pulsar: pulsar_chat_open: %s -- refusing\n", why);
+        return false;
+    }
     pulsar_vocab *vocab = &e->vocab;
     const bool has_system = system && system[0];
     chat_tmpl_push_marker(tokens, vocab->bos_id);
@@ -1266,10 +1278,21 @@ static bool ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *t
  *  @param n                 messages
  *  @param generation_prompt open the assistant's turn
  *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker)
- *  @return true: DeepSeek's byte-level tokenizer refuses no text */
+ *  @return false (said; nothing appended) for a message the front cannot place (ds4_chat_append_message); the
+ *          byte-level tokenizer itself refuses no text */
 static bool ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                           bool generation_prompt, pulsar_think_mode think_mode) {
-    for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
+    char why[256];
+    if (!pulsar_engine_think_mode_supported(e, think_mode, why, sizeof why)) {
+        fprintf(stderr, "pulsar: pulsar_chat_append_turn: %s -- refusing\n", why);
+        return false;
+    }
+    const int before = tokens->len;
+    for (int i = 0; i < n; i++)
+        if (!ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted)) {
+            tokens->len = before;   /* a refused turn appends nothing */
+            return false;
+        }
     if (!generation_prompt) return true;
     chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
     chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
