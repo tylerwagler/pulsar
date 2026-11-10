@@ -2031,6 +2031,10 @@ kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored) {
     return KV_PICK_LIVE;   /* responses-visible, responses-tool-output, anthropic-tool-output */
 }
 
+bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end) {
+    return (pick == KV_PICK_OWN || pick == KV_PICK_LIVE) && bank_prompt_end > 0 && at >= bank_prompt_end;
+}
+
 void gen_kv_finish(gen_state *g, const char *word) {
     if (!g->kv_finish[0]) snprintf(g->kv_finish, sizeof g->kv_finish, "%.*s", (int)sizeof g->kv_finish - 1, word);
 }
@@ -2120,6 +2124,7 @@ void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     kv_line_int(&l, "prefilled_now", r->prefilled_now);
     /* what a resume at the deepest live match would have saved */
     kv_line_int(&l, "below", r->deep >= 0 && r->at >= 0 ? (r->deep > r->at ? r->deep - r->at : 0) : -1);
+    kv_line_int(&l, "epcut", r->epcut);
     kv_line_int(&l, "evict", r->evict);
     kv_line_int(&l, "evict_tokens", r->evict >= 0 ? r->evict_tokens : -1);
     kv_line_hash(&l, "evict_conv", r->evict >= 0, r->evict_conv);
@@ -2158,7 +2163,7 @@ void server::kv_req_key(job *j) {
     r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
     r->prompt = q->prompt.len;
     r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
-    r->from = r->at = r->reused = r->prefilled_now = r->evict = r->evict_tokens = -1;
+    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->evict = r->evict_tokens = -1;
     r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;
 }
 

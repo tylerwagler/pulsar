@@ -1295,6 +1295,9 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     if (j->kvr.pick != KV_PICK_ADOPT) j->kvr.from = -1;
     j->kvr.at = resumed_at.raw();
     j->kvr.reused = cached;
+    /* L380: read before any sync of this request moves the bank's prompt-end record */
+    g->endpoint_waive = server_endpoint_waive(j->kvr.pick, resumed_at.raw(),
+                                              pulsar_session_bank_prompt_end(s->sess, sl->bank).raw());
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by pulsar_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -1510,6 +1513,7 @@ void server::gen_step_prefill(session_slot *sl) {
     /* L329 (b2): the sync reads the next chunk's PLE rows ahead along the whole request, past a cold-store or a
      * share_mark cut too (the chunk after the cut is the next sync's first) */
     pulsar_session_set_prefill_ahead(s->sess, g->prompt_for_sync);
+    pulsar_session_set_endpoint_waive(s->sess, g->endpoint_waive);   /* L380: the request's, for each of its syncs */
     g->bank_written = true;   /* the sync rewinds to its resume point and writes this prompt's rows */
     int rc;
     {
@@ -1521,6 +1525,11 @@ void server::gen_step_prefill(session_slot *sl) {
             : pulsar_session_sync(s->sess, target, g->err, sizeof(g->err));
     }
     pulsar_session_set_prefill_ahead(s->sess, NULL);
+    /* L380: what the walk did with the message endpoint ahead of it, for the `kv req:` line -- the last quantum that
+     * had one (a later quantum starts past it) */
+    const pulsar_endpoint_plan ep = pulsar_session_endpoint_plan(s->sess);
+    if (ep != PULSAR_ENDPOINT_NONE) g->j->kvr.epcut = ep == PULSAR_ENDPOINT_CUT ? 1 : 0;
+    pulsar_session_set_endpoint_waive(s->sess, false);
     pulsar_tokens_free(&to_cut);
     if (rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
         if (gen_client_disconnected(g->j->fd)) {

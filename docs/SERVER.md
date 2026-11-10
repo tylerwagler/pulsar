@@ -478,6 +478,7 @@ unserved. A request that never bound to a bank has `bank=-` and `-` in every fie
 | `reused` | the request's tokens served from state (the cache read) |
 | `prefilled_now` | tokens this request prefilled |
 | `below` | tokens between `at` and the deepest match any free bank had when the request was routed: what a resume at that match would have saved |
+| `epcut` | the prefill's cut at the prompt's message endpoint (the start of its generation header; the cut leaves the record a later prompt resumes from when it re-renders that header differently, and costs a prefill chunk): `1` made and recorded, `0` waived, `-` no endpoint lay ahead of the prefill (a tool round past it, a family that makes no such cut, a prefill in the fused lane, no prefill). Waived when the request starts computing (`at`) at or past the end of the last prompt its bank prefilled whole, from the bank's own state (`pick=own` or `live`), and no resume-grid point lies between the endpoint and the prompt's end; a request on a bank with no prompt end standing, one that resumes below it, an adopt and a disk chain all cut |
 | `evict` | the bank this request's bind evicted (the last one, when it evicted several) |
 | `evict_tokens`, `evict_conv`, `evict_ro` | that bank's history: its tokens, its `conv` key (the same rule over its tokens), and 1 when it was a read-only request's |
 | `snapshot` | the eviction line's word with its blank removed: `disk`, `none`, `none(<rule>)` |
@@ -489,7 +490,7 @@ unserved. A request that never bound to a bank has `bank=-` and `-` in every fie
 | `finish` | the turn's finish label (`stop`, `length`, `tool_calls`, `abandoned`, `error`, ...), or the server's word for an end that is no turn: `failed`, `busy`, `gone`, `conflict` (409), `stream-failed`, `refused-memory` (a 503 mid-prefill), and for a request that never bound `gone-queued`, `refused-context` (400), `refused-bank` (500), `refused-kv` (503) |
 
 ```text
-pulsar-server: kv req: id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 prefilled_now=29708 below=29356 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop
+pulsar-server: kv req: id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 prefilled_now=29708 below=29356 epcut=1 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop
 ```
 
 ### The cumulative ledger: `pulsar-server: kv ledger:`

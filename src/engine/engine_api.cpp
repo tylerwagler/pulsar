@@ -420,6 +420,12 @@ void pulsar_session_set_progress(pulsar_session *s, pulsar_session_progress_fn f
 void pulsar_session_set_display_progress(pulsar_session *s, pulsar_session_progress_fn fn, void *ud) { if (s) s->set_display_progress(fn, ud); }
 void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, void *ud) { if (s) s->set_cancel(fn, ud); }
 void pulsar_session_set_prefill_ahead(pulsar_session *s, const pulsar_tokens *prompt) { if (s) s->prefill_ahead = prompt; }
+void pulsar_session_set_endpoint_waive(pulsar_session *s, bool waive) {
+    if (!s) return;
+    s->endpoint_waive = waive;
+    s->endpoint_plan = PULSAR_ENDPOINT_NONE;
+}
+pulsar_endpoint_plan pulsar_session_endpoint_plan(const pulsar_session *s) { return s ? s->endpoint_plan : PULSAR_ENDPOINT_NONE; }
 uint32_t pulsar_session_prompt_read_ahead(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, int run_end) {
     return run_end >= 0 ? pulsar_session_read_ahead(s, bank, prompt, (uint32_t)run_end) : 0u;
 }
@@ -1469,6 +1475,10 @@ bool pulsar_session_split_invariant(const pulsar_session *s) {
 }
 TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     return TokPos{s ? (int)session_banks(s)->prefill_frontier(s, bank) : 0}; }
+TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank) {
+    const pulsar_ckpt_store *st = s ? pulsar_session_kv_store(s) : NULL;
+    return TokPos{st && st->ops ? (int)pulsar_ckpt_end(st, bank) : 0};
+}
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);

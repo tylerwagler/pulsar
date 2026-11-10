@@ -954,6 +954,21 @@ extern const char *const kv_resume_why_names[PULSAR_RESUME_WHYS];
  *  @param spill_restored the bank's history came back from its spill chain for this job
  *  @return the pick it names (the one mapping from the resolution's word to the line's) */
 kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored);
+/** L380: whether a request's syncs waive the cut at its prompt's message endpoint
+ *  (pulsar_session_set_endpoint_waive).  The cut leaves the record a later prompt resumes from when it re-renders the
+ *  generation header differently (a client or template that drops history reasoning, L311); every request pays a
+ *  prefill chunk for it.  The evidence that this conversation does not need it is the request itself: it starts
+ *  computing at or past the end of the last prompt its bank prefilled whole -- it carried that prompt's header as
+ *  generated -- from the bank's own state.  Everything else cuts, as before: a bank with no prompt end standing (a
+ *  fresh, evicted, invalidated or spill-restored bank; one whose record a resume below it or the record pool
+ *  dropped), a request that resumes below it (it re-rendered the header or something before it), an adopt or a disk
+ *  chain (the bank takes another history).  The per-bank state is the engine's prompt-end record and nothing else:
+ *  whatever changes the bank's conversation drops it. */
+/// @param pick             the state the request's sync starts from
+/// @param at               where it starts computing (kv_req_line::at)
+/// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), 0 = none
+/// @return true when the request's syncs waive the cut
+bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end);
 /// Bytes of a client id (session, agent, parent agent) the `kv req:` line prints
 #define KV_REQ_ID_CHARS 16
 /** Everything one `kv req:` line prints.  Kept on the job (job::kvr) and filled as each fact becomes known: the
@@ -987,6 +1002,8 @@ typedef struct {
     int at;              ///< where its sync started computing
     int reused;          ///< its tokens served from state (the cache read)
     int prefilled_now;   ///< tokens this request prefilled
+    /// L380: the prefill's cut at the prompt's message endpoint: 1 made (and recorded), 0 waived, -1 no endpoint ahead
+    int epcut;
     bool spill_restored; ///< its bank's history came back from the spill chain for it
     int evict;           ///< the bank its bind evicted (the last, when several)
     int evict_tokens;    ///< that bank's history, in tokens
@@ -4260,6 +4277,8 @@ struct gen_state {
     char ctx_span[48];   ///< human-readable context span, for logs ("1234-5678")
     char req_flags[64];  ///< compact flag string describing the request, for logs
     server_prefill_progress progress;  ///< stable address: callback userdata
+    /// L380: this request's syncs waive the cut at the prompt's message endpoint (server_endpoint_waive, gen_begin_plan)
+    bool endpoint_waive;
     int cold_store_len;  ///< the anchor cut (kv_cache_anchor_cut, system prompt + tools before the task message) the prefill stops at and persists as KV_PERSIST_ANCHOR on its second sighting (L347 I2); always < the prompt; 0 = no cold write
     pulsar_tokens cold_prefix;  ///< the token prefix the cold write covers
     /** L329 (a): a cut on the resume grid that a queued request waits for this prefill to stand at (0: none; stale

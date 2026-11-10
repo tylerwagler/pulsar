@@ -3173,6 +3173,11 @@ struct pulsar_session {
     /** L329 (b2): the prompt a sync's read-ahead follows (pulsar_session_set_prefill_ahead; borrowed for one sync),
      *  NULL = the sync's own */
     const pulsar_tokens *prefill_ahead;
+    /** L380: the caller waived the cut at the prompt's message endpoint for the sync in flight
+     *  (pulsar_session_set_endpoint_waive; false = the walk cuts there, as every unlicensed sync does) */
+    bool endpoint_waive;
+    /** L380: what the last walk since that call did with an endpoint ahead of it (pulsar_session_endpoint_plan) */
+    pulsar_endpoint_plan endpoint_plan;
     /** L329 (b2): each bank's read-ahead record (pulsar_read_ahead_plan), [n_ahead], grown on first use */
     struct pulsar_read_ahead_mark *ahead;
     /// Entries allocated in `ahead`.
@@ -4846,9 +4851,9 @@ void pulsar_session_note_committed(pulsar_session *s, const int *toks, int n);
 /** THE cut rule (prefill_loop.cpp, L284): a walk's chunk ends, as a pure function of the chunk's start, the
  *  prompt's end and these fixed inputs.  In order: snap to the absolute grid of `grid_cap` (at most `chunk_cap`
  *  rows); round a non-final end down to `align`; move an end that would split an image block to the block's start
- *  (or past its end when the block starts the chunk); stop at the prompt's message endpoint inside the chunk (L311);
- *  then cut the final chunk at the prompt's last resume-grid point (pulsar_ckpt_final_cut) unless that lands inside a
- *  block. */
+ *  (or past its end when the block starts the chunk); cut the final chunk at the prompt's last resume-grid point
+ *  (pulsar_ckpt_final_cut) unless that lands inside a block; then stop at the plan's message endpoint inside the
+ *  chunk (L311; none when the walk has none ahead or its caller waived the cut, L380). */
 typedef struct {
     /// The absolute grid ends snap to, in tokens.
     uint32_t grid_cap, chunk_cap, align;
@@ -4865,6 +4870,21 @@ typedef struct {
     int n_images;
     uint32_t endpoint;                       ///< L311: the message endpoint a chunk stops at (0 = none; the walk's)
 } pulsar_prefill_plan;
+/** L380: whether a walk to `end` leaves out the cut at the prompt's message endpoint E ahead of it.  Only for a
+ *  caller that waived it (pulsar_session_set_endpoint_waive), and only when no resume-grid point lies in (E, end]:
+ *  the prompt's last grid point is then at or below E, within one grid step of it, and the grid checkpoint standing
+ *  there is what a later prompt that parts between E and `end` resumes from in the record's place.  With a grid
+ *  point past E the walk's final cut lands there instead, above such a prompt's match, and the nearest checkpoint
+ *  below E is an earlier walk's -- so the cut stays. */
+/// @param store the resume grid
+/// @param E the endpoint, in (the walk's start, end)
+/// @param end the prompt's end
+/// @param waive the caller's waiver
+/// @return true when the walk plans no endpoint cut
+static inline bool pulsar_prefill_endpoint_waived(const pulsar_ckpt_store *store, uint32_t E, uint32_t end,
+                                                  bool waive) {
+    return waive && pulsar_ckpt_grid_floor(store, end) <= E;
+}
 /** L311: the prompt's MESSAGE ENDPOINT -- where its last turn marker begins (pulsar_turn_marker_at): the history of
  *  complete messages before the generation header, the point an agent's side request (the same history plus a
  *  message of its own) and a re-rendered generation header branch from.  Only a split-invariant family's (any cut

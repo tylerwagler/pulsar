@@ -5813,6 +5813,59 @@ static void test_ckpt_records(void) {
     TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
     TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 390u);
     TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 390u, 400u) == 400u);
+    /* L380: a waived endpoint is planned as none -- the walk makes the grid cut and no other: [0, 384), [384, 400).
+     * The waiver holds only for a caller that gave it and only with no grid point past the endpoint (the last grid
+     * checkpoint then stands within a grid step below it) */
+    TEST_ASSERT(!pulsar_prefill_endpoint_waived(st, 390u, 400u, false));   /* nobody waived: the cut */
+    TEST_ASSERT(pulsar_prefill_endpoint_waived(st, 390u, 400u, true));
+    TEST_ASSERT(pulsar_prefill_endpoint_waived(st, 384u, 400u, true));     /* the grid point is the endpoint */
+    TEST_ASSERT(!pulsar_prefill_endpoint_waived(st, 297u, 400u, true));    /* 384 lies past it: the cut stays */
+    TEST_ASSERT(!pulsar_prefill_endpoint_waived(st, 380u, 384u, true));    /* so does a prompt end on the grid */
+    for (int waived = 0; waived < 2; waived++) {
+        plan.endpoint = pulsar_prefill_endpoint_waived(st, 390u, 400u, waived != 0) ? 0u : 390u;
+        uint32_t ends[4] = {0}, n = 0;
+        for (uint32_t pos = 0u; pos < 400u && n < 4u; pos = ends[n++]) ends[n] = pulsar_prefill_plan_next_end(&plan, pos, 400u);
+        if (waived) TEST_ASSERT(n == 2u && ends[0] == 384u && ends[1] == 400u);
+        else TEST_ASSERT(n == 3u && ends[0] == 384u && ends[1] == 390u && ends[2] == 400u);
+    }
+    /* a resumed walk too, with no grid point ahead of it: one chunk instead of two */
+    plan.endpoint = 0u;
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 400u);
+    plan.endpoint = 396u;
+    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 396u);
+
+    /* L380: when a request's syncs waive the cut (server_endpoint_waive) -- the per-bank state is the store's
+     * prompt-end record, so it follows the record's life.  Bank 0, a conversation's requests in order: */
+    for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, b);
+    const auto WAIVE = [st](kv_pick pick, int at, uint32_t bank) {
+        return server_endpoint_waive(pick, at, (int)pulsar_ckpt_end(st, bank));
+    };
+    /* no history: the cut, wherever the request starts */
+    TEST_ASSERT(!WAIVE(KV_PICK_NONE, 0, 0) && !WAIVE(KV_PICK_OWN, 300, 0) && !WAIVE(KV_PICK_LIVE, 300, 0));
+    /* its first prompt ended at 300 (endpoint 297); the next request starts there, or past it on the live rows */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 300, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, 297, toks, NULL, 0, NULL));
+    TEST_ASSERT(WAIVE(KV_PICK_OWN, 300, 0) && WAIVE(KV_PICK_LIVE, 345, 0));
+    TEST_ASSERT(!WAIVE(KV_PICK_OWN, 300, 1));   /* another bank's prompt end is not this bank's evidence */
+    /* a request that starts below it -- from the endpoint record, or the grid under it -- cuts again... */
+    TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 256, 0) && !WAIVE(KV_PICK_NONE, 0, 0));
+    /* ...and the resume itself drops the prompt end above it, so nothing waives until a prompt ends again and a
+     * request starts at or past THAT end */
+    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0) && pulsar_ckpt_end(st, 0) == 0u);
+    TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 420, 0));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 420, toks, lg, 4, NULL));
+    TEST_ASSERT(!WAIVE(KV_PICK_OWN, 417, 0) && WAIVE(KV_PICK_OWN, 420, 0) && WAIVE(KV_PICK_OWN, 500, 0));
+    /* another state than the bank's own never waives, whatever stands: an adopt (even of a prompt end, whose copy
+     * the adopter keeps), a disk chain, a spill restore */
+    TEST_ASSERT(!WAIVE(KV_PICK_ADOPT, 420, 0) && !WAIVE(KV_PICK_DISK, 420, 0) && !WAIVE(KV_PICK_SPILLED, 420, 0));
+    /* the bank's history falls below the prompt end (a rewind, a restore of a lower checkpoint): the cut */
+    pulsar_ckpt_frontier_lowered(st, 0, 419);
+    TEST_ASSERT(pulsar_ckpt_end(st, 0) == 0u && !WAIVE(KV_PICK_OWN, 420, 0));
+    /* the bank is invalidated, evicted or given to another conversation (its checkpoints and records dropped) */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, 420, toks, lg, 4, NULL) && WAIVE(KV_PICK_OWN, 420, 0));
+    pulsar_ckpt_drop_bank(st, 0);
+    TEST_ASSERT(!WAIVE(KV_PICK_OWN, 420, 0) && !WAIVE(KV_PICK_LIVE, 600, 0));
     pulsar_ckpt_release(st);
     free(st);
 }
@@ -6120,7 +6173,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--refusal-once", "refusal-once", "the library's say-once refusal table: once per op, every refusal said past its bound (L335)", test_refusal_once},
     {"--no-engine-family", "no-engine-family", "no engine is no family: the engine facts and a no-engine parse never default to DeepSeek (L335)", test_no_engine_no_family},
     {"--state-plan", "state-plan", "the state plan's decl and slot tables: a full table counts the overflow and the load / create refuse it by name (L335, L375)", test_state_plan_overflow},
-    {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule) and the endpoint cut (L311)", test_ckpt_records},
+    {"--ckpt-records", "ckpt-records", "the record pool (prompt ends, message endpoints: capture, match, LRU, frontier rule), the endpoint cut (L311) and its waiver (L380)", test_ckpt_records},
     {"--ckpt-host-tier", "ckpt-host-tier", "the checkpoint store's tiers: a dry price carries no host-tier checkpoint, a discrete card places them in pinned RAM and GB10 does not, each tier's capture / reader / reuse / claim / record round trip on this device (L347 I4)", test_ckpt_host_tier},
     {"--verify-pick", "verify-pick", "the verify pick: the brute-force argmax on a staircase curve, the robust online correction, the lockstep continuation (L301); the copy estimate's re-probe (L308)", test_verify_pick},
     {"--lib-image-rope", "lib-image-rope", "multi-axis rope positions from the image records vs HF get_rope_index (L268)", test_lib_image_rope},

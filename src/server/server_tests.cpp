@@ -9841,6 +9841,7 @@ static void test_l378_kv_req_line_format(void) {
     r.at = 31104;
     r.reused = 31104;
     r.prefilled_now = 29708;
+    r.epcut = 1;
     r.evict = 1;
     r.evict_tokens = 69233;
     r.evict_conv = UINT64_C(0x84c39a079fc08121);
@@ -9859,7 +9860,7 @@ static void test_l378_kv_req_line_format(void) {
         "id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- "
         "pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 "
         "anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 "
-        "prefilled_now=29708 below=29356 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 "
+        "prefilled_now=29708 below=29356 epcut=1 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 "
         "snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop"));
     /* an adopt names its source bank; a resume point inside the match has no noresume */
     r.pick = KV_PICK_ADOPT;
@@ -9887,7 +9888,7 @@ static void test_l378_kv_req_line_format(void) {
     snprintf(want, sizeof want,
              "id=9 ep=completions class=- ro=0 sess=a-session-id-lon agent=- parent=- pre=- conv=%016llx prompt=3 "
              "bank=- route=none best=- common=- score=- anchor=- frontier=- prefilled=- noresume=- pick=none from=- "
-             "at=- reused=- prefilled_now=- below=- evict=- evict_tokens=- evict_conv=- evict_ro=- snapshot=- "
+             "at=- reused=- prefilled_now=- below=- epcut=- evict=- evict_tokens=- evict_conv=- evict_ro=- snapshot=- "
              "qwait_ms=- restore_ms=0 prefill_ms=- ttft_ms=- out=0 finish=gone-queued",
              (unsigned long long)server_kv_token_hash(toks, 3));
     TEST_ASSERT(!strcmp(line, want));

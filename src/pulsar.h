@@ -1021,6 +1021,28 @@ void pulsar_session_set_cancel(pulsar_session *s, pulsar_session_cancel_fn fn, v
 /** @param s the session
  *  @param prompt the request being prefilled (borrowed), or NULL to clear */
 void pulsar_session_set_prefill_ahead(pulsar_session *s, const pulsar_tokens *prompt);
+/** L380: what a sync's prefill walk did about the cut at its prompt's message endpoint (pulsar_turn_endpoint). */
+typedef enum {
+    PULSAR_ENDPOINT_NONE = 0,   ///< no endpoint lay ahead of a walk (or no walk ran): nothing to cut at
+    PULSAR_ENDPOINT_CUT,        ///< a walk planned the cut: it stops there and records the message endpoint
+    PULSAR_ENDPOINT_WAIVED,     ///< the endpoint lay ahead and the caller's waiver held: no cut, no record
+} pulsar_endpoint_plan;
+/** L380: waive the next sync's cut at its prompt's message endpoint.  The cut exists to leave a record a later prompt
+ *  resumes from when it re-renders the generation header after it differently (L311); it moves no byte (only a
+ *  split-invariant family makes it), and costs a prefill chunk.  A caller that has seen this request resume at or
+ *  past the bank's previous prompt end -- its client re-rendered that prompt's header as it was generated --
+ *  waives it.  The waiver holds only when no resume-grid point lies past the endpoint within the prompt, so the
+ *  walk's last grid checkpoint stands at most one grid step below the endpoint and a prompt that does diverge there
+ *  later resumes from it.  Set right before the sync, cleared (false) right after; false -- the default, and every
+ *  sync nobody set it for -- always cuts.  Setting it also clears pulsar_session_endpoint_plan's report. */
+/** @param s the session
+ *  @param waive true to waive the cut for the walks that follow */
+void pulsar_session_set_endpoint_waive(pulsar_session *s, bool waive);
+/** L380: the last prefill walk's verdict since pulsar_session_set_endpoint_waive that had a message endpoint ahead
+ *  of it (an instrument: the server's `kv req:` line prints it). */
+/** @param s the session
+ *  @return the verdict; PULSAR_ENDPOINT_NONE when no walk since had one */
+pulsar_endpoint_plan pulsar_session_endpoint_plan(const pulsar_session *s);
 /** L329 (b2): a prefill of `bank` has rows up to `run_end` of `prompt` in flight (a fused step's prompt run, a
  *  sync's chunk): read ahead the rows of the prompt's next chunk -- [run_end, run_end + the prefill chunk) -- on the
  *  disk table's background readers, so that chunk's gather finds them in the page cache.  The family's prefill
@@ -1981,6 +2003,13 @@ TokPos pulsar_session_bank_pos(pulsar_session *s, uint32_t bank);
  *  @param bank the bank
  *  @return the prefill frontier */
 TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
+/** L289 / L380: where the bank's prompt-end record stands -- the end of the last prompt a sync prefilled whole on it,
+ *  while the bank's history still reaches it (a resume below it, an adopt over it, an invalidate or an eviction
+ *  drops the record). */
+/** @param s the session
+ *  @param bank the bank
+ *  @return the record's position, 0 when the bank holds none */
+TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank);
 /** Bank `bank`'s committed token history (the per-bank readers above).
  *  @param s the session
  *  @param bank the bank
