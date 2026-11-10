@@ -674,6 +674,8 @@ bool server::send_metrics(int fd) {
     const unsigned long long hint_dead_reuse = (unsigned long long)s->m_hint_dead_reuse;
     const unsigned long long prefill_mem_refusals = (unsigned long long)s->m_prefill_mem_refusals;
     const kv_restore_meter disk_meter = s->kv.meter;   /* L310 */
+    const kv_ledger_counts kvl = s->m_kvl;              /* L378: the ledger's counters, as its line prints them */
+    const pulsar_segstore_io disk_io = s->m_kv_disk_io;
     const unsigned long long preemptions = (unsigned long long)s->m_preemptions;    /* L314 */
     const unsigned long long readmissions = (unsigned long long)s->m_readmissions;
     const kv_dup_census dup = s->m_dup;                                              /* L324 */
@@ -1079,6 +1081,72 @@ bool server::send_metrics(int fd) {
     for (int i = 0; i < RESUME_PICKS; i++)
         buf_printf(&b, "pulsar:resume_decisions_total{source=\"%s\"} %llu\n", resume_pick_names[i],
                    (unsigned long long)disk_meter.picks[i]);
+    /* L378: the KV ledger's counters -- the variables the hourly `kv ledger:` line prints (server::kv_ledger_read) */
+    buf_puts(&b, "# HELP pulsar:kv_requests_total Generation requests ended (one kv req: log line each).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_requests_total counter\n");
+    buf_printf(&b, "pulsar:kv_requests_total %llu\n", (unsigned long long)kvl.requests);
+    buf_puts(&b, "# HELP pulsar:kv_routes_total Ended requests by where the router sent them.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_routes_total counter\n");
+    for (int i = 0; i < KV_ROUTES; i++)
+        buf_printf(&b, "pulsar:kv_routes_total{route=\"%s\"} %llu\n", kv_route_names[i],
+                   (unsigned long long)kvl.routes[i]);
+    buf_puts(&b, "# HELP pulsar:kv_request_picks_total Ended requests by the state their sync started from.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_request_picks_total counter\n");
+    for (int i = 0; i < KV_PICKS; i++)
+        buf_printf(&b, "pulsar:kv_request_picks_total{pick=\"%s\"} %llu\n", kv_pick_names[i],
+                   (unsigned long long)kvl.picks[i]);
+    buf_puts(&b, "# HELP pulsar:kv_evictions_by_total Bank evictions made for a request, by whether the evicted "
+                 "history and the requester were read-only (X-Pulsar-KV).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_evictions_by_total counter\n");
+    for (int victim = 0; victim < 2; victim++)
+        for (int by = 0; by < 2; by++)
+            buf_printf(&b, "pulsar:kv_evictions_by_total{victim=\"%s\",requester=\"%s\"} %llu\n",
+                       victim ? "read-only" : "conversation", by ? "read-only" : "conversation",
+                       (unsigned long long)kvl.evict_by[victim][by]);
+    buf_puts(&b, "# HELP pulsar:kv_evictions_own_best_total Evictions whose victim was the requester's own best-matching bank.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_evictions_own_best_total counter\n");
+    buf_printf(&b, "pulsar:kv_evictions_own_best_total %llu\n", (unsigned long long)kvl.evict_own_best);
+    buf_puts(&b, "# HELP pulsar:kv_disk_io_bytes_total Disk KV store file bytes since start: written, mapped for a load "
+                 "(read), removed, removed for room (removed_budget), removed without ever being read (removed_unread).\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_io_bytes_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"written\",part=\"rows\"} %llu\n",
+               (unsigned long long)disk_io.rows_bytes_written);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"written\",part=\"restore_point\"} %llu\n",
+               (unsigned long long)disk_io.rp_bytes_written);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"read\",part=\"rows\"} %llu\n",
+               (unsigned long long)disk_io.rows_bytes_read);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"read\",part=\"restore_point\"} %llu\n",
+               (unsigned long long)disk_io.rp_bytes_read);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"removed\",part=\"all\"} %llu\n",
+               (unsigned long long)disk_io.bytes_removed);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"removed_budget\",part=\"all\"} %llu\n",
+               (unsigned long long)disk_io.budget_bytes_removed);
+    buf_printf(&b, "pulsar:kv_disk_io_bytes_total{op=\"removed_unread\",part=\"all\"} %llu\n",
+               (unsigned long long)disk_io.unread_bytes_removed);
+    buf_puts(&b, "# HELP pulsar:kv_disk_io_files_total Disk KV store files since start: written and mapped for a load.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_io_files_total counter\n");
+    buf_printf(&b, "pulsar:kv_disk_io_files_total{op=\"written\",part=\"rows\"} %llu\n",
+               (unsigned long long)disk_io.segs_written);
+    buf_printf(&b, "pulsar:kv_disk_io_files_total{op=\"written\",part=\"restore_point\"} %llu\n",
+               (unsigned long long)disk_io.rps_written);
+    buf_printf(&b, "pulsar:kv_disk_io_files_total{op=\"read\",part=\"rows\"} %llu\n",
+               (unsigned long long)disk_io.segs_read);
+    buf_printf(&b, "pulsar:kv_disk_io_files_total{op=\"read\",part=\"restore_point\"} %llu\n",
+               (unsigned long long)disk_io.rps_read);
+    buf_puts(&b, "# HELP pulsar:kv_disk_restores_total Disk chain restores begun, done (the chain loaded) and failed.\n");
+    buf_puts(&b, "# TYPE pulsar:kv_disk_restores_total counter\n");
+    {
+        static const char *const outcome[3] = {"begun", "done", "failed"};
+        for (int i = 0; i < 3; i++)
+            buf_printf(&b, "pulsar:kv_disk_restores_total{outcome=\"%s\"} %llu\n", outcome[i],
+                       (unsigned long long)disk_meter.restores[i]);
+    }
+    buf_puts(&b, "# HELP pulsar:refused_503_total Requests answered 503, by cause (a prefill stopped by the memory "
+                 "floor is pulsar:prefill_mem_refusals_total).\n");
+    buf_puts(&b, "# TYPE pulsar:refused_503_total counter\n");
+    for (int i = 0; i < SERVER_503_CAUSES; i++)
+        buf_printf(&b, "pulsar:refused_503_total{cause=\"%s\"} %llu\n", server_503_cause_names[i],
+                   (unsigned long long)kvl.refused[i]);
     /* L318: prefills a disconnect abandoned, and the computed prefix each persisted for the re-send */
     buf_puts(&b, "# HELP pulsar:prefill_abandon_persisted_tokens_total Tokens an abandoned prefill left on disk as segments.\n");
     buf_puts(&b, "# TYPE pulsar:prefill_abandon_persisted_tokens_total counter\n");
@@ -1684,6 +1752,7 @@ void *client_main(void *arg) {
     }
     http_request_free(&hr);
     if (!ok) {
+        if (parse_refusal_get() == PARSE_REFUSED_BUSY) s->count_503(SERVER_503_PARSE_BUSY);   /* L378 */
         http_parse_error(fd, anthropic_surface, err);   /* 400, or the parse's own kind (L375: busy 503, render 500) */
         goto done;
     }
@@ -1737,7 +1806,10 @@ void *client_main(void *arg) {
             }
         }
     }
-    if (!enqueued) http_error_retry(fd, 503, "server shutting down", HTTP_RETRY_GOING_AWAY_S);
+    if (!enqueued) {
+        s->count_503(SERVER_503_SHUTDOWN);   /* L378 */
+        http_error_retry(fd, 503, "server shutting down", HTTP_RETRY_GOING_AWAY_S);
+    }
     pthread_cond_destroy(&j.cv);
     pthread_mutex_destroy(&j.mu);
     request_free(&j.req);

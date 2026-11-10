@@ -918,6 +918,135 @@ typedef struct {
 /// @param line  the header line (no line end)
 /// @param len   bytes at `line`
 void client_hints_read_line(client_hints *h, const char *line, size_t len);
+
+/* ---- L378: the KV evidence ------------------------------------------------------------------------------------
+ * One `kv req:` line a generation request, written when its job ends (server::kv_req_log), and a cumulative
+ * `kv ledger:` line an hour and at shutdown (server::kv_ledger_log).  Log lines and counters only: nothing here
+ * decides anything.  docs/SERVER.md ("KV evidence") is the lines' contract, field by field. */
+/** Where the router sent a request (server::choose_slot_for_job). */
+typedef enum {
+    KV_ROUTE_NONE = 0,   ///< never routed: it ended while queued
+    KV_ROUTE_IN_PLACE,   ///< it continues on its best bank (server_route_in_place)
+    KV_ROUTE_FRESH,      ///< an empty, dead, newly provisioned or just evicted bank
+    KV_ROUTE_CLOBBER,    ///< its best bank, over another conversation's history: no fresh bank could be had
+    KV_ROUTE_OWNER,      ///< the bank that owns its live tool call ids
+    /// L379: its best bank, in place: no fresh bank could be had and the only bank to free was that one
+    KV_ROUTE_MATCHED,
+    KV_ROUTES,           ///< array bound, not a route
+} kv_route;
+/// The routes' words in the `kv req:` line and the /metrics label, by kv_route
+extern const char *const kv_route_names[KV_ROUTES];
+/** The state a request's sync started from (server::gen_begin's resolution, read off its cache source). */
+typedef enum {
+    KV_PICK_NONE = 0,   ///< nothing: the sync started at token 0
+    KV_PICK_OWN,        ///< the bank's own history (its frontier, a grid checkpoint or a record)
+    KV_PICK_ADOPT,      ///< another resident bank's published state, copied in
+    KV_PICK_DISK,       ///< a disk chain
+    KV_PICK_LIVE,       ///< a live protocol continuation (Responses visible / tool output, Anthropic tool output)
+    KV_PICK_SPILLED,    ///< the bank's own history, restored from the chain its guard spill wrote
+    KV_PICKS,           ///< array bound, not a pick
+} kv_pick;
+/// The picks' words in the `kv req:` line and the /metrics label, by kv_pick
+extern const char *const kv_pick_names[KV_PICKS];
+/// The `noresume` words of the `kv req:` line, by pulsar_resume_why
+extern const char *const kv_resume_why_names[PULSAR_RESUME_WHYS];
+/** @param cache_source a resolution's cache source (gen_resolution::cache_source)
+ *  @param spill_restored the bank's history came back from its spill chain for this job
+ *  @return the pick it names (the one mapping from the resolution's word to the line's) */
+kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored);
+/// Bytes of a client id (session, agent, parent agent) the `kv req:` line prints
+#define KV_REQ_ID_CHARS 16
+/** Everything one `kv req:` line prints.  Kept on the job (job::kvr) and filled as each fact becomes known: the
+ *  request's own at enqueue (server::kv_req_key), the route in choose_slot_for_job, an eviction in
+ *  worker_evict_one, the pick in gen_begin_plan, the times and counts at its end (server::kv_req_log).  An int of
+ *  -1 and an empty string are "absent" and print as `-`. */
+typedef struct {
+    uint64_t id;         ///< the job's number (job::seq, given at enqueue)
+    const char *ep;      ///< the endpoint: chat, completions, responses, messages
+    const char *cls;     ///< the x-claude-code-request-class name ("" = no header)
+    bool ro;             ///< X-Pulsar-KV: read-only
+    char sess[KV_REQ_ID_CHARS + 1];     ///< x-claude-code-session-id, cut to KV_REQ_ID_CHARS
+    char agent[KV_REQ_ID_CHARS + 1];    ///< x-claude-code-agent-id, cut
+    char parent[KV_REQ_ID_CHARS + 1];   ///< x-claude-code-parent-agent-id, cut
+    bool has_pre;        ///< the prompt has a preamble end (a first user marker)
+    uint64_t pre;        ///< server_kv_token_hash of the prompt to its preamble end (server_prompt_preamble_end)
+    uint64_t conv;       ///< ... to its conversation key's end (server_prompt_conv_end)
+    int prompt;          ///< the prompt's tokens
+    int bank;            ///< the bank it bound to
+    kv_route route;      ///< where the router sent it
+    int best;            ///< the best-scoring free bank
+    int common;          ///< tokens it shares with that bank
+    int score;           ///< where that bank's sync would resume (the route's score)
+    int anchor;          ///< that bank's route anchor
+    int frontier;        ///< that bank's frontier
+    int prefilled;       ///< that bank's prefill frontier
+    pulsar_resume_why why;   ///< why the score is what it is (pulsar_bank_resume::why)
+    int deep;            ///< the deepest match any free bank had (the best bank's is `common`)
+    kv_pick pick;        ///< the state its sync started from
+    int from;            ///< the bank an adopt copied from
+    int at;              ///< where its sync started computing
+    int reused;          ///< its tokens served from state (the cache read)
+    int prefilled_now;   ///< tokens this request prefilled
+    bool spill_restored; ///< its bank's history came back from the spill chain for it
+    int evict;           ///< the bank its bind evicted (the last, when several)
+    int evict_tokens;    ///< that bank's history, in tokens
+    uint64_t evict_conv; ///< that history's conversation key (as `conv`)
+    bool evict_ro;       ///< that history was read-only (session_slot::kv_flags)
+    char snapshot[40];   ///< the eviction's snapshot word (server_evict_snapshot_word)
+    double qwait_ms;     ///< acceptance to bind (-1 = never bound)
+    double restore_ms;   ///< disk chain reads for it (0 = none)
+    double prefill_ms;   ///< prefill start to decode start (-1 = no decode started)
+    double ttft_ms;      ///< acceptance to the first generated token (-1 = none)
+    int out;             ///< tokens generated, every attempt
+    const char *finish;  ///< how it ended (the turn's finish label, or the refusal's word; NULL = unknown)
+} kv_req_line;
+/// Room for one formatted `kv req:` line (kv_req_format)
+#define KV_REQ_LINE_MAX 1024
+/** FNV-1a 64 over the first `n` token ids (each as 4 little-endian bytes): the ONE hash of the `kv req:` line's
+ *  pre, conv and evict_conv.  @param v the tokens  @param n how many (<= 0: the empty hash)  @return the hash */
+uint64_t server_kv_token_hash(const int *v, int n);
+/** @param prompt the prompt's tokens (NULL: -1)
+ *  @param m the template's turn markers
+ *  @return the position of the first user marker with no assistant marker before it -- the end of the shared
+ *          preamble (system prompt and tools) -- or -1 when there is none.  kv_cache_preamble_pos is this, held to
+ *          the disk tier's min_tokens. */
+int server_prompt_preamble_end(const pulsar_tokens *prompt, const pulsar_turn_markers *m);
+/** @param prompt the tokens (a request's prompt, or a bank's history)
+ *  @param m the template's turn markers
+ *  @return the end of the derived conversation key: the position of the first assistant marker (the preamble and
+ *          the user turns before the first reply: the same tokens on every turn of one conversation), or the whole
+ *          length when there is none (a completion, a template without markers) */
+int server_prompt_conv_end(const pulsar_tokens *prompt, const pulsar_turn_markers *m);
+/** Format one `kv req:` line (no prefix, no newline): every field, space-separated key=value, `-` for absent.
+ *  @param r the line's facts  @param out receives it  @param cap bytes at `out` (KV_REQ_LINE_MAX holds any) */
+void kv_req_format(const kv_req_line *r, char *out, size_t cap);
+/** L378: say how a bound job ended, for its `kv req:` line: the turn's finish label, or the server's word for an end
+ *  that is no turn ("failed", "busy", "gone", "conflict", "stream-failed", "refused-memory").  The first word stays.
+ *  @param g the job's generation  @param word the word */
+void gen_kv_finish(gen_state *g, const char *word);
+/** Why a request was answered 503, for the ledger (a prefill stopped by the memory floor is
+ *  server::m_prefill_mem_refusals, counted where it always was). */
+typedef enum {
+    SERVER_503_ADMISSION = 0,   ///< the prompt's KV does not fit the budget and nothing can be spilled
+    SERVER_503_IMAGE_BUSY,      ///< a prefill refused: the image-decode budget is held by other requests
+    SERVER_503_PARSE_BUSY,      ///< a parse refused as busy
+    SERVER_503_CONNECTIONS,     ///< too many connections
+    SERVER_503_SHUTDOWN,        ///< the server is shutting down
+    SERVER_503_SYSTEMONE,       ///< a /v1/systemone request refused (memory, shutdown, a failed prefill)
+    SERVER_503_CAUSES,          ///< array bound, not a cause
+} server_503_cause;
+/// The causes' words in the ledger line and the /metrics label, by server_503_cause
+extern const char *const server_503_cause_names[SERVER_503_CAUSES];
+/** The ledger's own counters (server::m_kvl, under server::mu); every other ledger value is a variable /metrics
+ *  already published. */
+typedef struct {
+    uint64_t requests;               ///< `kv req:` lines written
+    uint64_t routes[KV_ROUTES];      ///< ... by route
+    uint64_t picks[KV_PICKS];        ///< ... by pick
+    uint64_t evict_by[2][2];         ///< evictions for a request, [the victim's history read-only][the requester read-only]
+    uint64_t evict_own_best;         ///< ... where the victim was the requester's own best bank
+    uint64_t refused[SERVER_503_CAUSES];   ///< 503 answers by cause
+} kv_ledger_counts;
 /** Whether a disk-KV persist of a bank is skipped for a hint: the bank's history is dead (any reason but a shutdown
  *  or a guard spill, whose restore reads the chain), or the bank runs a compaction's summarization request (its
  *  prompt is the conversation that compaction retires: the continued / prompt / terminal stores). */
@@ -1581,6 +1710,9 @@ typedef struct {
     /// every restore decision, by its kv_restore_verdict
     uint64_t verdicts[KV_RESTORE_VERDICTS];
     uint64_t restored_tokens;          ///< tokens the loaded chains added over the banks' own resumes
+    /// L378: disk restores begun (kv_restore_begin), finished with the chain loaded (kv_restore_finish), failed (a
+    /// slice's fault, or a load that did not check out); begun - done - failed are running or were cancelled
+    uint64_t restores[3];
     uint64_t recomputed_tokens;        ///< tokens a RECOMPUTE verdict left to the prefill
     double last_transfer_ms;           ///< the last decision's read estimate
     double last_prefill_ms;            ///< ... and its prefill price
@@ -2162,6 +2294,13 @@ typedef enum {
                                       per-reason counters, not a reason */
 } provision_refusal;
 
+/** L379: what a make-room eviction would do (server_make_room). */
+typedef enum {
+    MAKE_ROOM_NONE = 0,   ///< no bank may go
+    MAKE_ROOM_EVICT,      ///< evict the victim
+    MAKE_ROOM_IN_PLACE,   ///< the victim is the requester's own best-matching bank: evict nothing, run in place on it
+} make_room_verdict;
+
 /** L280: the prompt's KV admission verdict (server::prompt_kv_check; the arithmetic is
  * server_prompt_kv_verdict in server_sched.cpp). */
 typedef enum {
@@ -2254,6 +2393,34 @@ struct kv_dup_census {
     int pairs[2];                ///< bank pairs sharing >= 1 whole page: [0] preamble (< PULSAR_KV_DUP_DEEP_TOKENS), [1] deep
     int longest[2];              ///< the longest shared prefix (tokens) of a pair in each class (0: no such pair)
 };
+
+/** L378: everything one `kv ledger:` line prints, read under server::mu (server::kv_ledger_read) from the variables
+ *  /metrics publishes -- the line and /metrics are two prints of the same counters. */
+typedef struct {
+    double uptime_s;              ///< seconds since the listener came up
+    kv_ledger_counts c;           ///< the ledger's own counters (server::m_kvl)
+    uint64_t evictions;           ///< server::m_evictions
+    bool disk;                    ///< the disk tier is on (the disk fields below are zeros when it is off)
+    pulsar_segstore_io io;        ///< the store's I/O ledger as last published (server::m_kv_disk_io)
+    uint64_t restores[3];         ///< disk restores begun / done / failed (kv_restore_meter::restores)
+    uint64_t restored_tokens;     ///< kv_restore_meter::restored_tokens
+    kv_dup_census dup;            ///< the last duplicate census (server::m_dup)
+    uint64_t dup_bytes_peak;      ///< server::m_dup_bytes_peak
+    uint64_t spills;              ///< server::m_spills
+    uint64_t preemptions;         ///< server::m_preemptions
+    uint64_t readmissions;        ///< server::m_readmissions
+    uint64_t prefill_refusals;    ///< server::m_prefill_mem_refusals (a 503 cause of its own)
+} kv_ledger_view;
+/// Room for one formatted `kv ledger:` line (kv_ledger_format)
+#define KV_LEDGER_LINE_MAX 2048
+/// Seconds between two `kv ledger:` lines while the server runs (the watchdog thread's clock)
+#define PULSAR_KV_LEDGER_PERIOD_S 3600
+/** Format one `kv ledger:` line (no prefix, no newline), key=value as the `kv req:` line.
+ *  @param v the ledger  @param out receives it  @param cap bytes at `out` (KV_LEDGER_LINE_MAX holds any) */
+void kv_ledger_format(const kv_ledger_view *v, char *out, size_t cap);
+/** @param now_s the watchdog's clock, seconds  @param last_s when the last hourly line was written (the start, before
+ *  the first)  @return true when the next hourly `kv ledger:` line is due */
+bool kv_ledger_due(int64_t now_s, int64_t last_s);
 
 /** L324: the census over injected per-slot facts (pure; server::kv_dup_census_update reads them): `n` slots,
  *  `hist_len[i]` the slot's history length (0 = none), `resident[i]` whether its KV is in GPU memory, `common[a][b]`
@@ -2576,6 +2743,8 @@ struct server {
     uint64_t m_kv_disk_segs_removed;  ///< L276: ... segments removed, ever
     uint64_t m_kv_disk_writes_failed;  ///< L353: ... files copied out whose write failed, ever
     uint64_t m_kv_disk_rps_removed;   ///< L276: ... restore points removed without their segment, ever
+    pulsar_segstore_io m_kv_disk_io;  ///< L378: ... its I/O ledger (bytes written, read, removed, removed unread)
+    kv_ledger_counts m_kvl;           ///< L378: the ledger's own counters (routes, picks, evictions by who, 503s)
     /// L276: segments persists copied out for writing, by trigger (kv_persist_trigger_names)
     uint64_t m_kv_disk_persisted[KV_PERSIST_TRIGGERS];
     /// L276: restore points persists copied out for writing, by trigger
@@ -3324,13 +3493,6 @@ struct server {
     /// @param was   receives a guard-spilled bank's history when it installs empty (bank_unspill); may be NULL
     /// @return false when the bank is preempted or its state restore failed (the session then holds no valid bank)
     bool bank_switch(int bank, spilled_history *was = nullptr);
-    /** Evict exactly one idle victim so a fresh conversation gets a bank.
-     * Live-tool owners are protected; dominated victims go first, else
-     * plain LRU (worker_evict_one's picker). Reuses the proven eviction body
-     * (snapshot + ledger release + bank reset). Worker thread only; returns
-     * true when a bank was freed. */
-    /// @return true when a bank was freed
-    bool fresh_make_room();
     /** L330: install a guard-spilled bank EMPTY: re-back its physical and invalidate it, its history left on disk
      *  where the spill put it (into `was` when given).  A job bound to it restores that history a slice of segments
      *  a worker turn (gen_begin, GEN_RESTORE_SPILLED); the make-room eviction and the shutdown persist keep what the
@@ -3395,8 +3557,9 @@ struct server {
     /// @param dec        the live decode set (never picked)
     /// @param n          its length
     /// @param dominated  per slot index: dominated slots go first (NULL = none)
+    /// @param scratch    per slot index: scratch slots go next (L379; NULL = none)
     /// @return the victim's slot index, or -1
-    int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr);
+    int guard_pick_victim(session_slot **dec, int n, const bool *dominated = nullptr, const bool *scratch = nullptr);
     /** Proactive-eviction guard: spill banks to disk until resident KV is back
      * under guard_touched_budget; L328 (5): with every idle bank spilled and the breach standing, preempt the
      * newest decoders (L314) while one makes the rest fit.  @param dec the decode set that must be kept
@@ -3458,6 +3621,31 @@ struct server {
      */
     /// @param counter  the server counter to increment
     void count_metric(uint64_t *counter);
+    /** L378: set a job's `kv req:` fields that are the request's own -- endpoint, class, read-only, the client ids,
+     *  the two prompt hashes -- and mark every later field absent.  Once per job, by its client thread as it enqueues
+     *  (server::enqueue, which gives the id): the worker only ever sees a keyed job. */
+    /// @param j  the job about to be queued
+    void kv_req_key(job *j);
+    /** L378: write a job's `kv req:` line and count it in the ledger: once, where the job ends -- worker_finish_slot
+     *  for a bound job (its times and token counts read off the slot's gen_state), worker_try_bind for one that ends
+     *  while queued. */
+    /// @param j       the job
+    /// @param sl      the slot it ran on, its gen_state still attached (NULL: it never bound)
+    /// @param finish  how it ended, for a job that never bound (NULL: the slot's gen_state::kv_finish)
+    void kv_req_log(job *j, const session_slot *sl, const char *finish);
+    /** L378: copy the ledger's values under mu (any thread). */
+    /// @param v     receives them
+    /// @param wait  block for mu (false: try it once -- the watchdog never waits on a held lock)
+    /// @return false when mu was held and `wait` is false (nothing read)
+    bool kv_ledger_read(kv_ledger_view *v, bool wait);
+    /** L378: write the `kv ledger:` line (any thread): the watchdog thread every PULSAR_KV_LEDGER_PERIOD_S, main at
+     *  shutdown. */
+    /// @param wait  as kv_ledger_read
+    /// @return false when nothing was written (mu was held)
+    bool kv_ledger_log(bool wait);
+    /** L378: count a 503 answer (takes mu; any thread). */
+    /// @param cause  why it was refused
+    void count_503(server_503_cause cause);
     /** Parse-time id lookups run on client threads before the request is bound to
      * a slot, so they scan every provisioned slot's live binding. n_slots is
      * published under mu (its owning lock) — take mu for the snapshot rather than
@@ -3501,17 +3689,31 @@ struct server {
     /// @param protect  per slot index: slots that must not be evicted
     /// @return true when evicting the unprotected idle slots could admit it
     bool worker_eviction_could_help(const job *j, const bool *protect);
-    /** Evict one idle slot (LRU victim): snapshot to the disk kv cache when
-     * possible, free the session, release the ledger, and leave the slot entry
+    /** L379: the victim classes of every slot, the facts both victim orders rank by (server_victim_rank): the
+     *  make-room eviction's (server_evict_pick_victim) and the guard's spill order (guard_pick_victim). */
+    /// @param dominated  receives, per slot index: dominated (dominated_slots) or a dead prefix (hint_dead)
+    /// @param scratch    receives, per slot index: scratch (server_slot_is_scratch over its frontier and the disk
+    ///                   tier's min_tokens)
+    void victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[PULSAR_SESSION_POOL_CAP]);
+    /** L379: which bank a make-room eviction would free now, and what to do about it (server_make_room over the
+     *  queued live-tool owners, the queued jobs' warm matches and victim_facts).  The ONE pick of the fresh path
+     *  (choose_slot_for_job) and the bind loop (worker_try_bind).  Evicts nothing.  Worker thread only. */
+    /// @param best    the requester's own best-matching bank (NULL: none)
+    /// @param victim  receives the slot index that would go (-1: none)
+    /// @param rank    receives its server_victim_rank (-1: none)
+    /// @return MAKE_ROOM_EVICT to evict `victim`, MAKE_ROOM_IN_PLACE when it is `best`, MAKE_ROOM_NONE
+    make_room_verdict make_room(const session_slot *best, int *victim, int *rank);
+    /** Evict one idle slot, make_room's victim: snapshot to the disk kv cache when
+     * possible, release the ledger, and leave the slot entry
      * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
      * unavailable snapshot only costs the returning client a re-prefill — the
      * eviction itself proceeds, and the response always belongs to the right
-     * conversation because the freed KV can never be read again. Returns false
-     * when nothing is evictable. Worker thread only.
+     * conversation because the freed KV can never be read again. Worker thread only.
      */
-    /// @param protect  per slot index: slots that must not be evicted
-    /// @return false when nothing is evictable
-    bool worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]);
+    /// @param vi       the slot to evict (provisioned, idle)
+    /// @param rank     its server_victim_rank, for the log line
+    /// @param for_job  the request the eviction is for (its `kv req:` line and the ledger record it, L378)
+    void worker_evict(int vi, int rank, job *for_job);
     /** Bind the head job to a slot if routing allows it. Strict FIFO: when the
      * head must wait (its owner slot is busy, or no fitting slot is free), later
      * jobs wait behind it — simple and starvation-free.  L329 (a): the "head" is
@@ -3758,6 +3960,7 @@ struct job {
      *  freed address is not the leader). */
     uint64_t seq;
     prefix_wait pw;   ///< L329 (a): its wait for another prompt's prefill while queued
+    kv_req_line kvr;  ///< L378: what its `kv req:` line will print, filled as it becomes known (worker thread)
     /** L249 D: the early stream.  A streaming request the worker has not started writing to gets its SSE head and
      *  keepalives from its client thread once it has waited PULSAR_SERVER_HEARTBEAT_MS (queued for a bank, a slot,
      *  a prefill it shares): a gateway in front (Cloudflare's ~100 s origin timeout) sees bytes from then on, not at
@@ -4096,6 +4299,8 @@ struct gen_state {
      * it, and this is that backed-up position. */
     size_t stop_scan_from;
     const char *finish;       ///< finish reason once known ("stop", "length", ...); NULL while running
+    /// L378: how the job ended in the server's own words, for its `kv req:` line ("" until it ends; gen_kv_finish)
+    char kv_finish[24];
     /** L372: the decode was abandoned (its client gone: lane_abandon).  The wire keeps a valid finish reason
      *  (`finish`, for a half-closed reader); the server's own records say "abandoned" -- the log lines and the trace --
      *  and the turn is neither observed in the request histograms nor given a terminal checkpoint. */
@@ -5373,11 +5578,53 @@ TokPos server_live_continuation_start(TokCount common, TokPos live_pos);
  * index or -1. Pure selection over host fields — never touches the session
  * (defined in server_sched.cpp; unit-tested in server_tests.cpp).  L323: a slot
  * `dominated` marks (server::dominated_slots; NULL = none) goes before any LRU
- * choice. */
+ * choice.  L379: then a slot `scratch` marks (server_slot_is_scratch; NULL =
+ * none), before any LRU choice among conversations. */
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
                                     const bool *protect,
                                     bool allow_slot0 = false,
-                                    const bool *dominated = nullptr);
+                                    const bool *dominated = nullptr,
+                                    const bool *scratch = nullptr);
+/** L379: a SCRATCH bank -- an idle provisioned bank whose history was last taken by a read-only request
+ *  (session_slot::kv_flags, X-Pulsar-KV: the gate's judge), or whose frontier is under the disk tier's minimum (a
+ *  history the tier itself does not save).  Never preserved for its own sake: the first victim after dominated and
+ *  dead banks (server_victim_rank), and no queued job's warm match keeps it (server_make_room).
+ *  @param sl          the slot
+ *  @param frontier    its frontier, tokens (server::slot_frontier_pos)
+ *  @param min_tokens  the disk tier's minimum (kv_cache_options::min_tokens; 0 with the tier off: only the
+ *                     read-only half applies)
+ *  @return true when the bank is scratch */
+bool server_slot_is_scratch(const session_slot *sl, int frontier, int min_tokens);
+/** L379: the victim classes' order, the ONE rule of the make-room eviction and the guard's spill order: 0 a
+ *  dominated or dead bank, 1 a scratch one, 2 a conversation.  The lower rank goes first; LRU decides within one.
+ *  @param dominated  the bank is dominated, or holds a dead prefix
+ *  @param scratch    the bank is scratch
+ *  @return the rank */
+int server_victim_rank(bool dominated, bool scratch);
+/** L379: a request takes a bank's history (gen_begin, after the old history's own persist): the bank carries the
+ *  request's X-Pulsar-KV tokens -- read-only makes it scratch, a request without it clears that -- its session
+ *  hint, and is no dead prefix any more.
+ *  @param sl  the bank's slot
+ *  @param r   the request */
+void server_slot_take_history(session_slot *sl, const request *r);
+/** L379: which bank a make-room eviction frees, over injected facts (server::make_room reads them): the victim
+ *  among the idle provisioned slots (server_evict_pick_victim's order) sparing the queued live-tool `owners` always
+ *  and, first, every queued job's usable `warm` match that is not scratch; with nothing left, the owners alone
+ *  (binding must progress).  A request never evicts the bank it matched best: when the victim is `best`, the verdict
+ *  is to run in place on it.
+ *  @param slots        the slot array
+ *  @param n_slots      its length
+ *  @param owners       per slot: owned by a queued live-tool continuation, never evicted (NULL: none)
+ *  @param warm         per slot: some queued job's usable warm match (NULL: none)
+ *  @param allow_slot0  slot 0 may go (pool mode)
+ *  @param dominated    per slot: dominated or dead (NULL: none)
+ *  @param scratch      per slot: scratch (NULL: none)
+ *  @param best         the requester's own best-matching slot (-1: none)
+ *  @param victim       receives the slot that would go (-1: none)
+ *  @return the verdict */
+make_room_verdict server_make_room(const session_slot *slots, int n_slots, const bool *owners, const bool *warm,
+                                   bool allow_slot0, const bool *dominated, const bool *scratch, int best,
+                                   int *victim);
 void trace_cache_capture(
         trace_cache_diag *d,
         const pulsar_tokens *live,

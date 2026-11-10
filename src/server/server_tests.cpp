@@ -9760,6 +9760,558 @@ static void test_l372_abandoned_decode_is_not_a_turn(void) {
     TEST_ASSERT(g.abandoned && g.phase == GEN_FINISH && !g.batch_feed_valid && !strcmp(g.finish, "length"));
 }
 
+/* L378: the one hash of the `kv req:` line (pre, conv, evict_conv) is stable -- FNV-1a 64 over the ids' little-endian
+ * bytes, known values -- and bounded by its position: the tokens past `n` never reach it.  The two ends it is taken
+ * to: the preamble's (the first user marker) and the conversation key's (the first assistant marker), which every
+ * turn of one conversation shares and two conversations behind one system prompt do not. */
+static void test_l378_token_hash_and_conversation_key(void) {
+    const int v[6] = {1, 2, 3, 4, 5, 6}, w[6] = {1, 2, 3, 9, 9, 9};
+    TEST_ASSERT(server_kv_token_hash(v, 0) == UINT64_C(0xcbf29ce484222325) && server_kv_token_hash(NULL, 0) ==
+                                                                                 server_kv_token_hash(v, -1));
+    TEST_ASSERT(server_kv_token_hash(v, 3) == UINT64_C(0xfd1f0f4381eb0395));
+    TEST_ASSERT(server_kv_token_hash(v, 4) == UINT64_C(0x84c39a079fc08121));
+    TEST_ASSERT(server_kv_token_hash(v, 3) == server_kv_token_hash(w, 3));   /* position-bounded */
+    TEST_ASSERT(server_kv_token_hash(v, 4) != server_kv_token_hash(w, 4));
+
+    pulsar_turn_markers m;
+    memset(&m, 0, sizeof m);
+    m.user[0] = 900;
+    m.n_user = 1;
+    m.assistant[0] = 901;
+    m.n_assistant = 1;
+    /* system 10 11 12 | user 20 21 | assistant: turn 1 ends at its generation header, turn 2 carries the reply and
+     * the next user turn; another conversation asks something else behind the same system prompt */
+    int t1[] = {10, 11, 12, 900, 20, 21, 901};
+    int t2[] = {10, 11, 12, 900, 20, 21, 901, 30, 31, 900, 40, 901};
+    int o1[] = {10, 11, 12, 900, 50, 51, 52, 901};
+    const pulsar_tokens p1 = {t1, 7, 7}, p2 = {t2, 12, 12}, q1 = {o1, 8, 8};
+    TEST_ASSERT(server_prompt_preamble_end(&p1, &m) == 3 && server_prompt_preamble_end(&p2, &m) == 3);
+    TEST_ASSERT(server_prompt_conv_end(&p1, &m) == 6 && server_prompt_conv_end(&p2, &m) == 6 &&
+                server_prompt_conv_end(&q1, &m) == 7);
+    const uint64_t c1 = server_kv_token_hash(p1.v, server_prompt_conv_end(&p1, &m));
+    TEST_ASSERT(c1 == server_kv_token_hash(p2.v, server_prompt_conv_end(&p2, &m)));   /* the same on every turn */
+    TEST_ASSERT(c1 != server_kv_token_hash(q1.v, server_prompt_conv_end(&q1, &m)));   /* another conversation */
+    TEST_ASSERT(server_kv_token_hash(p1.v, 3) == server_kv_token_hash(q1.v, 3));      /* one shared preamble */
+    /* no markers (a completion, a template without them): no preamble, the whole prompt is the key */
+    pulsar_turn_markers none;
+    memset(&none, 0, sizeof none);
+    TEST_ASSERT(server_prompt_preamble_end(&p1, &none) == -1 && server_prompt_conv_end(&p1, &none) == 7);
+    TEST_ASSERT(server_prompt_preamble_end(NULL, &m) == -1 && server_prompt_conv_end(NULL, &m) == 0);
+    /* an assistant turn before any user turn: no preamble; the key ends at that turn */
+    int a0[] = {10, 901, 11, 900, 12};
+    const pulsar_tokens pa = {a0, 5, 5};
+    TEST_ASSERT(server_prompt_preamble_end(&pa, &m) == -1 && server_prompt_conv_end(&pa, &m) == 1);
+    /* the disk tier's preamble rule is this position held to its min_tokens */
+    kv_disk_cache kc;
+    memset(&kc, 0, sizeof kc);
+    kc.opt.min_tokens = 3;
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &p1, &m) == 3);
+    kc.opt.min_tokens = 4;
+    TEST_ASSERT(kv_cache_preamble_pos(&kc, &p1, &m) == -1);
+}
+
+/* L378: the `kv req:` line prints every field, in order, for a request with all of them (the CT 130 worst case: a
+ * read-only request that shared 60,460 tokens with bank 0, evicted bank 1 and resumed from a disk anchor), and `-`
+ * for each absent one. */
+static void test_l378_kv_req_line_format(void) {
+    kv_req_line r;
+    memset(&r, 0, sizeof r);
+    r.id = 4711;
+    r.ep = "messages";
+    r.cls = "subagent";
+    r.ro = true;
+    snprintf(r.sess, sizeof r.sess, "0123456789abcdef");
+    snprintf(r.agent, sizeof r.agent, "agent 7");   /* a blank inside a value prints as _ */
+    r.has_pre = true;
+    r.pre = UINT64_C(0x00000000000000ab);
+    r.conv = UINT64_C(0xfd1f0f4381eb0395);
+    r.prompt = 60812;
+    r.bank = 1;
+    r.route = KV_ROUTE_FRESH;
+    r.best = 0;
+    r.common = 60460;
+    r.score = 0;
+    r.anchor = 31104;
+    r.frontier = 60987;
+    r.prefilled = 60900;
+    r.why = PULSAR_RESUME_CHECKPOINT_ABOVE;
+    r.deep = 60460;
+    r.pick = KV_PICK_DISK;
+    r.from = -1;
+    r.at = 31104;
+    r.reused = 31104;
+    r.prefilled_now = 29708;
+    r.evict = 1;
+    r.evict_tokens = 69233;
+    r.evict_conv = UINT64_C(0x84c39a079fc08121);
+    r.evict_ro = false;
+    snprintf(r.snapshot, sizeof r.snapshot, "none (read-only)");
+    r.qwait_ms = 3.4;
+    r.restore_ms = 456.0;
+    r.prefill_ms = 37300.2;
+    r.ttft_ms = 38012.0;
+    r.out = 16;
+    r.finish = "stop";
+    char line[KV_REQ_LINE_MAX];
+    kv_req_format(&r, line, sizeof line);
+    printf("  L378 example: pulsar-server: kv req: %s\n", line);
+    TEST_ASSERT(!strcmp(line,
+        "id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- "
+        "pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 "
+        "anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 "
+        "prefilled_now=29708 below=29356 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 "
+        "snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop"));
+    /* an adopt names its source bank; a resume point inside the match has no noresume */
+    r.pick = KV_PICK_ADOPT;
+    r.from = 3;
+    r.score = 12288;
+    kv_req_format(&r, line, sizeof line);
+    TEST_ASSERT(strstr(line, " pick=adopt from=3 ") && strstr(line, " noresume=- "));
+
+    /* a request that ended in the queue: everything the worker never learned is `-` */
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    job j;
+    memset(&j, 0, sizeof j);
+    int toks[] = {10, 11, 12};
+    j.req.prompt = {toks, 3, 3};
+    j.req.kind = REQ_COMPLETION;
+    snprintf(j.req.hints.session, sizeof j.req.hints.session, "a-session-id-longer-than-sixteen-chars");
+    s.kv_req_key(&j);
+    j.kvr.id = 9;
+    TEST_ASSERT(!strcmp(j.kvr.sess, "a-session-id-lon"));   /* as received, cut to 16 */
+    j.kvr.finish = "gone-queued";
+    kv_req_format(&j.kvr, line, sizeof line);
+    char want[KV_REQ_LINE_MAX];
+    snprintf(want, sizeof want,
+             "id=9 ep=completions class=- ro=0 sess=a-session-id-lon agent=- parent=- pre=- conv=%016llx prompt=3 "
+             "bank=- route=none best=- common=- score=- anchor=- frontier=- prefilled=- noresume=- pick=none from=- "
+             "at=- reused=- prefilled_now=- below=- evict=- evict_tokens=- evict_conv=- evict_ro=- snapshot=- "
+             "qwait_ms=- restore_ms=0 prefill_ms=- ttft_ms=- out=0 finish=gone-queued",
+             (unsigned long long)server_kv_token_hash(toks, 3));
+    TEST_ASSERT(!strcmp(line, want));
+    /* the endpoints and the class */
+    j.req.kind = REQ_CHAT;
+    j.req.kv_flags = KV_HDR_READ_ONLY;
+    j.req.hints.cls = REQ_CLASS_MAIN;
+    s.kv_req_key(&j);
+    TEST_ASSERT(!strcmp(j.kvr.ep, "chat") && j.kvr.ro && !strcmp(j.kvr.cls, "main"));
+    j.req.api = API_RESPONSES;
+    s.kv_req_key(&j);
+    TEST_ASSERT(!strcmp(j.kvr.ep, "responses"));
+    j.req.api = API_ANTHROPIC;
+    s.kv_req_key(&j);
+    TEST_ASSERT(!strcmp(j.kvr.ep, "messages"));
+    /* writing the line counts it in the ledger, by its route and pick */
+    j.kvr.route = KV_ROUTE_IN_PLACE;
+    j.kvr.pick = KV_PICK_OWN;
+    s.kv_req_log(&j, NULL, "refused-kv");
+    TEST_ASSERT(s.m_kvl.requests == 1 && s.m_kvl.routes[KV_ROUTE_IN_PLACE] == 1 && s.m_kvl.picks[KV_PICK_OWN] == 1 &&
+                !strcmp(j.kvr.finish, "refused-kv"));
+    /* the line's pick is read off the resolution's cache source */
+    TEST_ASSERT(kv_pick_of_source("none", false) == KV_PICK_NONE && kv_pick_of_source(NULL, true) == KV_PICK_NONE);
+    TEST_ASSERT(kv_pick_of_source("memory-token", false) == KV_PICK_OWN &&
+                kv_pick_of_source("memory-checkpoint", false) == KV_PICK_OWN &&
+                kv_pick_of_source("memory-token", true) == KV_PICK_SPILLED);
+    TEST_ASSERT(kv_pick_of_source("bank-adopt", true) == KV_PICK_ADOPT && kv_pick_of_source("disk-text", false) == KV_PICK_DISK);
+    TEST_ASSERT(kv_pick_of_source("responses-visible", false) == KV_PICK_LIVE &&
+                kv_pick_of_source("responses-tool-output", false) == KV_PICK_LIVE &&
+                kv_pick_of_source("anthropic-tool-output", false) == KV_PICK_LIVE);
+    /* a job's end word: the first one stays */
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    gen_kv_finish(&g, "refused-memory");
+    gen_kv_finish(&g, "stop");
+    TEST_ASSERT(!strcmp(g.kv_finish, "refused-memory"));
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L378: the `kv ledger:` line prints the variables /metrics publishes (read under mu by server::kv_ledger_read),
+ * every field, and is due once an hour. */
+static void test_l378_kv_ledger_line(void) {
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    s.started = time(NULL) - 7200;
+    s.m_kvl.requests = 309;
+    s.m_kvl.routes[KV_ROUTE_IN_PLACE] = 65;
+    s.m_kvl.routes[KV_ROUTE_FRESH] = 193;
+    s.m_kvl.routes[KV_ROUTE_CLOBBER] = 2;
+    s.m_kvl.routes[KV_ROUTE_OWNER] = 30;
+    s.m_kvl.routes[KV_ROUTE_MATCHED] = 5;
+    s.m_kvl.routes[KV_ROUTE_NONE] = 19;
+    s.m_kvl.picks[KV_PICK_OWN] = 65;
+    s.m_kvl.picks[KV_PICK_ADOPT] = 51;
+    s.m_kvl.picks[KV_PICK_DISK] = 86;
+    s.m_kvl.picks[KV_PICK_LIVE] = 30;
+    s.m_kvl.picks[KV_PICK_SPILLED] = 1;
+    s.m_kvl.picks[KV_PICK_NONE] = 76;
+    s.m_evictions = 164;
+    s.m_kvl.evict_by[0][0] = 31;
+    s.m_kvl.evict_by[0][1] = 4;
+    s.m_kvl.evict_by[1][0] = 20;
+    s.m_kvl.evict_by[1][1] = 109;
+    s.m_kvl.evict_own_best = 39;
+    s.m_kv_disk_enabled = true;
+    s.m_kv_disk_io.rows_bytes_written = 9200;
+    s.m_kv_disk_io.rp_bytes_written = 27400;
+    s.m_kv_disk_io.segs_written = 179;
+    s.m_kv_disk_io.rps_written = 115;
+    s.m_kv_disk_io.rows_bytes_read = 1300;
+    s.m_kv_disk_io.rp_bytes_read = 1900;
+    s.m_kv_disk_io.segs_read = 90;
+    s.m_kv_disk_io.rps_read = 86;
+    s.m_kv_disk_io.bytes_removed = 500;
+    s.m_kv_disk_io.budget_bytes_removed = 400;
+    s.m_kv_disk_io.unread_bytes_removed = 350;
+    s.kv.meter.restores[0] = 88;
+    s.kv.meter.restores[1] = 86;
+    s.kv.meter.restores[2] = 1;
+    s.kv.meter.restored_tokens = 2281088;
+    s.m_dup.banks = 2;
+    s.m_dup.pages_resident = 31;
+    s.m_dup.pages_shared = 3;
+    s.m_dup.dup_bytes = KvBytes{4096};
+    s.m_dup_bytes_peak = KvBytes{8192};
+    s.m_dup.pairs[1] = 1;
+    s.m_dup.longest[1] = 24512;
+    s.m_spills = 7;
+    s.m_preemptions = 1;
+    s.m_readmissions = 1;
+    s.m_prefill_mem_refusals = 2;
+    s.count_503(SERVER_503_ADMISSION);
+    s.count_503(SERVER_503_SYSTEMONE);
+    s.count_503(SERVER_503_SYSTEMONE);
+    kv_ledger_view v;
+    TEST_ASSERT(s.kv_ledger_read(&v, false) && v.uptime_s >= 7200.0 && v.uptime_s < 7210.0);
+    v.uptime_s = 7200.0;
+    char line[KV_LEDGER_LINE_MAX];
+    kv_ledger_format(&v, line, sizeof line);
+    printf("  L378 example: pulsar-server: kv ledger: %s\n", line);
+    TEST_ASSERT(!strcmp(line,
+        "uptime_s=7200 requests=309 route_in-place=65 route_fresh=193 route_clobber=2 route_owner=30 route_matched=5 route_none=19 "
+        "pick_own=65 pick_adopt=51 pick_disk=86 pick_live=30 pick_spilled=1 pick_none=76 evictions=164 "
+        "evict_conv_by_conv=31 evict_conv_by_ro=4 evict_ro_by_conv=20 evict_ro_by_ro=109 evict_own_best=39 disk=1 "
+        "seg_written_bytes=9200 rp_written_bytes=27400 segs_written=179 rps_written=115 seg_read_bytes=1300 "
+        "rp_read_bytes=1900 segs_read=90 rps_read=86 removed_bytes=500 removed_budget_bytes=400 "
+        "removed_unread_bytes=350 restores_begun=88 restores_done=86 restores_failed=1 restored_tokens=2281088 "
+        "dup_banks=2 dup_pages_resident=31 dup_pages_shared=3 dup_bytes=4096 dup_bytes_peak=8192 dup_deep_pairs=1 "
+        "dup_deep_longest=24512 spills=7 preemptions=1 readmissions=1 refused_admission=1 refused_image_busy=0 "
+        "refused_parse_busy=0 refused_connections=0 refused_shutdown=0 refused_systemone=2 refused_prefill=2"));
+    /* the watchdog's read never waits on a held mu: the line stays due */
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(!s.kv_ledger_read(&v, false) && !s.kv_ledger_log(false));
+    pthread_mutex_unlock(&s.mu);
+    TEST_ASSERT(s.kv_ledger_log(true));
+    TEST_ASSERT(!kv_ledger_due(1000 + PULSAR_KV_LEDGER_PERIOD_S - 1, 1000) &&
+                kv_ledger_due(1000 + PULSAR_KV_LEDGER_PERIOD_S, 1000));
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L378: the store's I/O ledger and its "was read" bit.  A file removed without any load having mapped it counts as
+ * removed unread; one removed after a load does not.  Written bytes count at the commit, read bytes at each map, and
+ * a removal for room (the budget) is told from a drop. */
+static void test_l378_segstore_io_ledger(void) {
+    char tmpl[] = "/tmp/pulsar-seg-io.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, 7, NULL, NULL);
+    TEST_ASSERT(st != NULL);
+    pulsar_segstore_io io;
+    pulsar_segstore_io_stats(NULL, &io);
+    TEST_ASSERT(io.bytes_removed == 0 && io.rows_bytes_written == 0);
+    char a[41], b[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "READ:", 100, 0x11, a));
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "NEVER:", 200, 0x22, b));
+    pulsar_segstore_seg ea, eb;
+    TEST_ASSERT(pulsar_segstore_get(st, a, &ea) && pulsar_segstore_get(st, b, &eb) && !ea.rows_read && !eb.rows_read);
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.segs_written == 2 && io.rows_bytes_written == ea.file_bytes + eb.file_bytes && io.rps_written == 0 &&
+                io.segs_read == 0 && io.rows_bytes_read == 0 && io.bytes_removed == 0);
+    /* a load maps `a` */
+    const uint8_t *pp = NULL;
+    uint64_t len = 0;
+    char err[256];
+    TEST_ASSERT(pulsar_segstore_map_part(st, a, PULSAR_SEGSTORE_PART_ROWS, &pp, &len, NULL, err, sizeof err) == 0);
+    pulsar_segstore_unmap_part(st, a, PULSAR_SEGSTORE_PART_ROWS);
+    TEST_ASSERT(pulsar_segstore_get(st, a, &ea) && ea.rows_read && pulsar_segstore_get(st, b, &eb) && !eb.rows_read);
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.segs_read == 1 && io.rows_bytes_read == ea.file_bytes);
+    /* a map that fails reads nothing */
+    char none[41];
+    memset(none, 'f', 40);
+    none[40] = '\0';
+    TEST_ASSERT(pulsar_segstore_map_part(st, none, PULSAR_SEGSTORE_PART_ROWS, &pp, &len, NULL, err, sizeof err) == 1);
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.segs_read == 1);
+    /* the read one removed: not unread.  The other: unread. */
+    pulsar_segstore_drop(st, a);
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.bytes_removed == ea.file_bytes && io.unread_bytes_removed == 0 && io.budget_bytes_removed == 0);
+    pulsar_segstore_drop(st, b);
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.bytes_removed == ea.file_bytes + eb.file_bytes && io.unread_bytes_removed == eb.file_bytes &&
+                io.budget_bytes_removed == 0);
+    /* a restore point: written, read, and removed with its segment as read; one never read is unread */
+    char c[41], d[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "C:", 100, 0x33, c) && test_seg_put(st, "", 0, 128, "D:", 100, 0x44, d));
+    test_seg_payload rp = {64, 0x55};
+    TEST_ASSERT(pulsar_segstore_put_rp(st, c, 64, 0, test_seg_write, &rp, err, sizeof err));
+    TEST_ASSERT(pulsar_segstore_put_rp(st, d, 64, 0, test_seg_write, &rp, err, sizeof err));
+    pulsar_segstore_seg ec;
+    TEST_ASSERT(pulsar_segstore_get(st, c, &ec) && ec.rp_bytes > 0 && !ec.rp_read);
+    pulsar_segstore_io before;
+    pulsar_segstore_io_stats(st, &before);
+    TEST_ASSERT(before.rps_written == 2 && before.rp_bytes_written == 2 * ec.rp_bytes);
+    TEST_ASSERT(pulsar_segstore_map_part(st, c, PULSAR_SEGSTORE_PART_RP, &pp, &len, NULL, err, sizeof err) == 0);
+    pulsar_segstore_unmap_part(st, c, PULSAR_SEGSTORE_PART_RP);
+    TEST_ASSERT(pulsar_segstore_drop_rp(st, c) && pulsar_segstore_drop_rp(st, d));
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(io.rps_read == 1 && io.rp_bytes_read == ec.rp_bytes);
+    TEST_ASSERT(io.bytes_removed - before.bytes_removed == 2 * ec.rp_bytes &&
+                io.unread_bytes_removed - before.unread_bytes_removed == ec.rp_bytes);
+    pulsar_segstore_close(st);
+    /* a store over its budget evicts: the bytes count as removed for room, and -- kept from an earlier run, never
+     * mapped in this one -- as unread */
+    st = pulsar_segstore_open(dir, ec.file_bytes * 2 + 16, 7, NULL, NULL);
+    TEST_ASSERT(st != NULL && pulsar_segstore_count(st) == 2);
+    char e[41];
+    TEST_ASSERT(test_seg_put(st, "", 0, 128, "E:", 100, 0x66, e));
+    pulsar_segstore_io_stats(st, &io);
+    TEST_ASSERT(pulsar_segstore_count(st) == 2 && io.bytes_removed == ec.file_bytes &&
+                io.budget_bytes_removed == ec.file_bytes && io.unread_bytes_removed == ec.file_bytes);
+    pulsar_segstore_close(st);
+    char cmd[4200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    TEST_ASSERT(system(cmd) == 0);
+}
+
+/* L379: the CT 130 shapes (2026-11-02..10, two chat banks), replayed on the one pick the fresh path and the bind loop
+ * share (server_make_room) over the facts the server injects: which bank would go, and whether it is the requester's
+ * own best match.  Each leg says what the code did before L379. */
+/// @param slots     receives `n` idle provisioned banks (bank i on slot i)
+/// @param n         how many
+/// @param tokens    per bank: its history, tokens
+/// @param ro        per bank: its history was taken by a read-only request
+/// @param served    per bank: its last service (the LRU key)
+/// @param scratch   receives, per bank, server_slot_is_scratch at the disk tier's default minimum
+static void l379_banks(session_slot *slots, int n, const int *tokens, const bool *ro, const uint64_t *served,
+                       bool scratch[PULSAR_SESSION_POOL_CAP]) {
+    memset(slots, 0, sizeof(session_slot) * PULSAR_SESSION_POOL_CAP);
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) scratch[i] = false;
+    const int min_tokens = kv_cache_default_options().min_tokens;
+    for (int i = 0; i < n; i++) {
+        slots[i].provisioned = true;
+        slots[i].bank = (uint32_t)i;
+        slots[i].kv_flags = ro[i] ? KV_HDR_READ_ONLY : 0u;
+        slots[i].last_serviced_us = served[i];
+        scratch[i] = server_slot_is_scratch(&slots[i], tokens[i], min_tokens);
+    }
+}
+
+static void test_l379_request_does_not_evict_its_matched_bank(void) {
+    session_slot slots[PULSAR_SESSION_POOL_CAP];
+    bool scratch[PULSAR_SESSION_POOL_CAP];
+    int victim = -9;
+    /* (i) bank 0: a judge request's history, 60,987 tokens, read-only; bank 1: a conversation, 69,233 tokens, idle
+     * longer.  A read-only request whose best match is bank 0 (common 60,460, score 0: no queued job's warm match)
+     * is routed fresh, and no bank is empty.  Before: bank 1, the conversation, was evicted (the LRU; 2026-11-06
+     * 12:57, its next turn a 503).  Now: bank 0 is scratch, so it is the bank that would go -- and it is the
+     * request's own best match, so nothing is evicted and the request runs in place on it. */
+    {
+        const int tokens[2] = {60987, 69233};
+        const bool ro[2] = {true, false};
+        const uint64_t served[2] = {200, 100};
+        l379_banks(slots, 2, tokens, ro, served, scratch);
+        TEST_ASSERT(scratch[0] && !scratch[1]);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, /*best=*/0, &victim) ==
+                    MAKE_ROOM_IN_PLACE);
+        TEST_ASSERT(victim == 0);
+        /* (ii) the same with bank 1 BUSY.  Before: bank 0, the matched bank, was evicted and the request started
+         * fresh on its slot (39 requests, 963,922 tokens of live match).  Now: in place, nothing evicted. */
+        slots[1].active_job = (struct job *)slots;
+        victim = -9;
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE);
+        TEST_ASSERT(victim == 0);
+        /* a conversation's bank too: with only the matched bank free, the request runs in place on it */
+        slots[0].kv_flags = 0u;
+        scratch[0] = false;
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_IN_PLACE);
+        /* a request with no best bank (nothing free fits it) evicts as before */
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 0);
+        /* and with nothing idle, nothing goes */
+        slots[0].active_job = (struct job *)slots;
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_NONE &&
+                    victim == -1);
+    }
+}
+
+static void test_l379_scratch_banks_go_first(void) {
+    session_slot slots[PULSAR_SESSION_POOL_CAP];
+    bool scratch[PULSAR_SESSION_POOL_CAP];
+    int victim = -9;
+    TEST_ASSERT(server_victim_rank(true, false) == 0 && server_victim_rank(true, true) == 0 &&
+                server_victim_rank(false, true) == 1 && server_victim_rank(false, false) == 2);
+    /* (iii) two scratch banks (judge histories): a third read-only conversation, matching the newer one best,
+     * evicts the least recently used scratch bank (as before: plain LRU among equals) */
+    {
+        const int tokens[2] = {41200, 60987};
+        const bool ro[2] = {true, true};
+        const uint64_t served[2] = {100, 200};
+        l379_banks(slots, 2, tokens, ro, served, scratch);
+        TEST_ASSERT(scratch[0] && scratch[1]);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 0);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 0);
+    }
+    /* (iv) conversation A (idle longer) and a scratch bank: a NEW ordinary conversation -- its best bank is A, the
+     * shared preamble, score 0 -- evicts the scratch bank.  Before: A, the LRU (and its own best match). */
+    {
+        const int tokens[2] = {69233, 60987};
+        const bool ro[2] = {false, true};
+        const uint64_t served[2] = {100, 200};
+        l379_banks(slots, 2, tokens, ro, served, scratch);
+        TEST_ASSERT(!scratch[0] && scratch[1]);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 1);
+        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, NULL, scratch) == 1);
+        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, NULL, NULL) == 0);   /* no facts: plain LRU */
+        /* B5: a read-only request never takes the conversation's bank while a scratch one exists -- whichever is the
+         * LRU, whichever it matches best */
+        for (int lru = 0; lru < 2; lru++)
+            for (int best = -1; best < 2; best++) {
+                slots[0].last_serviced_us = lru == 0 ? 100 : 300;
+                const make_room_verdict v = server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, best, &victim);
+                TEST_ASSERT(victim == 1 && v == (best == 1 ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT));
+            }
+        /* a dominated or dead bank still goes before a scratch one, a protected scratch bank is never taken */
+        bool dom[PULSAR_SESSION_POOL_CAP] = {false};
+        dom[0] = true;
+        TEST_ASSERT(server_evict_pick_victim(slots, 2, NULL, true, dom, scratch) == 0);
+        bool protect[PULSAR_SESSION_POOL_CAP] = {false};
+        protect[1] = true;
+        TEST_ASSERT(server_evict_pick_victim(slots, 2, protect, true, NULL, scratch) == 0);
+    }
+    /* B5: two conversations: a read-only request (no best among them) evicts the least recently used, as before */
+    {
+        const int tokens[2] = {69233, 40000};
+        const bool ro[2] = {false, false};
+        const uint64_t served[2] = {300, 100};
+        l379_banks(slots, 2, tokens, ro, served, scratch);
+        TEST_ASSERT(!scratch[0] && !scratch[1]);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 1);
+        TEST_ASSERT(server_make_room(slots, 2, NULL, NULL, true, NULL, scratch, 0, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 1);
+    }
+    /* B3: a queued job's warm match is spared -- unless it is scratch.  Bank 0 a conversation (the LRU), bank 1 a
+     * scratch bank some queued job would resume on.  Before: the overlay spared bank 1 and the eviction fell on the
+     * conversation.  Now: the scratch bank goes. */
+    {
+        const int tokens[3] = {69233, 60987, 52000};
+        const bool ro[3] = {false, true, false};
+        const uint64_t served[3] = {100, 200, 300};
+        l379_banks(slots, 3, tokens, ro, served, scratch);
+        bool warm[PULSAR_SESSION_POOL_CAP] = {false};
+        warm[1] = true;
+        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 1);
+        /* a conversation that is a warm match is still spared: the eviction passes over the LRU to the next */
+        warm[1] = false;
+        warm[0] = true;
+        scratch[1] = false;
+        slots[1].kv_flags = 0u;
+        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 1);
+        /* every free bank a warm match: binding must progress -- the LRU goes */
+        warm[1] = warm[2] = true;
+        TEST_ASSERT(server_make_room(slots, 3, NULL, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 0);
+        /* a queued live-tool continuation's owner is never evicted, scratch or not */
+        bool owners[PULSAR_SESSION_POOL_CAP] = {false};
+        owners[1] = true;
+        scratch[1] = true;
+        slots[1].kv_flags = KV_HDR_READ_ONLY;
+        warm[0] = warm[1] = warm[2] = false;
+        TEST_ASSERT(server_make_room(slots, 3, owners, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_EVICT &&
+                    victim == 0);
+        owners[0] = owners[2] = true;
+        TEST_ASSERT(server_make_room(slots, 3, owners, warm, true, NULL, scratch, -1, &victim) == MAKE_ROOM_NONE);
+    }
+    /* the guard's spill order ranks by the same classes: a dominated bank, then a scratch one, then the
+     * conversations by LRU; a bank whose client is running a tool still goes last, scratch or not */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.tool_mu, NULL);
+        s.n_slots = 3;
+        for (int i = 0; i < 3; i++) {
+            s.slots[i].provisioned = true;
+            s.slots[i].bank = (uint32_t)i;
+            s.slots[i].last_serviced_us = (uint64_t)(100 * (i + 1));   /* slot 0 is the LRU */
+        }
+        bool gdom[PULSAR_SESSION_POOL_CAP] = {false}, gscr[PULSAR_SESSION_POOL_CAP] = {false};
+        gscr[1] = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 1);
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, NULL) == 0);
+        gdom[2] = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 2);
+        gdom[2] = false;
+        s.slots[1].anthropic_live.valid = true;
+        TEST_ASSERT(s.guard_pick_victim(NULL, 0, gdom, gscr) == 0);
+        /* host-only: no session, so no frontier and no disk tier minimum -- the facts name the read-only bank alone */
+        s.slots[1].anthropic_live.valid = false;
+        s.slots[2].kv_flags = KV_HDR_READ_ONLY;
+        bool fd[PULSAR_SESSION_POOL_CAP], fs[PULSAR_SESSION_POOL_CAP];
+        s.victim_facts(fd, fs);
+        TEST_ASSERT(!fs[0] && !fs[1] && fs[2] && !fd[0] && !fd[1] && !fd[2]);
+        s.slots[0].hint_dead = true;
+        s.victim_facts(fd, fs);
+        TEST_ASSERT(fd[0]);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+}
+
+/* L379 (v), (vi): what makes a bank scratch -- the history of a read-only request, or one under the disk tier's
+ * minimum -- and that the mark follows the request that takes the bank's history. */
+static void test_l379_scratch_predicate(void) {
+    const int min_tokens = kv_cache_default_options().min_tokens;
+    TEST_ASSERT(min_tokens == 512);
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    sl.provisioned = true;
+    /* (v) a 300-token bank is scratch; a 600-token one that no read-only request wrote is not */
+    TEST_ASSERT(server_slot_is_scratch(&sl, 300, min_tokens));
+    TEST_ASSERT(!server_slot_is_scratch(&sl, 600, min_tokens));
+    TEST_ASSERT(server_slot_is_scratch(&sl, 511, min_tokens) && !server_slot_is_scratch(&sl, 512, min_tokens));
+    /* without a disk tier there is no minimum: only a read-only history is scratch */
+    TEST_ASSERT(!server_slot_is_scratch(&sl, 300, 0));
+    /* (vi) a read-only request taking the bank makes it scratch at any length; a request without the token taking
+     * it clears that */
+    request ro, plain;
+    memset(&ro, 0, sizeof ro);
+    memset(&plain, 0, sizeof plain);
+    ro.kv_flags = KV_HDR_READ_ONLY | KV_HDR_PIN_ANCHOR;
+    snprintf(ro.hints.session, sizeof ro.hints.session, "judge");
+    sl.hint_dead = true;
+    server_slot_take_history(&sl, &ro);
+    TEST_ASSERT(server_slot_is_scratch(&sl, 60987, min_tokens) && server_slot_is_scratch(&sl, 60987, 0));
+    TEST_ASSERT(!sl.hint_dead && !strcmp(sl.hint_session, "judge"));
+    server_slot_take_history(&sl, &plain);
+    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens) && sl.kv_flags == 0u && !sl.hint_session[0]);
+    /* a busy bank and an unprovisioned one are nobody's victim, so not scratch */
+    sl.kv_flags = KV_HDR_READ_ONLY;
+    sl.active_job = (struct job *)&sl;
+    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens));
+    sl.active_job = NULL;
+    sl.provisioned = false;
+    TEST_ASSERT(!server_slot_is_scratch(&sl, 60987, min_tokens));
+}
+
 /* L372 (O24): an eviction says what became of the history -- on disk, not written by a rule (named, no warning), or
  * not written though a store was expected (the warning's case). */
 static void test_l372_evict_snapshot_word(void) {
@@ -15793,6 +16345,13 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_ill_formed_utf8_is_refused_at_parse();
     test_l372_judge_bank_floor_and_release();
     test_l372_evict_snapshot_word();
+    test_l378_token_hash_and_conversation_key();
+    test_l378_kv_req_line_format();
+    test_l378_kv_ledger_line();
+    test_l378_segstore_io_ledger();
+    test_l379_request_does_not_evict_its_matched_bank();
+    test_l379_scratch_banks_go_first();
+    test_l379_scratch_predicate();
     test_l372_abandoned_decode_is_not_a_turn();
     test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();

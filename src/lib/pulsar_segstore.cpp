@@ -145,6 +145,10 @@ struct pulsar_segstore {
     void *disk_free_ud = nullptr;
     /// L276: restore points removed without their segment, ever (pulsar_segstore_removed)
     uint64_t rps_removed = 0;
+    /// L378: what the store wrote, served and removed since it opened (pulsar_segstore_io_stats)
+    pulsar_segstore_io io = {};
+    /// L378: evict_one is removing a file: the bytes note_removed counts go to io.budget_bytes_removed too
+    bool evicting = false;
 
     /** printf-style message to `log` (truncated to 511 bytes); no-op without a sink.
      *  @param fmt printf format */
@@ -332,6 +336,15 @@ struct pulsar_segstore {
         ::unlink(rp_path(key.c_str()).c_str());
     }
 
+    /** L378: count a removed file in the I/O ledger.
+     *  @param bytes its file bytes (0: nothing to count)
+     *  @param read  a load mapped it since the store opened */
+    void note_removed(uint64_t bytes, bool read) {
+        if (!bytes) return;
+        io.bytes_removed += bytes;
+        if (evicting) io.budget_bytes_removed += bytes;
+        if (!read) io.unread_bytes_removed += bytes;
+    }
     /** Add e to the index: segs, its parent's children, used. Does not refresh dominance.
      *  @param e the entry (file_bytes set) */
     void link(const pulsar_segstore_seg &e) {
@@ -350,6 +363,8 @@ struct pulsar_segstore {
         if (it == segs.end()) return;
         if (removed) removed(removed_ud, key.c_str(), false);
         segs_removed++;   /* L276 */
+        note_removed(it->second.file_bytes, it->second.rows_read);   /* L378 */
+        note_removed(it->second.rp_bytes, it->second.rp_read);
         used -= it->second.file_bytes + it->second.rp_bytes;
         const std::string parent = it->second.parent;
         auto &sib = children[parent];
@@ -444,9 +459,11 @@ struct pulsar_segstore {
         ::unlink(rp_path(e.key).c_str());
         img_drop(ram_rp, e.key);   /* L347 I3a */
         read_fails.erase(hold_name(e.key, true));
+        note_removed(e.rp_bytes, e.rp_read);   /* L378 */
         used -= e.rp_bytes;
         e.rp_bytes = 0;
         e.rp_flags = 0;
+        e.rp_read = false;
         rps_removed++;   /* L276 */
         if (removed) removed(removed_ud, e.key, true);
     }
@@ -527,15 +544,17 @@ struct pulsar_segstore {
         /* L347 I3b: nothing else may go -- the oldest-used pinned anchor loses its pin (and goes by the classes next) */
         if (!victim) return unpin_oldest("the store needs room and nothing else may go", keep, keep2);
         const std::string k = victim->key;
+        evicting = true;   /* L378: the removal below is for room */
         if (victim->rp_bytes > 0u) {
             drop_rp_of(segs[k], victim_class < 4 ? "store over budget"
                                                  : "store over budget (a flagged or branch point's)");
-            return true;
+        } else {
+            logf("evicted segment %s [%u,%u) %llu bytes%s: store over budget", k.c_str(), victim->G_prev, victim->G,
+                 (unsigned long long)victim->file_bytes, victim->dominated ? " (dominated)" : "");
+            unlink_files(k);
+            unlink_index(k);
         }
-        logf("evicted segment %s [%u,%u) %llu bytes%s: store over budget", k.c_str(), victim->G_prev, victim->G,
-             (unsigned long long)victim->file_bytes, victim->dominated ? " (dominated)" : "");
-        unlink_files(k);
-        unlink_index(k);
+        evicting = false;
         return true;
     }
     /** The most bytes evict_one(keep, keep2) could ever release, run until it refuses: every restore point but the
@@ -1238,9 +1257,13 @@ static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool writte
     const uint32_t kept = flags;
     auto it = st->segs.find(key);
     if (it != st->segs.end()) {
+        st->note_removed(it->second.rp_bytes, it->second.rp_read);   /* L378: the restore point it replaces */
+        st->io.rps_written++;
+        st->io.rp_bytes_written += job->need;
         st->used = st->used - it->second.rp_bytes + job->need;
         it->second.rp_bytes = job->need;
         it->second.rp_flags = kept;
+        it->second.rp_read = false;
         st->img_keep(st->ram_rp, key, job->img);
         if (kept & PULSAR_SEGSTORE_RP_PINNED) {   /* L347 I3b */
             it->second.last_used = (uint64_t)time(nullptr);
@@ -1254,6 +1277,8 @@ static bool commit_rp(pulsar_segstore *st, pulsar_segstore_job *job, bool writte
         pp.flags = kept;
         pp.img = job->img;
         st->used += job->need;
+        st->io.rps_written++;   /* L378 */
+        st->io.rp_bytes_written += job->need;
         return true;
     }
     st->logf("restore point %s dropped: its segment is gone", job->key);
@@ -1308,6 +1333,8 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         st->used -= rp.bytes;   /* link counts it again, on the entry */
         e.rp_bytes = rp.bytes;
         e.rp_flags = rp.bytes ? rp.flags : 0u;
+        st->io.segs_written++;   /* L378 */
+        st->io.rows_bytes_written += job->need;
         st->link(e);
         st->heads[e.key] = std::string((const char *)job->img.p + HDR,
                                        (size_t)(job->text_len < HEAD_BYTES ? job->text_len : HEAD_BYTES));
@@ -1321,6 +1348,7 @@ bool pulsar_segstore_commit(pulsar_segstore *st, pulsar_segstore_job *job, bool 
         st->img_free(job->img);
         if (rp.bytes) {
             ::unlink(st->rp_path(key.c_str()).c_str());
+            st->note_removed(rp.bytes, false);   /* L378: written, never indexed */
             st->used -= rp.bytes;
             st->img_free(rp.img);
             st->rps_removed++;   /* L276 */
@@ -1433,12 +1461,19 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
         snprintf(err, errlen, "%s not stored", rp ? "restore point" : "segment");
         return 1;
     }
-    const pulsar_segstore_seg &e = it->second;
+    pulsar_segstore_seg &e = it->second;
     const uint64_t off = rp ? RP_HDR : HDR + e.text_len;
     const uint64_t pbytes = rp ? e.rp_bytes - RP_HDR : e.payload_bytes;
+    /* L378: a part a load mapped is read -- its entry's bit (consulted when the file is removed) and the ledger */
+    const auto note_read = [&]() {
+        (rp ? e.rp_read : e.rows_read) = true;
+        (rp ? st->io.rps_read : st->io.segs_read)++;
+        (rp ? st->io.rp_bytes_read : st->io.rows_bytes_read) += rp ? e.rp_bytes : e.file_bytes;
+    };
     auto &ram = rp ? st->ram_rp : st->ram_rows;
     auto res = ram.find(k);
     if (res != ram.end()) {
+        note_read();
         st->held[pulsar_segstore::hold_name(k, rp)]++;
         *payload = res->second.p + off;
         *bytes = pbytes;
@@ -1515,6 +1550,7 @@ int pulsar_segstore_map_part(pulsar_segstore *st, const char key[41], int part, 
     }
     if (st->retain) ram[k] = img;
     else (rp ? st->loan_rp : st->loan_rows)[k] = img;
+    note_read();
     st->held[pulsar_segstore::hold_name(k, rp)]++;
     *payload = img.p + off;
     *bytes = pbytes;
@@ -1722,6 +1758,10 @@ uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps) {
 }
 bool pulsar_segstore_retains(const pulsar_segstore *st) { return st && st->retain; }
 uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st) { return st ? st->writes_failed : 0u; }
+void pulsar_segstore_io_stats(const pulsar_segstore *st, pulsar_segstore_io *out) {
+    if (st) *out = st->io;
+    else memset(out, 0, sizeof *out);
+}
 void pulsar_segstore_set_disk_free(pulsar_segstore *st, pulsar_segstore_disk_free_fn fn, void *ud) {
     if (!st) return;
     st->disk_free_fn = fn;

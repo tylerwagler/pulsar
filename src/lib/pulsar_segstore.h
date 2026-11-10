@@ -118,6 +118,11 @@ typedef struct {
     /// L323: its text is a byte prefix of a sibling's (index-derived); eviction counts it only for a leaf without a
     /// restore point (L347 I2)
     bool dominated;
+    /// L378: its rows were mapped for a load since the store opened (pulsar_segstore_map_part); index only, never on
+    /// disk, so a file kept from an earlier run starts unread
+    bool rows_read;
+    /// L378: ... and its restore point (cleared when the restore point is removed or replaced)
+    bool rp_read;
 } pulsar_segstore_seg;
 
 /** L323: which chain ends a lookup accepts.  `grid`: the last segment's G is a multiple of it (0 = any end);
@@ -589,6 +594,24 @@ uint64_t pulsar_segstore_removed(const pulsar_segstore *st, uint64_t *rps);
 /** L353 no. 16: whether a part read from disk stays as its RAM copy (pulsar_segstore_set_ram's retain): a second read
  *  of it then costs nothing.  @param st the store, or NULL  @return true when it does */
 bool pulsar_segstore_retains(const pulsar_segstore *st);
+/** L378: what the store wrote, served and removed since it opened -- the disk tier's ledger (bytes are file bytes:
+ *  header, text, payload and trailer of a .seg; header and payload of a .rp). */
+typedef struct {
+    uint64_t segs_written;         ///< .seg files committed
+    uint64_t rows_bytes_written;   ///< ... their bytes
+    uint64_t rps_written;          ///< .rp files committed
+    uint64_t rp_bytes_written;     ///< ... their bytes
+    uint64_t segs_read;            ///< .seg parts mapped for a load (from the RAM tier or the disk), each map
+    uint64_t rows_bytes_read;      ///< ... their file bytes
+    uint64_t rps_read;             ///< .rp parts mapped for a load, each map
+    uint64_t rp_bytes_read;        ///< ... their file bytes
+    uint64_t bytes_removed;        ///< bytes of the files removed, any reason (evicted, dropped as bad, released, replaced)
+    uint64_t budget_bytes_removed; ///< ... of them, evicted for room (the budget or a full disk)
+    /// ... of bytes_removed, files no load had mapped since the store opened (pulsar_segstore_seg::rows_read / rp_read)
+    uint64_t unread_bytes_removed;
+} pulsar_segstore_io;
+/** L378: read the store's I/O ledger.  @param st the store, or NULL (zeros)  @param out receives it */
+void pulsar_segstore_io_stats(const pulsar_segstore *st, pulsar_segstore_io *out);
 /** L353: files copied out whose write failed, ever.  @param st the store, or NULL  @return the count (0 for NULL) */
 uint64_t pulsar_segstore_writes_failed(const pulsar_segstore *st);
 /** L353: reads the disk's free bytes.  @param ud context  @return the bytes */

@@ -725,13 +725,8 @@ int kv_cache_chat_anchor_pos(const kv_disk_cache *kc, const pulsar_tokens *promp
 }
 
 int kv_cache_preamble_pos(const kv_disk_cache *kc, const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
-    if (!prompt || !m || m->n_user <= 0) return -1;
-    for (int i = 0; i < prompt->len; i++) {
-        const int role = pulsar_turn_marker_at(m, prompt->v, prompt->len, i);
-        if (role == 2) return -1;   /* an assistant turn before any user turn: no preamble this rule can name */
-        if (role == 1) return i >= kc->opt.min_tokens ? i : -1;
-    }
-    return -1;
+    const int i = server_prompt_preamble_end(prompt, m);   /* L378: the one scan; here held to min_tokens */
+    return i >= kc->opt.min_tokens ? i : -1;
 }
 
 int kv_cache_anchor_cut(const kv_disk_cache *kc, int anchor, int grid) {
@@ -797,6 +792,8 @@ void server::kv_cache_publish_store() {
     const uint64_t ram = pulsar_segstore_ram_bytes(kv.st), ram_pool = kv.ram ? pulsar_kvpool_size(kv.ram) : 0;
     const uint64_t segs_removed = pulsar_segstore_removed(kv.st, &rps_removed);
     const uint64_t writes_failed = pulsar_segstore_writes_failed(kv.st);
+    pulsar_segstore_io io;   /* L378 */
+    pulsar_segstore_io_stats(kv.st, &io);
     struct statvfs fs;   /* L276: the store's budget is not the disk's -- a full filesystem refuses stores */
     const bool fs_ok = kv.dir && statvfs(kv.dir, &fs) == 0;
     pthread_mutex_lock(&mu);
@@ -814,6 +811,7 @@ void server::kv_cache_publish_store() {
     m_kv_disk_segs_removed = segs_removed;
     m_kv_disk_rps_removed = rps_removed;
     m_kv_disk_writes_failed = writes_failed;
+    m_kv_disk_io = io;
     pthread_mutex_unlock(&mu);
 }
 
@@ -1226,6 +1224,7 @@ void server::kv_restore_begin(kv_restore *r, const kv_chain_hit *hit, int base, 
     r->pinned = true;
     pthread_mutex_lock(&s->mu);
     kv_read_cost_touch(&s->kv.meter.read, server_now_sec());   /* L342: a load is running: hold the relaxation */
+    s->kv.meter.restores[0]++;   /* L378: begun */
     pthread_mutex_unlock(&s->mu);
     if (!sliced) return;
     /* the read each segment costs, disk and RAM tier apart (L327 / L347 I3a), as the meter prices the whole chain */
@@ -1285,6 +1284,7 @@ int server::kv_restore_slice(kv_restore *r, int k) {
     if (rc != 0) {
         r->fault = rc;
         s->count_metric(&s->m_restore_faults[rc == 1 ? 0 : 1]);
+        s->count_metric(&s->kv.meter.restores[2]);   /* L378: failed */
         server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s%s", err,
                    r->touched ? "" : " (the bank is untouched: checked before the load)");
         return -1;
@@ -1325,7 +1325,10 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
     char err[384];
     const int G = pulsar_kvchain_load_check(s->kv.st, s->engine, s->sess, text, chain, n, err, sizeof err);
     if (err[0]) server_log(PULSAR_LOG_WARNING, "pulsar-server: kv cache %s", err);
-    if (G == 0) return 0;
+    if (G == 0) {
+        s->count_metric(&s->kv.meter.restores[2]);   /* L378: failed -- the load did not check out */
+        return 0;
+    }
     const size_t text_bytes = strlen(text);
     pthread_mutex_lock(&s->mu);
     /* L353 no. 16: a checked restore read the chain twice unless the check's read stayed as the RAM copy; the time is both */
@@ -1353,8 +1356,12 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
         const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail,
                                                                           tail_n, effective_prompt);
         free(tail);
-        if (!built) return 0;   /* a failed restore: the request's own prompt is synced (the bank was touched) */
+        if (!built) {   /* a failed restore: the request's own prompt is synced (the bank was touched) */
+            s->count_metric(&s->kv.meter.restores[2]);   /* L378: failed */
+            return 0;
+        }
     }
+    s->count_metric(&s->kv.meter.restores[1]);   /* L378: done */
     if (loaded_key_out) *loaded_key_out = server_xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
                "pulsar-server: kv cache hit%s chain of %d to %u (text %llu of %zu bytes) load=%.1f ms in %d slice%s "

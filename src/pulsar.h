@@ -2088,6 +2088,21 @@ void pulsar_session_rewind(pulsar_session *s, TokPos pos);
  *  @param limit the deepest position allowed
  *  @return the checkpoint position, or 0 */
 TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit);
+/** L378: why a bank's state serves a request from where it does (pulsar_session_bank_resume_at) -- for a resume at
+ *  0 inside a match, what the bank lacks. */
+typedef enum {
+    PULSAR_RESUME_WHY_NONE = 0,       ///< not said: no bank, no prompt, or an adopt score
+    PULSAR_RESUME_CONTINUES,          ///< the bank continues where it stands: the whole match serves
+    PULSAR_RESUME_POINT,              ///< a grid checkpoint or a record within the match
+    PULSAR_RESUME_NO_MATCH,           ///< the request shares no token with the bank's history
+    PULSAR_RESUME_NO_CHECKPOINT,      ///< a match, and the bank holds no grid checkpoint at any depth
+    PULSAR_RESUME_CHECKPOINT_ABOVE,   ///< a match, and every checkpoint the bank holds lies above what it may resume
+    /// the request extends the bank's whole history, the bank does not continue it (decode rows past its prefill, an
+    /// end off the grid, stale rows), and no checkpoint lies below
+    PULSAR_RESUME_NOT_CONTINUED,
+    PULSAR_RESUME_IMAGES,             ///< a checkpoint within the match, refused: the bank's images are not the request's
+    PULSAR_RESUME_WHYS,               ///< array bound, not a reason
+} pulsar_resume_why;
 /** L334: where a bank's state serves a request from, in both currencies: `at` where the sync's computed rows start
  *  on the prompt it runs (the stitch: the live side -- a checkpoint, a record, or the bank's frontier), `served` how
  *  many of the REQUEST's tokens that state holds (pulsar_tokens_prompt_held_with of `at`: the prompt side, what a
@@ -2095,6 +2110,7 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit);
 typedef struct {
     TokPos at;           ///< the sync starts computing here, on the stitched prompt
     PromptToks served;   ///< the request's tokens the state at `at` holds
+    pulsar_resume_why why;   ///< L378: the rule that put `at` there
 } pulsar_bank_resume;
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
  *  and (L325) the router's score for the bank, so the route ranks banks by the rule their syncs resume by,

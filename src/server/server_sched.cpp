@@ -20,14 +20,11 @@
  * `bank`'s device views + host carry on the pool session, saving the outgoing
  * bank first. No-op in classic mode or when `bank` is already live. Called at
  * the top of every per-slot worker op (gen_begin, generate_job_step,
- * worker_evict_one) so all s->sess touches inside that op are live-correct. */
+ * worker_evict) so all s->sess touches inside that op are live-correct. */
 /* Returns false only when the target is a guard-spilled bank whose restore FAILED
  * (KV unrecoverable): the bank is NOT installed and cur_bank is unchanged, so the
  * caller MUST fail the request rather than sample/commit on the wrong bank's KV
  * (review finding 1). True on success (or classic mode / no-op). */
-/* Evict ONE idle victim (a dominated bank preferred, else plain LRU) so a fresh
- * conversation has a bank; live-tool owners protected. Defined near
- * worker_evict_one; forward-declared for the routing path above it. */
 
 
 
@@ -37,12 +34,14 @@ bool server::enqueue(job *j) {
      * neither, so a path that skipped setting them dies here, by name, instead of running as some default */
     if (!j->req.family) pulsar_die("server::enqueue: a request without its family (the parse never set it)");
     if (!j->req.model) pulsar_die("server::enqueue: a request without its model id (never set from the engine)");
+    s->kv_req_key(j);   /* L378: the request's own fields of its `kv req:` line, before the worker can see the job */
     pthread_mutex_lock(&s->mu);
     if (s->stopping) {
         pthread_mutex_unlock(&s->mu);
         return false;
     }
     j->seq = ++s->job_seq;
+    j->kvr.id = j->seq;
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
     s->n_queued++;
@@ -734,12 +733,15 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
             return NULL;
         }
         *waiting_owner = owner->active_job != NULL;
+        j->kvr.route = KV_ROUTE_OWNER;   /* L378 */
         return owner->active_job ? NULL : owner;
     }
 
     const int needed = s->job_needed_ctx(j);
     session_slot *best = NULL;
     int best_common = -1, best_score = -1;
+    int deep = -1;                                         /* L378: the deepest match any free bank has */
+    pulsar_resume_why best_why = PULSAR_RESUME_WHY_NONE;   /* L378: why the best bank's score is what it is */
     static const int route_debug = getenv("PULSAR_ROUTE_DEBUG") != NULL;
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
@@ -751,16 +753,19 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
          * the whole match for a history it continues.  The route scored the grid checkpoint below the match alone (a
          * record only for a bank holding the whole prompt, L289), so a bank whose turn-end record stood above its
          * thinned grid ranked below a shallower bank. */
-        const int score =
-            pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt, j->req.images, j->req.n_images).served.raw();
+        const pulsar_bank_resume resume =
+            pulsar_session_bank_resume_at(s->sess, sl->bank, &j->req.prompt, j->req.images, j->req.n_images);
+        const int score = resume.served.raw();
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: route-scan slot %d bank %u: frontier=%d common=%d score=%d",
                        i, sl->bank, s->slot_frontier_pos(sl).raw(), common, score);
+        if (common > deep) deep = common;
         if (score > best_score || (score == best_score && common > best_common)) {
             best_score = score;
             best_common = common;
             best = sl;
+            best_why = resume.why;
         }
     }
     /* The shared-prefix ceiling is per job, not a global constant: a
@@ -827,19 +832,34 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
         : -1;
     const bool in_place = best && server_route_in_place(best_common, best_score, frontier, prefilled,
                                                         s->slot_trivial_common_tokens, anchor);
+    /* L378: the decision's numbers, for the request's `kv req:` line (the last routing of a head that waited) */
+    j->kvr.best = best ? (int)best->bank : -1;
+    j->kvr.common = best ? best_common : -1;
+    j->kvr.score = best ? best_score : -1;
+    j->kvr.anchor = anchor;
+    j->kvr.frontier = best ? frontier : -1;
+    j->kvr.prefilled = best ? prefilled : -1;
+    j->kvr.why = best_why;
+    j->kvr.deep = deep;
+    j->kvr.route = in_place ? KV_ROUTE_IN_PLACE : KV_ROUTE_NONE;
     /* One line per bind decision: which bank, how deep the match, where it resumes, what it costs the bank, and
      * where the bank's last turn starts (a head that waits re-routes every quantum; its line repeats only when the
      * decision changes). */
     const uint64_t route_key = best ? 1u + (((uint64_t)best->bank << 1 | (in_place ? 1u : 0u)) ^
                                             ((uint64_t)(uint32_t)best_common << 17) ^ ((uint64_t)(uint32_t)best_score << 40))
                                     : 0u;
-    if (best && route_key != j->route_logged) {
-        j->route_logged = route_key;
+    /* L379: the same decision ended "in place (the only bank to free is the matched one)" -- its own key, so a head
+     * that re-routes every quantum says neither line twice */
+    const uint64_t matched_key = route_key ^ (UINT64_C(1) << 63);
+    const auto route_line = [&](const char *verdict) {
         server_log(PULSAR_LOG_KVCACHE,
                    "pulsar-server: route: best bank %u common %d resume %d frontier %d prefilled %d "
                    "anchor %d prompt %d -> %s",
-                   best->bank, best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len,
-                   in_place ? "in place" : "fresh preferred");
+                   best->bank, best_common, best_score, frontier, prefilled, anchor, j->req.prompt.len, verdict);
+    };
+    if (best && route_key != j->route_logged && matched_key != j->route_logged) {
+        j->route_logged = route_key;
+        route_line(in_place ? "in place" : "fresh preferred");
     }
     if (in_place) return best;
     /* L328 (3): a provisioned bank that holds nothing IS a fresh bank.  A prompt queued on KV leaves the bank its try
@@ -866,6 +886,7 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
                            (double)need_fresh.raw() / (1024.0 * 1024.0 * 1024.0), best->bank,
                            (double)need_best.raw() / (1024.0 * 1024.0 * 1024.0));
                 *clobbers = true;
+                j->kvr.route = KV_ROUTE_CLOBBER;   /* L378 */
                 return best;
             }
         }
@@ -877,14 +898,34 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * 2026-08-10: an 8-bank pool pre-churned by 12 one-shots served every later
      * conversation cold off bank 1.  Evict an LRU idle bank (live-tool owners
      * protected) and retry once. */
-    if (!fresh && server_refusal_evictable(*refusal, s->pool_banks > 0) && s->fresh_make_room())
-        fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
+    if (!fresh && s->pool_banks > 0 && server_refusal_evictable(*refusal, true)) {
+        int vi = -1, rank = -1;
+        const make_room_verdict room = s->make_room(best, &vi, &rank);
+        if (room == MAKE_ROOM_IN_PLACE) {
+            /* L379: the bank an eviction would free is the one this request matched best.  Evicting it bought
+             * nothing -- the request landed on the same slot and resumed from the same source it has in place (CT
+             * 130, 2026-11-02..10: 39 requests, 963,922 tokens of live match discarded) -- so it runs in place, and
+             * not as a clobber: the caller's evict-and-retry loop has nothing better to free. */
+            if (matched_key != j->route_logged) {
+                j->route_logged = matched_key;
+                route_line("in place (the only bank to free is the matched one)");
+            }
+            j->kvr.route = KV_ROUTE_MATCHED;
+            return best;
+        }
+        if (room == MAKE_ROOM_EVICT) {
+            s->worker_evict(vi, rank, j);
+            fresh = s->provision_slot(s->provision_ctx_for_job(j), refusal);
+        }
+    }
     if (fresh) {
         if (route_debug)
             server_log(PULSAR_LOG_DEFAULT, "pulsar-server: route-branch: FRESH bank %u", fresh->bank);
+        j->kvr.route = KV_ROUTE_FRESH;   /* L378 */
         return fresh;
     }
     *clobbers = best != NULL;
+    j->kvr.route = best ? KV_ROUTE_CLOBBER : KV_ROUTE_NONE;   /* L378 */
     return best;
 }
 
@@ -969,39 +1010,72 @@ uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
 
 
 
-/// @brief The eviction victim: a provisioned idle slot, not protected; dominated first, then least recently
-/// serviced, then the smaller cost.
+bool server_slot_is_scratch(const session_slot *sl, int frontier, int min_tokens) {
+    return sl->provisioned && !sl->active_job &&
+           ((sl->kv_flags & KV_HDR_READ_ONLY) != 0u || frontier < min_tokens);
+}
+
+int server_victim_rank(bool dominated, bool scratch) { return dominated ? 0 : scratch ? 1 : 2; }
+
+void server_slot_take_history(session_slot *sl, const request *r) {
+    sl->kv_flags = r->kv_flags;
+    sl->hint_dead = false;
+    snprintf(sl->hint_session, sizeof sl->hint_session, "%s", r->hints.session);
+}
+
+/// @brief The eviction victim: a provisioned idle slot, not protected; by class (server_victim_rank: dominated,
+/// then scratch, then a conversation), then least recently serviced, then the smaller cost.
 /// @param slots the slot array
 /// @param n_slots its length
 /// @param protect per slot: never evicted (NULL: none)
 /// @param allow_slot0 slot 0 may be picked (pool mode)
 /// @param dominated per slot: dominated (NULL: none)
+/// @param scratch per slot: scratch (server_slot_is_scratch; NULL: none)
 /// @return the slot index, or -1
 int server_evict_pick_victim(const session_slot *slots, int n_slots,
-                             const bool *protect, bool allow_slot0, const bool *dominated) {
+                             const bool *protect, bool allow_slot0, const bool *dominated, const bool *scratch) {
     int victim = -1;
+    int victim_rank = 0;
     /* Slot 0 competes in LRU only when the caller says so (pool mode, where
      * bank 0 is just another bank): an idle conversation squatting bank 0 was
      * otherwise IMMORTAL, silently shrinking the evictable pool to N-1 and
      * seeding the churned-pool LRU domino (measured 2026-08-10: a one-shot's
      * leftovers on bank 0 forced an 8-conversation load into 7 banks, and the
      * shortage evicted a live conversation every turn forever).  L323: a
-     * dominated slot (server::dominated_slots) goes before any LRU choice. */
+     * dominated slot (server::dominated_slots) goes before any LRU choice.
+     * L379: then a scratch one (server_slot_is_scratch), before any LRU choice
+     * among conversations. */
     for (int i = allow_slot0 ? 0 : 1; i < n_slots; i++) {
         const session_slot *sl = &slots[i];
         if (!sl->provisioned || sl->active_job) continue;
         if (protect && protect[i]) continue;
-        const bool dom = dominated && dominated[i], vdom = victim >= 0 && dominated && dominated[victim];
-        if (victim < 0 || (dom && !vdom) ||
-            (dom == vdom &&
+        const int rank = server_victim_rank(dominated && dominated[i], scratch && scratch[i]);
+        if (victim < 0 || rank < victim_rank ||
+            (rank == victim_rank &&
              (sl->last_serviced_us < slots[victim].last_serviced_us ||
               (sl->last_serviced_us == slots[victim].last_serviced_us &&
                sl->est_cost_bytes < slots[victim].est_cost_bytes))))
         {
             victim = i;
+            victim_rank = rank;
         }
     }
     return victim;
+}
+
+make_room_verdict server_make_room(const session_slot *slots, int n_slots, const bool *owners, const bool *warm,
+                                   bool allow_slot0, const bool *dominated, const bool *scratch, int best,
+                                   int *victim) {
+    /* first sparing every queued job's usable warm match -- never a scratch bank for its own sake (L379) -- then,
+     * when that leaves nothing, with the owners alone: binding must progress */
+    bool soft[PULSAR_SESSION_POOL_CAP];
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++)
+        soft[i] = (owners && owners[i]) || (warm && warm[i] && !(scratch && scratch[i]));
+    int vi = server_evict_pick_victim(slots, n_slots, soft, allow_slot0, dominated, scratch);
+    if (vi < 0) vi = server_evict_pick_victim(slots, n_slots, owners, allow_slot0, dominated, scratch);
+    *victim = vi;
+    if (vi < 0) return MAKE_ROOM_NONE;
+    return vi == best ? MAKE_ROOM_IN_PLACE : MAKE_ROOM_EVICT;
 }
 
 
@@ -1173,30 +1247,54 @@ bool server_evict_snapshot_word(bool stored, kv_persist_rule rule, char word[40]
     return !stored && rule == KV_PERSIST_RULE_NONE;
 }
 
-/* Evict one idle slot (LRU victim): snapshot to the disk kv cache when
- * possible, free the session, release the ledger, and leave the slot entry
- * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or
- * unavailable snapshot only costs the returning client a re-prefill — the
- * eviction itself proceeds, and the response always belongs to the right
- * conversation because the freed KV can never be read again. Returns false
- * when nothing is evictable. Worker thread only. */
-bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
+/* L379: the make-room eviction in two halves -- make_room says which bank would go (the ONE pick the fresh path
+ * and the bind loop share, so the "is it the requester's own best bank?" check and the eviction cannot disagree),
+ * worker_evict evicts it: snapshot to the disk kv cache when possible, release the ledger, and leave the slot entry
+ * (provisioned == false) for provision_slot to reuse. Failure honesty: a failed or unavailable snapshot only costs
+ * the returning client a re-prefill — the eviction itself proceeds, and the response always belongs to the right
+ * conversation because the freed KV can never be read again. Worker thread only. */
+void server::victim_facts(bool dominated[PULSAR_SESSION_POOL_CAP], bool scratch[PULSAR_SESSION_POOL_CAP]) {
+    auto *s = this;
+    s->dominated_slots(dominated);
+    for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) scratch[i] = false;
+    for (int i = 0; i < s->n_slots; i++) {
+        const session_slot *sl = &s->slots[i];
+        /* L249 D / L353 no. 19: a dead prefix (its session compacted) goes first, like a dominated history */
+        dominated[i] = dominated[i] || sl->hint_dead;
+        scratch[i] = server_slot_is_scratch(sl, s->slot_frontier_pos(sl).raw(), s->kv.opt.min_tokens);
+    }
+}
+
+make_room_verdict server::make_room(const session_slot *best, int *victim, int *rank) {
     PULSAR_NVTX_FN();
     auto *s = this;
-    bool dominated[PULSAR_SESSION_POOL_CAP];
-    s->dominated_slots(dominated);
-    /* L249 D: a dead prefix goes first, like a dominated history */
-    for (int i = 0; i < s->n_slots; i++) dominated[i] = dominated[i] || s->slots[i].hint_dead;
-    const int vi = server_evict_pick_victim(s->slots, s->n_slots, protect,
-                                            /*allow_slot0=*/s->pool_banks > 0, dominated);
-    if (vi < 0) return false;
+    bool owners[PULSAR_SESSION_POOL_CAP], warm[PULSAR_SESSION_POOL_CAP] = {false};
+    bool dominated[PULSAR_SESSION_POOL_CAP], scratch[PULSAR_SESSION_POOL_CAP];
+    s->worker_protect_queued_owner_slots(owners);       /* live-tool owners: absolute */
+    s->worker_protect_queued_warm_matches(warm);        /* the queued jobs' usable warm matches: soft */
+    s->victim_facts(dominated, scratch);
+    const make_room_verdict v =
+        server_make_room(s->slots, s->n_slots, owners, warm, /*allow_slot0=*/s->pool_banks > 0, dominated, scratch,
+                         best ? (int)(best - s->slots) : -1, victim);
+    *rank = *victim >= 0 ? server_victim_rank(dominated[*victim], scratch[*victim]) : -1;
+    return v;
+}
+
+void server::worker_evict(int vi, int rank, job *for_job) {
+    PULSAR_NVTX_FN();
+    auto *s = this;
     session_slot *sl = &s->slots[vi];
     if (sl->hint_dead)
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u holds a dead prefix (its session compacted)",
                    sl->bank);
-    else if (dominated[vi])
+    else if (rank == 0)
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u is dominated (another bank holds its whole "
                                        "history)", sl->bank);
+    else if (rank == 1)
+        server_log(PULSAR_LOG_KVCACHE, "pulsar-server: evict: bank %u is scratch (%s) -- taken before any "
+                   "conversation's", sl->bank,
+                   (sl->kv_flags & KV_HDR_READ_ONLY) ? "a read-only request's history"
+                                                     : "a history under the disk tier's minimum");
 
     /* Tier-2: install the victim's bank so the snapshot store below reads its
      * OWN frontier (not the pool's live cursor).  L330: a guard-spilled victim
@@ -1206,6 +1304,11 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
     const bool switched = s->bank_switch(sl->bank);
     const pulsar_tokens *tokens = switched ? pulsar_session_tokens(s->sess) : NULL;
     const int live_tokens = tokens ? tokens->len : 0;
+    /* L378: the victim's facts for the requester's `kv req:` line and the ledger, read before the reset below */
+    const bool victim_ro = (sl->kv_flags & KV_HDR_READ_ONLY) != 0u;
+    const uint64_t victim_conv =
+        tokens ? server_kv_token_hash(tokens->v, server_prompt_conv_end(tokens, &s->turn_markers)) : 0u;
+    const int victim_bank = (int)sl->bank;
     bool stored = false;
     kv_persist_rule rule = KV_PERSIST_RULE_NONE;
     if (switched && s->kv.enabled && live_tokens >= s->kv.opt.min_tokens) {
@@ -1267,8 +1370,19 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
      * which is the dominant tail-latency source on a busy pool — worth a
      * counter of its own rather than only a log line. */
     s->m_evictions++;
+    if (for_job) {   /* L378: who evicted whom */
+        s->m_kvl.evict_by[victim_ro ? 1 : 0][(for_job->req.kv_flags & KV_HDR_READ_ONLY) ? 1 : 0]++;
+        if (for_job->kvr.best == victim_bank) s->m_kvl.evict_own_best++;
+    }
     pthread_mutex_unlock(&s->mu);
-    protect[vi] = true; /* freed hole; never a candidate again this round */
+    if (for_job) {
+        kv_req_line *r = &for_job->kvr;
+        r->evict = victim_bank;
+        r->evict_tokens = live_tokens;
+        r->evict_conv = victim_conv;
+        r->evict_ro = victim_ro;
+        snprintf(r->snapshot, sizeof r->snapshot, "%s", snapshot);
+    }
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: evicted slot %d ctx=%d tokens=%d snapshot=%s "
                "released=%.2f GiB (allocator freed %.2f GiB) "
@@ -1279,7 +1393,6 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
                (double)committed_now / (1024.0 * 1024.0 * 1024.0),
                (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
                (double)server_mem_available_bytes() / (1024.0 * 1024.0 * 1024.0));
-    return true;
 }
 
 
@@ -1291,7 +1404,7 @@ bool server::worker_evict_one(bool protect[PULSAR_SESSION_POOL_CAP]) {
  * copy at a lower index (so of two identical copies exactly one is dominated).  Its KV is redundant -- every request
  * it serves, k serves at least as deep, and a spilled k's history is on disk -- so the guard spills it, and the
  * make-room eviction evicts it, before any LRU choice.  common[a][k] is read only where the length test holds (the
- * caller fills it there).  Before L323 this was plan-33 inc D's "LRU-superseded" pick, consulted by fresh_make_room
+ * caller fills it there).  Before L323 this was plan-33 inc D's "LRU-superseded" pick, consulted by the make-room eviction
  * alone and over resident banks only; the guard spilled by LRU and kept dominated copies resident (2026-10-24: 9 of
  * 16 banks at 150-205k, mostly copies of one conversation). */
 /// @param a the slot asked about
@@ -1437,28 +1550,6 @@ void server::kv_dup_census_update() {
     s->m_dup_bytes_peak = std::max(s->m_dup_bytes_peak, c.dup_bytes);
     pthread_mutex_unlock(&s->mu);
 }
-
-/* Evict exactly one NON-trunk victim so a warm fork gets a free bank. Trunk is
- * always protected (a sibling still matches it); dominated victims go first,
- * else plain LRU (worker_evict_one's picker). Reuses the proven eviction
- * body (snapshot + ledger release + bank reset). Worker thread only; returns
- * true when a bank was freed. */
-bool server::fresh_make_room() {
-    auto *s = this;
-    if (s->pool_banks <= 0) return false;
-    bool protect[PULSAR_SESSION_POOL_CAP];
-    s->worker_protect_queued_owner_slots(protect);      /* live-tool owners */
-    /* Two-phase: first avoid banks that are a queued job's usable warm match
-     * (the fresh-path domino), then — if that leaves no victim — retry without
-     * the overlay, because binding must progress. */
-    bool with_warm[PULSAR_SESSION_POOL_CAP];
-    memcpy(with_warm, protect, sizeof with_warm);
-    s->worker_protect_queued_warm_matches(with_warm);
-    if (s->worker_evict_one(with_warm)) return true;
-    return s->worker_evict_one(protect);
-}
-
-
 
 /* =========================================================================
  * L329 (a): the shared-prefix wait (PULSAR_SERVER_PREFIX_WAIT_MS_DEFAULT in pulsar_server_internal.h says why).
@@ -1659,6 +1750,7 @@ bool server::worker_try_bind() {
         server_log(PULSAR_LOG_DEFAULT,
                    "pulsar-server: dropping queued job for disconnected client fd=%d",
                    j->fd);
+        s->kv_req_log(j, NULL, "gone-queued");   /* L378 */
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -1687,21 +1779,23 @@ bool server::worker_try_bind() {
                  * for seconds inside pulsar_session_create, and a live-tool
                  * continuation enqueued during that stall would be invisible
                  * to a one-shot snapshot — its owner could then be evicted
-                 * into an avoidable 409. Holes are re-derived from
-                 * provisioned == false (the refresh clears worker_evict_one's
-                 * hole marks). */
-                s->worker_protect_queued_owner_slots(protect);
-                for (int i = 0; i < s->n_slots; i++) {
-                    if (!s->slots[i].provisioned) protect[i] = true;
+                 * into an avoidable 409. A hole (provisioned == false) is
+                 * never a candidate. */
+                /* L379: the one pick (make_room: the owners refreshed, the warm matches spared first), and its
+                 * verdict -- when the bank it would free is the one this job would otherwise clobber, the job's
+                 * own best match, nothing is evicted: it runs in place on it */
+                int vi = -1, rank = -1;
+                const make_room_verdict room = s->make_room(clobbers ? sl : NULL, &vi, &rank);
+                if (room == MAKE_ROOM_NONE) break;
+                if (room == MAKE_ROOM_IN_PLACE) {
+                    server_log(PULSAR_LOG_KVCACHE,
+                               "pulsar-server: route: best bank %u prompt %d -> in place (the only bank to free is the "
+                               "matched one)", sl->bank, j->req.prompt.len);
+                    j->kvr.route = KV_ROUTE_MATCHED;
+                    clobbers = false;
+                    break;
                 }
-                /* Two-phase: prefer victims that are no queued job's usable
-                 * warm match; fall back to owner-only protection when the
-                 * overlay leaves nothing evictable (progress over warmth). */
-                bool with_warm[PULSAR_SESSION_POOL_CAP];
-                memcpy(with_warm, protect, sizeof with_warm);
-                s->worker_protect_queued_warm_matches(with_warm);
-                if (!s->worker_evict_one(with_warm) &&
-                    !s->worker_evict_one(protect)) break;
+                s->worker_evict(vi, rank, j);
                 sl = s->choose_slot_for_job(j, &reject_ctx, &waiting_owner,
                                          &clobbers, &refusal);
             }
@@ -1723,6 +1817,7 @@ bool server::worker_try_bind() {
                      j->req.prompt.len, reject_ctx);
             sse_error_event(j->fd, &j->req, 400, msg);
         }
+        s->kv_req_log(j, NULL, "refused-context");   /* L378 */
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -1740,6 +1835,7 @@ bool server::worker_try_bind() {
         bool dead = false;
         const bool open = job_claim_writes(j, &dead);
         if (!dead) job_reply_error(j, open, 500, "session bank could not be installed (state restore refused)");
+        s->kv_req_log(j, NULL, "refused-bank");   /* L378 */
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -1760,6 +1856,7 @@ bool server::worker_try_bind() {
         if (!s->prompt_kv_admit(sl, j, &kv_refused)) {
             if (!kv_refused) return false;
             s->queue_unlink(j);
+            s->kv_req_log(j, NULL, "refused-kv");   /* L378 */
             pthread_mutex_lock(&j->mu);
             j->done = true;
             pthread_cond_signal(&j->cv);
@@ -1884,6 +1981,306 @@ void server::count_metric(uint64_t *counter) {
 }
 
 
+/* =========================================================================
+ * L378: the KV evidence -- the `kv req:` line and the `kv ledger:` line (pulsar_server_internal.h, "the KV
+ * evidence"; docs/SERVER.md is the contract).  Nothing below decides anything.
+ * ========================================================================= */
+
+const char *const kv_route_names[KV_ROUTES] = {"none", "in-place", "fresh", "clobber", "owner", "matched"};
+const char *const kv_pick_names[KV_PICKS] = {"none", "own", "adopt", "disk", "live", "spilled"};
+const char *const kv_resume_why_names[PULSAR_RESUME_WHYS] = {"-", "continues", "point", "no-match", "no-ckpt",
+                                                            "ckpt-above", "not-continued", "images"};
+const char *const server_503_cause_names[SERVER_503_CAUSES] = {"admission", "image_busy", "parse_busy", "connections",
+                                                               "shutdown", "systemone"};
+
+uint64_t server_kv_token_hash(const int *v, int n) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    for (int i = 0; i < n; i++) {
+        const uint32_t id = (uint32_t)v[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (id >> (8 * b)) & 0xffu;
+            h *= UINT64_C(0x100000001b3);
+        }
+    }
+    return h;
+}
+
+int server_prompt_preamble_end(const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
+    if (!prompt || !m || m->n_user <= 0) return -1;
+    for (int i = 0; i < prompt->len; i++) {
+        const int role = pulsar_turn_marker_at(m, prompt->v, prompt->len, i);
+        if (role == 2) return -1;   /* an assistant turn before any user turn: no preamble this rule can name */
+        if (role == 1) return i;
+    }
+    return -1;
+}
+
+int server_prompt_conv_end(const pulsar_tokens *prompt, const pulsar_turn_markers *m) {
+    if (!prompt) return 0;
+    if (!m || m->n_assistant <= 0) return prompt->len;
+    for (int i = 0; i < prompt->len; i++)
+        if (pulsar_turn_marker_at(m, prompt->v, prompt->len, i) == 2) return i;
+    return prompt->len;
+}
+
+kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored) {
+    if (!cache_source || !strcmp(cache_source, "none")) return KV_PICK_NONE;
+    if (!strcmp(cache_source, "bank-adopt")) return KV_PICK_ADOPT;
+    if (!strcmp(cache_source, "disk-text")) return KV_PICK_DISK;
+    if (!strncmp(cache_source, "memory-", 7)) return spill_restored ? KV_PICK_SPILLED : KV_PICK_OWN;
+    return KV_PICK_LIVE;   /* responses-visible, responses-tool-output, anthropic-tool-output */
+}
+
+void gen_kv_finish(gen_state *g, const char *word) {
+    if (!g->kv_finish[0]) snprintf(g->kv_finish, sizeof g->kv_finish, "%.*s", (int)sizeof g->kv_finish - 1, word);
+}
+
+namespace {
+
+/// A key=value line being written (kv_req_format, kv_ledger_format).
+struct kv_line {
+    char *out;    ///< the buffer
+    size_t cap;   ///< its size
+    size_t len;   ///< bytes written (never past cap - 1)
+};
+/** Append " key=" (no blank before the first key) and a printf-formatted value.
+ *  @param l the line  @param key the key  @param fmt the value's printf format, then its arguments */
+__attribute__((format(printf, 3, 4))) void kv_line_put(kv_line *l, const char *key, const char *fmt, ...) {
+    if (l->len + 1 >= l->cap) return;
+    int n = snprintf(l->out + l->len, l->cap - l->len, "%s%s=", l->len ? " " : "", key);
+    if (n < 0) return;
+    l->len = std::min(l->len + (size_t)n, l->cap - 1);
+    va_list ap;
+    va_start(ap, fmt);
+    n = vsnprintf(l->out + l->len, l->cap - l->len, fmt, ap);
+    va_end(ap);
+    if (n > 0) l->len = std::min(l->len + (size_t)n, l->cap - 1);
+}
+/** @param l the line  @param key the key  @param v the value (negative: absent, printed `-`) */
+void kv_line_int(kv_line *l, const char *key, long long v) {
+    if (v < 0) kv_line_put(l, key, "-");
+    else kv_line_put(l, key, "%lld", v);
+}
+/** @param l the line  @param key the key  @param v milliseconds (negative: absent, printed `-`) */
+void kv_line_ms(kv_line *l, const char *key, double v) {
+    if (v < 0.0) kv_line_put(l, key, "-");
+    else kv_line_put(l, key, "%.0f", v);
+}
+/** A word with no blank in it: blanks and control bytes print as `_`, an empty or NULL word as `-`.
+ *  @param l the line  @param key the key  @param v the word */
+void kv_line_word(kv_line *l, const char *key, const char *v) {
+    char w[64];
+    size_t n = 0;
+    for (; v && v[n] && n + 1 < sizeof w; n++) w[n] = (unsigned char)v[n] <= ' ' || v[n] == 0x7f ? '_' : v[n];
+    w[n] = '\0';
+    kv_line_put(l, key, "%s", n ? w : "-");
+}
+/** @param l the line  @param key the key  @param have the hash exists (else `-`)  @param h the hash, as hex16 */
+void kv_line_hash(kv_line *l, const char *key, bool have, uint64_t h) {
+    if (have) kv_line_put(l, key, "%016llx", (unsigned long long)h);
+    else kv_line_put(l, key, "-");
+}
+/** Copy a client id cut to KV_REQ_ID_CHARS.  @param dst receives it  @param id the id as received */
+void kv_id_cut(char dst[KV_REQ_ID_CHARS + 1], const char *id) {
+    const size_t n = strnlen(id, KV_REQ_ID_CHARS);
+    memcpy(dst, id, n);
+    dst[n] = '\0';
+}
+
+}  // namespace
+
+void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
+    kv_line l = {out, cap, 0};
+    if (cap) out[0] = '\0';
+    kv_line_put(&l, "id", "%llu", (unsigned long long)r->id);
+    kv_line_word(&l, "ep", r->ep);
+    kv_line_word(&l, "class", r->cls);
+    kv_line_put(&l, "ro", "%d", r->ro ? 1 : 0);
+    kv_line_word(&l, "sess", r->sess);
+    kv_line_word(&l, "agent", r->agent);
+    kv_line_word(&l, "parent", r->parent);
+    kv_line_hash(&l, "pre", r->has_pre, r->pre);
+    kv_line_hash(&l, "conv", true, r->conv);
+    kv_line_int(&l, "prompt", r->prompt);
+    kv_line_int(&l, "bank", r->bank);
+    kv_line_word(&l, "route", kv_route_names[r->route]);
+    kv_line_int(&l, "best", r->best);
+    kv_line_int(&l, "common", r->common);
+    kv_line_int(&l, "score", r->score);
+    kv_line_int(&l, "anchor", r->anchor);
+    kv_line_int(&l, "frontier", r->frontier);
+    kv_line_int(&l, "prefilled", r->prefilled);
+    /* why the best bank's resume point is 0 inside a match -- only then */
+    kv_line_word(&l, "noresume", r->score == 0 && r->common > 0 ? kv_resume_why_names[r->why] : "");
+    kv_line_word(&l, "pick", kv_pick_names[r->pick]);
+    if (r->pick == KV_PICK_ADOPT) kv_line_int(&l, "from", r->from);
+    else kv_line_word(&l, "from", r->pick == KV_PICK_DISK ? "disk" : "");
+    kv_line_int(&l, "at", r->at);
+    kv_line_int(&l, "reused", r->reused);
+    kv_line_int(&l, "prefilled_now", r->prefilled_now);
+    /* what a resume at the deepest live match would have saved */
+    kv_line_int(&l, "below", r->deep >= 0 && r->at >= 0 ? (r->deep > r->at ? r->deep - r->at : 0) : -1);
+    kv_line_int(&l, "evict", r->evict);
+    kv_line_int(&l, "evict_tokens", r->evict >= 0 ? r->evict_tokens : -1);
+    kv_line_hash(&l, "evict_conv", r->evict >= 0, r->evict_conv);
+    kv_line_int(&l, "evict_ro", r->evict >= 0 ? (r->evict_ro ? 1 : 0) : -1);
+    {
+        char word[sizeof r->snapshot];   /* "none (read-only)" -> "none(read-only)": no blank in a value */
+        size_t n = 0;
+        for (size_t i = 0; r->evict >= 0 && r->snapshot[i]; i++)
+            if (r->snapshot[i] != ' ') word[n++] = r->snapshot[i];
+        word[n] = '\0';
+        kv_line_word(&l, "snapshot", word);
+    }
+    kv_line_ms(&l, "qwait_ms", r->qwait_ms);
+    kv_line_ms(&l, "restore_ms", r->restore_ms);
+    kv_line_ms(&l, "prefill_ms", r->prefill_ms);
+    kv_line_ms(&l, "ttft_ms", r->ttft_ms);
+    kv_line_int(&l, "out", r->out);
+    kv_line_word(&l, "finish", r->finish);
+}
+
+void server::kv_req_key(job *j) {
+    auto *s = this;
+    kv_req_line *r = &j->kvr;
+    const request *q = &j->req;
+    memset(r, 0, sizeof *r);
+    r->ep = q->api == API_ANTHROPIC ? "messages" : q->api == API_RESPONSES ? "responses"
+            : q->kind == REQ_CHAT ? "chat" : "completions";
+    r->cls = q->hints.cls == REQ_CLASS_NONE ? "" : k_request_class_names[q->hints.cls];
+    r->ro = (q->kv_flags & KV_HDR_READ_ONLY) != 0u;
+    kv_id_cut(r->sess, q->hints.session);
+    kv_id_cut(r->agent, q->hints.agent);
+    kv_id_cut(r->parent, q->hints.parent_agent);
+    const int pre_end = server_prompt_preamble_end(&q->prompt, &s->turn_markers);
+    r->has_pre = pre_end >= 0;
+    r->pre = r->has_pre ? server_kv_token_hash(q->prompt.v, pre_end) : 0u;
+    r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
+    r->prompt = q->prompt.len;
+    r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
+    r->from = r->at = r->reused = r->prefilled_now = r->evict = r->evict_tokens = -1;
+    r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;
+}
+
+void server::kv_req_log(job *j, const session_slot *sl, const char *finish) {
+    auto *s = this;
+    kv_req_line *r = &j->kvr;
+    const gen_state *g = sl ? sl->gen : NULL;
+    r->finish = finish;
+    if (g) {
+        r->bank = (int)sl->bank;
+        if (g->decode_t0 > 0.0 && g->t0 > 0.0) r->prefill_ms = (g->decode_t0 - g->t0) * 1e3;
+        if (g->first_token_t > 0.0) r->ttft_ms = (g->first_token_t - j->accepted_at) * 1e3;
+        r->out = g->completion_total + g->completion;
+        if (r->at >= 0) {
+            /* a prefill that ran to its end computed the prompt past `at`; one that stopped, to its last chunk */
+            const int upto = g->decode_t0 > 0.0 ? g->prompt_tokens : sl->prefill_counted;
+            r->prefilled_now = upto > r->at ? upto - r->at : 0;
+        }
+        if (!finish) r->finish = g->kv_finish;
+    }
+    char line[KV_REQ_LINE_MAX];
+    kv_req_format(r, line, sizeof line);
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv req: %s", line);
+    pthread_mutex_lock(&s->mu);
+    s->m_kvl.requests++;
+    s->m_kvl.routes[r->route]++;
+    s->m_kvl.picks[r->pick]++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+void kv_ledger_format(const kv_ledger_view *v, char *out, size_t cap) {
+    kv_line l = {out, cap, 0};
+    if (cap) out[0] = '\0';
+    char key[48];
+    kv_line_put(&l, "uptime_s", "%.0f", v->uptime_s);
+    kv_line_put(&l, "requests", "%llu", (unsigned long long)v->c.requests);
+    for (int i = 1; i < KV_ROUTES; i++) {
+        snprintf(key, sizeof key, "route_%s", kv_route_names[i]);
+        kv_line_put(&l, key, "%llu", (unsigned long long)v->c.routes[i]);
+    }
+    kv_line_put(&l, "route_none", "%llu", (unsigned long long)v->c.routes[KV_ROUTE_NONE]);
+    for (int i = 1; i < KV_PICKS; i++) {
+        snprintf(key, sizeof key, "pick_%s", kv_pick_names[i]);
+        kv_line_put(&l, key, "%llu", (unsigned long long)v->c.picks[i]);
+    }
+    kv_line_put(&l, "pick_none", "%llu", (unsigned long long)v->c.picks[KV_PICK_NONE]);
+    kv_line_put(&l, "evictions", "%llu", (unsigned long long)v->evictions);
+    static const char *const who[2] = {"conv", "ro"};   /* a conversation's history / a read-only one */
+    for (int victim = 0; victim < 2; victim++)
+        for (int by = 0; by < 2; by++) {
+            snprintf(key, sizeof key, "evict_%s_by_%s", who[victim], who[by]);
+            kv_line_put(&l, key, "%llu", (unsigned long long)v->c.evict_by[victim][by]);
+        }
+    kv_line_put(&l, "evict_own_best", "%llu", (unsigned long long)v->c.evict_own_best);
+    kv_line_put(&l, "disk", "%d", v->disk ? 1 : 0);
+    kv_line_put(&l, "seg_written_bytes", "%llu", (unsigned long long)v->io.rows_bytes_written);
+    kv_line_put(&l, "rp_written_bytes", "%llu", (unsigned long long)v->io.rp_bytes_written);
+    kv_line_put(&l, "segs_written", "%llu", (unsigned long long)v->io.segs_written);
+    kv_line_put(&l, "rps_written", "%llu", (unsigned long long)v->io.rps_written);
+    kv_line_put(&l, "seg_read_bytes", "%llu", (unsigned long long)v->io.rows_bytes_read);
+    kv_line_put(&l, "rp_read_bytes", "%llu", (unsigned long long)v->io.rp_bytes_read);
+    kv_line_put(&l, "segs_read", "%llu", (unsigned long long)v->io.segs_read);
+    kv_line_put(&l, "rps_read", "%llu", (unsigned long long)v->io.rps_read);
+    kv_line_put(&l, "removed_bytes", "%llu", (unsigned long long)v->io.bytes_removed);
+    kv_line_put(&l, "removed_budget_bytes", "%llu", (unsigned long long)v->io.budget_bytes_removed);
+    kv_line_put(&l, "removed_unread_bytes", "%llu", (unsigned long long)v->io.unread_bytes_removed);
+    kv_line_put(&l, "restores_begun", "%llu", (unsigned long long)v->restores[0]);
+    kv_line_put(&l, "restores_done", "%llu", (unsigned long long)v->restores[1]);
+    kv_line_put(&l, "restores_failed", "%llu", (unsigned long long)v->restores[2]);
+    kv_line_put(&l, "restored_tokens", "%llu", (unsigned long long)v->restored_tokens);
+    kv_line_put(&l, "dup_banks", "%d", v->dup.banks);
+    kv_line_put(&l, "dup_pages_resident", "%llu", (unsigned long long)v->dup.pages_resident);
+    kv_line_put(&l, "dup_pages_shared", "%llu", (unsigned long long)v->dup.pages_shared);
+    kv_line_put(&l, "dup_bytes", "%llu", (unsigned long long)v->dup.dup_bytes.raw());
+    kv_line_put(&l, "dup_bytes_peak", "%llu", (unsigned long long)v->dup_bytes_peak);
+    kv_line_put(&l, "dup_deep_pairs", "%d", v->dup.pairs[1]);
+    kv_line_put(&l, "dup_deep_longest", "%d", v->dup.longest[1]);
+    kv_line_put(&l, "spills", "%llu", (unsigned long long)v->spills);
+    kv_line_put(&l, "preemptions", "%llu", (unsigned long long)v->preemptions);
+    kv_line_put(&l, "readmissions", "%llu", (unsigned long long)v->readmissions);
+    for (int i = 0; i < SERVER_503_CAUSES; i++) {
+        snprintf(key, sizeof key, "refused_%s", server_503_cause_names[i]);
+        kv_line_put(&l, key, "%llu", (unsigned long long)v->c.refused[i]);
+    }
+    kv_line_put(&l, "refused_prefill", "%llu", (unsigned long long)v->prefill_refusals);
+}
+
+bool kv_ledger_due(int64_t now_s, int64_t last_s) { return now_s - last_s >= PULSAR_KV_LEDGER_PERIOD_S; }
+
+bool server::kv_ledger_read(kv_ledger_view *v, bool wait) {
+    auto *s = this;
+    if (wait) pthread_mutex_lock(&s->mu);
+    else if (pthread_mutex_trylock(&s->mu) != 0) return false;
+    v->uptime_s = difftime(time(NULL), s->started);
+    v->c = s->m_kvl;
+    v->evictions = s->m_evictions;
+    v->disk = s->m_kv_disk_enabled;
+    v->io = s->m_kv_disk_io;
+    memcpy(v->restores, s->kv.meter.restores, sizeof v->restores);
+    v->restored_tokens = s->kv.meter.restored_tokens;
+    v->dup = s->m_dup;
+    v->dup_bytes_peak = s->m_dup_bytes_peak.raw();
+    v->spills = s->m_spills;
+    v->preemptions = s->m_preemptions;
+    v->readmissions = s->m_readmissions;
+    v->prefill_refusals = s->m_prefill_mem_refusals;
+    pthread_mutex_unlock(&s->mu);
+    return true;
+}
+
+bool server::kv_ledger_log(bool wait) {
+    kv_ledger_view v;
+    if (!kv_ledger_read(&v, wait)) return false;
+    char line[KV_LEDGER_LINE_MAX];
+    kv_ledger_format(&v, line, sizeof line);
+    server_log(PULSAR_LOG_KVCACHE, "pulsar-server: kv ledger: %s", line);
+    return true;
+}
+
+void server::count_503(server_503_cause cause) { count_metric(&m_kvl.refused[cause]); }
+
+
 
 /* Record why the head job could not be bound. Counted once per job, not once
  * per bind attempt: the worker retries the head every quantum, so counting
@@ -1917,6 +2314,7 @@ void server::worker_finish_slot(session_slot *sl) {
         server_log(PULSAR_LOG_KVCACHE, "pulsar-server: hint: bank %u ran a compaction (%s) -- its prefix is dead",
                    sl->bank, j->req.hints.compaction[0] ? j->req.hints.compaction : "class");
     }
+    s->kv_req_log(j, sl, NULL);   /* L378: the request's one line, while its gen_state is still attached */
     s->generate_job_end(sl);
     pthread_mutex_lock(&s->mu);
     if (s->n_generating > 0) s->n_generating--;
@@ -2920,12 +3318,13 @@ bool server::worker_readmit_preempted() {
  * not already spilled (L328: bank 0 is a victim like any other -- the pool parks
  * on another resident bank, server::park_bank). -1 if none.  L323: a dominated
  * bank (server::dominated_slots; `dominated` may be NULL) goes before any LRU
- * choice. */
-int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) {
+ * choice.  L379: then a scratch one -- the make-room eviction's order
+ * (server_victim_rank), under the guard's own filter. */
+int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated, const bool *scratch) {
     auto *s = this;
     pulsar_session *pool = s->sess;
     int best = -1;
-    bool best_dom = false;
+    int best_rank = 0;
     bool best_bound = false;
     uint64_t best_us = UINT64_MAX;
     KvBytes best_touched = KvBytes::max();
@@ -2936,7 +3335,7 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
         for (int k = 0; k < n; k++) if (dec[k] == sl) { live = true; break; }
         if (live) continue;
         const KvBytes t = pulsar_session_bank_touched_kv_bytes(pool, sl->bank);
-        const bool dom = dominated && dominated[i];
+        const int rank = server_victim_rank(dominated && dominated[i], scratch && scratch[i]);
         /* L353 no. 10: a bank whose client is running a tool last: its turn continues the decoded frontier, which a chain
          * can't reproduce, so spilling it turns that turn into a 409 */
         bool bound;
@@ -2946,9 +3345,9 @@ int server::guard_pick_victim(session_slot **dec, int n, const bool *dominated) 
         }
         if (best < 0 || (!bound && best_bound) ||
             (bound == best_bound &&
-             ((dom && !best_dom) || (dom == best_dom && (sl->last_serviced_us < best_us ||
+             (rank < best_rank || (rank == best_rank && (sl->last_serviced_us < best_us ||
                                                          (sl->last_serviced_us == best_us && t < best_touched)))))) {
-            best = i; best_dom = dom; best_bound = bound; best_us = sl->last_serviced_us; best_touched = t;
+            best = i; best_rank = rank; best_bound = bound; best_us = sl->last_serviced_us; best_touched = t;
         }
     }
     return best;
@@ -2992,15 +3391,14 @@ static int guard_spill_plan(KvBytes touched, KvBytes delta, KvBytes bound,
 static int guard_victim_order(server *s, session_slot **dec, int n, int *order, bool *dominated_out) {
     session_slot *excl[2 * PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < n; i++) excl[i] = dec[i];
-    /* L323: the dominance facts once for the whole order -- a spill leaves every bank's history (the host carry)
-     * as it was, so they hold across it */
-    bool dominated[PULSAR_SESSION_POOL_CAP];
-    s->dominated_slots(dominated);
-    /* L353 no. 19: a dead prefix (its session compacted) goes before a live conversation, as worker_evict_one's does */
-    for (int i = 0; i < s->n_slots; i++) dominated[i] = dominated[i] || s->slots[i].hint_dead;
+    /* L323: the victim classes once for the whole order -- a spill leaves every bank's history (the host carry)
+     * as it was, so they hold across it.  L379: the make-room eviction's own facts (server::victim_facts): dominated
+     * and dead banks, then scratch ones, then the conversations by LRU */
+    bool dominated[PULSAR_SESSION_POOL_CAP], scratch[PULSAR_SESSION_POOL_CAP];
+    s->victim_facts(dominated, scratch);
     int m = 0;
     while (n + m < 2 * PULSAR_SESSION_POOL_CAP) {
-        const int vi = s->guard_pick_victim(excl, n + m, dominated);
+        const int vi = s->guard_pick_victim(excl, n + m, dominated, scratch);
         if (vi < 0) break;
         order[m] = vi;
         excl[n + m] = &s->slots[vi];
@@ -3155,6 +3553,7 @@ bool server::prompt_kv_admit(session_slot *sl, job *j, bool *refused) {
              j->req.prompt.len, (double)need.raw() / gib, (double)touched.raw() / gib,
              (double)s->guard_budget().raw() / gib);
     server_log(PULSAR_LOG_WARNING, "pulsar-server: kv admission REFUSED (503): %s", msg);
+    s->count_503(SERVER_503_ADMISSION);   /* L378 */
     s->note_provision_refusal(j, PROVISION_REFUSED_KV_TOUCHED);
     *refused = true;
     bool dead = false;
@@ -3323,6 +3722,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     } else {
         job_reply_error(g->j, false, 503, g->err);
     }
+    gen_kv_finish(g, "refused-memory");   /* L378 */
     g->phase = GEN_DONE;
     return false;
 }

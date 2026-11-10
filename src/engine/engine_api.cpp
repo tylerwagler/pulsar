@@ -1964,7 +1964,7 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
 }
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
                                                  const pulsar_image_ref *images, int n_images) {
-    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
+    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
     if (!s || !prompt || prompt->len <= 0) return none;
     const pulsar_tokens *t = pulsar_bank_history(s, bank);
     if (!t) return none;
@@ -1986,7 +1986,7 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
             pulsar_image_licence_decide(e, t, held, prompt, images, n_images, &lic);
             keep = !lic.extends_live || lic.keep;
         }
-        if (keep) return {TokPos::after(m.live_cut), m.prompt_cut};
+        if (keep) return {TokPos::after(m.live_cut), m.prompt_cut, PULSAR_RESUME_CONTINUES};
     }
     /* else the one resume rule over the stitched prompt (G <= the cut: below it the stitched prompt is the bank's
      * own tokens).  L350: an image request's records match by the request's image identity, and a grid point keeps
@@ -2002,16 +2002,28 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
     if (n_images > 0 && !m.seamed && !by_images)
         vision_decode_busy_reset();   /* discarded: priced from tokens alone (O34) */
     uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL);
+    pulsar_resume_why why = PULSAR_RESUME_POINT;
     if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want) &&
-        !pulsar_image_holds_below(e, held, prompt, images, n_images, G))
+        !pulsar_image_holds_below(e, held, prompt, images, n_images, G)) {
         G = 0;
+        why = PULSAR_RESUME_IMAGES;
+    } else if (!G) {
+        /* L378: what the bank lacks, from the rule's own facts (pulsar_session_resume_point found nothing at or
+         * below min(match, prefill frontier, prompt - 1)) */
+        const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
+        why = m.live_cut == TokCount{0}                                  ? PULSAR_RESUME_NO_MATCH
+              : m.live_cut == TokCount{t->len}                           ? PULSAR_RESUME_NOT_CONTINUED
+              : st && st->ops && pulsar_ckpt_best(st, bank, UINT32_MAX)  ? PULSAR_RESUME_CHECKPOINT_ABOVE
+                                                                         : PULSAR_RESUME_NO_CHECKPOINT;
+    }
     const TokPos at{(int)G};
     /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
      * does (G was returned as the prompt-side count unconverted before) */
     if (at < TokPos::after(m.live_cut))
-        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, e, t->v, at, prompt->v, prompt->len)};
-    return {at, m.prompt_cut};
+        return {at, pulsar_tokens_prompt_held_with(pulsar_engine_token_text_fn, e, t->v, at, prompt->v, prompt->len),
+                why};
+    return {at, m.prompt_cut, why};
 }
 /* L313: where `src`'s published state serves `prompt` -- the one resume rule (pulsar_session_resume_point, the rule a
  * bank's own resume reads) on src: its deepest grid checkpoint within the match and its prefill-only history (one short
@@ -2050,7 +2062,7 @@ static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_t
 }
 
 pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt) {
-    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}};
+    const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
     if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s))
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
@@ -2061,7 +2073,7 @@ pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, uint32_t s
     int len = 0;
     const TokPos T{(int)bank_adopt_point(s, src, prompt, &r, &len)};
     /* L334: T is on src's history; the depth an adopt is ranked by is what src's tokens to T hold of the request */
-    return {T, pulsar_session_bank_prompt_held(s, src, prompt, T)};
+    return {T, pulsar_session_bank_prompt_held(s, src, prompt, T), PULSAR_RESUME_WHY_NONE};
 }
 
 PromptToks pulsar_session_bank_prompt_held(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, TokPos at) {
