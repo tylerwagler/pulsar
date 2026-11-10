@@ -2445,10 +2445,12 @@ const pulsar_tokens *pulsar_session_tokens(pulsar_session *s);
  * restored session prices its copy rounds as the saved one does; v4 refuses on the version.
  * v6 (L308): the copy acceptance's age (tokens since its last verdict) joins it (6 u32), so a restored session
  * re-probes a stale copy estimate when the saved one would; v5 refuses on the version.
- * v7 (L347 I3a): the trailing digest is lib/pulsar_kvdigest.h's v2 (four lanes); v6 refuses on the version. */
+ * v7 (L347 I3a): the trailing digest is lib/pulsar_kvdigest.h's v2 (four lanes); v6 refuses on the version.
+ * v8 (L370): no format change -- Gemma 4's window layers wrote wrong K / V on some short prompt steps (a bounded
+ * GQA split grid one chunk short), so every older payload is refused rather than trusted. */
 #define PULSAR_SESSION_KV_PAYLOAD_MAGIC UINT32_C(0x3150564b) /* "KVP1" */
-/** The kv-state payload's format version (the v2..v7 history above); a payload of another version is refused. */
-#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(7)
+/** The kv-state payload's format version (the v2..v8 history above); a payload of another version is refused. */
+#define PULSAR_SESSION_KV_PAYLOAD_VERSION UINT32_C(8)
 
 /** @param s the session (a family with payloads; else 0)
  *  @return the serialized payload's size, bytes */
@@ -2505,7 +2507,7 @@ int pulsar_session_save_snapshot(pulsar_session *s, pulsar_session_snapshot *sna
 /* v2 (L265): the header names the state layout by a digest (the model's state ops) instead of
  * DeepSeek's strides; v1 segments are refused and the chain rewrites itself. */
 /** The disk segment format's version (history beside it); a segment of another version is refused. */
-#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(8)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state; v7 (L347): rows only; the state at G is the key's restore point file (header word 8 carries no flag, 0); v8 (L347 I3a): the digest is pulsar_kvdigest v2 (four lanes) */
+#define PULSAR_SESSION_SEGMENT_VERSION UINT32_C(9)   /* v3 (L281): the span's image block records; v4 (L268): with each block's 2D grid; v5 (L292): NVFP4 KV rows from IEEE divides -- v4 rows differ in a few codes, so they are refused and rewritten; v6 (L323): the state is optional and last, behind its own digest (header word 8 flags it), so a load reads rows + one state; v7 (L347): rows only; the state at G is the key's restore point file (header word 8 carries no flag, 0); v8 (L347 I3a): the digest is pulsar_kvdigest v2 (four lanes); v9 (L370): no format change -- rows written by Gemma 4's short-grid window attention are refused, not trusted */
 /** L347: a RESTORE POINT -- the state at a grid point G: the installed bank's
  * grid checkpoint slot at G behind a header (magic, version, the segment layout
  * digest, the slot size, the resume grid, G, flags 0) and its own digest.  The
