@@ -3928,13 +3928,23 @@ int pulsar_gpu_hc_expand_add_split_tensor(
 /** pulsar_gpu_sample_req::flags: draw this row's argmax whatever its temperature (L296 toolsample positions). */
 #define PULSAR_GPU_SAMPLE_GREEDY 1u
 
-/** A row's status: OK, or why no token was drawn (the host sampler's three refusals). */
+/** A row's status: OK, or why no token was drawn (the host sampler's three refusals, and L375's broken row). */
 enum {
     PULSAR_GPU_SAMPLE_OK = 0,
     PULSAR_GPU_SAMPLE_REFUSED_KNOB = 1,    ///< a sampling knob is not finite
     PULSAR_GPU_SAMPLE_REFUSED_EMPTY = 2,   ///< no finite logit (after the mask)
     PULSAR_GPU_SAMPLE_REFUSED_MASS = 3,    ///< the candidate mass is not a positive finite number
+    /** The row's logits hold a NaN or +Inf (anywhere, under a cleared mask bit too): the forward that wrote the row
+     *  is broken, so nothing is drawn from the rest.  -inf is the mask's value and refuses nothing. */
+    PULSAR_GPU_SAMPLE_REFUSED_NONFINITE = 4,
 };
+
+/** Says a refused row's status by name on stderr, once per status and row width (rule 9); nothing for
+ *  PULSAR_GPU_SAMPLE_OK.  The kernels cannot print: whoever reads a pulsar_gpu_sample_out or a
+ *  pulsar_gpu_spec_walk_out back calls this with what it read. */
+/** @param status  a row's (or a walk's) PULSAR_GPU_SAMPLE_* status
+ *  @param n_vocab the width of the rows the launch drew from */
+void pulsar_gpu_sample_refusal_say(uint32_t status, uint32_t n_vocab);
 
 /** One row's draw: the request's knobs as it carries them (the sampler clamps them as the host's always did), the
  *  key (pulsar_sample_key at the token's index), the flags, and the row of the token mask it reads. */
@@ -4097,12 +4107,16 @@ uint64_t pulsar_gpu_logprobs_scratch_bytes(uint32_t n_vocab);
  *  candidates cand[c][j][0..topk) scored by scores[c][j][prev][0..topk) (prev: the slot before's pick, 0 at slot 0)
  *  -- a sparse row of `vocab` (every other id -inf, a repeated id keeps its last score, an id outside the vocabulary
  *  none) drawn by THE sampler under the chain's knobs at key[j]; the pick is the first candidate equal to the draw.
- *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there). */
+ *  out receives tokens [n_chains][slots] (int32; -1 from a refused slot on, the walk stops there; a slot whose
+ *  scores hold a NaN or +Inf is PULSAR_GPU_CHAIN_NONFINITE, the slots after it -1). */
 #define PULSAR_GPU_CHAIN_SLOTS_MAX 16u
 /** The most candidates per chain slot. */
 #define PULSAR_GPU_CHAIN_TOPK_MAX 64u
 /** The most chains one launch walks. */
 #define PULSAR_GPU_CHAINS_MAX 16u
+/** pulsar_gpu_sample_chains' out at a slot whose candidate scores hold a NaN or +Inf: a broken drafter row, not
+ *  drawn (the sampler's PULSAR_GPU_SAMPLE_REFUSED_NONFINITE rule on the slot's sparse row). */
+#define PULSAR_GPU_CHAIN_NONFINITE (-2)
 /** One chain's draw request for pulsar_gpu_sample_chains. */
 typedef struct pulsar_gpu_chain_req {
     float temperature, top_p, min_p;

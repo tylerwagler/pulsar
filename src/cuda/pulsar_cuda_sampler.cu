@@ -7,7 +7,11 @@
  * bytes a row.  The rule is the one the host sampler (tokenizer.cpp until L302) defined, kept BYTE FOR BYTE:
  *
  *   - a row's value at id i is its logit, or -inf where the row's token mask (L303's hook; L272's tool-name mask
- *     rides it) clears bit i; a non-finite value is no candidate;
+ *     rides it) clears bit i; a -inf value is no candidate -- the one legitimate hole;
+ *   - a row whose logits hold a NaN or a +Inf anywhere (under a cleared mask bit too: the forward that wrote the row
+ *     is what broke) draws nothing: PULSAR_GPU_SAMPLE_REFUSED_NONFINITE (L375; until then the host rule skipped such
+ *     a value like a masked one and drew from the rest).  The prep's scan counts them (row_prep::n_bad); a chain's
+ *     slot counts its own few (sample_chains_kernel);
  *   - greedy (temperature <= 0, or the row's GREEDY flag -- the toolsample positions) is the argmax: the lowest id
  *     whose value equals the row's finite maximum (IEEE ==, so +0 and -0 tie), -1 with no finite value;
  *   - otherwise the nucleus: candidates in descending value, ascending id on ties (-0 is +0); probabilities
@@ -82,6 +86,15 @@ __host__ __device__ __forceinline__ uint32_t f32_bits(float v) {
  * @return true for a finite v
  */
 __host__ __device__ __forceinline__ bool finite_bits(float v) { return (f32_bits(v) & 0x7f800000u) != 0x7f800000u; }
+/**
+ * Whether a logit breaks its row: a NaN or +Inf.  -inf is the mask's value and breaks nothing.
+ * @param v the stored logit (before the row's mask)
+ * @return true for a NaN (either sign) or +Inf
+ */
+__host__ __device__ __forceinline__ bool broken_bits(float v) {
+    const uint32_t u = f32_bits(v);
+    return (u & 0x7f800000u) == 0x7f800000u && u != 0xff800000u;
+}
 
 /* descending value, -0 as +0: unsigned ascending order of the key is the candidates' order (ids break ties) */
 /**
@@ -602,12 +615,16 @@ struct row_prep {
     int32_t maxi;
     /// Finite values in the row.
     uint32_t n_fin;
+    /// NaN and +Inf logits in the row, masked or not (broken_bits()): nonzero refuses the row.
+    uint32_t n_bad;
     /// Each chunk's first maximum (prep_scan_kernel).
     float pmax[PREP_CHUNKS];
     /// Each chunk's maximum's id, -1 with none.
     int32_t pidx[PREP_CHUNKS];
     /// Each chunk's finite count.
     uint32_t pfin[PREP_CHUNKS];
+    /// Each chunk's count of NaN and +Inf logits.
+    uint32_t pbad[PREP_CHUNKS];
     /// The candidates as (desc_key << 32 | id), unordered; the first SMP_CAP appended are kept.
     uint64_t cand[SMP_CAP];
 };
@@ -808,8 +825,8 @@ constexpr uint32_t WIDE_CHUNKS = 128;   /* the wide passes' blocks a row */
 
 /* scan: the chunk's first maximum and finite count; a top-k row's first histogram */
 /**
- * Prep pass 1: each chunk's first maximum, its id and its finite count into the row's pmax / pidx / pfin; a top-k
- * row's level-1 histogram.  Grid (PREP_CHUNKS, n_rows), block PREP_THREADS.
+ * Prep pass 1: each chunk's first maximum, its id, its finite count and its count of NaN / +Inf logits (the stored
+ * values, before the mask) into the row's pmax / pidx / pfin / pbad; a top-k row's level-1 histogram.  Grid (PREP_CHUNKS, n_rows), block PREP_THREADS.
  * @param a the launch
  * @param prep [n_rows] prep records, zeroed through zero_end
  */
@@ -817,6 +834,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
     __shared__ float rv_[PREP_THREADS];
     __shared__ int32_t ri_[PREP_THREADS];
     __shared__ uint32_t ru_[PREP_THREADS];
+    __shared__ uint32_t rb_[PREP_THREADS];
     const uint32_t row = blockIdx.y, c = blockIdx.x, tid = threadIdx.x;
     const pulsar_gpu_sample_req q = a.req[row];
     const row_plan p = plan_row(q, a.n_vocab);
@@ -827,8 +845,9 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
     const bool hist = !p.refuse && !p.greedy && p.path == PATH_TOPK;
     float bv = 0.0f;
     int32_t bi = -1;
-    uint32_t fin = 0;
+    uint32_t fin = 0, bad = 0;
     for (uint32_t i = lo + tid; i < hi; i += PREP_THREADS) {
+        bad += broken_bits(rv.x[i]) ? 1u : 0u;   /* the stored value: a NaN under a cleared mask bit breaks the row too */
         const float v = rv(i);
         if (!finite_bits(v)) continue;
         fin++;
@@ -838,6 +857,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
     rv_[tid] = bv;
     ri_[tid] = bi;
     ru_[tid] = fin;
+    rb_[tid] = bad;
     __syncthreads();
     for (uint32_t s = PREP_THREADS / 2u; s > 0u; s >>= 1) {
         if (tid < s) {
@@ -845,6 +865,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
             const int32_t ir = ri_[tid + s], il = ri_[tid];
             if (ir >= 0 && (il < 0 || vr > vl || (vr == vl && ir < il))) { rv_[tid] = vr; ri_[tid] = ir; }
             ru_[tid] += ru_[tid + s];
+            rb_[tid] += rb_[tid + s];
         }
         __syncthreads();
     }
@@ -852,32 +873,37 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_scan_kernel(const __grid_co
         pr->pmax[c] = rv_[0];
         pr->pidx[c] = ri_[0];
         pr->pfin[c] = ru_[0];
+        pr->pbad[c] = rb_[0];
     }
 }
 
 /* the row's first maximum and finite count from its chunks' (the block argmax's rule: a larger value, or an equal one
  * at a lower id) */
 /**
- * The row's first maximum and finite count, reduced from its chunks' records (a larger value, or an equal one at a
- * lower id).
+ * The row's first maximum, finite count and NaN / +Inf count, reduced from its chunks' records (a larger value, or an
+ * equal one at a lower id).
  * @param pr the row's prep record
  * @param maxv receives the maximum
  * @param maxi receives its id, or -1 with no finite value
  * @param n_fin receives the finite count
+ * @param n_bad receives the count of NaN and +Inf logits
  */
-__device__ __forceinline__ void prep_reduce_max(const row_prep *pr, float *maxv, int32_t *maxi, uint32_t *n_fin) {
+__device__ __forceinline__ void prep_reduce_max(const row_prep *pr, float *maxv, int32_t *maxi, uint32_t *n_fin,
+                                                uint32_t *n_bad) {
     float bv = 0.0f;
     int32_t bi = -1;
-    uint32_t fin = 0;
+    uint32_t fin = 0, bad = 0;
     for (uint32_t c = 0; c < PREP_CHUNKS; c++) {
         const float v = pr->pmax[c];
         const int32_t i = pr->pidx[c];
         fin += pr->pfin[c];
+        bad += pr->pbad[c];
         if (i >= 0 && (bi < 0 || v > bv || (v == bv && i < bi))) { bv = v; bi = i; }
     }
     *maxv = bv;
     *maxi = bi;
     *n_fin = fin;
+    *n_bad = bad;
 }
 
 /* decide level L of a top-k row's radix select: the digit whose cumulative count reaches the keys still wanted
@@ -902,8 +928,8 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_decide_kernel(const __grid_
     if (L == 1) {
         float mv;
         int32_t mi;
-        uint32_t nf;
-        prep_reduce_max(pr, &mv, &mi, &nf);
+        uint32_t nf, nb_;
+        prep_reduce_max(pr, &mv, &mi, &nf, &nb_);
         want = min((uint32_t)p.top_k, nf);
     } else {
         want = L == 2 ? pr->want1 : pr->want2;
@@ -962,7 +988,7 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_hist_kernel(const __grid_co
 
 /* the row's maximum (block 0 records it) and its candidates appended to its list */
 /**
- * Prep collection: block 0 records the row's maximum; every block appends its chunk's candidates (top-k: a key at
+ * Prep collection: block 0 records the row's maximum and its counts; every block appends its chunk's candidates (top-k: a key at
  * or below K*; else row_is_cand()) to the row's list, and writes the id-order rows' p values to a.pvals.  Skips
  * refused, greedy, empty and full-arm rows.  Grid (WIDE_CHUNKS at <= 4 rows, else PREP_CHUNKS; n_rows), block
  * PREP_THREADS.
@@ -977,12 +1003,13 @@ __global__ void __launch_bounds__(PREP_THREADS) prep_collect_kernel(const __grid
     row_prep *pr = prep + row;
     float maxv;
     int32_t maxi;
-    uint32_t n_fin;
-    prep_reduce_max(pr, &maxv, &maxi, &n_fin);
+    uint32_t n_fin, n_bad;
+    prep_reduce_max(pr, &maxv, &maxi, &n_fin, &n_bad);
     if (c == 0 && tid == 0) {
         pr->maxv = maxv;
         pr->maxi = maxi;
         pr->n_fin = n_fin;
+        pr->n_bad = n_bad;
     }
     if (p.refuse || p.greedy || maxi < 0 || ((a.full_rows >> row) & 1u)) return;
     const row_view rv = prep_view(a, q);
@@ -1684,6 +1711,12 @@ __device__ void sample_row(const launch_args &a, uint32_t row, row_smem<THREADS>
         finish(-1, PULSAR_GPU_SAMPLE_REFUSED_KNOB);
         return;
     }
+    /* a NaN or +Inf logit anywhere in the row: the prep counted them (a slot's row came through the row kernel's
+     * test; a chain's slot is tested by its kernel, which builds the row) */
+    if (pp && pp->n_bad) {
+        finish(-1, PULSAR_GPU_SAMPLE_REFUSED_NONFINITE);
+        return;
+    }
     float maxv;
     int32_t maxi;
     if (pp) {
@@ -2021,11 +2054,12 @@ __device__ __forceinline__ full_slot full_slot_of(const launch_args &a, const fu
 
 /* the sort's input, and the row's state reset (the floor search lowers f from n) */
 /**
- * The device sort's input (desc key, id) for every value, and the row's state reset (n = f = the finite count).
+ * The device sort's input (desc key, id) for every value, and the row's state reset (n = f = the finite count; the
+ * status refuses a row with a NaN or +Inf logit, or with no finite one).
  * Grid (WIDE_CHUNKS, g.n), block PREP_THREADS.
  * @param a the launch
  * @param g the pass
- * @param prep the rows' prep records (their finite counts)
+ * @param prep the rows' prep records (their finite and NaN / +Inf counts)
  */
 __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_constant__ launch_args a,
                                                                    const full_group g, const row_prep *prep) {
@@ -2040,7 +2074,8 @@ __global__ void __launch_bounds__(PREP_THREADS) full_keygen_kernel(const __grid_
         s.st->n = n;
         s.st->f = n;
         s.st->ub_bits = 0x7f800000u;
-        s.st->status = n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
+        s.st->status = prep[row].n_bad ? PULSAR_GPU_SAMPLE_REFUSED_NONFINITE
+                       : n == 0 ? PULSAR_GPU_SAMPLE_REFUSED_EMPTY : PULSAR_GPU_SAMPLE_OK;
     }
     uint32_t lo, hi;
     grid_chunk(rv.n, c, &lo, &hi);
@@ -2614,13 +2649,14 @@ struct chain_args {
      *  The vocabulary's width (the knobs' plan reads it). */
     /// The chains' requests, one a block.
     pulsar_gpu_chain_req req[PULSAR_GPU_CHAINS_MAX];
-    /// [n_chains][slots] the drawn tokens, -1 past the chain's stop.
+    /// [n_chains][slots] the drawn tokens; -1 past the chain's stop, PULSAR_GPU_CHAIN_NONFINITE at a broken slot.
     int32_t *out;
 };
 
 /**
- * One block a chain: each slot's sparse row (its finite entries in ascending id) drawn by sample_row(), the next
- * slot's scores picked by this draw.  Grid n_chains, block CHAIN_THREADS.
+ * One block a chain: each slot's sparse row (its entries in ascending id) drawn by sample_row(), the next slot's
+ * scores picked by this draw; a slot whose scores hold a NaN or +Inf is not drawn and ends the chain
+ * (PULSAR_GPU_CHAIN_NONFINITE).  Grid n_chains, block CHAIN_THREADS.
  * @param c the arguments
  */
 __global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __grid_constant__ chain_args c) {
@@ -2629,7 +2665,7 @@ __global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __gr
     __shared__ float row[PULSAR_GPU_CHAIN_TOPK_MAX];
     __shared__ int32_t ids[PULSAR_GPU_CHAIN_TOPK_MAX];
     __shared__ row_out_t o;
-    __shared__ uint32_t pend, prev, stop;
+    __shared__ uint32_t pend, prev, stop, bad;
     const uint32_t b = blockIdx.x, tid = threadIdx.x, TK = c.topk;
     const pulsar_gpu_chain_req &q = c.req[b];
     const int32_t *cand = c.cand + (size_t)q.chain * c.slots * TK;
@@ -2679,8 +2715,18 @@ __global__ void __launch_bounds__(CHAIN_THREADS) sample_chains_kernel(const __gr
             la.n_vocab = m;
             la.row_stride = m;
             la.req[0].key = q.key[j];
+            /* the slot's row is these m scores: a NaN or +Inf among them refuses the slot (and the chain); a
+             * non-finite knob refuses first, in sample_row, as on every other row */
+            row_plan pl;
+            plan_knobs(la.req[0], &pl);
+            bad = 0;
+            for (uint32_t k = 0; !pl.refuse && k < m; k++) bad += broken_bits(row[k]) ? 1u : 0u;
         }
         __syncthreads();
+        if (bad) {
+            if (tid == 0) { out[j] = PULSAR_GPU_CHAIN_NONFINITE; stop = 1; }
+            continue;
+        }
         sample_row<CHAIN_THREADS>(la, 0u, sm, nullptr, nullptr);
         __syncthreads();
         if (tid == 0) {
@@ -2809,6 +2855,22 @@ static bool sr_run(sr_args &sa, const sr_scratch &c, int k, uint32_t n_vocab) {
 static uint64_t sample_sr_off(uint32_t n_vocab) {
     return (sample_pvals_off(n_vocab) + (uint64_t)PULSAR_GPU_SAMPLE_ROWS_MAX * n_vocab * sizeof(float) + 255u) &
            ~255ull;
+}
+
+void pulsar_gpu_sample_refusal_say(uint32_t status, uint32_t n_vocab) {
+    if (status == PULSAR_GPU_SAMPLE_OK) return;
+    const char *why = status == PULSAR_GPU_SAMPLE_REFUSED_KNOB        ? "a sampling knob is not finite (REFUSED_KNOB)"
+                      : status == PULSAR_GPU_SAMPLE_REFUSED_EMPTY     ? "no finite logit after the mask (REFUSED_EMPTY)"
+                      : status == PULSAR_GPU_SAMPLE_REFUSED_MASS
+                          ? "the candidate mass is not a positive finite number (REFUSED_MASS)"
+                      : status == PULSAR_GPU_SAMPLE_REFUSED_NONFINITE
+                          ? "the row holds a NaN or +Inf logit: the forward that wrote it is broken (REFUSED_NONFINITE)"
+                          : "an unknown status";
+    char site[64];
+    snprintf(site, sizeof(site), "device sampler refusal %u @ %u", status, n_vocab);
+    if (cuda_first_say(site))
+        fprintf(stderr, "pulsar: device sampler: refused a %u-wide logits row: %s -- no token is drawn (said once for "
+                        "this status and width)\n", n_vocab, why);
 }
 
 uint64_t pulsar_gpu_sample_scratch_bytes(uint32_t n_vocab) {

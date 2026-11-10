@@ -195,6 +195,7 @@ bool pulsar_session::draw_rows_width(const pulsar_gpu_tensor *rows, uint32_t wid
         fprintf(stderr, "pulsar: session: the device sampler's readback failed\n");
         return false;
     }
+    for (uint32_t k = 0; k < n; k++) pulsar_gpu_sample_refusal_say(out[k].status, width);   /* each refusal by name */
     return true;
 }
 
@@ -205,6 +206,8 @@ bool pulsar_session::draw_rows(const pulsar_gpu_tensor *rows, const uint32_t *ro
         fprintf(stderr, "pulsar: session: the device sampler's readback failed\n");
         return false;
     }
+    for (uint32_t k = 0; k < n; k++)   /* each refusal by name */
+        pulsar_gpu_sample_refusal_say(out[k].status, (uint32_t)engine->logits_width());
     return true;
 }
 

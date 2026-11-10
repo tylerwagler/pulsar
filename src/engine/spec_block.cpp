@@ -1614,7 +1614,9 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
                 } else {
                     const int dt = drawn[(size_t)chain_of[b] * SL + j - 1];   /* THE sampler's draw over the slot's candidates */
                     if (dt < 0) {
-                        snprintf(err, errlen, "a draft slot's candidates have no distribution");
+                        snprintf(err, errlen, dt == PULSAR_GPU_CHAIN_NONFINITE
+                                                  ? "a draft slot's candidate scores hold a NaN or +Inf"
+                                                  : "a draft slot's candidates have no distribution");
                         return false;
                     }
                     q->refined[j] = dt;

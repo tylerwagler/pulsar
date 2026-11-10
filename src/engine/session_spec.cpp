@@ -780,6 +780,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
         commit_rc = (int)wv->commit;
         carry_tok = wv->carry;
         carry_refused = wv->status != PULSAR_GPU_SAMPLE_OK;
+        pulsar_gpu_sample_refusal_say(wv->status, (uint32_t)e->logits_width());   /* the refusing row's, by name */
         if (carry_refused && wv->commit < K) commit_rc = -1;
         /* L303: every row the walk judged a draft on must be under a mask (mask_rows > the stop row; a row past
          * them was drawn unconstrained, and no masks at all is the round's grammar failure): the round is refused.
