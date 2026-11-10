@@ -2039,7 +2039,8 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
  *  @param accepted_cap slots at accepted
  *  @param err receives the failure
  *  @param errlen bytes at err
- *  @return tokens emitted (0 on bad arguments), or -1 */
+ *  @return tokens emitted (0 on bad arguments), or -1 (a failure; a tensor-parallel session, which no frame mirrors
+ *          this entry for) */
 int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
                                         int max_tokens,
                                         int *accepted, int accepted_cap,

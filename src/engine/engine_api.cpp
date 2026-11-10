@@ -1862,7 +1862,18 @@ int pulsar_session_spec_redraft_commit_batch(pulsar_session *s, pulsar_spec_step
     const int own = pulsar_spec_steps_verdict(PULSAR_SPEC_PHASE_REDRAFT_COMMIT, steps, n, 0u);
     return tp_mirror_bank_verdict(s, tp, operation, own, -1) < 0 ? tp_spec_steps_fail(steps, n, operation) : 0;
 }
-int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int *accepted, int accepted_cap, char *err, size_t errlen) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1); return s ? s->eval_speculative_block(first_token, max_tokens, accepted, accepted_cap, err, errlen) : 0; }
+int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token, int max_tokens, int *accepted, int accepted_cap, char *err, size_t errlen) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", -1);
+    if (!s) return 0;
+    /* L375 O40: no frame mirrors this entry (pulsar_session_generate_speculative is the mirrored one), so on a pair
+     * the leader would run a round its workers never see -- refused by name */
+    if (pulsar_session_is_mirrored(s)) {
+        if (err) snprintf(err, errlen, "eval_speculative_block: a tensor-parallel engine does not mirror it "
+                                       "(pulsar_session_generate_speculative is the mirrored entry)");
+        return -1;
+    }
+    return s->eval_speculative_block(first_token, max_tokens, accepted, accepted_cap, err, errlen);
+}
 void pulsar_session_invalidate(pulsar_session *s) {
     PULSAR_NVTX_FN();
     /* The pair-off shape is untouched: one call, no TP code on the live path. */
