@@ -1480,24 +1480,32 @@ constexpr size_t gqa_dmma_smem(uint32_t hd, uint32_t rb) {
     return (size_t)GQA_DMMA_VT * (hd + 8u) * 2u + (size_t)rb * GQA_DMMA_NV * GQA_CHUNK * 4u;
 }
 
-/// Launches gqa_decode_mma_kernel<HD, RB>, raising its dynamic smem limit on its first launch (one flag an
-/// instantiation: the three row counts' kernels share a pointer type, not a limit).
+/// Launches gqa_decode_mma_kernel<HD, RB> once the current device has granted its dynamic smem (L335's per-device
+/// rule through pulsar_cuda_smem_opt_in; one record an instantiation: the three row counts' kernels share a pointer
+/// type, not a limit).  L375 (O56): the grant was one flag for the process, set on the first device that launched,
+/// and its result was not read -- HD 512 at 4 rows needs 49,408 B, past the 48 KiB every kernel has without one, so
+/// a refused grant launched a kernel that could not run.
 /// @tparam HD head_dim.
 /// @tparam RB rows a CTA.
 /// @param grid the grid.
 /// @param aa the arguments.
 /// @param n_rows the call's rows.
 /// @param st the stream.
+/// @return false when the device refused the grant (said once an instantiation): nothing launched.
 template <int HD, int RB>
-void gqa_decode_mma_go(dim3 grid, const gqa_args &aa, uint32_t n_rows, cudaStream_t st) {
+bool gqa_decode_mma_go(dim3 grid, const gqa_args &aa, uint32_t n_rows, cudaStream_t st) {
     constexpr size_t bytes = gqa_dmma_smem(HD, RB);
-    static bool raised = false;
-    if (!raised) {
-        (void)cudaFuncSetAttribute(gqa_decode_mma_kernel<HD, RB>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   (int)bytes);
-        raised = true;
+    static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    if (!pulsar_cuda_smem_opt_in((const void *)gqa_decode_mma_kernel<HD, RB>, smem_set, bytes)) {
+        char site[64];
+        snprintf(site, sizeof site, "gqa decode MMA smem grant %d x %d", HD, RB);
+        if (cuda_first_say(site))
+            fprintf(stderr, "pulsar: gqa attention refused: this device did not grant the MMA decode kernel (head_dim "
+                            "%d, %d rows a CTA) its %zu bytes of dynamic shared memory\n", HD, RB, bytes);
+        return false;
     }
     gqa_decode_mma_kernel<HD, RB><<<grid, GQA_DMMA_THREADS, bytes, st>>>(aa, n_rows);
+    return true;
 }
 
 /// Launches gqa_decode_mma_kernel at rb rows a CTA (1, 2, 4).
@@ -1507,11 +1515,12 @@ void gqa_decode_mma_go(dim3 grid, const gqa_args &aa, uint32_t n_rows, cudaStrea
 /// @param aa the arguments.
 /// @param n_rows the call's rows.
 /// @param st the stream.
+/// @return gqa_decode_mma_go's.
 template <int HD>
-void gqa_decode_mma_dispatch(uint32_t rb, dim3 grid, const gqa_args &aa, uint32_t n_rows, cudaStream_t st) {
-    if (rb == 4u)      gqa_decode_mma_go<HD, 4>(grid, aa, n_rows, st);
-    else if (rb == 2u) gqa_decode_mma_go<HD, 2>(grid, aa, n_rows, st);
-    else               gqa_decode_mma_go<HD, 1>(grid, aa, n_rows, st);
+bool gqa_decode_mma_dispatch(uint32_t rb, dim3 grid, const gqa_args &aa, uint32_t n_rows, cudaStream_t st) {
+    if (rb == 4u) return gqa_decode_mma_go<HD, 4>(grid, aa, n_rows, st);
+    if (rb == 2u) return gqa_decode_mma_go<HD, 2>(grid, aa, n_rows, st);
+    return gqa_decode_mma_go<HD, 1>(grid, aa, n_rows, st);
 }
 
 /// An instrument's forced decode arm (pulsar_gqa_decode_arm_force): 0 the pick's, 1 flash-decoding, 2 the MMA arm.
@@ -1544,17 +1553,22 @@ void gqa_decode_dispatch(uint32_t rb, uint32_t hb, dim3 grid, const gqa_args &aa
 /// An instrument's forced flash-decoding shape (pulsar_gqa_decode_force); {0, 0} = the pick's.
 gqa_dec_shape g_dec_force = {0u, 0u};
 
-/// The device's SM count (cached: the pick's parallelism floor).
-/// @return SMs of the current device
+/// The current device's SM count (the pick's parallelism floor), cached per device (L375, O56: it was one value for
+/// the process -- the first device's -- and 1 when the query failed, which picked the widest head sharing).
+/// @return SMs of the current device; 0 when it cannot be read: the caller refuses
 uint32_t gqa_sm_count() {
-    static int sms = 0;
-    if (sms == 0) {
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
-                                                      cudaSuccess || sms <= 0)
-            sms = 1;
+    static int sms_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return 0u;
+    if (sms_of[d] <= 0) {
+        int n = 0;
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d) != cudaSuccess || n <= 0) {
+            (void)cudaGetLastError();
+            return 0u;
+        }
+        sms_of[d] = n;
     }
-    return (uint32_t)sms;
+    return (uint32_t)sms_of[d];
 }
 
 /// The flash-decoding CTA shape a call runs at: an instrument's forced one, else the pick -- measured on the RTX 5000
@@ -1569,12 +1583,16 @@ uint32_t gqa_sm_count() {
 /// @param chunks the call's chunk CTAs a (row, head) (the bounded grid's).
 /// @param n_rows the call's rows.
 /// @param cap_rows the caller's most rows a CTA (pulsar_gqa_io::decode_group, 1 .. 4).
-/// @return the shape.
+/// @return the shape; {0, 0} when the pick needs the device's SM count and it cannot be read (the caller refuses).
 gqa_dec_shape gqa_dec_pick(uint32_t G, uint32_t n_q, uint32_t chunks, uint32_t n_rows, uint32_t cap_rows) {
     if (g_dec_force.rb) return g_dec_force;
     if (G <= 2u) return {n_rows >= 6u && cap_rows >= 2u && G == 2u ? 2u : 1u, G};
-    for (uint32_t hb = 4u; hb > 1u; hb /= 2u)
-        if (G % hb == 0u && (uint64_t)(n_q / hb) * chunks * n_rows >= gqa_sm_count()) return {1u, hb};
+    for (uint32_t hb = 4u; hb > 1u; hb /= 2u) {
+        if (G % hb != 0u) continue;
+        const uint32_t sms = gqa_sm_count();
+        if (sms == 0u) return {0u, 0u};
+        if ((uint64_t)(n_q / hb) * chunks * n_rows >= sms) return {1u, hb};
+    }
     return {1u, 1u};
 }
 
@@ -1726,7 +1744,7 @@ pulsar_shape_once g_gqa_announce;
 /// @param mma_dec the decode rows take the MMA arm (gqa_decode_mma_kernel) instead.
 /// @param st the stream.
 /// @param ws the workspace carve (rows, fresh).
-/// @return 0, or -3 on a launch failure.
+/// @return 0, or -3 on a launch failure or a refused dynamic-smem grant (the MMA decode arm's; said).
 template <int HD>
 int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_args &aa, uint32_t n_rows,
                uint32_t n_tiles, uint32_t grid_chunks, bool fold, bool decode, gqa_dec_shape shape, bool mma_dec,
@@ -1750,8 +1768,9 @@ int gqa_launch(const pulsar_gqa_layer *L, const gqa_prep_args &pa, const gqa_arg
                                   * speculation never changes the output */
             if (mma_dec) {   /* L338: a wide GQA's decode rows on the tensor cores (pulsar_gqa_launch's pick) */
                 const uint32_t rb = shape.rb;   /* rows a CTA: gqa_dmma_rows */
-                gqa_decode_mma_dispatch<HD>(rb, dim3(L->n_q / GQA_DMMA_NV, dec_chunks, (n_rows + rb - 1u) / rb), aa,
-                                            n_rows, st);
+                if (!gqa_decode_mma_dispatch<HD>(rb, dim3(L->n_q / GQA_DMMA_NV, dec_chunks, (n_rows + rb - 1u) / rb), aa,
+                                                 n_rows, st))
+                    return -3;
             } else {
                 const uint32_t rb = shape.rb, hb = shape.hb;   /* pulsar_gqa_launch's pick */
                 const dim3 dgrid(L->n_q / hb, dec_chunks, (n_rows + rb - 1u) / rb);
@@ -2017,6 +2036,8 @@ int pulsar_gqa_launch(const pulsar_gqa_layer *L, const pulsar_gqa_call *call, co
      * captured step's key already holds) */
     gqa_dec_shape shape = gqa_dec_pick(G, L->n_q, std::min(call->grid_chunks, ws.max_chunks), n_rows,
                                              io->decode_group <= 1 ? 1u : (uint32_t)io->decode_group);
+    if (shape.rb == 0u)
+        return gqa_refuse("the device's SM count could not be read (the decode CTA shape's parallelism floor)");
     if (G % shape.hb != 0u) return gqa_refuse("a forced decode shape whose heads do not divide the layer's G");
     /* L338: a wide GQA's decode rows (G a multiple of 8, BF16 rows) on the tensor cores -- a function of the layer
      * alone: a row's arm (its bytes) may not depend on its call's rows or bound, or a verify's rows and a plain
