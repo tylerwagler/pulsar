@@ -784,7 +784,8 @@ bool chat_openai_tools_json(const struct chat_conversation *c, struct request *r
 /// @param r       the request: r->images is built and placed on r->prompt
 /// @param err     receives the reason on false
 /// @param errlen  size of `err`
-/// @return false for a malformed image request (a placeholder without an image, a bad block)
+/// @return false for a malformed image request (a placeholder without an image, a bad block), or -- the parse then
+///         fails as PARSE_REFUSED_BUSY -- when an image's decode was refused by the engine's decode budget
 bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs, struct request *r, char *err, size_t errlen);
 
 /* ---- L303: structured outputs (constrain.cpp) ----------------------------------------------------------
@@ -4308,6 +4309,36 @@ const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *order
 /// @return true when declared
 bool tool_call_declared(const request *r, const char *name, char *detail, size_t detail_len);
 void request_init(request *r, req_kind kind, int max_tokens);
+/** L375: what a failed parse_*_request was, when it was not the request's own fault.  The parsers and the family
+ *  render hooks report with a bool and a text (and free the request on a failure), so the kind rides beside them
+ *  as the parsing thread's record: request_init resets it, the two sites below set it, and the handler that turns
+ *  the false into an HTTP error reads it there, on the same thread (http_parse_error). */
+typedef enum {
+    PARSE_REFUSED_REQUEST = 0,   ///< the request is malformed or asks what the model cannot do: 400
+    PARSE_REFUSED_BUSY,          ///< the engine's shared image-decode budget was held by other decodes
+                                 ///< (pulsar_expand_image_placeholders' -1): 503 with Retry-After
+    PARSE_REFUSED_RENDER,        ///< the tokenizer refused the prompt the server itself rendered -- a renderer
+                                 ///< defect, since an ill-formed UTF-8 body is refused at the parse: 500
+} parse_refusal;
+/** Record what the calling thread's parse failed as.  @param kind the kind */
+void parse_refusal_set(parse_refusal kind);
+/** @return what the calling thread's last parse failed as (PARSE_REFUSED_REQUEST after a request_init) */
+parse_refusal parse_refusal_get(void);
+/** Answer a failed parse_*_request: 400, or the status of its parse_refusal_get kind (503 + Retry-After
+ *  HTTP_RETRY_BUSY_S, 500), in the surface's error envelope.
+ *  @param fd         the client socket
+ *  @param anthropic  the Anthropic envelope (else OpenAI's)
+ *  @param err        the parse's reason
+ *  @return false when a write failed */
+bool http_parse_error(int fd, bool anthropic, const char *err);
+/** Tokenize the request's rendered prompt (prompt_text and its client spans) into r->prompt.  A tokenizer refusal is
+ *  the request's failure, never an empty prompt: `err` names it and the parse fails as PARSE_REFUSED_RENDER.
+ *  @param e       the engine
+ *  @param r       the request (prompt_text, prompt_spans rendered)
+ *  @param err     receives "the tokenizer refused the rendered prompt: <reason>" on false
+ *  @param errlen  size of `err`
+ *  @return false when the tokenizer refused */
+bool request_tokenize_rendered(pulsar_engine *e, struct request *r, char *err, size_t errlen);
 void request_free(request *r);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
 /** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
@@ -5063,7 +5094,7 @@ int kv_cache_wait_written(kv_disk_cache *kc);
 void kv_cache_writer_state(kv_disk_cache *kc, uint64_t *staged, int *uncommitted);
 char *render_tokens_text(pulsar_engine *engine, const pulsar_tokens *tokens, size_t *out_len);
 void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n);
-void build_prompt_from_exact_prefix_and_text_suffix(
+bool build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
@@ -5087,10 +5118,13 @@ void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_sto
 /// @param tail_text  the tail's rendered text
 /// @param spans  its client-data ranges
 /// @param n_spans  ranges in `spans`
-/// @param out  receives the continued prompt
-/// @return tokens shared with `live`
+/// @param out  receives the continued prompt (untouched on a refusal)
+/// @param err  receives "the tokenizer refused the rendered prompt: <reason>" on a refusal (may be NULL)
+/// @param errlen  size of `err`
+/// @return tokens shared with `live`; -1 when the tokenizer refused the tail (no prompt is built)
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
-                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out);
+                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out, char *err,
+                                   size_t errlen);
 /** L347 I2: the shared-prefix anchor's cut -- the chat anchor (kv_cache_chat_anchor_pos) aligned down to the
  *  family's resume grid (pulsar_session_resume_grid), where a prefill that stops there captures a checkpoint; 0 below
  *  the cache's min_tokens.  No margin and no floor beyond that: the second-sighting rule (server::kv_cache_anchor_due)

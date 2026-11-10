@@ -1360,10 +1360,17 @@ void agent_kv_persist(agent_worker *w, const char *what);
  *  @param tip receives the tip's 40 hex chars + NUL, or "" */
 void agent_kv_system_tip(agent_worker *w, char tip[41]);
 /** Render the transcript's head through the family's chat front (pulsar_chat_open): the built-in tool prompt as
- *  trusted text, then the configured -sys text.
+ *  trusted text, then the configured -sys text.  Both are UTF-8 (the tool prompt is the agent's own text; main
+ *  refuses a -sys text that is not), so a tokenizer that refuses the head is a defect: said, and the process ends.
  *  @param w   the worker
  *  @param out receives the head's tokens (appended) */
 void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out);
+/** L375 (O4): the agent's door to pulsar_chat_end_assistant.  The close is the template's own fixed text, so a
+ *  refusal (no chat front: refused at startup; a tokenizer that cannot encode its own marker) is a defect: said, and
+ *  the process ends -- never a transcript whose turn was silently left open.
+ *  @param e      the engine
+ *  @param tokens the transcript; the close is appended */
+void agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
 /** Add a message to the turn being built (agent_worker::turn); `content` is copied. */
 /** Append a message to the turn being built, taking it as it is.
  *  @param w   the worker
@@ -1408,8 +1415,9 @@ void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
 char *agent_utf8_repaired(const char *s);
 /** L373: the agent's ONE door to pulsar_chat_append_turn.  Every message's content and name is made well-formed
  *  UTF-8 first (agent_utf8_repaired): a tool result, a file's bytes or a pasted prompt is arbitrary bytes, and the
- *  Qwen, Nemotron and Gemma tokenizers refuse a turn that is not UTF-8.  A refusal that remains (the engine says why
- *  on stderr and appends nothing) is returned, never read as an empty turn.
+ *  Qwen, Nemotron and Gemma tokenizers refuse a turn that is not UTF-8.  A refusal that remains is
+ *  pulsar_chat_append_turn's own result (the engine says why on stderr and appends nothing): returned, never read
+ *  as an empty turn.
  *  @param w                 the worker (its engine)
  *  @param tokens            the transcript, appended to
  *  @param msgs              the turn's messages

@@ -871,8 +871,7 @@ bool pulsar_token_is_stop(pulsar_engine *e, int token) {
 bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_text");
     if (!t) return false;
-    t->encode_text(e, text, out);
-    return true;
+    return t->encode_text(e, text, out);
 }
 
 
@@ -994,17 +993,20 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
 bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat");
     if (!t) return false;
-    t->encode_rendered(e, text, NULL, 0u, out);
-    return true;
+    return t->encode_rendered(e, text, NULL, 0u, out, NULL, 0);
 }
 
 bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
-                                         pulsar_tokens *out) {
+                                         pulsar_tokens *out, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     const pulsar_family_tokenizer *t = tokenizer_require(e, "pulsar_tokenize_rendered_chat_spans");
-    if (!t) return false;
-    t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out);
-    return true;
+    if (!t) {
+        if (err && errlen) snprintf(err, errlen, "the model's family has no tokenizer");
+        return false;
+    }
+    return t->encode_rendered(e, text, n_spans && spans ? spans : NULL, n_spans && spans ? n_spans : 0u, out, err,
+                              errlen);
 }
 
 pulsar_text_span *pulsar_text_spans_slice(const pulsar_text_span *spans, uint32_t n_spans,
@@ -1035,8 +1037,7 @@ bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trust
                       pulsar_think_mode think_mode) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_open");
     if (!t) return false;
-    t->chat_open(e, tokens, trusted, system, NULL, think_mode);
-    return true;
+    return t->chat_open(e, tokens, trusted, system, NULL, think_mode);
 }
 
 bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
@@ -1049,16 +1050,14 @@ bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char 
                         "text, passed as trusted)\n");
         return false;
     }
-    t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
-    return true;
+    return t->chat_open(e, tokens, trusted, system, tools_json, think_mode);
 }
 
 bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_append_turn");
     if (!t) return false;
-    t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
-    return true;
+    return t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
 }
 
 bool pulsar_chat_calls_continue_turn(const pulsar_engine *e) {
@@ -1082,15 +1081,17 @@ bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, 
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     const pulsar_family_tokenizer *t = chat_require(e, "pulsar_chat_end_assistant");
     if (!t) return false;
-    t->chat_end_assistant(e, tokens);
-    return true;
+    return t->chat_end_assistant(e, tokens);
 }
 
 bool pulsar_encode_chat_prompt(pulsar_engine *e, const char *system, const char *prompt, pulsar_think_mode think_mode,
                                pulsar_tokens *out) {
+    const int before = out->len;
     if (!pulsar_chat_open(e, out, NULL, system, think_mode)) return false;
     const pulsar_chat_message user = {"user", prompt ? prompt : "", false};
-    return pulsar_chat_append_turn(e, out, &user, 1, true, think_mode);
+    if (pulsar_chat_append_turn(e, out, &user, 1, true, think_mode)) return true;
+    out->len = before;   /* a refused turn takes the head back: nothing appended */
+    return false;
 }
 
 
@@ -1219,7 +1220,8 @@ static void ds4_chat_append_message(pulsar_engine *e, pulsar_tokens *tokens, con
 /// @param system     the client's system message, or NULL
 /// @param tools_json unused (refused upstream)
 /// @param think_mode the reasoning effort
-static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+/// @return true: DeepSeek's byte-level tokenizer refuses no text
+static bool ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                           const char *tools_json, pulsar_think_mode think_mode) {
     (void)tools_json;   /* refused by pulsar_chat_open_tools: DeepSeek's tools are DSML text in `trusted` */
     pulsar_vocab *vocab = &e->vocab;
@@ -1227,9 +1229,10 @@ static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *t
     chat_tmpl_push_marker(tokens, vocab->bos_id);
     encode_chat_lead_in(vocab, has_system, think_mode, (token_vec *)tokens);
     if (trusted && trusted[0]) ds4_chat_append_trusted(vocab, tokens, trusted);
-    if (!has_system) return;
+    if (!has_system) return true;
     if (trusted && trusted[0]) vocab->tokenize_span(system, strlen(system), (token_vec *)tokens);
     else chat_tmpl_append_text(vocab, tokens, system);
+    return true;
 }
 
 /** pulsar_family_tokenizer::chat_turn for DeepSeek: the messages, then (generation_prompt) the assistant marker and
@@ -1239,22 +1242,26 @@ static void ds4_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *t
  *  @param msgs              [n] the messages
  *  @param n                 messages
  *  @param generation_prompt open the assistant's turn
- *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker) */
-static void ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+ *  @param think_mode        the reasoning effort (on: the think-start marker, off: the think-end marker)
+ *  @return true: DeepSeek's byte-level tokenizer refuses no text */
+static bool ds4_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                           bool generation_prompt, pulsar_think_mode think_mode) {
     for (int i = 0; i < n; i++) ds4_chat_append_message(e, tokens, msgs[i].role, msgs[i].content, msgs[i].trusted);
-    if (!generation_prompt) return;
+    if (!generation_prompt) return true;
     chat_tmpl_push_marker(tokens, e->vocab.assistant_id);
     chat_tmpl_push_marker(tokens, pulsar_think_mode_enabled(think_mode) ?
                           e->vocab.think_start_id : e->vocab.think_end_id);
+    return true;
 }
 
 /* the sampled turn's stop token is the template's turn end */
 /// pulsar_family_tokenizer::chat_end_assistant for DeepSeek.
 /// @param e      the engine
 /// @param tokens the tokens appended to (EOS)
-static void ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+/// @return true
+static bool ds4_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
     chat_tmpl_push_marker(tokens, e->vocab.eos_id);
+    return true;
 }
 
 
@@ -1460,12 +1467,12 @@ void pulsar_turn_markers_add_tool(pulsar_engine *e, const char *opener, const ch
     const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
     if (!t || !t->encode_rendered || !opener || !tool_token || m->n_user <= 0) return;
     pulsar_tokens r = {0}, tok = {0};
-    t->encode_rendered(e, opener, NULL, 0, &r);
-    t->encode_rendered(e, tool_token, NULL, 0, &tok);
+    const bool encoded = t->encode_rendered(e, opener, NULL, 0, &r, NULL, 0) &&
+                         t->encode_rendered(e, tool_token, NULL, 0, &tok, NULL, 0);
     /* the opener is the user marker, then the suffix, ending in the tool token -- ONE added token, so the render's
      * own text after it cannot merge into it */
     const int suffix = r.len - m->n_user;
-    bool ok = tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
+    bool ok = encoded && tok.len == 1 && suffix >= 1 && suffix <= (int)(sizeof(m->tool) / sizeof(m->tool[0])) &&
               r.v[r.len - 1] == tok.v[0];
     for (int k = 0; ok && k < m->n_user; k++) ok = r.v[k] == m->user[k];
     if (ok) {
@@ -1535,9 +1542,10 @@ const char *pulsar_backend_name(pulsar_backend backend) {
 /* ---- the DeepSeek family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2) ---------------- */
 
 /** pulsar_family_tokenizer::encode_text for DeepSeek: plain BPE.  @param e the engine  @param text the text
- *  (NULL = "")  @param out receives the tokens */
-static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+ *  (NULL = "")  @param out receives the tokens  @return true: the byte-level tokenizer refuses no text */
+static bool ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     e->vocab.bpe_tokenize_text(text ? text : "", out);
+    return true;
 }
 
 /// pulsar_family_tokenizer::encode_rendered for DeepSeek.
@@ -1547,10 +1555,12 @@ static void ds4_tok_encode_text(pulsar_engine *e, const char *text, pulsar_token
 ///                completed by one (L223, L375) -- or NULL (the whole text is the renderer's)
 /// @param n_spans spans
 /// @param out     receives the tokens
-static void ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
-                                    uint32_t n_spans, pulsar_tokens *out) {
+/// @return true: the byte-level tokenizer refuses no text (the unnamed reason buffer is never written)
+static bool ds4_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                                    uint32_t n_spans, pulsar_tokens *out, char *, size_t) {
     if (!spans || !n_spans) e->vocab.tokenize_rendered_chat_vocab(text, out);
     else e->vocab.tokenize_rendered_chat_spans_vocab(text, spans, n_spans, out);
+    return true;
 }
 
 /** pulsar_family_tokenizer::is_stop: EOS only.  @param e the engine  @param token the id  @return true for EOS */

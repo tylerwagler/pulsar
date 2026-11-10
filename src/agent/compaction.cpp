@@ -41,8 +41,8 @@ static bool agent_worker_should_compact(agent_worker *w) {
 /// @return its id, or -1 when it is not exactly one token
 static int agent_special_token_id(pulsar_engine *engine, const char *rendered) {
     pulsar_tokens t = {0};
-    pulsar_tokenize_rendered_chat(engine, rendered, &t);
-    int id = t.len == 1 ? t.v[0] : -1;
+    const bool encoded = pulsar_tokenize_rendered_chat(engine, rendered, &t);
+    int id = encoded && t.len == 1 ? t.v[0] : -1;
     pulsar_tokens_free(&t);
     return id;
 }
@@ -386,7 +386,11 @@ int worker_force_generated_text(agent_worker *w,
                                        char *err,
                                        size_t err_len) {
     pulsar_tokens tokens = {0};
-    pulsar_tokenize_text(w->engine, text, &tokens);
+    if (!pulsar_tokenize_text(w->engine, text, &tokens)) {
+        snprintf(err, err_len, "the tokenizer refused the forced text %s", text);
+        pulsar_tokens_free(&tokens);
+        return 1;
+    }
     if (tokens.len > max_tokens - *generated) {
         snprintf(err, err_len, "not enough generation room to force %s", text);
         pulsar_tokens_free(&tokens);

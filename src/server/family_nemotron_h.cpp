@@ -189,7 +189,7 @@ bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request 
         if (!request_apply_forced_tool_prefill(r, err, errlen)) return false;
     }
     if (e) {
-        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        if (!request_tokenize_rendered(e, r, err, errlen)) return false;
         if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
     }
     return true;
@@ -202,7 +202,8 @@ bool nemotron_render(pulsar_engine *e, server *s, chat_conversation *c, request 
  *  @return the tokens of "<|im_start|>system\n" */
 int nemotron_trivial_header_tokens(pulsar_engine *e) {
     pulsar_tokens t = {0};
-    pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t);
+    if (!pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t))
+        pulsar_die("nemotron: the tokenizer refused the trivial header");
     const int n = t.len;
     pulsar_tokens_free(&t);
     return n;

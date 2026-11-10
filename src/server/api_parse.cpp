@@ -2014,7 +2014,7 @@ bool parse_completion_request(pulsar_engine *e, const char *body, int def_tokens
         r->prompt_spans[0].hi = (uint32_t)strlen(r->prompt_text);
         r->prompt_n_spans = 1;
     }
-    pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+    if (!request_tokenize_rendered(e, r, err, errlen)) goto bad;
     return true;
 bad:
     for (int i = 0; i < n_controls; i++) free(controls[i].raw);

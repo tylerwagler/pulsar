@@ -120,7 +120,8 @@ void agent_turn_marks_init(pulsar_engine *e, agent_turn_marks *m) {
                                                 false);
     }
     pulsar_tokens end = {0};
-    pulsar_chat_end_assistant(e, &end);
+    /* a family with no chat front spells no close (refused, said once): the marker stays empty, as the two above */
+    if (!pulsar_chat_end_assistant(e, &end)) end.len = 0;
     m->end_len = agent_turn_mark_text(e, end.v, end.len, m->end, sizeof m->end, true);
     pulsar_tokens_free(&end);
 }

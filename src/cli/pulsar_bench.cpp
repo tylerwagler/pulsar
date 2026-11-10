@@ -363,10 +363,12 @@ int main(int argc, char **argv) {
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     pulsar_tokens prompt = {0};
-    if (cfg.chat_prompt_path) {
-        pulsar_encode_chat_prompt(engine, cfg.system, text, PULSAR_THINK_NONE, &prompt);
-    } else {
-        pulsar_tokenize_text(engine, text, &prompt);
+    const bool encoded = cfg.chat_prompt_path
+                             ? pulsar_encode_chat_prompt(engine, cfg.system, text, PULSAR_THINK_NONE, &prompt)
+                             : pulsar_tokenize_text(engine, text, &prompt);
+    if (!encoded) {   /* said by the engine; never benchmarked as an empty prompt */
+        fprintf(stderr, "pulsar-bench: the tokenizer refused the prompt file's text -- exiting\n");
+        exit(1);
     }
     free(text);
 

@@ -80,8 +80,8 @@ static bool server_warmup_generation(pulsar_engine *engine, pulsar_session *sess
                    want, prefill_cap);
     }
     pulsar_tokens body = {0}, prompt = {0};
-    pulsar_tokenize_text(engine, "The quick brown fox jumps over the lazy dog. ",
-                      &body);
+    if (!pulsar_tokenize_text(engine, "The quick brown fox jumps over the lazy dog. ", &body))
+        body.len = 0;   /* said by the engine: no warmup prompt, and the warmup below fails by name */
     if (body.len > 0 && want > 0) {
         while (prompt.len < want)
             for (int i = 0; i < body.len && prompt.len < want; i++)

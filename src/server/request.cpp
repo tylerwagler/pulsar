@@ -447,6 +447,13 @@ void client_hints_read_line(client_hints *h, const char *line, size_t len) {
 
 
 
+/// What the calling thread's parse in progress (or its last one) failed as; request_init resets it.
+static thread_local parse_refusal t_parse_refusal = PARSE_REFUSED_REQUEST;
+
+void parse_refusal_set(parse_refusal kind) { t_parse_refusal = kind; }
+parse_refusal parse_refusal_get(void) { return t_parse_refusal; }
+
+
 /// @brief Zero a request and set its defaults: OpenAI protocol, the default sampling knobs.  No model and no
 ///        family: the family is the loaded engine's (the render or the completions parse sets it), the model the
 ///        client's or the served id (http_server); server::enqueue dies on a request without either (L335).
@@ -454,6 +461,7 @@ void client_hints_read_line(client_hints *h, const char *line, size_t len) {
 /// @param kind chat or completion
 /// @param max_tokens the generation cap
 void request_init(request *r, req_kind kind, int max_tokens) {
+    t_parse_refusal = PARSE_REFUSED_REQUEST;   /* a parse starts here: any failure is the request's until said otherwise */
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;

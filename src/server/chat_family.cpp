@@ -53,6 +53,16 @@ void chat_conversation_control(chat_conversation *c, const char *key, char *raw)
  * lets the engine replace each rendered PULSAR_IMAGE_PLACEHOLDER with that
  * image's sentinel block, filling each start_pos.  A text-only request is left
  * untouched -- its sync path is pulsar_session_sync(). */
+bool request_tokenize_rendered(pulsar_engine *e, request *r, char *err, size_t errlen) {
+    char why[200] = "";
+    if (pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt, why,
+                                            sizeof why))
+        return true;
+    snprintf(err, errlen, "the tokenizer refused the rendered prompt: %s", why);
+    parse_refusal_set(PARSE_REFUSED_RENDER);
+    return false;
+}
+
 bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
                             request *r, char *err, size_t errlen) {
     int n = 0;
@@ -86,8 +96,12 @@ bool request_prepare_images(pulsar_engine *e, const chat_msgs *msgs,
      * happens again on every turn even when the KV rows are reused.  Timed here
      * because it is the thing a prepared-span cache would remove (L226). */
     const double vp_t0 = server_now_sec();
-    if (pulsar_expand_image_placeholders(e, &r->prompt, 0, r->images, r->n_images,
-                                         &expanded, err, errlen) != 1) {
+    const int placed = pulsar_expand_image_placeholders(e, &r->prompt, 0, r->images, r->n_images, &expanded, err,
+                                                        errlen);
+    if (placed != 1) {
+        /* O34: this runs on the connection's thread, beside every other connection's decodes -- where the decode
+         * budget is contended.  A busy refusal is not the image's fault: 503 + Retry-After (http_parse_error) */
+        if (placed == -1) parse_refusal_set(PARSE_REFUSED_BUSY);
         return false;
     }
     server_log(PULSAR_LOG_PREFILL, "pulsar-server: image prepare: %d image(s) decoded+preprocessed in %.1f ms",
@@ -397,7 +411,7 @@ static bool deepseek_render(pulsar_engine *e, server *s, chat_conversation *c, r
      * the decoded pixels live in the messages.  Without one the TEXT is the whole
      * contract (the renderer gate compares it with the reference encoder). */
     if (e) {
-        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        if (!request_tokenize_rendered(e, r, err, errlen)) return false;
         if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
     }
     return true;
@@ -702,7 +716,7 @@ static bool qwen_render(pulsar_engine *e, server *s, chat_conversation *c, reque
     /* With an engine: tokenise the rendered text, then the core's expansion puts each image's block where its
      * placeholder token sits (request_prepare_images, DeepSeek's path too) */
     if (e) {
-        pulsar_tokenize_rendered_chat_spans(e, r->prompt_text, r->prompt_spans, r->prompt_n_spans, &r->prompt);
+        if (!request_tokenize_rendered(e, r, err, errlen)) return false;
         if (!request_prepare_images(e, &c->msgs, r, err, errlen)) return false;
     }
     return true;
@@ -896,7 +910,8 @@ static const server_output_parser_ops k_parser_qwen = {
 /// @return tokens in the system turn's opener
 static int qwen_trivial_header_tokens(pulsar_engine *e) {
     pulsar_tokens t = {0};
-    pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t);
+    if (!pulsar_tokenize_rendered_chat(e, "<|im_start|>system\n", &t))
+        pulsar_die("qwen: the tokenizer refused the trivial header");
     const int hdr_len = t.len;
     pulsar_tokens_free(&t);
     return hdr_len;
@@ -912,7 +927,8 @@ static int deepseek_trivial_header_tokens(pulsar_engine *e) {
         buf_puts(&hdr, PULSAR_SERVER_RENDER_BOS);
         buf_puts(&hdr, pulsar_think_effort_prefix_family(prefixed_modes[i], pulsar_engine_chat_v41(e)));
         pulsar_tokens hdr_tokens = {0};
-        pulsar_tokenize_rendered_chat(e, hdr.ptr, &hdr_tokens);
+        if (!pulsar_tokenize_rendered_chat(e, hdr.ptr, &hdr_tokens))
+            pulsar_die("deepseek: the tokenizer refused the trivial header");
         if (hdr_tokens.len > hdr_len) hdr_len = hdr_tokens.len;
         pulsar_tokens_free(&hdr_tokens);
         buf_free(&hdr);

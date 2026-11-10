@@ -2572,7 +2572,10 @@ static int eval_max_prompt_tokens(pulsar_engine *engine,
             exit(1);
         }
         pulsar_tokens prompt = {0};
-        pulsar_encode_chat_prompt(engine, eval_system_prompt(), question, think_mode, &prompt);
+        if (!pulsar_encode_chat_prompt(engine, eval_system_prompt(), question, think_mode, &prompt)) {
+            fprintf(stderr, "pulsar-eval: the tokenizer refused case %d's prompt -- exiting\n", i);
+            exit(1);
+        }
         if (prompt.len > max_prompt) {
             max_prompt = prompt.len;
             max_case = i;
@@ -4172,7 +4175,12 @@ static eval_run_result run_one_case(pulsar_engine *engine, pulsar_session *sessi
     }
 
     pulsar_tokens prompt = {0};
-    pulsar_encode_chat_prompt(engine, system, question, think_mode, &prompt);
+    if (!pulsar_encode_chat_prompt(engine, system, question, think_mode, &prompt)) {
+        fprintf(stderr, "pulsar-eval: the tokenizer refused case %d's prompt\n", idx);
+        free(question);
+        pulsar_tokens_free(&prompt);
+        return EVAL_RUN_ERROR;
+    }
     ui->prompt_tokens[idx] = prompt.len;
     ui->generated_tokens[idx] = 0;
 

@@ -648,8 +648,10 @@ void tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *src, int n) {
 /// @param suffix_text   the text past the prefix
 /// @param spans         the suffix's text spans
 /// @param n_spans       spans in `spans`
-/// @param out           receives the prompt
-void build_prompt_from_exact_prefix_and_text_suffix(
+/// @param out           receives the prompt (untouched on false)
+/// @return false (logged) when the tokenizer refused the suffix: there is no prompt -- the caller serves the
+///         request's own rendered prompt, never the prefix alone
+bool build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
@@ -657,8 +659,13 @@ void build_prompt_from_exact_prefix_and_text_suffix(
         uint32_t n_spans,
         pulsar_tokens *out)
 {
-    pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, spans, n_spans, out);
+    char why[200] = "";
+    if (pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(engine, exact_prefix, suffix_text, spans, n_spans,
+                                                                     out, why, sizeof why))
+        return true;
+    server_log(PULSAR_LOG_ERROR, "pulsar-server: the tokenizer refused the rendered prompt: %s (the text past a "
+               "%d-token stored prefix) -- the prefix is not continued", why, exact_prefix->len);
+    return false;
 }
 
 /* L290: where a family tail joins the live history.  Every family's tail (tool_result_tail, tool_error_suffix)
@@ -679,10 +686,17 @@ void join_live_history_and_tail(const pulsar_tokens *live, bool live_ends_at_sto
 }
 
 int build_live_continuation_prompt(pulsar_engine *engine, const pulsar_tokens *live, const char *tail_text,
-                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out) {
+                                   const pulsar_text_span *spans, uint32_t n_spans, pulsar_tokens *out, char *err,
+                                   size_t errlen) {
     pulsar_tokens tail = {};
     /* the tail opens with chat markers: the rendered-chat tokenizer, its client ranges plain text (L223) */
-    pulsar_tokenize_rendered_chat_spans(engine, tail_text ? tail_text : "", spans, n_spans, &tail);
+    char why[200] = "";
+    if (!pulsar_tokenize_rendered_chat_spans(engine, tail_text ? tail_text : "", spans, n_spans, &tail, why,
+                                             sizeof why)) {
+        pulsar_tokens_free(&tail);
+        if (err && errlen) snprintf(err, errlen, "the tokenizer refused the rendered prompt: %s", why);
+        return -1;   /* never the history alone: that is a prompt without its tail */
+    }
     join_live_history_and_tail(live, live->len > 0 && pulsar_token_is_stop(engine, live->v[live->len - 1]), &tail,
                                out);
     pulsar_tokens_free(&tail);
@@ -1336,9 +1350,10 @@ int server::kv_restore_finish(kv_restore *r, const char *text, const pulsar_text
         uint32_t tail_n = 0;
         pulsar_text_span *tail = pulsar_text_spans_slice(spans, n_spans, (uint32_t)text_end,
                                                          (uint32_t)(text_bytes - text_end), &tail_n);
-        build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail, tail_n,
-                                                       effective_prompt);
+        const bool built = build_prompt_from_exact_prefix_and_text_suffix(s->engine, loaded, text + text_end, tail,
+                                                                          tail_n, effective_prompt);
         free(tail);
+        if (!built) return 0;   /* a failed restore: the request's own prompt is synced (the bank was touched) */
     }
     if (loaded_key_out) *loaded_key_out = server_xstrdup(chain[n - 1].key);
     server_log(PULSAR_LOG_KVCACHE,
@@ -1416,10 +1431,15 @@ int server::responses_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
+    char why[256];
     const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->responses_live_suffix_text,
         req->responses_live_suffix_spans, req->responses_live_suffix_n_spans,
-        effective_prompt);
+        effective_prompt, why, sizeof why);
+    if (common < 0) {   /* no continuation: the request's own rendered prompt is served */
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: responses live continuation not taken: %s", why);
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     return common;
 }
@@ -1447,10 +1467,15 @@ int server::anthropic_live_continuation_prompt(session_slot *sl,
     const pulsar_tokens *live_tokens = pulsar_session_tokens(s->sess);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
+    char why[256];
     const int common = build_live_continuation_prompt(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         req->anthropic_live_suffix_spans, req->anthropic_live_suffix_n_spans,
-        effective_prompt);
+        effective_prompt, why, sizeof why);
+    if (common < 0) {   /* no continuation: the request's own rendered prompt is served */
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: anthropic live continuation not taken: %s", why);
+        return 0;
+    }
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     return common;
 }
@@ -1505,11 +1530,11 @@ int server::responses_live_visible_prefix_prompt(session_slot *sl,
     pulsar_text_span *tail_spans =
         pulsar_text_spans_slice(req->prompt_spans, req->prompt_n_spans, visible_len,
                                 prompt_len - visible_len, &tail_n);
-    build_prompt_from_exact_prefix_and_text_suffix(
+    const bool built = build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + visible_len,
         tail_spans, tail_n, effective_prompt);
     free(tail_spans);
-    return live_tokens->len;
+    return built ? live_tokens->len : 0;
 }
 
 

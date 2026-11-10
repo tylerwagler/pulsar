@@ -235,15 +235,27 @@ void agent_worker_build_system_tokens(agent_worker *w, pulsar_tokens *out) {
         memcpy(system, "\n\n", 2);
         memcpy(system + 2, extra, n + 1);
     }
+    bool opened;
     if (dsml) {
-        pulsar_chat_open(w->engine, out, tools_prompt, system, w->cfg->gen.think_mode);
+        opened = pulsar_chat_open(w->engine, out, tools_prompt, system, w->cfg->gen.think_mode);
     } else {
         char *tools = agent_build_tools_json();
-        pulsar_chat_open_tools(w->engine, out, tools_prompt, system, tools, w->cfg->gen.think_mode);
+        opened = pulsar_chat_open_tools(w->engine, out, tools_prompt, system, tools, w->cfg->gen.think_mode);
         free(tools);
     }
     free(system);
     free(tools_prompt);
+    if (!opened) {
+        fprintf(stderr, "pulsar-agent: the chat front refused the transcript's head (the tool prompt and the -sys "
+                        "text) -- exiting\n");
+        exit(1);
+    }
+}
+
+void agent_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    if (pulsar_chat_end_assistant(e, tokens)) return;
+    fprintf(stderr, "pulsar-agent: the chat front refused the template's assistant close -- exiting\n");
+    exit(1);
 }
 
 
@@ -281,7 +293,7 @@ bool agent_worker_turn_open(const agent_worker *w, const pulsar_tokens *tokens) 
     pulsar_turn_markers m;
     if (!pulsar_chat_turn_markers(w->engine, &m)) return false;   /* refused at startup (agent_family_tools_supported) */
     pulsar_tokens end = {0};
-    pulsar_chat_end_assistant(w->engine, &end);
+    agent_chat_end_assistant(w->engine, &end);
     const bool open = agent_tokens_turn_open(&m, end.v, end.len, tokens->v, tokens->len);
     pulsar_tokens_free(&end);
     return open;
@@ -291,7 +303,7 @@ void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
     if (!agent_worker_turn_open(w, tokens)) return;
     /* where calls continue the turn (Gemma), a turn being built that opens with tool messages answers it */
     if (pulsar_chat_calls_continue_turn(w->engine) && w->turn_len > 0 && !strcmp(w->turn[0].role, "tool")) return;
-    pulsar_chat_end_assistant(w->engine, tokens);
+    agent_chat_end_assistant(w->engine, tokens);
 }
 
 
@@ -343,11 +355,8 @@ bool agent_chat_append_turn(const agent_worker *w, pulsar_tokens *tokens, const 
     std::vector<pulsar_chat_message> turn(msgs, msgs + n);
     std::vector<char *> owned;
     agent_chat_messages_repair(turn.data(), n, &owned);
-    /* a family whose tokenizer refuses the rendered turn says so on stderr and appends NOTHING (the chat front has
-     * no error return); a turn that was taken always adds its markers */
-    const int before = tokens->len;
-    const bool taken = pulsar_chat_append_turn(w->engine, tokens, turn.data(), n, generation_prompt, think_mode) &&
-                       tokens->len > before;
+    /* a family whose tokenizer refuses the rendered turn says so on stderr, appends nothing and returns false */
+    const bool taken = pulsar_chat_append_turn(w->engine, tokens, turn.data(), n, generation_prompt, think_mode);
     for (char *p : owned) free(p);
     return taken;
 }

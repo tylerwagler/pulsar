@@ -13,24 +13,29 @@
 #include <string.h>
 #include <vector>
 
-/* `spans` are the client-data ranges where no added token may match.  The entries have no error return;
- * an encode refusal (text that is not UTF-8 -- HF cannot take it either -- or spans out of order, a
- * renderer defect) is reported by name and yields no tokens, never a different tokenization. */
+/* `spans` are the client-data ranges where no added token may match.  An encode refusal (text that is not
+ * UTF-8 -- HF cannot take it either -- or spans out of order, a renderer defect) is said by name, appends
+ * nothing and returns false: never a different tokenization, and never an empty one read as the prompt. */
 /// @param e the engine
 /// @param text NUL-terminated text (NULL = empty)
 /// @param spans client-data byte ranges
 /// @param n_spans their count
-/// @param[in,out] out ids appended
-static void qwen_encode_into(const pulsar_engine *e, const char *text, const pulsar_text_span *spans,
-                             uint32_t n_spans, pulsar_tokens *out) {
+/// @param[in,out] out ids appended (nothing on a refusal)
+/// @param why receives the refusal's reason (NULL = not wanted; it is on stderr either way)
+/// @param whylen why's capacity
+/// @return false when the tokenizer refused the text
+static bool qwen_encode_into(const pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                             uint32_t n_spans, pulsar_tokens *out, char *why = NULL, size_t whylen = 0) {
     std::vector<int> ids;
     char err[256] = "";
     const size_t len = text ? strlen(text) : 0;
     if (!bpe_tokenizer_encode(e->qwen_tok, text ? text : "", len, spans, n_spans, &ids, err, sizeof(err))) {
         fprintf(stderr, "pulsar: qwen tokenizer refused %zu bytes: %s\n", len, err);
-        return;
+        if (why && whylen) snprintf(why, whylen, "%s", err);
+        return false;
     }
     for (int id : ids) pulsar_tokens_push(out, id);
+    return true;
 }
 
 /* raw text: all of it is client data, so no added token matches */
@@ -38,9 +43,10 @@ static void qwen_encode_into(const pulsar_engine *e, const char *text, const pul
 /// @param e the engine
 /// @param text the text
 /// @param[in,out] out ids appended
-static void qwen_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
+/// @return false when the tokenizer refused the text
+static bool qwen_tok_encode_text(pulsar_engine *e, const char *text, pulsar_tokens *out) {
     const pulsar_text_span all = {0u, (uint32_t)(text ? strlen(text) : 0)};
-    qwen_encode_into(e, text, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
+    return qwen_encode_into(e, text, all.hi ? &all : NULL, all.hi ? 1u : 0u, out);
 }
 
 /// pulsar_family_tokenizer::encode_rendered: rendered text, added tokens matched outside `spans`.
@@ -49,14 +55,18 @@ static void qwen_tok_encode_text(pulsar_engine *e, const char *text, pulsar_toke
 /// @param spans client-data ranges
 /// @param n_spans their count
 /// @param[in,out] out ids appended
-static void qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
-                                     uint32_t n_spans, pulsar_tokens *out) {
-    qwen_encode_into(e, text, spans, n_spans, out);
+/// @param err receives the refusal's reason (NULL = not wanted)
+/// @param errlen err's capacity
+/// @return false when the tokenizer refused the text
+static bool qwen_tok_encode_rendered(pulsar_engine *e, const char *text, const pulsar_text_span *spans,
+                                     uint32_t n_spans, pulsar_tokens *out, char *err, size_t errlen) {
+    return qwen_encode_into(e, text, spans, n_spans, out, err, errlen);
 }
 
 /* ---- the chat front, turn by turn (pulsar.h pulsar_chat_open, L284 P14): qwen_chat's head and turn, the
- * pieces the full render is made of, tokenized with their client spans.  The entries have no error return, so
- * a refusal (an effort the template has no level for, a role it cannot place) ends the process by name. */
+ * pieces the full render is made of, tokenized with their client spans.  A template refusal (an effort the
+ * template has no level for, a role it cannot place: a caller defect) ends the process by name; an encode
+ * refusal returns false. */
 
 /// Print the refusal and exit(1).
 /// @param op the entry
@@ -84,8 +94,9 @@ static qwen_effort qwen_chat_effort(const pulsar_engine *e, pulsar_think_mode th
 /// @param e the engine
 /// @param r the render
 /// @param[in,out] tokens ids appended
-static void qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, pulsar_tokens *tokens) {
-    qwen_encode_into(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
+/// @return false when the tokenizer refused the piece
+static bool qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, pulsar_tokens *tokens) {
+    return qwen_encode_into(e, r.text.c_str(), r.spans.data(), (uint32_t)r.spans.size(), tokens);
 }
 
 /* The system block: trusted text (the agent's DSML spells no marker of this family's) and the system text, as
@@ -96,7 +107,8 @@ static void qwen_chat_append(const pulsar_engine *e, const qwen_render_out &r, p
 /// @param system system text, or NULL
 /// @param tools_json the tools array as JSON text, or NULL (pulsar_chat_open_tools)
 /// @param think_mode the mode
-static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+/// @return false when the tokenizer refused the rendered head (said; nothing appended)
+static bool qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                            const char *tools_json, pulsar_think_mode think_mode) {
     const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_open");
     const std::string content = std::string(trusted ? trusted : "") + (system ? system : "");
@@ -104,7 +116,7 @@ static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *
     char err[256];
     if (!qwen_chat_render_head(content.c_str(), tools_json, qe, &r, err, sizeof err))
         qwen_chat_refuse("pulsar_chat_open", err);
-    qwen_chat_append(e, r, tokens);
+    return qwen_chat_append(e, r, tokens);
 }
 
 /* A mid-conversation system message is the user turn of its reminder (qwen_system_reminder), as the server
@@ -115,7 +127,8 @@ static void qwen_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *
 /// @param n their count
 /// @param generation_prompt append the assistant prompt
 /// @param think_mode the mode
-static void qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+/// @return false when the tokenizer refused the rendered turn (said; nothing appended)
+static bool qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                            bool generation_prompt, pulsar_think_mode think_mode) {
     const qwen_effort qe = qwen_chat_effort(e, think_mode, "pulsar_chat_append_turn");
     std::vector<std::string> notes((size_t)(n > 0 ? n : 0));
@@ -133,14 +146,15 @@ static void qwen_chat_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar
     char err[256];
     if (!qwen_chat_render_turn(qm.data(), (int)qm.size(), qe, generation_prompt, &r, err, sizeof err))
         qwen_chat_refuse("pulsar_chat_append_turn", err);
-    qwen_chat_append(e, r, tokens);
+    return qwen_chat_append(e, r, tokens);
 }
 
 /* the turn's end the template writes after a sampled turn (qwen_chat_render_tail's first bytes) */
 /// @param e the engine
 /// @param[in,out] tokens ids appended
-static void qwen_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
-    qwen_encode_into(e, "<|im_end|>\n", NULL, 0u, tokens);
+/// @return false when the tokenizer refused the close
+static bool qwen_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {
+    return qwen_encode_into(e, "<|im_end|>\n", NULL, 0u, tokens);
 }
 
 /// @param e the engine

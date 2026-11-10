@@ -172,7 +172,13 @@ int pulsar_engine::collect_imatrix(const char *dataset_path,
         char *prompt_text = imatrix_trim_block(start, end);
         if (prompt_text[0] != '\0') {
             token_vec prompt = {0};
-            pulsar_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (!pulsar_tokenize_rendered_chat(e, prompt_text, &prompt)) {
+                fprintf(stderr, "pulsar: imatrix: the tokenizer refused prompt %d\n", prompts_done + 1);
+                token_vec_free(&prompt);
+                *end = saved;
+                ok = false;
+                break;
+            }
             if (prompt.len > ctx_size) prompt.len = ctx_size;
             if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) {
                 prompt.len = max_tokens - tokens_done;

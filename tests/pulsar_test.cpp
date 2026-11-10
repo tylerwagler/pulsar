@@ -37,6 +37,9 @@
 /* engine internals */
 #include "../src/engine/pulsar_engine_internal.h"
 #include "../src/engine/spec_internal.h"   /* L308: the copy estimate */
+#include "../src/families/gemma4/gemma4.h"         /* L375: each family's tokenizer table and its model's tok */
+#include "../src/families/nemotron_h/nemotron_h.h"
+#include "../src/families/inkling/inkling.h"
 /* the frozen host sampler (L302): spec-math's oracle */
 #include "sampler_host_ref.h"
 #ifndef PULSAR_NO_GPU
@@ -1973,7 +1976,7 @@ static void test_anthropic_count_tokens_parse(void) {
             if (plain.prompt_spans[i].lo < cut)
                 spans.push_back({plain.prompt_spans[i].lo, std::min(plain.prompt_spans[i].hi, cut)});
         pulsar_tokens head = {0};
-        pulsar_tokenize_rendered_chat_spans(engine, pre.c_str(), spans.data(), (uint32_t)spans.size(), &head);
+        pulsar_tokenize_rendered_chat_spans(engine, pre.c_str(), spans.data(), (uint32_t)spans.size(), &head, NULL, 0);
         TEST_ASSERT(at && head.len > 0 && cp <= head.len + 1);
         pulsar_tokens_free(&head);
     }
@@ -2395,11 +2398,147 @@ static void test_o34_decode_busy_is_not_undecodable(void) {
     }
 }
 
+/* L375 (O4): a tokenizer that refuses its text -- client spans out of order (a renderer defect), bytes that are not
+ * UTF-8 -- is the public entry's FALSE with nothing appended, on every family whose tokenizer can refuse (the BPE
+ * four; DeepSeek's byte-level one takes any bytes).  Before, the family printed a line and the entry returned true
+ * with an empty tokenization: the agent's turn vanished, a server render became an empty prompt.  A host engine a
+ * family: its tokenizer table over the test checkpoint's BPE tokenizer (the refusals are the shared engine's, before
+ * anything a family's vocabulary decides). */
+static void test_l375_tokenizer_refusal_is_a_result(void) {
+    bpe_tokenizer *tok = (bpe_tokenizer *)qwen_test_tokenizer();
+    if (!tok) return;   /* failed by name inside */
+    struct fam_case {
+        const char *name;
+        const pulsar_family_tokenizer *table;
+        pulsar_chat_format fmt;
+    };
+    static const fam_case cases[] = {
+        {"qwen", &k_qwen_tokenizer, PULSAR_CHAT_QWEN},
+        {"gemma4", &PULSAR_GEMMA4_TOKENIZER, PULSAR_CHAT_GEMMA4},
+        {"nemotron-h", &PULSAR_NEMOTRON_H_TOKENIZER, PULSAR_CHAT_NEMOTRON_H},
+        {"inkling", &PULSAR_INKLING_TOKENIZER, PULSAR_CHAT_INKLING},
+    };
+    static pulsar_chat_format g_fmt;
+    pulsar_gemma4_model *gm = new pulsar_gemma4_model();
+    pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
+    pulsar_inkling_model *im = new pulsar_inkling_model();
+    gm->tok = nm->tok = im->tok = tok;
+    void *const state[] = {NULL, gm, nm, im};
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        pulsar_family fam{};
+        fam.arch = fam.name = cases[c].name;
+        fam.caps = PULSAR_FAMILY_CAP_CHAT;
+        fam.tokenizer = cases[c].table;
+        g_fmt = cases[c].fmt;
+        fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
+        pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+        e->family = &fam;
+        e->qwen_tok = tok;
+        e->family_state = state[c];
+        const char *text = "hello world";
+        const pulsar_text_span good[2] = {{0u, 5u}, {6u, 11u}}, bad[2] = {{6u, 11u}, {0u, 5u}};
+        pulsar_tokens out = {0};
+        char err[128] = "";
+        /* the rendered entry: ascending spans tokenize; the same spans out of order are refused, with the reason */
+        TEST_ASSERT(pulsar_tokenize_rendered_chat_spans(e, text, good, 2u, &out, err, sizeof err) && out.len > 0 &&
+                    !err[0]);
+        out.len = 0;
+        TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, text, bad, 2u, &out, err, sizeof err) && out.len == 0 &&
+                    err[0] != '\0');
+        TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, text, bad, 2u, &out, NULL, 0) && out.len == 0);
+        /* bytes that are not UTF-8, through every entry that encodes */
+        const char *not_utf8 = "caf\xe9 \xff";
+        TEST_ASSERT(!pulsar_tokenize_text(e, not_utf8, &out) && out.len == 0);
+        TEST_ASSERT(!pulsar_tokenize_rendered_chat(e, not_utf8, &out) && out.len == 0);
+        TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, not_utf8, PULSAR_THINK_NONE) && out.len == 0);
+        const pulsar_chat_message m = {"user", not_utf8, false, NULL};
+        TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &m, 1, true, PULSAR_THINK_NONE) && out.len == 0);
+        /* the one-shot prompt takes its head back when the turn is refused: nothing appended */
+        TEST_ASSERT(!pulsar_encode_chat_prompt(e, "be brief", not_utf8, PULSAR_THINK_NONE, &out) && out.len == 0);
+        /* and well-formed text is taken: the entries still answer true */
+        TEST_ASSERT(pulsar_tokenize_text(e, text, &out) && out.len > 0);
+        const pulsar_chat_message ok = {"user", text, false, NULL};
+        const int before = out.len;
+        TEST_ASSERT(pulsar_chat_append_turn(e, &out, &ok, 1, true, PULSAR_THINK_NONE) && out.len > before);
+        pulsar_tokens_free(&out);
+        e->qwen_tok = NULL;
+        free(e);
+    }
+    delete gm;
+    delete nm;
+    delete im;
+}
+
+/* L375 (O4): a refused render fails the REQUEST -- "the tokenizer refused the rendered prompt: <reason>", the parse
+ * recorded as a render defect (a 500: an ill-formed UTF-8 body is a 400 at the parse, before any render) -- never a
+ * request with an empty prompt.  And the parse-time kinds reach the handler's status: http_parse_error answers 400
+ * for a request's own fault, 500 for a render defect, 503 with Retry-After for a busy image decode (O34). */
+static void test_l375_refused_render_fails_the_request(void) {
+    bpe_tokenizer *tok = (bpe_tokenizer *)qwen_test_tokenizer();
+    if (!tok) return;
+    pulsar_family fam{};
+    fam.arch = fam.name = "qwen";
+    fam.caps = PULSAR_FAMILY_CAP_CHAT;
+    fam.tokenizer = &k_qwen_tokenizer;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    e->qwen_tok = tok;
+    request r;
+    request_init(&r, REQ_CHAT, 16);
+    TEST_ASSERT(parse_refusal_get() == PARSE_REFUSED_REQUEST);
+    r.prompt_text = server_xstrdup("hello world");
+    r.prompt_spans = (pulsar_text_span *)server_xmalloc(2 * sizeof(pulsar_text_span));
+    r.prompt_spans[0] = {6u, 11u};   /* out of order: what only a renderer defect produces */
+    r.prompt_spans[1] = {0u, 5u};
+    r.prompt_n_spans = 2;
+    char err[160] = "";
+    TEST_ASSERT(!request_tokenize_rendered(e, &r, err, sizeof err));
+    TEST_ASSERT(r.prompt.len == 0);
+    TEST_ASSERT(!strncmp(err, "the tokenizer refused the rendered prompt: ", 43) && err[43] != '\0');
+    TEST_ASSERT(parse_refusal_get() == PARSE_REFUSED_RENDER);
+    const auto answer = [](bool anthropic) {
+        int sv[2];
+        std::string got;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return got;
+        http_parse_error(sv[1], anthropic, "why");
+        close(sv[1]);
+        char b[2048];
+        ssize_t n;
+        while ((n = read(sv[0], b, sizeof b)) > 0) got.append(b, (size_t)n);
+        close(sv[0]);
+        return got;
+    };
+    std::string a = answer(false);
+    TEST_ASSERT(a.find(" 500 ") != std::string::npos && a.find("Retry-After") == std::string::npos);
+    a = answer(true);
+    TEST_ASSERT(a.find(" 500 ") != std::string::npos && a.find("api_error") != std::string::npos);
+    /* the same request with its spans in order parses: the record is the failed parse's alone */
+    r.prompt_spans[0] = {0u, 5u};
+    r.prompt_spans[1] = {6u, 11u};
+    TEST_ASSERT(request_tokenize_rendered(e, &r, err, sizeof err) && r.prompt.len > 0);
+    request_free(&r);
+    request_init(&r, REQ_CHAT, 16);   /* a new parse starts as the request's own */
+    a = answer(false);
+    TEST_ASSERT(a.find(" 400 ") != std::string::npos && a.find("Retry-After") == std::string::npos);
+    parse_refusal_set(PARSE_REFUSED_BUSY);   /* what request_prepare_images records for a busy decode */
+    for (const bool anthropic : {false, true}) {
+        a = answer(anthropic);
+        TEST_ASSERT(a.find(" 503 ") != std::string::npos && a.find("Retry-After: 1") != std::string::npos);
+    }
+    TEST_ASSERT(answer(true).find("overloaded_error") != std::string::npos);
+    request_init(&r, REQ_CHAT, 16);
+    request_free(&r);
+    e->qwen_tok = NULL;
+    free(e);
+}
+
 static void test_server_unit_group(void) {
     pulsar_server_unit_tests_run();
     test_l334_bank_pos_and_adopt_result();
     test_l372_sync_hooks_last_one_sync();
     test_o34_decode_busy_is_not_undecodable();
+    test_l375_tokenizer_refusal_is_a_result();
+    test_l375_refused_render_fails_the_request();
 }
 
 /* L325: a render case's protocol ("_api": "openai" | "anthropic" | "responses" (L326), default openai) and family
@@ -3176,7 +3315,7 @@ static void test_control_token_injection(void) {
             /* an empty span list IS the old entry (no second path) */
             pulsar_tokens unmarked = {0}, fallback = {0};
             pulsar_tokenize_rendered_chat(e, rr.prompt_text, &unmarked);
-            pulsar_tokenize_rendered_chat_spans(e, rr.prompt_text, NULL, 0, &fallback);
+            pulsar_tokenize_rendered_chat_spans(e, rr.prompt_text, NULL, 0, &fallback, NULL, 0);
             TEST_ASSERT(test_tokens_identical(&fallback, &unmarked));
             pulsar_tokens_free(&unmarked);
             pulsar_tokens_free(&fallback);
@@ -3208,7 +3347,7 @@ static int test_suffix_contract(pulsar_engine *e, const char *tag, const char *t
     if (!text || !spans) return 0;
     const int found = test_paste_covered(text, spans, n_spans, probe->hostile.c_str());
     pulsar_tokens marked = {0}, unmarked = {0};
-    pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &marked);
+    pulsar_tokenize_rendered_chat_spans(e, text, spans, n_spans, &marked, NULL, 0);
     pulsar_tokenize_rendered_chat(e, text, &unmarked);
     test_marked_tokens_ok(e, tag, text, spans, n_spans, &marked, &probe->ids);
     const int in_spans = test_spans_control_ids(e, text, spans, n_spans, &probe->ids);
@@ -3336,9 +3475,9 @@ static void test_control_token_suffix(void) {
              * span tokeniser produces it */
             pulsar_tokens prefix = {0}, want_suffix = {0}, out = {0};
             pulsar_tokenize_text(e, "PREFIX", &prefix);
-            pulsar_tokenize_rendered_chat_spans(e, suffix, suf_spans, suf_n, &want_suffix);
+            pulsar_tokenize_rendered_chat_spans(e, suffix, suf_spans, suf_n, &want_suffix, NULL, 0);
             pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
-                e, &prefix, suffix, suf_spans, suf_n, &out);
+                e, &prefix, suffix, suf_spans, suf_n, &out, NULL, 0);
             TEST_ASSERT(out.len == prefix.len + want_suffix.len);
             bool same = out.len == prefix.len + want_suffix.len;
             for (int i = 0; same && i < prefix.len; i++) same = out.v[i] == prefix.v[i];
@@ -4107,7 +4246,7 @@ static void test_tokenizer_refusals(void) {
     pulsar_tokens out = {0};
     TEST_ASSERT(!pulsar_tokenize_text(e, "hello", &out) && out.len == 0);
     TEST_ASSERT(!pulsar_tokenize_rendered_chat(e, "hello", &out) && out.len == 0);
-    TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, "hello", NULL, 0u, &out) && out.len == 0);
+    TEST_ASSERT(!pulsar_tokenize_rendered_chat_spans(e, "hello", NULL, 0u, &out, NULL, 0) && out.len == 0);
     TEST_ASSERT(!pulsar_chat_open(e, &out, NULL, NULL, PULSAR_THINK_NONE) && out.len == 0);
     const pulsar_chat_message m = {"user", "hi", false};
     TEST_ASSERT(!pulsar_chat_append_turn(e, &out, &m, 1, true, PULSAR_THINK_NONE) && out.len == 0);

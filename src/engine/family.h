@@ -254,20 +254,24 @@ typedef struct {
  * ends refuse such an engine at startup through pulsar_engine_has_tokenizer).  Before L272 the entries
  * branched on the Qwen tokenizer's pointer at every site. */
 typedef struct pulsar_family_tokenizer {
+    /* The five encoding entries return false when the tokenizer refuses the text (not UTF-8, or client spans out
+     * of order): said on stderr, NOTHING appended.  The public wrappers (tokenizer.cpp) return it; no caller reads a
+     * refused encode as an empty prompt (L375, O4). */
     /** Raw text, all of it client data (no added token matches). */
-    void (*encode_text)(pulsar_engine *e, const char *text, pulsar_tokens *out);
-    /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none). */
-    void (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
-                            pulsar_tokens *out);
+    bool (*encode_text)(pulsar_engine *e, const char *text, pulsar_tokens *out);
+    /** A rendered chat: added tokens match except inside the client-data `spans` (NULL / 0 = none).  `err`
+     *  (NULL = not wanted) receives a refusal's reason. */
+    bool (*encode_rendered)(pulsar_engine *e, const char *text, const pulsar_text_span *spans, uint32_t n_spans,
+                            pulsar_tokens *out, char *err, size_t errlen);
     /** The chat front turn by turn (pulsar.h pulsar_chat_open / _append_turn / _end_assistant): the head, one
      *  turn rendered whole, the close of a sampled assistant turn -- each the family's own template. */
-    void (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
+    bool (*chat_open)(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       const char *tools_json, pulsar_think_mode think_mode);
     /** Append `n` messages rendered whole, then the assistant generation prompt when `generation_prompt`. */
-    void (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+    bool (*chat_turn)(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                       bool generation_prompt, pulsar_think_mode think_mode);
     /** Append the close of a sampled assistant turn. */
-    void (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
+    bool (*chat_end_assistant)(pulsar_engine *e, pulsar_tokens *tokens);
     /** true when `token` is any of the tokenizer's stop ids. */
     bool (*is_stop)(pulsar_engine *e, int token);
     /** The stop id a caller that needs ONE uses (pulsar_token_is_stop tests them all). */

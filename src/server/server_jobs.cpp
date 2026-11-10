@@ -43,7 +43,8 @@ bool server::append_rendered_suffix_to_live_session(session_slot *sl,
     }
 
     pulsar_tokens target = {0};
-    (void)build_live_continuation_prompt(s->engine, live, suffix, spans, n_spans, &target);
+    if (build_live_continuation_prompt(s->engine, live, suffix, spans, n_spans, &target, err, errlen) < 0)
+        return false;   /* err names the refusal: nothing is synced */
     const TokPos before = pulsar_session_pos(s->sess);
     bool ok = pulsar_session_sync(s->sess, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
@@ -388,8 +389,18 @@ void server::canonicalize_tool_checkpoint(session_slot *sl,
     free(suffix_spans);
 
     pulsar_tokens canonical = {0};
-    pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "",
-                                        rendered.spans, rendered.n_spans, &canonical);
+    char tok_err[200] = "";
+    if (!pulsar_tokenize_rendered_chat_spans(s->engine, rendered.ptr ? rendered.ptr : "", rendered.spans,
+                                             rendered.n_spans, &canonical, tok_err, sizeof tok_err)) {
+        /* the response is out; the live history stands as sampled -- never synced to an empty canonical prompt */
+        server_log(PULSAR_LOG_ERROR, "pulsar-server: tool checkpoint canonicalization skipped: the tokenizer refused "
+                   "the rendered prompt: %s", tok_err);
+        s->trace_event(trace_id, "tool checkpoint canonicalization skipped: the tokenizer refused the rendered prompt");
+        pulsar_tokens_free(&canonical);
+        buf_free(&rendered);
+        free(suffix_text);
+        return;
+    }
     const int live_len = pulsar_session_pos(s->sess).raw();
     const int common = pulsar_session_common_prefix(s->sess, &canonical).raw();
     if (common == live_len && canonical.len == live_len) goto done;

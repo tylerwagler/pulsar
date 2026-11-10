@@ -1597,7 +1597,7 @@ void *client_main(void *arg) {
         if (!parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      &creq, cerr, sizeof(cerr)))
         {
-            http_error_anthropic(fd, 400, cerr);
+            http_parse_error(fd, true, cerr);
             http_request_free(&hr);
             goto done;
         }
@@ -1684,8 +1684,7 @@ void *client_main(void *arg) {
     }
     http_request_free(&hr);
     if (!ok) {
-        if (anthropic_surface) http_error_anthropic(fd, 400, err);
-        else http_error(fd, 400, err);
+        http_parse_error(fd, anthropic_surface, err);   /* 400, or the parse's own kind (L375: busy 503, render 500) */
         goto done;
     }
     if (!req.model_from_request) {

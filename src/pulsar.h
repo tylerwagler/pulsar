@@ -756,13 +756,15 @@ bool pulsar_tokens_starts_with(const pulsar_tokens *tokens, const pulsar_tokens 
  *  @param e the engine
  *  @param text NUL-terminated UTF-8
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8; said): a false is never an empty tokenization */
 bool pulsar_tokenize_text(pulsar_engine *e, const char *text, pulsar_tokens *out);
 /** Tokenize a rendered chat prompt: its special-token spellings become control tokens.  Appends to `out`.
  *  @param e the engine
  *  @param text the rendered prompt
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8; said) */
 bool pulsar_tokenize_rendered_chat(pulsar_engine *e, const char *text, pulsar_tokens *out);
 /** A half-open [lo, hi) byte range of CLIENT-supplied text in a rendered prompt.
  * The renderer produces these; the tokeniser treats them as plain text. */
@@ -782,10 +784,13 @@ typedef struct {
  *  @param spans client-data byte ranges of text
  *  @param n_spans their count
  *  @param out the tokens are appended here
- *  @return false, `out` untouched, when the family has no tokenizer (said once) */
+ *  @param err receives the reason on false (may be NULL)
+ *  @param errlen bytes at err
+ *  @return false, `out` untouched, when the family has no tokenizer (said once) or its tokenizer refused the text
+ *          (not UTF-8, or spans that are not ascending and disjoint -- a renderer defect; said) */
 bool pulsar_tokenize_rendered_chat_spans(pulsar_engine *e, const char *text,
                                          const pulsar_text_span *spans, uint32_t n_spans,
-                                         pulsar_tokens *out);
+                                         pulsar_tokens *out, char *err, size_t errlen);
 
 /** The client-data ranges of `text[skip .. skip+len)` (a suffix slice of the
  * same string the ranges were recorded against), rebased to the slice and
@@ -835,7 +840,8 @@ typedef struct {
  * Qwen's qwen_chat, HF's template byte for byte) -- head + turns + sampled assistant turns is the
  * conversation's full render, so a transcript's KV continues across turns.  The think mode is the family's
  * (pulsar_engine_think_mode_supported); any other ends the process, never a neighbouring effort.  Each returns
- * false, `tokens` untouched, when the family has no chat front (said once per entry).
+ * false, `tokens` untouched, when the family has no chat front (said once per entry) or its tokenizer refused the
+ * rendered piece (text that is not UTF-8; said): a caller never reads a refused piece as an empty one.
  *
  * pulsar_chat_open: the HEAD, everything before the first turn -- DeepSeek's BOS and lead-in, Qwen's system
  * block with its effort line -- carrying `trusted` (pulsar_chat_message::trusted; NULL = none) then the
@@ -845,7 +851,7 @@ typedef struct {
  *  @param trusted front-end control text, or NULL
  *  @param system client system text, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the tokenizer refused the text) */
 bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                       pulsar_think_mode think_mode);
 /** pulsar_chat_open with TOOLS (L365): the head also declares `tools_json`, an OpenAI tools array as JSON text
@@ -859,7 +865,7 @@ bool pulsar_chat_open(pulsar_engine *e, pulsar_tokens *tokens, const char *trust
  *  @param system client system text, or NULL
  *  @param tools_json the tools array, or NULL
  *  @param think_mode the family's think mode
- *  @return false when refused (no chat front, or tools on DeepSeek) */
+ *  @return false when refused (no chat front, tools on DeepSeek, or the tokenizer refused the text) */
 bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char *trusted, const char *system,
                             const char *tools_json, pulsar_think_mode think_mode);
 /** One TURN appended to a transcript that ends with its head or a closed assistant turn: the messages, then,
@@ -870,14 +876,14 @@ bool pulsar_chat_open_tools(pulsar_engine *e, pulsar_tokens *tokens, const char 
  *  @param n their count
  *  @param generation_prompt also open the assistant turn
  *  @param think_mode the mode the assistant turn opens for
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the tokenizer refused the text) */
 bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
                              bool generation_prompt, pulsar_think_mode think_mode);
 /** Close the sampled assistant turn the transcript ends with (sampled up to, not including, its stop token):
  * what the turn's end is in the family's template (DeepSeek: EOS; Qwen: "<|im_end|>\n"). */
 /** @param e the engine
  *  @param tokens the transcript, appended to
- *  @return false when refused (no chat front) */
+ *  @return false when refused (no chat front, or the tokenizer refused the text) */
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens);
 /** L365: whether the loaded family answers tool calls INSIDE the model turn that made them (Gemma 4: the response
  * follows the call, then the same turn continues).  There a sampled turn that made calls is NOT closed with
@@ -900,7 +906,7 @@ bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, 
  *  @param prompt the user message
  *  @param think_mode the think mode
  *  @param out the prompt's tokens are appended here
- *  @return false when refused (no chat front: nothing appended) */
+ *  @return false when refused (no chat front, or the tokenizer refused the text): nothing appended */
 bool pulsar_encode_chat_prompt(
         pulsar_engine *e,
         const char *system,

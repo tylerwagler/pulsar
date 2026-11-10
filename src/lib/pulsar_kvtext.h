@@ -60,14 +60,19 @@ void pulsar_kvtext_tokens_copy_prefix(pulsar_tokens *dst, const pulsar_tokens *s
 /// @param suffix_text  the rendered text that follows them
 /// @param spans        the suffix's client-data byte ranges, tokenised as plain text, or NULL
 /// @param n_spans      entries in `spans`
-/// @param out          receives the prompt's tokens
-void pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
+/// @param out          receives the prompt's tokens (untouched on false)
+/// @param err          receives the reason on false (may be NULL)
+/// @param errlen       bytes at err
+/// @return false when the tokenizer refused the suffix (pulsar_tokenize_rendered_chat_spans): no prompt is built --
+///         the prefix alone would be a truncated one
+bool pulsar_kvtext_build_prompt_from_exact_prefix_and_text_suffix(
         pulsar_engine *engine,
         const pulsar_tokens *exact_prefix,
         const char *suffix_text,
         const pulsar_text_span *spans,
         uint32_t n_spans,
-        pulsar_tokens *out);
+        pulsar_tokens *out,
+        char *err, size_t errlen);
 
 /** The SHA-1 of a byte range as 40 lowercase hex chars.
  *  @param ptr the bytes

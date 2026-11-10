@@ -250,7 +250,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (sync_rc == PULSAR_SESSION_SYNC_INTERRUPTED) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
-            pulsar_chat_end_assistant(w->engine, &w->transcript);
+            agent_chat_end_assistant(w->engine, &w->transcript);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -376,7 +376,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         renderer_finish(&renderer);
         worker_set_greedy_sampling(w, false);
         if (interrupted) {
-            pulsar_chat_end_assistant(w->engine, &w->transcript);
+            agent_chat_end_assistant(w->engine, &w->transcript);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
@@ -414,7 +414,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         /* L365: where calls continue the turn (Gemma), a turn that made calls stays open for their responses
          * (agent_worker_turn_open reads that off the transcript) */
         if (!(family.p && (got_tool || malformed_tool) && pulsar_chat_calls_continue_turn(w->engine)))
-            pulsar_chat_end_assistant(w->engine, &w->transcript);
+            agent_chat_end_assistant(w->engine, &w->transcript);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
