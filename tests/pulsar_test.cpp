@@ -3858,6 +3858,86 @@ static void test_live_row_valid(void) {
     free(e);
 }
 
+/* L375: the round API's refusals that run before any device work, on a session with no model behind it.
+ *   O38  no drafter: begin, both ends and the batch phases refuse by name; a batch step fails without its bank being
+ *        installed or a base drawn.
+ *   O39  begin refuses a bank that stands at the context, and cuts the drafts to the room below it.
+ *   O37  an end that never reaches the walk (a sampled round with no stream) undoes the round: its base and drafts
+ *        leave the view, which is then no position's.
+ *   L155 an end whose accepted[] cannot hold the base and every draft the round verified refuses before it commits. */
+static void test_spec_round_refusals(void) {
+    static pulsar_family fam{};
+    static pulsar_spec_target_ops target{};    /* no snapshot: nothing of a target to undo */
+    static pulsar_drafter_ops drafter{};       /* no prime, no harvest */
+    fam.name = "L375 round test";
+    fam.logits_width = test_carry_width;       /* ids 0 .. 7 */
+    fam.spec = &target;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = 6;
+    for (int t : {1, 2, 3}) token_vec_push(&s->checkpoint, t);
+    s->checkpoint_valid = true;
+    pulsar_spec_round *r = pulsar_spec_round_new();
+    char err[200] = "";
+    int acc[17];
+    const int32_t truth[17] = {0};
+    /* O38: no drafter */
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
+                strstr(err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
+    TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.0f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
+                                                    sizeof err) == -1 && strstr(err, "no drafter") != NULL);
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 17, err,
+                                                     sizeof err) == -1 && strstr(err, "no drafter") != NULL);
+    pulsar_spec_step st[2] = {};
+    st[0].bank = 0;
+    st[1].bank = 1;
+    st[0].round = st[1].round = r;
+    uint32_t rows = 7;
+    pulsar_session_spec_assemble_batch_local(s, st, 2, 16u, NULL, &rows);   /* no bank op is reached: fam.banks is NULL */
+    TEST_ASSERT(rows == 0u && st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
+                st[1].first_token == -1 && strstr(st[1].err, "no drafter") != NULL);
+    st[0].status = st[1].status = PULSAR_SPEC_STEP_OK;
+    pulsar_session_spec_round_end_batch_local(s, st, 2);
+    TEST_ASSERT(st[0].status == PULSAR_SPEC_STEP_FAILED && st[1].status == PULSAR_SPEC_STEP_FAILED &&
+                strstr(st[0].err, "no drafter") != NULL && s->checkpoint.len == 3 && s->checkpoint_valid);
+    e->drafter_ops = &drafter;
+    /* O39: five drafts pending at position 3 of a 6-token context -- rows at 3, 4, 5: the base and two drafts */
+    s->spec.n_pend = 5;
+    s->spec.pend_base = 4;
+    s->spec.pend_pos = 3;
+    s->spec.pend_top_p = 1.0f;
+    for (int i = 0; i < 5; i++) s->spec.pend[i] = 5;
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == 0);
+    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 && pulsar_spec_round_saved_len(r) == 3);
+    /* L155: accepted[] of 2 for a round of 3 rows -- refused before anything commits, the round undone */
+    TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 2, err,
+                                                     sizeof err) == -1 && strstr(err, "accepted[]") != NULL);
+    TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
+    /* O37: a begun round whose end cannot walk (sampled, no stream) is undone */
+    s->checkpoint_valid = true;
+    s->spec.n_pend = 1;
+    s->spec.pend_base = 4;
+    s->spec.pend_pos = 3;
+    s->spec.pend_temp = 0.7f;
+    s->spec.pend_top_p = 1.0f;
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.7f, 0, 1.0f, 0.0f, err, sizeof err) == 0 &&
+                s->checkpoint.len == 5);
+    TEST_ASSERT(pulsar_session_spec_round_end_local(s, r, 4, 0.7f, 0, 1.0f, 0.0f, 0u, NULL, 0u, NULL, 0u, acc, 17, err,
+                                                    sizeof err) == -1 && strstr(err, "stream") != NULL);
+    TEST_ASSERT(s->checkpoint.len == 3 && !s->checkpoint_valid);
+    /* O39: a bank at the context has no row for a base */
+    s->checkpoint_valid = true;
+    for (int t : {4, 5, 6}) token_vec_push(&s->checkpoint, t);
+    TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == -1 &&
+                strstr(err, "context is full") != NULL && s->checkpoint.len == 6 && s->checkpoint_valid);
+    pulsar_spec_round_free(r);
+    pulsar_tokens_free(&s->checkpoint);
+    free(s);
+    free(e);
+}
+
 /* L335: Qwen's eos is the first of the tokenizer's stop ids, and the list it reads is never empty: the loader refuses
  * an eos config with no id (bpe_tokenizer.cpp finish_table, the one authority) -- what qwen_tok_eos's refusal of an
  * empty list stands on.  Host: the checkpoint's tokenizer (PULSAR_TEST_QWEN_TOKENIZER). */
@@ -5237,6 +5317,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
+    {"--spec-round-refusals", "spec-round-refusals", "the round API's host-side refusals: no drafter, a bank at the context, a round that cannot be walked or handed back, each undone (L375)", test_spec_round_refusals},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},
     {"--api-err-null", "api-err-null", "the session entries that report through err accept a NULL err (L335)", test_api_err_null},
     {"--bf16-convert", "bf16-convert", "the host f32 -> bf16 converter over every float bit pattern: finite values as before, NaN stays NaN (L335)", test_bf16_from_f32},
