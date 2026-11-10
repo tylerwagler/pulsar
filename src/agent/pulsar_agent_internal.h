@@ -969,6 +969,17 @@ char *xstrndup(const char *s, size_t n);
  *  @param n   the new size, bytes
  *  @return the (possibly moved) block, never NULL */
 void *agent_xrealloc(void *ptr, size_t n);
+/** Skip UTF-8 continuation bytes, so a cut that drops a text's front lands on a character boundary.
+ *  @param p   the position
+ *  @param end the end (exclusive)
+ *  @return the first non-continuation byte at or after `p` (or `end`) */
+const char *agent_utf8_skip_continuation(const char *p, const char *end);
+/** L373: the length a byte cap may keep of s[0, n): `n`, less a trailing sequence the cap cut short (a lead byte
+ *  with fewer continuation bytes after it than it calls for), so the cut lands on a character boundary.
+ *  @param s the bytes
+ *  @param n their count
+ *  @return the length to keep (n - 3 .. n) */
+size_t agent_utf8_complete_len(const char *s, size_t n);
 /** write(2) until all n bytes are written, retrying EINTR; any other error drops the rest silently.
  *  @param fd the descriptor
  *  @param p  the bytes
@@ -1346,19 +1357,40 @@ void agent_turn_add_tool(agent_worker *w, const char *name, const char *content)
  *  @param w      the worker
  *  @param tokens the transcript (or a copy of it) to close */
 void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens);
+/** L373: text as well-formed UTF-8 (pulsar_utf8.h's rule): each byte that is not part of a well-formed sequence
+ *  becomes U+FFFD.
+ *  @param s the text (NUL-terminated)
+ *  @return NULL when `s` is already well-formed, else the repaired copy (malloc'd; caller frees) */
+char *agent_utf8_repaired(const char *s);
+/** L373: the agent's ONE door to pulsar_chat_append_turn.  Every message's content and name is made well-formed
+ *  UTF-8 first (agent_utf8_repaired): a tool result, a file's bytes or a pasted prompt is arbitrary bytes, and the
+ *  Qwen, Nemotron and Gemma tokenizers refuse a turn that is not UTF-8.  A refusal that remains (the engine says why
+ *  on stderr and appends nothing) is returned, never read as an empty turn.
+ *  @param w                 the worker (its engine)
+ *  @param tokens            the transcript, appended to
+ *  @param msgs              the turn's messages
+ *  @param n                 their count
+ *  @param generation_prompt also open the assistant turn
+ *  @param think_mode        the mode the assistant turn opens for
+ *  @return false when the turn was refused: `tokens` is unchanged */
+bool agent_chat_append_turn(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                            bool generation_prompt, pulsar_think_mode think_mode);
 /** The turn being built plus `extra` (n_extra messages after it), rendered as ONE turn onto `tokens`, with the
  *  assistant turn opened for `think_mode` -- what the next prefill will hold. */
 /** @param w          the worker
  *  @param tokens     receives the rendering (appended)
  *  @param extra      messages after the turn, or NULL
  *  @param n_extra    entries in `extra`
- *  @param think_mode the think mode the assistant turn opens with */
-void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+ *  @param think_mode the think mode the assistant turn opens with
+ *  @return false when the turn was refused (agent_chat_append_turn): `tokens` is unchanged */
+bool agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
                        pulsar_think_mode think_mode);
 /** Render the turn being built onto the transcript with the assistant turn opened, and empty it. */
 /** @param w          the worker
- *  @param think_mode the think mode the assistant turn opens with */
-void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode);
+ *  @param think_mode the think mode the assistant turn opens with
+ *  @return false when the turn was refused (agent_chat_append_turn): the transcript is unchanged and the turn's
+ *          messages are dropped */
+bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode);
 /** Drop the turn being built (a new or switched session starts without one). */
 /** @param w the worker */
 void agent_turn_clear(agent_worker *w);

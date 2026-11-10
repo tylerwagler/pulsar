@@ -144,8 +144,15 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
     pulsar_tokens_copy(&prompt, &w->transcript);
     agent_worker_close_open_turn(w, &prompt);   /* L365: the private request never lands inside an open turn */
     const pulsar_chat_message request = {"user", prompt_text, false};
-    agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
+    const bool request_taken = agent_turn_render(w, &prompt, &request, 1, PULSAR_THINK_NONE);
     free(prompt_text);
+    if (!request_taken) {
+        snprintf(err, err_len, "the tokenizer refused the compaction request (its reason is on stderr)");
+        pulsar_tokens_free(&prompt);
+        pulsar_tokens_free(&sys);
+        agent_publish(w, "\x1b[0m\n", 5);
+        return false;
+    }
 
     pthread_mutex_lock(&w->mu);
     w->status.state = AGENT_WORKER_COMPACTING;
@@ -274,9 +281,16 @@ bool agent_worker_compact(agent_worker *w, const char *reason,
         agent_buf_puts(&summary_msg, "\n");
     agent_buf_puts(&summary_msg, "[End compacted summary. Recent conversation continues verbatim below.]\n\n");
     const pulsar_chat_message summary_note = {"system", summary_msg.ptr, false};
-    pulsar_chat_append_turn(w->engine, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
+    const bool summary_taken = agent_chat_append_turn(w, &compacted, &summary_note, 1, false, PULSAR_THINK_NONE);
     free(summary_msg.ptr);
     free(summary.ptr);
+    if (!summary_taken) {
+        snprintf(err, err_len, "the tokenizer refused the compaction summary (its reason is on stderr)");
+        pulsar_session_invalidate(w->session);
+        pulsar_tokens_free(&compacted);
+        pulsar_tokens_free(&sys);
+        return false;
+    }
 
     agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
 

@@ -231,6 +231,7 @@ bool agent_tool_result_fits_context(agent_worker *w, const char *result,
     pulsar_tokens tmp = {0};
     pulsar_tokens_copy(&tmp, &w->transcript);
     const pulsar_chat_message tool = {"tool", result ? result : "", false};
+    /* a refused render leaves the transcript's own length, which fits: agent_turn_flush then fails the turn */
     agent_turn_render(w, &tmp, &tool, 1, w->cfg->gen.think_mode);
     int tokens = tmp.len;
     pulsar_tokens_free(&tmp);

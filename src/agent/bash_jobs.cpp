@@ -1,6 +1,7 @@
 /** @file
  *  pulsar-agent: the bash tool's background jobs (spawn, poll, output capture, observation). */
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -295,6 +296,10 @@ char *agent_bash_job::read_head(int max_lines,
     }
     if (out.len >= max_bytes && !feof(fp) && byte_limited) *byte_limited = true;
     fclose(fp);
+    if (out.len >= max_bytes) {   /* L373: the byte cap cuts on a character boundary */
+        out.len = agent_utf8_complete_len(out.ptr, out.len);
+        out.ptr[out.len] = '\0';
+    }
     if (lines_read) *lines_read = lines + (out.len && out.ptr[out.len - 1] != '\n');
     if (!out.ptr) return xstrdup("");
     return agent_buf_take(&out);
@@ -312,8 +317,10 @@ char *agent_bash_job::read_tail_lines(int max_lines) const {
 
     agent_buf tail = {0};
     char tmp[2048];
+    size_t total = 0;
     for (;;) {
         size_t n = fread(tmp, 1, sizeof(tmp), fp);
+        total += n;
         if (n) agent_tail_append(&tail, tmp, n, AGENT_BASH_TAIL_BYTES);
         if (n < sizeof(tmp)) {
             if (ferror(fp) && errno == EINTR) {
@@ -326,7 +333,9 @@ char *agent_bash_job::read_tail_lines(int max_lines) const {
     fclose(fp);
     if (!tail.ptr) return xstrdup("");
 
-    char *start = tail.ptr;
+    /* L373: a tail whose front the byte cap dropped starts on a character boundary */
+    char *start = total > AGENT_BASH_TAIL_BYTES ?
+        (char *)agent_utf8_skip_continuation(tail.ptr, tail.ptr + tail.len) : tail.ptr;
     int newlines = 0;
     for (char *p = tail.ptr + tail.len; p > tail.ptr; p--) {
         if (p[-1] == '\n' && ++newlines > max_lines) {
@@ -535,3 +544,77 @@ pid_t agent_tool_pid(const agent_tool_call *call) {
     return (pid_t)agent_parse_int_default(agent_tool_arg_value(call, "pid"), 0, 0, INT_MAX);
 }
 
+
+
+#ifdef PULSAR_AGENT_TEST
+/** @brief Whether the text is well-formed UTF-8 (pulsar_utf8.h's rule).
+ *  @param s the text
+ *  @return true when every byte is part of a well-formed sequence */
+static bool test_utf8_well_formed(const char *s) {
+    const size_t len = strlen(s);
+    for (size_t i = 0; i < len;) {
+        const int k = utf8_seq_ok((const unsigned char *)s + i, len - i);
+        if (!k) return false;
+        i += (size_t)k;
+    }
+    return true;
+}
+
+/** L373: what a tool hands the transcript is well-formed UTF-8 -- a lone lead byte and a character cut short become
+ *  U+FFFD at the chat door's repair (agent_chat_messages_repair, what agent_chat_append_turn renders), and the bash
+ *  head and tail byte caps cut on a character boundary, so they add no U+FFFD of their own. */
+static void test_agent_tool_results_are_utf8(void) {
+    AGENT_TEST_ASSERT(agent_utf8_repaired("plain \xe2\x80\x9cquoted\xe2\x80\x9d") == NULL);
+    pulsar_chat_message msgs[3] = {
+        {"tool", "gcc: \xe2 error", false, "ba\xffsh"},              /* a lone 0xE2, a bad byte in the name */
+        {"tool", "warning: \xe2\x80\x98x\xe2\x80", false, NULL},     /* a closing quote cut after two bytes */
+        {"user", "caf\xe9 \xc0\xaf \xed\xa0\x80 ok", false, NULL},    /* Latin-1, an overlong form, a surrogate */
+    };
+    std::vector<char *> owned;
+    agent_chat_messages_repair(msgs, 3, &owned);
+    AGENT_TEST_ASSERT(owned.size() == 4);
+    AGENT_TEST_ASSERT(!strcmp(msgs[0].content, "gcc: \xef\xbf\xbd error") && !strcmp(msgs[0].name, "ba\xef\xbf\xbdsh"));
+    AGENT_TEST_ASSERT(!strcmp(msgs[1].content, "warning: \xe2\x80\x98x\xef\xbf\xbd\xef\xbf\xbd"));
+    for (const pulsar_chat_message &m : msgs)
+        AGENT_TEST_ASSERT(test_utf8_well_formed(m.content) && strstr(m.content, "\xef\xbf\xbd") != NULL);
+    AGENT_TEST_ASSERT(strstr(msgs[2].content, " ok") != NULL);
+    for (char *p : owned) free(p);
+
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("ab\xe2\x80\x9c", 5) == 5);
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("ab\xe2\x80\x9c", 4) == 2);
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("ab\xe2\x80\x9c", 3) == 2);
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("ab\xf0\x9f\x9b", 5) == 2);
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("ab", 2) == 2 && agent_utf8_complete_len("", 0) == 0);
+    AGENT_TEST_ASSERT(agent_utf8_complete_len("\x80\x80\x80\x80\x80", 5) == 5);   /* no lead: not this cut's to fix */
+
+    /* one 36000-byte line of curly quotes: the 8 KiB head cap and the 32 KiB tail cap both land inside a character */
+    agent_worker w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_pending = true;   /* no wake pipe */
+    char err[160] = {0};
+    agent_bash_job *job = agent_bash_start(
+        &w, "i=0; while [ $i -lt 12000 ]; do printf '\\342\\200\\234'; i=$((i+1)); done", 60, err, sizeof err);
+    AGENT_TEST_ASSERT(job != NULL);
+    if (job) {
+        while (job->running) {
+            job->poll();
+            usleep(2000);
+        }
+        AGENT_TEST_ASSERT(job->bytes == 36000);
+        for (int leg = 0; leg < 2; leg++) {   /* the first observation shows the head, the second the tail */
+            char *obs = job->observation(true);
+            const char *body = strstr(obs, leg ? "<tail " : "<head ");
+            AGENT_TEST_ASSERT(body != NULL && strstr(body, "\xe2\x80\x9c") != NULL);
+            AGENT_TEST_ASSERT(test_utf8_well_formed(obs));
+            const char *first = body ? strstr(body, ">\n") : NULL;
+            const char *last = first ? strstr(first, leg ? "\n</tail>" : "\n</head>") : NULL;
+            AGENT_TEST_ASSERT(first && last && (size_t)(last - first - 2) ==
+                              (size_t)(leg ? AGENT_BASH_TAIL_BYTES : AGENT_BASH_HEAD_BYTES) / 3 * 3);
+            free(obs);
+        }
+        agent_bash_remove_job(&w, job);
+    }
+    pthread_mutex_destroy(&w.mu);
+}
+#endif

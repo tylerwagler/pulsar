@@ -1,6 +1,7 @@
 /** @file
  *  pulsar-agent: small utilities and command-line parsing. */
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 #include "pulsar_argparse.h"
 
 
@@ -54,6 +55,26 @@ void *agent_xrealloc(void *ptr, size_t n) {
         exit(1);
     }
     return p;
+}
+
+
+
+const char *agent_utf8_skip_continuation(const char *p, const char *end) {
+    while (p < end && (((unsigned char)*p) & 0xc0) == 0x80) p++;
+    return p;
+}
+
+
+
+size_t agent_utf8_complete_len(const char *s, size_t n) {
+    size_t lead = n;   /* the last byte that is not a continuation byte, looking back one sequence */
+    while (lead > 0 && n - lead < 4) {
+        lead--;
+        if ((((unsigned char)s[lead]) & 0xc0) != 0x80) {
+            return (size_t)utf8_seq_len((unsigned char)s[lead]) > n - lead ? lead : n;
+        }
+    }
+    return n;
 }
 
 

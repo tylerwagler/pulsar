@@ -149,7 +149,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
-        agent_turn_flush(w, think_mode);
+        if (!agent_turn_flush(w, think_mode)) {   /* L373: never sample after a turn that is not there */
+            agent_set_error(w, "the tokenizer refused the turn (its reason is on stderr); nothing was appended");
+            return 1;
+        }
 
         const pulsar_tokens *prompt_for_sync = &w->transcript;
         const TokPos old_pos = pulsar_session_pos(w->session);

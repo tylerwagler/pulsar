@@ -1,6 +1,8 @@
 /** @file
  *  pulsar-agent: the KV segment store and session persistence (save, load, list, titles). */
+#include <vector>
 #include "pulsar_agent_internal.h"
+#include "pulsar_utf8.h"
 
 
 
@@ -287,14 +289,67 @@ void agent_worker_close_open_turn(agent_worker *w, pulsar_tokens *tokens) {
 
 
 
-void agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
+char *agent_utf8_repaired(const char *s) {
+    const size_t len = strlen(s);
+    size_t bad = 0;
+    for (size_t i = 0; i < len;) {
+        const int k = utf8_seq_ok((const unsigned char *)s + i, len - i);
+        bad += k == 0;
+        i += k ? (size_t)k : 1;
+    }
+    if (!bad) return NULL;
+    char *out = (char *)agent_xmalloc(len + 2 * bad + 1);   /* each bad byte becomes U+FFFD's three */
+    size_t o = 0;
+    for (size_t i = 0; i < len;) {
+        const int k = utf8_seq_ok((const unsigned char *)s + i, len - i);
+        if (k) {
+            memcpy(out + o, s + i, (size_t)k);
+            o += (size_t)k;
+            i += (size_t)k;
+        } else {
+            memcpy(out + o, "\xef\xbf\xbd", 3);
+            o += 3;
+            i++;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/** @brief Point each message's content and name at well-formed UTF-8 (agent_utf8_repaired), in place.
+ *  @param msgs  the messages; a repaired field is replaced by its copy
+ *  @param n     their count
+ *  @param owned receives the copies made; the caller frees each after the messages' last use */
+static void agent_chat_messages_repair(pulsar_chat_message *msgs, int n, std::vector<char *> *owned) {
+    for (int i = 0; i < n; i++) {
+        for (const char **field : {&msgs[i].content, &msgs[i].name}) {
+            char *fixed = *field ? agent_utf8_repaired(*field) : NULL;
+            if (!fixed) continue;
+            *field = fixed;
+            owned->push_back(fixed);
+        }
+    }
+}
+
+bool agent_chat_append_turn(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *msgs, int n,
+                            bool generation_prompt, pulsar_think_mode think_mode) {
+    std::vector<pulsar_chat_message> turn(msgs, msgs + n);
+    std::vector<char *> owned;
+    agent_chat_messages_repair(turn.data(), n, &owned);
+    /* a family whose tokenizer refuses the rendered turn says so on stderr and appends NOTHING (the chat front has
+     * no error return); a turn that was taken always adds its markers */
+    const int before = tokens->len;
+    const bool taken = pulsar_chat_append_turn(w->engine, tokens, turn.data(), n, generation_prompt, think_mode) &&
+                       tokens->len > before;
+    for (char *p : owned) free(p);
+    return taken;
+}
+
+bool agent_turn_render(const agent_worker *w, pulsar_tokens *tokens, const pulsar_chat_message *extra, int n_extra,
                        pulsar_think_mode think_mode) {
-    const int n = w->turn_len + n_extra;
-    pulsar_chat_message *msgs = (pulsar_chat_message *)agent_xmalloc((size_t)(n > 0 ? n : 1) * sizeof(msgs[0]));
-    for (int i = 0; i < w->turn_len; i++) msgs[i] = w->turn[i];
-    for (int i = 0; i < n_extra; i++) msgs[w->turn_len + i] = extra[i];
-    pulsar_chat_append_turn(w->engine, tokens, msgs, n, true, think_mode);
-    free(msgs);
+    std::vector<pulsar_chat_message> msgs(w->turn, w->turn + w->turn_len);
+    msgs.insert(msgs.end(), extra, extra + n_extra);
+    return agent_chat_append_turn(w, tokens, msgs.data(), (int)msgs.size(), true, think_mode);
 }
 
 
@@ -309,11 +364,12 @@ void agent_turn_clear(agent_worker *w) {
 
 
 
-void agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
+bool agent_turn_flush(agent_worker *w, pulsar_think_mode think_mode) {
     agent_worker_close_open_turn(w, &w->transcript);
-    agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
-    w->model_turn_open = false;   /* answered by the turn's tool messages, or closed above */
+    const bool taken = agent_turn_render(w, &w->transcript, NULL, 0, think_mode);
+    if (taken) w->model_turn_open = false;   /* answered by the turn's tool messages, or closed above */
     agent_turn_clear(w);
+    return taken;
 }
 
 

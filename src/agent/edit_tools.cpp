@@ -868,6 +868,7 @@ static void test_agent_tool_call_display_is_sanitized(void) {
 }
 
 static void test_agent_family_tools(void);   /* family_tools.cpp, included after this file */
+static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
 
 static void pulsar_agent_unit_tests_run(void) {
     test_agent_workspace_and_terminal();
@@ -878,6 +879,7 @@ static void pulsar_agent_unit_tests_run(void) {
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_dsml_parser_recognises_every_syntax();
     test_agent_family_tools();
+    test_agent_tool_results_are_utf8();
     test_agent_session_file_round_trip();
     test_parse_u64_refuses_sign_and_range();
 }
