@@ -322,6 +322,10 @@ bool server_judge_step(server *s) {
     }
     pulsar_session *pool = s->sess;
     pulsar_stall_mark("worker: systemone");
+    /* L372: a chat job bound or parked mid-prefill leaves its hooks on the shared session; the judge's sync called them
+     * -- that job's continued store written from the judge bank, its cancel ending the judge's prefill (503), its
+     * progress counted from the judge's chunks */
+    s->job_hooks_clear();
     /* install the judge bank: the chat bank installed saved first (bank_switch's rule) */
     if (s->live_bank >= 0 && s->live_bank != J->bank) {
         s->slots[s->live_bank].committed_pos = pulsar_session_pos(pool);

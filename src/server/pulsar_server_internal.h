@@ -2988,6 +2988,11 @@ struct server {
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_prefill_fail(session_slot *sl);
+    /** L372: the pool session's cancel / progress / display-progress hooks cleared, for a worker step that syncs for
+     *  no job (the terminal checkpoint, the judge).  The hooks are the session's, not a bank's: a job bound or parked
+     *  mid-prefill leaves its own armed across worker passes (gen_begin's plan, a yielded gen_step_prefill), and any
+     *  sync on the shared session calls them.  That job arms them again before its next sync (gen_step_prefill). */
+    void job_hooks_clear();
     /** L318 / L347 I3b: what bank `src`'s published state serves of the slot's request (its tokens held to the state's
      *  T, pulsar_session_bank_adopt_score), 0 when it may not be adopted from (not resident, spilled, preempted,
      *  mid-restore, the slot's own) -- the resume pick's scan, and a failed restore's look again.

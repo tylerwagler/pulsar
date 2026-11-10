@@ -592,6 +592,12 @@ static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
     pulsar_session_set_cancel(sess, gen_prefill_cancel_cb, g);
 }
 
+void server::job_hooks_clear() {
+    pulsar_session_set_cancel(sess, NULL, NULL);
+    pulsar_session_set_progress(sess, NULL, NULL);
+    pulsar_session_set_display_progress(sess, NULL, NULL);
+}
+
 
 
 /* The failure epilogue of a job that has no decode attempt yet (both prefill
@@ -2333,9 +2339,7 @@ bool server::terminal_checkpoint_step() {
     pulsar_tokens target = {0};
     tokens_copy_prefix(&target, pulsar_session_tokens(s->sess), C);
     const int old_len = pulsar_session_pos(s->sess).raw();
-    pulsar_session_set_cancel(s->sess, NULL, NULL);
-    pulsar_session_set_progress(s->sess, NULL, NULL);
-    pulsar_session_set_display_progress(s->sess, NULL, NULL);
+    s->job_hooks_clear();
     const double t0 = server_now_sec();
     char err[192] = "";
     /* the view IS the target when no stop trails it, and a sync of the same prompt is a no-op: the history short of
