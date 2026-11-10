@@ -3829,7 +3829,14 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             if (!s->prefill_headroom_fused_ok(c)) { rv[k].why = pg->no_fuse; continue; }
             if (!pg->fuse_ready && !s->fuse_prepare(c)) { rv[k].why = pg->no_fuse; continue; }
             const int p0 = server_bank_pos(pool, (uint32_t)c->bank).raw();
-            if (pg->prompt_for_sync->len - p0 <= 0) { rv[k].why = "nothing left"; continue; }
+            if (pg->prompt_for_sync->len - p0 <= 0) {
+                /* L372: the bank already stands at the prompt's end (a re-send of a prompt whose first attempt ended
+                 * before a token): no chunk to ride, and the handoff to decode is the classic sync's.  Left fusable
+                 * it was stepped by neither -- this loop skipped it and the classic pick leaves a fusable prefill to
+                 * this lane (slot_steppable_beside_fused) -- until every decoder had finished. */
+                rv[k].why = pg->no_fuse = "nothing left to prefill: the classic sync hands it to decode";
+                continue;
+            }
             ps[n_ps] = c;
             pgs[n_ps] = pg;
             sp[n_ps] = {(uint32_t)p0, (uint32_t)pg->prompt_for_sync->len, pulsar_session_resume_grid(pool),

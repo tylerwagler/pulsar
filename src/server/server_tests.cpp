@@ -9404,6 +9404,28 @@ static void test_l372_failed_readmission_marks_the_bank_spilled(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* L372 (O13): what the spec quantum's fix rests on -- a main prefill marked no_fuse is the classic step's beside a
+ * fused quantum, a fusable one is not (it rides the quantum's forwards).  The quantum itself (a rider whose bank
+ * already stands at its prompt's end is marked no_fuse) needs a session: tests/ live legs, not here. */
+static void test_l372_no_fuse_prefill_is_the_classic_steps(void) {
+    session_slot sl;
+    memset(&sl, 0, sizeof sl);
+    job j;
+    memset(&j, 0, sizeof j);
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    pulsar_tokens prompt = {0};
+    g.j = &j;
+    g.phase = GEN_PREFILL_MAIN;
+    g.prompt_for_sync = &prompt;
+    sl.provisioned = true;
+    sl.active_job = &j;
+    sl.gen = &g;
+    TEST_ASSERT(slot_fusable_prefill(&sl) && slot_steppable_beside_decode(&sl) && !slot_steppable_beside_fused(&sl));
+    g.no_fuse = "nothing left to prefill: the classic sync hands it to decode";
+    TEST_ASSERT(!slot_fusable_prefill(&sl) && slot_steppable_beside_fused(&sl));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15177,6 +15199,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l353_routing_fixes();
     test_l372_predecode_failure_ends_the_job();
     test_l372_failed_readmission_marks_the_bank_spilled();
+    test_l372_no_fuse_prefill_is_the_classic_steps();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
