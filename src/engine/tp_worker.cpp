@@ -197,9 +197,7 @@ static int worker_ack(pulsar_engine *e, uint64_t sid, int rc, char *err, size_t 
 /// @return 1 when sent, -1 (err filled) when the control channel is gone
 static int worker_ack_live(pulsar_engine *e, uint64_t sid, int rc, pulsar_session *s, char *err, size_t errlen) {
     if (rc != 0) return worker_ack(e, sid, rc, err, errlen);
-    uint64_t digest = 0;
-    if (!s->rows_digest(s->dev.live, 0, 1, &digest)) digest = 0;
-    if (pulsar_tp_send_command_ack_digest(e->tp, sid, 0, digest) != 0) return 1;
+    if (pulsar_tp_send_command_ack_digest(e->tp, sid, 0, pulsar_session_live_digest(s)) != 0) return 1;
     snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
     return -1;
 }
@@ -832,9 +830,8 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             } else {
                 /* The run's last row is this rank's assembled logits after the
                  * whole loop; the positive verdict carries its digest (L243). */
-                uint64_t digest = 0;
-                if (!slot->s->rows_digest(slot->s->dev.live, 0, 1, &digest)) digest = 0;
-                if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, status, digest) != 0)
+                if (pulsar_tp_send_command_ack_digest(e->tp, c->session_id, status,
+                                                      pulsar_session_live_digest(slot->s)) != 0)
                     return 1;
                 snprintf(err, errlen, "tp: could not ack the leader (control channel gone)");
                 return -1;

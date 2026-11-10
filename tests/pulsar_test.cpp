@@ -3929,6 +3929,7 @@ static void test_live_row_valid(void) {
         /* invalidate: the row was the forgotten history's */
         pulsar_session_family_invalidate(s);
         TEST_ASSERT(s->live_dev() == NULL && s->argmax() == PULSAR_SAMPLE_REFUSED);
+        TEST_ASSERT(pulsar_session_live_digest(s) == 0u);   /* the TP ack's reader: refused at the gate, no device read */
     }
     pulsar_gpu_tensor_free(rows);
     pulsar_session_dev_free(s);

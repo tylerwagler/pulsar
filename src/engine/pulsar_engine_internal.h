@@ -6205,6 +6205,12 @@ void dump_tokens_fp(FILE *fp, const pulsar_vocab *vocab, const token_vec *tokens
 /// @param[out] len byte count, or NULL
 /// @return the bytes (caller frees)
 char *vocab_token_text(const pulsar_vocab *vocab, int token, size_t *len);
+/** The cross-rank identity digest of the session's live row (an eval's, a speculative run's last row), on the device,
+ *  read through the live row's gate (pulsar_session::live_dev): a view with no row refuses (said) and digests to 0.
+ *  The leader's and the worker's ack both call it (L375 O15).
+ *  @param s the session
+ *  @return the digest, 0 on a refusal or a device failure */
+uint64_t pulsar_session_live_digest(pulsar_session *s);
 /* The identity digest of a batched step's headed rows, on the device (engine_api.cpp; the TP mirror's check). */
 uint64_t pulsar_session_batch_digest(pulsar_session *s, uint32_t n_rows);
 /** L260 fusion: a fused step's digest -- its decode rows', then its `n_heads` headed rows'. */
