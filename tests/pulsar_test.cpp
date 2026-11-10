@@ -4838,16 +4838,18 @@ static void test_refusal_once(void) {
     TEST_ASSERT(pulsar_refusal_first(ops[n - 1u]));   /* past the table: said again, not dropped */
 }
 
-/* L335: no engine is no family -- the engine facts never answer DeepSeek for NULL (they did: V4.1 and "DeepSeek"),
- * and a completion parsed without an engine carries no family (the server's enqueue refuses one). */
+/* L335: no engine is no family -- the engine facts never answer DeepSeek for NULL (they did: V4.1 and "DeepSeek").
+ * L375: and a completion parsed without an engine is refused at the parse, by name: there is no tokenizer to make its
+ * prompt, and a tokenizer's refusal is the request's (before, the parse handed back an empty prompt for the server's
+ * enqueue to refuse). */
 static void test_no_engine_no_family(void) {
     TEST_ASSERT(pulsar_engine_chat_format(NULL) == PULSAR_CHAT_NONE);
     TEST_ASSERT(!strcmp(pulsar_engine_family_name(NULL), "(no engine)"));
     request r;
     char err[256] = "";
-    TEST_ASSERT(parse_completion_request(NULL, "{\"prompt\": \"hi\"}", 16, &r, err, sizeof err));
-    TEST_ASSERT(r.family == NULL);
-    request_free(&r);
+    TEST_ASSERT(!parse_completion_request(NULL, "{\"prompt\": \"hi\"}", 16, &r, err, sizeof err));
+    TEST_ASSERT(strstr(err, "the tokenizer refused the rendered prompt") != NULL);
+    TEST_ASSERT(r.family == NULL);   /* the refused request is freed: nothing of it stands */
 }
 
 /* L335: the state plan's decl table (state_kinds.cpp) filled past PULSAR_STATE_DECLS_MAX -- the add counts the
