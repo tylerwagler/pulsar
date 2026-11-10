@@ -1101,6 +1101,16 @@ static void test_ignored_key_named_once(void) {
     TEST_ASSERT(api_key_first_seen("/test2", "zz_new_key"));
     TEST_ASSERT(api_key_first_seen("/test", "zz_other_key"));
     TEST_ASSERT(!api_key_first_seen("/test2", "zz_new_key"));
+    /* L372 (O36): a pair is the whole key -- two long keys that differ past byte 160 are two */
+    std::string long_a(300, 'k'), long_b(300, 'k');
+    long_a += "_a";
+    long_b += "_b";
+    TEST_ASSERT(api_key_first_seen("/test", long_a.c_str()));
+    TEST_ASSERT(api_key_first_seen("/test", long_b.c_str()));
+    TEST_ASSERT(!api_key_first_seen("/test", long_a.c_str()) && !api_key_first_seen("/test", long_b.c_str()));
+    /* the set is bounded in bytes too: a key that alone passes it is never tracked (and never "first") */
+    std::string huge((size_t)API_SEEN_BYTES_MAX + 1u, 'h');
+    TEST_ASSERT(!api_key_first_seen("/test", huge.c_str()));
 }
 
 

@@ -7,35 +7,49 @@
 
 
 /* The set of ignored top-level keys already named in the log.  Keys are client
- * input, so the set is bounded: past the cap, further new keys are not
- * tracked, and that is said once. */
+ * input, so the set is bounded -- in entries and in bytes: past either, further
+ * new keys are not tracked, and that is said once.  L372: a pair is its whole
+ * "endpoint/key" (it was cut at 160 bytes, so two long keys with one head were
+ * one entry and the second was never named). */
 /// The most (endpoint, key) pairs api_key_first_seen tracks; past it new keys are not named (said once).
 #define API_SEEN_KEYS_MAX 256
+/// The most bytes of "endpoint/key" names the set holds; a pair that would pass it is not tracked (said once).
+#define API_SEEN_BYTES_MAX (64u * 1024u)
 /// Guards the ignored-key set below (the parsers run on client threads).
 static pthread_mutex_t api_seen_mu = PTHREAD_MUTEX_INITIALIZER;
 /// The "endpoint/key" names already logged, heap strings, never freed (process lifetime).
 static char *api_seen_keys[API_SEEN_KEYS_MAX];
 /// Entries used in api_seen_keys.
 static int api_seen_n = 0;
+/// Bytes of the names in api_seen_keys.
+static size_t api_seen_bytes = 0;
 /// The set-is-full line was said.
 static bool api_seen_full_warned = false;
 
 bool api_key_first_seen(const char *api, const char *key) {
-    char name[160];
-    snprintf(name, sizeof(name), "%s/%s", api, key);
+    const size_t la = strlen(api), lk = strlen(key);
     bool first = false;
     pthread_mutex_lock(&api_seen_mu);
     int i = 0;
-    while (i < api_seen_n && strcmp(api_seen_keys[i], name)) i++;
+    for (; i < api_seen_n; i++) {
+        const char *e = api_seen_keys[i];
+        if (!strncmp(e, api, la) && e[la] == '/' && !strcmp(e + la + 1, key)) break;
+    }
     if (i == api_seen_n) {
-        if (api_seen_n < API_SEEN_KEYS_MAX) {
-            api_seen_keys[api_seen_n++] = server_xstrdup(name);
+        const size_t bytes = la + 1 + lk;
+        if (api_seen_n < API_SEEN_KEYS_MAX && bytes <= API_SEEN_BYTES_MAX - api_seen_bytes) {
+            char *name = (char *)server_xmalloc(bytes + 1);
+            memcpy(name, api, la);
+            name[la] = '/';
+            memcpy(name + la + 1, key, lk + 1);
+            api_seen_keys[api_seen_n++] = name;
+            api_seen_bytes += bytes;
             first = true;
         } else if (!api_seen_full_warned) {
             api_seen_full_warned = true;
             server_log(PULSAR_LOG_WARNING,
-                       "ignored-key log is full (%d keys); further new keys are not named",
-                       API_SEEN_KEYS_MAX);
+                       "pulsar-server: ignored-key log is full (%d keys, %zu bytes; at most %d and %u); further new "
+                       "keys are not named", api_seen_n, api_seen_bytes, API_SEEN_KEYS_MAX, API_SEEN_BYTES_MAX);
         }
     }
     pthread_mutex_unlock(&api_seen_mu);
@@ -60,7 +74,7 @@ static bool skip_ignored_key(const char *api, const char *key, const char **p) {
         }
         shown[n] = '\0';
         server_log(PULSAR_LOG_WARNING,
-                   "%s: ignoring request key \"%s\"%s (named once per process)",
+                   "pulsar-server: %s: ignoring request key \"%s\"%s (named once per process)",
                    api, shown, key[n] ? "..." : "");
     }
     return json_skip_value(p);
