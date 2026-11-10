@@ -555,7 +555,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 /// @param top_p request top-p
 /// @param min_p request min-p
 /// @param rng the request's stream
-/// @return drafts kept
+/// @return drafts kept, or PULSAR_DRAFT_REFUSED (said) when the drafting pass failed
 static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float temperature, int top_k, float top_p,
                              float min_p, uint64_t *rng) {
     spec_redraft_req rec;
@@ -570,21 +570,21 @@ static uint32_t dspark_draft(pulsar_session *s, int next_base, bool, float tempe
     spec_redraft_req *qs[1] = {&rec};
     uint64_t *rngs[1] = {rng};
     char err[200];
-    uint32_t keep = 0;
     if (dspark_draft_group(s, qs, NULL, rngs, 1, defer, err, sizeof err) != 0) {
-        fprintf(stderr, "pulsar: %s -- no drafts this round\n", err);
+        /* L375 O41: the ops contract (spec_ops.h, L306) -- a failed draft refuses the round that asked for it; it
+         * used to drop the pendings and go on as a plain round, a second path nothing measured */
+        fprintf(stderr, "pulsar: %s -- refusing the chain\n", err);
         pulsar_spec_drop_pendings(&s->spec);
-    } else {
-        if (defer) rec.keep = 0;   /* the harvest sets the real count */
-        pulsar_spec_redraft_stamp(s, &rec);
-        if (defer) {
-            s->spec.dspark_chain_unharvested = true;
-            s->spec.dspark_chain_conf = rec.have_conf;
-            s->spec.dspark_chain_n = rec.n_draft;
-        }
-        keep = rec.keep;
+        return PULSAR_DRAFT_REFUSED;
     }
-    return keep;
+    if (defer) rec.keep = 0;   /* the harvest sets the real count */
+    pulsar_spec_redraft_stamp(s, &rec);
+    if (defer) {
+        s->spec.dspark_chain_unharvested = true;
+        s->spec.dspark_chain_conf = rec.have_conf;
+        s->spec.dspark_chain_n = rec.n_draft;
+    }
+    return rec.keep;
 }
 
 /* L108 P2: lazy completion of a deferred greedy chain: the ids and the confidences read back, the stop rule
