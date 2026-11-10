@@ -9,8 +9,6 @@
 #include <string.h>
 
 namespace {
-/// L353: image blocks a key or a parent lookup covers at most (a request's are capped alike, kv_cache_find_req).
-constexpr int KVCHAIN_IMAGES_MAX = 64;
 /** A non-owning pulsar_tokens over t[from, to); its `v` aliases t's storage and must not be freed.
  *  @param t source tokens
  *  @param from first index (inclusive)
@@ -72,8 +70,8 @@ put_rc kvchain_put(pulsar_segstore *st, pulsar_engine *e, pulsar_session *s, con
     uint64_t tbytes = 0;
     if (trailer && !trailer->size(trailer->ud, text, &tbytes)) tbytes = 0;
     /* L353: the key covers the span's images: same-size images render the same text */
-    uint64_t hashes[KVCHAIN_IMAGES_MAX];
-    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, KVCHAIN_IMAGES_MAX);
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{G_prev}, TokPos{G}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
     if (n_hashes < 0) {
         free(text);
         snprintf(r->err, sizeof(r->err), "segment [%d,%d): its image records could not be read", G_prev, G);
@@ -255,8 +253,8 @@ int pulsar_kvchain_persist(pulsar_segstore *st, pulsar_engine *e, pulsar_session
         const pulsar_segstore_end grid_end = { (uint32_t)grid, false };
         pulsar_segstore_seg chain[PULSAR_KVCHAIN_MAX];
         /* L353: this history's own images: another image's chain over the same text is not its parent */
-        uint64_t hashes[KVCHAIN_IMAGES_MAX];
-        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, KVCHAIN_IMAGES_MAX);
+        uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+        const int n_hashes = pulsar_session_span_image_hashes(s, TokPos{0}, TokPos{deepest}, hashes, PULSAR_IMAGE_BLOCKS_MAX);
         const int c = full && n_hashes >= 0 ? pulsar_segstore_lookup_images(st, full, full_len, &grid_end, hashes,
                                                                             (uint32_t)n_hashes, chain, PULSAR_KVCHAIN_MAX)
                                             : 0;

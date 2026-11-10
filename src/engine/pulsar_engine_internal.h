@@ -2613,8 +2613,6 @@ typedef struct {
     /** @var pulsar_image_block::grid_w
      *  The block's 2D layout width, in rows (see grid_h). */
 } pulsar_image_block;
-/// Most image blocks one KV records (pulsar_image_identity).
-#define PULSAR_IMAGE_BLOCKS_MAX 64
 /** The blocks a KV holds, in position order (image_identity.cpp).  Named (L350) so kv_state.h's checkpoint records,
  *  declared before it, can hold one by pointer. */
 typedef struct pulsar_image_identity {

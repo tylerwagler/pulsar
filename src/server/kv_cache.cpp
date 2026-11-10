@@ -850,8 +850,9 @@ bool server::kv_rp_writes_for_end(kv_persist_trigger why, unsigned kv_flags, uns
     kv_chain_hit hit;
     /* L353: with the history's own images: without them an image history's chain stopped at its first block, which
      * overstated the gain and logged a warning a persist */
-    uint64_t hashes[64];
-    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes, 64);
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_hashes = pulsar_session_span_image_hashes(s->sess, TokPos{0}, TokPos{E}, hashes,
+                                                          PULSAR_IMAGE_BLOCKS_MAX);
     const int D = text ? kv_cache_find(text, n_hashes > 0 ? hashes : NULL, n_hashes > 0 ? n_hashes : 0, &hit) : 0;
     free(text);
     const uint32_t gain = E > D ? (uint32_t)(E - D) : 0u;
@@ -1097,9 +1098,8 @@ int server::kv_cache_find(const char *prompt_text, const uint64_t *image_hashes,
 
 int server::kv_cache_find_req(const request *req, kv_chain_hit *hit) {
     /* L281: the chain loads past an image block only when this request brings the same image there */
-    enum { HASHES_MAX = 64 };
-    uint64_t hashes[HASHES_MAX];
-    const int n_images = req->n_images < HASHES_MAX ? req->n_images : HASHES_MAX;
+    uint64_t hashes[PULSAR_IMAGE_BLOCKS_MAX];
+    const int n_images = req->n_images < PULSAR_IMAGE_BLOCKS_MAX ? req->n_images : PULSAR_IMAGE_BLOCKS_MAX;
     for (int i = 0; i < n_images; i++) hashes[i] = pulsar_image_hash(&req->images[i]);
     const int G = kv_cache_find(req->prompt_text, hashes, n_images, hit);
     /* L353 no. 15: a chain ending at the prompt's end can't be resumed (a load leaves no record there, and a resume stops short
