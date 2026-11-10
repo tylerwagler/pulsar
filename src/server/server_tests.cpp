@@ -9426,6 +9426,22 @@ static void test_l372_no_fuse_prefill_is_the_classic_steps(void) {
     TEST_ASSERT(!slot_fusable_prefill(&sl) && slot_steppable_beside_fused(&sl));
 }
 
+/* L372 (O19): a re-send waits for a busy bank whose client is gone in every phase whose abandon keeps the bank's
+ * history -- since L353 no. 9 a prefill's does -- and in no other (the scan around it reads the session: live legs). */
+static void test_l372_gone_client_wait_covers_prefill(void) {
+    gen_state g;
+    memset(&g, 0, sizeof g);
+    static const struct { gen_phase phase; bool wait; } cases[] = {
+        {GEN_RESTORE, false},    {GEN_PREFILL_COLD, true}, {GEN_PREFILL_MAIN, true}, {GEN_DECODE_INIT, true},
+        {GEN_DECODE, true},      {GEN_FINISH, false},      {GEN_DONE, false},
+    };
+    for (const auto &c : cases) {
+        g.phase = c.phase;
+        TEST_ASSERT(gen_gone_wait_phase(&g) == c.wait);
+    }
+    TEST_ASSERT(!gen_gone_wait_phase(NULL));
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15200,6 +15216,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_predecode_failure_ends_the_job();
     test_l372_failed_readmission_marks_the_bank_spilled();
     test_l372_no_fuse_prefill_is_the_classic_steps();
+    test_l372_gone_client_wait_covers_prefill();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

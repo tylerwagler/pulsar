@@ -673,6 +673,17 @@ bool server_route_in_place(int common, int score, int frontier, int prefilled, i
     return common >= prefilled || (anchor >= 0 && common > anchor) || frontier - score < protect_floor;
 }
 
+/* L261 / L372: the phases in which a job whose client is gone ends by an abandon that keeps its bank's history, so a
+ * re-send is worth waiting for it (choose_slot_for_job): a prefill (gen_prefill_abandon, L353 no. 9), a decode init or
+ * a decode (the lanes' abandon).  Not a restore -- its bank holds no history until the chain is in, and a cancelled
+ * one invalidates what it wrote -- and not a finish, which ends in its own step. */
+/// @param g the busy slot's generation (NULL: false)
+/// @return true when a gone client's job in this phase is waited for
+static bool gen_gone_wait_phase(const gen_state *g) {
+    return g && (g->phase == GEN_PREFILL_COLD || g->phase == GEN_PREFILL_MAIN || g->phase == GEN_DECODE_INIT ||
+                 g->phase == GEN_DECODE);
+}
+
 /* Route the job to a slot. Preferences, in order:
  *   1. A live-tool-state continuation binds to the slot that owns its call
  *      ids (waiting for it if busy — running it elsewhere could only 409).
@@ -771,19 +782,22 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
      * stream drop, so the conversation's bank is still BUSY with a request
      * nobody will read -- and routing past it took the disk and a fresh bank
      * (25,306 tokens re-prefilled, pair, 2026-10-01).  When the deepest match
-     * for this job is a busy slot whose client is gone and whose prompt is
-     * fully prefilled (decode init / decode), wait for it: the lanes'
-     * per-quantum liveness poll abandons it within a quantum and the abandon
-     * keeps the bank's history, and *waiting_owner keeps the caller from
-     * evicting or provisioning meanwhile.  Not mid-prefill: that abandon
-     * invalidates the bank (gen_prefill_fail), so waiting would only delay. */
+     * for this job is a busy slot whose client is gone, wait for it: a decoder
+     * is abandoned by the lanes' per-quantum liveness poll within a quantum, a
+     * prefill at its next chunk boundary (the cancel hook; a fused rider at its
+     * next round), either abandon keeps the bank's history, and *waiting_owner
+     * keeps the caller from evicting or provisioning meanwhile.  L372: mid-
+     * prefill too -- gen_prefill_abandon keeps the bank since L353 no. 9 (it
+     * invalidated it before, so this wait skipped a prefilling slot), and the
+     * re-send after a mid-prefill Stop was still routed past the prefix it
+     * extends (gen_gone_wait_phase). */
     {
         session_slot *gone = NULL;
         int gone_common = -1;
         for (int i = 0; i < s->n_slots; i++) {
             session_slot *sl = &s->slots[i];
             if (!sl->active_job || !sl->provisioned || sl->ctx_size < needed) continue;
-            if (!sl->gen || (sl->gen->phase != GEN_DECODE_INIT && sl->gen->phase != GEN_DECODE)) continue;
+            if (!gen_gone_wait_phase(sl->gen)) continue;
             /* L353: a parked decoder steps nothing, so it never abandons: waiting on it would wait for ever (and a
              * head refused for KV holds its readmission back).  It ends once it is back. */
             if (sl->preempted) continue;
