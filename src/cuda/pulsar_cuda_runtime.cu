@@ -177,8 +177,10 @@ static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 
 
-/// Bytes of each staging buffer as allocated (0: no pool).
+/// Bytes of each staging buffer from its aligned pointer (g_model_stage) to the end of its allocation (0: no pool).
 static uint64_t g_model_stage_bytes;
+/// The alignment the pool's pointers were aligned to: a pool built for a smaller one is rebuilt.
+static uint64_t g_model_stage_align;
 
 
 
@@ -788,10 +790,14 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
 
 
 /** Ensures the four pinned staging buffers (and the upload stream) hold at least `bytes` each, reallocating them.
- *  @param bytes bytes a buffer
+ *  `bytes` are counted from the ALIGNED pointer (g_model_stage): the raw allocation is longer by the most the
+ *  alignment can shift it (L375, O21 -- it was `bytes` raw, so a full aligned read from a shifted pointer ran past
+ *  the pinned allocation by the shift).
+ *  @param bytes bytes a buffer, usable from its aligned pointer
  *  @return 1 ready, 0 an allocation failed (named on stderr) */
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+    const uint64_t align = model_fd_max_align();
+    if (g_model_stage_bytes >= bytes && g_model_stage_align == align) return 1;
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -812,14 +818,15 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             return 0;
         }
     }
+    const uint64_t shift_max = align > 1 ? align - 1 : 0;   /* cuda_align_ptr moves the pointer up by at most this */
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
+        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)(bytes + shift_max));
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
             return 0;
         }
-        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], model_fd_max_align());
+        g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], align);
         err = cudaEventCreateWithFlags(&g_model_stage_event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, "pulsar: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
@@ -828,6 +835,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = bytes;
+    g_model_stage_align = align;
     return 1;
 }
 
@@ -856,10 +864,11 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 
 /** Reads a file range into a staging buffer: the O_DIRECT twin when it can (aligned read, the payload offset into
- *  the buffer), else the buffered fd; a direct fd the filesystem rejects is dropped for this shard.
+ *  the buffer), else the buffered fd; a direct fd the filesystem rejects is dropped for this shard, with one line
+ *  naming the file and the errno (the shard's reads are buffered from then on).
  *  @param e           the container's fd entry
  *  @param stage       the staging buffer (aligned for O_DIRECT)
- *  @param stage_bytes its size
+ *  @param stage_bytes its size, from `stage` to the end of its pinned allocation
  *  @param offset      file byte offset
  *  @param bytes       bytes wanted
  *  @param payload     out: where the wanted bytes start in stage
@@ -885,6 +894,15 @@ static int cuda_model_stage_read(const model_fd_entry *e, void *stage,
             }
             const int direct_errno = errno;
             if (direct_errno == EINVAL || direct_errno == EFAULT || direct_errno == ENOTSUP || direct_errno == EOPNOTSUPP) {
+                /* a path switch for the rest of this shard's reads: said once, where it happens (L375, O21) */
+                char link[64], name[512];
+                snprintf(link, sizeof(link), "/proc/self/fd/%d", e->fd);
+                const ssize_t nl = readlink(link, name, sizeof(name) - 1);
+                name[nl > 0 ? nl : 0] = '\0';
+                fprintf(stderr, "pulsar: model upload: the O_DIRECT read of %s (%llu bytes at %llu, alignment %llu) failed: "
+                                "%s -- no direct I/O for this file from here on, its reads are buffered\n",
+                        nl > 0 ? name : "a model file", (unsigned long long)read_size, (unsigned long long)aligned_off,
+                        (unsigned long long)e->direct_align, strerror(direct_errno));
                 (void)close(e->direct_fd);
                 /* The entry is keyed by map and the table is not const here:
                  * drop the direct fd for THIS shard only. */
