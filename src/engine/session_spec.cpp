@@ -26,6 +26,26 @@ float pulsar_spec_tau(const pulsar_engine *e) {
     return e->drafter_ops ? e->drafter_ops->tau : 0.0f;
 }
 
+bool pulsar_spec_env_number(const char *name, const char *word, bool integer, bool *set, double *value) {
+    const char *v = getenv(name);
+    *set = false;
+    *value = 0.0;
+    if (!v || !v[0]) return true;
+    *set = true;
+    if (word && !strcmp(v, word)) return true;   /* *set with a zero value */
+    char *end = NULL;
+    const double t = strtod(v, &end);
+    if (end != v && *end == '\0' && isfinite(t) && (!integer || (t == floor(t) && fabs(t) <= (double)INT_MAX))) {
+        *value = t;
+        return true;
+    }
+    /* an unparsable value used to read as 0 -- the drafter's own number, silently (rule 9) */
+    fprintf(stderr, "pulsar: %s=\"%s\" is not %s%s%s%s -- refusing (it would have run the drafter's default "
+                    "unannounced)\n", name, v, integer ? "an integer" : "a number", word ? " nor \"" : "",
+            word ? word : "", word ? "\"" : "");
+    return false;
+}
+
 /* A shadow's depth: the controller's when it has moved it, else the start. */
 /// @param s the session
 /// @param sp a speculative shadow

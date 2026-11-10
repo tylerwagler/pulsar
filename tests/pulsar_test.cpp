@@ -3789,6 +3789,35 @@ static void test_driver_context_bound(void) {
     free(e);
 }
 
+/* L375: the draft schedule's environment overrides are parsed by one helper (the engine's open calls it for both and
+ * refuses the load on false), and a value that is not a number is refused by name -- PULSAR_SPEC_DEPTH went through
+ * atoi, where "3x" read as 3 and "deep" as 0 (the drafter's own), silently. */
+static void test_spec_env(void) {
+    char *saved = test_save_env("PULSAR_SPEC_DEPTH");
+    bool set = true;
+    double v = 7.0;
+    unsetenv("PULSAR_SPEC_DEPTH");
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && !set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && !set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "5", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v) && set && v == 5.0);
+    for (const char *bad : {"deep", "3x", "2.5", "off", " ", "1e30", "nan", "inf"}) {
+        setenv("PULSAR_SPEC_DEPTH", bad, 1);
+        TEST_ASSERT(!pulsar_spec_env_number("PULSAR_SPEC_DEPTH", NULL, true, &set, &v));
+    }
+    /* the tau's form: a number or the word */
+    setenv("PULSAR_SPEC_DEPTH", "off", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v) && set && v == 0.0);
+    setenv("PULSAR_SPEC_DEPTH", "0.25", 1);
+    TEST_ASSERT(pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v) && set && v == 0.25);
+    for (const char *bad : {"on", "0.25x", "nan", "inf", "offf"}) {
+        setenv("PULSAR_SPEC_DEPTH", bad, 1);
+        TEST_ASSERT(!pulsar_spec_env_number("PULSAR_SPEC_DEPTH", "off", false, &set, &v));
+    }
+    test_restore_env("PULSAR_SPEC_DEPTH", saved);
+}
+
 /* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
  * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
  * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
@@ -5723,6 +5752,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
+    {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
