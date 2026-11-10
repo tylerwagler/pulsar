@@ -1448,9 +1448,10 @@ static float *af16_partials(uint32_t n_dec, uint32_t n_head, uint32_t n_split) {
     static thread_local uint64_t cap = 0;
     const uint64_t need = (uint64_t)n_dec * n_head * n_split * AF16_PART_STRIDE * sizeof(float);
     if (need > cap) {
-        /* L335: refused inside a capture; a regrow drops the graphs that baked the old buffer */
-        if (cuda_grow_refused_under_capture("attn f16 split-K partials")) return NULL;
-        if (buf) { pulsar_gpu_seg_note_device_free("attn f16 split-K partials"); (void)cudaFree(buf); buf = NULL; cap = 0; }
+        /* the one rule for a grow (pulsar_gpu_seg_grow): an open capture is broken off, the graphs that baked the old
+         * buffer die */
+        if (!pulsar_gpu_seg_grow("attn f16 split-K partials", buf != NULL)) return NULL;
+        if (buf) { (void)cudaFree(buf); buf = NULL; cap = 0; }
         void *p = NULL;
         const cudaError_t e = cudaMalloc(&p, (size_t)need);
         if (e != cudaSuccess) {

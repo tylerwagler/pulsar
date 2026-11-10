@@ -1691,7 +1691,11 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
 }
 
 /* Grow-only device buffer for the cache. cudaFree implicitly synchronizes, so
- * a growth cannot pull the old pointer out from under an in-flight kernel. */
+ * a growth cannot pull the old pointer out from under an in-flight kernel.  The
+ * grow follows the one rule (pulsar_gpu_seg_grow, O54): a capture open on this
+ * thread is broken off first -- six LRU slots mean a stretch can meet a slot
+ * that is new or too small under its capture -- and the graphs that baked the
+ * old buffer are dropped. */
 /** @param buf  in / out: the device buffer (replaced when grown)
  *  @param cap  in / out: its capacity in bytes
  *  @param need bytes required
@@ -1700,8 +1704,8 @@ void pulsar_gpu_act_note_f32_skipped_for(const pulsar_gpu_tensor *x, uint64_t n_
 static int mxfp8_act_cache_reserve(void **buf, size_t *cap, size_t need, const char *what) {
     if (*cap >= need) return 1;
     void *p = NULL;
-    if (*buf) { pulsar_gpu_seg_note_device_free(what ? what : "an MXFP8 activation cache");  ///< stale baked pointers
-                (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
+    if (!pulsar_gpu_seg_grow(what ? what : "an MXFP8 activation cache", *buf != NULL)) return 0;   /* said */
+    if (*buf) { (void)cudaFree(*buf); *buf = NULL; *cap = 0; }
     if (cudaMalloc(&p, need) != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr, "pulsar: MXFP8 activation cache alloc failed for %s (%.2f MiB)\n",

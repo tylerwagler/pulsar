@@ -35,7 +35,7 @@
 #include <cstdio>
 #include "cuda/pulsar_cuda_lt_fixed.h"
 #include "cuda/pulsar_cuda_arch.cuh"   /* pulsar_cuda_smem_opt_in */
-#include "pulsar_gpu.h"   /* pulsar_gpu_seg_note_device_free */
+#include "pulsar_gpu.h"   /* pulsar_gpu_seg_grow */
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -160,9 +160,9 @@ dense_epilogue_kernel(float *__restrict__ y, const float *__restrict__ tail, con
  * PER (DEVICE, STREAM).  Per device since L335 (it was one process-wide buffer -- a TP rank on device 1 was handed
  * device 0's memory); per stream since L375 (O60): launches on two streams of one device run concurrently -- a
  * riding shared expert's on its lane's stream (exl3_moe_shared_fork) beside the block's on the caller's -- and one
- * buffer would have the second launch's decode overwrite the W_q the first one's GEMM is still reading.  A regrow
- * invalidates the captured graphs (pulsar_gpu_seg_note_device_free: a graph that baked the old pointer would replay
- * into freed memory) and refuses inside a capture (a free / malloc cannot be recorded). */
+ * buffer would have the second launch's decode overwrite the W_q the first one's GEMM is still reading.  A grow
+ * follows the one rule (pulsar_gpu_seg_grow): an open capture is broken off first (a free / malloc cannot be
+ * recorded), and a regrow drops the captured graphs (one that baked the old pointer would replay into freed memory). */
 /// Streams of one device that may hold a scratch (the caller's and its lanes'; past it a launch refuses).
 constexpr int kScratchStreams = 8;
 /// One (device, stream)'s scratch.
@@ -216,16 +216,12 @@ int qwen_exl3_dense_prefill_launch(const void *w, int k2, const void *x_bf16, fl
         return -1;
     }
     if (need > sc->bytes) {
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(stream, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) {
-            (void)cudaGetLastError();
-            fprintf(stderr, "%s: the scratch must grow to %zu bytes inside a graph capture -- refusing\n", tag, need);
+        if (!pulsar_gpu_seg_grow("the qwen exl3 dense prefill scratch", sc->base != nullptr)) {
+            fprintf(stderr, "%s: the scratch must grow to %zu bytes and the open capture could not be broken off -- "
+                            "refusing\n", tag, need);
             return -1;
         }
-        if (sc->base) {
-            pulsar_gpu_seg_note_device_free("the qwen exl3 dense prefill scratch");   /* graphs that baked the old scratch die with it */
-            (void)cudaFree(sc->base);
-        }
+        if (sc->base) (void)cudaFree(sc->base);
         sc->base = nullptr;
         sc->bytes = 0;
         if (cudaMalloc(&sc->base, need) != cudaSuccess) {

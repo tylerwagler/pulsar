@@ -98,8 +98,9 @@ static const void *const *expert_table_get(const void *base, uint32_t n_total, u
     for (struct expert_table *t = g_expert_tables; t; t = t->next)
         if (t->base == base && t->stride0 == stride0 && t->off1 == off1 && t->stride1 == stride1 &&
             t->n_total == n_total && t->planes == planes) return t->entries;
-    /* a new table allocates: never inside a capture (L335) */
-    if (cuda_grow_refused_under_capture("an expert address table")) return NULL;
+    /* a new table allocates, and its fill is a launch the stretch must not record: the one rule for a grow
+     * (pulsar_gpu_seg_grow) breaks an open capture off first */
+    if (!pulsar_gpu_seg_grow("an expert address table", 0)) return NULL;
     const void **entries = NULL;
     const size_t bytes = (size_t)n_total * planes * sizeof(*entries);
     if (!cuda_ok(cudaMalloc((void **)&entries, bytes), "expert table alloc")) return NULL;

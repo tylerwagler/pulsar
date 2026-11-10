@@ -481,13 +481,20 @@ int pulsar_gpu_seg_enter(uint64_t key);
  *  @param body_ok nonzero when the body enqueued its work without refusing
  *  @return 1 when the captured work ran, 0 when nothing ran (the step refuses) */
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok);
-/** @brief Drop every cached segment graph (they bake device pointers); deferred to seg_exit mid-capture. */
+/** @brief Drop every cached segment graph (they bake device pointers); deferred to the capture's close mid-capture. */
 void pulsar_gpu_seg_reset(void);   /* REQUIRED on gpu-graph teardown: cached
                                     * execs bake that graph's device pointers */
-/** @brief Note a scratch free: every cached graph is dropped (deferred to seg_exit mid-capture); catalog keys
- *  recapture on use.  `what` names the buffer regrown (in the first post-warmup regrow's line). */
-void pulsar_gpu_seg_note_device_free(const char *what); /* REQUIRED at every grow-realloc
-                                    * scratch free: baked pointers go stale */
+/** @brief The one rule for a device buffer kept across calls that must grow or be created (O54, L375): call this
+ *  BEFORE the cudaFree / cudaMalloc.  If a segment capture is open it is broken off here -- its nodes so far run
+ *  once from their own graph, the stream is eager for the rest of the stretch, the key warms up again and captures
+ *  at the new capacity (cudaMalloc / cudaFree are refused on a capturing thread and invalidate its capture).  With
+ *  `frees_old`, every cached graph is dropped (they bake the old pointer; when the open capture is another
+ *  thread's, at that capture's close); catalog keys recapture on use.
+ *  @param what      names the buffer (in the break's and the first post-warmup regrow's lines)
+ *  @param frees_old nonzero when the grow frees a block a captured graph may have baked
+ *  @return 1 go ahead; 0 the open capture could not be broken off (said): refuse the call, nothing ran */
+int pulsar_gpu_seg_grow(const char *what, int frees_old);   /* REQUIRED at every grow-realloc and first allocation
+                                                              * of a kept device buffer a graphed stretch can reach */
 /** Process-lifetime segment counters: graphs replayed and captures begun (L292: a gate proves it ran the replay
  *  lane, or the eager one, by their movement across its steps). */
 /** @param replays  receives graphs replayed
@@ -506,6 +513,7 @@ typedef struct pulsar_gpu_seg_stats {
     uint64_t regrows;         ///< scratch regrows outside the warmup that dropped every graph
     uint64_t dead;            ///< keys whose capture or replay failed (each refuses from then on)
     uint64_t refusals;        ///< uses refused
+    uint64_t capture_breaks;  ///< captures broken off at a grow (pulsar_gpu_seg_grow): the stretch ran, eager from there
 } pulsar_gpu_seg_stats;
 /** @brief Snapshot every segment counter.
  *  @param out receives them */
