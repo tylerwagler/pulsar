@@ -505,6 +505,32 @@ struct pulsar_segstore {
         unlink_index(k);
         return true;
     }
+    /** The most bytes evict_one(keep, keep2) could ever release, run until it refuses: every restore point but the
+     *  spared keys' (a pinned anchor's too -- it loses its pin last), and the rows of every segment that is neither a
+     *  spared key nor an ancestor of one (a segment with a stored child never goes).  Spared: `keep`, `keep2`, a parent
+     *  of a write in flight and a key being written, as in evict_one.
+     *  @param keep  a key to spare (NULL = none)
+     *  @param keep2 a second key to spare (NULL = none)
+     *  @return the bytes */
+    uint64_t evictable_bytes(const char *keep, const char *keep2) const {
+        std::unordered_set<std::string> held;   /* the spared keys and their stored ancestors: their rows stay */
+        const auto hold_chain = [&](const std::string &k) {
+            for (auto it = segs.find(k); it != segs.end() && held.insert(it->first).second;
+                 it = segs.find(it->second.parent)) {}
+        };
+        for (auto &kv : pinned) hold_chain(kv.first);
+        for (auto &k : pending) hold_chain(k);
+        if (keep) hold_chain(keep);
+        if (keep2) hold_chain(keep2);
+        uint64_t n = 0;
+        for (auto &kv : segs) {
+            const bool spared = (keep && kv.first == keep) || (keep2 && kv.first == keep2) || pinned.count(kv.first) ||
+                                pending.count(kv.first);
+            if (!spared) n += kv.second.rp_bytes;
+            if (!held.count(kv.first)) n += kv.second.file_bytes;
+        }
+        return n;
+    }
     /** L347 I3b: set a stored restore point's flags, in its index entry, its file's header (in place) and its RAM copy.
      *  @param e     the entry (rp_bytes > 0)
      *  @param flags the PULSAR_SEGSTORE_RP_* flags it carries from now
@@ -884,11 +910,23 @@ static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, cons
     if (st->budget && st->used + st->reserved - freed + need > st->budget) return false;
     /* L353: the budget counts this store's own files; the disk also holds other stores' and anyone's.  A full disk
      * evicts like a full budget -- without this, every later persist copied out, failed and wrote nothing.  The writes
-     * in flight count in full: the disk may already hold some of them, so this can evict a little early, never late. */
+     * in flight count in full: the disk may already hold some of them, so this can evict a little early, never late.
+     * L375 (O18): only while eviction can close the gap.  A disk short of more bytes than this store could release
+     * (someone else's files fill it) fails the write and keeps every chain -- the loop used to take every leaf, restore
+     * point and pinned anchor first and fail anyway -- and an eviction that does not raise the free space (a file
+     * still held open, a filesystem that frees later) is the last one tried. */
     bool said = false;
     for (;;) {
         const uint64_t avail = disk_free_bytes(st);
         if (avail == UINT64_MAX || st->reserved + need <= avail) return true;
+        const uint64_t short_by = st->reserved + need - avail, can = st->evictable_bytes(keep, keep2);
+        if (can < short_by) {
+            st->logf("the disk has %llu MiB free for a %llu MiB write (%llu MiB in flight): %llu bytes short, and this "
+                     "store could release %llu -- the write fails, nothing more is evicted",
+                     (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20),
+                     (unsigned long long)(st->reserved >> 20), (unsigned long long)short_by, (unsigned long long)can);
+            return false;
+        }
         if (!said) {
             st->logf("the disk has %llu MiB free for a %llu MiB write (%llu MiB in flight): evicting",
                      (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20),
@@ -896,6 +934,13 @@ static bool budget_room(pulsar_segstore *st, uint64_t need, uint64_t freed, cons
             said = true;
         }
         if (!st->evict_one(keep, keep2)) return false;
+        const uint64_t after = disk_free_bytes(st);
+        if (after != UINT64_MAX && after <= avail) {
+            st->logf("an eviction left the disk's free space at %llu bytes (%llu before): eviction is not what frees "
+                     "this disk -- the write fails, nothing more is evicted",
+                     (unsigned long long)after, (unsigned long long)avail);
+            return false;
+        }
     }
 }
 

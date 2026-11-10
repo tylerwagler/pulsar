@@ -9390,12 +9390,21 @@ static void test_l353_disk_full_evicts(void) {
     char d[41];
     TEST_ASSERT(test_seg_put(st, "", 0, 128, "after the foreign file", 1000, 4, d));
     TEST_ASSERT(!pulsar_segstore_contains(st, a) && pulsar_segstore_contains(st, d));
-    /* a disk nothing of ours can clear: refused, and what stays stays */
+    /* L375 (O18): foreign bytes fill the disk and the write is short of more than the store could release (c alone:
+     * b went with a above, d is the chain being extended): the persist fails and every stored segment is still there
+     * -- the loop used to take every leaf first and fail anyway */
     disk[1] = disk[0];
     char e[41];
     const int before = pulsar_segstore_count(st);
-    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 1000, 5, e));
-    TEST_ASSERT(before >= 1 && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    const uint64_t held_before = pulsar_segstore_used_bytes(st);
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left, and too big for our own bytes", held_before, 5, e));
+    TEST_ASSERT(before == 2 && pulsar_segstore_count(st) == before && pulsar_segstore_used_bytes(st) == held_before);
+    TEST_ASSERT(pulsar_segstore_contains(st, c) && pulsar_segstore_contains(st, d) && !pulsar_segstore_contains(st, e));
+    /* a shortfall our own bytes could cover, on a disk an eviction does not free (still full of foreign bytes): the
+     * first eviction that leaves the free space where it was is the last -- refused, one leaf gone, never the store */
+    TEST_ASSERT(!test_seg_put(st, d, 128, 256, "no disk left", 500, 5, e));
+    TEST_ASSERT(pulsar_segstore_count(st) == before - 1 && pulsar_segstore_contains(st, d) &&
+                !pulsar_segstore_contains(st, e));
     pulsar_segstore_set_disk_free(st, NULL, NULL);
     /* a failed write counts */
     TEST_ASSERT(pulsar_segstore_writes_failed(st) == 0);
