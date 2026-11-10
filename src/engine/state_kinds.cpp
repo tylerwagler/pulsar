@@ -700,6 +700,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
         /* .trailing_pools     = */ decl_trailing_pools,
         /* .noted_at           = */ decl_noted_at,
         /* .bank_pools         = */ decl_bank_pools,
+        /* .history_replaced   = */ NULL,   /* a drafter's state is the plan's slots: every walk carries it */
     };
     /* the grid checkpoints, ckpt_slots x the walk's bytes a bank -- priced with the rest under the dry run */
     if (ok) ok = pulsar_ckpt_alloc(&ss->ckpt, &ss->ops, ss, n_banks);

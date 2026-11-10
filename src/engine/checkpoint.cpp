@@ -591,6 +591,7 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, uint32
      * below T, the source's state at T -- the same three moves as a restore on the source itself */
     *moved = true;   /* L375 O43: from here dst is no longer what its view describes */
     pulsar_ckpt_drop_bank(st, dst);
+    if (st->ops->history_replaced) st->ops->history_replaced(st->state);   /* L375 O42: before the walk below */
     bool ok = r ? st->ops->install_frontier(st->state, T, T) : st->ops->prepare_restore(st->state, T);
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;

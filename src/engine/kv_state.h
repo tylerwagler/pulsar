@@ -129,6 +129,13 @@ typedef struct pulsar_kv_state_ops {
     /** L313: every append-only row pool of ANY bank -- pools() then trailing_pools(), the same order -- each
      *  bank's own tensor (a NULL `rows` while the bank's physical is freed).  What a cross-bank restore copies. */
     uint32_t (*bank_pools)(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap);
+    /** Optional (L375 O42).  The installed bank's history is being replaced by another bank's (pulsar_ckpt_adopt):
+     *  drop what described the OLD history and that no checkpoint walk carries, so nothing of it is read as the new
+     *  one's.  DeepSeek: the DSpark drafter's committed-row window and its prompt capture -- a grid checkpoint does
+     *  not carry them, and the capture's contiguity guard would join the old conversation's rows to a prefill that
+     *  starts where its capture ended.  NULL = the walk carries every such piece (the declared families: a
+     *  drafter's rings and rows are slots of the plan). */
+    void (*history_replaced)(void *state);
 } pulsar_kv_state_ops;
 
 /** The kinds of record (pulsar_ckpt_store::rec). */
