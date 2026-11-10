@@ -949,7 +949,10 @@ void pulsar_vocab::tokenize_rendered_chat_vocab(const char *text,
  * those ranges for every byte it copied from client data, so a client typing
  * `<|Assistant|>` or `｜DSML｜` into a message gets ordinary text tokens instead of
  * a control token.  Ranges are ascending and disjoint; a range is clamped to the
- * string's end. */
+ * string's end.  L375 O52: a match that STARTS in the renderer's text must also end
+ * before the next range begins -- client bytes that complete a control token the
+ * template's last bytes opened (`<thi` + a message starting `nk>`) are as much
+ * client text as a whole spelling is, and stay plain. */
 void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
                                                       const pulsar_text_span *spans,
                                                       uint32_t n_spans,
@@ -975,7 +978,8 @@ void pulsar_vocab::tokenize_rendered_chat_spans_vocab(const char *text,
         }
         int token = -1;
         size_t len = 0;
-        if (vocab->special_token_at(p, &token, &len)) {
+        /* spans[si], when there is one, is the next client range: off < its lo here */
+        if (vocab->special_token_at(p, &token, &len) && !(si < n_spans && off + len > spans[si].lo)) {
             vocab->tokenize_span(span, (size_t)(p - span), out);
             token_vec_push(out, token);
             p += len;
