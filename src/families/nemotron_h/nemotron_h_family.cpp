@@ -14,7 +14,7 @@ const char *const ARCH = PULSAR_NEMOTRON_H_ARCH;
 
 /** pulsar_family::unload: free the tokenizer, the block drafter's record (a plain record that owns nothing,
  *  pulsar_block_drafter: free() is its teardown) and the family state, and clear the engine's block-drafter pointer
- *  (safe after a partial load).
+ *  and its drafter ops (L375 O50: the block drafter's ops live in the record just freed) (safe after a partial load).
  *  @param e  the engine; its family_state is freed and set to NULL */
 void unload(pulsar_engine *e) {
     pulsar_nemotron_h_model *w = (pulsar_nemotron_h_model *)e->family_state;
@@ -24,6 +24,7 @@ void unload(pulsar_engine *e) {
         pulsar_nemotron_h_vision_run_free(&w->vision);
     }
     e->block_drafter = NULL;
+    e->drafter_ops = NULL;
     delete w;   /* the state holds the tower's host tables (std::vector): new / delete */
     e->family_state = NULL;
 }

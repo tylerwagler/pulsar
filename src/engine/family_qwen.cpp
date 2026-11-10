@@ -1721,6 +1721,7 @@ static void qwen_unload(pulsar_engine *e) {
         e->qwen_weights->block = NULL;
     }
     e->block_drafter = NULL;
+    e->drafter_ops = NULL;   /* L375 O50: a block drafter's ops live in the record just freed */
 }
 /// Qwen's session forward: the core driver's.
 static const pulsar_family_session_ops k_qwen_session_ops = PULSAR_DRIVER_SESSION_OPS(&k_qwen_sync);
