@@ -1513,16 +1513,14 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
             } else if (pulsar_token_is_stop(s->engine, first)) {
                 st->status = PULSAR_SPEC_STEP_EOS;
             } else if (pulsar_session_spec_round_begin_local(s, st->round, first, st->max_tokens,
-                                                             st->accepted_cap, st->temperature,
-                                                             st->top_k, st->top_p, st->min_p,
+                                                             /* the round's rows are at most the cap_rows the budget
+                                                              * was checked against: begin cuts K to this cap - 1,
+                                                              * whatever accepted_cap the step carries */
+                                                             st->accepted_cap < (int)cap_rows ? st->accepted_cap
+                                                                                              : (int)cap_rows,
+                                                             st->temperature, st->top_k, st->top_p, st->min_p,
                                                              st->err, sizeof st->err) != 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
-            } else if (rows + pulsar_spec_round_n_rows(st->round) > row_budget) {
-                /* Unreachable: begin only trims below cap_rows.  The backstop
-                 * runs BEFORE fill_reqs writes, so no change to begin's row
-                 * math can overflow reqs[]. */
-                pulsar_session_spec_round_abort_local(s, st->round);
-                st->status = PULSAR_SPEC_STEP_SKIPPED;
             } else {
                 /* The worker has no reqs: its rows ride the mixed-batch frame. */
                 st->n_rows = reqs ? pulsar_spec_round_fill_reqs(st->round, st->bank, reqs + rows)
