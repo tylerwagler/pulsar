@@ -35,7 +35,8 @@
  *     f32 into one bf16 rounding; HF multiplies each bf16 expert output by its f32 weight and index-adds in bf16.
  *
  * ROW KINDS (L284 #2): every arm-sensitive launch (the linears, the router's logits (L336), the routed experts) runs
- * rows [0, n_dec) on the decode arms and [n_dec, n_rows) on the prompt arms; the router's select, the row ops and F1
+ * rows [0, n_dec) on the decode arms and [n_dec, n_rows) on the prompt arms -- F1 too (L370: the wide heads' decode
+ * rows are not the MMA tile's bytes, so each segment is its own attention call); the router's select and the row ops
  * are one arithmetic at any row count.
  *
  * STATE (state_kinds.h; gemma4.h PULSAR_GEMMA4_STATE_*): a window layer's K|V ring (RING of W - 1 + verify rows
@@ -433,11 +434,12 @@ struct g4_state : pulsar_driver_state {
     uint32_t *row_pos;
     /// Host [max_rows]: F1's sequences for the call being planned
     pulsar_gqa_seq *seqs;
-    /// Host [n_layer]: each layer's attention call's plan (every layer attends)
+    /// Host [n_layer][2]: each layer's attention calls' plans, one a row kind (L370: [0] the decode rows [0, n_dec),
+    /// [1] the prompt rows [n_dec, n_rows); n_rows 0 = the step has no such rows)
     pulsar_gqa_call *attn_call;
-    /// Host [n_layer]: each call's descriptors' byte offset in attn_desc(_host)
+    /// Host [n_layer][2]: each call's descriptors' byte offset in attn_desc(_host)
     uint64_t *attn_off;
-    /// Host [n_layer * attn_desc_max]: the descriptors, staged
+    /// Host [n_layer * 2 * attn_desc_max]: the descriptors, staged
     uint8_t *attn_desc_host;
     /// Device, attn_desc_host's layout
     pulsar_gpu_tensor *attn_desc;
@@ -542,10 +544,10 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     st->trunk->w = W(e);
     st->trunk->st = st;
     st->attn_desc_max = a256(pulsar_gqa_desc_bytes((uint32_t)R));
-    st->attn_call = (pulsar_gqa_call *)xcalloc(NL, sizeof(pulsar_gqa_call));
-    st->attn_off = (uint64_t *)xcalloc(NL, sizeof(uint64_t));
-    st->attn_desc_host = (uint8_t *)xmalloc(NL * st->attn_desc_max);
-    st->attn_desc = pulsar_gpu_tensor_alloc(NL * st->attn_desc_max);
+    st->attn_call = (pulsar_gqa_call *)xcalloc(2u * NL, sizeof(pulsar_gqa_call));
+    st->attn_off = (uint64_t *)xcalloc(2u * NL, sizeof(uint64_t));
+    st->attn_desc_host = (uint8_t *)xmalloc(2u * NL * st->attn_desc_max);
+    st->attn_desc = pulsar_gpu_tensor_alloc(2u * NL * st->attn_desc_max);
     st->last_hidden = pulsar_gpu_tensor_alloc((uint64_t)sh.n_embd * 2u);
     const bool ok = st->h && st->xa && st->rope_tab && st->ones && st->escale && st->attn_desc && st->last_hidden &&
                     constants(e, st);
@@ -725,9 +727,9 @@ uint32_t attn_bound(const g4_step *st) {
 /** @param st      the step
  *  @param il      the layer
  *  @param bound   the attention bound in tokens
- *  @param off     the descriptors' byte offset in attn_desc_host
+ *  @param off     the layer's descriptors' byte offset in attn_desc_host (two calls' worth)
  *  @param stride  one call's descriptor bytes
- *  @return true = planned; false = a pool is evicted or the plan refused (said) */
+ *  @return true = both row kinds' calls planned; false = a pool is evicted or a plan refused (said) */
 bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uint64_t stride) {
     g4_state *q = st->st;
     const bool full = pulsar_gemma4_is_full(&st->w->shape, il);
@@ -753,10 +755,15 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
         }
         sq.cap = (uint32_t)(sq.bytes / tb);
     }
-    q->attn_off[il] = off;
-    return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq, q->row_pos, st->n_rows, bound, q->attn_desc_host + off,
-                           stride, &q->attn_call[il]) == 0 ||
-           failf("the attention's plan refused", il);
+    /* L370: one call a row kind -- a row's attention arm is its kind's, whatever rides in the step with it */
+    q->attn_call[2u * il] = q->attn_call[2u * il + 1u] = pulsar_gqa_call{};
+    return arm_segments(st, 0, st->n_rows, [&](bool prompt, uint32_t r0, uint32_t m) {
+        const uint32_t c = 2u * il + (prompt ? 1u : 0u);
+        q->attn_off[c] = off + (prompt ? stride : 0u);
+        return pulsar_gqa_plan(&G1, q->seqs, q->n_seq, q->row_seq + r0, q->row_pos + r0, m, bound,
+                               q->attn_desc_host + q->attn_off[c], stride, &q->attn_call[c]) == 0 ||
+               failf("the attention's plan refused", il);
+    });
 }
 
 /** pulsar_driver_ops::stage: the token ids checked, the step's tables and every layer's attention call staged and
@@ -774,8 +781,8 @@ bool stage(const pulsar_driver_step *st0, uint64_t *graph_key) {
     const uint32_t bound = attn_bound(st);
     const uint64_t stride = a256(pulsar_gqa_desc_bytes(st->n_rows));
     for (uint32_t il = 0; il < st->plan->n_layer; il++)
-        if (!plan_call(st, il, bound, (uint64_t)il * stride, stride)) return false;
-    if (pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)st->plan->n_layer * stride) == 0)
+        if (!plan_call(st, il, bound, (uint64_t)il * 2u * stride, stride)) return false;
+    if (pulsar_gpu_tensor_write_async(q->attn_desc, 0, q->attn_desc_host, (uint64_t)st->plan->n_layer * 2u * stride) == 0)
         return fail("could not upload the attention descriptors");
     /* L338 P2: the rows whose bank runs the runtime adapter (the LoRAs launch on them only) */
     q->step_adapter = false;
@@ -886,19 +893,27 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
     const pulsar_gqa_layer G1 = gqa_decl(s, full, (const uint16_t *)wp(st, L.attn_q_norm, "gemma4 q_norm"),
                                          (const uint16_t *)wp(st, L.attn_k_norm, "gemma4 k_norm"),
                                          (const float *)dptr(q->rope_tab));
-    if (q->attn_call[il].n_rows != n) return failf("an attention layer the step did not plan", il);
-    pulsar_gqa_io io{};
-    io.q = {qb, Q, hd};
-    io.k = {kb, KV, hd};
-    io.v = {vn, KV, hd};
-    io.out_bf16 = ab;
-    io.ld_out = Q;
-    io.workspace = base + M.gqa;
-    io.workspace_bytes = M.gqa_bytes;
-    io.decode_rows = st->n_dec == n ? 1 : 0;   /* L338: a step of decode rows only: the wide heads' flash-decoding */
-    io.decode_group = st->verify ? 4 : 1;      /* L338: a verify's rows (one sequence each run) load each key once a
-                                                * group of 4; a decode step's rows are sequences of their own */
-    if (pulsar_gqa_launch(&G1, &q->attn_call[il], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[il], &io, 0) != 0)
+    if (q->attn_call[2u * il].n_rows + q->attn_call[2u * il + 1u].n_rows != n)
+        return failf("an attention layer the step did not plan", il);
+    /* L370: the decode rows' call, then the prompt rows' (stage planned each).  Stream order makes the one workspace
+     * serve both; the calls' sequences are different banks' */
+    if (!arm_segments(st, 0, n, [&](bool prompt, uint32_t r0, uint32_t m) {
+            const uint32_t c = 2u * il + (prompt ? 1u : 0u);
+            if (q->attn_call[c].n_rows != m) return false;
+            pulsar_gqa_io io{};
+            io.q = {qb + (uint64_t)r0 * Q, Q, hd};
+            io.k = {kb + (uint64_t)r0 * KV, KV, hd};
+            io.v = {vn + (uint64_t)r0 * KV, KV, hd};
+            io.out_bf16 = ab + (uint64_t)r0 * Q;
+            io.ld_out = Q;
+            io.workspace = base + M.gqa;
+            io.workspace_bytes = M.gqa_bytes;
+            io.decode_rows = prompt ? 0 : 1;        /* L338: decode rows: the wide heads' flash-decoding */
+            io.decode_group = st->verify ? 4 : 1;   /* L338: a verify's rows (one sequence each run) load each key once
+                                                     * a group of 4; a decode step's rows are sequences of their own */
+            return pulsar_gqa_launch(&G1, &q->attn_call[c], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[c], &io,
+                                     0) == 0;
+        }))
         return failf("the attention refused", il);
     const pulsar_tensor *t[1] = {L.attn_o};
     const int outs[1] = {(int)E};
