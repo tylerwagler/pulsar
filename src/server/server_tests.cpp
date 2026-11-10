@@ -14742,6 +14742,26 @@ static void test_stall_watchdog_rules(void) {
         TEST_ASSERT(!server_stall_limit_parse(b, &lim, err, sizeof err));
         TEST_ASSERT(err[0] != '\0');
     }
+    /* L372 (O33): busy is a queued or running job, or a /v1/systemone request (the judge's own queue) */
+    {
+        server s;
+        memset(&s, 0, sizeof s);
+        TEST_ASSERT(!server_watchdog_busy(&s));
+        s.n_queued = 1;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        s.n_queued = 0;
+        s.n_generating = 1;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        s.n_generating = 0;
+        server_judge *J = new server_judge();
+        s.judge = J;
+        TEST_ASSERT(!server_watchdog_busy(&s));   /* a judge with nothing queued is idle */
+        judge_job jb;
+        J->head = J->tail = &jb;
+        TEST_ASSERT(server_watchdog_busy(&s));
+        J->head = J->tail = NULL;
+        server_judge_close(&s);
+    }
     /* a stall: busy and quiet for at least the limit */
     TEST_ASSERT(server_stall_seconds(200000, 80000, true, 120) == 120);
     TEST_ASSERT(server_stall_seconds(200000, 80001, true, 120) == 0);    /* 119.999 s: not yet */

@@ -5195,6 +5195,12 @@ bool server_stall_limit_parse(const char *v, int *limit_s, char *err, size_t err
 /// @param limit_s  the limit, seconds
 /// @return the stall, seconds (0 = none)
 int64_t server_stall_seconds(int64_t now_ms, int64_t beat_ms, bool busy, int limit_s);
+/** Whether the worker owes the watchdog a mark: jobs queued or running, or (L372) a /v1/systemone request -- the
+ *  judge's queue is its own, counted in neither, so a stall in judge work on an otherwise idle server was no stall.
+ *  The caller holds server::mu. */
+/// @param s the server
+/// @return true when there is work
+bool server_watchdog_busy(const server *s);
 /* Log priced-vs-actual for a freshly created session and return the bytes the
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller
