@@ -110,6 +110,17 @@ void agent_bash_jobs_free(agent_worker *w) {
 
 
 
+bool agent_bash_jobs_poll(agent_worker *w) {
+    bool running = false;
+    for (agent_bash_job *job = w->bash_jobs; job; job = job->next) {
+        job->poll();
+        running = running || job->running;
+    }
+    return running;
+}
+
+
+
 agent_bash_job *agent_bash_find_job(agent_worker *w, int id, pid_t pid) {
     for (agent_bash_job *job = w->bash_jobs; job; job = job->next) {
         if ((id > 0 && job->id == id) || (id <= 0 && pid > 0 && job->pid == pid))
@@ -189,9 +200,10 @@ void agent_bash_job::finalize(int status) {
 
 
 
-/* Drain available output, notice process exit, and enforce timeout.  This is
- * called opportunistically by status/wait/compaction instead of a background
- * reaper thread, keeping all bash job state owned by the agent worker. */
+/* Drain available output, notice process exit, and enforce timeout.  Called by
+ * status/wait/compaction and, for every job, once a tool round and once a second
+ * while the worker idles (agent_bash_jobs_poll) instead of a background reaper
+ * thread, keeping all bash job state owned by the agent worker. */
 void agent_bash_job::poll() {
     auto *job = this;
     if (!job || !job->running) return;
@@ -710,6 +722,19 @@ static void test_agent_bash_teardown(void) {
         AGENT_TEST_ASSERT(access(path, F_OK) != 0);
         agent_bash_remove_job(&w, job);
     }
+
+    /* agent_bash_jobs_poll, what the worker runs every tool round and idle second: with nobody observing them, a job
+     * that writes four pipes' worth runs to its end, and one past its timeout_sec is killed */
+    agent_bash_job *writer = agent_bash_start(&w, "head -c 262144 /dev/zero | tr '\\0' x; echo end", 600, err, sizeof err);
+    agent_bash_job *sleeper = agent_bash_start(&w, "sleep 300", 1, err, sizeof err);
+    AGENT_TEST_ASSERT(writer != NULL && sleeper != NULL);
+    if (writer && sleeper) {
+        for (int i = 0; i < 5000 && agent_bash_jobs_poll(&w); i++) usleep(2000);
+        AGENT_TEST_ASSERT(!writer->running && writer->exit_status == 0 && writer->bytes == 262144 + 4);
+        AGENT_TEST_ASSERT(!sleeper->running && sleeper->timed_out);
+        AGENT_TEST_ASSERT(!agent_bash_jobs_poll(&w));
+    }
+    agent_bash_jobs_free(&w);
 
     for (int i = 0; i < AGENT_BASH_JOBS_MAX; i++) AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) != NULL);
     AGENT_TEST_ASSERT(agent_bash_start(&w, "true", 600, err, sizeof err) == NULL && strstr(err, "already tracked") != NULL);

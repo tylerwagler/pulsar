@@ -148,6 +148,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
             return 1;
         }
+        agent_bash_jobs_poll(w);   /* L373: once a round, whether or not the model asks */
         agent_worker_maybe_append_system_prompt_reminder(w);
         if (!agent_turn_flush(w, think_mode)) {   /* L373: never sample after a turn that is not there */
             agent_set_error(w, "the tokenizer refused the turn (its reason is on stderr); nothing was appended");
@@ -581,9 +582,23 @@ void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
+        bool jobs_running = w->bash_jobs != NULL;   /* the list is this thread's: read without w->mu too */
         while (!w->stop && !w->cmd_text && !w->save_requested &&
                !w->compact_requested)
-            pthread_cond_wait(&w->cond, &w->mu);
+        {
+            if (!jobs_running) {
+                pthread_cond_wait(&w->cond, &w->mu);
+                continue;
+            }
+            /* L373: an idle worker with a bash job running wakes once a second to drain it and apply its timeout */
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            if (pthread_cond_timedwait(&w->cond, &w->mu, &until) != ETIMEDOUT) continue;
+            pthread_mutex_unlock(&w->mu);   /* a job that ends takes w->mu itself */
+            jobs_running = agent_bash_jobs_poll(w);
+            pthread_mutex_lock(&w->mu);
+        }
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;

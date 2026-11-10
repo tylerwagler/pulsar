@@ -1731,6 +1731,12 @@ void agent_bash_teardown_install(bool with_sigint);
 /** Free every bash job (agent_bash_teardown, then each job reaped and freed) and empty the list.
  *  @param w the worker */
 void agent_bash_jobs_free(agent_worker *w);
+/** L373: poll every job once (agent_bash_job::poll: drain its pipe, reap it, apply its timeout_sec), so a job the
+ *  model stopped asking about neither blocks on a full pipe nor outlives its timeout.  The worker thread calls it
+ *  at the top of every tool round and once a second while it idles with a job running.
+ *  @param w the worker
+ *  @return true while any job is still running */
+bool agent_bash_jobs_poll(agent_worker *w);
 /** Find a job by id, or by pid when id <= 0.
  *  @param w   the worker
  *  @param id  the job id; <= 0 = match by pid
