@@ -3932,7 +3932,9 @@ struct server {
     /// @param j  the job
     /// @return context in tokens, in [1, the startup ctx]
     int job_needed_ctx(const job *j) const;
-    /** The slot's committed KV position -- where a continuation would append. */
+    /** The slot's committed KV position -- where a continuation would append.  A decoder in the plain or mixed
+     *  batch (gen_state::batch_active) stands at its feed position: the engine's history of its bank is the one it
+     *  entered the batch with (or none, for the installed bank) until it leaves (L380). */
     /// @param sl  the slot (NULL or unprovisioned: 0)
     /// @return its bank's committed position
     TokPos slot_frontier_pos(const session_slot *sl) const;

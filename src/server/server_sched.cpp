@@ -250,6 +250,13 @@ bool server::bank_switch(int bank, spilled_history *was) {
 TokPos server::slot_frontier_pos(const session_slot *sl) const {
     const auto *s = this;
     if (!sl || !sl->provisioned) return TokPos{0};
+    /* L380: a decoder in the plain or mixed batch stands at its feed position.  Its tokens join its bank's history
+     * only as it leaves the batch (batch_leave, generate_job_step), and until then the engine's readers describe the
+     * bank as it ENTERED: the installed bank's history is invalid from the batch's first step (it reads no position,
+     * 0 here), another bank's is its carry saved at entry.  The feed position is the bank's KV frontier at every step
+     * boundary (lane_emit_and_draw moves it with each commit), so this is the one read for the lane prices' depth,
+     * /metrics and the live bindings' match. */
+    if (sl->gen && sl->gen->batch_active) return sl->gen->batch_feed_pos;
     if (!s->sess) return TokPos{0}; /* host-only server (unit tests): no session to read */
     if (s->pool_banks > 0) return server_bank_pos(s->sess, sl->bank);
     return pulsar_session_pos(s->sess);
@@ -1894,7 +1901,8 @@ void server::publish_metrics_snapshot() {
     pthread_mutex_lock(&s->mu);
     for (int i = 0; i < s->n_slots; i++) {
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
-         * live cursor (server_slot_frontier_pos). Pure host read, no CUDA. */
+         * live cursor, and a decoder in the plain batch reads its feed position
+         * (server::slot_frontier_pos). Pure host read, no CUDA. */
         s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
         /* Phase + prefill progress: pure host reads of the slot's gen_state,
@@ -2608,7 +2616,7 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
  *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.)
  *   - the measured prices' key -- the decoder count and the depth band -- is the decoders', whichever lane carries
- *     them (L380, lane_decoder_depth): a decoder in the plain batch stands at its feed position.  Read from its
+ *     them (L380, server::slot_frontier_pos): a decoder in the plain batch stands at its feed position.  Read from its
  *     bank, the installed bank's position is 0 from the batch's first step until the decoder leaves it (the step
  *     leaves the session's own history invalid), so a lone decoder's band fell to 0 on the plain lane and came back
  *     on the spec lane: each move dropped both lanes' measured prices, a plain probe never kept more than the steps
@@ -2852,7 +2860,7 @@ static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const
 /// @param spec the spec lane's cost fit
 /// @param n decoders
 /// @param verify_rows the verify width
-/// @param depth the decoders' mean depth, tokens (lane_decoder_depth; a new band drops the measured prices)
+/// @param depth the decoders' mean depth, tokens (server::slot_frontier_pos; a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
                            uint32_t verify_rows, uint32_t depth) {
@@ -2866,17 +2874,6 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         lp->moved[0] = '\0';
     }
     return lane;
-}
-
-/* L380: where a decoder stands for the lane prices' depth band, whichever lane carries it.  In the plain batch that
- * is its feed position: its tokens join its bank's history only as it leaves the batch, and until then the installed
- * bank's position reads 0 (a batch step leaves the session's own history invalid: pulsar_session_bank_pos). */
-/// @param s the server
-/// @param sl the decoder's slot
-/// @return its depth, tokens
-static uint32_t lane_decoder_depth(const server *s, const session_slot *sl) {
-    const gen_state *g = sl->gen;
-    return (uint32_t)(g && g->batch_active ? g->batch_feed_pos : s->slot_frontier_pos(sl)).raw();
 }
 
 /// @brief The decode lane for this sweep (the rule above): 0 idle, 2 batched, 3 spec-batched (1, the retired
@@ -5758,7 +5755,7 @@ void *server_worker_main(void *arg) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             uint64_t dsum = 0;   /* L338: the decoders' mean depth: the depth band the prices are measured in */
-            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)lane_decoder_depth(s, dec[i]);
+            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
             priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
                                      (uint32_t)(dsum / (uint64_t)n_dec));
         }

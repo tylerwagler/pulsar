@@ -13067,27 +13067,74 @@ static void test_l380_lane_probe_key(void) {
     TEST_ASSERT(fabs(lp.t_plain - 1000.0 / 29.0) < 1e-6);
 }
 
-/* L380 -- the depth the lane prices are keyed by is the decoder's, whichever lane carries it: in the plain batch
- * its feed position, not its bank's (the installed bank's position reads 0 from the batch's first step until the
- * decoder leaves: one Qwen stream at 36.5K fell from band 3 to band 0 on the plain lane and came back on the spec
- * lane, dropping both lanes' measured prices each way).  No engine: the bank's position reads 0 here, as the
- * installed bank's does in the batch. */
-static void test_l380_lane_decoder_depth(void) {
+/* L380 -- a decoder in the plain batch stands at its feed position for EVERY reader of its slot's position
+ * (server::slot_frontier_pos), not its bank's: the engine's history of the bank is the one it entered the batch with,
+ * and the installed bank's reads no position at all (0) from the batch's first step until the decoder leaves.  The
+ * lane prices' depth read that 0 (one Qwen stream at 36.5K fell from band 3 to band 0 on the plain lane and came back
+ * on the spec lane, dropping both lanes' measured prices each way), and so did /metrics.  No engine: the bank's
+ * position reads 0 here, as the installed bank's does in the batch. */
+static void test_l380_batch_frontier(void) {
     server s;
     memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.tool_mu, NULL);
     gen_state g;
     memset(&g, 0, sizeof g);
-    session_slot sl;
-    memset(&sl, 0, sizeof sl);
-    sl.provisioned = true;
+    s.n_slots = 2;
+    session_slot &sl = s.slots[1];
+    sl.bank = 1u;
     sl.gen = &g;
     g.phase = GEN_DECODE;
-    TEST_ASSERT(lane_decoder_depth(&s, &sl) == 0u);   /* on the spec lane: its bank's position */
     g.batch_active = true;
     g.batch_feed_valid = true;
     g.batch_feed_pos = TokPos{36600};
-    TEST_ASSERT(s.slot_frontier_pos(&sl).raw() == 0 && lane_decoder_depth(&s, &sl) == 36600u);
-    TEST_ASSERT(lane_depth_band(lane_decoder_depth(&s, &sl)) == 3);
+    /* the accessor's contract: an unprovisioned slot holds nothing, whatever its job says */
+    TEST_ASSERT(s.slot_frontier_pos(NULL) == TokPos{0} && s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.provisioned = true;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36600});
+    g.batch_active = false;   /* on the spec lane, prefilling or idle: its bank's position */
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.gen = NULL;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.gen = &g;
+    g.batch_active = true;
+    /* each commit moves it (lane_emit_and_draw), and a decoder that stopped in the batch keeps it until its finish
+     * step folds the batch's tokens into the bank's history (generate_job_step) */
+    g.batch_feed_pos += TokCount{1};
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36601});
+    g.batch_feed_valid = false;
+    g.phase = GEN_FINISH;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36601});
+    g.batch_feed_valid = true;
+    g.phase = GEN_DECODE;
+    g.batch_feed_pos = TokPos{36600};
+
+    /* the live bindings match at the slot's frontier (live_slot_for_ids): the one a continuation kept from the turn
+     * before stands below the decoder, so a second request carrying its ids finds no owner while the first decodes --
+     * neither at the old frontier nor at the 0 the installed bank reads */
+    job busy;
+    memset(&busy, 0, sizeof busy);
+    sl.active_job = &busy;
+    id_list_push_unique(&sl.anthropic_live.call_ids, "toolu_l380");
+    sl.anthropic_live.valid = true;
+    sl.anthropic_live.live_tokens = 36000;
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_l380");
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl.anthropic_live.live_tokens = 0;
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl.anthropic_live.live_tokens = 36600;   /* the read is the feed position */
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == &sl);
+    id_list_free(&ids);
+    live_tool_state_free(&sl.anthropic_live);
+
+    /* a busy bank is never an empty one or scratch, whatever its position reads */
+    bool fd[PULSAR_SESSION_POOL_CAP], fs[PULSAR_SESSION_POOL_CAP];
+    s.victim_facts(fd, fs);
+    TEST_ASSERT(!fs[1] && !fd[1]);
+    sl.active_job = NULL;
+
+    /* the lane prices' depth is that read: band 3 on either lane */
+    TEST_ASSERT(lane_depth_band((uint32_t)s.slot_frontier_pos(&sl).raw()) == 3);
     /* so a plain probe's steps count over its quanta: band 3 at every pick */
     lane_price lp;
     memset(&lp, 0, sizeof lp);
@@ -13097,12 +13144,15 @@ static void test_l380_lane_decoder_depth(void) {
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 36632u) == 2 && lp.probe == 2);
     for (uint32_t k = 0; k < 4u; k++) {   /* four quanta of eight plain steps */
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 2 && !lp.rekeyed);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 2 &&
+                    !lp.rekeyed);
         l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 8u, 1, 1, 1, 29.0);
         g.batch_feed_pos += TokCount{8};
     }
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 3 &&
+                lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && !strcmp(lp.why, "measured: the lane in force holds"));
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
@@ -16734,7 +16784,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
     test_l380_lane_probe_key();
-    test_l380_lane_decoder_depth();
+    test_l380_batch_frontier();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();
