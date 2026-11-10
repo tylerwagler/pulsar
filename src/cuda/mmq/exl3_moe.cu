@@ -298,13 +298,7 @@ int exl3_moe_routed_launch(const exl3_moe_stacks &w, const int32_t *sel, const f
                         "format %d) -- refusing\n", tag, n_shared, PULSAR_ROUTER_SHARED_MAX, x.format);
         return -1;
     }
-    static int mmq_ready = -1;   /* the sort's device-info singleton */
-    if (mmq_ready < 0) {
-        int dev = 0;
-        (void)cudaGetDevice(&dev);
-        mmq_ready = ds4_mmq_init(dev) == 0 ? 1 : 0;
-    }
-    if (!mmq_ready) {
+    if (!ds4_mmq_ready()) {   /* the sort's device-info singleton, asked of the current device (L375, O56) */
         fprintf(stderr, "%s: the MMQ drivers are unavailable on this device -- refusing\n", tag);
         return -1;
     }

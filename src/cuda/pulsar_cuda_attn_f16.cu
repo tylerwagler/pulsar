@@ -1384,28 +1384,26 @@ int pulsar_gpu_attention_prefill_reads_packed_comp(void) {
  * capped at 48 KB, so the tile double-buffer's bytes must be granted here.
  * Fail-loud: a refused grant means the launch would silently get 0 dynamic
  * bytes and fault, so the caller refuses instead. */
-/// @return 1 once the dynamic shared-memory grant for attn_f16_kernel succeeded, else 0.
+/// @return 1 once the current device granted attn_f16_kernel its dynamic shared memory (now or before), else 0.
 static int af16_dynsmem_ok(void) {
-    static int state = 0;   /* 0 = untried, 1 = ok, -1 = refused */
-    if (state == 0) {
-        /* ⚠ THE GRANT IS PER-INSTANTIATION.  attn_f16_kernel is templated on
-         * batch_q's element type (L045), and a missing grant does not fail
-         * loudly at build time -- the launch gets 0 dynamic bytes and faults,
-         * exactly as the comment above warns.  Grant the instantiation that
-         * launches, named by the same typedef the launch sites use, so a
-         * future width change moves the grant with it.  (A second <float>
-         * grant used to sit here as a "safety net"; it was the only reference
-         * to that instantiation, i.e. a whole dead kernel kept alive by a
-         * comment -- deleted 2026-09-02.) */
-        cudaError_t e = cudaFuncSetAttribute(attn_f16_kernel<pulsar_q_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
+    /* ⚠ THE GRANT IS PER-INSTANTIATION.  attn_f16_kernel is templated on
+     * batch_q's element type (L045), and a missing grant does not fail
+     * loudly at build time -- the launch gets 0 dynamic bytes and faults,
+     * exactly as the comment above warns.  Grant the instantiation that
+     * launches, named by the same typedef the launch sites use, so a
+     * future width change moves the grant with it.  (A second <float>
+     * grant used to sit here as a "safety net"; it was the only reference
+     * to that instantiation, i.e. a whole dead kernel kept alive by a
+     * comment -- deleted 2026-09-02.)
+     * L375 (O56): and PER DEVICE (L335's rule, pulsar_cuda_smem_opt_in) -- one process-wide flag granted the
+     * first device that asked and answered "granted" for every other. */
+    static int smem_set[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    if (pulsar_cuda_smem_opt_in((const void *)attn_f16_kernel<pulsar_q_t>, smem_set, (size_t)AF16_DYNSMEM_BYTES))
+        return 1;
+    if (cuda_first_say("attn f16 dynamic smem grant"))
+        fprintf(stderr, "pulsar: attn f16 dynamic smem grant (%d bytes) refused on this device\n",
                 (int)AF16_DYNSMEM_BYTES);
-        state = (e == cudaSuccess) ? 1 : -1;
-        if (state < 0)
-            fprintf(stderr, "pulsar: attn f16 dynamic smem grant refused: %s\n",
-                    cudaGetErrorString(e));
-    }
-    return state > 0;
+    return 0;
 }
 
 /* ONE block per SM -- which is all this kernel can have resident: 512 threads
@@ -1414,18 +1412,22 @@ static int af16_dynsmem_ok(void) {
  * WAVES, each paying the block's ~18 us fixed cost, and the served-lane census
  * read the split kernel at 75 us against the classic walk's 85 at 6..12 rows
  * (rows/L210.md).  Asked of the device once. */
-/// @return the device's SM count (the split-K block target), cached; 48 if the query fails.
+/// @return the current device's SM count (the split-K block target), cached per device (L375, O56: it was one
+///         process-wide value, and 48 -- the GB10's -- when the query failed); 0 when it cannot be read: the caller
+///         refuses.
 static uint32_t af16_split_target_blocks(void) {
-    static int sms = 0;
-    if (sms <= 0) {
-        int dev = 0, n = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess &&
-            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
-            sms = n;
-        else
-            sms = 48;   /* the GB10; only reached if the attribute query fails */
+    static int sms_of[PULSAR_CUDA_DEVICE_SLOTS] = {};
+    const int d = pulsar_cuda_device_slot();
+    if (d < 0) return 0u;
+    if (sms_of[d] <= 0) {
+        int n = 0;
+        if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d) != cudaSuccess || n <= 0) {
+            (void)cudaGetLastError();
+            return 0u;
+        }
+        sms_of[d] = n;
     }
-    return (uint32_t)sms;
+    return (uint32_t)sms_of[d];
 }
 
 /* L210: the split-K partials.  A value that must survive the combine launch
@@ -1701,7 +1703,9 @@ int pulsar_gpu_attention_f16_indexed(
     float *partials = NULL;
     if (n_dec != 0u) {
         const uint32_t groups = n_dec * (n_head / AF16_HPB);
-        n_phys = (af16_split_target_blocks() + groups - 1u) / groups;
+        const uint32_t target = af16_split_target_blocks();
+        AF16_REQUIRE("indexed", target != 0u, "%s", "the device's SM count could not be read (the split-K block target)");
+        n_phys = (target + groups - 1u) / groups;
         if (n_phys > AF16_SPLITS) n_phys = AF16_SPLITS;
         if (n_phys == 0u) n_phys = 1u;
         partials = af16_partials(n_dec, n_head, AF16_SPLITS);
@@ -1712,7 +1716,7 @@ int pulsar_gpu_attention_f16_indexed(
             fprintf(stderr, "pulsar: decode attention = split-K flash-decode over the fp16 tensor-core tile "
                             "(decode rows only; %u logical splits x %u head-groups per row, physical blocks "
                             "sized to %u)\n",
-                    (unsigned)AF16_SPLITS, n_head / AF16_HPB, af16_split_target_blocks());
+                    (unsigned)AF16_SPLITS, n_head / AF16_HPB, target);
         }
     }
     dim3 grid(n_tokens, n_head / AF16_HPB, n_phys);

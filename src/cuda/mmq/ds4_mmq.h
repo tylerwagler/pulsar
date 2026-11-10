@@ -35,6 +35,12 @@ extern "C" {
 /// @return 0 on success, -1 on a bad or missing device.
 int ds4_mmq_init(int device);
 
+// Is the MMQ driver set up on the calling thread's CURRENT device?  ds4_mmq_init once per device (L375, O56: the
+// launchers each kept one process-wide flag, so the first device's answer served every other device).
+/// @return 1 when ds4_mmq_init succeeded on the current device (now or before); 0 when it refused, or the device
+///         cannot be read or is past the per-device caches (said by pulsar_cuda_device_slot)
+int ds4_mmq_ready(void);
+
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
 //   0 otherwise (the caller refuses; there is no second path).
