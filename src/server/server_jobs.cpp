@@ -594,9 +594,10 @@ static void gen_arm_prefill_callbacks(pulsar_session *sess, gen_state *g) {
 
 
 
-/* Shared failure epilogue for both prefill phases (the old duplicated blocks
- * after each pulsar_session_sync failure). Token vectors and the disk path are
- * freed centrally by gen_state_free. */
+/* The failure epilogue of a job that has no decode attempt yet (both prefill
+ * phases, the restore, a decode init that could not start): the old duplicated
+ * blocks after each pulsar_session_sync failure. Token vectors and the disk path
+ * are freed centrally by gen_state_free. */
 void server::gen_prefill_fail(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -620,6 +621,9 @@ void server::gen_prefill_fail(session_slot *sl) {
                    "pulsar-server: bank %d not installed after a failed prefill; left as is "
                    "(no other bank is invalidated)", sl->bank);
     s->trace_event(g->trace_id, "prefill failed: %s", g->err);
+    /* the answer goes behind whatever this slot's writer still holds: a caller in a batched quantum, or one that
+     * failed before generate_job_step installed it, has another slot's writer installed (L372) */
+    slot_writer_install(&g->writer);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span,
                                   g->req_flags, g->err);
     g->phase = GEN_DONE;
@@ -1669,8 +1673,9 @@ void server::gen_decode_init(session_slot *sl) {
     if (g->parser_st) g->parser->destroy(g->parser_st);
     g->parser_st = g->parser->create(s, g, g->err, sizeof(g->err));
     if (!g->parser_st) {
-        g->finish = "error";
-        g->phase = GEN_FINISH;
+        /* L372: no parser, so no turn for gen_step_finish to read (it dereferenced the NULL state): the attempt
+         * never started, and the request ends where every failure before a decode attempt does */
+        s->gen_prefill_fail(sl);
         return;
     }
     /* tool_choice="required": the prompt was prefilled into an open tool-call block (thinking
@@ -1999,7 +2004,9 @@ bool server::gen_emit_token(session_slot *sl, int token) {
 
 /* Post-decode epilogue: tool repair/recovery, final parse, protocol live
  * state, checkpoints, the final response, and logging. Recovery paths loop
- * back to GEN_DECODE_INIT (the old goto decode_again). */
+ * back to GEN_DECODE_INIT (the old goto decode_again).  Only a job with a decode
+ * attempt (g->parser_st) gets here; one that fails before it ends in
+ * gen_prefill_fail. */
 void server::gen_step_finish(session_slot *sl) {
     auto *s = this;
     gen_state *g = sl->gen;
@@ -2442,6 +2449,13 @@ void server::generate_job_step(session_slot *sl) {
         if (!g->err[0])
             snprintf(g->err, sizeof g->err,
                      "bank %u state restore failed (evicted KV unrecoverable)", (unsigned)sl->bank);
+        if (!g->parser_st) {
+            /* L372: before its first decode attempt (GEN_RESTORE, a prefill phase, GEN_DECODE_INIT) the job has no
+             * parser, and gen_step_finish reads the turn through it -- GEN_FINISH from here was a NULL call on the
+             * next step, every client down.  It ends as gen_begin's failed install does: answered, GEN_DONE. */
+            s->gen_prefill_fail(sl);
+            return;
+        }
         g->finish = "error";
         if (g->phase == GEN_FINISH) {
             /* Already finishing and the restore STILL fails: run the finish

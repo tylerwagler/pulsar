@@ -2976,8 +2976,9 @@ struct server {
     /// @param reasoning  the turn's parsed reasoning (may be NULL)
     /// @param calls      the turn's calls (none: nothing to do)
     void canonicalize_tool_checkpoint(session_slot *sl, const job *j, const char *ctx, uint64_t trace_id, const char *content, const char *reasoning, const tool_calls *calls);
-    /** Shared failure epilogue for both prefill phases (the old duplicated blocks
-     * after each pulsar_session_sync failure). Token vectors and the disk path are
+    /** The failure epilogue of a job that has no decode attempt yet -- both prefill phases (the old duplicated blocks
+     * after each pulsar_session_sync failure), the restore, a bank that cannot be installed, a decode init that
+     * could not start (L372): the client is answered and the job is GEN_DONE.  Token vectors and the disk path are
      * freed centrally by gen_state_free.  The disk chain this request loaded is kept
      * whatever failed (L347 I3b, plans/124 D7: a chain is dropped only on a content
      * fault, and a loaded one passed its digests and its checks; a refused prefill
@@ -3085,7 +3086,8 @@ struct server {
     bool gen_emit_token(session_slot *sl, int token);
     /** Post-decode epilogue: tool repair/recovery, final parse, protocol live
      * state, checkpoints, the final response, and logging. Recovery paths loop
-     * back to GEN_DECODE_INIT (the old goto decode_again).
+     * back to GEN_DECODE_INIT (the old goto decode_again).  The turn is read through the decode attempt's parser
+     * (gen_state::parser_st): a job that fails before it has one ends in gen_prefill_fail, never in GEN_FINISH (L372).
      */
     /// @param sl the slot whose job this is (its gen_state; its bank installed by the caller unless said)
     void gen_step_finish(session_slot *sl);

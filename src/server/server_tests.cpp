@@ -9326,6 +9326,53 @@ static void test_l353_small_fixes(void) {
     l323_rmdir(dir);
 }
 
+/* L372 (O2): a job whose bank cannot be installed before its first decode attempt has no parser for the finish step
+ * to read a turn through -- GEN_FINISH from there was a NULL call on the next step.  It ends as a failed prefill does:
+ * answered, GEN_DONE, released by the same service call.  No session here: a parked (preempted) bank stands in for
+ * the install bank_switch refuses. */
+static void test_l372_predecode_failure_ends_the_job(void) {
+    static const gen_phase phases[] = {GEN_RESTORE, GEN_PREFILL_COLD, GEN_PREFILL_MAIN, GEN_DECODE_INIT};
+    for (const gen_phase ph : phases) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        s.pool_banks = 2;
+        s.n_slots = 2;
+        s.n_generating = 1;
+        job j;
+        memset(&j, 0, sizeof j);
+        pthread_mutex_init(&j.mu, NULL);
+        pthread_cond_init(&j.cv, NULL);
+        j.fd = sv[0];
+        session_slot *sl = &s.slots[1];
+        sl->provisioned = true;
+        sl->bank = 1;
+        sl->preempted = true;
+        sl->active_job = &j;
+        gen_state *g = (gen_state *)server_xmalloc(sizeof(*g));   /* the slot's own: generate_job_end frees it */
+        memset(g, 0, sizeof(*g));
+        g->j = &j;
+        g->finish = "length";
+        g->phase = ph;
+        slot_writer_init(&g->writer, sv[0]);
+        sl->gen = g;
+        s.worker_service_slot(sl);
+        TEST_ASSERT(sl->gen == NULL && sl->active_job == NULL && j.done && s.n_generating == 0);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, " 500 ") != NULL && strstr(out, "bank 1 state restore failed") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        pthread_mutex_destroy(&s.mu);
+    }
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15097,6 +15144,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l354_py_unprintable();
     test_l353_small_fixes();
     test_l353_routing_fixes();
+    test_l372_predecode_failure_ends_the_job();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();

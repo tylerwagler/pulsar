@@ -4708,7 +4708,8 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
      * per-bank counters so the mixed driver reads pf's TRUE starting frontier. */
     if (!s->bank_switch(pf->bank)) {
         snprintf(pg->err, sizeof pg->err, "prefill bank %u restore failed", (unsigned)pf->bank);
-        pg->finish = "error"; pg->phase = GEN_FINISH; return;
+        s->gen_prefill_fail(pf);   /* L372: no decode attempt yet, so no GEN_FINISH (released by the next pick, L282) */
+        return;
     }
     const int P0 = pulsar_session_pos(pool).raw();
     pulsar_session_bank_state_save(pool, (uint32_t)pf->bank);
@@ -4824,7 +4825,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
              * prefill bank's next-token row -- the decode seed for the handoff, on the device (L302) */
             if (pulsar_session_step_row_to_bank(pool, (uint32_t)m, (uint32_t)pf->bank) != 0) {
                 snprintf(pg->err, sizeof pg->err, "prefill bank %u: its last row could not be kept", (unsigned)pf->bank);
-                pg->finish = "error"; pg->phase = GEN_FINISH;
+                s->gen_prefill_fail(pf);   /* L372: as the bank install above */
                 break;
             }
             reached_end = true;
@@ -4857,7 +4858,7 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
             }
         } else {
             snprintf(pg->err, sizeof pg->err, "prefill bank %u reconcile failed", (unsigned)pf->bank);
-            pg->finish = "error"; pg->phase = GEN_FINISH;
+            s->gen_prefill_fail(pf);   /* L372: as the bank install above */
         }
     }
 
