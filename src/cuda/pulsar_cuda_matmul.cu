@@ -1184,7 +1184,11 @@ static const fp8_mx_weight *cuda_fp8_mx_weight(const void *model_map, uint64_t o
     fp8_fc_entry *fc = &g_fp8_fc[(uint32_t)(((offset >> 5) ^ (offset >> 17)) & (FC - 1u))];
     if (offset != 0 && fc->tag.load(std::memory_order_acquire) == offset) {
         const fp8_mx_weight *p = fc->ptr.load(std::memory_order_relaxed);
-        if (p && p->host_base == model_map && p->in_dim == in_dim && p->out_dim == out_dim) return p;
+        /* L375 (O58): the offset too.  The tag and the pointer are two loads: a slot republished between them pairs
+         * this offset's tag with another weight's entry, and layers share (map, in_dim, out_dim) -- the entry's own
+         * offset is what says whose it is. */
+        if (p && p->host_base == model_map && p->offset == offset && p->in_dim == in_dim && p->out_dim == out_dim)
+            return p;
     }
     auto it = g_fp8_mx_by_offset.find({model_map, offset});
     if (it != g_fp8_mx_by_offset.end() && it->second.host_base == model_map &&
