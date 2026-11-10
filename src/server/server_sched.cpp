@@ -2814,12 +2814,23 @@ bool server::worker_readmit_preempted() {
          * with the victim the only other resident bank, spill_bank refused (nowhere to park), this returned false,
          * and the next pass did the same -- the decoder never came back (#661).  Re-backing touches nothing (the pools
          * are demand-paged), and the reload below re-backs it anyway (alloc_physical is idempotent). */
-        if (n_spill > 0 && !pulsar_session_bank_alloc_physical(pool, v->bank)) return false;
+        const bool rebacked = n_spill > 0;
+        if (rebacked && !pulsar_session_bank_alloc_physical(pool, v->bank)) return false;
+        /* L372: a pass that gives up after that re-back frees the bank again, so a decoder still parked has no
+         * resident bank: park_bank reads residency, and a later spill or preemption would park the pool on it -- a
+         * view (the parked history, its carry) over rows it no longer holds.  Excluding a preempted bank in park_bank
+         * instead would undo L362: the spills below park on it by design.  Where one of them did, the pool stands on
+         * it and it cannot be freed (free_physical refuses the installed bank): it stays, no step runs on that view
+         * (bank_switch refuses a preempted bank), and the next pass picks up from there. */
+        auto give_up = [&]() {
+            if (rebacked && s->live_bank != (int)v->bank) (void)pulsar_session_bank_free_physical(pool, v->bank);
+            return false;
+        };
         for (int k = 0; k < n_spill; k++) {
-            if (!s->spill_bank(&s->slots[order[k]])) return false;
+            if (!s->spill_bank(&s->slots[order[k]])) return give_up();
             s->count_metric(&s->m_spills);
         }
-        if (s->kv_reserved_bytes(v) + want > s->guard_budget()) return false;
+        if (s->kv_reserved_bytes(v) + want > s->guard_budget()) return give_up();
     }
     const double t0 = server_now_sec();
     char err[256] = "";
