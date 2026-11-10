@@ -4166,7 +4166,6 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                                rows, pf_rows, n_fr, n_fin);
                 }
             }
-            else if (rc == 0) rc = -1;
         } else {
             rc = pulsar_session_decode_mixed(pool, reqs, rows, NULL, 0, &got, PULSAR_MSEQ_HEAD_ALL_ROWS, err,
                                              sizeof err);
@@ -4859,6 +4858,11 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
              * prefill bank's next-token row -- the decode seed for the handoff, on the device (L302) */
             if (pulsar_session_step_row_to_bank(pool, (uint32_t)m, (uint32_t)pf->bank) != 0) {
                 snprintf(pg->err, sizeof pg->err, "prefill bank %u: its last row could not be kept", (unsigned)pf->bank);
+                /* L372: the step is committed for the decode banks whatever became of the prefill's row -- their
+                 * tokens are emitted and their next drawn before the quantum stops.  The break alone dropped the step:
+                 * each bank's KV had advanced a row its slot never counted or emitted, and the next quantum fed the
+                 * same token at the same position again.  Before the prefill's epilogue, which installs its bank. */
+                lane_emit_and_draw(s, dec, live_idx, m, pool);
                 s->gen_prefill_fail(pf);   /* L372: as the bank install above */
                 break;
             }
