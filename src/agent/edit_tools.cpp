@@ -968,11 +968,12 @@ static char *agent_apply_file_splice(const char *path,
  * replaced. */
 char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     (void)w;
-    const char *path = agent_tool_arg_value(call, "path");
+    const char *path, *old, *new_text;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "old", &old)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "new", &new_text)) return bad;
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
     if (char *refused = agent_workspace_refusal(path)) return refused;
-    const char *old = agent_tool_arg_value(call, "old");
-    const char *new_text = agent_tool_arg_value(call, "new");
     if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
     if (!new_text) return xstrdup("Tool error: edit requires new text\n");
 
@@ -1161,19 +1162,24 @@ static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth
 /* Implement the search tool using either literal matching or POSIX regex. */
 char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     (void)w;
-    const char *query = agent_tool_arg_value(call, "query");
+    const char *query, *path, *mode, *glob;
+    int context, max_results;
+    if (char *bad = agent_tool_arg_string(call, "query", &query)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "mode", &mode)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "glob", &glob)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "context", 0, 0, 5, &context)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "max_results", 50, 1, 500, &max_results)) return bad;
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
-    const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
     if (char *refused = agent_workspace_refusal(path)) return refused;
-    const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,
-        .glob = agent_tool_arg_value(call, "glob"),
+        .glob = glob,
         .use_regex = mode && !strcmp(mode, "regex"),
         .case_sensitive = agent_parse_bool_default(agent_tool_arg_value(call, "case_sensitive"), true),
-        .context = agent_parse_int_default(agent_tool_arg_value(call, "context"), 0, 0, 5),
-        .max_results = agent_parse_int_default(agent_tool_arg_value(call, "max_results"), 50, 1, 500),
+        .context = context,
+        .max_results = max_results,
     };
     if (ctx.use_regex) {
         int flags = REG_EXTENDED | REG_NOSUB;

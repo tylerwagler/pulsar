@@ -28,14 +28,15 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
 
     if (!strcmp(call->name, "bash")) {
-        const char *cmd = agent_tool_arg_value(call, "command");
+        const char *cmd;
+        int timeout, refresh;
+        if (char *bad = agent_tool_arg_string(call, "command", &cmd)) return bad;
+        if (char *bad = agent_tool_arg_timeout(call, "timeout_sec", &timeout)) return bad;
+        if (char *bad = agent_tool_arg_int(call, "refresh_sec", 60, 1, 3600, &refresh)) return bad;
         if (!cmd || !cmd[0]) return xstrdup("Tool error: bash requires command\n");
         /* L354: nobody is watching a non-interactive run: running a model's commands is asked for by name */
         if (w->cfg->non_interactive && !w->cfg->allow_bash)
             return xstrdup("Tool error: bash is refused in a non-interactive run (--allow-bash permits it)\n");
-        int timeout = agent_parse_timeout(agent_tool_arg_value(call, "timeout_sec"));
-        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
         char err[160] = {0};
         agent_bash_job *job = agent_bash_start(w, cmd, timeout, err, sizeof(err));
         if (!job) {
@@ -50,8 +51,10 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "bash_status") ||
         !strcmp(call->name, "bash_stop"))
     {
-        int job_id = agent_tool_job_id(call);
-        pid_t pid = agent_tool_pid(call);
+        int job_id, pid, refresh;
+        if (char *bad = agent_tool_arg_int(call, "job", 0, 0, INT_MAX, &job_id)) return bad;
+        if (char *bad = agent_tool_arg_int(call, "pid", 0, 0, INT_MAX, &pid)) return bad;
+        if (char *bad = agent_tool_arg_int(call, "refresh_sec", 60, 1, 3600, &refresh)) return bad;
         agent_bash_job *job = agent_bash_find_job(w, job_id, pid);
         if (!job) {
             char msg[128];
@@ -59,8 +62,6 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
                      job_id, (long)pid);
             return xstrdup(msg);
         }
-        int refresh = agent_parse_int_default(agent_tool_arg_value(call, "refresh_sec"),
-                                              60, 1, 3600);
         bool stop = !strcmp(call->name, "bash_stop");
         bool wait = stop;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);

@@ -207,5 +207,40 @@ static void test_agent_family_tools(void) {
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&calls.v[0], "start_line"), "3"));
     AGENT_TEST_ASSERT(!strcmp(calls.v[1].name, "write") && !strcmp(agent_tool_arg_value(&calls.v[1], "content"), "x\ny"));
     agent_tool_calls_free(&calls);
+
+    /* L373: an argument of the wrong type is the tool's error, never the default or the value's JSON text */
+    static const struct {
+        const char *name, *arguments, *error;
+    } wrong[] = {
+        {"bash", "{\"command\": \"true\", \"timeout_sec\": \"10s\"}", "Tool error: timeout_sec is not a number\n"},
+        {"bash", "{\"command\": \"true\", \"refresh_sec\": 1.5}", "Tool error: refresh_sec is not an integer\n"},
+        {"bash", "{\"command\": [\"true\"]}", "Tool error: command must be a string\n"},
+        {"bash_status", "{\"job\": \"first\"}", "Tool error: job is not an integer\n"},
+        {"read", "{\"path\": null}", "Tool error: path must be a string\n"},
+        {"read", "{\"path\": \"x\", \"start_line\": \"top\"}", "Tool error: start_line is not an integer\n"},
+        {"more", "{\"count\": true}", "Tool error: count is not an integer\n"},
+        {"write", "{\"path\": null, \"content\": \"x\"}", "Tool error: path must be a string\n"},
+        {"write", "{\"path\": \"x\", \"content\": 7}", "Tool error: content must be a string\n"},
+        {"list", "{\"path\": 3}", "Tool error: path must be a string\n"},
+        {"edit", "{\"path\": \"x\", \"old\": \"a\", \"new\": null}", "Tool error: new must be a string\n"},
+        {"search", "{\"query\": \"a\", \"max_results\": \"many\"}", "Tool error: max_results is not an integer\n"},
+    };
+    for (const auto &c : wrong) {
+        AGENT_TEST_ASSERT(agent_family_call_append(&calls, c.name, c.arguments, err, sizeof err) && calls.len == 1);
+        char *res = agent_execute_tool_call_one(NULL, &calls.v[0]);
+        AGENT_TEST_ASSERT(!strcmp(res, c.error));
+        free(res);
+        agent_tool_calls_free(&calls);
+    }
+    AGENT_TEST_ASSERT(access("null", F_OK) != 0);
+    /* a number written as a string still counts; an absent or empty argument takes the default */
+    AGENT_TEST_ASSERT(agent_family_call_append(&calls, "bash", "{\"timeout_sec\": \"10\", \"refresh_sec\": 7200, \"job\": \"\"}",
+                                               err, sizeof err));
+    int got = 0;
+    AGENT_TEST_ASSERT(!agent_tool_arg_timeout(&calls.v[0], "timeout_sec", &got) && got == 10);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "refresh_sec", 60, 1, 3600, &got) && got == 3600);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "job", 0, 0, INT_MAX, &got) && got == 0);
+    AGENT_TEST_ASSERT(!agent_tool_arg_int(&calls.v[0], "pid", 5, 0, INT_MAX, &got) && got == 5);
+    agent_tool_calls_free(&calls);
 }
 #endif

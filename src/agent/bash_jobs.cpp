@@ -534,18 +534,6 @@ char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
 
 
 
-int agent_tool_job_id(const agent_tool_call *call) {
-    return agent_parse_int_default(agent_tool_arg_value(call, "job"), 0, 0, INT_MAX);
-}
-
-
-
-pid_t agent_tool_pid(const agent_tool_call *call) {
-    return (pid_t)agent_parse_int_default(agent_tool_arg_value(call, "pid"), 0, 0, INT_MAX);
-}
-
-
-
 #ifdef PULSAR_AGENT_TEST
 /** @brief Whether the text is well-formed UTF-8 (pulsar_utf8.h's rule).
  *  @param s the text

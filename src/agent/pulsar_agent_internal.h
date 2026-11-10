@@ -1126,6 +1126,11 @@ void agent_trace_tokens(agent_worker *w, const char *label,
  *  @param len   byte count */
 void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
+/** Find a call's argument by name.
+ *  @param call the call
+ *  @param name the argument
+ *  @return the argument (owned by the call), or NULL when absent */
+const agent_tool_arg *agent_tool_arg_find(const agent_tool_call *call, const char *name);
 /** The value of a tool call's named argument (the first one of that name).
  *  @param call the call
  *  @param name the argument name
@@ -1536,10 +1541,27 @@ bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 bool agent_worker_switch_session(agent_worker *w, const char *prefix,
                                         int history_turns,
                                         char *err, size_t err_len);
-/** Parse a tool's timeout argument in seconds.
- *  @param s the text, or NULL
- *  @return seconds clamped to [1, 86400]; 3600 when absent, unparsable or <= 0 */
-int agent_parse_timeout(const char *s);
+/** A tool call's integer argument (L373: a value that is not an integer is the tool's error, never the default).
+ *  @param call the call
+ *  @param name the argument
+ *  @param def  the value when the argument is absent or empty
+ *  @param min  lower clamp
+ *  @param max  upper clamp
+ *  @param out  receives the clamped value, or def
+ *  @return NULL, or "Tool error: <name> is not an integer" (malloc'd; the caller returns it) */
+char *agent_tool_arg_int(const agent_tool_call *call, const char *name, int def, int min, int max, int *out);
+/** A tool call's timeout argument, seconds (a number; fractions truncate).
+ *  @param call the call
+ *  @param name the argument
+ *  @param out  receives seconds clamped to [1, 86400]; 3600 when absent, empty or <= 0
+ *  @return NULL, or "Tool error: <name> is not a number" (malloc'd; the caller returns it) */
+char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int *out);
+/** A tool call's string argument (L373: a JSON null, number or object is the tool's error, never its JSON text).
+ *  @param call the call
+ *  @param name the argument
+ *  @param out  receives the value, or NULL when the argument is absent
+ *  @return NULL, or "Tool error: <name> must be a string" (malloc'd; the caller returns it) */
+char *agent_tool_arg_string(const agent_tool_call *call, const char *name, const char **out);
 /** Parse a whole-string decimal integer (trailing whitespace allowed).
  *  @param s   the text, or NULL
  *  @param def returned when absent or unparsable
@@ -1714,12 +1736,6 @@ agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
 char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
                                         bool stop, bool remove_if_done);
-/** @param call a bash tool call
- *  @return its job argument, 0 when absent */
-int agent_tool_job_id(const agent_tool_call *call);
-/** @param call a bash tool call
- *  @return its pid argument, 0 when absent */
-pid_t agent_tool_pid(const agent_tool_call *call);
 /** Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls.
  */

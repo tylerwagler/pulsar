@@ -11,28 +11,75 @@
  * ============================================================================
  */
 
-int agent_parse_timeout(const char *s) {
-    if (!s || !s[0]) return 3600;
+/** @brief Parse a whole-string decimal integer (trailing whitespace allowed).
+ *  @param s the text
+ *  @param v receives the value
+ *  @return false when `s` is not one */
+static bool agent_parse_int(const char *s, long *v) {
     char *end = NULL;
-    double v = strtod(s, &end);
-    if (end == s || v <= 0.0 || !isfinite(v)) return 3600;
-    if (v < 1.0) v = 1.0;
-    if (v > 24.0 * 3600.0) v = 24.0 * 3600.0;
-    return (int)v;
+    errno = 0;
+    *v = strtol(s, &end, 10);
+    if (end == s || errno == ERANGE) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    return *end == '\0';
 }
 
-
-
 int agent_parse_int_default(const char *s, int def, int min, int max) {
-    if (!s || !s[0]) return def;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (end == s) return def;
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
-    if (*end) return def;
+    long v;
+    if (!s || !s[0] || !agent_parse_int(s, &v)) return def;
     if (v < min) v = min;
     if (v > max) v = max;
     return (int)v;
+}
+
+/** @brief The tool error for an argument of the wrong type.
+ *  @param name the argument
+ *  @param what what it is not ("is not an integer", "must be a string", ...)
+ *  @return "Tool error: <name> <what>\n", malloc'd */
+static char *agent_tool_arg_error(const char *name, const char *what) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Tool error: ");
+    agent_buf_puts(&b, name);
+    agent_buf_puts(&b, " ");
+    agent_buf_puts(&b, what);
+    agent_buf_puts(&b, "\n");
+    return agent_buf_take(&b);
+}
+
+char *agent_tool_arg_int(const agent_tool_call *call, const char *name, int def, int min, int max, int *out) {
+    const char *s = agent_tool_arg_value(call, name);
+    *out = def;
+    if (!s || !s[0]) return NULL;
+    long v;
+    if (!agent_parse_int(s, &v)) return agent_tool_arg_error(name, "is not an integer");
+    if (v < min) v = min;
+    if (v > max) v = max;
+    *out = (int)v;
+    return NULL;
+}
+
+char *agent_tool_arg_timeout(const agent_tool_call *call, const char *name, int *out) {
+    const char *s = agent_tool_arg_value(call, name);
+    *out = 3600;
+    if (!s || !s[0]) return NULL;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    while (end != s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end++;
+    if (end == s || *end || !isfinite(v)) return agent_tool_arg_error(name, "is not a number");
+    if (v <= 0.0) return NULL;
+    if (v < 1.0) v = 1.0;
+    if (v > 24.0 * 3600.0) v = 24.0 * 3600.0;
+    *out = (int)v;
+    return NULL;
+}
+
+char *agent_tool_arg_string(const agent_tool_call *call, const char *name, const char **out) {
+    const agent_tool_arg *a = agent_tool_arg_find(call, name);
+    *out = NULL;
+    if (!a) return NULL;
+    if (!a->is_string) return agent_tool_arg_error(name, "must be a string");
+    *out = a->value ? a->value : "";
+    return NULL;
 }
 
 
@@ -400,15 +447,15 @@ char *agent_workspace_refusal(const char *path) {
 }
 
 char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
-    const char *path = agent_tool_arg_value(call, "path");
+    const char *path;
+    int start, count;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "start_line", 1, 1, INT_MAX, &start)) return bad;
+    if (char *bad = agent_tool_arg_int(call, "max_lines", AGENT_READ_DEFAULT_LINES, 1, INT_MAX, &count)) return bad;
     if (path && path[0]) {
         if (char *refused = agent_workspace_refusal(path)) return refused;
     }
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
-    int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
-                                        1, 1, INT_MAX);
-    int count = agent_parse_int_default(agent_tool_arg_value(call, "max_lines"),
-                                        AGENT_READ_DEFAULT_LINES, 1, INT_MAX);
     bool raw = agent_parse_bool_default(agent_tool_arg_value(call, "raw"), false);
     return agent_read_range(w, path, start, count, whole, raw, true);
 }
@@ -416,8 +463,8 @@ char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
 
 
 char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
-    int count = agent_parse_int_default(agent_tool_arg_value(call, "count"),
-                                        AGENT_READ_DEFAULT_LINES, 1, INT_MAX);
+    int count;
+    if (char *bad = agent_tool_arg_int(call, "count", AGENT_READ_DEFAULT_LINES, 1, INT_MAX, &count)) return bad;
     if (!w->more_valid) return xstrdup("Tool error: no previous output to continue\n");
     return agent_read_range(w, w->more_path, w->more_next_line, count, false,
                             w->more_bare, true);
@@ -427,8 +474,9 @@ char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
 
 char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     (void)w;
-    const char *path = agent_tool_arg_value(call, "path");
-    const char *content = agent_tool_arg_value(call, "content");
+    const char *path, *content;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
+    if (char *bad = agent_tool_arg_string(call, "content", &content)) return bad;
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (char *refused = agent_workspace_refusal(path)) return refused;
     if (!content) return xstrdup("Tool error: write requires content\n");
@@ -458,7 +506,8 @@ char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
 
 
 char *agent_tool_list(const agent_tool_call *call) {
-    const char *path = agent_tool_arg_value(call, "path");
+    const char *path;
+    if (char *bad = agent_tool_arg_string(call, "path", &path)) return bad;
     if (!path || !path[0]) path = ".";
     if (char *refused = agent_workspace_refusal(path)) return refused;
     DIR *dir = opendir(path);
