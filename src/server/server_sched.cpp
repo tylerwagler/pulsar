@@ -1799,6 +1799,9 @@ void server::publish_metrics_snapshot() {
         s->m_slot_phase[i]         = g ? (int)g->phase + 1 : 0;
         s->m_slot_prefill_done[i]  = (g && g->prefill_last_current > 0) ? g->prefill_last_current : 0;
         s->m_slot_prefill_total[i] = (g && g->prefill_total > 0) ? g->prefill_total : 0;
+        s->m_slot_bank[i]      = (int)sl->bank;   /* L372: the stall dump's (the watchdog reads only the snapshot) */
+        s->m_slot_spilled[i]   = sl->spilled;
+        s->m_slot_preempted[i] = sl->preempted;
         /* L112: adaptive draft depth, live-or-carry (pure host read) -- DSpark's; the Qwen MTP lane's
          * depth is fixed and the family refuses the query. */
         s->m_slot_depth[i] = sl->provisioned && pulsar_engine_has_spec_rounds(s->engine)

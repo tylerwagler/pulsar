@@ -248,9 +248,9 @@ void server::watchdog_dump(int64_t stalled_s) {
             if (ph == 0 && s->m_slot_pos[i] == 0) continue;   /* idle and empty */
             server_log(PULSAR_LOG_DEFAULT,
                        "pulsar-server: STALL:   slot %d bank %d: %s, position %d of %d, prefill %d/%d%s%s", i,
-                       s->slots[i].bank, phase_name(ph), s->m_slot_pos[i],
+                       s->m_slot_bank[i], phase_name(ph), s->m_slot_pos[i],
                        s->m_slot_ctx[i], s->m_slot_prefill_done[i], s->m_slot_prefill_total[i],
-                       s->slots[i].spilled ? ", spilled" : "", s->slots[i].preempted ? ", preempted" : "");
+                       s->m_slot_spilled[i] ? ", spilled" : "", s->m_slot_preempted[i] ? ", preempted" : "");
         }
         pthread_mutex_unlock(&s->mu);
     }

@@ -2505,6 +2505,11 @@ struct server {
     int m_slot_depth[PULSAR_SESSION_POOL_CAP];  ///< L112: adaptive draft depth per slot (0 = n/a)
     int m_slot_prefill_done[PULSAR_SESSION_POOL_CAP];  ///< tokens synced so far
     int m_slot_prefill_total[PULSAR_SESSION_POOL_CAP];  ///< prefill target, 0 if not prefilling
+    /** L372: what the stall dump names of a slot beside the fields above -- its bank and whether it is guard-spilled
+     *  or parked (preempted).  The dump runs on the watchdog thread and read these from the worker's own slots. */
+    int m_slot_bank[PULSAR_SESSION_POOL_CAP];
+    bool m_slot_spilled[PULSAR_SESSION_POOL_CAP];    ///< session_slot::spilled, as published
+    bool m_slot_preempted[PULSAR_SESSION_POOL_CAP];  ///< session_slot::preempted, as published
     pulsar_spec_metrics m_spec;  ///< engine spec-decode counters
     /* Request-latency histograms. req_timings is already computed for every
      * request (generate_job_end) and was previously only serialized into the
