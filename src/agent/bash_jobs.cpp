@@ -88,7 +88,7 @@ void agent_bash_job::job_free() {
     if (job->tmp_fd >= 0) close(job->tmp_fd);
     /* Remove the mkstemp output file.  Only the three spawn-time error paths
      * unlinked it before, so every COMPLETED bash tool call left a
-     * /tmp/pulsar_agent_output_* behind for the life of the box — a long agent
+     * /tmp/ds4_agent_output_* behind for the life of the box — a long agent
      * session orphaned one per command, sized by that command's full output. */
     if (job->path[0]) unlink(job->path);
     g_bash_live[job->live_slot].used = 0;

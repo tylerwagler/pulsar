@@ -788,9 +788,8 @@ struct agent_bash_job {
     pid_t pid;      ///< child process id
     int pipe_fd;    ///< read end of the child's output pipe; -1 once closed
     int tmp_fd;     ///< write end into the temp output file; -1 once closed
-    /** Always the mkstemp template "/tmp/pulsar_agent_output_XXXXXX" (27 chars +
-     * NUL) from agent_bash_start — mkstemp only substitutes the X's, so it can
-     * never lengthen.  Sized for exactly that, not PATH_MAX. */
+    /** Always the mkstemp template "/tmp/ds4_agent_output_XXXXXX" (28 chars + NUL) from agent_bash_start -- mkstemp
+     *  only substitutes the X's, so it can never lengthen.  Sized for that, not PATH_MAX. */
     char path[32];
     char *cmd;            ///< the command line, owned
     double start_time;    ///< wall-clock at spawn, for elapsed_sec
