@@ -274,6 +274,18 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
                 ARCH(e), n_rows, heads.n, d->max_rows, PULSAR_DRIVER_HEADS_MAX);
         return false;
     }
+    /* L375 O39: the context bound, once, for every row of every step kind (a decode row, a verify row, a prompt row
+     * of the sync or of a fused step): a bank's pools hold positions below the pool's capacity, and a row at or past
+     * it would write past them.  Refused by name before anything of the step moves.  Nothing served trips it -- the
+     * server caps a request's tokens at the room, the round caps its drafts (spec_round_begin), the sync and the
+     * fused step refuse a prompt with no room -- so a trip names a caller that lost count. */
+    for (uint32_t r = 0; r < n_rows; r++) {
+        if (pos[r] < 0 || (uint32_t)pos[r] >= ss->ctx || bank[r] < 0 || (uint32_t)bank[r] >= ss->n_banks) {
+            fprintf(stderr, "pulsar: %s: step row %u (bank %d, position %d) is outside the pool (%u banks of %u "
+                            "positions) -- refusing\n", ARCH(e), r, bank[r], pos[r], ss->n_banks, ss->ctx);
+            return false;
+        }
+    }
     /* L307, armed only: the step's disposable scratch -- the family's arenas and the CUDA scratch slots -- filled
      * before anything of the step is uploaded; an honest step overwrites everything it reads */
     if (!pulsar_gpu_scratch_poison_step(d->scratch, PULSAR_DRIVER_SCRATCH_MAX)) return false;

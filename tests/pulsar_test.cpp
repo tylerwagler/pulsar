@@ -3737,6 +3737,58 @@ static void test_driver_scratch_cap(void) {
     free(e);
 }
 
+/* L375 O39: the driver's context bound.  Every row of every step kind enters through the driver's one forward, and a
+ * row at or past the pool's capacity is refused there by name, before the family's trunk or any launch: a decode
+ * row, the plain eval's row, and a verify run whose first row fits and whose second does not.  Host: a driver family
+ * with no trunk (reaching it would crash the test), a state set of one 8-position bank. */
+static uint32_t test_driver_width(const pulsar_engine *) { return 4u; }
+static void test_driver_context_bound(void) {
+    static pulsar_driver_ops ops{};
+    ops.embed = test_driver_never;
+    ops.head = test_driver_head_never;
+    static pulsar_family fam{};
+    fam.arch = "l375_driver_test";
+    fam.name = "L375 driver test";
+    fam.driver = &ops;
+    fam.logits_width = test_driver_width;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_state_set *ss = (pulsar_state_set *)xcalloc(1, sizeof(*ss));
+    uint32_t bank_pos = 8u;
+    bool stale = false;
+    ss->n_banks = 1u;
+    ss->ctx = 8u;
+    ss->verify_rows = 4u;
+    ss->bank_pos = &bank_pos;
+    ss->frontier_stale = &stale;
+    pulsar_driver_state *d = (pulsar_driver_state *)xcalloc(1, sizeof(*d));
+    d->max_rows = 4u;
+    pulsar_session *s = (pulsar_session *)xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->states = ss;
+    s->driver = d;
+    s->ctx_size = 8;
+
+    char err[256] = "";
+    pulsar_multiseq_req at_ctx = { 0u, TokPos{8}, 1 };
+    TEST_ASSERT(pulsar_driver_decode_multiseq(s, &at_ctx, 1u, NULL, 0, err, sizeof err) == -1 && err[0]);
+    TEST_ASSERT(bank_pos == 8u);                       /* nothing moved */
+    for (int i = 0; i < 8; i++) token_vec_push(&s->checkpoint, 1);
+    err[0] = '\0';
+    TEST_ASSERT(pulsar_driver_eval_row(s, 1, err, sizeof err) == 1 && err[0] && bank_pos == 8u);
+    bank_pos = 7u;                                     /* a verify of [7, 8]: its second row is past the pool */
+    const pulsar_multiseq_req run[2] = { { 0u, TokPos{7}, 1 }, { 0u, TokPos{8}, 1 } };
+    uint32_t headed = 9u;
+    err[0] = '\0';
+    TEST_ASSERT(pulsar_driver_decode_mixed(s, run, 2u, NULL, 0, &headed, PULSAR_MSEQ_HEAD_ALL_ROWS, err, sizeof err) == -1 &&
+                err[0] && headed == 0u && bank_pos == 7u);
+    token_vec_free(&s->checkpoint);
+    free(s);
+    free(d);
+    free(ss);
+    free(e);
+}
+
 /* L335: the safetensors header's integers pass blob_value's exactness check (st_exact_integer: an integer a double
  * holds exactly) -- a fractional or past-2^53 shape entry used to truncate / round into a wrong integer that parsed.
  * Host: a one-tensor shard in a scratch directory, the open's stderr read back for the refusal. */
@@ -5643,6 +5695,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
+    {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
