@@ -669,6 +669,12 @@ void server::gen_prefill_abandon(session_slot *sl) {
     /* L353 no. 9: a client gone is no fault of the bank's: the sync stopped at a valid prefix its re-send extends (the
      * memory refusal keeps the same state).  Invalidating it sent the re-send to the disk, or to token 0 when the persist
      * above wrote nothing.  Only a real prefill failure (gen_prefill_fail) invalidates. */
+    /* L372: the bank is kept, so the bindings on it must be true of it.  A request that did not continue them has
+     * written its own rows there, and a binding matches by its call ids and the bank's position alone
+     * (live_state_matches_ids_locked): left valid, the owner's tool results could match where this prefill happened
+     * to stop.  gen_stream_begin's rule, which an abandoned prefill never reaches. */
+    if (!g->responses_live_continuation) s->responses_live_clear(sl);
+    if (!g->anthropic_live_continuation) s->anthropic_live_clear(sl);
     s->trace_event(g->trace_id, "prefill abandoned: %s", g->err);
     s->send_prefill_failure_response(g->j, &g->progress, g->ctx_span, g->req_flags, g->err);
     g->phase = GEN_DONE;

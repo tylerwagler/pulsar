@@ -9521,6 +9521,46 @@ static void test_l372_judge_ends_a_gone_clients_request(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* L372 (O23): an abandoned prefill keeps its bank, so it drops the live tool bindings it did not continue (they match
+ * by ids and position alone); a live continuation's own binding stays. */
+static void test_l372_abandoned_prefill_drops_stale_bindings(void) {
+    for (const bool continues : {false, true}) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        server s;
+        memset(&s, 0, sizeof s);
+        pthread_mutex_init(&s.mu, NULL);
+        pthread_mutex_init(&s.tool_mu, NULL);
+        s.pool_banks = 2;
+        s.n_slots = 2;
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = sv[0];
+        session_slot *sl = &s.slots[1];
+        sl->provisioned = true;
+        sl->bank = 1;
+        sl->active_job = &j;
+        sl->responses_live.valid = sl->anthropic_live.valid = true;
+        sl->responses_live.live_tokens = sl->anthropic_live.live_tokens = 100;
+        gen_state g;
+        memset(&g, 0, sizeof g);
+        g.j = &j;
+        g.phase = GEN_PREFILL_MAIN;
+        g.responses_live_continuation = g.anthropic_live_continuation = continues;
+        slot_writer_init(&g.writer, sv[0]);
+        sl->gen = &g;
+        s.gen_prefill_abandon(sl);
+        TEST_ASSERT(g.phase == GEN_DONE);
+        TEST_ASSERT(sl->responses_live.valid == continues && sl->anthropic_live.valid == continues);
+        slot_writer_free(&g.writer);
+        close(sv[0]);
+        close(sv[1]);
+        pthread_mutex_destroy(&s.tool_mu);
+        pthread_mutex_destroy(&s.mu);
+    }
+}
+
 /* L353: past the budget the rows that restore nothing go before any conversation's resume point: with several chats'
  * ends in a store, dead rows-only leaves are what a newcomer displaces, and each chat still restores at its end. */
 static void test_l353_eviction_keeps_chain_ends(void) {
@@ -15319,6 +15359,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l372_failed_batch_leave_is_still_stepped();
     test_l372_empty_banks_are_not_spill_victims();
     test_l372_judge_ends_a_gone_clients_request();
+    test_l372_abandoned_prefill_drops_stale_bindings();
     test_l353_eviction_keeps_chain_ends();
     test_l353_disk_full_evicts();
     test_l353_picked_chain_survives_the_evict_persist();
