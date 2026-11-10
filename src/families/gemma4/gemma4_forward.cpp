@@ -909,6 +909,9 @@ bool attention(const g4_step *st, uint32_t il, uint8_t *base, const mix_scratch 
             io.decode_rows = prompt ? 0 : 1;        /* L338: decode rows: the wide heads' flash-decoding */
             io.decode_group = st->verify ? 4 : 1;   /* L338: a verify's rows (one sequence each run) load each key once
                                                      * a group of 4; a decode step's rows are sequences of their own */
+            /* O59: the step's non-finite flag (step_end reads it); bit 23 marks an attention operand */
+            io.nf_flag = (uint32_t *)((uint8_t *)dptr(st->st->scratch[ARENA_ROWS]) + rows_layout(st->st->max_rows).nf);
+            io.nf_code = 0x47800000u | il;
             return pulsar_gqa_launch(&G1, &q->attn_call[c], (const uint8_t *)dptr(q->attn_desc) + q->attn_off[c], &io,
                                      0) == 0;
         }))
@@ -1145,16 +1148,23 @@ uint32_t hidden(pulsar_session *s, float *out, uint32_t cap) {
     return E;
 }
 
-/** pulsar_driver_ops::step_end: the routed experts' non-finite flag (rule 9).
+/** pulsar_driver_ops::step_end: the step's non-finite flag (rule 9) -- a layer's routed output, or (bit 23, a
+ *  build that widens the attention's bf16 operands to fp16: sm_75) an attention operand outside fp16's range.
  *  @param st0  the step
  *  @param ok   the forward's verdict
- *  @return ok and no layer's routed output went non-finite (said) */
+ *  @return ok and the flag is clear (said) */
 bool step_end(const pulsar_driver_step *st0, bool ok) {
     if (!ok) return false;
     const g4_step *st = S(st0);
     uint32_t nf = 0;
     if (!pulsar_gpu_tensor_read(st->st->scratch[ARENA_ROWS], rows_layout(st->st->max_rows).nf, &nf, sizeof(nf)))
         return fail("could not read the MoE non-finite flag");
+    if (nf & 0x800000u) {
+        fprintf(stderr, "pulsar: %s: an attention operand (q / k / v) of layer %u is outside fp16's range, which this "
+                        "build's tensor-core arms widen bf16 to (code 0x%08x) -- refusing the step\n",
+                ARCH, nf & 0x7fffffu, nf);
+        return false;
+    }
     if (nf) {
         fprintf(stderr, "pulsar: %s: the routed output of layer %u went non-finite (code 0x%08x) -- refusing the step\n",
                 ARCH, nf & 0xffffffu, nf);

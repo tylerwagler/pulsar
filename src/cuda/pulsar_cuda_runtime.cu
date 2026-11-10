@@ -295,8 +295,9 @@ static void *cuda_tmp_reserve_slot(int slot, uint64_t bytes, const char *what) {
      * second arena on this slot alias the first one's live slices, and the
      * cudaFree below is what makes it worse.  One live arena per slot. */
     if (g_cuda_tmp_bytes[slot] >= bytes) return g_cuda_tmp[slot];
+    /* the one rule for a grow (O54): an open capture is broken off first, the graphs that baked the old block die */
+    if (!pulsar_gpu_seg_grow(what, g_cuda_tmp[slot] != NULL)) return NULL;
     if (g_cuda_tmp[slot]) {
-        pulsar_gpu_seg_note_device_free(what);   /* baked scratch pointers die */
         (void)cudaFree(g_cuda_tmp[slot]);
         g_cuda_tmp[slot] = NULL;
         g_cuda_tmp_bytes[slot] = 0;
@@ -2198,9 +2199,18 @@ int pulsar_gpu_begin_commands(void) { return 1; }
  *            the table never runs a shape eager because it is full.
  *
  * Invalidation (L119): pulsar_gpu_seg_reset drops everything (a graph teardown: the execs bake its buffers);
- * pulsar_gpu_seg_note_device_free drops every exec but keeps the catalog (a scratch regrow: the baked pointers die;
- * the catalog recaptures on its next uses, counted as live captures).  Worker thread only; ThreadLocal capture mode,
- * so other threads' CUDA calls are unaffected. */
+ * pulsar_gpu_seg_grow with a block to free drops every exec but keeps the catalog (a scratch regrow: the baked
+ * pointers die; the catalog recaptures on its next uses, counted as live captures).  Worker thread only; ThreadLocal
+ * capture mode, so other threads' CUDA calls are unaffected.
+ *
+ * A grow INSIDE a capture (O54, L375).  cudaMalloc and cudaFree are refused on a capturing thread and invalidate its
+ * capture (measured, CUDA 13.3: "operation not permitted when stream is capturing", then the capture's end fails),
+ * so a stretch whose buffer had to grow under its capture used to fail there -- and, its key still at the capture
+ * threshold and the buffer now gone, on every later use.  The one rule, pulsar_gpu_seg_grow, at every grow site: the
+ * capture is BROKEN OFF where the grow is asked for -- the nodes recorded so far are instantiated and run once, on
+ * the buffers as they were, the stream is eager again for the rest of the stretch (the grow and everything after
+ * it), and the key starts its warm-up over, so it captures again at the new capacity.  The stretch's launches are
+ * then the eager stretch's, in order. */
 namespace {
 
 /** One key's cache state. */
@@ -2222,7 +2232,12 @@ std::unordered_map<uint64_t, seg_ent> g_seg;
 std::list<uint64_t> g_seg_lru;               ///< the live keys, most recently used first
 /// A segment capture is open on this process (pulsar_gpu_seg_enter .. exit).
 bool g_seg_capturing = false;
-bool g_seg_reset_pending = false;            ///< a scratch regrow during a capture: drop every exec after it
+/// ANOTHER thread regrew a buffer of its own while a capture was open here: drop every exec at the capture's close.
+bool g_seg_reset_pending = false;
+uint64_t g_seg_key = 0;                      ///< the open capture's key (seg_break restarts its warm-up)
+/// The open stretch's capture was broken off at a grow (seg_break): its seg_exit has no capture to close.
+bool g_seg_broken = false;
+bool g_seg_break_failed = false;             ///< ... and its nodes so far could not be run: the stretch refuses
 /// pulsar_gpu_seg_reset during a capture: the FULL reset (every key, the catalog too) runs at seg_exit
 bool g_seg_full_reset_pending = false;
 bool g_seg_catalog_on = false;               ///< the warmup's declaration window is open
@@ -2339,18 +2354,67 @@ void seg_drop_graphs(void) {
 }
 
 /* What a capture that just closed owes: pulsar_gpu_seg_reset asked for during it is the full reset (every key and the
- * catalog dropped -- a graph teardown), a scratch regrow during it the drop of every exec (the catalog kept).  L335:
- * both used to set one flag, so a reset under capture came out as the partial drop. */
-/// Runs the reset or the regrow drop a capture deferred (seg_exit, after g_seg_capturing is cleared).
+ * catalog dropped -- a graph teardown); a regrow on ANOTHER thread during it, the drop of every exec (the catalog
+ * kept).  The capturing thread's own regrow does not wait for the close: it breaks the capture off (seg_break). */
+/// Runs the reset or the drop a capture deferred (seg_exit or seg_break, after g_seg_capturing is cleared).
 void seg_settle_pending(void) {
     if (g_seg_full_reset_pending) pulsar_gpu_seg_reset();
     else if (g_seg_reset_pending) seg_drop_graphs();
 }
 
+/* O54: break the open capture off at a grow.  The nodes recorded so far become a graph that is launched once and
+ * waited for (they address the buffers as they were, which the caller is about to free), the stream is left eager,
+ * and the key's warm-up starts over.  A capture that cannot be ended or run (a forked stream not yet joined, an
+ * instantiate failure) ran nothing: the stretch refuses this once -- said -- and the key, warm-up restarted, takes
+ * its next use eager, where the grow is an ordinary one. */
+/// @param what the buffer that must grow, for the lines
+/// @return true when the capture's nodes so far ran and the stream is eager; false when they could not (said)
+bool seg_break(const char *what) {
+    g_seg_capturing = false;
+    g_seg_broken = true;
+    g_seg_st.capture_breaks++;
+    cudaGraph_t gr = NULL;
+    cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
+    const auto it = g_seg.find(g_seg_key);
+    if (it != g_seg.end()) it->second.uses = 0;
+    size_t n = 0;
+    if (rc == cudaSuccess && !gr) rc = cudaErrorStreamCaptureInvalidated;
+    if (rc == cudaSuccess) rc = cudaGraphGetNodes(gr, NULL, &n);
+    if (rc == cudaSuccess && n > 0) {
+        cudaGraphExec_t ex = NULL;
+        rc = cudaGraphInstantiateWithFlags(&ex, gr, cudaGraphInstantiateFlagUseNodePriority);
+        if (rc == cudaSuccess) rc = cudaGraphLaunch(ex, cudaStreamPerThread);
+        if (rc == cudaSuccess) {
+            pulsar_cuda_sync_note(0, 0);   /* a host wait: the caller frees what these nodes address */
+            rc = cudaStreamSynchronize(cudaStreamPerThread);
+        }
+        if (ex) (void)cudaGraphExecDestroy(ex);
+    }
+    if (gr) (void)cudaGraphDestroy(gr);
+    (void)cudaGetLastError();
+    g_seg_break_failed = rc != cudaSuccess;
+    char site[160];
+    snprintf(site, sizeof(site), "capture broken off at a grow: %s", what ? what : "unnamed");
+    if (g_seg_break_failed)
+        fprintf(stderr, "pulsar: L375 a graph capture (key %016llx) could not be broken off for a grow of %s (%s): "
+                        "nothing of the stretch ran and it refuses this once; the key warms up again and grows the "
+                        "buffer on its next, eager use\n",
+                (unsigned long long)g_seg_key, what ? what : "an unnamed buffer", cudaGetErrorString(rc));
+    else if (cuda_first_say(site))
+        fprintf(stderr, "pulsar: L375 a device buffer had to grow INSIDE a graph capture (%s, key %016llx): the "
+                        "capture was broken off there -- its %zu node(s) so far ran once, the rest of the stretch runs "
+                        "eager, and the key captures again at the new capacity (counted: "
+                        "pulsar_gpu_seg_stats::capture_breaks; said once for this buffer)\n",
+                what ? what : "unnamed", (unsigned long long)g_seg_key, n);
+    seg_settle_pending();   /* a reset asked for inside the capture */
+    return !g_seg_break_failed;
+}
+
 }  // namespace
 
 int pulsar_gpu_seg_enter(uint64_t key) {
-    if (g_seg_capturing || key == 0 || g_seg_off) return 0;
+    /* inside a capture, or inside a stretch whose capture was broken off (seg_break), a nested segment is eager */
+    if (g_seg_capturing || g_seg_broken || key == 0 || g_seg_off) return 0;
     seg_ent &e = seg_lookup(key);
     if (e.dead) {
         g_seg_st.refusals++;
@@ -2384,6 +2448,7 @@ int pulsar_gpu_seg_enter(uint64_t key) {
         return -1;
     }
     g_seg_capturing = true;
+    g_seg_key = key;
     g_seg_st.captures++;
     if (!g_seg_catalog_on && g_seg_st.live_captures++ == 0 && g_seg_catalog_done)
         fprintf(stderr, "pulsar: L306 a live step captured a graph after the warmup (key %016llx, %s): counted in "
@@ -2393,6 +2458,15 @@ int pulsar_gpu_seg_enter(uint64_t key) {
 }
 
 int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
+    if (g_seg_broken) {
+        /* O54: the capture was broken off at a grow (seg_break): its first nodes ran from their own graph, the rest
+         * of the body eager -- there is no capture to close and no graph to keep; the key warms up again */
+        const bool ran = !g_seg_break_failed;
+        g_seg_broken = false;
+        g_seg_break_failed = false;
+        if (!(body_ok && ran) && g_seg_catalog_on) g_seg_catalog_refused++;
+        return body_ok && ran ? 1 : 0;
+    }
     cudaGraph_t gr = NULL;
     g_seg_capturing = false;
     const cudaError_t rc = cudaStreamEndCapture(cudaStreamPerThread, &gr);
@@ -2435,8 +2509,8 @@ int pulsar_gpu_seg_exit(uint64_t key, int body_ok) {
         return 0;
     }
     if (g_seg_reset_pending || g_seg_full_reset_pending) {
-        /* a scratch regrow (or a reset) DURING this capture: the graph ran (the work is done) but its baked pointers
-         * may be stale for later replays -- drop every exec (a reset: every key too) */
+        /* another thread's regrow, or a reset, DURING this capture: the graph ran (the work is done); every exec is
+         * dropped (a reset: every key too) */
         (void)cudaGraphExecDestroy(ex);
         seg_settle_pending();
         return 1;
@@ -2514,29 +2588,30 @@ uint64_t pulsar_gpu_seg_catalog_close(void) {
  * 2026-08-27, rows/L119.md).  Growth sites call this; a sync at the free site prevents the race but NOT the staleness
  * -- only invalidation does.  L306: the catalog stays declared and recaptures on its next uses; a regrow after the
  * warmup is announced once and counted. */
-/// Scratch-regrow hook: drops every exec (keeps the catalog), deferred while a capture is open.
-/// @param what the buffer regrown (named in the first post-warmup regrow's line; NULL = unnamed)
-void pulsar_gpu_seg_note_device_free(const char *what) {
+/* The grow hook (O54: the one rule, see the segment graphs' header; documented at its declaration): breaks an open
+ * capture off, then -- when the grow frees a block -- drops every exec (keeps the catalog). */
+int pulsar_gpu_seg_grow(const char *what, int frees_old) {
     if (g_seg_capturing) {
-        /* L375 (O54): the path nobody announced.  The sites that refuse a grow under capture first
-         * (cuda_grow_refused_under_capture) never get here; the scratch slots and the activation cache do, and
-         * whether a served stretch ever does is what this line settles. */
-        char site[160];
-        snprintf(site, sizeof(site), "regrown inside a capture: %s", what ? what : "unnamed");
-        if (cuda_first_say(site))
-            fprintf(stderr, "pulsar: a device buffer was regrown INSIDE a graph capture (%s): the capture's graph "
-                            "runs once and every captured graph is dropped at its close (said once for this buffer)\n",
-                    what ? what : "unnamed");
-        g_seg_reset_pending = true;
-        return;
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        const bool mine = cudaStreamIsCapturing(cudaStreamPerThread, &cs) != cudaSuccess ||
+                          cs != cudaStreamCaptureStatusNone;
+        if (!mine) {
+            /* the capture is another thread's: this thread's malloc / free are legal and its buffers are in no
+             * graph of that capture; the graphs are dropped when the capture closes */
+            (void)cudaGetLastError();
+            if (frees_old) g_seg_reset_pending = true;
+            return 1;
+        }
+        if (!seg_break(what)) return 0;
     }
-    if (g_seg.empty()) return;
+    if (!frees_old || g_seg.empty()) return 1;
     if (g_seg_catalog_done && !g_seg_catalog_on && g_seg_st.regrows == 0)
         fprintf(stderr, "pulsar: L306 a scratch regrow after the warmup (%s) dropped every captured graph (%llu); the "
                         "catalog recaptures on use (counted: pulsar_gpu_seg_stats::regrows, ::live_captures)\n",
                 what ? what : "unnamed", (unsigned long long)g_seg_st.graphs);
     if (!g_seg_catalog_on) g_seg_st.regrows++;
     seg_drop_graphs();
+    return 1;
 }
 
 /* ==== L307 scratch poisoning (gates and debugging only) =====================

@@ -1288,7 +1288,8 @@ int pulsar_session_argmax(pulsar_session *s);
  *  @param excluded_id the id to skip */
 int pulsar_session_argmax_excluding(pulsar_session *s, int excluded_id);
 /** Returned by the draws (pulsar_session_draw, _draw_rows, _sample) when the row is DEGENERATE (no finite logit,
- * a probability mass that is not a positive finite number, a non-finite knob): no token is drawn and the caller
+ * a NaN or +Inf logit anywhere in it, a probability mass that is not a positive finite number, a non-finite knob):
+ * no token is drawn and the caller
  * must fail its request (L188).  Never a valid id. */
 #define PULSAR_SAMPLE_REFUSED (-1)
 /** L302: one draw (THE sampler, on the device: src/cuda/pulsar_cuda_sampler.cu).  `rng` is the request's sampler

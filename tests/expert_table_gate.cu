@@ -31,6 +31,10 @@
 #include "../src/cuda/pulsar_cuda_expert_table.cu"
 #include "../src/engine/exl3_trellis.h"
 
+/* A new table follows the one rule for a grow (pulsar_gpu_seg_grow, defined in pulsar_cuda_runtime.cu, not linked
+ * here); this gate captures no graph. */
+int pulsar_gpu_seg_grow(const char *, int) { return 1; }
+
 #include <cstdio>
 #include <vector>
 
