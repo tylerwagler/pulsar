@@ -53,6 +53,27 @@
         "go": 0.05
       },
       "tolerance_why": "L368: on DeepSeek the verify width each round is set by timing-measured policies (the verify pick; the draft depth's controller), so a greedy prompt can take a different text and run at that text's speed. typescript swings between paths ~30/34/36 tok/s (gpuq #682-#685); the other four repeat within ~4%. typescript 20%, the rest 5%."
+    },
+    "nemotron-3.5-super": {
+      "release": "v0.5.3",
+      "engine": "425d8dbc",
+      "server_args": "--drafter lilicorr --ctx 262144",
+      "recorded": "2026-11-10",
+      "per_workload": {
+        "python": 61.015,
+        "rust": 51.177,
+        "typescript": 52.423,
+        "cuda": 51.29,
+        "go": 48.695
+      },
+      "tolerance": 0.05,
+      "spread": {
+        "python": 0.0974,
+        "rust": 0.003,
+        "typescript": 0.0192,
+        "cuda": 0.0036,
+        "go": 0.0164
+      }
     }
   }
 }
