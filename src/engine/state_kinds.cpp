@@ -765,9 +765,10 @@ static bool decl_bank_restore(pulsar_session *s, uint32_t bank) {
  *  @return the set's checkpoint store (borrowed), NULL without declared state */
 static pulsar_ckpt_store *decl_bank_kv_store(pulsar_session *s) { return s && s->states ? &s->states->ckpt : NULL; }
 
-/** pulsar_family_bank_ops::prefill_frontier.  @param s the session  @param bank the bank
+/** pulsar_family_bank_ops::prefill_frontier: the set's own per-bank fact, one for both host views (a decode step
+ *  does not move it).  @param s the session  @param bank the bank
  *  @return the bank's prefill-only history end in tokens, 0 out of range */
-static uint32_t decl_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
+static uint32_t decl_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view) {
     return s && s->states && bank < s->states->n_banks ? s->states->prefill_pos[bank] : 0u;
 }
 

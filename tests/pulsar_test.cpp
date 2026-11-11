@@ -4261,6 +4261,274 @@ static void test_multiseq_step_view(void) {
     free(e);
 }
 
+/* L380: the history a decoder in the plain batch reads to the server's history readers, over a host session.  The
+ * pool stands on bank 1, whose decoder a batch step has moved past the live view (checkpoint_valid false): the
+ * engine's read of that bank is "no history" (pulsar_bank_history), its carry -- saved as the decoder entered the
+ * batch -- holds the 600-token prompt, and the batch has committed three tokens since (gen_state::batch_pending).
+ * The readers must see that history, as they see a batch-mate's whose bank is not installed:
+ *   (1) the L261 wait: a re-send of the decoder's prompt, its client gone, waits for the decoder
+ *       (choose_slot_for_job) instead of binding the idle bank that holds half of it;
+ *   (2) the dominance matrix and the duplicate census: idle banks holding a prefix of the decoder's history -- of
+ *       its history at entry, and of its batch commits -- are dominated, and its pages are counted;
+ *   (3) the prefix wait: `have` is the decoder's prefix, so no wait starts for a leader's cut an adopt already
+ *       serves within the gain (prefix_wait_decide);
+ *   (4) the queued jobs' warm-match protection scores the decoder, not the shallower idle bank.
+ * And the read's scope: a slot not stepping in the batch (left it, finishing after a failed step) reads as before,
+ * and a carry the engine invalidated (a failed step's reset) reads no history.  Host only: the batch's own steps
+ * and the reconciliation at batch_leave are a GPU gate's. */
+static int test_bh_bank_count(pulsar_session *) { return 4; }
+static uint32_t g_test_bh_live = 1u;
+static uint32_t test_bh_live(pulsar_session *) { return g_test_bh_live; }
+static pulsar_ckpt_store *g_test_bh_store = NULL;
+static pulsar_ckpt_store *test_bh_store(pulsar_session *) { return g_test_bh_store; }
+static bool test_bh_resident(const pulsar_session *, uint32_t) { return false; }
+static KvBytes test_bh_growth(pulsar_session *, KvRows q) { return KvBytes{(uint64_t)q.raw() * 1000u}; }
+static bool test_bh_not_stale(void *, uint32_t) { return false; }
+static char *test_bh_text(pulsar_engine *, int token, size_t *len) {
+    char buf[16];
+    const int n = snprintf(buf, sizeof buf, "<%d>", token);   /* one spelling a token: no seam in these histories */
+    if (len) *len = (size_t)n;
+    return strdup(buf);
+}
+static void test_batch_history(void) {
+    static pulsar_family fam{};
+    static pulsar_family_bank_ops bops{};
+    static pulsar_family_tokenizer tok{};
+    static pulsar_kv_state_ops kops{};
+    bops.count = test_bh_bank_count;
+    bops.live = test_bh_live;
+    bops.kv_store = test_bh_store;
+    bops.prefill_frontier = k_ds4_bank_ops.prefill_frontier;   /* DeepSeek's: the host view's own fact */
+    bops.is_evicted = test_bh_resident;
+    bops.growth_bytes = test_bh_growth;
+    tok.token_text = test_bh_text;
+    kops.name = "L380 batch history test";
+    kops.resume_grid = 128u;
+    kops.split_invariant = true;
+    kops.ckpt_slots = 2u;
+    kops.stale = test_bh_not_stale;
+    fam.name = "L380 batch history test";
+    fam.caps = PULSAR_FAMILY_CAP_BANKS | PULSAR_FAMILY_CAP_CHAT;
+    fam.banks = &bops;
+    fam.tokenizer = &tok;
+    pulsar_ckpt_store *st = (pulsar_ckpt_store *)xcalloc(1, sizeof(*st));
+    st->ops = &kops;
+    g_test_bh_store = st;
+    g_test_bh_live = 1u;
+    pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
+    e->family = &fam;
+    pulsar_session *fs = (pulsar_session *)xcalloc(1, sizeof(*fs));
+    fs->engine = e;
+    fs->prefill_cap = 100u;   /* the census grid */
+    fs->bank_carry = (pulsar_bank_carry *)xcalloc(4, sizeof(*fs->bank_carry));
+    fs->bank_carry_n = 4;
+
+    /* the token streams: P the decoder's prompt; C, D, E, U continuations */
+    std::vector<int> P, lead, resend, wait_p;
+    for (int i = 0; i < 600; i++) P.push_back(1000 + i);
+    lead = P;
+    for (int i = 0; i < 200; i++) lead.push_back(3000 + i);
+    wait_p = lead;                                             /* P + C: shares 800 with the leader's prompt */
+    for (int i = 0; i < 600; i++) lead.push_back(4000 + i);    /* the leader's prompt: P + C + D, 1400 */
+    for (int i = 0; i < 500; i++) wait_p.push_back(6000 + i);  /* the waiter's: P + C + E, 1300 */
+    resend = P;
+    for (int i = 0; i < 100; i++) resend.push_back(7000 + i);  /* the re-send: P + U, 700 */
+    auto carry = [&](uint32_t bank, int n, const std::vector<int> &more) {
+        pulsar_bank_carry *c = &fs->bank_carry[bank];
+        pulsar_tokens_free(&c->checkpoint);
+        for (int i = 0; i < n; i++) token_vec_push(&c->checkpoint, P[(size_t)i]);
+        for (int t : more) token_vec_push(&c->checkpoint, t);
+        c->valid = true;
+        c->checkpoint_valid = true;
+        c->prefill_frontier = n;
+    };
+    carry(0, 300, {});            /* idle: the first half of the decoder's prompt */
+    carry(1, 600, {});            /* the decoder's bank as it entered the batch */
+    carry(2, 128, {});            /* a prefilling leader, standing at 128 */
+    carry(3, 600, {5001, 5002});  /* idle: the decoder's prompt and its first two batch commits */
+    /* the installed bank's live view: the step moved the bank past it */
+    for (int t : P) token_vec_push(&fs->checkpoint, t);
+    fs->checkpoint_valid = false;
+    fs->prefill_frontier = 600;
+
+    /* the engine's two views of the installed bank, and of one that is not */
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, 1) == NULL);
+    TEST_ASSERT(pulsar_bank_history_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
+    TEST_ASSERT(pulsar_session_bank_tokens_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
+    TEST_ASSERT(pulsar_bank_history(fs, 0) == &fs->bank_carry[0].checkpoint &&
+                pulsar_bank_history_as(fs, 0, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[0].checkpoint);
+    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == 0u &&
+                bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 600u &&
+                bops.prefill_frontier(fs, 0, PULSAR_BANK_VIEW_CURRENT) == 300u);
+    fs->bank_carry[1].prefill_frontier = 590;   /* the saved view's frontier is the carry's, not the live view's */
+    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 590u);
+    fs->bank_carry[1].prefill_frontier = 600;
+    /* a valid live view is the current read, whatever the carry says (the generic contract: not the carry) */
+    fs->checkpoint_valid = true;
+    fs->checkpoint.len = 10;
+    TEST_ASSERT(pulsar_bank_history(fs, 1) == &fs->checkpoint && pulsar_session_bank_pos(fs, 1) == TokPos{10});
+    fs->checkpoint.len = 600;
+    fs->checkpoint_valid = false;
+    {
+        pulsar_tokens pr = {resend.data(), (int)resend.size(), (int)resend.size()};
+        TEST_ASSERT(pulsar_session_bank_resume_at(fs, 1, &pr, NULL, 0).served == PromptToks{0});
+        const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        TEST_ASSERT(sv.served == PromptToks{600} && sv.at == TokPos{600} && sv.why == PULSAR_RESUME_CONTINUES);
+        /* not continued (decode rows in the history at entry): the grid checkpoint within the saved prefill */
+        fs->bank_carry[1].prefill_frontier = 520;
+        st->pos[1][0] = 512u;
+        const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
+        TEST_ASSERT(gp.served == PromptToks{512} && gp.at == TokPos{512} && gp.why == PULSAR_RESUME_POINT);
+        st->pos[1][0] = 0u;
+        fs->bank_carry[1].prefill_frontier = 600;
+    }
+
+    /* the server: bank i is slot i; slot 1 decodes in the batch, slot 2 prefills, slots 0 and 3 are idle */
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.sess = fs;
+    s.engine = e;
+    s.pool_banks = 4;
+    s.n_slots = 4;
+    s.pool_ctx_size = 4096;
+    s.slot_trivial_common_tokens = 64;
+    s.prefix_wait_ms = 1000;
+    for (int i = 0; i < 4; i++) {
+        s.slots[i].bank = (uint32_t)i;
+        s.slots[i].provisioned = true;
+        s.slots[i].ctx_size = 4096;
+    }
+    job dec_job, lead_job;
+    memset(&dec_job, 0, sizeof dec_job);
+    memset(&lead_job, 0, sizeof lead_job);
+    dec_job.fd = lead_job.fd = -1;
+    dec_job.seq = 11;
+    lead_job.seq = 12;
+    gen_state g, lg;
+    memset(&g, 0, sizeof g);
+    memset(&lg, 0, sizeof lg);
+    session_slot &dec = s.slots[1];
+    dec.active_job = &dec_job;
+    dec.gen = &g;
+    g.j = &dec_job;
+    g.phase = GEN_DECODE;
+    g.batch_active = true;
+    g.batch_feed_valid = true;
+    g.batch_feed_pos = TokPos{603};
+    for (int t : {5001, 5002, 5003}) pulsar_tokens_push(&g.batch_pending, t);
+    pulsar_tokens lead_t = {lead.data(), (int)lead.size(), (int)lead.size()};
+    session_slot &ld = s.slots[2];
+    ld.active_job = &lead_job;
+    ld.gen = &lg;
+    lg.j = &lead_job;
+    lg.phase = GEN_PREFILL_MAIN;
+    lg.prompt_for_sync = &lead_t;
+
+    /* the one read: the history at entry, then the batch's commits; the prefix match reads the former */
+    const slot_tokens h = s.slot_history(&dec);
+    TEST_ASSERT(h.base == &fs->bank_carry[1].checkpoint && h.tail == &g.batch_pending && slot_tokens_len(h) == 603);
+    TEST_ASSERT(slot_tokens_len(h) == s.slot_frontier_pos(&dec).raw());
+    pulsar_tokens resend_t = {resend.data(), (int)resend.size(), (int)resend.size()};
+    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == 600);
+    TEST_ASSERT(s.slot_common_prefix(&s.slots[0], &resend_t) == 300 && s.slot_history(&s.slots[0]).tail == NULL);
+
+    /* (1) the L261 wait: the decoder's client is gone and the re-send extends its prompt -- wait for its abandon */
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = -1;
+        j.req.prompt = resend_t;
+        j.req.max_tokens = 16;
+        g.writer.failed = true;
+        int reject_ctx = 0;
+        bool waiting = false, clobbers = false;
+        provision_refusal refusal = PROVISION_OK;
+        TEST_ASSERT(s.choose_slot_for_job(&j, &reject_ctx, &waiting, &clobbers, &refusal) == NULL);
+        TEST_ASSERT(waiting && reject_ctx == 0);
+        g.writer.failed = false;
+    }
+
+    /* (2) dominance and the census.  Slot 0 holds a prefix of the decoder's history at entry; slot 3 holds that
+     * history and two of the batch's commits, so only the commits make the decoder reach past it */
+    {
+        bool dom[PULSAR_SESSION_POOL_CAP];
+        s.dominated_slots(dom);
+        TEST_ASSERT(dom[0] && !dom[1] && dom[3]);
+        int hist_len[PULSAR_SESSION_POOL_CAP];
+        int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP];
+        bank_common_matrix(&s, hist_len, common_rows);
+        TEST_ASSERT(hist_len[0] == 300 && hist_len[1] == 603 && hist_len[2] == 128 && hist_len[3] == 602);
+        TEST_ASSERT(common_rows[0][1] == 300 && common_rows[3][1] == 602 && common_rows[1][3] == -1);
+        /* another third token on the idle bank: not the decoder's history any more */
+        fs->bank_carry[3].checkpoint.v[601] = 9999;
+        s.dominated_slots(dom);
+        TEST_ASSERT(dom[0] && !dom[1] && !dom[3]);
+        fs->bank_carry[3].checkpoint.v[601] = 5002;
+        /* the census: 3 + 6 + 1 + 6 pages of 100 held, 6 distinct (the decoder's six), the deepest pair 602 */
+        s.kv_dup_census_update();
+        TEST_ASSERT(s.m_dup.grid == 100 && s.m_dup.banks == 4 && s.m_dup.pages_resident == 16u &&
+                    s.m_dup.pages_distinct == 6u && s.m_dup.pages_duplicate == 10u && s.m_dup.longest[0] == 602);
+    }
+
+    /* (3) the prefix wait: the leader's cut the waiter could adopt is 768 (shares 800, grid 128); the decoder's
+     * prefix serves 600 now, within the adopt's gain of it -- no wait.  (4) the warm-match protection scores the
+     * decoder (600), not the idle bank (300) */
+    pulsar_tokens wait_t = {wait_p.data(), (int)wait_p.size(), (int)wait_p.size()};
+    {
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = -1;
+        j.req.prompt = wait_t;
+        TEST_ASSERT(s.slot_resume_at(&dec, &wait_t, NULL, 0).served == PromptToks{600});
+        TEST_ASSERT(!s.prefix_wait_decide(&j) && j.pw.decided && j.pw.leader == 0);
+        s.head = &j;
+        bool protect[PULSAR_SESSION_POOL_CAP] = {false};
+        s.worker_protect_queued_warm_matches(protect);
+        TEST_ASSERT(protect[1] && !protect[0] && !protect[2] && !protect[3]);
+        s.head = NULL;
+    }
+
+    /* the scope.  The same reads when the decoder's bank is not the installed one: the carry either way */
+    g_test_bh_live = 0u;
+    TEST_ASSERT(s.slot_common_prefix(&dec, &resend_t) == 600 && slot_tokens_len(s.slot_history(&dec)) == 603);
+    g_test_bh_live = 1u;
+    /* a slot that left the batch, or is finishing in it (a failed step, an abandon), reads the engine's current
+     * view -- here none, and the prefix wait then starts as it did */
+    g.phase = GEN_FINISH;
+    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == 0);
+    g.phase = GEN_DECODE;
+    g.batch_active = false;
+    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_common_prefix(&dec, &resend_t) == 0);
+    {
+        bool dom[PULSAR_SESSION_POOL_CAP];
+        s.dominated_slots(dom);
+        TEST_ASSERT(dom[0] && !dom[1] && !dom[3]);   /* slot 0 by slot 3 alone; nothing reaches past slot 3 */
+        job j;
+        memset(&j, 0, sizeof j);
+        j.fd = -1;
+        j.req.prompt = wait_t;
+        TEST_ASSERT(s.prefix_wait_decide(&j) && j.pw.leader == 12 && j.pw.mark == 768 && j.pw.have == 300);
+        lg.share_mark = 0;
+    }
+    g.batch_active = true;
+    /* a carry the engine invalidated (a failed step reset the bank) names no history, in the batch or not */
+    pulsar_bank_view_invalidate(fs, 1);
+    TEST_ASSERT(s.slot_history(&dec).base == NULL && s.slot_history(&dec).tail == NULL &&
+                slot_tokens_len(s.slot_history(&dec)) == 0 && s.slot_common_prefix(&dec, &resend_t) == 0);
+
+    pulsar_tokens_free(&g.batch_pending);
+    pthread_mutex_destroy(&s.mu);
+    pthread_mutex_destroy(&s.tool_mu);
+    fs->bank_carry_free();
+    pulsar_tokens_free(&fs->checkpoint);
+    free(fs);
+    free(e);
+    free(st);
+    g_test_bh_store = NULL;
+}
+
 /* L375 O15: the live row's validity.  A view nothing wrote a row for has none -- a fresh session, a bank saved
  * without one, an invalidated bank -- and every reader of the row refuses there through the one gate (live_dev): the
  * draws, the logprobs, the host mirror.  A bank's saved row carries its own validity across a switch (a restore used
@@ -6223,6 +6491,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
     {"--bank-carry-restore", "bank-carry-restore", "a bank carry's restore is all or nothing: a live row that fails leaves the host view untouched (L335)", test_bank_carry_restore},
     {"--multiseq-view", "multiseq-view", "a DeepSeek batch step drops the installed bank's view only when it moved that bank (a row of it, or a failed sweep); a dirty view is read, never continued (L380)", test_multiseq_step_view},
+    {"--batch-history", "batch-history", "a decoder in the plain batch reads its history at entry and the batch's commits to the L261 wait, the dominance matrix, the duplicate census and the prefix wait, installed or not; out of the batch or with an invalidated carry it reads as before (L380)", test_batch_history},
     {"--live-row", "live-row", "the live logits row's validity: every reader refuses a view with no row, a bank's saved row carries its own, invalidate clears it (L375)", test_live_row_valid},
     {"--spec-round-refusals", "spec-round-refusals", "the round API's host-side refusals: no drafter, a bank at the context, a round that cannot be walked or handed back, each undone (L375)", test_spec_round_refusals},
     {"--qwen-eos", "qwen-eos", "Qwen's eos: the tokenizer's first stop id; a tokenizer with none never loads (L335)", test_qwen_eos},

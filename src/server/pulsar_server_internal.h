@@ -2427,6 +2427,14 @@ typedef struct {
     int deferral;
 } lane_price;
 
+/** L380: a slot's bank history as the server's readers take it (server::slot_history): the engine's tokens for the
+ *  bank, then -- for a decoder stepping in the plain or mixed batch -- the tokens the batch committed since the bank
+ *  entered it, which join the engine's history only as the decoder leaves the batch.  Both borrowed. */
+struct slot_tokens {
+    const pulsar_tokens *base;   ///< the bank's history in the engine (NULL: it holds none, and `tail` is NULL too)
+    const pulsar_tokens *tail;   ///< the batch's commits past `base` (gen_state::batch_pending), or NULL
+};
+
 /** L324: a pair of banks whose shared prefix reaches this deep shares more than the client preamble (Claude Code's
  *  tools + system prompt render to ~14-25k tokens; 2026-10-23 measured 13.7-24.5k): the census logs it by bank and
  *  reports it in the `deep` class. */
@@ -2437,7 +2445,7 @@ typedef struct {
  *  prefill chunk, 4096 in production); bank b holds page p when its history covers [p*grid, (p+1)*grid) whole, and
  *  two banks hold the SAME page p when their token ids agree to (p+1)*grid -- the condition under which one physical
  *  copy could serve both (KV at a position depends on every token before it) and under which the L323 store gives
- *  their grid segments one key.  Measured from the host carries only (pulsar_session_bank_common_prefix, the
+ *  their grid segments one key.  Measured from the host histories only (server::slot_history, the read behind the
  *  route's and the dominance predicate's compare); never a GPU read.  Published under mu for /metrics. */
 struct kv_dup_census {
     int grid;                    ///< tokens per page (0: no census yet)
@@ -3605,8 +3613,8 @@ struct server {
     session_slot *hint_dead_bank();
     /** L323: which slots are DOMINATED -- a bank whose whole history is the prefix of another resident or spilled
      * bank's (bank_dominated_core, the one predicate).  The guard's spill and the make-room eviction take a
-     * dominated bank before any LRU choice.  Pure host reads (pulsar_session_bank_tokens / _common_prefix, the
-     * host-carry reads routing already uses on idle banks; no CUDA, no install); all false off the bank pool. */
+     * dominated bank before any LRU choice.  Pure host reads (server::slot_history, the read routing uses; no CUDA,
+     * no install); all false off the bank pool. */
     /// @param dominated  receives, per slot index, whether that slot is dominated
     void dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]);
     /** L324: take the duplicate-prefix census of the resident banks (kv_dup_census_core over the host carries; no
@@ -3992,6 +4000,25 @@ struct server {
     /// @param j  the job
     /// @return context in tokens, in [1, the startup ctx]
     int job_needed_ctx(const job *j) const;
+    /** L380: the slot's bank history as the server's readers take it (slot_tokens) -- the one read behind the prefix
+     *  match (routing, the L261 wait), the dominance matrix and the duplicate census.  The engine's history of the
+     *  bank; for a decoder stepping in the plain or mixed batch (server_slot_batch_decoding) the history its bank
+     *  entered the batch with, read from the carry saved at entry also when the bank is the installed one (the
+     *  engine's own read of an installed bank a batch step moved is "no history"), then the tokens the batch has
+     *  committed since.  Why that is exactly what the bank holds: at the definition. */
+    /// @param sl  the slot (NULL, unprovisioned, off the bank pool or a host-only server: no history)
+    /// @return its history (borrowed: until the worker next steps, installs or finishes anything)
+    slot_tokens slot_history(const session_slot *sl) const;
+    /** L380: where the slot's bank serves `prompt` from (pulsar_session_bank_resume_at) -- for a decoder stepping in
+     *  the batch, over the history its bank entered the batch with (slot_history's base: the resume rule reads grid
+     *  checkpoints and records within the bank's prefill, all below it), as a bank adopt from it would read it. */
+    /// @param sl        the slot (provisioned, on the bank pool)
+    /// @param prompt    the request
+    /// @param images    the request's images, or NULL
+    /// @param n_images  entries in `images`
+    /// @return where a sync of `prompt` on the bank starts and what it serves
+    pulsar_bank_resume slot_resume_at(const session_slot *sl, const pulsar_tokens *prompt,
+                                      const pulsar_image_ref *images, int n_images) const;
     /** The slot's committed KV position -- where a continuation would append.  A decoder in the plain or mixed
      *  batch (gen_state::batch_active) stands at its feed position: the engine's history of its bank is the one it
      *  entered the batch with (or none, for the installed bank) until it leaves (L380). */
@@ -5635,6 +5662,29 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.cpp; unit-tested in cli_main.cpp). */
 uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+/** L380: a decoder stepping in the plain or mixed batch: in the batch (gen_state::batch_active) and still decoding.
+ *  The scope of the saved-carry history read (server::slot_history).  Every way a batch step or the slot's install
+ *  can fail ends the decode (GEN_FINISH: a failed or rejected step, a refused draw, a bank that would not install, a
+ *  spent budget, an abandon), so a slot here has had nothing but landed steps since it entered.
+ *  @param sl the slot (NULL: false) */
+/// @return true when the slot's bank is stepped by the batch and its engine history is the one it entered with
+inline bool server_slot_batch_decoding(const session_slot *sl) {
+    return sl && sl->gen && sl->gen->batch_active && sl->gen->phase == GEN_DECODE;
+}
+/** L380: slot_tokens' length.  @param h the history */
+/// @return its tokens (0 for none)
+inline int slot_tokens_len(const slot_tokens &h) { return h.base ? h.base->len + (h.tail ? h.tail->len : 0) : 0; }
+/** L380: the tokens two slot histories share from position 0, by id.
+ *  @param a one history
+ *  @param b another */
+/// @return the shared prefix length in tokens (0 when either holds none)
+inline int slot_tokens_common(const slot_tokens &a, const slot_tokens &b) {
+    const int la = slot_tokens_len(a), lb = slot_tokens_len(b), n = la < lb ? la : lb;
+    auto at = [](const slot_tokens &h, int i) { return i < h.base->len ? h.base->v[i] : h.tail->v[i - h.base->len]; };
+    int i = 0;
+    while (i < n && at(a, i) == at(b, i)) i++;
+    return i;
+}
 /** L334: a bank's position for the scheduler -- pulsar_session_bank_pos, where a bank that holds no history (never
  *  populated or invalidated; or outside the pool, which the engine refuses by name) stands at position 0: nothing
  *  of it is reused, so routing, metrics, the prefix waits, the prefill bounds and the committed frontier read it as

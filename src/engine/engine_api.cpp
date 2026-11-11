@@ -1418,11 +1418,16 @@ pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
 uint32_t pulsar_session_live_bank(pulsar_session *s) {
     return session_banks(s)->live(s);
 }
+/** L380: pulsar_session_bank_prefill_frontier in the host view asked.  @param s the session  @param bank the bank
+ *  @param view the host view  @return the bank's prefill frontier there */
+static TokPos bank_prefill_frontier_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+    return TokPos{s ? (int)session_banks(s)->prefill_frontier(s, bank, view) : 0};
+}
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
-                                     const pulsar_image_identity *want) {
+                                     const pulsar_image_identity *want, pulsar_bank_view view) {
     if (!s || common <= 0 || prompt_len <= 0) return 0;
     uint32_t limit = (uint32_t)common;
-    const int pf = pulsar_session_bank_prefill_frontier(s, bank).raw();   /* L334: the body stays raw (P2b) */
+    const int pf = bank_prefill_frontier_as(s, bank, view).raw();   /* L334: the body stays raw (P2b) */
     const uint32_t frontier = pf < 0 ? 0u : (uint32_t)pf;
     if (limit > frontier) limit = frontier;
     if (limit > (uint32_t)prompt_len - 1u) limit = (uint32_t)prompt_len - 1u;
@@ -1437,7 +1442,7 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     uint32_t rlimit = (uint32_t)common;
     if (rlimit > frontier) rlimit = frontier;
     if (rlimit > (uint32_t)prompt_len) rlimit = (uint32_t)prompt_len;
-    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
     const pulsar_ckpt_record *r =
         h ? pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt_len, want) : NULL;
     if (r && r->T > G && (r->T == (uint32_t)prompt_len || st->ops->split_invariant)) return r->T;
@@ -1445,19 +1450,19 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
 }
 
 const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len,
-                                                       const pulsar_image_identity *want) {
+                                                       const pulsar_image_identity *want, pulsar_bank_view view) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const pulsar_tokens *h = pulsar_bank_history(s, bank);
+    const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
     /* below the prompt's end a grid checkpoint at T is the restore; AT it only a record (its logits) serves */
     if (!st || !st->ops || !h || T == 0u || (T < (uint32_t)prompt_len && pulsar_ckpt_best(st, bank, T) == T))
         return NULL;
     const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len, want);
     return r && r->T == T ? r : NULL;
 }
-bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len) {
+bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len, pulsar_bank_view view) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops || len < 0) return false;
-    return pulsar_session_bank_prefill_frontier(s, bank).raw() >= len &&   /* L334: raw body (P2b) */
+    return bank_prefill_frontier_as(s, bank, view).raw() >= len &&   /* L334: raw body (P2b) */
            (st->ops->split_invariant || (uint32_t)len % st->ops->resume_grid == 0u) &&
            !pulsar_session_bank_comp_stale(s, bank);
 }
@@ -1474,7 +1479,7 @@ bool pulsar_session_split_invariant(const pulsar_session *s) {
     return st && st->ops && st->ops->split_invariant;
 }
 TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
-    return TokPos{s ? (int)session_banks(s)->prefill_frontier(s, bank) : 0}; }
+    return bank_prefill_frontier_as(s, bank, PULSAR_BANK_VIEW_CURRENT); }
 TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = s ? pulsar_session_kv_store(s) : NULL;
     return TokPos{st && st->ops ? (int)pulsar_ckpt_end(st, bank) : 0};
@@ -1484,23 +1489,13 @@ bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     return st && st->ops && st->ops->stale(st->state, bank);
 }
-const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL); return pulsar_bank_history(s, bank); }
-/* The bank's committed history, the family's reader or DeepSeek's (the prefix readers below are
- * ONE body over it; L272 P0 folded the two copies). */
-/** The bank's committed history (pulsar_bank_history).  @param s the session  @param bank the bank
- *  @return the tokens, or NULL */
-static const pulsar_tokens *session_bank_history(pulsar_session *s, uint32_t bank) {
-    return pulsar_bank_history(s, bank);
+const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank) {
+    return pulsar_session_bank_tokens_as(s, bank, PULSAR_BANK_VIEW_CURRENT);
 }
-TokCount pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", TokCount{0});
-    return TokCount{pulsar_tokens_common_prefix(session_bank_history(s, bank), prompt)}; }
-/* L115: the prefix-reuse authority against one bank's committed history. */
-void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt, pulsar_prefix_match *out) { if (s && !pulsar_family_require(s->engine, PULSAR_FAMILY_CAP_BANKS, "per-bank state")) s = NULL;
-    if (!out) return;
-    out->live_cut = TokCount{0}; out->prompt_cut = PromptToks{0}; out->seamed = false;
-    if (!s) return;
-    const pulsar_tokens *t = session_bank_history(s, bank);
-    if (t && prompt) pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, out); }
+const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "per-bank state", NULL);
+    return pulsar_bank_history_as(s, bank, view);
+}
 int pulsar_session_note_prefilled(pulsar_session *s, const int *toks, int n, int head) {
     PULSAR_NVTX_FN();
     if (!s) return 1;
@@ -1974,22 +1969,29 @@ TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
 }
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
                                                  const pulsar_image_ref *images, int n_images) {
+    return pulsar_session_bank_resume_at_as(s, bank, PULSAR_BANK_VIEW_CURRENT, prompt, images, n_images);
+}
+pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view,
+                                                    const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                                    int n_images) {
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
     if (!s || !prompt || prompt->len <= 0) return none;
-    const pulsar_tokens *t = pulsar_bank_history(s, bank);
+    const pulsar_tokens *t = pulsar_bank_history_as(s, bank, view);
     if (!t) return none;
     if (!images) n_images = 0;
     pulsar_engine *e = s->engine;
-    /* L350: the images the bank holds -- what the sync's image rules read on it */
-    const pulsar_image_identity *held = n_images > 0 ? pulsar_session_bank_images(s, bank, pulsar_session_live_bank(s))
-                                                     : NULL;
+    /* L350: the images the bank holds -- what the sync's image rules read on it (L380: the saved view's are the
+     * carry's, as for a bank that is not installed) */
+    const pulsar_image_identity *held = n_images <= 0 ? NULL
+        : view == PULSAR_BANK_VIEW_SAVED ? &s->bank_carry[bank].live_images
+                                         : pulsar_session_bank_images(s, bank, pulsar_session_live_bank(s));
     /* every family's sync runs on the token-seam stitch (L115/L284): the bank's tokens up to the deepest shared
      * byte boundary, the prompt after it */
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(e, t->v, t->len, prompt->v, prompt->len, &m);
     /* an extension (or the same prompt) of a history the sync continues where it stands -- an image request only
      * under the licence, as the sync decides it (L268) */
-    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw())) {
+    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut.raw(), view)) {
         bool keep = true;
         if (n_images > 0) {
             pulsar_image_licence lic;
@@ -2011,9 +2013,9 @@ pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t ban
                                                        (uint32_t)prompt->len, &want);
     if (n_images > 0 && !m.seamed && !by_images)
         vision_decode_busy_reset();   /* discarded: priced from tokens alone (O34) */
-    uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL);
+    uint32_t G = pulsar_session_resume_point(s, bank, m.live_cut.raw(), len, by_images ? &want : NULL, view);
     pulsar_resume_why why = PULSAR_RESUME_POINT;
-    if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want) &&
+    if (G && by_images && !pulsar_session_resume_record(s, bank, G, len, &want, view) &&
         !pulsar_image_holds_below(e, held, prompt, images, n_images, G)) {
         G = 0;
         why = PULSAR_RESUME_IMAGES;
@@ -2060,14 +2062,15 @@ static uint32_t bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_t
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(s->engine, h->v, h->len, prompt->v, prompt->len, &m);
     *len = pulsar_prefix_match_stitched_len(&m, PromptToks{prompt->len}).raw();
-    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut.raw(), *len, NULL);   /* L350: no image adopts */
+    /* L350: no image adopts */
+    const uint32_t T = pulsar_session_resume_point(s, src, m.live_cut.raw(), *len, NULL, PULSAR_BANK_VIEW_CURRENT);
     if (T == 0u) return 0u;
     if (m.seamed) {
         pulsar_prefix_match at;
         pulsar_tokens_prefix_match(s->engine, h->v, (int)T, prompt->v, prompt->len, &at);
         if (at.live_cut != TokCount{(int)T}) return 0u;
     }
-    *rec = pulsar_session_resume_record(s, src, T, *len, NULL);
+    *rec = pulsar_session_resume_record(s, src, T, *len, NULL, PULSAR_BANK_VIEW_CURRENT);
     return T;
 }
 

@@ -1295,14 +1295,17 @@ PromptToks pulsar_tokens_prompt_held_with(pulsar_token_text_fn text, void *ud, c
  *  @param out receives the match */
 void pulsar_session_prefix_match(pulsar_session *s, const pulsar_tokens *prompt,
                                  pulsar_prefix_match *out);
-/** pulsar_tokens_prefix_match of bank `bank`'s history (installed or saved) against `prompt`.
- *  @param s the session (a bank pool family; else an empty match)
- *  @param bank the bank
- *  @param prompt the request
- *  @param out receives the match */
-void pulsar_session_bank_prefix_match(pulsar_session *s, uint32_t bank,
-                                      const pulsar_tokens *prompt,
-                                      pulsar_prefix_match *out);
+/** Tokens `t` (NULL = none) and `p` share from the start, by id.
+ *  @param t one token array, or NULL
+ *  @param p another, or NULL
+ *  @return the shared prefix length, in tokens (0 when either is NULL) */
+static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const pulsar_tokens *p) {
+    if (!t || !p) return 0;
+    const int n = t->len < p->len ? t->len : p->len;
+    int i = 0;
+    while (i < n && t->v[i] == p->v[i]) i++;
+    return i;
+}
 /** Greedy token over the session's live logits: the first finite value seeds,
  * the lowest id wins a tie. @return the id, or -1 when no logit is finite. */
 /** @param s the session */
@@ -1985,8 +1988,8 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s);
  *  @return true for a split-invariant family */
 bool pulsar_session_split_invariant(const pulsar_session *s);
 
-/** Per-bank frontier readers for a bank-pooled session: the committed length,
- * token history, and common-prefix-with-prompt of ONE bank, correct even when
+/** Per-bank frontier readers for a bank-pooled session: the committed length
+ * and token history of ONE bank, correct even when
  * that bank is not the currently-installed one (the live bank reads the live
  * checkpoint; others read their saved host carry).  pulsar_session_pos/_tokens/
  * _common_prefix describe only the live bank, so server routing and /metrics
@@ -1997,6 +2000,18 @@ bool pulsar_session_split_invariant(const pulsar_session *s);
  * L334: bank_pos is none() for a bank that holds no history -- never populated, or its view invalidated (the two
  * are one engine state: no valid checkpoint) -- and position 0 for one whose valid history is empty.  A bank outside
  * the pool is a caller's bug: refused by name (logged once) with none(). */
+/** L380: which of a bank's two host views a per-bank reader takes.  They differ only for the INSTALLED bank.
+ *  CURRENT is every reader's default (the rule above).  SAVED is the carry of the bank's last
+ *  pulsar_session_bank_state_save whichever bank is installed -- the history the bank was saved with, which the
+ *  engine cannot vouch for on the installed bank: a sync, a rewind, an adopt, a payload load or an invalidate of it
+ *  since the save moved its rows and not the carry.  It is a prefix of what the bank holds only for a caller that
+ *  saved the bank with a valid view and has since done nothing to it but append rows, the caller's to know: the
+ *  server's decoders in the plain and mixed batch (pulsar_session_decode_mixed moves the installed bank past its
+ *  live view, so CURRENT reads no history for it until it is installed again). */
+typedef enum {
+    PULSAR_BANK_VIEW_CURRENT = 0,   ///< the live view for the installed bank, else the bank's saved carry
+    PULSAR_BANK_VIEW_SAVED,         ///< the bank's saved carry, also for the installed bank
+} pulsar_bank_view;
 /** @param s the session
  *  @param bank the bank
  *  @return its committed length, or none() */
@@ -2019,12 +2034,13 @@ TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank);
  *  @param bank the bank
  *  @return the session-owned history, or NULL (out of range, never populated, no bank pool) */
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, uint32_t bank);
-/** The tokens bank `bank`'s history and `prompt` share from position 0, by id.
+/** L380: pulsar_session_bank_tokens in the host view asked (pulsar_bank_view: who may ask for the saved one).
  *  @param s the session
  *  @param bank the bank
- *  @param prompt the prompt
- *  @return the shared length (0 for a bad bank) */
-TokCount pulsar_session_bank_common_prefix(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt);
+ *  @param view the host view
+ *  @return the session-owned history, or NULL (as pulsar_session_bank_tokens; a saved view never saved, or saved
+ *          invalid) */
+const pulsar_tokens *pulsar_session_bank_tokens_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
 /** True when `bank`'s compressor state is stale: a rewind into a group the
  * verify saves and the projection ring do not cover (on the pair: a 1-token ghost
  * rewind from a ratio-128 group boundary).  Such a bank can only be extended from
@@ -2148,7 +2164,7 @@ typedef struct {
 /** L266: where a sync of `prompt` on `bank` starts its prefill -- the prompt tokens the bank's state serves,
  *  and (L325) the router's score for the bank, so the route ranks banks by the rule their syncs resume by,
  *  every family by one rule (L284; DeepSeek answered -1 before and its callers trusted the byte match).  The
- *  sync runs on the token-seam stitch (pulsar_session_bank_prefix_match): an extension of a history the bank
+ *  sync runs on the token-seam stitch (pulsar_tokens_prefix_match): an extension of a history the bank
  *  continues where it stands (prefilled whole, at a cut the model's prefill reproduces, its state live) serves
  *  the whole match; anything else serves its deepest grid checkpoint within the match, the prefill-only history
  *  and the stitched prompt's length - 1, else nothing (0).  L334: both currencies (pulsar_bank_resume); the route's
@@ -2164,6 +2180,20 @@ typedef struct {
  *  @return where the sync starts and what it serves */
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
                                                  const pulsar_image_ref *images, int n_images);
+/** L380: pulsar_session_bank_resume_at over the host view asked (pulsar_bank_view): the bank's history, its prefill
+ *  frontier and its image records are that view's; its grid checkpoints and records are the store's either way.  The
+ *  saved view of the installed bank answers as the bank would were another bank installed -- what a bank adopt from
+ *  it reads.
+ *  @param s the session
+ *  @param bank the bank
+ *  @param view the host view
+ *  @param prompt the request
+ *  @param images the request's images (start_pos set), or NULL for a text request
+ *  @param n_images entries in `images`
+ *  @return where the sync starts and what it serves */
+pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view,
+                                                    const pulsar_tokens *prompt, const pulsar_image_ref *images,
+                                                    int n_images);
 /** Restore the installed bank to its grid checkpoint at `G` (the L264 notes above).
  *  @param s the session
  *  @param G the checkpoint position (> 0)

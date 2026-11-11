@@ -323,8 +323,9 @@ typedef struct {
     bool (*restore)(pulsar_session *s, uint32_t bank);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
-    /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit). */
-    uint32_t (*prefill_frontier)(pulsar_session *s, uint32_t bank);
+    /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit), in the host view
+     *  asked (L380, pulsar_bank_view: a family that keeps the fact in the host view reads the saved one's). */
+    uint32_t (*prefill_frontier)(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
     /** L266: the bank sync / eval run on (the store's walk reads and writes this one). */
     uint32_t (*live)(pulsar_session *s);
     /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share

@@ -13280,6 +13280,39 @@ static void test_l380_batch_frontier(void) {
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 3 &&
                 lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && !strcmp(lp.why, "measured: the lane in force holds"));
+
+    /* the history readers' scope (server::slot_history): in the batch AND still decoding -- every failed step,
+     * refused draw, abandon or bank that would not install ends the decode, and the slot then reads as any other */
+    g.phase = GEN_DECODE;
+    g.batch_active = true;
+    TEST_ASSERT(server_slot_batch_decoding(&sl) && !server_slot_batch_decoding(NULL));
+    g.phase = GEN_FINISH;
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    g.phase = GEN_DECODE;
+    g.batch_active = false;   /* on the spec lane */
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    g.batch_active = true;
+    sl.gen = NULL;
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    sl.gen = &g;
+    /* a host-only server reads no engine history, in the batch or not (the readers over a session:
+     * pulsar_test --batch-history) */
+    s.pool_banks = 2;
+    TEST_ASSERT(s.slot_history(&sl).base == NULL && s.slot_history(&sl).tail == NULL);
+    pulsar_tokens any = {0};
+    TEST_ASSERT(s.slot_common_prefix(&sl, &any) == 0);
+    s.pool_banks = 0;
+    /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
+    int bv[4] = {1, 2, 3, 4}, tv[2] = {5, 6}, wv[6] = {1, 2, 3, 4, 5, 7};
+    pulsar_tokens b = {bv, 4, 4}, t = {tv, 2, 2}, w = {wv, 6, 6}, t0 = {0};
+    const slot_tokens two = {&b, &t}, flat = {&w, NULL}, entry = {&b, NULL}, fresh = {&b, &t0}, none = {NULL, NULL};
+    TEST_ASSERT(slot_tokens_len(two) == 6 && slot_tokens_len(entry) == 4 && slot_tokens_len(fresh) == 4 &&
+                slot_tokens_len(none) == 0);
+    TEST_ASSERT(slot_tokens_common(two, flat) == 5 && slot_tokens_common(flat, two) == 5);   /* parts inside the tail */
+    TEST_ASSERT(slot_tokens_common(two, entry) == 4 && slot_tokens_common(two, two) == 6);
+    TEST_ASSERT(slot_tokens_common(two, none) == 0 && slot_tokens_common(none, flat) == 0);
+    wv[1] = 9;   /* parts inside the base */
+    TEST_ASSERT(slot_tokens_common(two, flat) == 1);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
