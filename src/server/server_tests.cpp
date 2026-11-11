@@ -8187,6 +8187,73 @@ static void test_l280_kv_identity_rope(void) {
     rmdir(dir);
 }
 
+/// L386: the store's log lines, captured (a pulsar_segstore_log_fn).
+/// @param ud  the std::vector<std::string> that receives them
+/// @param msg one line
+static void l386_log(void *ud, const char *msg) { static_cast<std::vector<std::string> *>(ud)->push_back(msg); }
+
+/* L386: the store identity carries the arithmetic that computed the bytes -- the compute capability, the cuBLASLt
+ * version, the CUDA runtime version -- beside the model word.  The identity differs when any one word differs and
+ * not otherwise; a store opened under another identity indexes none of the segments or restore points (left alone,
+ * not removed) and says so ONCE at the open, naming both identities word by word; the writer's identity reads them
+ * all again.  The values are injected: which values a device reports (pulsar_gpu_arithmetic) only a GPU run shows. */
+static void test_l386_kv_identity_arithmetic(void) {
+    const pulsar_segstore_ident base(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050);
+    const pulsar_segstore_ident same(pulsar_segstore_identity(2, 36, 0), 121, 130500, 13050);
+    const pulsar_segstore_ident others[] = {
+        {pulsar_segstore_identity(3, 36, 0), 121, 130500, 13050},              /* another model */
+        {pulsar_segstore_identity(2, 4, 0), 121, 130500, 13050},               /* another routed format */
+        {pulsar_segstore_identity(2, 36, 0x1234abcdull), 121, 130500, 13050},  /* another rope */
+        {pulsar_segstore_identity(2, 36, 0), 120, 130500, 13050},              /* another GPU */
+        {pulsar_segstore_identity(2, 36, 0), 121, 130501, 13050},              /* another cuBLASLt */
+        {pulsar_segstore_identity(2, 36, 0), 121, 130500, 13060},              /* another CUDA runtime */
+    };
+    TEST_ASSERT(base == same && !(base != same));
+    for (const pulsar_segstore_ident &o : others) TEST_ASSERT(o != base && !(o == base));
+    /* a bare model word is the identity with no arithmetic recorded, as the host tests' stores open */
+    TEST_ASSERT(pulsar_segstore_ident(base.model) != base && pulsar_segstore_ident(base.model).cc == 0u);
+
+    char tmpl[] = "/tmp/pulsar-seg-arith.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char root[41], err[256];
+    pulsar_segstore *st = pulsar_segstore_open(dir, 0, base, NULL, NULL);
+    TEST_ASSERT(st && test_seg_put(st, "", 0, 128, "SYSTEM:", 100, 0x11, root));
+    test_seg_payload rp = {64, 0x55};
+    TEST_ASSERT(pulsar_segstore_put_rp(st, root, 64, 0, test_seg_write, &rp, err, sizeof err));
+    pulsar_segstore_close(st);
+    for (const pulsar_segstore_ident &o : others) {
+        std::vector<std::string> lines;
+        pulsar_segstore *other = pulsar_segstore_open(dir, 0, o, l386_log, &lines);
+        TEST_ASSERT(other && pulsar_segstore_count(other) == 0);
+        pulsar_segstore_close(other);
+        int said = 0;
+        for (const std::string &l : lines) {
+            if (l.find("of another identity set aside") == std::string::npos) continue;
+            said++;
+            TEST_ASSERT(l.find(": 1 segments of another identity set aside") != std::string::npos);
+            TEST_ASSERT(l.find("written by [model id 2, routed bits 36, rope fold 0, cc 12.1, cuBLASLt 130500, CUDA "
+                               "runtime 13050]") != std::string::npos);
+            char want[200];
+            snprintf(want, sizeof want, "this process is [model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt "
+                     "%u, CUDA runtime %u]", (o.model >> 8) & 0xffffu, o.model & 0xffu, o.model >> 24, o.cc / 10,
+                     o.cc % 10, o.cublaslt, o.cudart);
+            TEST_ASSERT(l.find(want) != std::string::npos);
+        }
+        TEST_ASSERT(said == 1);
+    }
+    /* left alone: the writer's identity indexes the segment and its restore point again, and says nothing of it */
+    std::vector<std::string> lines;
+    st = pulsar_segstore_open(dir, 0, base, l386_log, &lines);
+    pulsar_segstore_seg e;
+    TEST_ASSERT(st && pulsar_segstore_count(st) == 1 && pulsar_segstore_get(st, root, &e) && e.rp_bytes > 0);
+    for (const std::string &l : lines) TEST_ASSERT(l.find("another identity") == std::string::npos);
+    pulsar_segstore_drop(st, root);
+    pulsar_segstore_close(st);
+    rmdir(dir);
+}
+
 /* L323: where a persist ends segments -- the canonical grid.  Every multiple of the grid past the stored chain up to
  * the deepest checkpoint, then (closing) the tail to that checkpoint; never a cut where the writer's own checkpoints
  * fell (2026-10-24: copies cut at turn ends -- [7808,7936) [7936,8064) ... -- deduped nothing). */
@@ -17177,6 +17244,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_segstore_reserve_commit();
     test_l338_kv_writer_lifecycle();
     test_l280_kv_identity_rope();
+    test_l386_kv_identity_arithmetic();
     test_l323_kvchain_segment_ends();
     test_l323_grid_cut_dedupes_copies();
     test_l323_tail_supersession();

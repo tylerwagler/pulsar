@@ -536,11 +536,12 @@ void kv_ram_plan_for(int integrated, uint64_t mem_total, int64_t ram_mb, uint64_
 /// @param kc         the cache (zeroed first)
 /// @param dir        the store directory (copied)
 /// @param budget_mb  the store's byte budget, MiB
-/// @param identity   the model identity segments are keyed to (a different model's segments do not load)
+/// @param identity   the identity segments are keyed to (pulsar_engine_kv_identity: the model and the arithmetic; a
+///                   segment of another is set aside, not loaded)
 /// @param opt        the checkpoint policy
 /// @param ram        L347 I3a: the host memory pool's plan (kv_ram_plan_for)
 /// @return false when the store would not open or its pool could not be pinned (the cache stays disabled)
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, const pulsar_segstore_ident &identity,
                    kv_cache_options opt, kv_ram_plan ram) {
     memset(kc, 0, sizeof(*kc));
     kc->opt = opt;

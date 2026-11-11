@@ -380,9 +380,15 @@ Format (`src/lib/pulsar_segstore.h`, `src/lib/pulsar_kvchain.h`):
   segment. Copies and branches of a conversation therefore deduplicate.
 - **Lookup.** A lookup returns the deepest chain whose text is a byte prefix of
   the request and whose last segment carries a state.
-- **Identity.** A store records the model, its routed-expert format and its rope.
-  Segments of another identity or payload version (segment v8, restore point
-  v2, store v4) are refused and rewritten, never converted.
+- **Identity.** A store records the model, its routed-expert format and its rope,
+  and (L386) the arithmetic that computed the bytes: the GPU's compute
+  capability, the cuBLASLt version and the CUDA runtime version. A server opened
+  on a store written under another identity (a CUDA or cuBLASLt upgrade, another
+  GPU) indexes none of those segments: it says so once at open, naming both
+  identities, and leaves the files alone. Files of an older store format
+  (`.seg` v6, `.rp` v4 since L386) are removed at open; payloads of another
+  engine version (segment v9, KV payload v8) are refused and rewritten, never
+  converted.
 - **Restore.** A restore loads in slices between decode rounds, so other
   sessions keep decoding (L330). The chain is pinned against eviction while it
   loads. When the bank holds a history the request could resume from, every

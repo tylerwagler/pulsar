@@ -26,17 +26,22 @@
 namespace {
 
 /* Fixed header, little-endian:
- *   0 magic, 4 version, 8 identity, 12 flags, 16 key[40], 56 parent[40],
+ *   0 magic, 4 version, 8 identity's model word, 12 flags, 16 key[40], 56 parent[40],
  *   96 G_prev, 100 G, 104 text_len u64, 112 payload_bytes u64,
- *   120 trailer_bytes u64, 128 hits u32, 132 pad, 136 created u64,
- *   144 last_used u64, 152 pad u64 (v2's state_bytes; 0 since v3, L347)  -> 160 bytes. */
+ *   120 trailer_bytes u64, 128 hits u32, 132 identity's cc (v6; a pad before), 136 created u64,
+ *   144 last_used u64, 152 identity's cuBLASLt | CUDA runtime << 32 (v6; v2's state_bytes, then 0)  -> 160 bytes. */
 /// Bytes of the fixed .seg header (layout above); the text starts at this offset.
 constexpr size_t HDR = 160;
 /* L347: a restore point file's header, little-endian:
- *   0 magic, 4 version, 8 identity, 12 flags (PULSAR_SEGSTORE_RP_*, v2), 16 key[40], 56 payload_bytes u64  -> 64
- *   bytes; the engine's restore point payload follows. */
+ *   0 magic, 4 version, 8 identity's model word, 12 flags (PULSAR_SEGSTORE_RP_*, v2), 16 key[40], 56 payload_bytes
+ *   u64, 64 identity's cc (v4), 68 pad, 72 identity's cuBLASLt | CUDA runtime << 32 (v4)  -> 80 bytes; the engine's
+ *   restore point payload follows. */
 /// Bytes of the fixed .rp header (layout above); the payload starts at this offset.
-constexpr size_t RP_HDR = 64;
+constexpr size_t RP_HDR = 80;
+/// Where a .seg header's identity words sit (model word, cc, the two library versions as one u64).
+constexpr size_t SEG_ID_AT[3] = {8, 132, 152};
+/// Where a .rp header's identity words sit.
+constexpr size_t RP_ID_AT[3] = {8, 64, 72};
 /** L347 I2: the bytes of a segment's text the index keeps (pulsar_segstore::heads), so pulsar_segstore_covers reads a
  *  segment's file only when they match: a store of one-shot prompts holds many root tails that share a template's
  *  first bytes and part soon after them. */
@@ -50,6 +55,32 @@ void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t
 uint32_t get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 /** @param p 8 little-endian bytes @return their value */
 uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+
+/** Write an identity into a header at `at` (SEG_ID_AT / RP_ID_AT).
+ *  @param h  the header
+ *  @param at where its three fields sit
+ *  @param id the identity */
+void put_ident(uint8_t *h, const size_t at[3], const pulsar_segstore_ident &id) {
+    put32(h + at[0], id.model);
+    put32(h + at[1], id.cc);
+    put64(h + at[2], (uint64_t)id.cublaslt | (uint64_t)id.cudart << 32);
+}
+/** @param h  a header
+ *  @param at where its identity's three fields sit (SEG_ID_AT / RP_ID_AT)
+ *  @return the identity it carries */
+pulsar_segstore_ident get_ident(const uint8_t *h, const size_t at[3]) {
+    const uint64_t libs = get64(h + at[2]);
+    return pulsar_segstore_ident(get32(h + at[0]), get32(h + at[1]), (uint32_t)libs, (uint32_t)(libs >> 32));
+}
+/** An identity, word by word, for the open's line: the model word's fields and the arithmetic.
+ *  @param id  the identity
+ *  @param out receives the text
+ *  @param n   bytes at `out` */
+void describe_ident(const pulsar_segstore_ident &id, char *out, size_t n) {
+    snprintf(out, n, "model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt %u, CUDA runtime %u",
+             (id.model >> 8) & 0xffffu, id.model & 0xffu, id.model >> 24, id.cc / 10, id.cc % 10, id.cublaslt,
+             id.cudart);
+}
 
 /** @param s at least 40 chars
  *  @return true when s[0..40) is all lowercase hex (a well-formed key) */
@@ -69,8 +100,8 @@ struct pulsar_segstore {
     std::string dir;
     /// Bytes of .seg and .rp files the store may hold (0 = unbounded)
     uint64_t budget = 0;
-    /// The store identity (pulsar_segstore_identity) a header must carry
-    uint32_t identity = 0;
+    /// The store identity (pulsar_segstore_ident) a header must carry
+    pulsar_segstore_ident identity;
     /// Log sink (NULL = silent)
     pulsar_segstore_log_fn log = nullptr;
     /// Context for `log`
@@ -154,7 +185,7 @@ struct pulsar_segstore {
      *  @param fmt printf format */
     void logf(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
         if (!log) return;
-        char msg[512];
+        char msg[1024];
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(msg, sizeof msg, fmt, ap);
@@ -185,7 +216,7 @@ struct pulsar_segstore {
      *  @return false on another magic / version / identity, a malformed key, or an empty span */
     bool parse_header(const uint8_t *h, pulsar_segstore_seg *e, uint32_t *flags) const {
         if (get32(h) != PULSAR_SEGSTORE_MAGIC || get32(h + 4) != PULSAR_SEGSTORE_VERSION) return false;
-        if (get32(h + 8) != identity) return false;
+        if (get_ident(h, SEG_ID_AT) != identity) return false;
         memset(e, 0, sizeof *e);
         *flags = get32(h + 12);
         memcpy(e->key, h + 16, 40);
@@ -227,7 +258,7 @@ struct pulsar_segstore {
             *older = get32(h + 4) < PULSAR_SEGSTORE_RP_VERSION;
             return false;
         }
-        if (get32(h + 8) != identity) return false;
+        if (get_ident(h, RP_ID_AT) != identity) return false;
         memcpy(key, h + 16, 40);
         key[40] = '\0';
         *flags = get32(h + 12);
@@ -654,7 +685,7 @@ struct pulsar_segstore {
     }
 };
 
-pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, uint32_t identity,
+pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, const pulsar_segstore_ident &identity,
                                       pulsar_segstore_log_fn log, void *log_ud) {
     if (!dir || !dir[0]) return nullptr;
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return nullptr;
@@ -686,7 +717,8 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
     st->log_ud = log_ud;
     DIR *d = opendir(dir);
     if (!d) { delete st; return nullptr; }
-    uint64_t retired = 0, retired_bytes = 0;
+    uint64_t retired = 0, retired_bytes = 0, foreign_n = 0;
+    pulsar_segstore_ident foreign;   /* the first segment of another identity met */
     std::vector<std::string> rps;   /* L347: the .rp files, indexed once every .seg is */
     while (const struct dirent *de = readdir(d)) {
         const size_t n = strlen(de->d_name);
@@ -716,9 +748,15 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
          * 2026-10-13) and its bytes sit outside the budget: removed, whatever model wrote it */
         bool older = false;
         if (!ok) {
-            uint8_t h[8];
-            older = fseek(fp, 0, SEEK_SET) == 0 && fread(h, 1, 8, fp) == 8 && get32(h) == PULSAR_SEGSTORE_MAGIC &&
-                    get32(h + 4) < PULSAR_SEGSTORE_VERSION;
+            uint8_t h[HDR];
+            const size_t got = fseek(fp, 0, SEEK_SET) == 0 ? fread(h, 1, HDR, fp) : 0u;
+            const bool ours = got >= 8 && get32(h) == PULSAR_SEGSTORE_MAGIC;
+            older = ours && get32(h + 4) < PULSAR_SEGSTORE_VERSION;
+            /* L386: this version's segment of another identity -- another model, or the same model's KV computed by
+             * other arithmetic -- is left alone, and said once below */
+            if (ours && got == HDR && get32(h + 4) == PULSAR_SEGSTORE_VERSION && get_ident(h, SEG_ID_AT) != identity &&
+                !foreign_n++)
+                foreign = get_ident(h, SEG_ID_AT);
         }
         fclose(fp);
         if (older && ::unlink(p.c_str()) == 0) {
@@ -737,6 +775,13 @@ pulsar_segstore *pulsar_segstore_open(const char *dir, uint64_t budget_bytes, ui
     if (retired)
         st->logf("segment store %s: removed %llu segments of an older store version (%llu MiB)", dir,
                  (unsigned long long)retired, (unsigned long long)(retired_bytes >> 20));
+    if (foreign_n) {
+        char theirs[192], ours[192];
+        describe_ident(foreign, theirs, sizeof theirs);
+        describe_ident(identity, ours, sizeof ours);
+        st->logf("segment store %s: %llu segments of another identity set aside (not indexed, not removed): the "
+                 "first was written by [%s], this process is [%s]", dir, (unsigned long long)foreign_n, theirs, ours);
+    }
     /* L347: a restore point joins its indexed segment; one whose .seg file is gone, of an older store version, or not
      * readable beside an indexed segment can never load and is removed; one beside another identity's (or an
      * unreadable) segment is left alone, as that segment is */
@@ -1063,7 +1108,7 @@ int pulsar_segstore_reserve_images(pulsar_segstore *st, const char *parent, uint
     const uint64_t now = (uint64_t)time(nullptr);
     put32(h, PULSAR_SEGSTORE_MAGIC);
     put32(h + 4, PULSAR_SEGSTORE_VERSION);
-    put32(h + 8, st->identity);
+    put_ident(h, SEG_ID_AT, st->identity);
     put32(h + 12, trailer_bytes ? PULSAR_SEGSTORE_FLAG_TRAILER : 0u);
     memcpy(h + 16, key, 40);
     if (j->parent[0]) memcpy(h + 56, j->parent, 40);
@@ -1145,7 +1190,7 @@ int pulsar_segstore_reserve_rp(pulsar_segstore *st, const char key[41], uint64_t
     memset(h, 0, RP_HDR);
     put32(h, PULSAR_SEGSTORE_RP_MAGIC);
     put32(h + 4, PULSAR_SEGSTORE_RP_VERSION);
-    put32(h + 8, st->identity);
+    put_ident(h, RP_ID_AT, st->identity);
     put32(h + 12, joined);
     memcpy(h + 16, key, 40);
     put64(h + 56, rp_bytes);

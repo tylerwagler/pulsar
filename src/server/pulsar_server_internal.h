@@ -184,8 +184,8 @@
  * one (a write costs the new tokens, never the history), at prompt end, on
  * progress (one prefill chunk at a time), at the system-prefix cut, on evict and on a Tier-2 spill -- always
  * from checkpoints the live bank already holds; the session is never rolled
- * back to build an entry.  The store is keyed by pulsar_segstore_identity
- * (model + routed-expert format), evicts least-recently-used LEAVES first, and
+ * back to build an entry.  The store is keyed by pulsar_engine_kv_identity
+ * (model, routed-expert format, rope + L386 the device's arithmetic), evicts least-recently-used LEAVES first, and
  * (L347 I3a) writes behind with O_DIRECT from a pinned host pool -- on a
  * discrete-GPU host also the RAM tier the restores read first.
  *
@@ -5512,7 +5512,7 @@ void id_list_push_unique(stop_list *ids, const char *id);
 void id_list_free(stop_list *ids);
 void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids);
 char *path_join(const char *dir, const char *name);
-bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, uint32_t identity,
+bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb, const pulsar_segstore_ident &identity,
                    kv_cache_options opt, kv_ram_plan ram);
 void kv_cache_close(kv_disk_cache *kc);
 /** L338: index the segments the background writer has finished (the store's thread: the worker, or the close). */

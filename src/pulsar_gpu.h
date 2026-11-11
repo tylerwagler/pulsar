@@ -167,6 +167,15 @@ int pulsar_gpu_init(void);
  *  @param need   receives a static string naming the requirement on a 0 return; may be NULL
  *  @return 1 when the device can run the layout, else 0 */
 int pulsar_gpu_layout_supported(uint32_t layout, const char **need);
+/** L386: what decides the prompt arm's arithmetic on this device beyond the engine's own code: the device's compute
+ *  capability (its kernels and the fixed GEMM's recorded picks are chosen by it), the cuBLASLt version (the picks are
+ *  keyed by it, and an unrecorded shape takes cuBLASLt's first suggestion, which the library may change) and the CUDA
+ *  runtime version.  The disk-KV store identity carries them (pulsar_engine_kv_identity), so KV bytes written by other
+ *  arithmetic are never resumed as this process's.
+ *  @param cc       receives the compute capability, major * 10 + minor (pulsar_cuda_device_cc; 0 if unknown)
+ *  @param cublaslt receives cublasLtGetVersion()
+ *  @param cudart   receives cudaRuntimeGetVersion() (0 if it fails) */
+void pulsar_gpu_arithmetic(uint32_t *cc, uint32_t *cublaslt, uint32_t *cudart);
 /** @brief Synchronize the device, clear the routed-expert flags and weight caches and free the model arenas
  *  (process teardown, or before another engine opens in the same process). */
 void pulsar_gpu_cleanup(void);

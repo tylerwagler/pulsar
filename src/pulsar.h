@@ -508,12 +508,14 @@ void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out);
 /** @param e the engine
  *  @return the shape id */
 int pulsar_engine_model_id(pulsar_engine *e);
-/** L280: the identity a disk-KV segment store is opened with (pulsar_segstore_identity): the model id, the routed
- *  experts' format and the rope the loaded positions run (the family's rope_id -- Qwen under YaRN).  The one
- *  answer every store opener asks; a store of another identity is not indexed. */
+struct pulsar_segstore_ident;
+/** L280: the identity a disk-KV segment store is opened with (pulsar_segstore_ident, lib/pulsar_segstore.h): the model
+ *  id, the routed experts' format and the rope the loaded positions run (the family's rope_id -- Qwen under YaRN),
+ *  and (L386) the arithmetic this device runs them with (pulsar_gpu_arithmetic: compute capability, cuBLASLt and CUDA
+ *  runtime versions).  The one answer every store opener asks; a store file of another identity is not indexed. */
 /** @param e the engine
  *  @return the store identity */
-uint32_t pulsar_engine_kv_identity(pulsar_engine *e);
+pulsar_segstore_ident pulsar_engine_kv_identity(pulsar_engine *e);
 /** True when the loaded model is expert-pruned (REAP compact: some layers carry
  * fewer physical routed experts than the architecture's n_expert). Fidelity
  * tests against full-model reference vectors are meaningless when true. */
