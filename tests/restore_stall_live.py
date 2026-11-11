@@ -9,20 +9,29 @@ Before L330 a request whose resume pick was the disk chain read the whole chain 
 10-22..10-24 production log: 24 loads over 5 s, the longest 24.0 s, the log silent through it).  Now the chain loads
 a slice of segments per worker turn, the job in GEN_RESTORE between decode rounds.
 
-The shape, on one server with the disk tier (its hooks instance: PULSAR_SERVER_KV_RESTORE_SLICE_MS=--slice-ms, the
-slice's test hook, so a chain a few GiB long -- what --ctx 262144 holds -- reads in many slices; production's slice is
-one prefill chunk's priced time, which a 1M-token chain spans several of):
-  C   a ~--tokens raw prompt (the story fixture behind a nonce, repeated: nothing stored serves it), its client hangs up
-      once 90% of its prefill is done -- the abandon stores the computed prefix as a chain (L318) and leaves the bank
-      invalid, so the identical re-send can only resume from the DISK chain
-  D   a greedy chat stream decoding 1500 tokens; the page cache is dropped (the read comes from the disk), and once D
-      has decoded 40 tokens, C is re-sent (1 token out)
+The shape, on two servers on ONE disk store (live_legs' warm instance and its restart, the hooks instance:
+PULSAR_SERVER_KV_RESTORE_SLICE_MS=--slice-ms, the slice's test hook, so a chain a few GiB long -- what --ctx 262144
+holds -- reads in many slices; production's slice is one prefill chunk's priced time, which a 1M-token chain spans
+several of):
+  warm   C, a ~--tokens raw prompt (the story fixture behind a nonce, repeated: nothing stored serves it); its client
+         hangs up once 90% of its prefill is done, and the abandon stores the computed prefix as a chain (L318).  The
+         bank KEEPS that prefix (L353 no. 9, v0.5.0: a client gone is no fault of the bank's; resume-fixes' disconnect
+         case asserts it), so on this server the re-send resumes from memory and reads nothing.  The instance stops.
+  hooks  the restart on the same store, every bank empty: the disk chain is the only state that holds C.
+         D, a greedy chat stream decoding 1500 tokens; the page cache is dropped (the read comes from the disk), and
+         once D has decoded for 3 s, C is re-sent (1 token out) -- its resume pick must be the disk chain.
   /metrics is polled at 50 Hz throughout: the restore window is where a slot's phase reads "restore", the reservation
   is kv_reserved_bytes - kv_touched_bytes there.
 
+Until 2026-11-11 (L388) C's abandon and re-send ran on one server: the abandon used to invalidate the bank, so the
+re-send could only resume from disk.  From v0.5.0 (d3e488fe, L353 no. 9) the bank keeps the prefix, the re-send's
+pick was `own` at the chain's depth, no restore ran, and the leg failed "no restore / hit line" -- correct, cheaper
+serving and a stale precondition.  The restart forces the disk tier on purpose (resume-deepest's fix, 54b04687).
+
 Checks (must-pass):
-  * LANE (rule 5): the server announces the sliced restore and the hook's slice; C's re-send loads its chain from disk
-    ("kv cache hit chain ... in S slices"), the chain at least --min-gib and S >= 4.
+  * LANE (rule 5): the server announces the sliced restore and the hook's slice; the restart holds nothing of C in
+    memory (the re-send's `resume:` line picks disk, at or past the stored chain); C's re-send loads
+    its chain from disk ("kv cache hit chain ... in S slices"), the chain at least --min-gib and S >= 4.
   * BOUND: D's longest inter-token gap inside the restore window <= the longest slice (/metrics
     kv_restore_stall_max_seconds) + one decode round (max(0.5 s, 4 x D's median gap outside the window)) -- about one
     slice, not the whole read.
@@ -31,7 +40,8 @@ Checks (must-pass):
     reserves its chain's room from bind, L328's base).
   * C's re-send and D answer 200, D with all 1500 tokens.
 
-Alone (this command line, make restore-stall-live) it runs on an instance of its own.  Exit 0 only on PASS."""
+Alone (this command line, make restore-stall-live) it runs through live_legs.standalone: the warm instance, then its
+restart (two loads).  Exit 0 only on PASS."""
 import os, random, re, socket, json, sys, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +64,7 @@ class RestoreStallLeg(Leg):
     def __init__(self, g, work, tokens=200000, slice_ms=250, min_gib=1.5, tag=None):
         Leg.__init__(self, g, work)
         self.tokens, self.slice_ms, self.min_gib = tokens, slice_ms, min_gib
+        self.text, self.stored = None, None   # C's prompt and its stored chain's end, kept by warm() for the restart
 
     def hook_env(self):
         return {"PULSAR_SERVER_KV_RESTORE_SLICE_MS": str(self.slice_ms)}
@@ -90,16 +101,23 @@ class RestoreStallLeg(Leg):
             time.sleep(0.2)
         return None, at
 
+    def warm(self, srv):
+        """C's abandon on the warm instance: its chain goes to the store the restart starts on"""
+        text = self.prompt()
+        stored, at = self.abandon(srv, text)
+        if self.g.check(stored is not None, "C abandoned at %s of its prefill stored its prefix: chain to %s"
+                        % ("%d/%d" % at if at else "?", stored)):
+            self.text, self.stored = text, stored
+
     def hooked(self, srv):
+        """the restart: every bank empty, so C's re-send can resume only from its disk chain -- in slices, beside D"""
         log0 = srv.text()
         self.g.check("restores are SLICED between rounds" in log0 and "%d ms reads" % self.slice_ms in log0,
                      "the server announces the sliced restore at the hook's %d ms slice" % self.slice_ms)
-        per_tok = srv.metrics().get("pulsar:kv_bank_bytes", 0.0) / max(1, srv.ctx)
-        text = self.prompt()
-        stored, at = self.abandon(srv, text)
-        if not self.g.check(stored is not None, "C abandoned at %s of its prefill stored its prefix: chain to %s"
-                            % ("%d/%d" % at if at else "?", stored)):
+        if not self.g.check(self.stored is not None, "the warm phase left C's prompt and its stored chain for the restart"):
             return
+        text, stored = self.text, self.stored
+        per_tok = srv.metrics().get("pulsar:kv_bank_bytes", 0.0) / max(1, srv.ctx)
         # D decodes; the page cache dropped, so the restore reads the disk
         drop_caches()
         res, samples, stop = {}, [], threading.Event()
@@ -140,7 +158,13 @@ class RestoreStallLeg(Leg):
         self.g.check(len(d.get("stamps", [])) > 0 and d.get("tokens", 0) == GEN_D,
                      "D decoded all its %d tokens (%d)" % (GEN_D, d.get("tokens", 0)))
         self.g.check(rc.get("first_evt") is not None, "C's re-send answered")
-        # LANE
+        # LANE: the precondition first -- nothing in memory serves C on the restart, its pick is the disk chain
+        pick = re.findall(r"resume: bank \d+ own (-?\d+) adopt (-?\d+)(?: \(none\))? disk (-?\d+) of \d+ "
+                          r"\(match -?\d+\) -> (\w+)", log)
+        self.g.check(bool(pick) and pick[-1][3] == "disk" and int(pick[-1][2]) >= stored,
+                     "the re-send's state came from the disk chain, deeper than anything in memory: %s" %
+                     ("own %s adopt %s disk %s -> %s (the chain stored to %d)" % (pick[-1] + (stored,)) if pick else
+                      "no `resume:` line"))
         st = re.findall(r"restores the request's chain of (\d+) segments to (\d+) \(([\d.]+) MiB", log)
         hit = re.findall(r"kv cache hit chain of (\d+) to (\d+) .*load=([\d.]+) ms in (\d+) slices? \(longest ([\d.]+) ms\)",
                          log)
