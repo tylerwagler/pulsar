@@ -22,6 +22,12 @@
  *                 that applies the pending rows (pulsar_gdn_call::rec_fold) == the commit then the call (output,
  *                 both states), and a captured call that folds leaves the committed state and writes the records
  *                 the same captured call writes from it, at the table's first row.
+ *   9. marks      (L387) in-pass state marks, at the whole layer and one tp 2 rank, 1 .. 4096 rows, one or two marks
+ *                 (first / last interior row, multiples of 8 and 128, arbitrary, the same row twice, 5 before the
+ *                 end), and once under a fold: the marked call's outputs and both final states == the unmarked
+ *                 call's, each mark's buffer == the state a call over exactly its first `cut` rows leaves (and not a
+ *                 byte past the slot written), byte for byte; the refusals (count, range, null / misaligned buffer,
+ *                 a verify call, more than one sequence) launch nothing.
  *
  * The fixture is live: heavy-tailed inputs with outlier channels, decays from
  * ~0.5 to ~0.9999, random initial states; the log prints rms and median error
@@ -37,6 +43,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <map>
+#include <string>
 #include <vector>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -193,6 +201,241 @@ struct Rig {
 
 static bool same(const std::vector<float> &x, const std::vector<float> &y) {
     return x.size() == y.size() && memcmp(x.data(), y.data(), x.size() * sizeof(float)) == 0;
+}
+
+/* ---- 9. in-pass state marks (L387) ----------------------------------------------------------------------------
+ * A mark stores the recurrent state after the call's first `cut` rows into a caller's buffer laid out as a slot.
+ * Every call here is one sequence starting at input row 0 from the same state, so the state a call over exactly
+ * `cut` rows leaves (the reference of a mark at `cut`) depends on `cut` and the TP degree only, and is computed once
+ * each.  The mark buffers are poisoned (0xFF) before every call with a guard past the slot, so a mark that is not
+ * written, or a byte written past the slot, fails. */
+static void marks_section(const Rig &R, const std::vector<float> &cs0, const std::vector<float> &rs0) {
+    const int LMAX = 4096;
+    const size_t GUARD = 256;                                /* floats past the slot that no mark may touch */
+    printf("9. in-pass state marks (L387): marked == unmarked (outputs, both states); mark == the state after `cut` "
+           "rows (bit-exact)\n");
+    /* the inputs of the longest sequence: the gate's 512 rows are too few */
+    std::vector<float> qkv((size_t)LMAX * QKV), z((size_t)LMAX * VD), a((size_t)LMAX * NV), b((size_t)LMAX * NV);
+    for (size_t i = 0; i < qkv.size(); i++) qkv[i] = R.qkv[i % R.qkv.size()] * (float)(0.5 + urand());
+    for (auto &v : z) v = (float)(urand() * 6.0 - 3.0);
+    for (auto &v : a) v = (float)(nrand() * 1.5);
+    for (auto &v : b) v = (float)(nrand() * 1.5);
+    float *dqkv = dalloc<float>(qkv.size()), *dz = dalloc<float>(z.size()), *da = dalloc<float>(a.size());
+    float *db = dalloc<float>(b.size());
+    h2d(dqkv, qkv.data(), qkv.size()); h2d(dz, z.data(), z.size()); h2d(da, a.data(), a.size()); h2d(db, b.data(), b.size());
+    float *dcs = dalloc<float>(CSF), *drs = dalloc<float>(RSF);          /* slot 0, sized for the whole layer */
+    int32_t *dslot = dalloc<int32_t>(2 * LMAX);
+    CK(cudaMemset(dslot, 0, (size_t)2 * LMAX * sizeof(int32_t)));
+    const size_t scratch_bytes = pulsar_gdn_scratch_bytes(LMAX);
+    void *dscratch = dalloc<char>(scratch_bytes);
+    float *dy = dalloc<float>((size_t)LMAX * VD);
+    uint16_t *dyb = dalloc<uint16_t>((size_t)LMAX * VD);
+    float *dmk[2] = {dalloc<float>(RSF + GUARD), dalloc<float>(RSF + GUARD)};
+    const pulsar_gdn_weights w = R.weights();
+    /* the fold leg's pending rows: the update records of a captured 5-row call from the starting state */
+    const int PK = 5;
+    const size_t UF = pulsar_gdn_upd_floats(1);
+    float *dupd = dalloc<float>(UF * PK), *dconvr = dalloc<float>(CSF * PK);
+    int32_t *dfold = dalloc<int32_t>(3);
+    const int32_t fold_tab[3] = {0, 0, PK};                   /* slot 0: PK pending records from record 0 */
+    h2d(dfold, fold_tab, 3);
+
+    struct Run {
+        int rc;
+        std::vector<float> y, cs, rs, mk[2];
+        std::vector<uint16_t> yb;
+    };
+    auto call = [&](int tp, int rows) {
+        pulsar_gdn_call c{};
+        c.tp_ranks = tp; c.n_seq = 1; c.seq_rows = rows;
+        c.row_slot = dslot; c.conv_state = dcs; c.rec_state = drs;
+        c.qkv = dqkv; c.ld_qkv = QKV; c.z = dz; c.ld_z = VD; c.a = da; c.ld_a = NV; c.b = db; c.ld_b = NV;
+        c.scratch = dscratch; c.scratch_bytes = scratch_bytes;
+        c.out_f32 = dy; c.out_bf16 = dyb;
+        return c;
+    };
+    /* the starting state (tp 2: the first rank's share of the same values), then the call, then everything back */
+    auto start = [&](int tp) {
+        h2d(dcs, cs0.data(), pulsar_gdn_conv_state_floats(tp));
+        h2d(drs, rs0.data(), pulsar_gdn_rec_state_floats(tp));
+        CK(cudaMemset(dmk[0], 0xFF, (RSF + GUARD) * sizeof(float)));
+        CK(cudaMemset(dmk[1], 0xFF, (RSF + GUARD) * sizeof(float)));
+    };
+    auto finish = [&](const pulsar_gdn_call &c, bool outputs) {
+        Run r;
+        r.rc = pulsar_gdn_forward(&w, &c, 0);
+        CK(cudaDeviceSynchronize());
+        const size_t ny = outputs ? (size_t)c.seq_rows * (VD / (c.tp_ranks == 2 ? 2 : 1)) : 0;
+        r.y.resize(ny); r.yb.resize(ny);
+        r.cs.resize(pulsar_gdn_conv_state_floats(c.tp_ranks)); r.rs.resize(pulsar_gdn_rec_state_floats(c.tp_ranks));
+        d2h(r.y.data(), dy, ny); d2h(r.yb.data(), dyb, ny);
+        d2h(r.cs.data(), dcs, r.cs.size()); d2h(r.rs.data(), drs, r.rs.size());
+        for (int k = 0; k < 2; k++) { r.mk[k].resize(RSF + GUARD); d2h(r.mk[k].data(), dmk[k], RSF + GUARD); }
+        return r;
+    };
+    /* the fold leg's records (whole layer only): a captured call leaves the recurrent state as it was */
+    start(1);
+    {
+        pulsar_gdn_call c = call(1, PK);
+        c.conv_rows = dconvr; c.rec_upd = dupd;
+        check(finish(c, false).rc == 0, "the fold leg's %d pending records captured", PK);
+    }
+    /* the state after exactly `cut` rows: the reference of every mark there */
+    std::map<std::pair<int, int>, std::vector<float>> ref;   /* (tp, or 0 = tp 1 under the fold; cut) */
+    auto ref_state = [&](int tp, bool fold, int cut) -> const std::vector<float> & {
+        std::vector<float> &s = ref[{fold ? 0 : tp, cut}];
+        if (s.empty()) {
+            start(tp);
+            pulsar_gdn_call c = call(tp, cut);
+            if (fold) { c.rec_fold = dfold; c.rec_fold_rows = dupd; }
+            Run r = finish(c, false);
+            if (r.rc != 0) check(false, "tp %d: the %d-row reference call returns %d", tp, cut, r.rc);
+            s = r.rs;
+        }
+        return s;
+    };
+    auto untouched = [&](const std::vector<float> &v, size_t from) {
+        for (size_t i = from; i < v.size(); i++) { uint32_t u; memcpy(&u, &v[i], 4); if (u != 0xFFFFFFFFu) return false; }
+        return true;
+    };
+    /* one length at one degree: the unmarked call, then every placement marked */
+    auto leg = [&](int tp, bool fold, int L, const std::vector<std::vector<int>> &places) {
+        start(tp);
+        pulsar_gdn_call c0 = call(tp, L);
+        if (fold) { c0.rec_fold = dfold; c0.rec_fold_rows = dupd; }
+        const Run u = finish(c0, true);
+        const size_t RS = u.rs.size();
+        int bad_out = 0, bad_mark = 0, dead = 0, n_marks = 0;
+        for (const std::vector<int> &p : places) {
+            pulsar_gdn_marks m{};
+            m.n_marks = (int)p.size();
+            for (int k = 0; k < m.n_marks; k++) { m.cut[k] = p[k]; m.rec_state[k] = dmk[k]; }
+            start(tp);
+            pulsar_gdn_call c = c0;
+            c.rec_marks = &m;
+            const Run r = finish(c, true);
+            bad_out += r.rc != 0 || !same(r.y, u.y) || r.yb != u.yb || !same(r.cs, u.cs) || !same(r.rs, u.rs);
+            for (int k = 0; k < 2; k++) {
+                if (k >= m.n_marks) { bad_mark += !untouched(r.mk[k], 0); continue; }
+                const std::vector<float> &want = ref_state(tp, fold, p[k]);
+                bad_mark += memcmp(r.mk[k].data(), want.data(), RS * sizeof(float)) != 0 || !untouched(r.mk[k], RS);
+                /* liveness: a mark is neither the starting nor the final state */
+                dead += memcmp(r.mk[k].data(), rs0.data(), RS * sizeof(float)) == 0 ||
+                        memcmp(r.mk[k].data(), u.rs.data(), RS * sizeof(float)) == 0;
+                n_marks++;
+            }
+        }
+        std::string where;
+        for (const std::vector<int> &p : places) {
+            where += where.empty() ? "{" : " {";
+            for (size_t k = 0; k < p.size(); k++) where += (k ? "," : "") + std::to_string(p[k]);
+            where += "}";
+        }
+        check(u.rc == 0 && bad_out == 0 && bad_mark == 0 && dead == 0 && !places.empty(),
+              "tp %d%s, %4d rows: %zu placements, %d marks; outputs + final states differ in %d, marks differ from "
+              "the state after their rows in %d, %d not live: %s", tp, fold ? " + fold" : "", L, places.size(),
+              n_marks, bad_out, bad_mark, dead, where.c_str());
+    };
+    /* the placements at L rows: first / last interior row, the last multiple of 8 and of 128 below L, an arbitrary
+     * row, 5 before the end (the message endpoint's shape), two marks, the same row twice */
+    auto placements = [](int L) {
+        const int m8 = (L - 1) / 8 * 8, m128 = (L - 1) / 128 * 128, arb = 1 + (L * 37) / 100, ep = L - 5;
+        const std::vector<std::vector<int>> all = {{1}, {L - 1}, {m8}, {m128}, {128}, {arb}, {ep}, {1, L - 1},
+                                                   {arb, m8}, {ep, m128}, {L - 1, 1}, {arb, arb}};
+        std::vector<std::vector<int>> v;
+        for (const std::vector<int> &p : all) {
+            bool ok = true;
+            for (int c : p) ok = ok && c >= 1 && c < L;
+            if (ok && std::find(v.begin(), v.end(), p) == v.end()) v.push_back(p);
+        }
+        return v;
+    };
+    const int lens[] = {1, 2, 7, 8, 9, 63, 64, 65, 300, 4096};
+    for (int tp : {1, 2})
+        for (int L : lens) {
+            if (L == 1) {                                    /* no interior row: every mark is refused */
+                start(tp);
+                pulsar_gdn_marks m{};
+                m.n_marks = 1; m.cut[0] = 1; m.rec_state[0] = dmk[0];
+                pulsar_gdn_call c = call(tp, 1);
+                c.rec_marks = &m;
+                const Run r = finish(c, false);
+                check(r.rc == -1 && untouched(r.mk[0], 0), "tp %d,    1 row: no interior row, a mark at 1 refused (%d)",
+                      tp, r.rc);
+                continue;
+            }
+            leg(tp, false, L, placements(L));
+        }
+    leg(1, true, 300, {{128, 295}, {1, 1}, {299}});          /* the prompt run's fold: pending rows applied first */
+
+    /* refusals: each returns -1, writes no output, no state and no mark */
+    printf("   refusals (each returns -1 and leaves the outputs, both states and the mark buffers untouched)\n");
+    {
+        int32_t *dfirst = dalloc<int32_t>(3);
+        const int32_t first[3] = {0, 4, 9};
+        h2d(dfirst, first, 3);
+        struct Ctx { float *upd, *convr, *mk1; const int32_t *first; };
+        const Ctx x = {dupd, dconvr, dmk[1], dfirst};
+        struct Case { const char *what; void (*mut)(pulsar_gdn_call &, pulsar_gdn_marks &, const Ctx &); };
+        const Case cases[] = {
+            {"n_marks 0", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.n_marks = 0; }},
+            {"n_marks 3", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.n_marks = 3; }},
+            {"a cut of 0", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.cut[0] = 0; }},
+            {"a cut of -1", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.cut[0] = -1; }},
+            {"a cut at the call's rows (the final store)",
+             [](pulsar_gdn_call &c, pulsar_gdn_marks &m, const Ctx &) { m.cut[0] = c.seq_rows; }},
+            {"the second cut past the rows", [](pulsar_gdn_call &c, pulsar_gdn_marks &m, const Ctx &x) {
+                m.n_marks = 2; m.cut[1] = c.seq_rows + 1; m.rec_state[1] = x.mk1; }},
+            {"a null buffer", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.rec_state[0] = nullptr; }},
+            {"the second mark's buffer null",
+             [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.n_marks = 2; m.cut[1] = 2; }},
+            {"a buffer not 16-byte aligned", [](pulsar_gdn_call &, pulsar_gdn_marks &m, const Ctx &) { m.rec_state[0] += 1; }},
+            {"a verify call (rec_upd + conv_rows)", [](pulsar_gdn_call &c, pulsar_gdn_marks &, const Ctx &x) {
+                c.rec_upd = x.upd; c.conv_rows = x.convr; }},
+            {"two uniform sequences", [](pulsar_gdn_call &c, pulsar_gdn_marks &, const Ctx &) { c.n_seq = 2; }},
+            {"ragged runs (seq_first)", [](pulsar_gdn_call &c, pulsar_gdn_marks &, const Ctx &x) {
+                c.n_seq = 2; c.seq_rows = 5; c.seq_first = x.first; c.n_rows = 9; }},
+        };
+        const int RR = 9;
+        auto base_marks = [&]() {
+            pulsar_gdn_marks m{};
+            m.n_marks = 1; m.cut[0] = 4; m.rec_state[0] = dmk[0];
+            return m;
+        };
+        {                                                    /* the unmutated call is accepted */
+            start(1);
+            pulsar_gdn_marks m = base_marks();
+            pulsar_gdn_call c = call(1, RR);
+            c.rec_marks = &m;
+            check(finish(c, false).rc == 0, "the unmutated marked call (%d rows, a mark at 4) returns 0", RR);
+        }
+        for (const Case &k : cases) {
+            start(1);
+            CK(cudaMemset(dy, 0x7f, (size_t)2 * RR * VD * sizeof(float)));
+            CK(cudaMemset(dyb, 0x7f, (size_t)2 * RR * VD * sizeof(uint16_t)));
+            pulsar_gdn_marks m = base_marks();
+            pulsar_gdn_call c = call(1, RR);
+            c.rec_marks = &m;
+            k.mut(c, m, x);
+            const Run r = finish(c, false);
+            std::vector<float> y((size_t)2 * RR * VD);
+            std::vector<uint16_t> yb(y.size());
+            d2h(y.data(), dy, y.size()); d2h(yb.data(), dyb, yb.size());
+            bool out_same = true;
+            for (size_t i = 0; i < y.size(); i++) {
+                uint32_t u; memcpy(&u, &y[i], 4);
+                out_same = out_same && u == 0x7f7f7f7fu && yb[i] == 0x7f7fu;
+            }
+            const bool st_same = memcmp(r.cs.data(), cs0.data(), CSF * sizeof(float)) == 0 &&
+                                 memcmp(r.rs.data(), rs0.data(), RSF * sizeof(float)) == 0;
+            check(r.rc == -1 && out_same && st_same && untouched(r.mk[0], 0) && untouched(r.mk[1], 0), "%s -> %d",
+                  k.what, r.rc);
+        }
+        cudaFree(dfirst);
+    }
+    cudaFree(dqkv); cudaFree(dz); cudaFree(da); cudaFree(db); cudaFree(dcs); cudaFree(drs); cudaFree(dslot);
+    cudaFree(dscratch); cudaFree(dy); cudaFree(dyb); cudaFree(dmk[0]); cudaFree(dmk[1]); cudaFree(dupd);
+    cudaFree(dconvr); cudaFree(dfold);
 }
 
 int main() {
@@ -628,6 +871,8 @@ int main() {
         }
         cudaFree(dfirst); cudaFree(dcr); cudaFree(dru); cudaFree(dub);
     }
+
+    marks_section(R, cs0, rs0);
 
     printf("gdn_gate: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail;

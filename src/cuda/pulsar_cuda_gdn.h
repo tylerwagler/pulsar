@@ -28,6 +28,18 @@
  * association of the same sums; it is not built (see the L251 GDN notes for
  * when it would pay).
  *
+ * In-pass state marks (L387): because the state lives in registers row by row,
+ * the state a call split after row r would leave in the pool exists inside the
+ * unsplit call too.  A prompt run (one sequence) may name up to two such rows
+ * (pulsar_gdn_call::rec_marks); the recurrence stores its register state there
+ * into the caller's buffers, with the final store's indexing, and the call's
+ * outputs and final states are the unmarked call's bytes.  The marked kernel is
+ * a compile-time variant; the unmarked one is the code it was before (SASS
+ * identical).  The marks hold the RECURRENT state only: the conv state after a
+ * row is the last three inputs up to it (gdn_conv_rows_kernel's rule, verify's
+ * per-row capture).  tests/gdn_gate.cu
+ * section 9 asserts both claims and the refusals.
+ *
  * Two kernels per call:
  *   1. conv + SiLU + L2 norms + gates  -> the call's scratch (f32 q^, k^, v,
  *      decay, beta per row).  One CTA per (sequence, 16-token tile, 128-channel
@@ -97,6 +109,20 @@ typedef struct {
     const uint16_t *norm_w;   /**< [128], the gated norm's weight (used as is, no 1+w) */
 } pulsar_gdn_weights;
 
+/** L387: up to two in-pass recurrent-state marks of one call (pulsar_gdn_call::rec_marks).  Mark m stores the
+ *  recurrent state after the call's first cut[m] rows -- the bytes a call over exactly those rows from the same
+ *  starting state (and the same fold, rec_fold) leaves in its slot -- into rec_state[m], laid out as one slot of the
+ *  pool ([NV][DK][DV] of the rank's heads), so a buffer is a slot's GDN_REC payload as it stands.  Two marks may name
+ *  the same row (both buffers get it).  Host memory; the buffers are device memory.  Refused by name: n_marks not 1
+ *  or 2, a cut outside 1 .. seq_rows - 1 (seq_rows is the final store, not a mark), a null or misaligned buffer, a
+ *  verify call (rec_upd), and any call but one uniform sequence (n_seq 1, no seq_first): a mark is a prompt run's,
+ *  and every prompt run is its own n_seq 1 call. */
+typedef struct {
+    int    n_marks;        /**< marks given, 1 or 2 (cut / rec_state [0, n_marks) are read) */
+    int    cut[2];         /**< the state after the first cut[m] rows, 1 <= cut[m] < seq_rows */
+    float *rec_state[2];   /**< device out: pulsar_gdn_rec_state_floats(tp_ranks) floats each, 16-byte aligned */
+} pulsar_gdn_marks;
+
 /** One call: n_seq sequences of consecutive rows -- the family step's modes: DECODE is n_seq rows of
  *  one token (seq_rows 1), a PREFILL chunk is one sequence (n_seq 1) of seq_rows tokens, and (L272 P1
  *  S4) a multi-bank verify is n_seq RAGGED runs, one per bank: seq_first gives each run's first row.
@@ -156,6 +182,9 @@ typedef struct {
     const int32_t *rec_fold;
     /** L339 the records rec_fold's pending rows index (16-byte aligned); set with rec_fold. */
     const float   *rec_fold_rows;
+    /** L387 in-pass state marks (host pointer), or NULL = none (every caller before L387: the kernel it always ran).
+     *  See pulsar_gdn_marks. */
+    const pulsar_gdn_marks *rec_marks;
     /** L266 step 7: the tensor-parallel degree (0 or 1 = the whole layer).  At 2 the call is ONE rank's
      *  heads -- NK / 2 key heads and the NV / 2 value heads reading them -- with its own qkv / z / a / b
      *  rows, conv channels, A_log and dt_bias (the caller offsets the pointers), state pools of

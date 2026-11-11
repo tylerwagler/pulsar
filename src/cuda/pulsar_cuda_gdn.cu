@@ -306,12 +306,29 @@ struct gdn_no_cluster {
 };
 #endif
 
+/** L387: a call's in-pass state marks as the recurrence reads them (pulsar_gdn_marks, checked by the host): the
+ *  state after the first cut[m] rows goes to state[m].  A cut that no row reaches (0 for an unused second mark) stores
+ *  nothing. */
+struct gdn_marks {
+    int    cut[2];     ///< rows after which each mark's state is stored (1 .. rows - 1), 0 = none
+    float *state[2];   ///< each mark's buffer, one slot's recurrent state [NV][DK][DV] (the pool's layout)
+};
+
 /** Kernel 2: the gated delta-rule recurrence over one sequence for one V head, then the gated RMSNorm and the
  *  out_proj activation (f32, bf16 and / or MX E4M3).  A verify (rec_upd set) leaves the pool's state unchanged and
  *  stores each row's rank-1 update instead.
  *
+ *  L387 MARK: the marked variant also stores the register state after row cut[m] - 1 into marks.state[m], with the
+ *  final store's indexing -- the bytes a call split there leaves in the pool.  The unmarked variant compiles the
+ *  `if constexpr` away: its SASS is the pre-L387 kernel's.  Registers: ptxas gives the unmarked variant 64 (4 CTAs
+ *  of 256 an SM) but the marked one 122 (2 CTAs an SM) unless told, so the marked variant asks for 4 CTAs an SM (64,
+ *  no spill: the unmarked's occupancy); the unmarked keeps its bare `__launch_bounds__(256)` (minimum 0 = none),
+ *  since naming 4 there too changes its SASS.
+ *
  *  Launch: grid (n_seq, Sh::NV, VQ) with cluster (1, 1, VQ) (sm_90+), block 256; static smem only (~15 KB).
  *  @tparam TP tensor-parallel degree.
+ *  @tparam MARK whether the call stores in-pass state marks (single-sequence prompt runs only; the host refuses
+ *               the rest).
  *  @param qkvn       kernel 1's f32 [rows][Sh::QKV] (q^, k^, v).
  *  @param gb         kernel 1's f32 [rows][Sh::GB] (decay, beta).
  *  @param z          in_proj_z output, f32 [rows][ld_z]: the norm's gate (SiLU).
@@ -329,9 +346,10 @@ struct gdn_no_cluster {
  *  @param out_bf16   out bf16 [rows][Sh::VDIM], or NULL.
  *  @param out_q      out MX E4M3 data [rows][Sh::VDIM], or NULL.
  *  @param out_s      out_q's ue8m0 block scales.
- *  @param kbp        out_q's scale row pitch, pulsar_mx_kbp(Sh::VDIM). */
-template <int TP>
-__global__ void GDN_CLUSTER_DIMS __launch_bounds__(256)
+ *  @param kbp        out_q's scale row pitch, pulsar_mx_kbp(Sh::VDIM).
+ *  @param marks      MARK only: the cuts and their buffers (unread by the unmarked variant). */
+template <int TP, bool MARK>
+__global__ void GDN_CLUSTER_DIMS __launch_bounds__(256, MARK ? 4 : 0)
 gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       const float *__restrict__ gb,
                       const float *__restrict__ z, int ld_z,
@@ -346,7 +364,8 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                       float *__restrict__ out_f32,
                       __nv_bfloat16 *__restrict__ out_bf16,
                       __nv_fp8_e4m3 *__restrict__ out_q,
-                      unsigned char *__restrict__ out_s, int kbp) {
+                      unsigned char *__restrict__ out_s, int kbp,
+                      const gdn_marks marks) {
     using Sh = gdn_shape<TP>;
     __shared__ float4 sq[T2][DK / 4], sk[T2][DK / 4];
     __shared__ float4 sv4[T2][8];
@@ -452,6 +471,15 @@ gdn_recur_norm_kernel(const float *__restrict__ qkvn,
                 if (w == 0) U[h * DV + col] = d;
                 if (w == 1 && qr == 0 && h % Sh::GQA == 0) reinterpret_cast<float4 *>(U + Sh::U_K + kh * DK)[lane] = sk[j][lane];
                 if (w == 2 && qr == 0 && lane == 0) U[Sh::U_DEC + h] = dec;
+            }
+            if constexpr (MARK) {                            /* L387: the state after this row, if a mark is here */
+                #pragma unroll
+                for (int m = 0; m < 2; m++)
+                    if (t0 + j + 1 == marks.cut[m]) {        /* block-uniform */
+                        float *M = marks.state[m] + (size_t)h * DK * DV;
+                        #pragma unroll
+                        for (int i = 0; i < RPW; i++) M[(w * RPW + i) * DV + col] = s[i];
+                    }
             }
             par ^= 1;
         }
@@ -611,10 +639,18 @@ int gdn_forward_tp(const pulsar_gdn_weights *w, const pulsar_gdn_call *c, cudaSt
     gdn_conv_prep_kernel<TP><<<dim3((unsigned)(c->n_seq * tiles), Sh::CONV_HEADS), 128, 0, stream>>>(
         c->qkv, c->ld_qkv, c->a, c->ld_a, c->b, c->ld_b, w->conv_w, w->A_log, w->dt_bias,
         c->seq_rows, c->seq_first, c->row_slot, c->conv_state, qkvn, gb, tiles);
-    gdn_recur_norm_kernel<TP><<<dim3((unsigned)c->n_seq, Sh::NV, VQ), 256, 0, stream>>>(
+    /* L387: the marked variant only when the call carries marks (checked by pulsar_gdn_forward) */
+    gdn_marks mk = {};
+    if (c->rec_marks)
+        for (int m = 0; m < c->rec_marks->n_marks; m++) {
+            mk.cut[m] = c->rec_marks->cut[m];
+            mk.state[m] = c->rec_marks->rec_state[m];
+        }
+    auto recur = c->rec_marks ? gdn_recur_norm_kernel<TP, true> : gdn_recur_norm_kernel<TP, false>;
+    recur<<<dim3((unsigned)c->n_seq, Sh::NV, VQ), 256, 0, stream>>>(
         qkvn, gb, c->z, c->ld_z, w->norm_w, c->seq_rows, c->seq_first, c->row_slot, c->rec_state, c->rec_upd,
         c->rec_fold, c->rec_fold_rows, c->out_f32, static_cast<__nv_bfloat16 *>(c->out_bf16),
-        static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp);
+        static_cast<__nv_fp8_e4m3 *>(c->out_e4m3), static_cast<unsigned char *>(c->out_scale), c->out_kbp, mk);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "pulsar: gdn: launch failed: %s\n", cudaGetErrorString(e));
@@ -643,6 +679,22 @@ extern "C" int pulsar_gdn_forward(const pulsar_gdn_weights *w, const pulsar_gdn_
         return refuse("no output (out_f32, out_e4m3 and out_bf16 all NULL)");
     if (c->out_bf16 && ((uintptr_t)c->out_bf16 & 1u)) return refuse("out_bf16 not 2-byte aligned");
     if (c->out_f32 && !aligned16(c->out_f32)) return refuse("out_f32 not 16-byte aligned");
+    if (c->rec_marks) {                                  /* L387: in-pass state marks of one prompt run */
+        const pulsar_gdn_marks *m = c->rec_marks;
+        if (m->n_marks < 1 || m->n_marks > 2) return refuse("marks: n_marks is not 1 or 2");
+        if (c->rec_upd) return refuse("marks: a verify call (rec_upd set) leaves its state to the commit; no mark");
+        if (c->n_seq != 1 || c->seq_first) return refuse("marks: the call is not one uniform sequence (n_seq 1, no seq_first)");
+        for (int k = 0; k < m->n_marks; k++) {
+            if (m->cut[k] < 1 || m->cut[k] >= c->seq_rows) {
+                char why[96];
+                snprintf(why, sizeof why, "marks: mark %d's cut %d outside 1 .. %d (seq_rows - 1)", k, m->cut[k],
+                         c->seq_rows - 1);
+                return refuse(why);
+            }
+            if (!m->rec_state[k]) return refuse("marks: a mark with a null state buffer");
+            if (!aligned16(m->rec_state[k])) return refuse("marks: a state buffer not 16-byte aligned");
+        }
+    }
     switch (c->tp_ranks) {
     case 0:
     case 1: return gdn_forward_tp<1>(w, c, stream);
