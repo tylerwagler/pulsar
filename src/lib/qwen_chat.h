@@ -245,9 +245,9 @@ std::string qwen_system_reminder(const char *content);
  * A parameter VALUE is the text between the tags minus one leading and one trailing newline (the template
  * writes exactly those).  Arguments are rebuilt as JSON.  The template wrote strings raw and every other
  * value with tojson, so a value is JSON exactly when (a) the tool schema does not declare the property a
- * string (type "string" or a type list that includes it) and (b) the text parses AND is the tojson spelling
- * of what it parses to; anything else is the text as a string.  Either way the value re-renders to the
- * bytes the model sampled.
+ * string (out_tool_param_type: the declared type is or includes string, read through unions and local
+ * references) and (b) the text parses AND is the tojson spelling of what it parses to; anything else is
+ * the text as a string.  Either way the value re-renders to the bytes the model sampled.
  *
  * L284 P5: a call streams as it is read -- TOOL_BEGIN when its name is complete, TOOL_ARGS as each
  * parameter CLOSES (a value's JSON spelling is known only then: the schema and the whole text decide it),
@@ -293,11 +293,6 @@ private:
     /// @param index the call's index, for the events
     /// @param ev    receives the fragments
     void stream_params(const std::string &b, int index, std::vector<out_event> *ev);
-    /// @param fn  a function name
-    /// @param key one of its parameters
-    /// @return "string" when the schema declares the property a string (or a type list holding string), "other" for
-    ///         any other declaration, NULL when the tool or the property is not declared
-    const char *param_type(const std::string &fn, const std::string &key) const;
 
     /** @var pay_
     *  Where the open block's decode is (in_payload), scanned incrementally. */

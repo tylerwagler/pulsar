@@ -67,30 +67,6 @@ void qwen_xml_call_body::open() {
     pay_ = payload_scan();
 }
 
-/* The type the schema declares for `key` of function `fn`: "string" when the
- * declared type is or includes string, "other" for any other declaration,
- * NULL when the tool or the property is not declared. */
-const char *qwen_xml_call_body::param_type(const std::string &fn, const std::string &key) const {
-    for (const pyjson_value &tool : tools.a) {
-        const pyjson_value *f = tool.get("function");
-        if (!f) f = &tool;
-        const pyjson_value *name = f->get("name");
-        if (!name || name->kind != pyjson_value::STR || name->s != fn) continue;
-        const pyjson_value *params = f->get("parameters");
-        const pyjson_value *props = params ? params->get("properties") : NULL;
-        const pyjson_value *prop = props ? props->get(key.c_str()) : NULL;
-        if (!prop) return NULL;
-        const pyjson_value *type = prop->get("type");
-        if (!type) return "other";
-        if (type->kind == pyjson_value::STR) return type->s == "string" ? "string" : "other";
-        if (type->kind == pyjson_value::ARR)
-            for (const pyjson_value &t : type->a)
-                if (t.kind == pyjson_value::STR && t.s == "string") return "string";
-        return "other";
-    }
-    return NULL;
-}
-
 /* One "<parameter=KEY>\nVALUE\n</parameter>" of function `fn` at b[*i]: 1 = read (*key, the typed *v,
  * *i past it), 0 = not complete yet, -1 = not a parameter; *why names what is missing or wrong.  The one
  * reading close and the stream share. */
@@ -122,7 +98,7 @@ int qwen_xml_call_body::read_param(const std::string &b, size_t *i, const std::s
      * template writes every non-string with tojson, so text in any other
      * spelling can only have been a raw string. */
     *v = pyjson_value();
-    const char *type = param_type(fn, *key);
+    const char *type = out_tool_param_type(tools, fn, *key);
     char jerr[8];
     bool as_json = !(type && !strcmp(type, "string")) && pyjson_parse(text.data(), text.size(), v, jerr, sizeof jerr);
     if (as_json) {
@@ -198,7 +174,7 @@ void qwen_xml_call_body::scan_payload(const std::string &b, size_t held) {
                 ps.pos = at;
                 break;
             }
-            const char *type = param_type(fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
+            const char *type = out_tool_param_type(tools, fn_, b.substr(at + strlen(kParam), gt - at - strlen(kParam)));
             ps.value = true;
             ps.is_string = type && !strcmp(type, "string");
             ps.json_str = ps.esc = false;

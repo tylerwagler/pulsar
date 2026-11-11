@@ -151,7 +151,8 @@ const out_grammar &gemma4_output_grammar(void);
  *  the template's spelling at the close (one TOOL_ARGS fragment), the payload any <|"|>-quoted string in them. */
 class gemma4_call_body : public out_call_body {
 public:
-    /** The request's tools (a bare value whose top-level property is declared a string stays the raw text). */
+    /** The request's tools (a bare value whose top-level property is declared a string -- out_tool_param_type --
+     *  stays the raw text). */
     pyjson_value tools;
     void open() override;
     void grow(const std::string &b, size_t held, bool closing, int index, std::vector<out_event> *ev) override;
@@ -160,10 +161,6 @@ public:
                size_t *at) override;
 
 private:
-    /// @param fn  the call's function name
-    /// @param key a top-level argument key
-    /// @return true when the tools declare that property a string (its type is or includes "string")
-    bool declared_string(const std::string &fn, const std::string &key) const;
     bool began_ = false;       ///< TOOL_BEGIN sent
     size_t args_lo_ = 0;       ///< where the arguments start (past the "{" / "("); 0 = not yet
     size_t scan_ = 0;          ///< bytes of the arguments scanned for quotes

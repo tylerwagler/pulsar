@@ -323,6 +323,86 @@ bool out_parser::raw_span(size_t *lo, size_t *hi) const {
     return true;
 }
 
+/* ---- the declared type of a tool parameter ----------------------------------------------------- */
+
+namespace {
+
+/// References followed in one chain: deeper declares nothing (a real schema nests two or three).
+constexpr int kParamRefDepth = 8;
+/// Schema nodes one parameter's reading may visit: a schema past it declares nothing (a `$ref` diamond
+/// would otherwise visit 2^depth nodes for every parameter of every call).
+constexpr int kParamNodeBudget = 64;
+
+/* Whether schema node `s` declares string among its types (out_tool_param_type's rule).  `root` is the
+ * function's parameters object (the base of its local references); `chain[0..n_chain)` the reference
+ * targets on the way here; `budget` the nodes left to visit. */
+/// @param root    the function's `parameters` object
+/// @param s       the schema node
+/// @param chain   the `$ref` targets followed to reach `s` (room for kParamRefDepth)
+/// @param n_chain how many
+/// @param budget  in/out: nodes left to visit
+/// @return true when `s` declares string (or a union that includes it)
+bool schema_declares_string(const pyjson_value &root, const pyjson_value &s, const pyjson_value **chain, int n_chain,
+                            int *budget) {
+    if (--*budget < 0 || s.kind != pyjson_value::OBJ) return false;
+    if (const pyjson_value *type = s.get("type")) {   /* a declared type decides alone, as it always did */
+        if (type->kind == pyjson_value::STR) return type->s == "string";
+        if (type->kind == pyjson_value::ARR)
+            for (const pyjson_value &t : type->a)
+                if (t.kind == pyjson_value::STR && t.s == "string") return true;
+        return false;
+    }
+    const pyjson_value *ref = s.get("$ref");
+    if (ref && ref->kind == pyjson_value::STR) {
+        static const char *const kLocal[][2] = {{"#/$defs/", "$defs"}, {"#/definitions/", "definitions"}};
+        for (const auto &l : kLocal) {
+            const size_t n = strlen(l[0]);
+            if (ref->s.compare(0, n, l[0])) continue;
+            const pyjson_value *defs = root.get(l[1]);
+            const pyjson_value *to = defs ? defs->get(ref->s.c_str() + n) : NULL;
+            bool stop = !to || n_chain == kParamRefDepth;   /* unresolved, too deep, or a cycle */
+            for (int i = 0; i < n_chain && !stop; i++) stop = chain[i] == to;
+            if (stop) break;
+            chain[n_chain] = to;
+            if (schema_declares_string(root, *to, chain, n_chain + 1, budget)) return true;
+            break;
+        }
+    }
+    for (const char *k : {"anyOf", "oneOf"})
+        if (const pyjson_value *u = s.get(k); u && u->kind == pyjson_value::ARR)
+            for (const pyjson_value &b : u->a)
+                if (schema_declares_string(root, b, chain, n_chain, budget)) return true;
+    const pyjson_value *all = s.get("allOf");
+    if (all && all->kind == pyjson_value::ARR && all->a.size() == 1 &&
+        schema_declares_string(root, all->a[0], chain, n_chain, budget))
+        return true;
+    const pyjson_value *en = s.get("enum");
+    if (en && en->kind == pyjson_value::ARR && !en->a.empty() &&
+        std::all_of(en->a.begin(), en->a.end(), [](const pyjson_value &v) { return v.kind == pyjson_value::STR; }))
+        return true;
+    const pyjson_value *c = s.get("const");
+    return c && c->kind == pyjson_value::STR;
+}
+
+}  // namespace
+
+const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn, const std::string &key) {
+    for (const pyjson_value &tool : tools.a) {
+        const pyjson_value *f = tool.get("function");
+        if (!f) f = &tool;
+        const pyjson_value *name = f->get("name");
+        if (!name || name->kind != pyjson_value::STR || name->s != fn) continue;
+        const pyjson_value *params = f->get("parameters");
+        const pyjson_value *props = params ? params->get("properties") : NULL;
+        const pyjson_value *prop = props ? props->get(key.c_str()) : NULL;
+        if (!prop) return NULL;
+        const pyjson_value *chain[kParamRefDepth];
+        int budget = kParamNodeBudget;
+        return schema_declares_string(*params, *prop, chain, 0, &budget) ? "string" : "other";
+    }
+    return NULL;
+}
+
 /* ---- the shared JSON call body ----------------------------------------------------------------- */
 
 void out_json_call_body::open() {

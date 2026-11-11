@@ -17,6 +17,7 @@
 #include "lib/pulsar_kvdigest.h"
 #include "lib/pulsar_kvpool.h"
 #include "lib/bpe_tokenizer.h"
+#include "lib/gemma4_chat.h"
 #include "lib/nemotron_chat.h"
 #include "lib/pulsar_grammar.h"
 
@@ -3890,6 +3891,136 @@ static void test_qwen_payload_is_sampled_structure_greedy(void) {
     p.finish(&ev);
     TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
     TEST_ASSERT(p.calls()[0].arguments == "{\"s\": \"hello </b\", \"n\": 42, \"o\": {\"k\": \"v \\\" still\"}}");
+}
+
+/* L386: a property's declared type is read through unions and local references (out_tool_param_type), so a
+ * string argument declared `Optional[str]` (pydantic: anyOf string | null), by `$ref`, or by a string enum
+ * stays a string whatever its text -- in the call's arguments and in its streamed fragments, for every
+ * family that types a value by its declaration (Qwen, Nemotron, Gemma). */
+static void test_tool_param_type_reads_unions_and_refs(void) {
+    const char *tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\","
+        "\"$defs\":{\"Name\":{\"type\":\"string\"},\"Obj\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}},"
+        "\"Loop\":{\"$ref\":\"#/$defs/Loop2\"},\"Loop2\":{\"anyOf\":[{\"$ref\":\"#/$defs/Loop\"},{\"type\":\"integer\"}]},"
+        "\"SelfOrStr\":{\"anyOf\":[{\"$ref\":\"#/$defs/SelfOrStr\"},{\"type\":\"string\"}]}},"
+        "\"definitions\":{\"Old\":{\"type\":\"string\"}},"
+        "\"properties\":{"
+        "\"os\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null},"
+        "\"oi\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}]},"
+        "\"si\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"integer\"}]},"
+        "\"one\":{\"oneOf\":[{\"type\":\"null\"},{\"type\":\"string\"}]},"
+        "\"all\":{\"allOf\":[{\"$ref\":\"#/$defs/Name\"}]},"
+        "\"all2\":{\"allOf\":[{\"type\":\"string\"},{\"minLength\":1}]},"
+        "\"rs\":{\"$ref\":\"#/$defs/Name\"},\"rd\":{\"$ref\":\"#/definitions/Old\"},\"ro\":{\"$ref\":\"#/$defs/Obj\"},"
+        "\"rmiss\":{\"$ref\":\"#/$defs/Missing\"},\"remote\":{\"$ref\":\"https://example.com/s.json#/$defs/Name\"},"
+        "\"en\":{\"enum\":[\"1\",\"2\"]},\"enm\":{\"enum\":[\"1\",2]},\"cs\":{\"const\":\"7\"},"
+        "\"cy\":{\"$ref\":\"#/$defs/Loop\"},\"cys\":{\"$ref\":\"#/$defs/SelfOrStr\"},"
+        "\"nt\":{\"description\":\"no type\"},\"tw\":{\"type\":\"integer\",\"anyOf\":[{\"type\":\"string\"}]},"
+        "\"ts\":{\"type\":[\"null\",\"string\"]}}}}}]";
+    /* each: the parameter, the text the model wrote, its JSON in the arguments */
+    struct row { const char *key, *text, *json; };
+    static const row rows[] = {
+        {"os", "123", "\"123\""}, {"os", "true", "\"true\""}, {"os", "null", "\"null\""},   /* Optional[str] */
+        {"os", "[1]", "\"[1]\""}, {"os", "hello", "\"hello\""},
+        {"oi", "123", "123"}, {"oi", "null", "null"},              /* Optional[int]: no string in it */
+        {"si", "123", "\"123\""},                                  /* includes string */
+        {"one", "123", "\"123\""},
+        {"all", "123", "\"123\""},                                 /* allOf of one branch is that branch */
+        {"all2", "123", "123"},                                    /* of two: not read */
+        {"rs", "123", "\"123\""}, {"rd", "123", "\"123\""},        /* $defs, definitions */
+        {"ro", "{\"a\": 1}", "{\"a\": 1}"}, {"ro", "123", "123"},  /* a reference to an object */
+        {"rmiss", "123", "123"}, {"remote", "123", "123"},         /* unresolved, not local: nothing declared */
+        {"en", "1", "\"1\""}, {"enm", "1", "1"}, {"cs", "7", "\"7\""},
+        {"cy", "123", "123"},                                      /* a cycle: no hang, nothing declared */
+        {"cys", "123", "\"123\""},                                 /* a cycle beside a string branch */
+        {"nt", "123", "123"}, {"nt", "hello", "\"hello\""},        /* no type: as before */
+        {"tw", "123", "123"},                                      /* a declared type decides alone, as before */
+        {"ts", "123", "\"123\""},
+    };
+    for (const row &rw : rows) {
+        const std::string out = std::string("<tool_call>\n<function=f>\n<parameter=") + rw.key + ">\n" + rw.text +
+                                "\n</parameter>\n</function>\n</tool_call>";
+        const std::string want = std::string("{\"") + rw.key + "\": " + rw.json + "}";
+        for (int bytewise = 0; bytewise < 2; bytewise++) {
+            qwen_output_parser p;
+            char err[160];
+            TEST_ASSERT(p.init(false, tools, err, sizeof err));
+            std::vector<out_event> ev;
+            if (bytewise) for (char c : out) p.feed(&c, 1, &ev);
+            else p.feed(out.data(), out.size(), &ev);
+            p.finish(&ev);
+            std::string streamed;
+            for (const out_event &e : ev)
+                if (e.kind == out_event::TOOL_ARGS) streamed += e.text;
+            streamed += "}";
+            const bool ok = p.errors() == 0 && p.calls().size() == 1 && p.calls()[0].arguments == want && streamed == want;
+            if (!ok)
+                fprintf(stderr, "L386 %s=%s (%s): arguments %s, streamed %s, want %s\n", rw.key, rw.text,
+                        bytewise ? "byte by byte" : "whole", p.calls().empty() ? "-" : p.calls()[0].arguments.c_str(),
+                        streamed.c_str(), want.c_str());
+            TEST_ASSERT(ok);
+        }
+    }
+
+    /* the decode rule follows the same reading: an Optional[str] value is payload, an Optional[int] one is not */
+    for (const char *key : {"os", "oi"}) {
+        qwen_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        std::vector<out_event> ev;
+        const std::string head = std::string("<tool_call>\n<function=f>\n<parameter=") + key + ">\n";
+        p.feed(head.data(), head.size(), &ev);
+        TEST_ASSERT(p.in_payload() == !strcmp(key, "os"));
+    }
+
+    /* Nemotron reads the same body with Python's scalar spelling: None stays the text where string is declared */
+    static const row nrows[] = {
+        {"os", "123", "\"123\""}, {"os", "None", "\"None\""}, {"oi", "123", "123"}, {"oi", "None", "null"},
+        {"rs", "True", "\"True\""}, {"ro", "True", "true"},
+    };
+    for (const row &rw : nrows) {
+        nemotron_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        const std::string out = std::string("<tool_call>\n<function=f>\n<parameter=") + rw.key + ">\n" + rw.text +
+                                "\n</parameter>\n</function>\n</tool_call>";
+        std::vector<out_event> ev;
+        p.feed(out.data(), out.size(), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
+        TEST_ASSERT(p.calls()[0].arguments == std::string("{\"") + rw.key + "\": " + rw.json + "}");
+    }
+
+    /* Gemma's bare values take the same reading */
+    static const row grows[] = {{"os", "123", "\"123\""}, {"oi", "123", "123"}, {"en", "1", "\"1\""}, {"cy", "123", "123"}};
+    for (const row &rw : grows) {
+        gemma4_output_parser p;
+        char err[160];
+        TEST_ASSERT(p.init(false, tools, err, sizeof err));
+        const std::string out = std::string("<|tool_call>call:f{") + rw.key + ":" + rw.text + "}<tool_call|>";
+        std::vector<out_event> ev;
+        p.feed(out.data(), out.size(), &ev);
+        p.finish(&ev);
+        TEST_ASSERT(p.errors() == 0 && p.calls().size() == 1);
+        TEST_ASSERT(p.calls()[0].arguments == std::string("{\"") + rw.key + "\": " + rw.json + "}");
+    }
+
+    /* the three answers, and a reference diamond (ten levels of ten branches) answered within its budget */
+    pyjson_value t;
+    char jerr[160];
+    TEST_ASSERT(pyjson_parse(tools, strlen(tools), &t, jerr, sizeof jerr));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "f", "os"), "string"));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "f", "oi"), "other"));
+    TEST_ASSERT(out_tool_param_type(t, "f", "absent") == NULL && out_tool_param_type(t, "g", "os") == NULL);
+    std::string diamond = "[{\"name\":\"d\",\"parameters\":{\"$defs\":{";
+    for (int lvl = 0; lvl < 10; lvl++) {
+        diamond += "\"D" + std::to_string(lvl) + "\":{\"anyOf\":[";
+        for (int b = 0; b < 10; b++) diamond += (b ? ",{\"$ref\":\"#/$defs/D" : "{\"$ref\":\"#/$defs/D") + std::to_string(lvl + 1) + "\"}";
+        diamond += "]},";
+    }
+    diamond += "\"D10\":{\"type\":\"integer\"}},\"properties\":{\"x\":{\"$ref\":\"#/$defs/D0\"}}}}]";
+    TEST_ASSERT(pyjson_parse(diamond.data(), diamond.size(), &t, jerr, sizeof jerr));
+    TEST_ASSERT(!strcmp(out_tool_param_type(t, "d", "x"), "other"));
 }
 
 /* ==== L303: structured outputs -- the grammars, the gate, the protocols ================================== */
@@ -16964,6 +17095,7 @@ static void pulsar_server_unit_tests_run(void) {
     test_l309_draft_prefix();
     test_l303_protocol_fields();
     test_qwen_payload_is_sampled_structure_greedy();
+    test_tool_param_type_reads_unions_and_refs();
     test_qwen_tool_error_suffix_reminds_the_system_turn();
     test_inkling_effort_map();
     test_inkling_hooks_compose_to_the_full_render();

@@ -126,6 +126,27 @@ struct out_grammar {
     const char *reasoning_prefix = nullptr;
 };
 
+struct pyjson_value;
+
+/** The type a request's tools declare for parameter `key` of function `fn`: the ONE schema reading every
+ * call body that types a value by its declaration shares (Qwen's and Nemotron's XML parameters, Gemma's bare
+ * values).  "string" when the declared type is or includes string, "other" for any other declaration, NULL
+ * when the tool or the property is not declared.
+ *
+ * The declaration is the property's `type` (a name, or a list of names) when it has one -- and then only
+ * that.  Without a `type` (L386), the property's union and reference keywords are read: `anyOf` / `oneOf`
+ * include string when any branch does (pydantic's `Optional[str]` is `{"anyOf": [{"type": "string"},
+ * {"type": "null"}]}`), an `allOf` of exactly one branch is that branch, a `$ref` to `#/$defs/NAME` or
+ * `#/definitions/NAME` is that member of the function's `parameters` object (no other reference is
+ * followed; a reference back into its own chain is a cycle and declares nothing), and an `enum` whose
+ * values are all strings or a string `const` is a string.  A property with none of these is "other". */
+/// @param tools the request's tools array (OpenAI shape: each `{"type": "function", "function": {...}}`,
+///              or the function object itself)
+/// @param fn    a function name
+/// @param key   one of its parameters
+/// @return "string", "other", or NULL (the tool or the property is not declared)
+const char *out_tool_param_type(const pyjson_value &tools, const std::string &fn, const std::string &key);
+
 /** The reader of a call's body: the bytes between the marker that opened the call and the marker that
  * closes it.  The kit owns the call's index, the events' order and the call list; the reader owns the
  * body's syntax. */
