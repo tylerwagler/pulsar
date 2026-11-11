@@ -984,6 +984,10 @@ void server::gen_begin(session_slot *sl) {
         sl->terminal_turn = pulsar_tokens{};
     }
     s->slot_terminal_clear(sl);
+    /* L380: and the reply that turn left is this job's to read its prompt against (server_reply_use, in the plan);
+     * taken here, so a bind that never plans leaves none behind */
+    const slot_reply last_reply = sl->reply;
+    sl->reply = slot_reply{};
     /* Tier-2: install this slot's bank before ANY s->sess touch below (all the
      * pos/common-prefix/tokens reads and the prefill sync run against the live
      * bank). No-op in classic mode / when already live. Finding 1: a bank that
@@ -1017,6 +1021,15 @@ void server::gen_begin(session_slot *sl) {
     pulsar_prefix_match pm;
     s->slot_prefix_match(sl, &j->req.prompt, &pm);
     const int common = pm.live_cut.raw();    /* live/bank side: KV rows */
+    /* L380: the match with the history the last turn left, its reply included: the bank's, or the kept turn of a
+     * checkpoint that yielded (the bank stands at a prefix of it) */
+    reply_seen seen = { last_reply, common, pm.prompt_cut.raw() < j->req.prompt.len };
+    if (turn.t.len > 0) {
+        pulsar_prefix_match tm;
+        pulsar_tokens_prefix_match(s->engine, turn.t.v, turn.t.len, j->req.prompt.v, j->req.prompt.len, &tm);
+        seen.common = tm.live_cut.raw();
+        seen.extends = tm.prompt_cut.raw() < j->req.prompt.len;
+    }
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, pulsar_session_tokens(s->sess),
                         &j->req.prompt, old_pos, common);
@@ -1236,6 +1249,7 @@ void server::gen_begin(session_slot *sl) {
         gr->res.resumed_at = resumed_at;
         gr->res.cache_source = cache_source;
         gr->res.cache_diag = cache_diag;
+        gr->res.seen = seen;
         gen_restore_start(sl, gr);
         return;
     }
@@ -1252,6 +1266,7 @@ void server::gen_begin(session_slot *sl) {
     res.responses_live_match_ids = responses_live_match_ids;
     res.anthropic_live_match_ids = anthropic_live_match_ids;
     res.cache_diag = cache_diag;
+    res.seen = seen;
     s->gen_begin_plan(sl, &res);
 }
 
@@ -1307,6 +1322,13 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
     if (j->kvr.pick != KV_PICK_ADOPT) j->kvr.from = -1;
     j->kvr.at = resumed_at.raw();
     j->kvr.reused = cached;
+    /* L380: what this request found of its bank's last reply -- the evidence its turn's end reads before arming a
+     * terminal checkpoint (slot_turn_reply) */
+    {
+        const reply_use use = server_reply_use(j->kvr.pick, r->seen.common, r->seen.extends, &r->seen.reply);
+        server_terminal_evidence_note(&sl->terminal_ev, use, &r->seen.reply, r->seen.common);
+        j->kvr.reply = use == REPLY_USE_CONTINUED ? 1 : use == REPLY_USE_LEFT ? 0 : -1;
+    }
     /* L380: read before any sync of this request moves the bank's prompt-end record */
     g->endpoint_waive = server_endpoint_waive(j->kvr.pick, resumed_at.raw(),
                                               pulsar_session_bank_prompt_end(s->sess, sl->bank).raw());
@@ -2417,12 +2439,15 @@ void server::gen_step_finish(session_slot *sl) {
                        server_now_sec() - g->t0);
         }
     }
+    const bool called = parsed_calls.len > 0;
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
     /* L311: a turn that decoded leaves its reply as decode rows; the idle worker prefills it as the next turn would */
     /* L372: not an abandoned one -- its partial reply is no turn the client will send back */
-    sl->terminal_pending = gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion);
+    /* L380: nor when this conversation's requests leave replies of this kind behind (slot_turn_reply) */
+    sl->terminal_pending = s->slot_turn_reply(
+        sl, gen_turn_wants_terminal(g->abandoned, final_finish, g->completion_total + g->completion), called);
     sl->turn_ended_at = server_now_sec();   /* L380: the checkpoint's idle grace runs from here */
     gen_kv_finish(g, said_finish);   /* L378 */
     g->phase = GEN_DONE;
@@ -2447,6 +2472,37 @@ terminal_outcome server_terminal_outcome(int rc) {
 ///         reply isn't worth a sync
 static bool terminal_slot_applies(const session_slot *sl) {
     return sl->provisioned && !sl->spilled && !sl->active_job && !sl->hint_dead;
+}
+
+/// @param e the engine (its stop set)
+/// @param h a bank's history after a turn, len > 0
+/// @return the end a terminal checkpoint syncs it to: its length, a trailing stop excluded (the next render re-spells
+///         the stop, L290's join)
+static int terminal_turn_end(pulsar_engine *e, const pulsar_tokens *h) {
+    return pulsar_token_is_stop(e, h->v[h->len - 1]) ? h->len - 1 : h->len;
+}
+
+bool server::slot_turn_reply(session_slot *sl, bool wants, bool called) {
+    auto *s = this;
+    sl->reply = slot_reply{};
+    if (!wants || s->pool_banks <= 0) return wants;
+    const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, sl->bank);
+    const int pf = pulsar_session_bank_prefill_frontier(s->sess, sl->bank).raw();
+    const int C = h && h->len > 0 ? terminal_turn_end(s->engine, h) : 0;
+    if (C <= pf) return true;   /* nothing decoded past the prefill: the step drops it, as before */
+    sl->reply = slot_reply{ pf, C, server_route_header_anchor(h, pf, &s->turn_markers), called };
+    if (server_terminal_arms(wants, &sl->terminal_ev, called)) return true;
+    const int k = called ? 1 : 0;
+    server_log(PULSAR_LOG_KVCACHE,
+               "pulsar-server: terminal checkpoint: bank %u skipped: the request after its conversation's last %s "
+               "reply resumed below that reply (%d of %d reply tokens matched) -- [%d, %d) stays as decoded",
+               sl->bank, called ? "tool-call" : "closing", sl->terminal_ev.matched[k], sl->terminal_ev.of[k], pf, C);
+    return false;
+}
+
+void server::slot_reply_forget(session_slot *sl) {
+    sl->reply = slot_reply{};
+    sl->terminal_ev = terminal_evidence{};
 }
 
 void server::slot_terminal_clear(session_slot *sl) {
@@ -2549,8 +2605,7 @@ bool server::terminal_checkpoint_step(double now_sec, bool grace_waived) {
     const pulsar_tokens *h = pulsar_session_bank_tokens(s->sess, pick->bank);
     const int pf = pulsar_session_bank_prefill_frontier(s->sess, pick->bank).raw();
     if (!h || h->len <= 0) return true;
-    int C = resumed ? target.len : h->len;
-    if (!resumed && pulsar_token_is_stop(s->engine, h->v[C - 1])) C--;   /* the render re-spells the stop (L290's join) */
+    const int C = resumed ? target.len : terminal_turn_end(s->engine, h);
     if (C <= pf) return true;                                /* nothing decoded past the prefill */
     if (!s->bank_switch((int)pick->bank)) return true;
     /* the records keep no image identity: a history holding an image block stays as decoded */

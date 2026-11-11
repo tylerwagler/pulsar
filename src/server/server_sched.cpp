@@ -1410,6 +1410,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     s->responses_live_clear(sl);
     s->anthropic_live_clear(sl);
     s->slot_terminal_clear(sl);   /* L380: and the turn a yielded terminal checkpoint kept for it */
+    s->slot_reply_forget(sl);     /* L380: and what its conversation showed of its replies */
 
     const uint64_t committed = sl->est_cost_bytes;
     uint64_t freed = 0;
@@ -2106,6 +2107,34 @@ bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end) {
     return (pick == KV_PICK_OWN || pick == KV_PICK_LIVE) && bank_prompt_end > 0 && at >= bank_prompt_end;
 }
 
+reply_use server_reply_use(kv_pick pick, int common, bool extends, const slot_reply *r) {
+    if (r->to <= r->from) return REPLY_USE_NONE;
+    if (pick == KV_PICK_LIVE) return REPLY_USE_CONTINUED;
+    if (pick != KV_PICK_OWN) return REPLY_USE_NONE;
+    if (common >= r->to) return REPLY_USE_CONTINUED;
+    if (!extends) return REPLY_USE_SAME;
+    const bool next_turn = r->header >= 0 ? common > r->header : common >= r->from;
+    return next_turn ? REPLY_USE_LEFT : REPLY_USE_NONE;
+}
+
+void server_terminal_evidence_note(terminal_evidence *ev, reply_use use, const slot_reply *r, int common) {
+    const int k = r->called ? 1 : 0;
+    switch (use) {
+    case REPLY_USE_NONE: *ev = terminal_evidence{}; break;
+    case REPLY_USE_SAME: break;
+    case REPLY_USE_CONTINUED: ev->left[k] = false; break;
+    case REPLY_USE_LEFT:
+        ev->left[k] = true;
+        ev->of[k] = r->to - r->from;
+        ev->matched[k] = common <= r->from ? 0 : common - r->from;
+        break;
+    }
+}
+
+bool server_terminal_arms(bool wants, const terminal_evidence *ev, bool called) {
+    return wants && !ev->left[called ? 1 : 0];
+}
+
 void gen_kv_finish(gen_state *g, const char *word) {
     if (!g->kv_finish[0]) snprintf(g->kv_finish, sizeof g->kv_finish, "%.*s", (int)sizeof g->kv_finish - 1, word);
 }
@@ -2196,6 +2225,7 @@ void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     /* what a resume at the deepest live match would have saved */
     kv_line_int(&l, "below", r->deep >= 0 && r->at >= 0 ? (r->deep > r->at ? r->deep - r->at : 0) : -1);
     kv_line_int(&l, "epcut", r->epcut);
+    kv_line_int(&l, "reply", r->reply);
     kv_line_int(&l, "evict", r->evict);
     kv_line_int(&l, "evict_tokens", r->evict >= 0 ? r->evict_tokens : -1);
     kv_line_hash(&l, "evict_conv", r->evict >= 0, r->evict_conv);
@@ -2234,7 +2264,7 @@ void server::kv_req_key(job *j) {
     r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
     r->prompt = q->prompt.len;
     r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
-    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->evict = r->evict_tokens = -1;
+    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->reply = r->evict = r->evict_tokens = -1;
     r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;
 }
 
@@ -3086,6 +3116,7 @@ bool server::spill_bank(session_slot *victim) {
         return false;
     }
     victim->spilled = true;
+    s->slot_reply_forget(victim);   /* L380: its rows are a chain now; what comes back is read as a new bank */
     victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     s->guard_evictions++;
     const double gib = 1024.0 * 1024.0 * 1024.0;

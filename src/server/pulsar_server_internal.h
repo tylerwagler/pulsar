@@ -969,6 +969,72 @@ kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored);
 /// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), 0 = none
 /// @return true when the request's syncs waive the cut
 bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end);
+/** L380: the reply a finished turn left on its bank, as the turn's end found it (server::slot_turn_reply): the rows
+ *  a terminal checkpoint of the turn syncs.  Positions on the bank's history (the live side).  The next job bound to
+ *  the slot takes it (server::gen_begin) and reads its own prompt against it (server_reply_use). */
+typedef struct {
+    int from;      ///< its start: the bank's prefill frontier at the turn's end, where the turn's prompt ended
+    int to;        ///< its end: the history's end, a trailing stop excluded (the checkpoint's target); <= from: none
+    int header;    ///< server_route_header_anchor of the turn's prompt (the history to `from`); -1 = none
+    bool called;   ///< the reply ended in tool calls (its next request is a tool result, not a user turn)
+} slot_reply;
+/** L380: what a request found of the reply its bank's last turn left (server_reply_use): the evidence for whether a
+ *  terminal checkpoint over a reply of that kind is used by this conversation. */
+typedef enum {
+    REPLY_USE_NONE = 0,    ///< no evidence about this bank's conversation: its verdicts are forgotten
+    REPLY_USE_SAME,        ///< the request lies within the bank's history (a re-send, a rollback): the verdicts stand
+    REPLY_USE_CONTINUED,   ///< it continued from the reply: carried it whole, or a live continuation
+    REPLY_USE_LEFT,        ///< it carried the turn's prompt to its generation header and left the reply before its end
+} reply_use;
+/** L380: what gen_begin read of the bound slot's last reply, for the plan's verdict (the pick is known there). */
+typedef struct {
+    slot_reply reply;   ///< the reply the slot held at the bind (none: to <= from)
+    int common;         ///< the request's byte match with the bank's history, the reply included (live side)
+    bool extends;       ///< the request has tokens past that match
+} reply_seen;
+/** L380: a slot's evidence that its conversation does not use terminal checkpoints, by the reply's kind (index 0: a
+ *  reply that closed its turn, 1: one that ended in tool calls -- an agent loop keeps a tool-call reply for the tool
+ *  result while its template or client re-renders the closing reply at the next user turn).  All zero: no evidence,
+ *  every turn arms its checkpoint. */
+typedef struct {
+    bool left[2];     ///< the last request after a reply of this kind left it (REPLY_USE_LEFT)
+    int matched[2];   ///< ... having matched this many of the reply's tokens
+    int of[2];        ///< ... of this many
+} terminal_evidence;
+/** L380: what a request found of its bank's last reply.  The terminal checkpoint is the next turn's own sync run
+ *  early; its rows are used only by a request that continues from the reply.  The evidence is the request's byte
+ *  match against the bank's history WITH the reply (decode rows or prefilled, the same tokens either way; the kept
+ *  turn of a checkpoint that yielded) -- not where its sync resumed, which after a skipped checkpoint is the prompt
+ *  end whatever the client sent.
+ *  - no reply recorded (the first turn on a bank, an evicted or re-bound bank, a turn that failed or was abandoned,
+ *    a bind that never planned), or a pick that replaces or reloads the bank's state (adopt, disk, spilled, none):
+ *    REPLY_USE_NONE.
+ *  - a live protocol continuation (pick live), or a match through the reply's end: REPLY_USE_CONTINUED.
+ *  - else a request wholly inside the match (the same prompt again, a rollback): REPLY_USE_SAME.
+ *  - else a request that carries the turn's generation header (common > header: this conversation's next turn, the
+ *    rule server_route_in_place reads; with no header known, the whole prompt, common >= from) and parts from the
+ *    history before the reply's end: REPLY_USE_LEFT.
+ *  - else (it parts below the header: another conversation behind a shared prefix, an edit of earlier history):
+ *    REPLY_USE_NONE. */
+/// @param pick     the state the request's sync starts from
+/// @param common   its byte match with the bank's history, the reply included (reply_seen::common)
+/// @param extends  it has tokens past that match
+/// @param r        the reply the slot held
+/// @return the verdict
+reply_use server_reply_use(kv_pick pick, int common, bool extends, const slot_reply *r);
+/** L380: fold a request's verdict into its slot's evidence: NONE forgets both kinds, SAME changes nothing, CONTINUED
+ *  and LEFT set the kind of the reply the request was read against. */
+/// @param ev      the slot's evidence
+/// @param use     the verdict
+/// @param r       the reply it was read against
+/// @param common  the request's match (reply_seen::common), for the LEFT count
+void server_terminal_evidence_note(terminal_evidence *ev, reply_use use, const slot_reply *r, int common);
+/// @param wants   the turn is one a terminal checkpoint serves (gen_turn_wants_terminal)
+/// @param ev      the slot's evidence
+/// @param called  the turn's reply ended in tool calls
+/// @return true when the turn arms its terminal checkpoint: wanted, and no evidence that this conversation leaves
+///         replies of this kind (L380)
+bool server_terminal_arms(bool wants, const terminal_evidence *ev, bool called);
 /// Bytes of a client id (session, agent, parent agent) the `kv req:` line prints
 #define KV_REQ_ID_CHARS 16
 /** Everything one `kv req:` line prints.  Kept on the job (job::kvr) and filled as each fact becomes known: the
@@ -1004,6 +1070,8 @@ typedef struct {
     int prefilled_now;   ///< tokens this request prefilled
     /// L380: the prefill's cut at the prompt's message endpoint: 1 made (and recorded), 0 waived, -1 no endpoint ahead
     int epcut;
+    /// L380: what it found of its bank's previous reply: 1 continued from it, 0 left it, -1 no evidence (reply_use)
+    int reply;
     bool spill_restored; ///< its bank's history came back from the spill chain for it
     int evict;           ///< the bank its bind evicted (the last, when several)
     int evict_tokens;    ///< that bank's history, in tokens
@@ -2276,6 +2344,14 @@ typedef struct session_slot {
     /** L380: the yielded checkpoint stopped inside its first of two syncs (the history short of its last token),
      *  so the resume runs both again in that order. */
     bool         terminal_short_first;
+    /** L380: the reply the slot's last finished turn left on its bank (none: to <= from), until the next job's bind
+     *  takes it (server::gen_begin); cleared with the bank's conversation (server::slot_reply_forget). */
+    slot_reply   reply;
+    /** L380: the evidence that this bank's conversation does not use terminal checkpoints, from the requests that
+     *  ran on it (server_terminal_evidence_note); a turn whose reply kind it names arms none
+     *  (server::slot_turn_reply).  Zeroed with the bank's conversation (server::slot_reply_forget) and by a request
+     *  that is no evidence about it (REPLY_USE_NONE). */
+    terminal_evidence terminal_ev;
     /** L314: the slot's running decoder was PREEMPTED for a prompt the KV budget could not otherwise admit: its
      *  bank's exact state (the frontier payload at its consumed count) is on disk at preempt_path, its physical
      *  freed, its job parked with everything the decode loop keeps (stream, budget, stop / grammar / penalty state,
@@ -3411,6 +3487,19 @@ struct server {
     /// @return the turn a yielded terminal checkpoint keeps for it (session_slot::terminal_turn) while its bank
     ///         stands inside that turn, else NULL (L380)
     const pulsar_tokens *slot_interrupted_turn(const session_slot *sl) const;
+    /** L380: a turn's end: records the reply it left on the slot's bank (session_slot::reply; none for a turn no
+     *  checkpoint serves or one with nothing decoded past its prefill) and decides its terminal checkpoint
+     *  (server_terminal_arms), saying so when the slot's evidence skips it.  A skipped checkpoint is a pending one
+     *  that never runs: the reply stays as decode rows, nothing more is persisted or invalidated, and the live tool
+     *  bindings stand as they do inside the grace. */
+    /// @param sl      the slot (its bank installed, its history folded)
+    /// @param wants   the turn is one a terminal checkpoint serves (gen_turn_wants_terminal)
+    /// @param called  its reply ended in tool calls
+    /// @return the slot's terminal_pending
+    bool slot_turn_reply(session_slot *sl, bool wants, bool called);
+    /// Forgets the slot's last reply and its terminal-checkpoint evidence: its bank's conversation is gone (L380).
+    /// @param sl the slot
+    void slot_reply_forget(session_slot *sl);
     /** Tear down the slot's generation state.
      *
      * Uninstalls every engine callback FIRST: a cancel/progress callback still
@@ -4165,6 +4254,7 @@ typedef struct gen_resolution {
     int responses_live_match_ids;           ///< ... and on how many call ids
     int anthropic_live_match_ids;           ///< the Anthropic continuation's matched call ids
     trace_cache_diag cache_diag;            ///< the trace's record of the live match
+    reply_seen seen;                        ///< L380: the slot's last reply and the request's match with it
 } gen_resolution;
 
 /** L330: what restores while a job is in GEN_RESTORE. */
