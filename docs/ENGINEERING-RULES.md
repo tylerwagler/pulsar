@@ -240,6 +240,14 @@ increment, and not again for a delta that cannot move a number:
   proved the numerics; re-running it proves nothing the dev tier does not.
 - `tools/`, `docs/`, test helpers, Makefile recipes only: `make check` plus
   `make gates-dev`.
+- A release run that comes back red on a gate because the TEST is wrong (a bad
+  fixture, a stale expectation, a harness fault) is not run again: fix the
+  test, run that gate plus `make gates-dev` for the touched paths at the fixed
+  sha, and record both shas.  The run's other results stand at the sha they
+  ran on.  The release tier runs again only when the fix changes
+  `src/engine`, `src/families`, `src/cuda`, `src/server` or `src/tp` on a path
+  a token takes.  (2026-11-11, Tyler: "We don't need to re-run whole batteries
+  for fixing a test case."; L381's gate built a bad fixture.)
 
 A measurement (the perf A/B, a census) goes AHEAD of a release run in the GPU
 queue when someone is waiting on the number; the release run waits behind it.

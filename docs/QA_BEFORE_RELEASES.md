@@ -591,6 +591,11 @@ Do not sign off until:
 - `make release` passed on the GB10 host against the release commit and the
   shipped artifacts, on a clean tree, with nothing under "NOT FULLY RUN"
   that is not written down; keep its `results.json` with the release notes.
+  A delta after that run that cannot move a number (tests, tools, docs,
+  Makefile recipes, the release notes) does not call for another run, and
+  neither does a gate that failed because the test itself was wrong: the gate
+  that covers the delta at the release commit, both shas written down
+  (`docs/ENGINEERING-RULES.md` §10).
 - The byte baselines (`PREFILL_BASELINE_REF`) were dumped on the shipped
   container revision, by a build that loads it.
 - The Flash inference path (CLI, thinking modes, long-context recall) was
