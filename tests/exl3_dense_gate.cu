@@ -34,10 +34,37 @@
  *      M-independent rows, and windows cut from the head equal its columns bit for bit and grade vs double.
  *   8. a logical width short of the stored 128 multiple (L295 F7: Inkling's head 4096 -> 201024, stored 201088):
  *      bit for bit the stored call's columns, nothing written past N, graded vs double.
+ *   9. the GEMV's two CTA forms (L380: 16 warps, one CTA an SM; 8 warps, two an SM): (a) the selection rule
+ *      (ds4_exl3_dense_gemv_arm) on a table of (rows, grid, SMs, device) -- the measured GB10 launches on their side
+ *      of it, one wave, five waves, M > 8, two passes and every other architecture on the 16-warp side; (b) each
+ *      form FORCED (ds4_exl3_dense_arm_force) on the same launches -- every rate, the narrow and the wide CTA
+ *      (shapes sized from the device's SM count so gemv_wide picks each; the description proves which kernel ran),
+ *      K of 1, 3, 5 and 20 blocks, M = 1, 2, 3, 4, 8, 16, single and multi launches (one rate and mixed), f32 and
+ *      bf16 outputs: the 8-warp form's bytes are the 16-warp form's, every f32 row its M = 16 row, every bf16 row
+ *      the f32 row rounded, the single shapes graded vs double; any differing byte fails; (c) a mutated weight
+ *      moves the 8-warp output; the forced 8-warp form refuses a two-pass launch.  Run on every device: the forced
+ *      8-warp form runs on sm_75 too (the rule never picks it there), so its bytes are held on Turing as well.
+ *  10. the prompt arm's two kernels (L381: the fixed-algorithm GEMM on the weight decoded to fp16; the in-place
+ *      kernel on small chunks): (a) the selection rule (ds4_exl3_dense_prompt_arm) on a table of (rows, device);
+ *      (b) each kernel FORCED (ds4_exl3_dense_prompt_force) on the same launches -- every rate; K of 1, 3 and 20
+ *      blocks (K is always whole 128-blocks: the arm refuses any other); N a 128 multiple, short of its stored
+ *      multiple, and under one block; single and multi launches (one rate and mixed); the prompt launches of
+ *      Qwen3.8-Flash-Next, Nemotron-3.5 Super and Gemma 4; M = 1, 2, 3, 5, 16, 17, 30, 64, 65, 128, the rule's 256
+ *      and 257: EVERY output byte of the in-place kernel is the GEMM arm's, nothing is written past the rows, and
+ *      every row of the in-place kernel at 256 rows is that row launched alone; (c) the rule's own path: a shape's
+ *      first launch is the check (both kernels, compared), its next ones the in-place kernel, 257 rows the GEMM --
+ *      the description proves which -- and every one writes the GEMM arm's bytes; (d) the check can fail: with a
+ *      fault armed (ds4_exl3_dense_prompt_check_fault) it finds the mismatch, the in-place kernel turns itself off
+ *      for every shape, and the launch still returns the GEMM arm's bytes; a flipped trellis bit moves the in-place
+ *      output.  The equality is a property of the device's cuBLASLt kernel: (b)-(d) FAIL on any differing byte on
+ *      a device the rule names (sm_12x) and are information elsewhere (the rule keeps the GEMM there).
  *
- * usage: ./tests/exl3_dense_gate
+ * usage: ./tests/exl3_dense_gate --plan   section 10's fixtures walked on the host (no GPU): every layout and workspace
+ *                                         it will ask for, a refused one failing here
+ *        ./tests/exl3_dense_gate     (make exl3-dense-gate CUDA_ARCH=sm_120f on GB10; CUDA_ARCH=sm_75 on Turing)
  */
 #include "../src/cuda/mmq/ds4_exl3_dense.cuh"
+#include "../src/cuda/pulsar_cuda_arch.cuh"
 #include "../src/cuda/pulsar_cuda_mx.cuh"
 #include "../src/engine/exl3_trellis.h"
 #include "exl3_dense_ref.h"
@@ -217,7 +244,612 @@ static void grade_prefill(const dev &d, const weight &w, const slot &s, const st
     }
 }
 
-int main(void) {
+/* 9. L380: the GEMV's two CTA forms.  (a) the rule's table; (b) both forms forced on the same launches, byte for byte;
+ * (c) a mutation and the forced form's refusal. */
+static void arm_section(const double tol) {
+    const int W16 = DS4_EXL3_DENSE_ARM_16W, W8 = DS4_EXL3_DENSE_ARM_8W;
+    /* (a) the rule: rows, the launched grid, the device's SMs and compute capability -> the form */
+    struct rule { int M, ctas, sms, cc, want; const char *what; };
+    const rule rules[] = {
+        {1, 512, 48, 121, W8, "GB10 2560->10240+6144 narrow, 11 waves, 1 row (measured 0.85)"},
+        {4, 512, 48, 121, W8, "the same at 4 rows (0.83)"},
+        {8, 256, 48, 121, W8, "the same launch wide at 8 rows, 6 waves (0.93)"},
+        {1, 416, 48, 121, W8, "GB10 2560->12288+2x512 narrow, 9 waves (0.88)"},
+        {8, 208, 48, 121, W16, "the same launch wide at 8 rows, 5 waves (measured 1.07: slower)"},
+        {1, 320, 48, 121, W8, "GB10 2560->10240 narrow, 7 waves (0.85)"},
+        {8, 160, 48, 121, W16, "the same wide at 8 rows, 4 waves (0.97: inside the noise)"},
+        {1, 3880, 48, 121, W8, "GB10 lm_head wide, 81 waves, 1 row (0.90)"},
+        {8, 3880, 48, 121, W8, "GB10 lm_head wide at 8 rows (0.91)"},
+        {1, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 1 row (1.05-1.50: slower)"},
+        {8, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 8 rows"},
+        {1, 240, 48, 121, W16, "5 full waves: the last grid that keeps 16 warps"},
+        {1, 241, 48, 121, W8, "the first CTA of a 6th wave"},
+        {9, 3880, 48, 121, W16, "9 rows: past the measured widths"},
+        {16, 512, 48, 121, W16, "16 rows"},
+        {17, 3880, 48, 121, W16, "two passes (17 rows)"},
+        {32, 3880, 48, 121, W16, "two passes (32 rows)"},
+        {1, 512, 48, 120, W8, "sm_120: the same family as GB10's sm_121"},
+        {1, 512, 170, 120, W16, "sm_120 with 170 SMs: the same grid is 4 waves there"},
+        {1, 1024, 170, 120, W8, "sm_120 with 170 SMs: 7 waves"},
+        {1, 512, 48, 75, W16, "sm_75 (Turing, 48 SMs): not measured"},
+        {1, 3880, 72, 75, W16, "sm_75 (Turing, 72 SMs): not measured"},
+        {1, 3880, 48, 89, W16, "sm_89: not measured"},
+        {1, 3880, 48, 100, W16, "sm_100: not measured"},
+        {1, 3880, 48, 0, W16, "a device whose capability is unknown"},
+        {0, 3880, 48, 121, W16, "no rows"},
+        {1, 3880, 0, 121, W16, "no SM count"},
+    };
+    size_t rule_bad = 0;
+    for (const rule &r : rules) {
+        const int got = ds4_exl3_dense_gemv_arm(r.M, r.ctas, r.sms, r.cc);
+        CHECK(got == r.want, "arm rule: M=%d grid=%d SMs=%d sm_%d (%s) -> %s, want %s", r.M, r.ctas, r.sms, r.cc, r.what,
+              got == W8 ? "8 warps" : "16 warps", r.want == W8 ? "8 warps" : "16 warps");
+        rule_bad += got != r.want;
+    }
+    printf("  arm rule: %zu of %zu (rows, grid, SMs, device) cases on their side (8 warps iff sm_12x, M <= 8, 6+ waves)\n",
+           sizeof rules / sizeof *rules - rule_bad, sizeof rules / sizeof *rules);
+
+    ds4_exl3_dense_gemv_desc dv{};
+    if (ds4_exl3_dense_gemv_describe(10, 1, 20, &dv)) {
+        CHECK(false, "arm forms: the device does not describe a GEMV launch -- section 9 not run");
+        return;
+    }
+    const int sms = dv.sms, cc = pulsar_cuda_device_cc();
+    printf("  this device: sm_%d, %d SMs; unforced, a 512-CTA launch runs %d warps at 1 row and %d at 16\n", cc, sms,
+           ds4_exl3_dense_gemv_arm(1, 512, sms, cc) == W8 ? 8 : 16, ds4_exl3_dense_gemv_arm(16, 256, sms, cc) == W8 ? 8 : 16);
+    CHECK(ds4_exl3_dense_arm_force(7) == -1, "arm forms: an unknown forced form accepted");
+
+    /* (b) the launches.  Narrow: at most one wave of 32-output CTAs (gemv_wide keeps 32 outputs at every M); wide:
+     * 4 x SMs of them (two waves of 64-output CTAs for four: gemv_wide takes 64 outputs at every M). */
+    struct lcase { const char *what; int K, n, N[4], k2[4], nt; };
+    std::vector<lcase> cases;
+    const int rates[] = {4, 6, 8, 10, 12, 16};
+    const int wide_n = 128 * sms;
+    for (int k2 : rates) {
+        cases.push_back({"narrow, K of 1 block", 128, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 3 blocks", 384, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 5 blocks", 640, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 20 blocks", 2560, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"wide", 2560, 1, {wide_n, 0, 0, 0}, {k2, 0, 0, 0}, 4});
+        cases.push_back({"wide, K of 5 blocks", 640, 1, {wide_n, 0, 0, 0}, {k2, 0, 0, 0}, 4});
+        cases.push_back({"narrow multi", 2560, 3, {256, 128, 256, 0}, {k2, k2, k2, 0}, 2});
+        cases.push_back({"wide multi", 2560, 3, {wide_n - 1024, 512, 512, 0}, {k2, k2, k2, 0}, 4});
+    }
+    cases.push_back({"multi at rates 8 / 10 / 8 (two GEMVs)", 2560, 3, {256, 512, 128, 0}, {8, 10, 8, 0}, 2});
+    cases.push_back({"wide multi at rates 10 / 6 (two GEMVs)", 2560, 2, {wide_n, wide_n, 0, 0}, {10, 6, 0, 0}, 4});
+
+    const int Ms[] = {1, 2, 3, 4, 8, 16};
+    size_t n_out = 0, n_diff = 0, n_m16 = 0, n_rn = 0, n_lane = 0, n_graded = 0;
+    double g_mx = 0;
+    for (const lcase &c : cases) {
+        const int K = c.K, n = c.n;
+        const slot s = make_slot(16, K);
+        std::vector<weight> w;
+        uint8_t *dw[4] = {}, *dq = nullptr;
+        float *dy[4] = {};
+        uint16_t *dyb[4] = {};
+        void *ws = nullptr;
+        ds4_exl3_dense_proj pf[4] = {}, pb[4] = {};
+        CUDA_OK(cudaMalloc((void **)&dq, s.q.size() * sizeof(uint16_t)));
+        CUDA_OK(cudaMemcpy(dq, s.q.data(), s.q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        for (int j = 0; j < n; j++) {
+            w.push_back(make_weight(K, c.N[j], c.k2[j]));
+            CUDA_OK(cudaMalloc((void **)&dw[j], w[j].stride));
+            CUDA_OK(cudaMemcpy(dw[j], w[j].bytes.data(), w[j].stride, cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMalloc((void **)&dy[j], (size_t)16 * c.N[j] * sizeof(float)));
+            CUDA_OK(cudaMalloc((void **)&dyb[j], (size_t)16 * c.N[j] * sizeof(uint16_t)));
+            pf[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], dy[j], nullptr};
+            pb[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], nullptr, dyb[j]};
+        }
+        const size_t wsb = ds4_exl3_dense_multi_workspace_bytes(pf, n, 16, K);
+        CUDA_OK(cudaMalloc(&ws, wsb));
+        /* one launch under a forced form: each projection's M rows, f32 or bf16, canaries first (every output written) */
+        auto launch = [&](int arm, int M, bool bf16, const ds4_exl3_dense_proj *p, std::vector<std::vector<uint8_t>> &out) {
+            const size_t el = bf16 ? sizeof(uint16_t) : sizeof(float);
+            for (int j = 0; j < n; j++)
+                CUDA_OK(cudaMemset(bf16 ? (void *)dyb[j] : (void *)dy[j], 0xff, (size_t)M * c.N[j] * el));
+            if (ds4_exl3_dense_arm_force(arm) != 0) return -1;
+            const int rc = ds4_exl3_dense_multi_launch(p, n, dq, M, K, ws, wsb, 0, false);
+            CUDA_OK(cudaDeviceSynchronize());
+            ds4_exl3_dense_arm_force(0);
+            if (rc) return rc;
+            out.assign(n, {});
+            for (int j = 0; j < n; j++) {
+                out[j].resize((size_t)M * c.N[j] * el);
+                CUDA_OK(cudaMemcpy(out[j].data(), bf16 ? (void *)dyb[j] : (void *)dy[j], out[j].size(), cudaMemcpyDeviceToHost));
+            }
+            return 0;
+        };
+        /* the instrument proves the lane: under each forced form, every rate's GEMV is that form's kernel at the
+         * CTA width the case was sized for */
+        bool lanes = true;
+        for (int j = 0; j < n; j++) {
+            int c32 = 0;
+            for (int i = 0; i < n; i++)
+                if (c.k2[i] == c.k2[j]) c32 += (int)(exl3_out_stored((uint64_t)c.N[i]) / 32);
+            for (int M : Ms)
+                for (int arm : {W16, W8}) {
+                    ds4_exl3_dense_gemv_desc d{};
+                    ds4_exl3_dense_arm_force(arm);
+                    const int rc = ds4_exl3_dense_gemv_describe(c.k2[j], M, c32, &d);
+                    ds4_exl3_dense_arm_force(0);
+                    const bool ok = rc == 0 && d.arm == arm && d.threads == (arm == W8 ? 256 : 512) && d.nt == c.nt;
+                    CHECK(ok, "arm forms: %s K=%d M=%d: forced %d warps describes rc=%d form %d, %d threads, %d n-tiles a "
+                          "CTA (want %d) on %d SMs -- the case does not run the kernel it names", c.what, c.k2[j] / 2, M,
+                          arm == W8 ? 8 : 16, rc, d.arm, d.threads, d.nt, c.nt, sms);
+                    lanes = lanes && ok;
+                    n_lane++;
+                }
+        }
+        std::vector<std::vector<uint8_t>> ref16, y, yb16, yb8;
+        int rc = launch(W16, 16, false, pf, ref16);
+        CHECK(rc == 0, "arm forms: %s K=%d: the 16-warp M=16 launch rc=%d", c.what, c.k2[0] / 2, rc);
+        for (int M : Ms) {
+            if (rc || !lanes) break;
+            for (int arm : {W16, W8}) {
+                int r2 = launch(arm, M, false, pf, y);
+                CHECK(r2 == 0, "arm forms: %s K=%d M=%d: the %d-warp f32 launch rc=%d", c.what, c.k2[0] / 2, M,
+                      arm == W8 ? 8 : 16, r2);
+                if (r2) { n_diff++; continue; }
+                for (int j = 0; j < n; j++) {
+                    const bool same = memcmp(y[j].data(), ref16[j].data(), y[j].size()) == 0;
+                    CHECK(same, "arm forms: %s K=%d M=%d projection %d (%d -> %d): the %d-warp CTA's f32 rows are not the "
+                          "16-warp CTA's M=16 rows", c.what, c.k2[j] / 2, M, j, K, c.N[j], arm == W8 ? 8 : 16);
+                    (arm == W8 ? n_diff : n_m16) += !same;
+                    n_out += arm == W8;
+                }
+                std::vector<std::vector<uint8_t>> &ybx = arm == W8 ? yb8 : yb16;
+                r2 = launch(arm, M, true, pb, ybx);
+                CHECK(r2 == 0, "arm forms: %s K=%d M=%d: the %d-warp bf16 launch rc=%d", c.what, c.k2[0] / 2, M,
+                      arm == W8 ? 8 : 16, r2);
+                if (r2) { n_diff++; continue; }
+                for (int j = 0; j < n; j++) {   /* the bf16 rows are the f32 rows rounded to nearest even */
+                    size_t bad = 0;
+                    const uint16_t *b = (const uint16_t *)ybx[j].data();
+                    for (size_t i = 0; i < ybx[j].size() / 2; i++) {
+                        uint32_t u;
+                        memcpy(&u, ref16[j].data() + i * 4, 4);
+                        u += 0x7fffu + ((u >> 16) & 1u);
+                        bad += (uint16_t)(u >> 16) != b[i];
+                    }
+                    CHECK(bad == 0, "arm forms: %s K=%d M=%d projection %d: %zu of the %d-warp CTA's bf16 outputs are not "
+                          "the f32 outputs rounded", c.what, c.k2[j] / 2, M, j, bad, arm == W8 ? 8 : 16);
+                    n_rn += bad != 0;
+                }
+            }
+            for (int j = 0; j < n && yb8.size() == (size_t)n && yb16.size() == (size_t)n; j++) {
+                const bool same = yb8[j].size() == yb16[j].size() && memcmp(yb8[j].data(), yb16[j].data(), yb8[j].size()) == 0;
+                CHECK(same, "arm forms: %s K=%d M=%d projection %d (%d -> %d): the 8-warp CTA's bf16 rows are not the "
+                      "16-warp CTA's", c.what, c.k2[j] / 2, M, j, K, c.N[j]);
+                n_diff += !same;
+                n_out++;
+            }
+        }
+        if (!rc && lanes && n == 1) {   /* the 8-warp form against the host authority in double */
+            std::vector<double> what, yref;
+            exl3t_dequant(w[0].bytes.data(), K, c.N[0], c.k2[0], what);
+            exl3t_reference(w[0].bytes.data(), what, K, c.N[0], c.k2[0], s.x.data(), 16, yref);
+            if (launch(W8, 16, false, pf, y) == 0) {
+                std::vector<float> yf((size_t)16 * c.N[0]);
+                memcpy(yf.data(), y[0].data(), y[0].size());
+                double mx, med;
+                grade(yf, yref, 16, c.N[0], 0, &mx, &med);
+                CHECK(mx < tol, "arm forms: %s %d -> %d K=%d: the 8-warp CTA's M=16 max rel %.3e (limit %.0e)", c.what, K,
+                      c.N[0], c.k2[0] / 2, mx, tol);
+                CHECK(med > 1e-10, "arm forms: %s K=%d: median rel %.3e -- a degenerate fixture, not a pass", c.what,
+                      c.k2[0] / 2, med);
+                g_mx = fmax(g_mx, mx);
+                n_graded++;
+            }
+        }
+        if (!rc && lanes && n == 1 && c.nt == 4 && c.k2[0] == 10 && K == 2560) {
+            /* (c) the comparison can fail: one flipped trellis bit moves the 8-warp form's output */
+            weight wm = w[0];
+            wm.words()[12345] ^= 0x0100u;
+            CUDA_OK(cudaMemcpy(dw[0], wm.bytes.data(), wm.stride, cudaMemcpyHostToDevice));
+            const int r2 = launch(W8, 16, false, pf, y);
+            size_t moved = 0;
+            if (!r2)
+                for (size_t i = 0; i < y[0].size(); i += 4) moved += memcmp(y[0].data() + i, ref16[0].data() + i, 4) != 0;
+            CHECK(r2 == 0 && moved > 0, "arm forms: a flipped trellis bit moved no 8-warp output -- the comparison is "
+                  "degenerate");
+            CUDA_OK(cudaMemcpy(dw[0], w[0].bytes.data(), w[0].stride, cudaMemcpyHostToDevice));
+            /* the 8-warp form is one pass: forced on 17 rows it refuses, in the launch and in the description */
+            ds4_exl3_dense_gemv_desc d{};
+            ds4_exl3_dense_arm_force(W8);
+            const int r17 = ds4_exl3_dense_multi_launch(pf, 1, dq, 17, K, ws, wsb, 0, false);
+            const int d17 = ds4_exl3_dense_gemv_describe(10, 17, c.N[0] / 32, &d);
+            ds4_exl3_dense_arm_force(0);
+            CHECK(r17 == -1 && d17 == -1, "arm forms: the forced 8-warp CTA took a two-pass launch (rc=%d, describe %d)", r17,
+                  d17);
+            printf("  arm forms: a flipped trellis bit moved %zu 8-warp outputs; the forced 8-warp CTA refuses 17 rows\n", moved);
+        }
+        for (int j = 0; j < n; j++) { cudaFree(dw[j]); cudaFree(dy[j]); cudaFree(dyb[j]); }
+        cudaFree(dq);
+        cudaFree(ws);
+    }
+    ds4_exl3_dense_gemv_desc d8{};
+    ds4_exl3_dense_arm_force(W8);
+    const int rd = ds4_exl3_dense_gemv_describe(10, 8, 4 * sms, &d8);
+    ds4_exl3_dense_arm_force(0);
+    CHECK(n_out > 0 && n_graded > 0, "arm forms: nothing was compared");
+    printf("  arm forms: %zu launches (K = 2, 3, 4, 5, 6, 8; narrow and wide; M = 1, 2, 3, 4, 8, 16; single and multi; f32 "
+           "and bf16), %zu (launch, projection) outputs of the 8-warp CTA: %zu differ from the 16-warp CTA's bytes; %zu "
+           "16-warp f32 outputs off their M=16 rows; %zu bf16 outputs off the f32 rounded; %zu kernel descriptions "
+           "checked; %zu single shapes vs double, max rel %.2e\n", cases.size() * 24, n_out, n_diff, n_m16, n_rn, n_lane,
+           n_graded, g_mx);
+    if (!rd)
+        printf("  arm forms: the 8-warp K=5 wide CTA here: %d registers a thread, %d B shared, %d CTAs an SM at 8 rows "
+               "(information)\n", d8.regs, d8.smem, d8.ctas_per_sm);
+}
+
+/* 10. the prompt arm's launches: N is each projection's LOGICAL width (stored at exl3_out_stored, a 128 multiple). */
+struct pcase { const char *what; int K, n, N[4], k2[4]; bool full; };
+static std::vector<pcase> prompt_cases(void) {
+    std::vector<pcase> cases;
+    for (int k2 : {4, 6, 8, 10, 12, 16}) {
+        cases.push_back({"K of 1 block", 128, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"K of 3 blocks", 384, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"K of 20 blocks", 2560, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"N short of its stored 1024", 640, 1, {1000, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"N under one block (stored 128)", 640, 1, {100, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"multi", 1280, 3, {256, 1000, 128, 0}, {k2, k2, k2, 0}, true});
+    }
+    cases.push_back({"multi at rates 4 / 5 / 6 / 2", 1280, 4, {256, 512, 100, 640}, {8, 10, 12, 4}, true});
+    /* the families' prompt launches (family_qwen_s4.cpp, nemotron_h_forward.cpp, gemma4_forward.cpp), at 5 rows and
+     * the rule's last */
+    cases.push_back({"Qwen GDN qkv + z", 2560, 2, {10240, 6144, 0, 0}, {10, 10, 0, 0}, false});
+    cases.push_back({"Qwen QSA q + k + v", 2560, 3, {12288, 512, 512, 0}, {10, 10, 10, 0}, false});
+    cases.push_back({"Qwen QSA q + k + v + index_qk (K8 / K6 container)", 2560, 4, {12288, 512, 512, 640}, {16, 16, 16, 12}, false});
+    cases.push_back({"Qwen GDN out / QSA o", 6144, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen shared gate + up", 2560, 2, {640, 640, 0, 0}, {10, 10, 0, 0}, false});
+    cases.push_back({"Qwen shared down", 640, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen PLE key", 2560, 1, {10240, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen PLE value", 2560, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Nemotron Mamba in_proj", 4096, 1, {18560, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron Mamba out_proj / MTP eh_proj", 8192, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron attention q + k + v", 4096, 3, {4096, 256, 256, 0}, {8, 8, 8, 0}, false});
+    cases.push_back({"Nemotron latent in", 4096, 1, {1024, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron latent out", 1024, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron shared up", 4096, 1, {5376, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron shared down", 5376, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma window q + k + v", 2816, 3, {4096, 2048, 2048, 0}, {8, 8, 8, 0}, false});
+    cases.push_back({"Gemma full q + k", 2816, 2, {8192, 1024, 0, 0}, {8, 8, 0, 0}, false});
+    cases.push_back({"Gemma full o_proj", 8192, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma MLP gate / up", 2816, 1, {2176, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma MLP down", 2176, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
+
+    return cases;
+}
+
+/* One projection's weight for a prompt case: the [trellis | suh | svh] slice at the STORED width, svh 0 on the pad
+ * columns past the logical N (exllamav3's pad; section 8's construction).  false, said by name, when the layout is
+ * refused -- the case fails, the section goes on. */
+static bool prompt_weight(const pcase &c, int j, weight &w) {
+    const int K = c.K, N = c.N[j], k2 = c.k2[j], Ns = (int)exl3_out_stored((uint64_t)N);
+    uint64_t lt = 0, lsc = 0, lst = 0, et = 0, esc = 0, est = 0;
+    const bool ok = N > 0 && N % 4 == 0 && exl3_linear_layout(K, N, k2, &lt, &lsc, &lst) &&
+                    exl3_expert_layout(K, Ns, k2, &et, &esc, &est) && est == lst && et == lt;
+    CHECK(ok, "prompt kernels: %s projection %d: %d -> %d (stored %d) at k2=%d is not an EXL3 dense layout -- the case "
+          "is not run", c.what, j, K, N, Ns, k2);
+    if (!ok) return false;
+    w = make_weight(K, Ns, k2);
+    uint16_t *svp = (uint16_t *)(w.bytes.data() + w.trellis) + K;
+    for (int n = N; n < Ns; n++) svp[n] = 0;
+    return true;
+}
+
+/* `--plan`: section 10's fixtures walked on the host, no GPU -- every case's layouts and workspace are what the
+ * section will ask for, so a refused fixture shows here (and on any build host) instead of on the device. */
+static int prompt_plan(void) {
+    const std::vector<pcase> cases = prompt_cases();
+    const int R = DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS + 1;
+    size_t n_proj = 0, n_pad = 0, n_tail_only = 0;
+    for (const pcase &c : cases) {
+        ds4_exl3_dense_proj pf[4] = {};
+        bool ok = c.n >= 1 && c.n <= 4 && c.K > 0 && c.K % 128 == 0;
+        CHECK(ok, "plan: %s: %d projections of K=%d", c.what, c.n, c.K);
+        printf("  plan %-52s K=%-5d %s:", c.what, c.K, c.full ? "M 1..257" : "M 5, 256");
+        for (int j = 0; j < c.n && ok; j++) {
+            const int N = c.N[j], Ns = (int)exl3_out_stored((uint64_t)N);
+            weight w;   /* the section's own construction, on the host */
+            const bool lay = prompt_weight(c, j, w) && ds4_exl3_dense_rate_supported(c.k2[j]);
+            CHECK(lay, "plan: %s projection %d: %d -> %d (stored %d) at k2=%d is refused", c.what, j, c.K, N, Ns, c.k2[j]);
+            ok = ok && lay;
+            pf[j] = ds4_exl3_dense_proj{nullptr, c.k2[j], N, nullptr, nullptr};
+            printf(" %d%s@K%.1f (%.1f MB)", N, N == Ns ? "" : N < 128 ? " [tail only]" : " [padded]", c.k2[j] / 2.0,
+                   lay ? w.stride / 1e6 : 0.0);
+            n_proj++;
+            n_pad += N != Ns;
+            n_tail_only += N < 128;
+        }
+        const size_t wsb = ok ? ds4_exl3_dense_multi_workspace_bytes(pf, c.n, R, c.K) : 0;
+        CHECK(!ok || wsb > 0, "plan: %s: the arm refuses the set's workspace", c.what);
+        printf("  workspace %zu B%s\n", wsb, ok && wsb ? "" : "  *** REFUSED ***");
+    }
+    {   /* (d)'s two shapes */
+        const weight wa = make_weight(640, 640, 10), wb = make_weight(640, 256, 10);   /* exit(1) if refused */
+        CHECK(wa.stride > 0 && wb.stride > 0, "plan: the check leg's weights are empty");
+    }
+    CHECK(n_pad > 0 && n_tail_only > 0, "plan: no case has a logical width short of its stored one, or none under a block");
+    printf("exl3-dense-gate --plan: %zu cases, %zu projections (%zu with a logical width short of the stored one, %zu of "
+           "them under one block): %s\n", cases.size(), n_proj, n_pad, n_tail_only,
+           g_fail ? "A FIXTURE IS REFUSED" : "every fixture is a layout the arm takes");
+    return g_fail;
+}
+
+/* 10. L381: the prompt arm's two kernels.  (a) the rule's table; (b) both kernels forced on the same launches, byte
+ * for byte, and the in-place kernel's rows one at a time; (c) the rule's path with its check; (d) the check's
+ * mismatch path and a mutation. */
+static void prompt_arm_section(void) {
+    const int GEMM = DS4_EXL3_DENSE_PROMPT_GEMM, INP = DS4_EXL3_DENSE_PROMPT_INPLACE, CHK = DS4_EXL3_DENSE_PROMPT_CHECK;
+    const int T = DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS;
+    auto arm_name = [&](int a) { return a == GEMM ? "the GEMM" : a == INP ? "in place" : a == CHK ? "the check" : "?"; };
+    /* (a) the rule: rows and the device's compute capability -> the kernel */
+    struct rule { int M, cc, want; const char *what; };
+    const rule rules[] = {
+        {1, 121, INP, "GB10, 1 row"},
+        {5, 121, INP, "GB10, 5 rows (measured: Qwen 66.6 -> 17.1 ms a chunk, Nemotron 147.1 -> 22.5)"},
+        {64, 121, INP, "GB10, 64 rows (64.4 -> 18.9, 141.8 -> 25.8)"},
+        {T, 121, INP, "GB10, 256 rows: the last measured width (72.2 -> 33.7, 161.7 -> 67.3)"},
+        {T + 1, 121, GEMM, "GB10, 257 rows: past the measured widths"},
+        {4096, 121, GEMM, "GB10, a bulk chunk"},
+        {1, 120, INP, "sm_120: the same family as GB10's sm_121"},
+        {T, 120, INP, "sm_120, 256 rows"},
+        {T + 1, 120, GEMM, "sm_120, 257 rows"},
+        {5, 75, GEMM, "sm_75 (Turing): the order is not established there"},
+        {5, 89, GEMM, "sm_89: not established"},
+        {5, 100, GEMM, "sm_100: not established"},
+        {5, 0, GEMM, "a device whose capability is unknown"},
+        {0, 121, GEMM, "no rows"},
+        {-3, 121, GEMM, "negative rows"},
+    };
+    size_t rule_bad = 0;
+    for (const rule &r : rules) {
+        const int got = ds4_exl3_dense_prompt_arm(r.M, r.cc);
+        CHECK(got == r.want, "prompt rule: M=%d sm_%d (%s) -> %s, want %s", r.M, r.cc, r.what, arm_name(got),
+              arm_name(r.want));
+        rule_bad += got != r.want;
+    }
+    printf("  prompt rule: %zu of %zu (rows, device) cases on their side (in place iff sm_12x and 1 <= M <= %d)\n",
+           sizeof rules / sizeof *rules - rule_bad, sizeof rules / sizeof *rules, T);
+    CHECK(ds4_exl3_dense_prompt_force(7) == -1, "prompt kernels: an unknown forced kernel accepted");
+
+    const int cc = pulsar_cuda_device_cc();
+    const bool est = ds4_exl3_dense_prompt_arm(1, cc) == INP;   /* the rule names this device */
+    ds4_exl3_dense_prompt_desc d0{};
+    if (ds4_exl3_dense_prompt_describe(10, 1, 128, 128, &d0)) {
+        CHECK(false, "prompt kernels: the device does not describe a prompt launch -- section 10 not run");
+        return;
+    }
+    CHECK(!est || !d0.off, "prompt kernels: an earlier section's prompt launch FAILED the in-place kernel's check on this "
+          "device (the loud line above): the in-place kernel does not write the fixed GEMM's bytes here");
+    ds4_exl3_dense_prompt_check_reset();
+    if (!est)
+        printf("  N/A the in-place prompt kernel on sm_%d: the rule names sm_12x only, every prompt launch here is the "
+               "GEMM -- the forced comparison below is information, the check's legs (c), (d) do not exist here\n", cc);
+
+    /* (b), (c) the launches (prompt_cases) */
+    const std::vector<pcase> cases = prompt_cases();
+    const std::vector<int> Ms_full = {1, 2, 3, 5, 16, 17, 30, 64, 65, 128, T, T + 1}, Ms_fam = {5, T};
+    const int R = T + 1;   /* rows of a case's fixture */
+    size_t n_cmp = 0, n_out = 0, n_diff = 0, n_nan = 0, n_past = 0, n_row = 0, n_row_bad = 0, n_rule = 0, n_rule_bad = 0,
+           n_lane = 0, n_lane_bad = 0, n_fail = 0;
+    for (const pcase &c : cases) {
+        const int K = c.K, n = c.n;
+        std::vector<weight> w(n);
+        bool built = true;
+        for (int j = 0; j < n; j++) built = prompt_weight(c, j, w[j]) && built;
+        if (!built) { n_fail++; continue; }   /* said by name; the other cases still run */
+        const slot s = make_slot(R, K);
+        uint8_t *dw[4] = {}, *dq = nullptr;
+        float *dy[4] = {};
+        void *ws = nullptr;
+        ds4_exl3_dense_proj pf[4] = {};
+        CUDA_OK(cudaMalloc((void **)&dq, s.q.size() * sizeof(uint16_t)));
+        CUDA_OK(cudaMemcpy(dq, s.q.data(), s.q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        for (int j = 0; j < n; j++) {
+            CUDA_OK(cudaMalloc((void **)&dw[j], w[j].stride));
+            CUDA_OK(cudaMemcpy(dw[j], w[j].bytes.data(), w[j].stride, cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMalloc((void **)&dy[j], (size_t)(R + 1) * c.N[j] * sizeof(float)));
+            pf[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], dy[j], nullptr};
+        }
+        const size_t wsb = ds4_exl3_dense_multi_workspace_bytes(pf, n, R, K);
+        CHECK(wsb > 0, "prompt kernels: %s: the arm refuses the set's workspace", c.what);
+        CUDA_OK(cudaMalloc(&ws, wsb ? wsb : 16));
+        /* one prompt launch of rows [r0, r0 + M) under a forced kernel (0: the rule's): each projection's M rows, a
+         * NaN canary under them (every output written) and in the row after them (none written past) */
+        auto launch = [&](int force, int M, int r0, std::vector<std::vector<float>> &out) {
+            for (int j = 0; j < n; j++) CUDA_OK(cudaMemset(dy[j], 0xff, (size_t)(M + 1) * c.N[j] * sizeof(float)));
+            if (ds4_exl3_dense_prompt_force(force) != 0) return -1;
+            const int rc = ds4_exl3_dense_multi_launch(pf, n, dq + (size_t)r0 * K * 2, M, K, ws, wsb, 0, true);
+            CUDA_OK(cudaDeviceSynchronize());
+            ds4_exl3_dense_prompt_force(0);
+            if (rc) return rc;
+            out.assign(n, {});
+            for (int j = 0; j < n; j++) {
+                std::vector<float> y((size_t)(M + 1) * c.N[j]);
+                CUDA_OK(cudaMemcpy(y.data(), dy[j], y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < (size_t)M * c.N[j]; i++) n_nan += !(y[i] == y[i]);
+                for (size_t i = (size_t)M * c.N[j]; i < y.size(); i++) {
+                    uint32_t u;
+                    memcpy(&u, &y[i], 4);
+                    n_past += u != 0xffffffffu;
+                }
+                y.resize((size_t)M * c.N[j]);
+                out[j] = std::move(y);
+            }
+            return 0;
+        };
+        /* outputs of a (launch, projection) that differ, byte for byte */
+        auto differ = [](const std::vector<float> &a, const std::vector<float> &b) {
+            size_t d = a.size() != b.size();
+            for (size_t i = 0; i < a.size() && i < b.size(); i++) d += memcmp(&a[i], &b[i], sizeof(float)) != 0;
+            return d;
+        };
+        const std::vector<int> &Ms = c.full ? Ms_full : Ms_fam;
+        std::vector<std::vector<std::vector<float>>> g(Ms.size());   /* the GEMM arm's outputs, an M */
+        std::vector<std::vector<float>> yi, yT;
+        bool ok = true;
+        size_t case_diff = 0;
+        /* (b) each kernel forced, every output */
+        for (size_t mi = 0; mi < Ms.size() && ok; mi++) {
+            const int M = Ms[mi];
+            int rc = launch(GEMM, M, 0, g[mi]);
+            CHECK(rc == 0, "prompt kernels: %s K=%d M=%d: the forced GEMM launch rc=%d", c.what, K, M, rc);
+            if (!rc) rc = launch(INP, M, 0, yi);
+            CHECK(rc == 0, "prompt kernels: %s K=%d M=%d: the forced in-place launch rc=%d", c.what, K, M, rc);
+            if (rc) { ok = false; n_fail++; break; }
+            for (int j = 0; j < n; j++) {
+                const size_t d = differ(yi[j], g[mi][j]);
+                CHECK(!est || d == 0, "prompt kernels: %s M=%d projection %d (%d -> %d, K=%.1f bits): %zu of %zu outputs "
+                      "of the in-place kernel are not the GEMM arm's bytes", c.what, M, j, K, c.N[j], c.k2[j] / 2.0, d,
+                      yi[j].size());
+                n_diff += d;
+                case_diff += d;
+                n_out += yi[j].size();
+                n_cmp++;
+            }
+            if (M == T) yT = yi;
+        }
+        /* a row's bytes do not depend on the rows beside it: every row of the T-row in-place launch, launched alone */
+        if (ok && c.full && yT.size() == (size_t)n) {
+            for (int r = 0; r < T; r++) {
+                if (launch(INP, 1, r, yi)) { CHECK(false, "prompt kernels: %s: the one-row in-place launch refused", c.what); n_fail++; break; }
+                for (int j = 0; j < n; j++) {
+                    const bool same = memcmp(yi[j].data(), yT[j].data() + (size_t)r * c.N[j], (size_t)c.N[j] * sizeof(float)) == 0;
+                    CHECK(same, "prompt kernels: %s projection %d (%d -> %d, K=%.1f bits): row %d of the in-place kernel at "
+                          "%d rows is not the row launched alone", c.what, j, K, c.N[j], c.k2[j] / 2.0, r, T);
+                    n_row_bad += !same;
+                    n_row++;
+                }
+            }
+        }
+        /* (c) the rule's own path: the description says which kernel each launch is, and each writes the GEMM arm's
+         * bytes.  A shape's first launch at <= T rows is its check; from then on it runs in place; T + 1 is the GEMM. */
+        if (ok) {
+            ds4_exl3_dense_prompt_check_reset();
+            for (size_t mi = 0; mi < Ms.size(); mi++) {
+                const int M = Ms[mi];
+                for (int pass = 0; pass < 2; pass++) {   /* before the launch, after it */
+                    if (pass == 1) {
+                        const int rc = launch(0, M, 0, yi);
+                        CHECK(rc == 0, "prompt kernels: %s M=%d: the rule's launch rc=%d", c.what, M, rc);
+                        if (rc) { n_fail++; break; }
+                        for (int j = 0; j < n; j++) {
+                            const size_t d = differ(yi[j], g[mi][j]);
+                            CHECK(d == 0, "prompt kernels: %s M=%d projection %d (%d -> %d): %zu outputs of the rule's "
+                                  "launch are not the GEMM arm's bytes", c.what, M, j, K, c.N[j], d);
+                            n_rule_bad += d != 0;
+                            n_rule++;
+                        }
+                    }
+                    for (int j = 0; j < n; j++) {
+                        ds4_exl3_dense_prompt_desc d{};
+                        const int rd = ds4_exl3_dense_prompt_describe(c.k2[j], M, K, c.N[j], &d);
+                        /* a device the rule names with every byte equal: the check before the shape's first small
+                         * launch, in place after it; anything else: the GEMM */
+                        const bool small = est && M <= T && !d.off;
+                        const int want = !small ? GEMM : pass == 0 && mi == 0 ? CHK : INP;
+                        const bool good = rd == 0 && d.arm == want && (!est || case_diff != 0 || !d.off) &&
+                                          (want != INP || d.checked);
+                        CHECK(good, "prompt kernels: %s M=%d projection %d (%d -> %d) %s its launch: described rc=%d as %s "
+                              "(checked %d, off %d), want %s", c.what, M, j, K, c.N[j], pass ? "after" : "before", rd,
+                              arm_name(d.arm), d.checked, d.off, arm_name(want));
+                        n_lane_bad += !good;
+                        n_lane++;
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < n; j++) { cudaFree(dw[j]); cudaFree(dy[j]); }
+        cudaFree(dq);
+        cudaFree(ws);
+    }
+    CHECK(n_nan == 0 && n_past == 0, "prompt kernels: %zu outputs left unwritten (or NaN), %zu written past a launch's rows",
+          n_nan, n_past);
+    CHECK(n_cmp > 0 && n_row > 0 && n_fail == 0, "prompt kernels: nothing was compared, or a launch refused");
+    printf("  prompt kernels: %zu launches (K = 2, 3, 4, 5, 6, 8 bits; K of 1, 3, 20 blocks; N whole, short of its stored "
+           "multiple and under a block; single and multi; the Qwen, Nemotron and Gemma prompt launches; M = 1 .. %d), %zu "
+           "(launch, projection) outputs = %zu f32: %zu of the in-place kernel's differ from the GEMM arm's bytes%s; %zu "
+           "rows launched alone, %zu off their row at %d rows; %zu outputs of the rule's own launches, %zu off the GEMM "
+           "arm's; %zu descriptions, %zu not the kernel the rule names\n", cases.size(), T + 1, n_cmp, n_out, n_diff,
+           est ? "" : " (information on this device)", n_row, n_row_bad, T, n_rule, n_rule_bad, n_lane, n_lane_bad);
+
+    /* (d) the check can fail, and the comparison is not degenerate */
+    {
+        const int K = 640, k2 = 10, NA = 640, NB = 256, M = 5;
+        const slot s = make_slot(M, K);
+        const weight wa = make_weight(K, NA, k2), wb = make_weight(K, NB, k2);
+        dev da, db;
+        upload(wa, s, M, da);
+        upload(wb, s, M, db);
+        auto one = [&](const dev &d, int N, int force, std::vector<float> &y) {
+            ds4_exl3_dense_prompt_force(force);
+            const int rc = run(d, k2, M, K, N, y, true);
+            ds4_exl3_dense_prompt_force(0);
+            return rc;
+        };
+        std::vector<float> ga, gb, ia, y;
+        CHECK(one(da, NA, GEMM, ga) == 0 && one(db, NB, GEMM, gb) == 0 && one(da, NA, INP, ia) == 0,
+              "prompt check: a forced launch refused");
+        /* a flipped trellis bit moves the in-place kernel's output */
+        weight wm = wa;
+        wm.words()[321] ^= 0x0100u;
+        CUDA_OK(cudaMemcpy(da.w, wm.bytes.data(), wm.stride, cudaMemcpyHostToDevice));
+        size_t moved = 0;
+        if (one(da, NA, INP, y) == 0)
+            for (size_t i = 0; i < y.size() && i < ia.size(); i++) moved += memcmp(&y[i], &ia[i], sizeof(float)) != 0;
+        CHECK(moved > 0, "prompt check: a flipped trellis bit moved no in-place output -- the comparison is degenerate");
+        CUDA_OK(cudaMemcpy(da.w, wa.bytes.data(), wa.stride, cudaMemcpyHostToDevice));
+        if (est) {
+            ds4_exl3_dense_prompt_desc d{};
+            ds4_exl3_dense_prompt_check_reset();
+            ds4_exl3_dense_prompt_check_fault(true);
+            printf("  prompt check: a fault is armed -- the loud line that follows is the leg working\n");
+            fflush(stdout);
+            const int rc = one(da, NA, 0, y);
+            ds4_exl3_dense_prompt_check_fault(false);
+            CHECK(rc == 0 && y.size() == ga.size() && memcmp(y.data(), ga.data(), ga.size() * sizeof(float)) == 0,
+                  "prompt check: the launch whose check failed did not return the GEMM arm's bytes (rc=%d)", rc);
+            CHECK(ds4_exl3_dense_prompt_describe(k2, M, K, NA, &d) == 0 && d.off && !d.checked && d.arm == GEMM,
+                  "prompt check: after a mismatch the failed shape is described as %s (off %d, checked %d), want the GEMM, "
+                  "off", arm_name(d.arm), d.off, d.checked);
+            CHECK(ds4_exl3_dense_prompt_describe(k2, M, K, NB, &d) == 0 && d.off && d.arm == GEMM,
+                  "prompt check: after a mismatch ANOTHER shape is described as %s (off %d): the in-place kernel must be "
+                  "off for every shape", arm_name(d.arm), d.off);
+            const int rb = one(db, NB, 0, y);
+            CHECK(rb == 0 && y.size() == gb.size() && memcmp(y.data(), gb.data(), gb.size() * sizeof(float)) == 0,
+                  "prompt check: another shape's launch after the mismatch is not the GEMM arm's bytes (rc=%d)", rb);
+            CHECK(ds4_exl3_dense_prompt_describe(k2, M, K, NB, &d) == 0 && !d.checked && d.arm == GEMM,
+                  "prompt check: a shape was checked after the in-place kernel turned itself off");
+            /* the fault gone, the check passes again: the mismatch above was the fault's */
+            ds4_exl3_dense_prompt_check_reset();
+            const int r3 = one(da, NA, 0, y);
+            CHECK(r3 == 0 && ds4_exl3_dense_prompt_describe(k2, M, K, NA, &d) == 0 && !d.off && d.checked && d.arm == INP,
+                  "prompt check: without the fault the shape did not pass its check (rc=%d, %s, off %d, checked %d)", r3,
+                  arm_name(d.arm), d.off, d.checked);
+            printf("  prompt check: a faulted check turned the in-place kernel off for every shape and returned the GEMM "
+                   "arm's bytes; without the fault the shape passes; a flipped trellis bit moved %zu in-place outputs\n",
+                   moved);
+        } else {
+            printf("  N/A the check's mismatch leg on sm_%d (no launch is checked here); a flipped trellis bit moved %zu "
+                   "in-place outputs\n", cc, moved);
+        }
+        ds4_exl3_dense_prompt_check_reset();
+        release(da);
+        release(db);
+    }
+    for (int k2 : {4, 6, 8, 10, 12, 16}) {
+        ds4_exl3_dense_prompt_desc d{};
+        if (!ds4_exl3_dense_prompt_describe(k2, T, 2560, 10240, &d))
+            printf("  prompt kernels: the in-place kernel at K=%.1f bits here: %d registers a thread, %d B shared, %d CTAs "
+                   "an SM (information)\n", k2 / 2.0, d.regs, d.smem, d.ctas_per_sm);
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--plan")) return prompt_plan();
     struct shape { int K, N; const char *what; };
     const shape shapes[] = {
         {2560, 10240, "Qwen DeltaNet in_proj_qkv"},
@@ -688,6 +1320,8 @@ int main(void) {
             release(d);
         }
     }
+    arm_section(tol);
+    prompt_arm_section();
     printf(g_fail ? "EXL3-DENSE GATE FAIL\n" : "EXL3-DENSE GATE PASS\n");
     return g_fail;
 }

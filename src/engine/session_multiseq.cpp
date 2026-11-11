@@ -18,6 +18,25 @@
  *       rebuild path — which resets the graph's prefill state and so
  *       re-establishes per-bank truth.
  *
+ *       L380: set by the step only when the INSTALLED bank is among its rows
+ *       (pulsar_multiseq_step_stale), as the driver families' step does it
+ *       (pulsar_driver_decode_multiseq).  A step that holds no row of the
+ *       installed bank writes none of that bank's state: the KV rows, the
+ *       compressed frontier (ms_n_comp[bank]), the compressor lanes and the
+ *       drafter rings are per bank and addressed by each row's own bank id,
+ *       the scalar twins of the drafter counters are written only for
+ *       b == cur_bank (gpu_graph_dspark_seed_rows_banked, dspark_bulk_drain_runs),
+ *       the live row (dev.live) is not the step's slab, and the step never
+ *       repoints -- so the view still names the installed bank's history,
+ *       and pulsar_bank_history keeps serving it (unconditional, an idle
+ *       installed bank read "no history" to the server's routing, its empty-
+ *       bank pick and its live tool bindings while other banks stepped).
+ *       What the view may not do is be CONTINUED: mseq_dirty below stays
+ *       unconditional, and the two places that would act on a dirty view
+ *       drop it first (pulsar_session_dirty_view_drop: the sync's entry and a
+ *       restore of the same bank with no saved carry), so every single-bank
+ *       entry behaves as it did when the step invalidated the view itself.
+ *
  *   mseq_dirty = true  stops pulsar_session_eval.  checkpoint_valid does NOT
  *       cover it: eval never reads checkpoint_valid, it just decodes at
  *       s->checkpoint.len on whatever bank is installed.
@@ -40,6 +59,19 @@
 #define PULSAR_MULTISEQ_ERR(...) do { \
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
+
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+                                bool landed) {
+    bool live_moved = !landed;   /* a failed sweep: no bank's state is known */
+    for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == live;
+    if (live_moved) s->checkpoint_valid = false;
+    s->mseq_dirty = true;
+    s->spec.spec_carry_valid = false;
+}
+
+void pulsar_session_dirty_view_drop(pulsar_session *s) {
+    if (s->mseq_dirty) s->checkpoint_valid = false;
+}
 
 /* The step every batched entry below runs once its own arguments are checked: the requests split into the
  * driver's descriptor (positions / seq ids / tokens, heap scratch sized to n_rows -- no [PULSAR_MSEQ_MAX]
@@ -91,12 +123,10 @@ static int ds4_batch_step(pulsar_session *s, const pulsar_multiseq_req *reqs, ui
         PULSAR_MULTISEQ_ERR("%s rejected (recoverable; reason on stderr)", what);
         return 1;
     }
-    /* The step was armed: the scalar counters hold a superset on success, and
-     * on a fatal mid-sweep failure their state is unknown.  Both leave the
-     * classic single-bank view stale (see above); only the diagnosis differs. */
-    s->checkpoint_valid = false;
-    s->mseq_dirty = true;
-    s->spec.spec_carry_valid = false;
+    /* The step was armed: the installed bank's view is stale when the step moved that bank (a row of it) or failed
+     * mid-sweep (every bank's state unknown), and the per-bank truth is to re-establish either way (see above); only
+     * the diagnosis differs.  The step does not repoint: the installed bank is the one it began on. */
+    pulsar_multiseq_step_stale(s, reqs, n_rows, gpu_graph_cur_bank(s->graph), rc == 1);
     if (rc == 1) return 0;
     PULSAR_MULTISEQ_ERR("%s failed mid-sweep (session state fatal)", what);
     return -1;

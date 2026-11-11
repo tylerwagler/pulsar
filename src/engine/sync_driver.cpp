@@ -115,6 +115,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
         return 1;
     }
     const uint32_t live = pulsar_session_live_bank(s);
+    /* L380: a view a batch step on OTHER banks left valid (DeepSeek, pulsar_multiseq_step_stale) is the readers', not
+     * a resume's: the sync rebuilds, which re-establishes the bank and clears the mark, as after any batch step */
+    pulsar_session_dirty_view_drop(s);
     /* `common` and the seam are read before the agreement check: a view the state has moved past can no longer
      * be continued, but its prefix (and the live bytes it re-spells) still say which checkpoint the prompt shares */
     int common = s->checkpoint_valid ? pulsar_tokens_common_prefix(&s->checkpoint, prompt) : 0;
@@ -156,7 +159,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
      * the deepest checkpoint at or below the prefill frontier -- the tokens generated since are prefilled
      * again and the prompt is the cold prefill's bytes, as DeepSeek's sync does it (L195) */
     const bool extends = continuable && common == s->checkpoint.len && common < prompt->len &&
-                         pulsar_session_bank_continues(s, live, common);
+                         pulsar_session_bank_continues(s, live, common, PULSAR_BANK_VIEW_CURRENT);
     /* the same prompt is a no-op only while the logits are its next-token row; when they are stale the
      * resume below stops one token short, so the last row is evaluated again */
     if (continuable && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
@@ -172,10 +175,11 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             if (err) snprintf(err, errlen, "%s: the request's image blocks do not read", ops->name);
             return 1;
         }
-        uint32_t G = pulsar_session_resume_point(s, live, common, prompt->len, &want);
+        uint32_t G = pulsar_session_resume_point(s, live, common, prompt->len, &want, PULSAR_BANK_VIEW_CURRENT);
         /* L289 / L311: a resume at a record (the bank's prompt end or message endpoint) rather than a grid point;
          * L350: a record's images were matched against the request's with its ids */
-        const pulsar_ckpt_record *rec = G ? pulsar_session_resume_record(s, live, G, prompt->len, &want) : NULL;
+        const pulsar_ckpt_record *rec =
+            G ? pulsar_session_resume_record(s, live, G, prompt->len, &want, PULSAR_BANK_VIEW_CURRENT) : NULL;
         /* L268: the KV below a grid point G is kept only when the bank's image records are the request's there, and G
          * is outside every block (its merged rows cannot be re-evaluated) */
         if (G && !rec && !pulsar_image_holds_below(e, &s->live_images, prompt, images, n_images, G)) {

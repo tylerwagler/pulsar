@@ -174,12 +174,58 @@ when running one alone.
 - `make cuda-multiseq-gate`, `make cuda-multiseq-gate-nodspark` — multiseq
   isolation and throughput.
 - `make cuda-algo-stability-gate` — cuBLASLt M-independence.
+- `make lt-order-gate` (kernels tier) — the fixed cuBLASLt fp16 GEMM still
+  follows the accumulation order the EXL3 dense arm's in-place prompt kernel
+  implements, on every dense prompt shape (`tests/lt_order_probe --gate`; N/A
+  on a device the rule does not give that kernel).
+- `make exl3-dense-gate` section 10 (in `cuda-regression`) — the prompt arm's
+  two kernels write the same bytes: every rate, width and row count, the
+  rule's table, and the check's mismatch path.
 - `make cuda-spec-sampling-gate` — speculative-sampling chi-square exactness.
 
 **The release tier runs the production drafters (L305, 2026-10-21).**  Qwen's model and every Qwen gate default
 (`QWEN_GATE_MODEL`, `DFLASH2_GATE_MODEL`) are the published Qwen container (DFlash2, the EXL3 K5
 head, no MTP module); Nemotron's drafter gate is LiLiCorr's.  **MTP is a dormant lane, and no gate grades it.**
 `sync-budget-gate` runs each hosted model's own drafter, so its Qwen leg is DFlash2's.
+
+### After a toolchain move (CUDA toolkit, cuBLASLt, driver, CUTLASS)
+
+A move can change which vendor kernels exist and what they compute, so the
+byte gates are regraded and re-anchored on the new toolchain rather than the
+toolchain pinned (the reference grade decides, never an argument).  Two things
+are keyed by `(compute capability, cuBLASLt version)` and need their own step:
+
+- **The fixed GEMM's recorded picks** (`src/cuda/pulsar_cuda_lt_picks.inc`):
+  on a new cuBLASLt version no entry matches, every shape takes cuBLASLt's
+  first suggestion (the server log's `fixed GEMM ... (no recorded pick)`
+  lines), and prompt bytes may move.  Re-measure with
+  `tests/lt_picks --from-log <server log>` on a quiet device, commit the rows
+  with the reference grade.
+- **The in-place prompt kernel of the EXL3 dense arm** (L381,
+  `src/cuda/mmq/qwen_exl3_dense_prefill.cu`): a prompt chunk of up to 256 rows
+  reads the trellis in place and must write the bytes the fixed GEMM writes
+  for a bulk chunk.  That holds while the vendor GEMM accumulates each output
+  as one ascending chain of 16-wide MMAs -- established on GB10 (sm_121) with
+  cuBLASLt 131000.  After a move, in this order:
+  1. `make lt-order-gate` (or `tests/lt_order_probe`, which prints a verdict a
+     shape): exit 0 iff every dense prompt shape is still reproduced by the
+     shipped order.
+  2. `make exl3-dense-gate`: section 10 compares the real kernels, every
+     output byte.
+  3. `tests/exl3_dense_bench chunk` if the vendor kernels changed: the row
+     rule (`ds4_exl3_dense_prompt_arm`) was priced against the old ones.
+
+  If a shape is no longer reproduced, production is already safe without a
+  code change: the arm checks each shape once a process on real operands
+  (both kernels, every output byte compared) and, on a mismatch, says so in
+  one loud line (`the in-place kernel's bytes are NOT the fixed GEMM's`) and
+  keeps EVERY prompt chunk on the fixed GEMM for the life of the process -- the
+  speed before L381, the same bytes at every chunk size.  Grep a server log
+  for that line after a move.  Getting the speed back is a kernel change
+  (`tests/lt_order_probe --survey` names the order the new vendor kernel
+  follows, if it is one of the family), gated like any other.  A new
+  architecture is added to the rule only after the probe reproduces every
+  shape there.
 
 ### Battery wall time (the release tier)
 
@@ -545,6 +591,11 @@ Do not sign off until:
 - `make release` passed on the GB10 host against the release commit and the
   shipped artifacts, on a clean tree, with nothing under "NOT FULLY RUN"
   that is not written down; keep its `results.json` with the release notes.
+  A delta after that run that cannot move a number (tests, tools, docs,
+  Makefile recipes, the release notes) does not call for another run, and
+  neither does a gate that failed because the test itself was wrong: the gate
+  that covers the delta at the release commit, both shas written down
+  (`docs/ENGINEERING-RULES.md` §10).
 - The byte baselines (`PREFILL_BASELINE_REF`) were dumped on the shipped
   container revision, by a build that loads it.
 - The Flash inference path (CLI, thinking modes, long-context recall) was

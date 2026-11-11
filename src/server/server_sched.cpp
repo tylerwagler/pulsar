@@ -250,9 +250,74 @@ bool server::bank_switch(int bank, spilled_history *was) {
 TokPos server::slot_frontier_pos(const session_slot *sl) const {
     const auto *s = this;
     if (!sl || !sl->provisioned) return TokPos{0};
+    /* L380: a decoder in the plain or mixed batch stands at its feed position.  Its tokens join its bank's history
+     * only as it leaves the batch (batch_leave, generate_job_step), and until then the engine's readers describe the
+     * bank as it ENTERED: the installed bank's history is invalid from the batch's first step (it reads no position,
+     * 0 here), another bank's is its carry saved at entry.  The feed position is the bank's KV frontier at every step
+     * boundary (lane_emit_and_draw moves it with each commit), so this is the one read for the lane prices' depth,
+     * /metrics and the live bindings' match. */
+    if (sl->gen && sl->gen->batch_active) return sl->gen->batch_feed_pos;
     if (!s->sess) return TokPos{0}; /* host-only server (unit tests): no session to read */
     if (s->pool_banks > 0) return server_bank_pos(s->sess, sl->bank);
     return pulsar_session_pos(s->sess);
+}
+
+/* L380: the history readers' one read of a slot's bank.
+ *
+ * While a decoder steps in the plain or mixed batch its tokens join its bank's engine history only as it leaves
+ * (batch_leave, generate_job_step), and the engine's read of the bank in between depends on which bank the pool
+ * stands on: a bank that is not installed reads the carry saved as it entered the batch; the INSTALLED one reads
+ * nothing, because the step moved it past the live view and the engine does not serve an installed bank from its
+ * carry (pulsar_bank_history: after a failed sync, say, that carry names rows the bank no longer holds).  So the
+ * decoder the pool happened to stand on had no history for the L261 wait (choose_slot_for_job), the dominance
+ * matrix and the duplicate census (bank_common_matrix) and the prefix wait's `have` (slot_resume_at), where its
+ * batch-mates had theirs.  For such a decoder -- and only for one (server_slot_batch_decoding) -- the read is the
+ * SAVED view (pulsar_bank_view), installed or not, then the batch's commits.
+ *
+ * Why `base` + `tail` is exactly the bank's rows, [0, batch_feed_pos), wherever a reader runs (the worker thread,
+ * between steps):
+ *  - Entry (worker_batched_decode_quantum, worker_mixed_batch_quantum): bank_switch installed the bank, its first
+ *    token was drawn from its logits, and pulsar_session_bank_state_save copied the live view -- the bank's history
+ *    to its frontier, batch_feed_pos -- into the carry, in that order with nothing between.  A view that was not
+ *    valid there is saved invalid and reads no history here.
+ *  - Steps: a batch step appends one row a bank at batch_feed_pos and rewinds nothing; lane_emit_and_draw pushes
+ *    the committed token on batch_pending only after the step landed.  batch_pending is empty at entry (freed
+ *    wherever batch_active is cleared).
+ *  - Nothing else moves the bank while the slot is here.  A sync, a rewind, an adopt over it, a payload load, a
+ *    chain restore are its own job's, in phases before GEN_DECODE or after the slot left the batch; an eviction, a
+ *    guard spill and the terminal checkpoint take idle slots only (make_room, guard_pick_victim: no active job);
+ *    a preemption and a switch to the spec lane call batch_leave first, which installs the bank, folds
+ *    batch_pending into its history and clears batch_active before anything else; the judge works on its own bank.
+ *  - Nothing else writes the carry to another content.  It is written by a state save of the installed bank's
+ *    valid view only: at entry; by bank_switch's switch-away save or park_live_bank when the pool was put back on
+ *    this bank from the same carry (a spill's or a preemption's park, a readmission's give-up: bank_state_restore
+ *    of it, nothing run on it), which copies the same tokens back.
+ *  - Failures.  A step that failed or was rejected, a draw the sampler refused, a spent budget, a server stop, an
+ *    abandoned client and a bank that would not install (batch_leave, the quanta's entry) all end the decode
+ *    (GEN_FINISH), which takes the slot out of this read at once: after a failed step the driver families reset the
+ *    step's banks and invalidate their carries (pulsar_bank_view_invalidate), and DeepSeek's mid-sweep failure
+ *    leaves every bank's state unknown with the carries standing -- neither is read here.  The slot then reads as
+ *    before this change until generate_job_step reconciles it.
+ * The under-read left: the token-seam match (slot_prefix_match) and the resume rule (slot_resume_at) read `base`
+ * alone, the history at entry -- a true prefix; the lengths and compares of the dominance matrix and the census
+ * read both parts. */
+slot_tokens server::slot_history(const session_slot *sl) const {
+    const auto *s = this;
+    slot_tokens h = {NULL, NULL};
+    if (!sl || !sl->provisioned || !s->sess || s->pool_banks <= 0) return h;
+    const bool batch = server_slot_batch_decoding(sl);
+    h.base = pulsar_session_bank_tokens_as(s->sess, sl->bank,
+                                           batch ? PULSAR_BANK_VIEW_SAVED : PULSAR_BANK_VIEW_CURRENT);
+    if (batch && h.base) h.tail = &sl->gen->batch_pending;
+    return h;
+}
+
+pulsar_bank_resume server::slot_resume_at(const session_slot *sl, const pulsar_tokens *prompt,
+                                          const pulsar_image_ref *images, int n_images) const {
+    const auto *s = this;
+    return pulsar_session_bank_resume_at_as(
+        s->sess, sl->bank, server_slot_batch_decoding(sl) ? PULSAR_BANK_VIEW_SAVED : PULSAR_BANK_VIEW_CURRENT, prompt,
+        images, n_images);
 }
 
 int server::slot_common_prefix(const session_slot *sl,
@@ -275,10 +340,14 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
     out->prompt_cut = PromptToks{0};
     out->seamed = false;
     if (!sl || !sl->provisioned) return;
-    if (s->pool_banks > 0)
-        pulsar_session_bank_prefix_match(s->sess, sl->bank, prompt, out);
-    else
+    if (s->pool_banks > 0) {
+        /* L380: the bank's history as every reader of the slot takes it; for a decoder in the batch its history at
+         * entry (slot_history) */
+        const pulsar_tokens *t = s->slot_history(sl).base;
+        if (t && prompt) pulsar_tokens_prefix_match(s->engine, t->v, t->len, prompt->v, prompt->len, out);
+    } else {
         pulsar_session_prefix_match(s->sess, prompt, out);
+    }
 }
 
 /* Provision a bank in the shared pool (Tier-2). No GPU allocation happens here:
@@ -1137,10 +1206,9 @@ void server::worker_protect_queued_warm_matches(bool protect[PULSAR_SESSION_POOL
         for (int k = 0; k < s->n_slots && k < PULSAR_SESSION_POOL_CAP; k++) {
             const session_slot *sl = &s->slots[k];
             if (!sl->provisioned) continue;
-            /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job) */
-            const int score =
-                pulsar_session_bank_resume_at(s->sess, sl->bank, &q->req.prompt, q->req.images, q->req.n_images)
-                    .served.raw();
+            /* L325: the route's score (pulsar_session_bank_resume_at, choose_slot_for_job); L380: a decoder in the
+             * batch scores by the history it entered with, whichever bank is installed (slot_resume_at) */
+            const int score = s->slot_resume_at(sl, &q->req.prompt, q->req.images, q->req.n_images).served.raw();
             if (score > best_score) { best_score = score; best_i = k; }
         }
         if (best_i >= 0) protect[best_i] = true;
@@ -1341,6 +1409,8 @@ void server::worker_evict(int vi, int rank, job *for_job) {
      * them). A later continuation of those ids gets the protocol's 409. */
     s->responses_live_clear(sl);
     s->anthropic_live_clear(sl);
+    s->slot_terminal_clear(sl);   /* L380: and the turn a yielded terminal checkpoint kept for it */
+    s->slot_reply_forget(sl);     /* L380: and what its conversation showed of its replies */
 
     const uint64_t committed = sl->est_cost_bytes;
     uint64_t freed = 0;
@@ -1423,25 +1493,25 @@ static bool bank_dominated_core(int a, int n_slots, const int *hist_len, const i
 
 /* L323/L324: the common-prefix matrix of the slots' histories, the ONE fill both the dominance predicate and the
  * duplicate census read: hist_len[i] (0 = no history; unprovisioned slots have none) and, where hist_len[i] > 0 and
- * hist_len[k] >= hist_len[i] (k != i), common_rows[i][k] = their common token prefix; -1 elsewhere.  Host-carry
- * prefix reads (the same reads routing does on idle banks; no CUDA), only where a reader looks: two conversations
- * part within a few thousand tokens, so a compare runs long only between copies of one. */
+ * hist_len[k] >= hist_len[i] (k != i), common_rows[i][k] = their common token prefix; -1 elsewhere.  Host reads
+ * (server::slot_history, the read routing does; no CUDA), only where a reader looks: two conversations part within
+ * a few thousand tokens, so a compare runs long only between copies of one.  L380: a decoder stepping in the batch
+ * is read whole -- its history at entry and the batch's commits -- whichever bank is installed (the installed one
+ * read no history: a bank it dominates was left to LRU, and the census missed its pages). */
 /// @param s the server (worker thread)
 /// @param hist_len receives each slot's history length in tokens
 /// @param common_rows receives the matrix (-1 where not filled)
 static void bank_common_matrix(server *s, int hist_len[PULSAR_SESSION_POOL_CAP],
                                int common_rows[PULSAR_SESSION_POOL_CAP][PULSAR_SESSION_POOL_CAP]) {
-    pulsar_session *pool = s->sess;
-    const pulsar_tokens *hist[PULSAR_SESSION_POOL_CAP];
+    slot_tokens hist[PULSAR_SESSION_POOL_CAP];
     for (int i = 0; i < s->n_slots; i++) {
-        const session_slot *a = &s->slots[i];
-        hist[i] = a->provisioned ? pulsar_session_bank_tokens(pool, a->bank) : NULL;
-        hist_len[i] = hist[i] ? hist[i]->len : 0;
+        hist[i] = s->slot_history(&s->slots[i]);
+        hist_len[i] = slot_tokens_len(hist[i]);
     }
     for (int i = 0; i < s->n_slots; i++)
         for (int k = 0; k < s->n_slots; k++)
             common_rows[i][k] = (hist_len[i] > 0 && k != i && hist_len[k] >= hist_len[i])
-                ? pulsar_session_bank_common_prefix(pool, s->slots[k].bank, hist[i]).raw() : -1;
+                ? slot_tokens_common(hist[k], hist[i]) : -1;
 }
 
 void server::dominated_slots(bool dominated[PULSAR_SESSION_POOL_CAP]) {
@@ -1653,9 +1723,10 @@ bool server::prefix_wait_decide(job *j) {
     for (int i = 0; i < s->n_slots; i++) {
         session_slot *sl = &s->slots[i];
         if (!sl->provisioned || sl->spilled || sl->preempted) continue;
-        /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads */
-        const int at =
-            pulsar_session_bank_resume_at(s->sess, (uint32_t)sl->bank, &r->prompt, r->images, r->n_images).served.raw();
+        /* the deepest state a bank serves the prompt from now: its own resume, which is what an adopt of it reads
+         * (L380: a decoder in the batch by the history it entered with, also when its bank is the installed one --
+         * it read nothing, and a wait could start for a prefix an adopt from the decoder already serves) */
+        const int at = s->slot_resume_at(sl, &r->prompt, r->images, r->n_images).served.raw();
         if (at > have) have = at;
         if (!slot_prefilling(sl) || sl->gen->j->req.n_images > 0 || !sl->gen->prompt_for_sync) continue;
         const pulsar_tokens *lp = sl->gen->prompt_for_sync;
@@ -1894,7 +1965,8 @@ void server::publish_metrics_snapshot() {
     pthread_mutex_lock(&s->mu);
     for (int i = 0; i < s->n_slots; i++) {
         /* Bank-aware: a non-live bank's pos is its saved carry, never the pool's
-         * live cursor (server_slot_frontier_pos). Pure host read, no CUDA. */
+         * live cursor, and a decoder in the plain batch reads its feed position
+         * (server::slot_frontier_pos). Pure host read, no CUDA. */
         s->m_slot_pos[i] = s->slot_frontier_pos(&s->slots[i]).raw();
         s->m_slot_ctx[i] = s->slots[i].ctx_size;
         /* Phase + prefill progress: pure host reads of the slot's gen_state,
@@ -2035,6 +2107,34 @@ bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end) {
     return (pick == KV_PICK_OWN || pick == KV_PICK_LIVE) && bank_prompt_end > 0 && at >= bank_prompt_end;
 }
 
+reply_use server_reply_use(kv_pick pick, int common, bool extends, const slot_reply *r) {
+    if (r->to <= r->from) return REPLY_USE_NONE;
+    if (pick == KV_PICK_LIVE) return REPLY_USE_CONTINUED;
+    if (pick != KV_PICK_OWN) return REPLY_USE_NONE;
+    if (common >= r->to) return REPLY_USE_CONTINUED;
+    if (!extends) return REPLY_USE_SAME;
+    const bool next_turn = r->header >= 0 ? common > r->header : common >= r->from;
+    return next_turn ? REPLY_USE_LEFT : REPLY_USE_NONE;
+}
+
+void server_terminal_evidence_note(terminal_evidence *ev, reply_use use, const slot_reply *r, int common) {
+    const int k = r->called ? 1 : 0;
+    switch (use) {
+    case REPLY_USE_NONE: *ev = terminal_evidence{}; break;
+    case REPLY_USE_SAME: break;
+    case REPLY_USE_CONTINUED: ev->left[k] = false; break;
+    case REPLY_USE_LEFT:
+        ev->left[k] = true;
+        ev->of[k] = r->to - r->from;
+        ev->matched[k] = common <= r->from ? 0 : common - r->from;
+        break;
+    }
+}
+
+bool server_terminal_arms(bool wants, const terminal_evidence *ev, bool called) {
+    return wants && !ev->left[called ? 1 : 0];
+}
+
 void gen_kv_finish(gen_state *g, const char *word) {
     if (!g->kv_finish[0]) snprintf(g->kv_finish, sizeof g->kv_finish, "%.*s", (int)sizeof g->kv_finish - 1, word);
 }
@@ -2125,6 +2225,7 @@ void kv_req_format(const kv_req_line *r, char *out, size_t cap) {
     /* what a resume at the deepest live match would have saved */
     kv_line_int(&l, "below", r->deep >= 0 && r->at >= 0 ? (r->deep > r->at ? r->deep - r->at : 0) : -1);
     kv_line_int(&l, "epcut", r->epcut);
+    kv_line_int(&l, "reply", r->reply);
     kv_line_int(&l, "evict", r->evict);
     kv_line_int(&l, "evict_tokens", r->evict >= 0 ? r->evict_tokens : -1);
     kv_line_hash(&l, "evict_conv", r->evict >= 0, r->evict_conv);
@@ -2163,7 +2264,7 @@ void server::kv_req_key(job *j) {
     r->conv = server_kv_token_hash(q->prompt.v, server_prompt_conv_end(&q->prompt, &s->turn_markers));
     r->prompt = q->prompt.len;
     r->bank = r->best = r->common = r->score = r->anchor = r->frontier = r->prefilled = r->deep = -1;
-    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->evict = r->evict_tokens = -1;
+    r->from = r->at = r->reused = r->prefilled_now = r->epcut = r->reply = r->evict = r->evict_tokens = -1;
     r->qwait_ms = r->prefill_ms = r->ttft_ms = -1.0;
 }
 
@@ -2608,7 +2709,7 @@ static bool server_spec_lane_carries(bool spec_rounds, uint32_t verify_rows, ses
  *     plain 33.8-36.1 measured, and the 512-step clock re-probed plain 13 times in 48 requests at ~0.67 s each,
  *     ~9% of a probed request; the plain price it re-measured moved 7% end to end.)
  *   - the measured prices' key -- the decoder count and the depth band -- is the decoders', whichever lane carries
- *     them (L380, lane_decoder_depth): a decoder in the plain batch stands at its feed position.  Read from its
+ *     them (L380, server::slot_frontier_pos): a decoder in the plain batch stands at its feed position.  Read from its
  *     bank, the installed bank's position is 0 from the batch's first step until the decoder leaves it (the step
  *     leaves the session's own history invalid), so a lone decoder's band fell to 0 on the plain lane and came back
  *     on the spec lane: each move dropped both lanes' measured prices, a plain probe never kept more than the steps
@@ -2852,7 +2953,7 @@ static int lane_price_weigh(lane_price *lp, const pulsar_lane_cost *plain, const
 /// @param spec the spec lane's cost fit
 /// @param n decoders
 /// @param verify_rows the verify width
-/// @param depth the decoders' mean depth, tokens (lane_decoder_depth; a new band drops the measured prices)
+/// @param depth the decoders' mean depth, tokens (server::slot_frontier_pos; a new band drops the measured prices)
 /// @return the lane: 2 plain or 3 spec
 static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const pulsar_lane_cost *spec, int n,
                            uint32_t verify_rows, uint32_t depth) {
@@ -2866,17 +2967,6 @@ static int lane_price_pick(lane_price *lp, const pulsar_lane_cost *plain, const 
         lp->moved[0] = '\0';
     }
     return lane;
-}
-
-/* L380: where a decoder stands for the lane prices' depth band, whichever lane carries it.  In the plain batch that
- * is its feed position: its tokens join its bank's history only as it leaves the batch, and until then the installed
- * bank's position reads 0 (a batch step leaves the session's own history invalid: pulsar_session_bank_pos). */
-/// @param s the server
-/// @param sl the decoder's slot
-/// @return its depth, tokens
-static uint32_t lane_decoder_depth(const server *s, const session_slot *sl) {
-    const gen_state *g = sl->gen;
-    return (uint32_t)(g && g->batch_active ? g->batch_feed_pos : s->slot_frontier_pos(sl)).raw();
 }
 
 /// @brief The decode lane for this sweep (the rule above): 0 idle, 2 batched, 3 spec-batched (1, the retired
@@ -3026,6 +3116,7 @@ bool server::spill_bank(session_slot *victim) {
         return false;
     }
     victim->spilled = true;
+    s->slot_reply_forget(victim);   /* L380: its rows are a chain now; what comes back is read as a new bank */
     victim->last_serviced_us = (uint64_t)(server_now_sec() * 1e6);
     s->guard_evictions++;
     const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -5609,6 +5700,29 @@ static bool slot_steppable_beside_fused(const session_slot *c) {
     return slot_steppable_beside_decode(c) && !slot_fusable_prefill(c);
 }
 
+bool server_request_queued(server *s) {
+    pulsar::ScopedLock lk(&s->mu);
+    return s->head != NULL || server_judge_queued(s);
+}
+
+/// Waits on `cv` for at most `seconds` (one pthread_cond_timedwait; a signal, a timeout and a spurious wake all
+/// return).
+/// @param cv       the condition (the default clock: CLOCK_REALTIME)
+/// @param mu       its mutex, held by the caller
+/// @param seconds  the longest wait, >= 0
+static void worker_cond_wait_s(pthread_cond_t *cv, pthread_mutex_t *mu, double seconds) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    const long ns = (long)(seconds * 1e9);
+    deadline.tv_sec += ns / 1000000000L;
+    deadline.tv_nsec += ns % 1000000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(cv, mu, &deadline);
+}
+
 /// @brief The worker thread: the one thread that drives the engine -- it binds queued jobs to slots and steps
 ///        their generations a quantum at a time until the server stops (pulsar_server_internal.h, the CUDA-state
 ///        audit).
@@ -5664,14 +5778,17 @@ void *server_worker_main(void *arg) {
              * that can leave head set with nothing active, this predicate
              * becomes a hard spin — keep the first-bank guarantee. */
             /* L311: an idle worker with no queued job first completes the finished turns' terminal checkpoints, one
-             * a pass (a request that arrives meanwhile binds before the next) */
+             * a pass (a request that arrives meanwhile binds before the next).  L380: each once its idle grace has
+             * passed -- at shutdown without it, so every pending one still runs before the worker leaves -- and a
+             * checkpoint that yields to a request comes back here through the bind above, which serves it first */
             {
-                bool queued;
+                bool stopping;
                 {
                     pulsar::ScopedLock lk(&s->mu);
-                    queued = s->head != NULL;
+                    stopping = s->stopping;
                 }
-                if (!queued && (pulsar_stall_mark("terminal checkpoint"), s->terminal_checkpoint_step())) {
+                if (!server_request_queued(s) &&
+                    (pulsar_stall_mark("terminal checkpoint"), s->terminal_checkpoint_step(server_now_sec(), stopping))) {
                     s->publish_metrics_snapshot();
                     continue;
                 }
@@ -5680,8 +5797,16 @@ void *server_worker_main(void *arg) {
             {
                 pulsar::ScopedLock lk(&s->mu);
                 had_head = s->head != NULL;
-                while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-                quit = !s->head && !server_judge_queued(s) && s->stopping;   /* read shared state under the lock */
+                /* L380: a checkpoint inside its grace is what the worker wakes for; no request and none pending, it
+                 * sleeps until one arrives.  The slots are the worker's own state */
+                const double grace_s = s->terminal_wait_s(server_now_sec());
+                if (grace_s < 0.0) {
+                    while (!s->head && !server_judge_queued(s) && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+                } else if (!s->head && !server_judge_queued(s) && !s->stopping) {
+                    worker_cond_wait_s(&s->cv, &s->mu, grace_s);   /* one wait: any wake goes round the loop */
+                }
+                /* read shared state under the lock; a pending checkpoint runs first (the pass above, grace waived) */
+                quit = !s->head && !server_judge_queued(s) && s->stopping && grace_s < 0.0;
             }
             if (quit) break;
             /* A head that was already queued when nothing is active is a head
@@ -5758,7 +5883,7 @@ void *server_worker_main(void *arg) {
             const pulsar_lane_cost plain_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_PLAIN);
             const pulsar_lane_cost spec_cost = pulsar_engine_lane_cost(s->engine, PULSAR_LANE_SPEC);
             uint64_t dsum = 0;   /* L338: the decoders' mean depth: the depth band the prices are measured in */
-            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)lane_decoder_depth(s, dec[i]);
+            for (int i = 0; i < n_dec; i++) dsum += (uint64_t)s->slot_frontier_pos(dec[i]).raw();
             priced = lane_price_pick(&s->w_lane_price, &plain_cost, &spec_cost, n_dec, verify_rows,
                                      (uint32_t)(dsum / (uint64_t)n_dec));
         }

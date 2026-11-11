@@ -579,6 +579,9 @@ exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
 # split-K trellis GEMV, output Hadamard + svh) at the Qwen dense shapes and a
 # DeepSeek one, K = 2..5, M = 1..16 and a 40-row prefill, graded against the
 # host authority in double; M-neutrality bit-exact; mutations; refusals.
+# L380: the GEMV's two CTA forms (16 warps / 8 warps, two an SM) -- the
+# selection rule's table, and both forms forced on the same launches byte for
+# byte (every rate, narrow and wide, single and multi, f32 and bf16).
 # Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
 # the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
 tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile \
@@ -640,6 +643,12 @@ tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h $(CUD
 # L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
 # decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
 # and a streaming-read roofline, DRAM-cold, M = 1..16.  Not a gate.
+# L380: `tests/exl3_dense_bench round ...` prices the GEMV's CTA forms (16 warps
+# forced / the shipped rule / 8 warps forced) at a model's per-round launches
+# (qwen, nemotron) -- usage in the file's header.
+# L381: `tests/exl3_dense_bench chunk ...` prices the prompt arm's kernels (the
+# GEMM forced / the shipped rule / in place forced) at a model's per-chunk
+# launches, 5 to 4096 rows.
 tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
@@ -678,6 +687,18 @@ segstore-tsan: tests/segstore_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
+# L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
+# implements (qwen_exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
+# shipped order.  `lt-order-gate` is its battery form (kernels tier: a GPU, no model): on a device the rule gives the
+# in-place kernel (sm_12x) a vendor change fails it; elsewhere it is N/A.  Run by hand without --gate to establish the
+# order on a new architecture, and after a toolchain move (docs/QA_BEFORE_RELEASES.md) -- usage in the file's header.
+tests/lt_order_probe: tests/lt_order_probe.cu src/cuda/pulsar_cuda_lt_fixed.h src/cuda/mmq/ds4_exl3_dense.cuh \
+                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_order_probe.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+.PHONY: lt-order-gate
+lt-order-gate: tests/lt_order_probe
+	./tests/lt_order_probe --gate
 .PHONY: router-gate
 router-gate: tests/router_gate
 	./tests/router_gate
@@ -2081,8 +2102,10 @@ nemotron-mem-squeeze-live: pulsar-server
 
 # L318: an Open WebUI conversation (the history rewritten inside the previous turn, ~30k-token prompts) resumes within
 # one segment of its byte match from the deepest valid state -- own bank, adopt, disk chain -- a prefill its client
-# abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  Production's
-# Qwen pack and flags (262k, 16 banks, 64 GB disk tier); two loads, ~8 min.  gates-dev runs it on a routing / kv path.
+# abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  L380: the
+# disk tier serves it on a restart of the server, where no bank can (its turns in memory come from memory).
+# Production's Qwen pack at 262k and 16 banks, the disk tier at the server's default size; three loads (the server, its
+# restart on the same disk store, a fresh one).  gates-dev runs it on a routing / kv path.
 RESUME_LIVE_MODEL ?= $(QWEN_GATE_MODEL)
 RESUME_LIVE_WORK ?= $(or $(TMPDIR),/var/tmp)/pulsar-l318-$(USER)
 .PHONY: resume-deepest-live

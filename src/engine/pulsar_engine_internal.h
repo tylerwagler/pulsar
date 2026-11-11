@@ -3239,7 +3239,10 @@ struct pulsar_session {
      * does NOT cover this: pulsar_session_eval never reads it.  Set on every
      * decode_multiseq path that armed a step; cleared only where per-bank
      * device state is legitimately re-established (pulsar_session_sync's rebuild
-     * path, via gpu_graph_reset_prefill_state zeroing the counters). */
+     * path, via gpu_graph_reset_prefill_state zeroing the counters).  L380: it
+     * can stand beside a VALID view -- the step held no row of the installed
+     * bank (pulsar_multiseq_step_stale) -- which the readers serve and nothing
+     * resumes from (pulsar_session_dirty_view_drop). */
     bool mseq_dirty;
     /** GPU bytes this session's create actually allocated (tensor-allocator
      * delta across pulsar_session_create); the server ledger commits this. */
@@ -4274,9 +4277,10 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
 /// @param common      tokens the prompt shares with the bank's history
 /// @param prompt_len  the prompt's length, in tokens
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
+/// @param view        L380: the bank's host view the history and the prefill frontier are read in
 /// @return the resume position, in tokens (0 = from the start).
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
-                                     const pulsar_image_identity *want);
+                                     const pulsar_image_identity *want, pulsar_bank_view view);
 /** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
  *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
 /// @param s           the session
@@ -4284,9 +4288,10 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
 /// @param T           the resume position
 /// @param prompt_len  the prompt's length, in tokens
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
+/// @param view        L380: the bank's host view the history is read in
 /// @return the record (borrowed from the store), or NULL.
 const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len,
-                                                       const pulsar_image_identity *want);
+                                                       const pulsar_image_identity *want, pulsar_bank_view view);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
  * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
  * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not
@@ -4294,8 +4299,9 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
 /// @param s     the session
 /// @param bank  the bank
 /// @param len   tokens of the bank's history the sync keeps
+/// @param view  L380: the bank's host view the prefill frontier is read in
 /// @return true when the sync can continue there.
-bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len);
+bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len, pulsar_bank_view view);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 /// @param s       the session
@@ -4304,17 +4310,6 @@ bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len);
 /// @param errlen  its size
 /// @return true for an id in [0, the tokenizer table length).
 bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, size_t errlen);
-/** Tokens `t` (NULL = none) and `p` share from the start. */
-/// @param t  one token array, or NULL
-/// @param p  another, or NULL
-/// @return the shared prefix length, in tokens (0 when either is NULL).
-static inline int pulsar_tokens_common_prefix(const pulsar_tokens *t, const pulsar_tokens *p) {
-    if (!t || !p) return 0;
-    const int n = t->len < p->len ? t->len : p->len;
-    int i = 0;
-    while (i < n && t->v[i] == p->v[i]) i++;
-    return i;
-}
 /** Bind + layout-validate the Vision-Exp tower.  Returns false (and leaves the
  * struct zeroed) when the artifact carries no `vision.patch_embed.proj.weight`,
  * so a text-only artifact is not an error; a PRESENT tower with any wrong dims,
@@ -4737,6 +4732,30 @@ void pulsar_bank_carry_fresh_view(pulsar_session *s);
 /// @param bank  the bank
 /// @return the history (borrowed), or NULL.
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank);
+/** L380: a bank's committed history in the host view asked.  PULSAR_BANK_VIEW_CURRENT is pulsar_bank_history.
+ *  PULSAR_BANK_VIEW_SAVED is the carry of the bank's last state save whichever bank is installed: the same answer for
+ *  a bank that is not installed, and for the installed one the history it was SAVED with -- a prefix of what the
+ *  bank holds only when nothing but appends moved it since (session_banks.cpp, at the definition: who may ask). */
+/// @param s     the session
+/// @param bank  the bank
+/// @param view  the host view
+/// @return the history (borrowed), or NULL.
+const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
+/** L380: what an armed DeepSeek batch step (session_multiseq.cpp) leaves of the session's single-bank bookkeeping.
+ *  The view (checkpoint_valid) goes only when the step moved the installed bank -- a row of it -- or failed
+ *  mid-sweep; the per-bank truth is always to re-establish (mseq_dirty) and the speculation carry is dropped.
+ *  @param s      the session
+ *  @param reqs   [n_rows] the step's rows
+ *  @param n_rows rows
+ *  @param live   the installed bank
+ *  @param landed the step ran to its end (false: it failed mid-sweep) */
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+                                bool landed);
+/** L380: a view left valid across a batch step on other banks (pulsar_multiseq_step_stale) names the installed bank's
+ *  history for the readers, but nothing resumes from it while the per-bank truth is to re-establish: dropped here
+ *  (checkpoint_valid) when mseq_dirty is set, before the caller acts on it.
+ *  @param s the session */
+void pulsar_session_dirty_view_drop(pulsar_session *s);
 /** L334: pulsar_session_bank_pos's rule over what the pool knows: none() for a bank outside a pool of `n_banks`
  *  (refused by name, logged once) or one that holds no history (`history` NULL), else the history's length.
  *  @param bank the bank asked about

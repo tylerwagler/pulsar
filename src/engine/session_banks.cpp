@@ -160,6 +160,11 @@ static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
         }
     } else if (bank != held) {
         pulsar_bank_carry_fresh_view(s);
+    } else {
+        /* L380: the kept view of the bank the host was synced on, with no carry saved for it: after a batch step on
+         * other banks it is still valid, but the counters installed above are twins nothing captured -- not a state
+         * to continue; the next sync rebuilds, as when the step invalidated the view itself */
+        pulsar_session_dirty_view_drop(s);
     }
     s->mseq_dirty = false;
     return true;
@@ -219,10 +224,26 @@ bool pulsar_bank_carry_restore_view(pulsar_session *s, uint32_t bank) {
  * keeps current for idle banks by bank_state_save'ing at job end).  Pure host
  * reads — no CUDA, safe on the worker thread at routing/publish time. */
 const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
+    return pulsar_bank_history_as(s, bank, PULSAR_BANK_VIEW_CURRENT);
+}
+
+/* L380: the SAVED view is the carry whichever bank is installed.  For a bank that is not installed the two views are
+ * one (the carry is all there is).  For the installed bank the carry is what its last save copied from the live view
+ * (pulsar_bank_carry_save_view; cleared with the bank's state by pulsar_bank_view_invalidate), and the live view has
+ * been the authority since: a sync, a rewind, an adopt, a payload load or an invalidate of the installed bank moves
+ * its rows and its live view and leaves the carry naming the history it held at the save -- rows the bank may no
+ * longer hold.  So the CURRENT view never reads it (a failed sync leaves the installed bank with no history, not
+ * with its old one), and the saved view is no general reader: it is a true prefix of the bank's rows only for a
+ * caller that knows the bank was saved while its view was valid and has since only been APPENDED to.  One caller
+ * does: the server, for a decoder in its plain or mixed batch (server::slot_history, where the argument is made
+ * path by path).  There a batch step moved the installed bank past the live view (pulsar_driver_decode_multiseq,
+ * pulsar_multiseq_step_stale: checkpoint_valid = false), so CURRENT reads no history for it while the batch's other
+ * banks, not installed, read the carries saved at their entry. */
+const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
     if (!s || bank >= session_bank_n(s)) return NULL;
-    if (bank == pulsar_session_live_bank(s)) return s->checkpoint_valid ? &s->checkpoint : NULL;
-    if (s->bank_carry && bank < s->bank_carry_n &&
-        s->bank_carry[bank].valid && s->bank_carry[bank].checkpoint_valid)
+    if (view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s))
+        return s->checkpoint_valid ? &s->checkpoint : NULL;
+    if (pulsar_bank_carry_saved(s, bank) && s->bank_carry[bank].checkpoint_valid)
         return &s->bank_carry[bank].checkpoint;
     return NULL;
 }
@@ -277,10 +298,12 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
  * carry rule as pulsar_bank_history.  0 when nothing valid. */
 /// @param s    the session
 /// @param bank the bank
+/// @param view the host view asked (L380: the saved one reads the carry's, also for the installed bank)
 /// @return the bank's prefill frontier in tokens, 0 when it holds no valid history
-static uint32_t ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
-    if (!pulsar_bank_history(s, bank)) return 0;
-    const int pf = bank == pulsar_session_live_bank(s) ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
+static uint32_t ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+    if (!pulsar_bank_history_as(s, bank, view)) return 0;
+    const bool live = view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s);
+    const int pf = live ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
     return pf > 0 ? (uint32_t)pf : 0u;
 }
 

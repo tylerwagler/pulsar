@@ -9408,7 +9408,7 @@ static void test_l353_small_fixes(void) {
         s.slots[0].provisioned = true;
         s.slots[0].terminal_pending = true;
         s.slots[0].hint_dead = true;
-        TEST_ASSERT(!s.terminal_checkpoint_step());
+        TEST_ASSERT(!s.terminal_checkpoint_step(0.0, true));
         TEST_ASSERT(!s.slots[0].terminal_pending);
     }
     /* 13: a file that can't be opened now is transient: it and its descendants stay; a missing one is a fault (1).
@@ -9842,6 +9842,7 @@ static void test_l378_kv_req_line_format(void) {
     r.reused = 31104;
     r.prefilled_now = 29708;
     r.epcut = 1;
+    r.reply = -1;
     r.evict = 1;
     r.evict_tokens = 69233;
     r.evict_conv = UINT64_C(0x84c39a079fc08121);
@@ -9860,7 +9861,7 @@ static void test_l378_kv_req_line_format(void) {
         "id=4711 ep=messages class=subagent ro=1 sess=0123456789abcdef agent=agent_7 parent=- "
         "pre=00000000000000ab conv=fd1f0f4381eb0395 prompt=60812 bank=1 route=fresh best=0 common=60460 score=0 "
         "anchor=31104 frontier=60987 prefilled=60900 noresume=ckpt-above pick=disk from=disk at=31104 reused=31104 "
-        "prefilled_now=29708 below=29356 epcut=1 evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 "
+        "prefilled_now=29708 below=29356 epcut=1 reply=- evict=1 evict_tokens=69233 evict_conv=84c39a079fc08121 evict_ro=0 "
         "snapshot=none(read-only) qwait_ms=3 restore_ms=456 prefill_ms=37300 ttft_ms=38012 out=16 finish=stop"));
     /* an adopt names its source bank; a resume point inside the match has no noresume */
     r.pick = KV_PICK_ADOPT;
@@ -9888,7 +9889,7 @@ static void test_l378_kv_req_line_format(void) {
     snprintf(want, sizeof want,
              "id=9 ep=completions class=- ro=0 sess=a-session-id-lon agent=- parent=- pre=- conv=%016llx prompt=3 "
              "bank=- route=none best=- common=- score=- anchor=- frontier=- prefilled=- noresume=- pick=none from=- "
-             "at=- reused=- prefilled_now=- below=- epcut=- evict=- evict_tokens=- evict_conv=- evict_ro=- snapshot=- "
+             "at=- reused=- prefilled_now=- below=- epcut=- reply=- evict=- evict_tokens=- evict_conv=- evict_ro=- snapshot=- "
              "qwait_ms=- restore_ms=0 prefill_ms=- ttft_ms=- out=0 finish=gone-queued",
              (unsigned long long)server_kv_token_hash(toks, 3));
     TEST_ASSERT(!strcmp(line, want));
@@ -12972,6 +12973,274 @@ static void test_l289_lane_reprobe_evidence(void) {
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 4, 16u, 0u) == 2 && lp.probe == 2 && lp.deferral == 0);
 }
 
+/* L380: the terminal checkpoint waits out an idle grace and yields to a queued request.  The decisions are host
+ * functions (the step itself needs a session): the grace and the worker's wait, the cancel predicate, what a sync's
+ * result does to the slot, and where a yielded slot's live binding matches. */
+static void test_l380_terminal_grace_and_yield(void) {
+    const double G = PULSAR_SERVER_TERMINAL_GRACE_MS / 1000.0;
+    /* the grace: not before it has passed since the turn ended, yes from then on */
+    TEST_ASSERT(fabs(server_terminal_grace_left_s(100.0, 100.0) - G) < 1e-9);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G / 2, 100.0) > 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G - 0.001, 100.0) > 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(100.0 + G + 0.001, 100.0) == 0.0);
+    TEST_ASSERT(server_terminal_grace_left_s(500.0, 100.0) == 0.0);
+
+    server s;
+    memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.pool_banks = 3;
+    s.n_slots = 3;
+    for (int i = 0; i < 3; i++) {
+        s.slots[i].provisioned = true;
+        s.slots[i].bank = (uint32_t)i;
+    }
+    /* the worker's wait: none pending sleeps untimed (< 0); else the earliest pending slot's deadline */
+    TEST_ASSERT(s.terminal_wait_s(100.0) < 0.0);
+    s.slots[0].terminal_pending = true;
+    s.slots[0].turn_ended_at = 100.0;
+    s.slots[2].terminal_pending = true;
+    s.slots[2].turn_ended_at = 100.1;
+    TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G - 0.05)) < 1e-9);    /* slot 0's, the earlier turn */
+    TEST_ASSERT(s.terminal_wait_s(100.0 + G + 0.001) == 0.0 && s.terminal_wait_s(200.0) == 0.0);
+    s.slots[0].hint_dead = true;                                          /* a turn that no longer applies is not waited for */
+    TEST_ASSERT(fabs(s.terminal_wait_s(100.05) - (G + 0.05)) < 1e-9);
+    s.slots[2].spilled = true;
+    TEST_ASSERT(s.terminal_wait_s(100.05) < 0.0);
+    s.slots[0].hint_dead = false;
+    s.slots[2].spilled = false;
+    /* the step picks nothing inside the grace and leaves both pending; the stale one is dropped whatever the clock */
+    s.slots[1].terminal_pending = true;
+    s.slots[1].turn_ended_at = 100.2;
+    s.slots[1].hint_dead = true;
+    TEST_ASSERT(!s.terminal_checkpoint_step(100.05, false));
+    TEST_ASSERT(s.slots[0].terminal_pending && s.slots[2].terminal_pending && !s.slots[1].terminal_pending);
+    TEST_ASSERT(!s.terminal_checkpoint_step(100.0 + G - 0.01, false) && s.slots[0].terminal_pending);
+
+    /* the cancel predicate: true iff a request is queued -- a job, or a judge call */
+    TEST_ASSERT(!server_request_queued(&s));
+    job queued;
+    memset(&queued, 0, sizeof queued);
+    s.head = &queued;
+    TEST_ASSERT(server_request_queued(&s));
+    s.head = NULL;
+    server_judge *J = new server_judge();
+    s.judge = J;
+    TEST_ASSERT(!server_request_queued(&s));
+    judge_job jb;
+    J->head = J->tail = &jb;
+    TEST_ASSERT(server_request_queued(&s));
+    J->head = J->tail = NULL;
+    /* the sync's hook yields to it only once a chunk has landed: the first progress event is the resume point */
+    terminal_sync_watch w = { &s, -1, 0 };
+    s.head = &queued;
+    TEST_ASSERT(!terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36480, 36700);
+    TEST_ASSERT(w.landed == 0 && !terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36608, 36700);
+    TEST_ASSERT(w.landed == 1 && terminal_cancel_cb(&w));
+    terminal_progress_cb(&w, "prefill_chunk", 36608, 36701);              /* the second sync's start: no chunk */
+    TEST_ASSERT(w.landed == 1);
+    s.head = NULL;
+    TEST_ASSERT(!terminal_cancel_cb(&w));
+    s.judge = NULL;
+    delete J;
+
+    /* the sync's result: its end persists, a yield re-arms and neither persists nor invalidates, a failure
+     * invalidates */
+    const terminal_outcome done = server_terminal_outcome(0), yielded = server_terminal_outcome(PULSAR_SESSION_SYNC_INTERRUPTED),
+                           failed = server_terminal_outcome(1), busy = server_terminal_outcome(PULSAR_SESSION_SYNC_BUSY);
+    TEST_ASSERT(done.persist && !done.rearm && !done.invalidate);
+    TEST_ASSERT(!yielded.persist && yielded.rearm && !yielded.invalidate);
+    TEST_ASSERT(!failed.persist && !failed.rearm && failed.invalidate);
+    TEST_ASSERT(!busy.persist && !busy.rearm && busy.invalidate);
+
+    /* a yielded slot: pending again with its turn kept, due at once (its turn ended before the checkpoint started) */
+    session_slot *sl = &s.slots[1];
+    sl->hint_dead = false;
+    sl->turn_ended_at = 100.2;
+    TEST_ASSERT(!sl->terminal_pending && s.slot_interrupted_turn(sl) == NULL);
+    pulsar_tokens turn = {0};
+    for (int i = 0; i < 700; i++) pulsar_tokens_push(&turn, 1000 + i);
+    s.slot_terminal_rearm(sl, &turn, true);
+    TEST_ASSERT(turn.len == 0 && turn.v == NULL);
+    TEST_ASSERT(sl->terminal_pending && sl->terminal_short_first && sl->provisioned);
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == &sl->terminal_turn && sl->terminal_turn.len == 700);
+    s.slots[0].terminal_pending = s.slots[2].terminal_pending = false;
+    TEST_ASSERT(s.terminal_wait_s(100.2 + G + 1.0) == 0.0);
+    /* its live tool binding matches at the turn's end -- where the checkpoint set it -- not at the bank's position
+     * (0 here: no session), so the continuation still finds its owner */
+    id_list_push_unique(&sl->anthropic_live.call_ids, "toolu_l380t");
+    sl->anthropic_live.valid = true;
+    sl->anthropic_live.live_tokens = 700;
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_l380t");
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == sl);
+    /* the bind reads the turn with its job already on the slot (gen_begin) */
+    sl->active_job = &queued;
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == &sl->terminal_turn);
+    sl->active_job = NULL;
+    /* a slot spilled since no longer stands inside the turn: the turn is not read, and the clear frees it */
+    sl->spilled = true;
+    TEST_ASSERT(s.slot_interrupted_turn(sl) == NULL && s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl->spilled = false;
+    s.slot_terminal_clear(sl);
+    TEST_ASSERT(!sl->terminal_pending && !sl->terminal_short_first && sl->terminal_turn.len == 0 &&
+                sl->terminal_turn.v == NULL);
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    id_list_free(&ids);
+    live_tool_state_free(&sl->anthropic_live);
+
+    /* the bank's tokens must be a prefix of the kept turn for the continuation to be built from it */
+    int a3[] = {1, 2, 3}, a4[] = {1, 2, 3, 4}, b3[] = {1, 9, 3};
+    const pulsar_tokens p3 = {a3, 3, 3}, p4 = {a4, 4, 4}, q3 = {b3, 3, 3}, none = {NULL, 0, 0};
+    TEST_ASSERT(server_tokens_prefix_of(&p3, &p4) && server_tokens_prefix_of(&p4, &p4) && server_tokens_prefix_of(&none, &p3));
+    TEST_ASSERT(!server_tokens_prefix_of(&p4, &p3) && !server_tokens_prefix_of(&q3, &p4));
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* L380: one request of a conversation -- its pick, its match `common` with the bank's history, whether it `extends`
+ * past the match -- read against the reply `last` its bank's last turn left and folded into the evidence; returns
+ * whether its own turn (its reply ending in tool calls: `called`) arms the checkpoint */
+static bool l380_turn(terminal_evidence *ev, const slot_reply *last, kv_pick pick, int common, bool extends,
+                      bool called) {
+    server_terminal_evidence_note(ev, server_reply_use(pick, common, extends, last), last, common);
+    return server_terminal_arms(true, ev, called);
+}
+
+/* L380: a turn arms no terminal checkpoint when its conversation's requests leave replies of its kind behind.  The
+ * shape measured (Nemotron 3.5 Super at ~36k, 2026-11-10): the prompt ends at 36000 on a generation header whose
+ * marker ends at 35994, the reply is 48 tokens, and the next prompt re-renders the header's tail and the reply, so
+ * its bytes part from the bank's history at 35996. */
+static void test_l380_terminal_skips_unused_replies(void) {
+    const slot_reply none = {0, 0, -1, false};
+    const slot_reply rep = {36000, 36048, 35994, false};
+    /* (a) the next user turn re-renders the reply: carried the header, parted below the reply's end */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 35996, true, &rep) == REPLY_USE_LEFT);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36000, true, &rep) == REPLY_USE_LEFT);    /* header kept, reply stripped */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36047, true, &rep) == REPLY_USE_LEFT);    /* all but its last token */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 35995, true, &rep) == REPLY_USE_LEFT);    /* just past the marker */
+    /* (b) a live tool continuation, whatever its rendered prompt matches; an exact append */
+    TEST_ASSERT(server_reply_use(KV_PICK_LIVE, 0, true, &rep) == REPLY_USE_CONTINUED);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36048, true, &rep) == REPLY_USE_CONTINUED);
+    /* (c) a full replay that matches through the reply (and the stop the render re-spells after it) */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36049, true, &rep) == REPLY_USE_CONTINUED);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36048, false, &rep) == REPLY_USE_CONTINUED);   /* a prompt ending on it */
+    /* (d) another conversation: parts at or below the header's marker, or takes the bank from other state */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 35994, true, &rep) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 2300, true, &rep) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_NONE, 0, true, &rep) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_ADOPT, 36048, true, &rep) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_DISK, 36048, true, &rep) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_SPILLED, 36048, true, &rep) == REPLY_USE_NONE);
+    /* (e) the same prompt again, or a rollback: it lies within the history and says nothing about the reply */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36000, false, &rep) == REPLY_USE_SAME);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 20000, false, &rep) == REPLY_USE_SAME);
+    /* no reply on record (a first turn, an evicted or re-bound bank, a failed turn): no evidence, whatever matched */
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36048, true, &none) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_LIVE, 36048, true, &none) == REPLY_USE_NONE);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 35996, true, &none) == REPLY_USE_NONE);
+    /* a template without markers: the next turn is the one that carries the whole prompt */
+    const slot_reply bare = {36000, 36048, -1, false};
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 36000, true, &bare) == REPLY_USE_LEFT);
+    TEST_ASSERT(server_reply_use(KV_PICK_OWN, 35999, true, &bare) == REPLY_USE_NONE);
+
+    /* the arming decision: a wanted turn arms unless its kind was left; an unwanted one never */
+    terminal_evidence ev = {};
+    TEST_ASSERT(server_terminal_arms(true, &ev, false) && server_terminal_arms(true, &ev, true));
+    TEST_ASSERT(!server_terminal_arms(false, &ev, false) && !server_terminal_arms(false, &ev, true));
+    server_terminal_evidence_note(&ev, REPLY_USE_LEFT, &rep, 35996);
+    TEST_ASSERT(ev.left[0] && !ev.left[1] && ev.matched[0] == 0 && ev.of[0] == 48);
+    TEST_ASSERT(!server_terminal_arms(true, &ev, false) && server_terminal_arms(true, &ev, true));
+    server_terminal_evidence_note(&ev, REPLY_USE_LEFT, &rep, 36007);                    /* the count the skip line prints */
+    TEST_ASSERT(ev.matched[0] == 7 && ev.of[0] == 48);
+    server_terminal_evidence_note(&ev, REPLY_USE_SAME, &rep, 36000);                    /* a re-send: the verdict stands */
+    TEST_ASSERT(ev.left[0] && !server_terminal_arms(true, &ev, false));
+    server_terminal_evidence_note(&ev, REPLY_USE_CONTINUED, &rep, 36048);
+    TEST_ASSERT(!ev.left[0] && server_terminal_arms(true, &ev, false));
+    server_terminal_evidence_note(&ev, REPLY_USE_LEFT, &rep, 35996);
+    server_terminal_evidence_note(&ev, REPLY_USE_NONE, &rep, 0);                        /* another conversation: forgotten */
+    TEST_ASSERT(!ev.left[0] && !ev.left[1] && ev.matched[0] == 0 && ev.of[0] == 0);
+
+    /* (f) no flip-flop.  A reply-stripping client, four turns: arm (no evidence), then skip, skip, skip -- the
+     * verdict reads the match against the history with the reply, which stands there as decode rows after a skip
+     * exactly as it stood prefilled after a checkpoint; where the sync resumed is not read. */
+    ev = terminal_evidence{};
+    slot_reply last = none;
+    int end = 36000;                         /* each turn: the prompt's end, header marker ending 6 below it */
+    bool armed[4];
+    for (int t = 0; t < 4; t++) {
+        armed[t] = l380_turn(&ev, &last, t == 0 ? KV_PICK_NONE : KV_PICK_OWN, t == 0 ? 0 : last.header + 2, true, false);
+        last = slot_reply{end, end + 48, end - 6, false};
+        end += 120;
+    }
+    TEST_ASSERT(armed[0] && !armed[1] && !armed[2] && !armed[3]);
+    /* ... a re-send in the middle changes nothing (e), and its turn is skipped like the one it repeats */
+    TEST_ASSERT(!l380_turn(&ev, &last, KV_PICK_OWN, last.from, false, false));
+    /* ... and the client starts keeping its replies: that turn arms again, and the next */
+    TEST_ASSERT(l380_turn(&ev, &last, KV_PICK_OWN, last.to + 1, true, false));
+    TEST_ASSERT(l380_turn(&ev, &last, KV_PICK_OWN, last.to + 1, true, false));
+    /* a reply-keeping client arms every turn */
+    ev = terminal_evidence{};
+    last = none;
+    end = 36000;
+    for (int t = 0; t < 4; t++) {
+        TEST_ASSERT(l380_turn(&ev, &last, t == 0 ? KV_PICK_NONE : KV_PICK_OWN, t == 0 ? 0 : last.to + 1, true, false));
+        last = slot_reply{end, end + 48, end - 6, false};
+        end += 120;
+    }
+    /* a stripping conversation settled into skip; another conversation lands on the bank: forgotten, its turn arms */
+    ev = terminal_evidence{};
+    server_terminal_evidence_note(&ev, REPLY_USE_LEFT, &rep, 35996);
+    TEST_ASSERT(l380_turn(&ev, &rep, KV_PICK_OWN, 2300, true, false) && !ev.left[0]);
+    /* an agent loop on a template that re-renders a turn's replies once the user speaks again: the tool-call replies
+     * are continued from (their checkpoints stay), the closing reply is left (its checkpoint goes) -- the two kinds
+     * settle apart.  User turn, tool result, closing; twice more. */
+    ev = terminal_evidence{};
+    const slot_reply tool_reply = {36000, 36060, 35994, true}, closing = {36400, 36448, 35994, false};
+    TEST_ASSERT(l380_turn(&ev, &none, KV_PICK_NONE, 0, true, true));                    /* user turn 1 -> a tool call */
+    TEST_ASSERT(l380_turn(&ev, &tool_reply, KV_PICK_OWN, 36061, true, false));          /* its result -> the closing reply */
+    for (int t = 0; t < 2; t++) {
+        TEST_ASSERT(l380_turn(&ev, &closing, KV_PICK_OWN, 35996, true, true));          /* next user turn: left it; arms */
+        TEST_ASSERT(ev.left[0] && !ev.left[1]);
+        TEST_ASSERT(!l380_turn(&ev, &tool_reply, KV_PICK_LIVE, 0, true, false));        /* result: the closing reply skips */
+    }
+
+    /* the slot: an eviction forgets the reply and the evidence; the bind's clear of a pending checkpoint does not */
+    server s;
+    memset(&s, 0, sizeof s);
+    session_slot *sl = &s.slots[0];
+    sl->provisioned = true;
+    sl->reply = rep;
+    server_terminal_evidence_note(&sl->terminal_ev, REPLY_USE_LEFT, &rep, 35996);
+    sl->terminal_pending = true;
+    s.slot_terminal_clear(sl);
+    TEST_ASSERT(sl->reply.to == 36048 && sl->terminal_ev.left[0]);
+    s.slot_reply_forget(sl);
+    TEST_ASSERT(sl->reply.to == 0 && sl->reply.from == 0 && !sl->terminal_ev.left[0] && !sl->terminal_ev.left[1]);
+    /* a turn no checkpoint serves (failed, abandoned, nothing generated) leaves no reply on record, so the request
+     * after it is no evidence; classic mode (no pool) records none either and arms as asked */
+    sl->reply = rep;
+    TEST_ASSERT(!s.slot_turn_reply(sl, false, false) && sl->reply.to == 0);
+    sl->reply = rep;
+    TEST_ASSERT(s.slot_turn_reply(sl, true, false) && sl->reply.to == 0);
+    /* the `kv req:` line's field */
+    kv_req_line r;
+    memset(&r, 0, sizeof r);
+    char line[KV_REQ_LINE_MAX];
+    r.reply = 1;
+    kv_req_format(&r, line, sizeof line);
+    TEST_ASSERT(strstr(line, " epcut=0 reply=1 evict=0 "));
+    r.reply = 0;
+    kv_req_format(&r, line, sizeof line);
+    TEST_ASSERT(strstr(line, " reply=0 "));
+    r.reply = -1;
+    kv_req_format(&r, line, sizeof line);
+    TEST_ASSERT(strstr(line, " reply=- "));
+}
+
+
 /* L380 -- a probe belongs to the decoder count and depth band it began at.  Qwen one stream (2026-11-10): spec 4 tokens
  * a 53.3 ms round = 75 tok/s, plain predicted 1 / 29 ms = 34.5.  (a) The decoders idling between requests ends
  * nothing: the probe's steps so far count and it completes after the rest.  (b) A new band or count ends it unweighed
@@ -13067,27 +13336,74 @@ static void test_l380_lane_probe_key(void) {
     TEST_ASSERT(fabs(lp.t_plain - 1000.0 / 29.0) < 1e-6);
 }
 
-/* L380 -- the depth the lane prices are keyed by is the decoder's, whichever lane carries it: in the plain batch
- * its feed position, not its bank's (the installed bank's position reads 0 from the batch's first step until the
- * decoder leaves: one Qwen stream at 36.5K fell from band 3 to band 0 on the plain lane and came back on the spec
- * lane, dropping both lanes' measured prices each way).  No engine: the bank's position reads 0 here, as the
- * installed bank's does in the batch. */
-static void test_l380_lane_decoder_depth(void) {
+/* L380 -- a decoder in the plain batch stands at its feed position for EVERY reader of its slot's position
+ * (server::slot_frontier_pos), not its bank's: the engine's history of the bank is the one it entered the batch with,
+ * and the installed bank's reads no position at all (0) from the batch's first step until the decoder leaves.  The
+ * lane prices' depth read that 0 (one Qwen stream at 36.5K fell from band 3 to band 0 on the plain lane and came back
+ * on the spec lane, dropping both lanes' measured prices each way), and so did /metrics.  No engine: the bank's
+ * position reads 0 here, as the installed bank's does in the batch. */
+static void test_l380_batch_frontier(void) {
     server s;
     memset(&s, 0, sizeof s);
+    pthread_mutex_init(&s.tool_mu, NULL);
     gen_state g;
     memset(&g, 0, sizeof g);
-    session_slot sl;
-    memset(&sl, 0, sizeof sl);
-    sl.provisioned = true;
+    s.n_slots = 2;
+    session_slot &sl = s.slots[1];
+    sl.bank = 1u;
     sl.gen = &g;
     g.phase = GEN_DECODE;
-    TEST_ASSERT(lane_decoder_depth(&s, &sl) == 0u);   /* on the spec lane: its bank's position */
     g.batch_active = true;
     g.batch_feed_valid = true;
     g.batch_feed_pos = TokPos{36600};
-    TEST_ASSERT(s.slot_frontier_pos(&sl).raw() == 0 && lane_decoder_depth(&s, &sl) == 36600u);
-    TEST_ASSERT(lane_depth_band(lane_decoder_depth(&s, &sl)) == 3);
+    /* the accessor's contract: an unprovisioned slot holds nothing, whatever its job says */
+    TEST_ASSERT(s.slot_frontier_pos(NULL) == TokPos{0} && s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.provisioned = true;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36600});
+    g.batch_active = false;   /* on the spec lane, prefilling or idle: its bank's position */
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.gen = NULL;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{0});
+    sl.gen = &g;
+    g.batch_active = true;
+    /* each commit moves it (lane_emit_and_draw), and a decoder that stopped in the batch keeps it until its finish
+     * step folds the batch's tokens into the bank's history (generate_job_step) */
+    g.batch_feed_pos += TokCount{1};
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36601});
+    g.batch_feed_valid = false;
+    g.phase = GEN_FINISH;
+    TEST_ASSERT(s.slot_frontier_pos(&sl) == TokPos{36601});
+    g.batch_feed_valid = true;
+    g.phase = GEN_DECODE;
+    g.batch_feed_pos = TokPos{36600};
+
+    /* the live bindings match at the slot's frontier (live_slot_for_ids): the one a continuation kept from the turn
+     * before stands below the decoder, so a second request carrying its ids finds no owner while the first decodes --
+     * neither at the old frontier nor at the 0 the installed bank reads */
+    job busy;
+    memset(&busy, 0, sizeof busy);
+    sl.active_job = &busy;
+    id_list_push_unique(&sl.anthropic_live.call_ids, "toolu_l380");
+    sl.anthropic_live.valid = true;
+    sl.anthropic_live.live_tokens = 36000;
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "toolu_l380");
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl.anthropic_live.live_tokens = 0;
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == NULL);
+    sl.anthropic_live.live_tokens = 36600;   /* the read is the feed position */
+    TEST_ASSERT(s.anthropic_live_slot_for_ids(&ids) == &sl);
+    id_list_free(&ids);
+    live_tool_state_free(&sl.anthropic_live);
+
+    /* a busy bank is never an empty one or scratch, whatever its position reads */
+    bool fd[PULSAR_SESSION_POOL_CAP], fs[PULSAR_SESSION_POOL_CAP];
+    s.victim_facts(fd, fs);
+    TEST_ASSERT(!fs[1] && !fd[1]);
+    sl.active_job = NULL;
+
+    /* the lane prices' depth is that read: band 3 on either lane */
+    TEST_ASSERT(lane_depth_band((uint32_t)s.slot_frontier_pos(&sl).raw()) == 3);
     /* so a plain probe's steps count over its quanta: band 3 at every pick */
     lane_price lp;
     memset(&lp, 0, sizeof lp);
@@ -13097,12 +13413,48 @@ static void test_l380_lane_decoder_depth(void) {
     l284_steps(&lp, &spec, PULSAR_LANE_SPEC, LANE_PRICE_PROBE_STEPS, 1, 4, 5, 53.3);
     TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, 36632u) == 2 && lp.probe == 2);
     for (uint32_t k = 0; k < 4u; k++) {   /* four quanta of eight plain steps */
-        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 2 && !lp.rekeyed);
+        TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 2 &&
+                    !lp.rekeyed);
         l284_steps(&lp, &plain, PULSAR_LANE_PLAIN, 8u, 1, 1, 1, 29.0);
         g.batch_feed_pos += TokCount{8};
     }
-    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, lane_decoder_depth(&s, &sl)) == 3 && lp.probe == 0);
+    TEST_ASSERT(lane_price_pick(&lp, &plain, &spec, 1, 16u, (uint32_t)s.slot_frontier_pos(&sl).raw()) == 3 &&
+                lp.probe == 0);
     TEST_ASSERT(lp.meas_plain && lp.meas_spec && !strcmp(lp.why, "measured: the lane in force holds"));
+
+    /* the history readers' scope (server::slot_history): in the batch AND still decoding -- every failed step,
+     * refused draw, abandon or bank that would not install ends the decode, and the slot then reads as any other */
+    g.phase = GEN_DECODE;
+    g.batch_active = true;
+    TEST_ASSERT(server_slot_batch_decoding(&sl) && !server_slot_batch_decoding(NULL));
+    g.phase = GEN_FINISH;
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    g.phase = GEN_DECODE;
+    g.batch_active = false;   /* on the spec lane */
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    g.batch_active = true;
+    sl.gen = NULL;
+    TEST_ASSERT(!server_slot_batch_decoding(&sl));
+    sl.gen = &g;
+    /* a host-only server reads no engine history, in the batch or not (the readers over a session:
+     * pulsar_test --batch-history) */
+    s.pool_banks = 2;
+    TEST_ASSERT(s.slot_history(&sl).base == NULL && s.slot_history(&sl).tail == NULL);
+    pulsar_tokens any = {0};
+    TEST_ASSERT(s.slot_common_prefix(&sl, &any) == 0);
+    s.pool_banks = 0;
+    /* a slot's history is the engine's tokens, then the batch's commits: its length and its compares read both */
+    int bv[4] = {1, 2, 3, 4}, tv[2] = {5, 6}, wv[6] = {1, 2, 3, 4, 5, 7};
+    pulsar_tokens b = {bv, 4, 4}, t = {tv, 2, 2}, w = {wv, 6, 6}, t0 = {0};
+    const slot_tokens two = {&b, &t}, flat = {&w, NULL}, entry = {&b, NULL}, fresh = {&b, &t0}, none = {NULL, NULL};
+    TEST_ASSERT(slot_tokens_len(two) == 6 && slot_tokens_len(entry) == 4 && slot_tokens_len(fresh) == 4 &&
+                slot_tokens_len(none) == 0);
+    TEST_ASSERT(slot_tokens_common(two, flat) == 5 && slot_tokens_common(flat, two) == 5);   /* parts inside the tail */
+    TEST_ASSERT(slot_tokens_common(two, entry) == 4 && slot_tokens_common(two, two) == 6);
+    TEST_ASSERT(slot_tokens_common(two, none) == 0 && slot_tokens_common(none, flat) == 0);
+    wv[1] = 9;   /* parts inside the base */
+    TEST_ASSERT(slot_tokens_common(two, flat) == 1);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 /* L179 branch 13 -- the per-quantum client-disconnect poll shared by the
@@ -16734,7 +17086,9 @@ static void pulsar_server_unit_tests_run(void) {
     test_l338_systemone_state_dump();
     test_l289_lane_reprobe_evidence();
     test_l380_lane_probe_key();
-    test_l380_lane_decoder_depth();
+    test_l380_terminal_grace_and_yield();
+    test_l380_terminal_skips_unused_replies();
+    test_l380_batch_frontier();
     test_l179_lane_abandon_needs_decode_and_hangup();
     test_l190_mem_floor_warn_is_rate_limited();
     test_l184_every_consumer_loops_the_syntax_table();

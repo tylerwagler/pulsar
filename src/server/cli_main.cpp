@@ -479,6 +479,7 @@ void server::close_resources() {
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) {
         live_tool_state_free(&s->slots[i].responses_live);
         live_tool_state_free(&s->slots[i].anthropic_live);
+        s->slot_terminal_clear(&s->slots[i]);   /* L380: a yielded checkpoint's kept turn */
         s->slots[i].provisioned = false;
     }
     if (s->sess) pulsar_session_free(s->sess);

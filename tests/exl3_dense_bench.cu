@@ -27,6 +27,23 @@
  *
  * The gemma set (L338): Gemma 4 26B-A4B's dense Linears and its K=6 tied head, at the rates its pack stores (4, 6).
  * The MXFP8 arm needs the MX tensor cores (sm_100+); below them it is not run (said once).
+ *
+ * THE ROUND MODE (L380): the GEMV's CTA forms priced at the launches a model makes a decode round --
+ *
+ *   tests/exl3_dense_bench round [iters=200] [repeats=3] [M list=1,2,4,8] [set: qwen (default) | nemotron]
+ *                                [k2, 0 = the set's rate] [arms: rule (default) | 8w] [shape index, -1 = all]
+ *
+ * see round_main below.  How the 8-warp CTA's rule (ds4_exl3_dense_gemv_arm) was priced on GB10 (gpuq #702 / #703:
+ * `round 200 5 1,2,4,8 qwen`) and how it is re-priced on another device, rate or model.  Build with the served arch
+ * (make tests/exl3_dense_bench CUDA_ARCH=sm_120f) and run with the GPU to itself: no pulsar-server on it.
+ *
+ * THE CHUNK MODE (L381): the prompt arm's two kernels priced at the launches a model makes a PROMPT chunk --
+ *
+ *   tests/exl3_dense_bench chunk [iters=40] [repeats=3] [M list=5,16,30,64,128,256,512,1024,2048,4096]
+ *                                [set: qwen (default) | nemotron] [k2, 0 = the set's rate] [shape index, -1 = all]
+ *
+ * see chunk_main below.  How the in-place kernel's row rule (ds4_exl3_dense_prompt_arm) was priced on GB10 (gpuq
+ * #704, to 256 rows) and how its crossover with the GEMM arm is found: both kernels run to 4096 rows here.
  */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
@@ -35,6 +52,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -94,7 +112,600 @@ static double time_calls(int iters, F fn) {
     return ms * 1000.0 / iters;
 }
 
+/* THE ROUND MODE (L380).  The EXL3 dense launches a model makes a decode round, each as its family makes it
+ * (ds4_exl3_dense_multi_launch: one PREP + one PDL GEMV over the launch's projections, decode rows, f32 outputs), at
+ * one rate, synthetic weights, under each CTA form:
+ *
+ *   16w    the 16-warp CTA forced on every launch (ds4_exl3_dense_arm_force) -- the arm before L380
+ *   rule   the shipped selection (ds4_exl3_dense_gemv_arm on this device); the "form" column says which it took
+ *   8w     (asked for with `8w`) the 8-warp CTA forced, one-pass launches only (M <= 16)
+ *
+ * qwen (Qwen3.8-Flash-Next, K = 5): a round's launches and their counts --
+ *   GDN in_proj_qkv + in_proj_z   ONE multi launch 2560 -> 10240 + 6144      x36
+ *   QSA q + k + v                 ONE multi launch 2560 -> 12288 + 512 + 512 x12
+ *   GDN out_proj / QSA o_proj     6144 -> 2560                               x36 + x12
+ *   shared gate + up              ONE multi launch 2560 -> 640 + 640         x48
+ *   shared down                   640 -> 2560                                x48
+ *   PLE key_proj, value_proj      2560 -> 10240, 2560 -> 2560                x1 each
+ *   lm_head                       2560 -> 248320                             x1
+ * nemotron (Nemotron-3.5 Super's trunk, K = 4): the shapes are the profile's (PULSAR_NEMOTRON_H_SHAPE_SUPER) through
+ * the forward's launches (nemotron_h_forward.cpp), the counts the model's 40 Mamba-2 / 8 attention / 40 MoE blocks
+ * (nemotron_h.h) --
+ *   Mamba-2 in_proj               4096 -> 18560 ([z 8192 | x B C 10240 | dt 128]) x40
+ *   Mamba-2 out_proj              8192 -> 4096                               x40
+ *   attention q + k + v           ONE multi launch 4096 -> 4096 + 256 + 256  x8
+ *   attention o_proj              4096 -> 4096                               x8
+ *   latent in / latent out        4096 -> 1024, 1024 -> 4096                 x40 each
+ *   shared up / shared down       4096 -> 5376, 5376 -> 4096                 x40 each
+ *   lm_head                       4096 -> 131072                             x1
+ *   NOT in it: the MTP drafter's module (eh_proj, its attention and MoE: a draft step's, not the trunk's); and a
+ *   decode step runs the shared expert beside the routed chain on a second stream (L296 dec2), which a launch timed
+ *   alone does not see.  Which of these Linears a served container stores as EXL3 is the container's: check its
+ *   layouts before reading the totals as that model's round.
+ *
+ * Per (launch, M): one launch of each form on the same weights and rows into canary-filled outputs -- every form's
+ * bytes must be the 16-warp form's (the forms are one arithmetic; a differing byte fails the run) -- then `repeats`
+ * rounds of timings with the forms' order rotated, each `iters` calls back to back behind a spin kernel, DRAM-cold
+ * (each call takes the next replica of every projection's weight, >= 96 MB of replicas a launch).  Medians; then the
+ * per-round totals at the counts above.  The description (ds4_exl3_dense_gemv_describe) names the kernel each form
+ * ran: its warps, registers and CTAs an SM.
+ * Returns 0; 2 on a usage, setup or launch failure; 3 when a form's output is not the 16-warp form's. */
+static int round_main(int argc, char **argv) {
+    const int iters = argc > 2 ? atoi(argv[2]) : 200;
+    const int repeats = argc > 3 ? atoi(argv[3]) : 3;
+    std::vector<int> Ms;
+    {
+        const char *l = argc > 4 ? argv[4] : "1,2,4,8";
+        for (const char *q = l; *q;) {
+            Ms.push_back(atoi(q));
+            while (*q && *q != ',') q++;
+            if (*q == ',') q++;
+        }
+    }
+    const char *set = argc > 5 ? argv[5] : "qwen";
+    const bool nemotron = !strcmp(set, "nemotron");
+    const int k2 = argc > 6 && atoi(argv[6]) ? atoi(argv[6]) : nemotron ? 8 : 10;
+    const char *arms_s = argc > 7 ? argv[7] : "rule";
+    const bool with_8w = !strcmp(arms_s, "8w");
+    const int only_shape = argc > 8 ? atoi(argv[8]) : -1;
+    int maxM = 0;
+    bool usage = iters < 1 || repeats < 1 || Ms.empty() || (!nemotron && strcmp(set, "qwen")) ||
+                 (!with_8w && strcmp(arms_s, "rule")) || !ds4_exl3_dense_rate_supported(k2);
+    for (int M : Ms) {
+        usage = usage || M < 1 || M > 32;   /* one launch: 16-row passes, two at most */
+        maxM = std::max(maxM, M);
+    }
+    if (usage) {
+        fprintf(stderr, "usage: exl3_dense_bench round [iters=200] [repeats=3] [M list=1,2,4,8 (1..32)] [qwen|nemotron] "
+                        "[k2, 0 = the set's] [rule|8w] [shape]\n");
+        return 2;
+    }
+    struct lshape { const char *what; int K, n, N[DS4_EXL3_DENSE_MAX_PROJ], count; };
+    const lshape qwen_shapes[] = {
+        {"GDN qkv+z  2560->10240+6144",  2560, 2, {10240, 6144, 0, 0}, 36},
+        {"QSA q+k+v  2560->12288+2x512", 2560, 3, {12288, 512, 512, 0}, 12},
+        {"GDN out / QSA o 6144->2560",   6144, 1, {2560, 0, 0, 0}, 48},
+        {"shared gate+up 2560->2x640",   2560, 2, {640, 640, 0, 0}, 48},
+        {"shared down 640->2560",        640,  1, {2560, 0, 0, 0}, 48},
+        {"PLE key 2560->10240",          2560, 1, {10240, 0, 0, 0}, 1},
+        {"PLE value 2560->2560",         2560, 1, {2560, 0, 0, 0}, 1},
+        {"lm_head 2560->248320",         2560, 1, {248320, 0, 0, 0}, 1},
+    };
+    const lshape nemotron_shapes[] = {
+        {"Mamba in_proj 4096->18560",    4096, 1, {18560, 0, 0, 0}, 40},
+        {"Mamba out_proj 8192->4096",    8192, 1, {4096, 0, 0, 0}, 40},
+        {"attn q+k+v 4096->4096+2x256",  4096, 3, {4096, 256, 256, 0}, 8},
+        {"attn o_proj 4096->4096",       4096, 1, {4096, 0, 0, 0}, 8},
+        {"latent in 4096->1024",         4096, 1, {1024, 0, 0, 0}, 40},
+        {"latent out 1024->4096",        1024, 1, {4096, 0, 0, 0}, 40},
+        {"shared up 4096->5376",         4096, 1, {5376, 0, 0, 0}, 40},
+        {"shared down 5376->4096",       5376, 1, {4096, 0, 0, 0}, 40},
+        {"lm_head 4096->131072",         4096, 1, {131072, 0, 0, 0}, 1},
+    };
+    const lshape *shapes = nemotron ? nemotron_shapes : qwen_shapes;
+    const int n_shapes = nemotron ? (int)(sizeof nemotron_shapes / sizeof *nemotron_shapes)
+                                  : (int)(sizeof qwen_shapes / sizeof *qwen_shapes);
+    struct form { const char *name; int force; };
+    const form forms[] = {{"16w", DS4_EXL3_DENSE_ARM_16W}, {"rule", 0}, {"8w", DS4_EXL3_DENSE_ARM_8W}};
+    const int n_forms = with_8w ? 3 : 2;
+
+    if (!pulsar_gpu_init()) { fprintf(stderr, "no GPU\n"); return 2; }
+    int sms = 0, cc_major = 0, cc_minor = 0;
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    CK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0));
+    CK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, 0));
+    size_t gfree = 0, gtotal = 0;
+    CK(cudaMemGetInfo(&gfree, &gtotal));
+    unsigned *d_sink = nullptr;
+    CK(cudaMalloc((void **)&d_sink, 4));
+    printf("exl3_dense_bench round: set %s, K=%.1f bits, sm_%d%d, %d SMs, %.1f of %.1f GB free, %d calls x %d repeats a "
+           "point, DRAM-cold (>= %.0f MB of replicas a launch)\n", set, k2 / 2.0, cc_major, cc_minor, sms, gfree / 1e9,
+           gtotal / 1e9, iters, repeats, kMinRotateBytes / 1e6);
+    printf("columns: NT = n-tiles a CTA (2: 32 outputs, 4: 64), grid = GEMV CTAs; form = the warps the rule took; reg, "
+           "c/SM = registers a thread and CTAs resident an SM of the 16w / rule%s kernels; us = median per launch (prep + "
+           "GEMV); GB/s = weight bytes / us; r/16 = rule us / 16w us\n", with_8w ? " / 8w" : "");
+    printf("%-30s %2s %7s %2s %5s %4s %-11s %-7s | %9s %9s %9s | %6s %6s | %6s %6s | %s\n", "launch", "M", "MB", "NT", "grid",
+           "form", "reg", "c/SM", "16w us", "rule us", "8w us", "GB/s16", "GB/s r", "r/16", "8/16", "bytes");
+
+    struct result { double bytes, us[3]; bool have, have8; };
+    std::vector<std::vector<result>> res(n_shapes, std::vector<result>(Ms.size(), result{0, {0, 0, 0}, false, false}));
+    bool launch_failed = false, bytes_failed = false;
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+    };
+
+    for (int si = 0; si < n_shapes; si++) {
+        const lshape &sh = shapes[si];
+        if (only_shape >= 0 && si != only_shape) continue;
+        const int K = sh.K, n = sh.n;
+        uint64_t tb[DS4_EXL3_DENSE_MAX_PROJ], stride[DS4_EXL3_DENSE_MAX_PROJ], pitch[DS4_EXL3_DENSE_MAX_PROJ];
+        double bytes = 0;
+        int c32 = 0;
+        for (int j = 0; j < n; j++) {
+            uint64_t sb;
+            if (!exl3_linear_layout(K, sh.N[j], k2, &tb[j], &sb, &stride[j])) { fprintf(stderr, "round: layout\n"); return 2; }
+            pitch[j] = (stride[j] + 255) & ~(uint64_t)255;   /* replicas 16-byte aligned */
+            bytes += (double)stride[j];
+            c32 += (int)(exl3_out_stored(sh.N[j]) / 32);
+        }
+        const int nrep = n_replicas(bytes);
+        size_t need = (size_t)maxM * K * 2;
+        for (int j = 0; j < n; j++) need += pitch[j] * nrep + (size_t)maxM * sh.N[j] * 4;
+        CK(cudaMemGetInfo(&gfree, &gtotal));
+        if (need + (256u << 20) > gfree) {
+            fprintf(stderr, "round: %s needs %.2f GB of device memory, %.2f GB free -- refusing\n", sh.what, need / 1e9,
+                    gfree / 1e9);
+            return 2;
+        }
+        /* weights: random trellis words, +-0.025 scales (the bench's fixture), every replica its own bytes */
+        uint8_t *arena[DS4_EXL3_DENSE_MAX_PROJ] = {};
+        float *d_y[DS4_EXL3_DENSE_MAX_PROJ] = {};
+        for (int j = 0; j < n; j++) {
+            CK(cudaMalloc((void **)&arena[j], pitch[j] * nrep));
+            CK(cudaMalloc((void **)&d_y[j], (size_t)maxM * sh.N[j] * 4));
+            std::vector<uint8_t> h(pitch[j]);
+            const uint64_t scales = (uint64_t)K + exl3_out_stored(sh.N[j]);
+            for (int r = 0; r < nrep; r++) {
+                uint16_t *t = (uint16_t *)h.data();
+                for (uint64_t i = 0; i < tb[j] / 2; i++) t[i] = (uint16_t)rnd();
+                for (uint64_t i = 0; i < scales; i++) t[tb[j] / 2 + i] = exl3_f32_to_f16((float)(0.025 * ((rnd() & 1) ? 1 : -1)));
+                CK(cudaMemcpy(arena[j] + (size_t)r * pitch[j], h.data(), pitch[j], cudaMemcpyHostToDevice));
+            }
+        }
+        /* the rows: bf16, the family's block input */
+        uint16_t *d_x = nullptr;
+        CK(cudaMalloc((void **)&d_x, (size_t)maxM * K * 2));
+        {
+            std::vector<uint16_t> hb((size_t)maxM * K);
+            for (auto &v : hb) {
+                const __nv_bfloat16 b = __float2bfloat16(((float)(rnd() >> 8) / 16777216.0f - 0.5f) * 4.0f);
+                std::memcpy(&v, &b, sizeof(uint16_t));
+            }
+            CK(cudaMemcpy(d_x, hb.data(), hb.size() * 2, cudaMemcpyHostToDevice));
+        }
+        ds4_exl3_dense_proj p0[DS4_EXL3_DENSE_MAX_PROJ];
+        for (int j = 0; j < n; j++) p0[j] = ds4_exl3_dense_proj{arena[j], k2, sh.N[j], d_y[j], nullptr};
+        const size_t ws_bytes = ds4_exl3_dense_multi_workspace_bytes(p0, n, maxM, K);
+        void *d_ws = nullptr;
+        if (!ws_bytes) { fprintf(stderr, "round: %s: the arm refuses the shape\n", sh.what); return 2; }
+        CK(cudaMalloc(&d_ws, ws_bytes));
+        /* one launch as the family makes it: replica i of every projection's weight */
+        auto launch = [&](int i, int M) {
+            ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ];
+            for (int j = 0; j < n; j++) {
+                p[j] = p0[j];
+                p[j].w = arena[j] + (size_t)(i % nrep) * pitch[j];
+            }
+            return ds4_exl3_dense_multi_launch(p, n, d_x, M, K, d_ws, ws_bytes, cudaStreamPerThread, false) == 0;
+        };
+
+        for (size_t mi = 0; mi < Ms.size(); mi++) {
+            const int M = Ms[mi];
+            /* the kernel each form runs here; the forced 8-warp CTA has none past 16 rows */
+            ds4_exl3_dense_gemv_desc d[3] = {};
+            bool run[3] = {};
+            for (int f = 0; f < n_forms; f++) {
+                ds4_exl3_dense_arm_force(forms[f].force);
+                run[f] = ds4_exl3_dense_gemv_describe(k2, M, c32, &d[f]) == 0;
+            }
+            ds4_exl3_dense_arm_force(0);
+            if (!run[0] || !run[1]) { fprintf(stderr, "round: no launch description for %s M=%d\n", sh.what, M); return 2; }
+            /* the bytes: every form on the same weights and rows */
+            std::vector<std::vector<float>> y0(n);
+            bool ok = true;
+            size_t n_diff = 0, n_nan = 0;
+            for (int f = 0; f < n_forms && ok; f++) {
+                if (!run[f]) continue;
+                ds4_exl3_dense_arm_force(forms[f].force);
+                for (int j = 0; j < n; j++) CK(cudaMemset(d_y[j], 0xff, (size_t)M * sh.N[j] * 4));   /* NaN */
+                ok = launch(0, M);
+                CK(cudaStreamSynchronize(cudaStreamPerThread));
+                for (int j = 0; j < n && ok; j++) {
+                    std::vector<float> y((size_t)M * sh.N[j]);
+                    CK(cudaMemcpy(y.data(), d_y[j], y.size() * 4, cudaMemcpyDeviceToHost));
+                    for (float v : y) n_nan += !(v == v);
+                    if (f == 0) y0[j] = y;
+                    else n_diff += memcmp(y.data(), y0[j].data(), y.size() * 4) != 0;
+                }
+            }
+            const bool same = ok && n_diff == 0 && n_nan == 0;
+            if (ok && !same) bytes_failed = true;
+
+            /* timing: the forms in turn, the order rotated a repeat */
+            std::vector<double> t[3];
+            for (int r = 0; r < repeats && ok; r++)
+                for (int a = 0; a < n_forms && ok; a++) {
+                    const int f = (a + r) % n_forms;
+                    if (!run[f]) continue;
+                    ds4_exl3_dense_arm_force(forms[f].force);
+                    t[f].push_back(time_calls(iters, [&](int i) { if (!launch(i, M)) ok = false; }));
+                }
+            ds4_exl3_dense_arm_force(0);
+            if (!ok) {
+                launch_failed = true;
+                printf("%-30s %2d  LAUNCH FAILED\n", sh.what, M);
+                continue;
+            }
+            const double u16 = median(t[0]), ur = median(t[1]), u8 = run[2] ? median(t[2]) : 0.0;
+            res[si][mi] = result{bytes, {u16, ur, u8}, true, run[2]};
+            char regs[24], occ[24], c8[16] = "-", r8[16] = "-";
+            if (run[2]) {
+                snprintf(regs, sizeof regs, "%d/%d/%d", d[0].regs, d[1].regs, d[2].regs);
+                snprintf(occ, sizeof occ, "%d/%d/%d", d[0].ctas_per_sm, d[1].ctas_per_sm, d[2].ctas_per_sm);
+                snprintf(c8, sizeof c8, "%.1f", u8);
+                snprintf(r8, sizeof r8, "%.3f", u8 / u16);
+            } else {
+                snprintf(regs, sizeof regs, "%d/%d", d[0].regs, d[1].regs);
+                snprintf(occ, sizeof occ, "%d/%d", d[0].ctas_per_sm, d[1].ctas_per_sm);
+            }
+            printf("%-30s %2d %7.2f %2d %5d %4s %-11s %-7s | %9.1f %9.1f %9s | %6.1f %6.1f | %6.3f %6s | %s\n", sh.what, M,
+                   bytes / 1e6, d[1].nt, d[1].ctas, d[1].arm == DS4_EXL3_DENSE_ARM_8W ? "8w" : "16w", regs, occ, u16, ur, c8,
+                   bytes / (u16 * 1e-6) / 1e9, bytes / (ur * 1e-6) / 1e9, ur / u16, r8,
+                   same ? "identical" : "*** DIFFER (or NaN / unwritten) ***");
+            for (int f = 0; f < n_forms; f++) {
+                if (!run[f]) continue;
+                printf("    %s us:", forms[f].name);
+                for (double v : t[f]) printf(" %.1f", v);
+            }
+            printf("   (%d replicas)\n", nrep);
+            fflush(stdout);
+        }
+        for (int j = 0; j < n; j++) { cudaFree(arena[j]); cudaFree(d_y[j]); }
+        cudaFree(d_x);
+        cudaFree(d_ws);
+    }
+
+    /* the round: every launch at its count */
+    printf("\nper-round totals (median us x the launch's count a round; the last launch is the head):\n");
+    printf("%2s | %10s %10s %7s | %10s %7s | %10s %10s %7s\n", "M", "16w ms", "rule ms", "r/16", "8w ms", "8/16",
+           "no-head 16", "no-head r", "r/16");
+    for (size_t mi = 0; mi < Ms.size(); mi++) {
+        double ms[3] = {0, 0, 0}, nh[2] = {0, 0};
+        bool all = true, all8 = with_8w;
+        for (int si = 0; si < n_shapes; si++) {
+            const result &r = res[si][mi];
+            if (!r.have) { all = false; continue; }
+            all8 = all8 && r.have8;
+            for (int f = 0; f < 3; f++) ms[f] += r.us[f] * shapes[si].count / 1e3;
+            if (si != n_shapes - 1)
+                for (int f = 0; f < 2; f++) nh[f] += r.us[f] * shapes[si].count / 1e3;
+        }
+        char m8[16] = "-", r8[16] = "-";
+        if (all8) {
+            snprintf(m8, sizeof m8, "%.3f", ms[2]);
+            snprintf(r8, sizeof r8, "%.3f", ms[0] > 0 ? ms[2] / ms[0] : 0.0);
+        }
+        printf("%2d | %10.3f %10.3f %7.3f | %10s %7s | %10.3f %10.3f %7.3f%s\n", Ms[mi], ms[0], ms[1],
+               ms[0] > 0 ? ms[1] / ms[0] : 0.0, m8, r8, nh[0], nh[1], nh[0] > 0 ? nh[1] / nh[0] : 0.0,
+               all ? "" : "   (PARTIAL: not every launch ran)");
+    }
+    if (launch_failed) { fprintf(stderr, "round: *** A LAUNCH FAILED ***\n"); return 2; }
+    if (bytes_failed) {
+        fprintf(stderr, "round: *** A FORM'S OUTPUT IS NOT THE 16-WARP FORM'S (or holds a NaN / an unwritten output): the "
+                        "timings above do not compare the same work, and exl3-dense-gate should be failing ***\n");
+        return 3;
+    }
+    return 0;
+}
+
+/* THE CHUNK MODE (L381).  The EXL3 dense launches a model makes a PROMPT chunk, each as its family makes it
+ * (ds4_exl3_dense_multi_launch, prompt rows: a projection at a time), at M rows a chunk, at one rate, synthetic
+ * weights, under each kernel of the prompt arm:
+ *
+ *   gemm   the GEMM arm forced on every launch (ds4_exl3_dense_prompt_force): the weight to fp16, the PREP, the
+ *          fixed-algorithm cuBLASLt GEMM, the epilogue -- the arm before L381, and every bulk chunk's still
+ *   rule   the shipped selection (ds4_exl3_dense_prompt_arm on this device, after the shape's check); the "rule"
+ *          column of the kernel line says which it took
+ *   inpl   the in-place kernel forced at every M: past the rule's rows this is how the crossover is found
+ *
+ * The tables are the round mode's without the heads (a prefill chunk heads one row of its final chunk, on the decode
+ * arm), from the families' forwards (family_qwen_s4.cpp, nemotron_h_forward.cpp, moe.cpp) and the served containers'
+ * format maps (tools/container/format-maps):
+ * qwen (Qwen3.8-Flash-Next, U-e4-d5: K = 5) --
+ *   GDN in_proj_qkv + in_proj_z   ONE multi launch 2560 -> 10240 + 6144      x36   (in_proj_a / _b ride the call as
+ *                                 MXFP8, not EXL3)
+ *   QSA q + k + v                 ONE multi launch 2560 -> 12288 + 512 + 512 x12   (index_qk 2560 -> 640 is MXFP8 in
+ *                                 this container; the turboderp containers store it EXL3 and it then rides as a
+ *                                 fourth projection at its own rate: exl3_dense_gate section 10 holds that launch)
+ *   GDN out_proj / QSA o_proj     6144 -> 2560                               x36 + x12
+ *   shared gate + up              ONE multi launch 2560 -> 640 + 640         x48   (on its lane's stream beside the
+ *                                 routed experts, which a launch timed alone does not see)
+ *   shared down                   640 -> 2560                                x48
+ *   PLE key_proj, value_proj      2560 -> 10240, 2560 -> 2560                x1 each
+ * nemotron (Nemotron-3.5 Super's trunk, K = 4) --
+ *   Mamba-2 in_proj               4096 -> 18560                              x40
+ *   Mamba-2 out_proj              8192 -> 4096                               x40
+ *   attention q + k + v           ONE multi launch 4096 -> 4096 + 256 + 256  x8
+ *   attention o_proj              4096 -> 4096                               x8
+ *   latent in / latent out        4096 -> 1024, 1024 -> 4096                 x40 each
+ *   shared up / shared down       4096 -> 5376, 5376 -> 4096                 x40 each (two single launches)
+ *   NOT in it: the MTP module's catch-up on the chunk's rows with an MTP container (eh_proj 8192 -> 4096, one
+ *   attention and one MoE block's launches, x1).
+ *
+ * Per (launch, M): one launch of each kernel on the same weights and rows into NaN-filled outputs -- the rule's and
+ * the in-place kernel's bytes must be the GEMM arm's, every output (a differing byte fails the run; the rule's
+ * first launch of a shape is its check, so no timed launch is one) -- and a row's bytes at M must be its bytes at
+ * every smaller M of the list; then `repeats` rounds of timings with the kernels' order rotated, each `iters` calls
+ * (scaled down past 32 rows) back to back behind a spin kernel, DRAM-cold (each call takes the next replica of
+ * every projection's weight, >= 96 MB of replicas a launch).  Medians; then the per-chunk totals at the counts above.
+ * Returns 0; 2 on a usage, setup or launch failure; 3 when a kernel's output is not the GEMM arm's or a row's bytes
+ * moved with M. */
+static int chunk_main(int argc, char **argv) {
+    const int iters = argc > 2 ? atoi(argv[2]) : 40;
+    const int repeats = argc > 3 ? atoi(argv[3]) : 3;
+    std::vector<int> Ms;
+    {
+        const char *l = argc > 4 ? argv[4] : "5,16,30,64,128,256,512,1024,2048,4096";
+        for (const char *q = l; *q;) {
+            Ms.push_back(atoi(q));
+            while (*q && *q != ',') q++;
+            if (*q == ',') q++;
+        }
+    }
+    const char *set = argc > 5 ? argv[5] : "qwen";
+    const bool nemotron = !strcmp(set, "nemotron");
+    const int k2 = argc > 6 && atoi(argv[6]) ? atoi(argv[6]) : nemotron ? 8 : 10;
+    const int only_shape = argc > 7 ? atoi(argv[7]) : -1;
+    int maxM = 0;
+    bool usage = iters < 1 || repeats < 1 || Ms.empty() || (!nemotron && strcmp(set, "qwen")) ||
+                 !ds4_exl3_dense_rate_supported(k2);
+    for (int M : Ms) {
+        usage = usage || M < 1 || M > 4096;
+        maxM = std::max(maxM, M);
+    }
+    if (usage) {
+        fprintf(stderr, "usage: exl3_dense_bench chunk [iters=40] [repeats=3] [M list (1..4096)] [qwen|nemotron] "
+                        "[k2, 0 = the set's] [shape]\n");
+        return 2;
+    }
+    struct lshape { const char *what; int K, n, N[DS4_EXL3_DENSE_MAX_PROJ], count; };
+    const lshape qwen_shapes[] = {
+        {"GDN qkv+z  2560->10240+6144",  2560, 2, {10240, 6144, 0, 0}, 36},
+        {"QSA q+k+v  2560->12288+2x512", 2560, 3, {12288, 512, 512, 0}, 12},
+        {"GDN out / QSA o 6144->2560",   6144, 1, {2560, 0, 0, 0}, 48},
+        {"shared gate+up 2560->2x640",   2560, 2, {640, 640, 0, 0}, 48},
+        {"shared down 640->2560",        640,  1, {2560, 0, 0, 0}, 48},
+        {"PLE key 2560->10240",          2560, 1, {10240, 0, 0, 0}, 1},
+        {"PLE value 2560->2560",         2560, 1, {2560, 0, 0, 0}, 1},
+    };
+    const lshape nemotron_shapes[] = {
+        {"Mamba in_proj 4096->18560",    4096, 1, {18560, 0, 0, 0}, 40},
+        {"Mamba out_proj 8192->4096",    8192, 1, {4096, 0, 0, 0}, 40},
+        {"attn q+k+v 4096->4096+2x256",  4096, 3, {4096, 256, 256, 0}, 8},
+        {"attn o_proj 4096->4096",       4096, 1, {4096, 0, 0, 0}, 8},
+        {"latent in 4096->1024",         4096, 1, {1024, 0, 0, 0}, 40},
+        {"latent out 1024->4096",        1024, 1, {4096, 0, 0, 0}, 40},
+        {"shared up 4096->5376",         4096, 1, {5376, 0, 0, 0}, 40},
+        {"shared down 5376->4096",       5376, 1, {4096, 0, 0, 0}, 40},
+    };
+    const lshape *shapes = nemotron ? nemotron_shapes : qwen_shapes;
+    const int n_shapes = nemotron ? (int)(sizeof nemotron_shapes / sizeof *nemotron_shapes)
+                                  : (int)(sizeof qwen_shapes / sizeof *qwen_shapes);
+    enum { A_GEMM, A_RULE, A_INPL, N_ARMS };
+    const char *names[N_ARMS] = {"gemm", "rule", "inpl"};
+    const int force[N_ARMS] = {DS4_EXL3_DENSE_PROMPT_GEMM, 0, DS4_EXL3_DENSE_PROMPT_INPLACE};
+
+    if (!pulsar_gpu_init()) { fprintf(stderr, "no GPU\n"); return 2; }
+    int sms = 0, cc_major = 0, cc_minor = 0;
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    CK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0));
+    CK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, 0));
+    size_t gfree = 0, gtotal = 0;
+    CK(cudaMemGetInfo(&gfree, &gtotal));
+    ds4_exl3_dense_prompt_desc kd{};
+    if (ds4_exl3_dense_prompt_describe(k2, 1, 128, 128, &kd)) { fprintf(stderr, "chunk: no launch description\n"); return 2; }
+    printf("exl3_dense_bench chunk: set %s, K=%.1f bits, sm_%d%d, %d SMs, %.1f of %.1f GB free, %d calls (scaled down "
+           "past 32 rows) x %d repeats a point, DRAM-cold (>= %.0f MB of replicas a launch)\n", set, k2 / 2.0, cc_major,
+           cc_minor, sms, gfree / 1e9, gtotal / 1e9, iters, repeats, kMinRotateBytes / 1e6);
+    printf("the in-place kernel here: %d threads, %d registers a thread, %d B shared, %d CTAs an SM; the rule gives it "
+           "launches of up to %d rows on sm_12x\n", kd.threads, kd.regs, kd.smem, kd.ctas_per_sm,
+           DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS);
+    printf("columns: rule = the kernel the shipped selection ran; us = median per launch (every projection); i/g = inpl "
+           "us / gemm us\n");
+    printf("%-30s %5s %-8s | %10s %10s %10s | %6s | %s\n", "launch", "M", "rule", "gemm us", "rule us", "inpl us", "i/g",
+           "bytes");
+
+    struct result { double us[N_ARMS]; bool have; };
+    std::vector<std::vector<result>> res(n_shapes, std::vector<result>(Ms.size(), result{}));
+    bool launch_failed = false, bytes_failed = false;
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+    };
+    const cudaStream_t st = cudaStreamPerThread;
+
+    for (int si = 0; si < n_shapes; si++) {
+        const lshape &sh = shapes[si];
+        if (only_shape >= 0 && si != only_shape) continue;
+        const int K = sh.K, n = sh.n;
+        uint64_t tb[DS4_EXL3_DENSE_MAX_PROJ], stride[DS4_EXL3_DENSE_MAX_PROJ], pitch[DS4_EXL3_DENSE_MAX_PROJ];
+        double bytes = 0;
+        size_t wq_max = 0;
+        for (int j = 0; j < n; j++) {
+            uint64_t sb;
+            if (!exl3_linear_layout(K, sh.N[j], k2, &tb[j], &sb, &stride[j])) { fprintf(stderr, "chunk: layout\n"); return 2; }
+            pitch[j] = (stride[j] + 255) & ~(uint64_t)255;   /* replicas 16-byte aligned */
+            bytes += (double)stride[j];
+            wq_max = std::max(wq_max, (size_t)K * sh.N[j] * 2);
+        }
+        const int nrep = n_replicas(bytes);
+        /* the rows, the outputs, the replicas; the arm's own scratch (the fp16 weight, the plane, the check's copy) */
+        size_t need = (size_t)maxM * K * 2 * 2 + wq_max;
+        for (int j = 0; j < n; j++) need += pitch[j] * nrep + (size_t)maxM * sh.N[j] * 4 * 2;
+        CK(cudaMemGetInfo(&gfree, &gtotal));
+        if (need + (512u << 20) > gfree) {
+            fprintf(stderr, "chunk: %s needs %.2f GB of device memory, %.2f GB free -- refusing\n", sh.what, need / 1e9,
+                    gfree / 1e9);
+            return 2;
+        }
+        uint8_t *arena[DS4_EXL3_DENSE_MAX_PROJ] = {};
+        float *d_y[DS4_EXL3_DENSE_MAX_PROJ] = {};
+        for (int j = 0; j < n; j++) {
+            CK(cudaMalloc((void **)&arena[j], pitch[j] * nrep));
+            CK(cudaMalloc((void **)&d_y[j], (size_t)maxM * sh.N[j] * 4));
+            std::vector<uint8_t> h(pitch[j]);
+            const uint64_t scales = (uint64_t)K + exl3_out_stored(sh.N[j]);
+            for (int r = 0; r < nrep; r++) {
+                uint16_t *t = (uint16_t *)h.data();
+                for (uint64_t i = 0; i < tb[j] / 2; i++) t[i] = (uint16_t)rnd();
+                for (uint64_t i = 0; i < scales; i++) t[tb[j] / 2 + i] = exl3_f32_to_f16((float)(0.025 * ((rnd() & 1) ? 1 : -1)));
+                CK(cudaMemcpy(arena[j] + (size_t)r * pitch[j], h.data(), pitch[j], cudaMemcpyHostToDevice));
+            }
+        }
+        uint16_t *d_x = nullptr;
+        CK(cudaMalloc((void **)&d_x, (size_t)maxM * K * 2));
+        {
+            std::vector<uint16_t> hb((size_t)maxM * K);
+            for (auto &v : hb) {
+                const __nv_bfloat16 b = __float2bfloat16(((float)(rnd() >> 8) / 16777216.0f - 0.5f) * 4.0f);
+                std::memcpy(&v, &b, sizeof(uint16_t));
+            }
+            CK(cudaMemcpy(d_x, hb.data(), hb.size() * 2, cudaMemcpyHostToDevice));
+        }
+        ds4_exl3_dense_proj p0[DS4_EXL3_DENSE_MAX_PROJ];
+        for (int j = 0; j < n; j++) p0[j] = ds4_exl3_dense_proj{arena[j], k2, sh.N[j], d_y[j], nullptr};
+        const size_t ws_bytes = ds4_exl3_dense_multi_workspace_bytes(p0, n, 32, K);   /* a prompt launch reads none */
+        void *d_ws = nullptr;
+        if (!ws_bytes) { fprintf(stderr, "chunk: %s: the arm refuses the shape\n", sh.what); return 2; }
+        CK(cudaMalloc(&d_ws, ws_bytes));
+        /* one prompt launch as the family makes it, under kernel a: replica i of every projection's weight */
+        auto launch = [&](int a, int i, int M) {
+            ds4_exl3_dense_proj p[DS4_EXL3_DENSE_MAX_PROJ];
+            for (int j = 0; j < n; j++) {
+                p[j] = p0[j];
+                p[j].w = arena[j] + (size_t)(i % nrep) * pitch[j];
+            }
+            ds4_exl3_dense_prompt_force(force[a]);
+            const bool ok = ds4_exl3_dense_multi_launch(p, n, d_x, M, K, d_ws, ws_bytes, st, true) == 0;
+            ds4_exl3_dense_prompt_force(0);
+            return ok;
+        };
+        /* every projection's M rows, concatenated */
+        auto fetch = [&](int M) {
+            std::vector<float> v;
+            for (int j = 0; j < n; j++) {
+                const size_t at = v.size(), cnt = (size_t)M * sh.N[j];
+                v.resize(at + cnt);
+                CK(cudaMemcpy(v.data() + at, d_y[j], cnt * 4, cudaMemcpyDeviceToHost));
+            }
+            return v;
+        };
+        /* the first `rows` rows of every projection: a fetch of a_rows rows against one of b_rows */
+        auto prefix_same = [&](const std::vector<float> &a, int a_rows, const std::vector<float> &b, int b_rows, int rows) {
+            size_t ao = 0, bo = 0;
+            for (int j = 0; j < n; j++) {
+                if (memcmp(a.data() + ao, b.data() + bo, (size_t)rows * sh.N[j] * 4)) return false;
+                ao += (size_t)a_rows * sh.N[j];
+                bo += (size_t)b_rows * sh.N[j];
+            }
+            return true;
+        };
+        std::vector<float> gold;   /* the GEMM arm's rows at the largest M so far */
+        int gold_rows = 0;
+
+        for (size_t mi = 0; mi < Ms.size(); mi++) {
+            const int M = Ms[mi];
+            bool ok = true, same = true, minv = true;
+            size_t n_nan = 0;
+            /* the bytes: every kernel on replica 0; the rule's launch here is the shape's check when it has one due */
+            std::vector<float> y0;
+            for (int a = 0; a < N_ARMS && ok; a++) {
+                for (int j = 0; j < n; j++) CK(cudaMemset(d_y[j], 0xff, (size_t)M * sh.N[j] * 4));   /* NaN */
+                ok = launch(a, 0, M);
+                CK(cudaStreamSynchronize(st));
+                if (!ok) break;
+                std::vector<float> y = fetch(M);
+                for (float v : y) n_nan += !(v == v);
+                if (a == A_GEMM) y0 = std::move(y);
+                else same = same && y.size() == y0.size() && !memcmp(y.data(), y0.data(), y.size() * 4);
+            }
+            if (ok && gold_rows) minv = prefix_same(y0, M, gold, gold_rows, std::min(M, gold_rows));
+            if (ok && M > gold_rows) { gold = y0; gold_rows = M; }
+            if (ok && (!same || !minv || n_nan)) bytes_failed = true;
+            /* the kernel the rule runs now (every projection the same M: the first one's says it) */
+            ds4_exl3_dense_prompt_desc d{};
+            if (ok && ds4_exl3_dense_prompt_describe(k2, M, K, sh.N[0], &d)) ok = false;
+
+            /* the timings: the kernels in turn, the order rotated a repeat */
+            const int n_it = M <= 32 ? iters : std::max(3, iters * 32 / M);
+            std::vector<double> t[N_ARMS];
+            for (int r = 0; r < repeats && ok; r++)
+                for (int k = 0; k < N_ARMS && ok; k++) {
+                    const int a = (k + r) % N_ARMS;
+                    t[a].push_back(time_calls(n_it, [&](int i) { if (!launch(a, i, M)) ok = false; }));
+                }
+            if (!ok) {
+                launch_failed = true;
+                printf("%-30s %5d  LAUNCH FAILED\n", sh.what, M);
+                continue;
+            }
+            res[si][mi].have = true;
+            for (int a = 0; a < N_ARMS; a++) res[si][mi].us[a] = median(t[a]);
+            const double *u = res[si][mi].us;
+            printf("%-30s %5d %-8s | %10.1f %10.1f %10.1f | %6.3f | %s%s\n", sh.what, M,
+                   d.arm == DS4_EXL3_DENSE_PROMPT_INPLACE ? "in place" : d.arm == DS4_EXL3_DENSE_PROMPT_GEMM ? "gemm" : "CHECK?",
+                   u[A_GEMM], u[A_RULE], u[A_INPL], u[A_INPL] / u[A_GEMM],
+                   same && !n_nan ? "identical" : "*** DIFFER (or NaN / unwritten) ***", minv ? "" : " *** A ROW MOVED WITH M ***");
+            for (int a = 0; a < N_ARMS; a++) {
+                printf("    %s us:", names[a]);
+                for (double v : t[a]) printf(" %.1f", v);
+            }
+            printf("   (%d calls, %d replicas%s)\n", n_it, nrep, d.off ? "; THE IN-PLACE KERNEL IS OFF: A CHECK FAILED" : "");
+            fflush(stdout);
+        }
+        for (int j = 0; j < n; j++) { cudaFree(arena[j]); cudaFree(d_y[j]); }
+        cudaFree(d_x);
+        cudaFree(d_ws);
+    }
+
+    /* the chunk: every launch at its count */
+    printf("\nper-chunk totals, dense ms (median us x the launch's count a chunk):\n");
+    printf("%5s | %10s %10s %10s | %7s %7s\n", "M", "gemm", "rule", "inpl", "rule/g", "inpl/g");
+    for (size_t mi = 0; mi < Ms.size(); mi++) {
+        double ms[N_ARMS] = {};
+        bool all = true;
+        for (int si = 0; si < n_shapes; si++) {
+            if (!res[si][mi].have) { all = false; continue; }
+            for (int a = 0; a < N_ARMS; a++) ms[a] += res[si][mi].us[a] * shapes[si].count / 1e3;
+        }
+        printf("%5d | %10.2f %10.2f %10.2f | %7.3f %7.3f%s\n", Ms[mi], ms[A_GEMM], ms[A_RULE], ms[A_INPL],
+               ms[A_GEMM] > 0 ? ms[A_RULE] / ms[A_GEMM] : 0.0, ms[A_GEMM] > 0 ? ms[A_INPL] / ms[A_GEMM] : 0.0,
+               all ? "" : "   (PARTIAL: not every launch ran)");
+    }
+    if (launch_failed) { fprintf(stderr, "chunk: *** A LAUNCH FAILED ***\n"); return 2; }
+    if (bytes_failed) {
+        fprintf(stderr, "chunk: *** A KERNEL'S OUTPUT IS NOT THE GEMM ARM'S, A ROW'S BYTES MOVED WITH M, OR AN OUTPUT HOLDS "
+                        "A NaN: the timings above do not compare the same work (on a device the rule names, exl3-dense-gate should be "
+                        "failing; elsewhere the in-place kernel's order is simply not the vendor's) ***\n");
+        return 3;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "round")) return round_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "chunk")) return chunk_main(argc, argv);
     const int iters = argc > 1 ? atoi(argv[1]) : 120;
     const int only_shape = argc > 2 ? atoi(argv[2]) : -1;
     const int only_m = argc > 3 ? atoi(argv[3]) : 0;

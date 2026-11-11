@@ -167,8 +167,9 @@ class Leg:
     warm = None
     hooked = None
     cold = None
-    # L357: True when hooked() needs only the hooks instance's test routes (Server.set_guard_budget), no env hook;
-    # otherwise hooked() runs only when hook_env() names one (fanout-prefix's A/B runs only under its own env)
+    # L357: True when hooked() needs only the hooks instance's test routes (Server.set_guard_budget) or the restart it
+    # is (L380: resume-deepest's disk turns), no env hook; otherwise hooked() runs only when hook_env() names one
+    # (fanout-prefix's A/B runs only under its own env)
     test_routes = False
 
     def __init__(self, g, work):
