@@ -579,6 +579,9 @@ exl3-moe-epilogue-gate: tests/exl3_moe_epilogue_gate
 # split-K trellis GEMV, output Hadamard + svh) at the Qwen dense shapes and a
 # DeepSeek one, K = 2..5, M = 1..16 and a 40-row prefill, graded against the
 # host authority in double; M-neutrality bit-exact; mutations; refusals.
+# L380: the GEMV's two CTA forms (16 warps / 8 warps, two an SM) -- the
+# selection rule's table, and both forms forced on the same launches byte for
+# byte (every rate, narrow and wide, single and multi, f32 and bf16).
 # Links the PRODUCTION object (the MMQ rule, the engine's NVCCFLAGS), so pass
 # the served arch: make exl3-dense-gate CUDA_ARCH=sm_120f.  Model-free.
 tests/exl3_dense_gate: tests/exl3_dense_gate.cu tests/exl3_dense_ref.h $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile \
@@ -640,6 +643,9 @@ tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h $(CUD
 # L251: the dense arm's microbenchmark -- EXL3 K=2..5 vs the engine's MXFP8
 # decode GEMV (the production wrapper, decode rows declared, the A8 slot armed)
 # and a streaming-read roofline, DRAM-cold, M = 1..16.  Not a gate.
+# L380: `tests/exl3_dense_bench round ...` prices the GEMV's CTA forms (16 warps
+# forced / the shipped rule / 8 warps forced) at a model's per-round launches
+# (qwen, nemotron) -- usage in the file's header.
 tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)

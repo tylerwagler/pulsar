@@ -35,7 +35,8 @@
 //
 // Every row is bit-identical at every M: every row block is 16 rows (the
 // MMA's M; rows past M are zero), a row's k order and warp order do not
-// depend on its batchmates;
+// depend on its batchmates, nor on which of the GEMV's two CTA forms the launch
+// takes (L380: 16 warps, or 8 warps at two CTAs an SM -- ds4_exl3_dense_gemv_arm);
 // a launch carries up to 32 decode rows as 16-row passes over trellis words it
 // reads once (L341), and rows past 32 run 32-row launches in turn (L288 C1).
 // Prompt chunks take
@@ -167,3 +168,77 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
 /// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
                                 size_t workspace_bytes, cudaStream_t stream, bool prompt = false);
+
+/** The decode GEMV's CTA form: 16 warps, one CTA an SM (exl3_dense_kernel) -- every launch the rule below does not
+ *  name, and every two-pass one. */
+#define DS4_EXL3_DENSE_ARM_16W 1
+/** The decode GEMV's CTA form: 8 warps, two CTAs an SM (exl3_dense_kernel_8w, L380) -- the 16-warp form's bytes. */
+#define DS4_EXL3_DENSE_ARM_8W 2
+
+/** L380: the CTA form a decode GEMV launch takes -- the one authority; the launch asks it with its own grid, rows
+ *  and device.  A function of the launch's shape and the device only (never the family, the rate or a switch), and a
+ *  choice of SPEED only: both forms write the same bytes (exl3_dense_gate section 9).
+ *
+ *  8 warps iff   the device is sm_12x (cc / 10 == 12)
+ *            and M <= 8 rows
+ *            and the grid is 6 or more waves of 16-warp CTAs at one an SM: ceil(ctas / sms) >= 6
+ *                (ctas = the launched grid, after the narrow / wide choice; 241+ CTAs on GB10's 48 SMs).
+ *
+ *  Why: the 16-warp CTA needs 128 registers a thread, so one fills an SM; the 8-warp CTA fits two, so a grid of
+ *  several waves keeps twice the CTAs' loads in flight, while a grid of one wave gets nothing for it and runs its
+ *  CTA on half the warps.  Measured on GB10 (sm_121, 48 SMs), K = 5 bits, tests/exl3_dense_bench round, 200 calls x
+ *  5 repeats, the arms alternated, median us a launch with the prep, 16 warps / 8 warps (gpuq #702 / #703):
+ *
+ *    grid  CTA     waves  launch                         M=1            M=2            M=4            M=8
+ *    3880  wide     81    2560 -> 248320 (a head)        2037.7/1826.5  2044.8/1839.4  2060.2/1864.0  2107.3/1918.9
+ *     512  narrow   11    2560 -> 10240 + 6144           158.3/135.2    159.2/137.1    164.4/137.0    (wide: 256)
+ *     416  narrow    9    2560 -> 12288 + 2 x 512        125.1/109.6    129.4/110.2    134.4/111.0    (wide: 208)
+ *     320  narrow    7    2560 -> 10240                  103.8/87.8                    104.6/89.0     (wide: 160)
+ *     256  wide      6    2560 -> 10240 + 6144                                                        145.7/135.4
+ *     208  wide      5    2560 -> 12288 + 2 x 512                                                     114.4/122.7
+ *     160  wide      4    2560 -> 10240                                                               92.1/89.4
+ *      40  either    1    6144 -> 2560, 2560 -> 2 x 640, 640 -> 2560, 2560 -> 2560: 8 warps 1.05-1.50 x slower
+ *                         at every M, worst at 8 rows
+ *
+ *  6 waves and up: 8 warps win at every point (0.83-0.93 of the 16-warp time).  5 waves and down: the one clear
+ *  result is a loss (208 CTAs, 1.07), the 160-CTA launch is inside the noise (0.97) and one wave loses outright, so
+ *  they keep 16 warps.  Rows: measured on the arm production takes at 1, 2, 4 and 8 rows, and with the narrow CTA
+ *  forced at 8 and 16; 9..16 rows were not measured on the wide CTA they take (narrow at 16 rows the gain is down to
+ *  4-7 %), so they keep 16 warps, as does a two-pass launch (M > 16), which has no 8-warp instance.  The device:
+ *  nothing was measured off GB10 -- sm_75 (Turing) and every other architecture keep 16 warps until they are; the
+ *  other rates (K = 2, 3, 4, 6, 8) take the rule on K = 5's measurement.
+ *  @param M     rows of the launch, 1..32
+ *  @param ctas  the launch's GEMV grid, CTAs
+ *  @param sms   the device's SM count
+ *  @param cc    the device's compute capability, major * 10 + minor (pulsar_cuda_device_cc)
+ *  @return DS4_EXL3_DENSE_ARM_8W or DS4_EXL3_DENSE_ARM_16W */
+int ds4_exl3_dense_gemv_arm(int M, int ctas, int sms, int cc);
+
+/** L380: an instrument's forced CTA form for every decode GEMV launch -- 0 the rule's (ds4_exl3_dense_gemv_arm),
+ *  DS4_EXL3_DENSE_ARM_16W, or DS4_EXL3_DENSE_ARM_8W (a two-pass launch, M > 16, then refuses: the form is one pass).
+ *  The bytes are the same at either form (exl3_dense_gate holds them equal, exl3_dense_bench prices them); the
+ *  engine never calls it.  Process-wide and unsynchronised: set it with no launch in flight.
+ *  @param arm 0, DS4_EXL3_DENSE_ARM_16W or DS4_EXL3_DENSE_ARM_8W
+ *  @return 0, -1 not one of them */
+int ds4_exl3_dense_arm_force(int arm);
+
+/** What one decode GEMV launch is on the calling thread's device, under the current ds4_exl3_dense_arm_force: how an
+ *  instrument shows which kernel it ran (rule 5). */
+struct ds4_exl3_dense_gemv_desc {
+    int arm;           ///< DS4_EXL3_DENSE_ARM_16W or DS4_EXL3_DENSE_ARM_8W
+    int nt;            ///< n-tiles a CTA: 2 (32 outputs) or 4 (64)
+    int ctas;          ///< the grid
+    int threads;       ///< threads a CTA (512 or 256)
+    int regs;          ///< registers a thread (cudaFuncGetAttributes)
+    int smem;          ///< shared memory bytes a CTA, static + dynamic
+    int ctas_per_sm;   ///< CTAs resident an SM (cudaOccupancyMaxActiveBlocksPerMultiprocessor)
+    int sms;           ///< the device's SM count
+};
+
+/** Describes the GEMV launch of one rate's projections (ds4_exl3_dense_gemv_desc).
+ *  @param k2   rate (2 x bits per weight), a supported one
+ *  @param M    rows, 1..32
+ *  @param c32  the launch's 32-output CTAs: the sum of its projections' stored N / 32
+ *  @param d    out
+ *  @return 0; -1 when the device cannot say, the arguments are out of range, or the forced form has no instance at M */
+int ds4_exl3_dense_gemv_describe(int k2, int M, int c32, ds4_exl3_dense_gemv_desc *d);

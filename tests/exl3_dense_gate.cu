@@ -34,10 +34,21 @@
  *      M-independent rows, and windows cut from the head equal its columns bit for bit and grade vs double.
  *   8. a logical width short of the stored 128 multiple (L295 F7: Inkling's head 4096 -> 201024, stored 201088):
  *      bit for bit the stored call's columns, nothing written past N, graded vs double.
+ *   9. the GEMV's two CTA forms (L380: 16 warps, one CTA an SM; 8 warps, two an SM): (a) the selection rule
+ *      (ds4_exl3_dense_gemv_arm) on a table of (rows, grid, SMs, device) -- the measured GB10 launches on their side
+ *      of it, one wave, five waves, M > 8, two passes and every other architecture on the 16-warp side; (b) each
+ *      form FORCED (ds4_exl3_dense_arm_force) on the same launches -- every rate, the narrow and the wide CTA
+ *      (shapes sized from the device's SM count so gemv_wide picks each; the description proves which kernel ran),
+ *      K of 1, 3, 5 and 20 blocks, M = 1, 2, 3, 4, 8, 16, single and multi launches (one rate and mixed), f32 and
+ *      bf16 outputs: the 8-warp form's bytes are the 16-warp form's, every f32 row its M = 16 row, every bf16 row
+ *      the f32 row rounded, the single shapes graded vs double; any differing byte fails; (c) a mutated weight
+ *      moves the 8-warp output; the forced 8-warp form refuses a two-pass launch.  Run on every device: the forced
+ *      8-warp form runs on sm_75 too (the rule never picks it there), so its bytes are held on Turing as well.
  *
- * usage: ./tests/exl3_dense_gate
+ * usage: ./tests/exl3_dense_gate     (make exl3-dense-gate CUDA_ARCH=sm_120f on GB10; CUDA_ARCH=sm_75 on Turing)
  */
 #include "../src/cuda/mmq/ds4_exl3_dense.cuh"
+#include "../src/cuda/pulsar_cuda_arch.cuh"
 #include "../src/cuda/pulsar_cuda_mx.cuh"
 #include "../src/engine/exl3_trellis.h"
 #include "exl3_dense_ref.h"
@@ -215,6 +226,245 @@ static void grade_prefill(const dev &d, const weight &w, const slot &s, const st
         CHECK(diff_p == 0, "%s K=%d: %zu of 4 prompt widths (M=1,3,16,17) differ from the same rows at M=%d",
               what_s, k2 / 2, diff_p, max_rows);
     }
+}
+
+/* 9. L380: the GEMV's two CTA forms.  (a) the rule's table; (b) both forms forced on the same launches, byte for byte;
+ * (c) a mutation and the forced form's refusal. */
+static void arm_section(const double tol) {
+    const int W16 = DS4_EXL3_DENSE_ARM_16W, W8 = DS4_EXL3_DENSE_ARM_8W;
+    /* (a) the rule: rows, the launched grid, the device's SMs and compute capability -> the form */
+    struct rule { int M, ctas, sms, cc, want; const char *what; };
+    const rule rules[] = {
+        {1, 512, 48, 121, W8, "GB10 2560->10240+6144 narrow, 11 waves, 1 row (measured 0.85)"},
+        {4, 512, 48, 121, W8, "the same at 4 rows (0.83)"},
+        {8, 256, 48, 121, W8, "the same launch wide at 8 rows, 6 waves (0.93)"},
+        {1, 416, 48, 121, W8, "GB10 2560->12288+2x512 narrow, 9 waves (0.88)"},
+        {8, 208, 48, 121, W16, "the same launch wide at 8 rows, 5 waves (measured 1.07: slower)"},
+        {1, 320, 48, 121, W8, "GB10 2560->10240 narrow, 7 waves (0.85)"},
+        {8, 160, 48, 121, W16, "the same wide at 8 rows, 4 waves (0.97: inside the noise)"},
+        {1, 3880, 48, 121, W8, "GB10 lm_head wide, 81 waves, 1 row (0.90)"},
+        {8, 3880, 48, 121, W8, "GB10 lm_head wide at 8 rows (0.91)"},
+        {1, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 1 row (1.05-1.50: slower)"},
+        {8, 40, 48, 121, W16, "GB10 one wave of 40 CTAs, 8 rows"},
+        {1, 240, 48, 121, W16, "5 full waves: the last grid that keeps 16 warps"},
+        {1, 241, 48, 121, W8, "the first CTA of a 6th wave"},
+        {9, 3880, 48, 121, W16, "9 rows: past the measured widths"},
+        {16, 512, 48, 121, W16, "16 rows"},
+        {17, 3880, 48, 121, W16, "two passes (17 rows)"},
+        {32, 3880, 48, 121, W16, "two passes (32 rows)"},
+        {1, 512, 48, 120, W8, "sm_120: the same family as GB10's sm_121"},
+        {1, 512, 170, 120, W16, "sm_120 with 170 SMs: the same grid is 4 waves there"},
+        {1, 1024, 170, 120, W8, "sm_120 with 170 SMs: 7 waves"},
+        {1, 512, 48, 75, W16, "sm_75 (Turing, 48 SMs): not measured"},
+        {1, 3880, 72, 75, W16, "sm_75 (Turing, 72 SMs): not measured"},
+        {1, 3880, 48, 89, W16, "sm_89: not measured"},
+        {1, 3880, 48, 100, W16, "sm_100: not measured"},
+        {1, 3880, 48, 0, W16, "a device whose capability is unknown"},
+        {0, 3880, 48, 121, W16, "no rows"},
+        {1, 3880, 0, 121, W16, "no SM count"},
+    };
+    size_t rule_bad = 0;
+    for (const rule &r : rules) {
+        const int got = ds4_exl3_dense_gemv_arm(r.M, r.ctas, r.sms, r.cc);
+        CHECK(got == r.want, "arm rule: M=%d grid=%d SMs=%d sm_%d (%s) -> %s, want %s", r.M, r.ctas, r.sms, r.cc, r.what,
+              got == W8 ? "8 warps" : "16 warps", r.want == W8 ? "8 warps" : "16 warps");
+        rule_bad += got != r.want;
+    }
+    printf("  arm rule: %zu of %zu (rows, grid, SMs, device) cases on their side (8 warps iff sm_12x, M <= 8, 6+ waves)\n",
+           sizeof rules / sizeof *rules - rule_bad, sizeof rules / sizeof *rules);
+
+    ds4_exl3_dense_gemv_desc dv{};
+    if (ds4_exl3_dense_gemv_describe(10, 1, 20, &dv)) {
+        CHECK(false, "arm forms: the device does not describe a GEMV launch -- section 9 not run");
+        return;
+    }
+    const int sms = dv.sms, cc = pulsar_cuda_device_cc();
+    printf("  this device: sm_%d, %d SMs; unforced, a 512-CTA launch runs %d warps at 1 row and %d at 16\n", cc, sms,
+           ds4_exl3_dense_gemv_arm(1, 512, sms, cc) == W8 ? 8 : 16, ds4_exl3_dense_gemv_arm(16, 256, sms, cc) == W8 ? 8 : 16);
+    CHECK(ds4_exl3_dense_arm_force(7) == -1, "arm forms: an unknown forced form accepted");
+
+    /* (b) the launches.  Narrow: at most one wave of 32-output CTAs (gemv_wide keeps 32 outputs at every M); wide:
+     * 4 x SMs of them (two waves of 64-output CTAs for four: gemv_wide takes 64 outputs at every M). */
+    struct lcase { const char *what; int K, n, N[4], k2[4], nt; };
+    std::vector<lcase> cases;
+    const int rates[] = {4, 6, 8, 10, 12, 16};
+    const int wide_n = 128 * sms;
+    for (int k2 : rates) {
+        cases.push_back({"narrow, K of 1 block", 128, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 3 blocks", 384, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 5 blocks", 640, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"narrow, K of 20 blocks", 2560, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, 2});
+        cases.push_back({"wide", 2560, 1, {wide_n, 0, 0, 0}, {k2, 0, 0, 0}, 4});
+        cases.push_back({"wide, K of 5 blocks", 640, 1, {wide_n, 0, 0, 0}, {k2, 0, 0, 0}, 4});
+        cases.push_back({"narrow multi", 2560, 3, {256, 128, 256, 0}, {k2, k2, k2, 0}, 2});
+        cases.push_back({"wide multi", 2560, 3, {wide_n - 1024, 512, 512, 0}, {k2, k2, k2, 0}, 4});
+    }
+    cases.push_back({"multi at rates 8 / 10 / 8 (two GEMVs)", 2560, 3, {256, 512, 128, 0}, {8, 10, 8, 0}, 2});
+    cases.push_back({"wide multi at rates 10 / 6 (two GEMVs)", 2560, 2, {wide_n, wide_n, 0, 0}, {10, 6, 0, 0}, 4});
+
+    const int Ms[] = {1, 2, 3, 4, 8, 16};
+    size_t n_out = 0, n_diff = 0, n_m16 = 0, n_rn = 0, n_lane = 0, n_graded = 0;
+    double g_mx = 0;
+    for (const lcase &c : cases) {
+        const int K = c.K, n = c.n;
+        const slot s = make_slot(16, K);
+        std::vector<weight> w;
+        uint8_t *dw[4] = {}, *dq = nullptr;
+        float *dy[4] = {};
+        uint16_t *dyb[4] = {};
+        void *ws = nullptr;
+        ds4_exl3_dense_proj pf[4] = {}, pb[4] = {};
+        CUDA_OK(cudaMalloc((void **)&dq, s.q.size() * sizeof(uint16_t)));
+        CUDA_OK(cudaMemcpy(dq, s.q.data(), s.q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        for (int j = 0; j < n; j++) {
+            w.push_back(make_weight(K, c.N[j], c.k2[j]));
+            CUDA_OK(cudaMalloc((void **)&dw[j], w[j].stride));
+            CUDA_OK(cudaMemcpy(dw[j], w[j].bytes.data(), w[j].stride, cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMalloc((void **)&dy[j], (size_t)16 * c.N[j] * sizeof(float)));
+            CUDA_OK(cudaMalloc((void **)&dyb[j], (size_t)16 * c.N[j] * sizeof(uint16_t)));
+            pf[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], dy[j], nullptr};
+            pb[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], nullptr, dyb[j]};
+        }
+        const size_t wsb = ds4_exl3_dense_multi_workspace_bytes(pf, n, 16, K);
+        CUDA_OK(cudaMalloc(&ws, wsb));
+        /* one launch under a forced form: each projection's M rows, f32 or bf16, canaries first (every output written) */
+        auto launch = [&](int arm, int M, bool bf16, const ds4_exl3_dense_proj *p, std::vector<std::vector<uint8_t>> &out) {
+            const size_t el = bf16 ? sizeof(uint16_t) : sizeof(float);
+            for (int j = 0; j < n; j++)
+                CUDA_OK(cudaMemset(bf16 ? (void *)dyb[j] : (void *)dy[j], 0xff, (size_t)M * c.N[j] * el));
+            if (ds4_exl3_dense_arm_force(arm) != 0) return -1;
+            const int rc = ds4_exl3_dense_multi_launch(p, n, dq, M, K, ws, wsb, 0, false);
+            CUDA_OK(cudaDeviceSynchronize());
+            ds4_exl3_dense_arm_force(0);
+            if (rc) return rc;
+            out.assign(n, {});
+            for (int j = 0; j < n; j++) {
+                out[j].resize((size_t)M * c.N[j] * el);
+                CUDA_OK(cudaMemcpy(out[j].data(), bf16 ? (void *)dyb[j] : (void *)dy[j], out[j].size(), cudaMemcpyDeviceToHost));
+            }
+            return 0;
+        };
+        /* the instrument proves the lane: under each forced form, every rate's GEMV is that form's kernel at the
+         * CTA width the case was sized for */
+        bool lanes = true;
+        for (int j = 0; j < n; j++) {
+            int c32 = 0;
+            for (int i = 0; i < n; i++)
+                if (c.k2[i] == c.k2[j]) c32 += (int)(exl3_out_stored((uint64_t)c.N[i]) / 32);
+            for (int M : Ms)
+                for (int arm : {W16, W8}) {
+                    ds4_exl3_dense_gemv_desc d{};
+                    ds4_exl3_dense_arm_force(arm);
+                    const int rc = ds4_exl3_dense_gemv_describe(c.k2[j], M, c32, &d);
+                    ds4_exl3_dense_arm_force(0);
+                    const bool ok = rc == 0 && d.arm == arm && d.threads == (arm == W8 ? 256 : 512) && d.nt == c.nt;
+                    CHECK(ok, "arm forms: %s K=%d M=%d: forced %d warps describes rc=%d form %d, %d threads, %d n-tiles a "
+                          "CTA (want %d) on %d SMs -- the case does not run the kernel it names", c.what, c.k2[j] / 2, M,
+                          arm == W8 ? 8 : 16, rc, d.arm, d.threads, d.nt, c.nt, sms);
+                    lanes = lanes && ok;
+                    n_lane++;
+                }
+        }
+        std::vector<std::vector<uint8_t>> ref16, y, yb16, yb8;
+        int rc = launch(W16, 16, false, pf, ref16);
+        CHECK(rc == 0, "arm forms: %s K=%d: the 16-warp M=16 launch rc=%d", c.what, c.k2[0] / 2, rc);
+        for (int M : Ms) {
+            if (rc || !lanes) break;
+            for (int arm : {W16, W8}) {
+                int r2 = launch(arm, M, false, pf, y);
+                CHECK(r2 == 0, "arm forms: %s K=%d M=%d: the %d-warp f32 launch rc=%d", c.what, c.k2[0] / 2, M,
+                      arm == W8 ? 8 : 16, r2);
+                if (r2) { n_diff++; continue; }
+                for (int j = 0; j < n; j++) {
+                    const bool same = memcmp(y[j].data(), ref16[j].data(), y[j].size()) == 0;
+                    CHECK(same, "arm forms: %s K=%d M=%d projection %d (%d -> %d): the %d-warp CTA's f32 rows are not the "
+                          "16-warp CTA's M=16 rows", c.what, c.k2[j] / 2, M, j, K, c.N[j], arm == W8 ? 8 : 16);
+                    (arm == W8 ? n_diff : n_m16) += !same;
+                    n_out += arm == W8;
+                }
+                std::vector<std::vector<uint8_t>> &ybx = arm == W8 ? yb8 : yb16;
+                r2 = launch(arm, M, true, pb, ybx);
+                CHECK(r2 == 0, "arm forms: %s K=%d M=%d: the %d-warp bf16 launch rc=%d", c.what, c.k2[0] / 2, M,
+                      arm == W8 ? 8 : 16, r2);
+                if (r2) { n_diff++; continue; }
+                for (int j = 0; j < n; j++) {   /* the bf16 rows are the f32 rows rounded to nearest even */
+                    size_t bad = 0;
+                    const uint16_t *b = (const uint16_t *)ybx[j].data();
+                    for (size_t i = 0; i < ybx[j].size() / 2; i++) {
+                        uint32_t u;
+                        memcpy(&u, ref16[j].data() + i * 4, 4);
+                        u += 0x7fffu + ((u >> 16) & 1u);
+                        bad += (uint16_t)(u >> 16) != b[i];
+                    }
+                    CHECK(bad == 0, "arm forms: %s K=%d M=%d projection %d: %zu of the %d-warp CTA's bf16 outputs are not "
+                          "the f32 outputs rounded", c.what, c.k2[j] / 2, M, j, bad, arm == W8 ? 8 : 16);
+                    n_rn += bad != 0;
+                }
+            }
+            for (int j = 0; j < n && yb8.size() == (size_t)n && yb16.size() == (size_t)n; j++) {
+                const bool same = yb8[j].size() == yb16[j].size() && memcmp(yb8[j].data(), yb16[j].data(), yb8[j].size()) == 0;
+                CHECK(same, "arm forms: %s K=%d M=%d projection %d (%d -> %d): the 8-warp CTA's bf16 rows are not the "
+                      "16-warp CTA's", c.what, c.k2[j] / 2, M, j, K, c.N[j]);
+                n_diff += !same;
+                n_out++;
+            }
+        }
+        if (!rc && lanes && n == 1) {   /* the 8-warp form against the host authority in double */
+            std::vector<double> what, yref;
+            exl3t_dequant(w[0].bytes.data(), K, c.N[0], c.k2[0], what);
+            exl3t_reference(w[0].bytes.data(), what, K, c.N[0], c.k2[0], s.x.data(), 16, yref);
+            if (launch(W8, 16, false, pf, y) == 0) {
+                std::vector<float> yf((size_t)16 * c.N[0]);
+                memcpy(yf.data(), y[0].data(), y[0].size());
+                double mx, med;
+                grade(yf, yref, 16, c.N[0], 0, &mx, &med);
+                CHECK(mx < tol, "arm forms: %s %d -> %d K=%d: the 8-warp CTA's M=16 max rel %.3e (limit %.0e)", c.what, K,
+                      c.N[0], c.k2[0] / 2, mx, tol);
+                CHECK(med > 1e-10, "arm forms: %s K=%d: median rel %.3e -- a degenerate fixture, not a pass", c.what,
+                      c.k2[0] / 2, med);
+                g_mx = fmax(g_mx, mx);
+                n_graded++;
+            }
+        }
+        if (!rc && lanes && n == 1 && c.nt == 4 && c.k2[0] == 10 && K == 2560) {
+            /* (c) the comparison can fail: one flipped trellis bit moves the 8-warp form's output */
+            weight wm = w[0];
+            wm.words()[12345] ^= 0x0100u;
+            CUDA_OK(cudaMemcpy(dw[0], wm.bytes.data(), wm.stride, cudaMemcpyHostToDevice));
+            const int r2 = launch(W8, 16, false, pf, y);
+            size_t moved = 0;
+            if (!r2)
+                for (size_t i = 0; i < y[0].size(); i += 4) moved += memcmp(y[0].data() + i, ref16[0].data() + i, 4) != 0;
+            CHECK(r2 == 0 && moved > 0, "arm forms: a flipped trellis bit moved no 8-warp output -- the comparison is "
+                  "degenerate");
+            CUDA_OK(cudaMemcpy(dw[0], w[0].bytes.data(), w[0].stride, cudaMemcpyHostToDevice));
+            /* the 8-warp form is one pass: forced on 17 rows it refuses, in the launch and in the description */
+            ds4_exl3_dense_gemv_desc d{};
+            ds4_exl3_dense_arm_force(W8);
+            const int r17 = ds4_exl3_dense_multi_launch(pf, 1, dq, 17, K, ws, wsb, 0, false);
+            const int d17 = ds4_exl3_dense_gemv_describe(10, 17, c.N[0] / 32, &d);
+            ds4_exl3_dense_arm_force(0);
+            CHECK(r17 == -1 && d17 == -1, "arm forms: the forced 8-warp CTA took a two-pass launch (rc=%d, describe %d)", r17,
+                  d17);
+            printf("  arm forms: a flipped trellis bit moved %zu 8-warp outputs; the forced 8-warp CTA refuses 17 rows\n", moved);
+        }
+        for (int j = 0; j < n; j++) { cudaFree(dw[j]); cudaFree(dy[j]); cudaFree(dyb[j]); }
+        cudaFree(dq);
+        cudaFree(ws);
+    }
+    ds4_exl3_dense_gemv_desc d8{};
+    ds4_exl3_dense_arm_force(W8);
+    const int rd = ds4_exl3_dense_gemv_describe(10, 8, 4 * sms, &d8);
+    ds4_exl3_dense_arm_force(0);
+    CHECK(n_out > 0 && n_graded > 0, "arm forms: nothing was compared");
+    printf("  arm forms: %zu launches (K = 2, 3, 4, 5, 6, 8; narrow and wide; M = 1, 2, 3, 4, 8, 16; single and multi; f32 "
+           "and bf16), %zu (launch, projection) outputs of the 8-warp CTA: %zu differ from the 16-warp CTA's bytes; %zu "
+           "16-warp f32 outputs off their M=16 rows; %zu bf16 outputs off the f32 rounded; %zu kernel descriptions "
+           "checked; %zu single shapes vs double, max rel %.2e\n", cases.size() * 24, n_out, n_diff, n_m16, n_rn, n_lane,
+           n_graded, g_mx);
+    if (!rd)
+        printf("  arm forms: the 8-warp K=5 wide CTA here: %d registers a thread, %d B shared, %d CTAs an SM at 8 rows "
+               "(information)\n", d8.regs, d8.smem, d8.ctas_per_sm);
 }
 
 int main(void) {
@@ -688,6 +938,7 @@ int main(void) {
             release(d);
         }
     }
+    arm_section(tol);
     printf(g_fail ? "EXL3-DENSE GATE FAIL\n" : "EXL3-DENSE GATE PASS\n");
     return g_fail;
 }
