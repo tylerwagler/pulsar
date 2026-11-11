@@ -14,7 +14,8 @@ once (two engines do not fit on GB10):
           injected failure) -- each touches only what its leg drives -- and the test routes (PULSAR_SERVER_TEST_ROUTES=1),
           through which each budget leg sets the guard's KV budget for its own phase (Server.set_guard_budget; set back
           to the startup budget after every phase).  L357: it starts on the warm instance's disk tier, so it is also
-          the warm instance's RESTART: a leg may check what a shutdown persisted (resume-fixes' boundary case)
+          the warm instance's RESTART: a leg may check what a shutdown persisted (resume-fixes' boundary case) and
+          what only the disk tier can serve (L380: resume-deepest's disk turns -- every bank is empty)
   fresh   only if a leg grades reuse against a fresh server: one instance, an empty disk tier, for every leg's
           reference request.  Each leg's conversations open with text no other leg sends, and each reference
           request must report 0 cached prompt tokens (live_server.check_fresh), or the comparison says nothing
@@ -54,7 +55,7 @@ LEGS = [
     ("prefix-turns-live-gate", "prefix_turns_live", "PrefixTurnsLeg", {"reply": 600, "tag": "gate"}, ("qwen",)),
     ("prefix-turns-side", "prefix_turns_live", "PrefixTurnsLeg", {"turns": 6, "side": True, "tag": "side"}, ("qwen",)),
     ("preempt-exact", "preempt_live", "PreemptLeg", {"margin": 1.25}, ("qwen",)),
-    # L318 (make resume-deepest-live runs it alone)
+    # L318 (make resume-deepest-live runs it alone).  L380: its disk turns run on the hooks instance, the restart
     ("resume-deepest", "resume_deepest_live", "ResumeDeepestLeg", {}, ("qwen",)),
     # L322 (make sidecall-turns-live runs it alone)
     ("sidecall-turns", "sidecall_turns_live", "SidecallLeg", {}, ("qwen",)),

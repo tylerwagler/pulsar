@@ -2102,8 +2102,10 @@ nemotron-mem-squeeze-live: pulsar-server
 
 # L318: an Open WebUI conversation (the history rewritten inside the previous turn, ~30k-token prompts) resumes within
 # one segment of its byte match from the deepest valid state -- own bank, adopt, disk chain -- a prefill its client
-# abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  Production's
-# Qwen pack and flags (262k, 16 banks, 64 GB disk tier); two loads, ~8 min.  gates-dev runs it on a routing / kv path.
+# abandons keeps its computed prefix for the re-send, and both stay reuse == cold against a fresh server.  L380: the
+# disk tier serves it on a restart of the server, where no bank can (its turns in memory come from memory).
+# Production's Qwen pack at 262k and 16 banks, the disk tier at the server's default size; three loads (the server, its
+# restart on the same disk store, a fresh one).  gates-dev runs it on a routing / kv path.
 RESUME_LIVE_MODEL ?= $(QWEN_GATE_MODEL)
 RESUME_LIVE_WORK ?= $(or $(TMPDIR),/var/tmp)/pulsar-l318-$(USER)
 .PHONY: resume-deepest-live
