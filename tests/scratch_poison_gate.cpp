@@ -20,6 +20,14 @@
  * PASS: C == A and B == A in every record, byte for byte; the graphed lanes replayed in B (rule 5: the gate ran the
  * production lane) and B poisoned steps (A and C none).
  *
+ * L382: each run declares its graph keys as the server's warmup does (pulsar_gpu_seg_catalog_open on a fresh segment
+ * cache), so a key captures on its SECOND use and every later use replays.  Before, the script's keys were live ones,
+ * captured only at their 12th use, and the script's cycles (77 subset x width pairs, a draft pass keyed on its bank
+ * count and bound) bring at most one key there in ~50 ticks: on the GB10 Gemma pack one key, 1 capture and 2 replays
+ * (L369, 82d9dd14), on the RTX 6000 (sm_75) none -- 0 replays, a FAIL of the precondition with the engine capturing
+ * normally (graph-eager-gate and block-spec-gate replayed in the same engine).  The catalog closes before the session
+ * is freed, and a shape it failed to capture fails the run (the server refuses to start on one too).
+ *
  * Mutation-tested (make scratch-poison-gate-mutant): a build whose Qwen step clears its MoE non-finite flag only on its
  * first step -- an unpoisoned run never sees the difference (the flag stays clear), a poisoned run must FAIL.
  *
@@ -59,6 +67,7 @@ struct run_rec {
     std::vector<tick_rec> ticks;
     std::vector<int32_t> out[NB];
     uint64_t replays = 0, captures = 0, poisoned = 0, poison_bytes = 0;
+    uint64_t catalog_failed = 0;   /* declared shapes whose capture failed or refused (pulsar_gpu_seg_catalog_close) */
     bool ok = false;
     std::string err;
 };
@@ -95,6 +104,11 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     char err[256] = "";
     /* poisoned from the banks' prefill on: every step of the run */
     const int was = pulsar_gpu_scratch_poison_set(poison ? 1 : 0);
+    /* L382: a fresh segment cache (a key carries its session's address, which a new session may reuse) whose keys
+     * are declared, as the warmup declares the server's: each captures on its second use, so the graphed lanes
+     * replay between the poisonings whatever the script's key repetition (see the header) */
+    pulsar_gpu_seg_reset();
+    pulsar_gpu_seg_catalog_open();
     uint64_t r0 = 0, c0 = 0, p0 = 0, pb0 = 0;
     pulsar_gpu_seg_counts(&r0, &c0);
     pulsar_gpu_scratch_poison_counts(&p0, &pb0);
@@ -222,6 +236,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
     uint64_t r1 = 0, c1 = 0, p1 = 0, pb1 = 0;
     pulsar_gpu_seg_counts(&r1, &c1);
     pulsar_gpu_scratch_poison_counts(&p1, &pb1);
+    R.catalog_failed = pulsar_gpu_seg_catalog_close();   /* before the session's free drops its keys */
     (void)pulsar_gpu_scratch_poison_set(was);
     R.replays = r1 - r0;
     R.captures = c1 - c0;
@@ -336,6 +351,10 @@ int GATE_ENTRY(int argc, char **argv) {
     CHECK(A.poisoned == 0 && C.poisoned == 0 && B.poisoned > 0,
           "only run B poisoned its steps (A %llu, B %llu, C %llu)", (unsigned long long)A.poisoned,
           (unsigned long long)B.poisoned, (unsigned long long)C.poisoned);
+    CHECK(A.catalog_failed == 0 && B.catalog_failed == 0 && C.catalog_failed == 0,
+          "every declared shape captured (failed or refused under capture: A %llu, B %llu, C %llu)",
+          (unsigned long long)A.catalog_failed, (unsigned long long)B.catalog_failed,
+          (unsigned long long)C.catalog_failed);
     CHECK(B.replays > 0, "run B replayed captured graphs between the poisonings (%llu replays)",
           (unsigned long long)B.replays);
     printf("every record against run A:\n");
