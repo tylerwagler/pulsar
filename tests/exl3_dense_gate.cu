@@ -59,7 +59,9 @@
  *      output.  The equality is a property of the device's cuBLASLt kernel: (b)-(d) FAIL on any differing byte on
  *      a device the rule names (sm_12x) and are information elsewhere (the rule keeps the GEMM there).
  *
- * usage: ./tests/exl3_dense_gate     (make exl3-dense-gate CUDA_ARCH=sm_120f on GB10; CUDA_ARCH=sm_75 on Turing)
+ * usage: ./tests/exl3_dense_gate --plan   section 10's fixtures walked on the host (no GPU): every layout and workspace
+ *                                         it will ask for, a refused one failing here
+ *        ./tests/exl3_dense_gate     (make exl3-dense-gate CUDA_ARCH=sm_120f on GB10; CUDA_ARCH=sm_75 on Turing)
  */
 #include "../src/cuda/mmq/ds4_exl3_dense.cuh"
 #include "../src/cuda/pulsar_cuda_arch.cuh"
@@ -481,6 +483,101 @@ static void arm_section(const double tol) {
                "(information)\n", d8.regs, d8.smem, d8.ctas_per_sm);
 }
 
+/* 10. the prompt arm's launches: N is each projection's LOGICAL width (stored at exl3_out_stored, a 128 multiple). */
+struct pcase { const char *what; int K, n, N[4], k2[4]; bool full; };
+static std::vector<pcase> prompt_cases(void) {
+    std::vector<pcase> cases;
+    for (int k2 : {4, 6, 8, 10, 12, 16}) {
+        cases.push_back({"K of 1 block", 128, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"K of 3 blocks", 384, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"K of 20 blocks", 2560, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"N short of its stored 1024", 640, 1, {1000, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"N under one block (stored 128)", 640, 1, {100, 0, 0, 0}, {k2, 0, 0, 0}, true});
+        cases.push_back({"multi", 1280, 3, {256, 1000, 128, 0}, {k2, k2, k2, 0}, true});
+    }
+    cases.push_back({"multi at rates 4 / 5 / 6 / 2", 1280, 4, {256, 512, 100, 640}, {8, 10, 12, 4}, true});
+    /* the families' prompt launches (family_qwen_s4.cpp, nemotron_h_forward.cpp, gemma4_forward.cpp), at 5 rows and
+     * the rule's last */
+    cases.push_back({"Qwen GDN qkv + z", 2560, 2, {10240, 6144, 0, 0}, {10, 10, 0, 0}, false});
+    cases.push_back({"Qwen QSA q + k + v", 2560, 3, {12288, 512, 512, 0}, {10, 10, 10, 0}, false});
+    cases.push_back({"Qwen QSA q + k + v + index_qk (K8 / K6 container)", 2560, 4, {12288, 512, 512, 640}, {16, 16, 16, 12}, false});
+    cases.push_back({"Qwen GDN out / QSA o", 6144, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen shared gate + up", 2560, 2, {640, 640, 0, 0}, {10, 10, 0, 0}, false});
+    cases.push_back({"Qwen shared down", 640, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen PLE key", 2560, 1, {10240, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Qwen PLE value", 2560, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
+    cases.push_back({"Nemotron Mamba in_proj", 4096, 1, {18560, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron Mamba out_proj / MTP eh_proj", 8192, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron attention q + k + v", 4096, 3, {4096, 256, 256, 0}, {8, 8, 8, 0}, false});
+    cases.push_back({"Nemotron latent in", 4096, 1, {1024, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron latent out", 1024, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron shared up", 4096, 1, {5376, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Nemotron shared down", 5376, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma window q + k + v", 2816, 3, {4096, 2048, 2048, 0}, {8, 8, 8, 0}, false});
+    cases.push_back({"Gemma full q + k", 2816, 2, {8192, 1024, 0, 0}, {8, 8, 0, 0}, false});
+    cases.push_back({"Gemma full o_proj", 8192, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma MLP gate / up", 2816, 1, {2176, 0, 0, 0}, {8, 0, 0, 0}, false});
+    cases.push_back({"Gemma MLP down", 2176, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
+
+    return cases;
+}
+
+/* One projection's weight for a prompt case: the [trellis | suh | svh] slice at the STORED width, svh 0 on the pad
+ * columns past the logical N (exllamav3's pad; section 8's construction).  false, said by name, when the layout is
+ * refused -- the case fails, the section goes on. */
+static bool prompt_weight(const pcase &c, int j, weight &w) {
+    const int K = c.K, N = c.N[j], k2 = c.k2[j], Ns = (int)exl3_out_stored((uint64_t)N);
+    uint64_t lt = 0, lsc = 0, lst = 0, et = 0, esc = 0, est = 0;
+    const bool ok = N > 0 && N % 4 == 0 && exl3_linear_layout(K, N, k2, &lt, &lsc, &lst) &&
+                    exl3_expert_layout(K, Ns, k2, &et, &esc, &est) && est == lst && et == lt;
+    CHECK(ok, "prompt kernels: %s projection %d: %d -> %d (stored %d) at k2=%d is not an EXL3 dense layout -- the case "
+          "is not run", c.what, j, K, N, Ns, k2);
+    if (!ok) return false;
+    w = make_weight(K, Ns, k2);
+    uint16_t *svp = (uint16_t *)(w.bytes.data() + w.trellis) + K;
+    for (int n = N; n < Ns; n++) svp[n] = 0;
+    return true;
+}
+
+/* `--plan`: section 10's fixtures walked on the host, no GPU -- every case's layouts and workspace are what the
+ * section will ask for, so a refused fixture shows here (and on any build host) instead of on the device. */
+static int prompt_plan(void) {
+    const std::vector<pcase> cases = prompt_cases();
+    const int R = DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS + 1;
+    size_t n_proj = 0, n_pad = 0, n_tail_only = 0;
+    for (const pcase &c : cases) {
+        ds4_exl3_dense_proj pf[4] = {};
+        bool ok = c.n >= 1 && c.n <= 4 && c.K > 0 && c.K % 128 == 0;
+        CHECK(ok, "plan: %s: %d projections of K=%d", c.what, c.n, c.K);
+        printf("  plan %-52s K=%-5d %s:", c.what, c.K, c.full ? "M 1..257" : "M 5, 256");
+        for (int j = 0; j < c.n && ok; j++) {
+            const int N = c.N[j], Ns = (int)exl3_out_stored((uint64_t)N);
+            weight w;   /* the section's own construction, on the host */
+            const bool lay = prompt_weight(c, j, w) && ds4_exl3_dense_rate_supported(c.k2[j]);
+            CHECK(lay, "plan: %s projection %d: %d -> %d (stored %d) at k2=%d is refused", c.what, j, c.K, N, Ns, c.k2[j]);
+            ok = ok && lay;
+            pf[j] = ds4_exl3_dense_proj{nullptr, c.k2[j], N, nullptr, nullptr};
+            printf(" %d%s@K%.1f (%.1f MB)", N, N == Ns ? "" : N < 128 ? " [tail only]" : " [padded]", c.k2[j] / 2.0,
+                   lay ? w.stride / 1e6 : 0.0);
+            n_proj++;
+            n_pad += N != Ns;
+            n_tail_only += N < 128;
+        }
+        const size_t wsb = ok ? ds4_exl3_dense_multi_workspace_bytes(pf, c.n, R, c.K) : 0;
+        CHECK(!ok || wsb > 0, "plan: %s: the arm refuses the set's workspace", c.what);
+        printf("  workspace %zu B%s\n", wsb, ok && wsb ? "" : "  *** REFUSED ***");
+    }
+    {   /* (d)'s two shapes */
+        const weight wa = make_weight(640, 640, 10), wb = make_weight(640, 256, 10);   /* exit(1) if refused */
+        CHECK(wa.stride > 0 && wb.stride > 0, "plan: the check leg's weights are empty");
+    }
+    CHECK(n_pad > 0 && n_tail_only > 0, "plan: no case has a logical width short of its stored one, or none under a block");
+    printf("exl3-dense-gate --plan: %zu cases, %zu projections (%zu with a logical width short of the stored one, %zu of "
+           "them under one block): %s\n", cases.size(), n_proj, n_pad, n_tail_only,
+           g_fail ? "A FIXTURE IS REFUSED" : "every fixture is a layout the arm takes");
+    return g_fail;
+}
+
 /* 10. L381: the prompt arm's two kernels.  (a) the rule's table; (b) both kernels forced on the same launches, byte
  * for byte, and the in-place kernel's rows one at a time; (c) the rule's path with its check; (d) the check's
  * mismatch path and a mutation. */
@@ -532,49 +629,19 @@ static void prompt_arm_section(void) {
         printf("  N/A the in-place prompt kernel on sm_%d: the rule names sm_12x only, every prompt launch here is the "
                "GEMM -- the forced comparison below is information, the check's legs (c), (d) do not exist here\n", cc);
 
-    /* (b), (c) the launches */
-    struct pcase { const char *what; int K, n, N[4], k2[4]; bool full; };
-    std::vector<pcase> cases;
-    for (int k2 : {4, 6, 8, 10, 12, 16}) {
-        cases.push_back({"K of 1 block", 128, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
-        cases.push_back({"K of 3 blocks", 384, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
-        cases.push_back({"K of 20 blocks", 2560, 1, {640, 0, 0, 0}, {k2, 0, 0, 0}, true});
-        cases.push_back({"N short of its stored 1024", 640, 1, {1000, 0, 0, 0}, {k2, 0, 0, 0}, true});
-        cases.push_back({"N under one block (stored 128)", 640, 1, {100, 0, 0, 0}, {k2, 0, 0, 0}, true});
-        cases.push_back({"multi", 1280, 3, {256, 1000, 128, 0}, {k2, k2, k2, 0}, true});
-    }
-    cases.push_back({"multi at rates 4 / 5 / 6 / 2", 1280, 4, {256, 512, 100, 640}, {8, 10, 12, 4}, true});
-    /* the families' prompt launches (family_qwen_s4.cpp, nemotron_h_forward.cpp, gemma4_forward.cpp), at 5 rows and
-     * the rule's last */
-    cases.push_back({"Qwen GDN qkv + z", 2560, 2, {10240, 6144, 0, 0}, {10, 10, 0, 0}, false});
-    cases.push_back({"Qwen QSA q + k + v", 2560, 3, {12288, 512, 512, 0}, {10, 10, 10, 0}, false});
-    cases.push_back({"Qwen QSA q + k + v + index_qk (K8 / K6 container)", 2560, 4, {12288, 512, 512, 640}, {16, 16, 16, 12}, false});
-    cases.push_back({"Qwen GDN out / QSA o", 6144, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
-    cases.push_back({"Qwen shared gate + up", 2560, 2, {640, 640, 0, 0}, {10, 10, 0, 0}, false});
-    cases.push_back({"Qwen shared down", 640, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
-    cases.push_back({"Qwen PLE key", 2560, 1, {10240, 0, 0, 0}, {10, 0, 0, 0}, false});
-    cases.push_back({"Qwen PLE value", 2560, 1, {2560, 0, 0, 0}, {10, 0, 0, 0}, false});
-    cases.push_back({"Nemotron Mamba in_proj", 4096, 1, {18560, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Nemotron Mamba out_proj / MTP eh_proj", 8192, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Nemotron attention q + k + v", 4096, 3, {4096, 256, 256, 0}, {8, 8, 8, 0}, false});
-    cases.push_back({"Nemotron latent in", 4096, 1, {1024, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Nemotron latent out", 1024, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Nemotron shared up", 4096, 1, {5376, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Nemotron shared down", 5376, 1, {4096, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Gemma window q + k + v", 2816, 3, {4096, 2048, 2048, 0}, {8, 8, 8, 0}, false});
-    cases.push_back({"Gemma full q + k", 2816, 2, {8192, 1024, 0, 0}, {8, 8, 0, 0}, false});
-    cases.push_back({"Gemma full o_proj", 8192, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Gemma MLP gate / up", 2816, 1, {2176, 0, 0, 0}, {8, 0, 0, 0}, false});
-    cases.push_back({"Gemma MLP down", 2176, 1, {2816, 0, 0, 0}, {8, 0, 0, 0}, false});
-
+    /* (b), (c) the launches (prompt_cases) */
+    const std::vector<pcase> cases = prompt_cases();
     const std::vector<int> Ms_full = {1, 2, 3, 5, 16, 17, 30, 64, 65, 128, T, T + 1}, Ms_fam = {5, T};
     const int R = T + 1;   /* rows of a case's fixture */
     size_t n_cmp = 0, n_out = 0, n_diff = 0, n_nan = 0, n_past = 0, n_row = 0, n_row_bad = 0, n_rule = 0, n_rule_bad = 0,
            n_lane = 0, n_lane_bad = 0, n_fail = 0;
     for (const pcase &c : cases) {
         const int K = c.K, n = c.n;
+        std::vector<weight> w(n);
+        bool built = true;
+        for (int j = 0; j < n; j++) built = prompt_weight(c, j, w[j]) && built;
+        if (!built) { n_fail++; continue; }   /* said by name; the other cases still run */
         const slot s = make_slot(R, K);
-        std::vector<weight> w;
         uint8_t *dw[4] = {}, *dq = nullptr;
         float *dy[4] = {};
         void *ws = nullptr;
@@ -582,14 +649,14 @@ static void prompt_arm_section(void) {
         CUDA_OK(cudaMalloc((void **)&dq, s.q.size() * sizeof(uint16_t)));
         CUDA_OK(cudaMemcpy(dq, s.q.data(), s.q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
         for (int j = 0; j < n; j++) {
-            w.push_back(make_weight(K, c.N[j], c.k2[j]));
             CUDA_OK(cudaMalloc((void **)&dw[j], w[j].stride));
             CUDA_OK(cudaMemcpy(dw[j], w[j].bytes.data(), w[j].stride, cudaMemcpyHostToDevice));
             CUDA_OK(cudaMalloc((void **)&dy[j], (size_t)(R + 1) * c.N[j] * sizeof(float)));
             pf[j] = ds4_exl3_dense_proj{dw[j], c.k2[j], c.N[j], dy[j], nullptr};
         }
         const size_t wsb = ds4_exl3_dense_multi_workspace_bytes(pf, n, R, K);
-        CUDA_OK(cudaMalloc(&ws, wsb));
+        CHECK(wsb > 0, "prompt kernels: %s: the arm refuses the set's workspace", c.what);
+        CUDA_OK(cudaMalloc(&ws, wsb ? wsb : 16));
         /* one prompt launch of rows [r0, r0 + M) under a forced kernel (0: the rule's): each projection's M rows, a
          * NaN canary under them (every output written) and in the row after them (none written past) */
         auto launch = [&](int force, int M, int r0, std::vector<std::vector<float>> &out) {
@@ -781,7 +848,8 @@ static void prompt_arm_section(void) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--plan")) return prompt_plan();
     struct shape { int K, N; const char *what; };
     const shape shapes[] = {
         {2560, 10240, "Qwen DeltaNet in_proj_qkv"},
