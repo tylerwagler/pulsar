@@ -646,6 +646,9 @@ tests/exl3_dense_xcheck: tests/exl3_dense_xcheck.cu tests/exl3_dense_ref.h $(CUD
 # L380: `tests/exl3_dense_bench round ...` prices the GEMV's CTA forms (16 warps
 # forced / the shipped rule / 8 warps forced) at a model's per-round launches
 # (qwen, nemotron) -- usage in the file's header.
+# L381: `tests/exl3_dense_bench chunk ...` prices the prompt arm's kernels (the
+# GEMM forced / the shipped rule / in place forced) at a model's per-chunk
+# launches, 5 to 4096 rows.
 tests/exl3_dense_bench: tests/exl3_dense_bench.cu $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/exl3_dense_bench.cu \
 		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
@@ -684,6 +687,18 @@ segstore-tsan: tests/segstore_tsan
 	TSAN_OPTIONS=halt_on_error=1 ./tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
+# L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
+# implements (qwen_exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
+# shipped order.  `lt-order-gate` is its battery form (kernels tier: a GPU, no model): on a device the rule gives the
+# in-place kernel (sm_12x) a vendor change fails it; elsewhere it is N/A.  Run by hand without --gate to establish the
+# order on a new architecture, and after a toolchain move (docs/QA_BEFORE_RELEASES.md) -- usage in the file's header.
+tests/lt_order_probe: tests/lt_order_probe.cu src/cuda/pulsar_cuda_lt_fixed.h src/cuda/mmq/ds4_exl3_dense.cuh \
+                      $(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) Makefile
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_order_probe.cu \
+		$(CUDA_OBJS) $(CUTLASS_CUDA_OBJS) $(MMQ_OBJS) $(CUDA_LDLIBS)
+.PHONY: lt-order-gate
+lt-order-gate: tests/lt_order_probe
+	./tests/lt_order_probe --gate
 .PHONY: router-gate
 router-gate: tests/router_gate
 	./tests/router_gate

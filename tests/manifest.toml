@@ -40,7 +40,12 @@ budget = 90   # L373: the bash-job teardown, timeout and atomic-write tests wait
 [[test]]
 name = "cuda-regression"
 tier = "kernels"
-budget = 150   # L370 / L375: the 1024-key window leg, the widening and grow-under-capture cases (Sparky #692: 113 s)
+budget = 240   # L381: exl3_dense_gate section 10, the prompt arm's two kernels (not yet measured); L370 / L375: the 1024-key window leg, the widening and grow-under-capture cases (Sparky #692: 113 s)
+
+[[test]]
+name = "lt-order-gate"
+tier = "kernels"
+budget = 300   # L381: the fixed cuBLASLt GEMM against the in-place prompt kernel's order, 26 shapes (not yet measured on Sparky)
 
 [[test]]
 name = "cuda-kv-rows-pack-gate"

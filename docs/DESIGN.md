@@ -118,6 +118,15 @@ across the raw ring, the compressed pool, the drafter and chunked prefill; V4.1
 stores an E4M3 window row and an E2M1 compressed row (`pulsar_kv_row_style`).
 Weights are MXFP8 / MXFP4 / IQ2 / EXL3 depending on tier and family.
 
+A dense EXL3 Linear has two arms, chosen by row kind. Decode rows run a
+tensor-core GEMV that reads the trellis in place. Prompt rows run one
+arithmetic with a row's bytes independent of its chunk: the weight decoded to
+fp16 and a fixed-algorithm cuBLASLt GEMM for bulk chunks, and, for chunks of up
+to 256 rows on the devices where it is established, a kernel that reads the
+trellis in place and reproduces that GEMM's bytes (`ds4_exl3_dense_prompt_arm`;
+each shape is checked against the GEMM once a process, and a mismatch keeps
+every prompt chunk on the GEMM -- `src/cuda/mmq/qwen_exl3_dense_prefill.cu`).
+
 ## Correctness discipline
 
 The engine is gated by a battery of GPU-resident tests (`make gates`) covering

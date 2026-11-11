@@ -40,8 +40,11 @@
 // a launch carries up to 32 decode rows as 16-row passes over trellis words it
 // reads once (L341), and rows past 32 run 32-row launches in turn (L288 C1).
 // Prompt chunks take
-// the tensor-core prefill GEMM (qwen_exl3_dense_prefill.cu), which agrees to
-// rounding.
+// the prompt arm (qwen_exl3_dense_prefill.cu), which agrees to rounding: the
+// fixed-algorithm tensor-core GEMM on the weight decoded to fp16, or -- a chunk
+// of up to DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS rows, on a device where it is
+// established (L381, ds4_exl3_dense_prompt_arm) -- a kernel that reads the
+// trellis in place and writes that GEMM's bytes.
 
 #pragma once
 
@@ -59,7 +62,7 @@ bool ds4_exl3_dense_rate_supported(int k2);
 /** Workspace bytes ds4_exl3_dense_launch needs for (M, K, N): the split
  *  partials (at the stored width) and the prep planes of min(M, 32) rows
  *  (decode rows past 32 reuse them a launch at a time, L341; a prompt chunk's
- *  prefill GEMM needs none).  0 for a shape the arm refuses. */
+ *  arm needs none).  0 for a shape the arm refuses. */
 /// @param M activation rows.
 /// @param K input width (a multiple of 128).
 /// @param N logical output width (a multiple of 4).
@@ -86,7 +89,7 @@ size_t ds4_exl3_dense_workspace_bytes(int M, int K, int N);
 /// @param workspace device workspace, 16-byte aligned.
 /// @param workspace_bytes bytes of workspace.
 /// @param stream the stream.
-/// @param prompt the rows are a prompt chunk (the prefill GEMM), else decode rows (the GEMV).
+/// @param prompt the rows are a prompt chunk (the prompt arm), else decode rows (the GEMV).
 /// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_dense_launch(
     const void   * w,
@@ -99,14 +102,15 @@ int ds4_exl3_dense_launch(
     void         * workspace,
     size_t         workspace_bytes,
     cudaStream_t   stream,
-    /* L266: a prompt chunk takes the prefill GEMM at every M (qwen_exl3_dense_prefill.cu), so a
+    /* L266: a prompt chunk takes the prompt arm at every M, one arithmetic (qwen_exl3_dense_prefill.cu), so a
      * prompt cut anywhere is byte-identical to one prefilled whole; false: decode rows, the GEMV at
      * every M (16-row passes in a launch of up to 32 rows, L341; 32-row launches past that, L288 C1) */
     bool           prompt = false);
 
-/** L251: the dense arm's prompt chunks through a decode-once tensor-core GEMM: w is the dense layout
- *  (trellis | suh[K] | svh[stored N], exl3_linear_layout); writes y [M][N] finished (output rotation and svh
- *  applied), N the logical width.
+/** L251: the dense arm's prompt chunks: w is the dense layout (trellis | suh[K] | svh[stored N],
+ *  exl3_linear_layout); writes y [M][N] finished (output rotation and svh applied), N the logical width.  One
+ *  arithmetic, two kernels with the same bytes (L381): the decode-once tensor-core GEMM, or the in-place kernel
+ *  where ds4_exl3_dense_prompt_arm says and the shape's check has passed (the file's header).
  *  ds4_exl3_dense_launch calls it for prompt chunks. */
 /// @param w the [trellis | suh | svh] slice, device, 16-byte aligned.
 /// @param k2 the rate in half-bit units (2 x bits per weight).
@@ -153,8 +157,8 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
 /** n (1..DS4_EXL3_DENSE_MAX_PROJ) projections of ONE input xb [M][K] bf16 (L288 exl3-dense: a GDN block's
  *  in_proj_qkv and _z, an attention's q / k / v / index, a shared expert's gate and up): one prep launch for all of
  *  them, then one GEMV launch per rate among them.  Each output is bit for bit what ds4_exl3_dense_launch writes for
- *  it alone.  Prompt chunks take the prefill GEMM, once per projection; decode rows past 16 run 16-row blocks in
- *  turn.  ds4_exl3_dense_launch is the
+ *  it alone.  Prompt chunks take the prompt arm, once per projection (each its own prep: suh is the projection's);
+ *  decode rows past 16 run 16-row blocks in turn.  ds4_exl3_dense_launch is the
  *  n = 1 call. */
 /// @param p the projections, [n].
 /// @param n projections (1 .. DS4_EXL3_DENSE_MAX_PROJ).
@@ -164,7 +168,7 @@ size_t ds4_exl3_dense_multi_workspace_bytes(const ds4_exl3_dense_proj *p, int n,
 /// @param workspace device workspace, 16-byte aligned.
 /// @param workspace_bytes bytes of workspace.
 /// @param stream the stream.
-/// @param prompt the rows are a prompt chunk (the prefill GEMM), else decode rows (the GEMV).
+/// @param prompt the rows are a prompt chunk (the prompt arm), else decode rows (the GEMV).
 /// @return 0, -1 refused, -3 launch failure.
 int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void *xb, int M, int K, void *workspace,
                                 size_t workspace_bytes, cudaStream_t stream, bool prompt = false);
@@ -242,3 +246,87 @@ struct ds4_exl3_dense_gemv_desc {
  *  @param d    out
  *  @return 0; -1 when the device cannot say, the arguments are out of range, or the forced form has no instance at M */
 int ds4_exl3_dense_gemv_describe(int k2, int M, int c32, ds4_exl3_dense_gemv_desc *d);
+
+/** The prompt arm's kernel: the weight decoded to fp16 once, the fixed-algorithm cuBLASLt GEMM (every chunk the rule
+ *  below does not name; the only form before L381). */
+#define DS4_EXL3_DENSE_PROMPT_GEMM 1
+/** The prompt arm's kernel: the trellis read in place, the fixed GEMM's bytes (L381). */
+#define DS4_EXL3_DENSE_PROMPT_INPLACE 2
+/** ds4_exl3_dense_prompt_describe only: the launch would run BOTH kernels and compare them (the shape's one check). */
+#define DS4_EXL3_DENSE_PROMPT_CHECK 3
+/** L381: the rows up to which a prompt launch may take the in-place kernel (ds4_exl3_dense_prompt_arm). */
+#define DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS 256
+
+/** L381: the kernel a prompt launch of M rows may take on a device -- the one authority; the launch asks it with its
+ *  own rows and device.  A function of the launch and the device only (never the family, the rate or a switch), and a
+ *  choice of SPEED only: the in-place kernel is taken only while it writes the fixed GEMM's bytes.
+ *
+ *  in place iff  the device is sm_12x (cc / 10 == 12)
+ *            and 1 <= M <= DS4_EXL3_DENSE_PROMPT_INPLACE_ROWS (256)
+ *  and then only for a (device, K, N, rate) whose FIRST such launch in the process ran both kernels on its own
+ *  operands and found every output byte equal (qwen_exl3_dense_prefill.cu, "the check"); one mismatch turns the
+ *  in-place kernel off for the whole process, loudly.
+ *
+ *  Why the device: the equality is a property of the VENDOR kernel -- cuBLASLt's fp16 GEMM for a (compute capability,
+ *  library version, shape).  tests/lt_order_probe established it on GB10 (sm_121), cuBLASLt 131000 (gpuq #704,
+ *  2026-11-11): for all 16 dense prompt shapes of Qwen3.8-Flash-Next and Nemotron-3.5 Super (K 640 .. 8192; algo 67
+ *  tiles 409 / 412, algo 21 tiles 20 / 23; recorded picks and first suggestions) the vendor's f32 output is ONE
+ *  ascending chain of m16n8k16 MMAs into one f32 accumulator an output, the same at 1 / 5 / 30 / 64 / 256 rows as at
+ *  4096.  Every other architecture keeps the GEMM until the probe is run there (sm_75 has no m16n8k16 for fp16 at
+ *  all); a library change on sm_12x is what the check is for.
+ *
+ *  Why 256 rows: the GEMM arm's cost is the weight's decode and does not fall with the rows; the in-place kernel
+ *  re-reads the trellis once per 64 rows.  Measured on GB10, tests/exl3_dense_bench chunk (the probe's kernel, K = 5
+ *  bits Qwen / 4 bits Nemotron, 40 calls x 3, DRAM-cold; gpuq #704), dense ms a prompt chunk, GEMM / in place:
+ *
+ *    rows        5            16           30           64           128          256
+ *    Qwen        66.6 / 17.1  65.7 / 16.9  63.9 / 18.1  64.4 / 18.9  65.2 / 22.3  72.2 / 33.7
+ *    Nemotron    147.1 / 22.5 145.2 / 23.6 144.3 / 23.4 141.8 / 25.8 146.7 / 39.3 161.7 / 67.3
+ *
+ *  In place wins by 2.1x or more at every measured point, 256 rows included; nothing was measured past 256, so the
+ *  rule stops there (the crossover is somewhere above: `exl3_dense_bench chunk` runs both kernels to 4096 rows to
+ *  find it).  The other rates (K = 2, 3, 6, 8) take the rule on K = 4 and 5's measurement.
+ *  @param M   rows of the launch
+ *  @param cc  the device's compute capability, major * 10 + minor (pulsar_cuda_device_cc)
+ *  @return DS4_EXL3_DENSE_PROMPT_INPLACE or DS4_EXL3_DENSE_PROMPT_GEMM */
+int ds4_exl3_dense_prompt_arm(int M, int cc);
+
+/** L381: an instrument's forced kernel for every prompt launch -- 0 the rule's (ds4_exl3_dense_prompt_arm and the
+ *  check), DS4_EXL3_DENSE_PROMPT_GEMM, or DS4_EXL3_DENSE_PROMPT_INPLACE (at every M and on every device, UNCHECKED:
+ *  how exl3_dense_gate compares the two kernels and exl3_dense_bench prices the in-place one past the rule's rows).
+ *  The engine never calls it.  Process-wide and unsynchronised: set it with no launch in flight.
+ *  @param arm 0, DS4_EXL3_DENSE_PROMPT_GEMM or DS4_EXL3_DENSE_PROMPT_INPLACE
+ *  @return 0, -1 not one of them */
+int ds4_exl3_dense_prompt_force(int arm);
+
+/** L381: an instrument's fault in the check: while on, a check flips one bit of the in-place kernel's first output
+ *  on the device before the comparison, so the check must find a mismatch (exl3_dense_gate: the arm turns itself
+ *  off and the launch returns the GEMM's bytes).  The engine never calls it.
+ *  @param on  arm or disarm the fault */
+void ds4_exl3_dense_prompt_check_fault(bool on);
+
+/** L381: an instrument's reset of the check: forgets every checked shape and a mismatch's process-wide off, so the
+ *  next launch of a shape checks again.  The engine never calls it; no launch in flight. */
+void ds4_exl3_dense_prompt_check_reset(void);
+
+/** What one prompt launch is on the calling thread's device, under the current ds4_exl3_dense_prompt_force and the
+ *  check's state: how an instrument shows which kernel it ran (rule 5). */
+struct ds4_exl3_dense_prompt_desc {
+    int arm;           ///< DS4_EXL3_DENSE_PROMPT_GEMM, _INPLACE, or _CHECK (both, compared: the shape's first)
+    int off;           ///< 1: a check found a mismatch in this process, every launch takes the GEMM
+    int checked;       ///< 1: this (device, K, N, rate) passed its check
+    int ctas;          ///< the in-place kernel's grid at M rows: stored N / 128 x ceil(M / 64)
+    int threads;       ///< its threads a CTA
+    int regs;          ///< its registers a thread (cudaFuncGetAttributes)
+    int smem;          ///< its shared memory bytes a CTA
+    int ctas_per_sm;   ///< its CTAs resident an SM (cudaOccupancyMaxActiveBlocksPerMultiprocessor)
+};
+
+/** Describes the prompt launch of one projection (ds4_exl3_dense_prompt_desc).
+ *  @param k2  rate (2 x bits per weight), a supported one
+ *  @param M   rows, >= 1
+ *  @param K   input width (a multiple of 128)
+ *  @param N   logical output width (a multiple of 4)
+ *  @param d   out
+ *  @return 0; -1 when the device cannot say or the arguments are out of range */
+int ds4_exl3_dense_prompt_describe(int k2, int M, int K, int N, ds4_exl3_dense_prompt_desc *d);
