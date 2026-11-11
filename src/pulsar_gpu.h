@@ -173,9 +173,9 @@ int pulsar_gpu_layout_supported(uint32_t layout, const char **need);
  *  runtime version.  The disk-KV store identity carries them (pulsar_engine_kv_identity), so KV bytes written by other
  *  arithmetic are never resumed as this process's.
  *  @param cc       receives the compute capability, major * 10 + minor (pulsar_cuda_device_cc; 0 if unknown)
- *  @param cublaslt receives cublasLtGetVersion()
- *  @param cudart   receives cudaRuntimeGetVersion() (0 if it fails) */
-void pulsar_gpu_arithmetic(uint32_t *cc, uint32_t *cublaslt, uint32_t *cudart);
+ *  @param gemm_lib receives cublasLtGetVersion()
+ *  @param runtime  receives cudaRuntimeGetVersion() (0 if it fails) */
+void pulsar_gpu_arithmetic(uint32_t *cc, uint32_t *gemm_lib, uint32_t *runtime);
 /** @brief Synchronize the device, clear the routed-expert flags and weight caches and free the model arenas
  *  (process teardown, or before another engine opens in the same process). */
 void pulsar_gpu_cleanup(void);

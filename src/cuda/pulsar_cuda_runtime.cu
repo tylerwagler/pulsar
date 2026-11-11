@@ -1363,11 +1363,11 @@ static int cuda_tu_archs_ok(const cudaDeviceProp *prop) {
 
 
 
-void pulsar_gpu_arithmetic(uint32_t *cc, uint32_t *cublaslt, uint32_t *cudart) {
+void pulsar_gpu_arithmetic(uint32_t *cc, uint32_t *gemm_lib, uint32_t *runtime) {
     int rt = 0;
     *cc = (uint32_t)pulsar_cuda_device_cc();
-    *cublaslt = (uint32_t)cublasLtGetVersion();
-    *cudart = cudaRuntimeGetVersion(&rt) == cudaSuccess ? (uint32_t)rt : 0u;
+    *gemm_lib = (uint32_t)cublasLtGetVersion();
+    *runtime = cudaRuntimeGetVersion(&rt) == cudaSuccess ? (uint32_t)rt : 0u;
 }
 
 int pulsar_gpu_layout_supported(uint32_t layout, const char **need) {

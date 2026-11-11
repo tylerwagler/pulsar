@@ -195,18 +195,18 @@ static inline uint32_t pulsar_segstore_identity(uint32_t model_id, uint32_t rout
 struct pulsar_segstore_ident {
     uint32_t model = 0;      ///< pulsar_segstore_identity: model id, routed-expert format, rope
     uint32_t cc = 0;         ///< the device's compute capability, major * 10 + minor
-    uint32_t cublaslt = 0;   ///< cublasLtGetVersion()
-    uint32_t cudart = 0;     ///< cudaRuntimeGetVersion()
+    uint32_t gemm_lib = 0;   ///< cublasLtGetVersion()
+    uint32_t runtime = 0;    ///< cudaRuntimeGetVersion()
     pulsar_segstore_ident() = default;
     /** @param model_word pulsar_segstore_identity
      *  @param cc_        the compute capability, major * 10 + minor
      *  @param lt         the cuBLASLt version
      *  @param rt         the CUDA runtime version */
     pulsar_segstore_ident(uint32_t model_word, uint32_t cc_ = 0, uint32_t lt = 0, uint32_t rt = 0)
-        : model(model_word), cc(cc_), cublaslt(lt), cudart(rt) {}
+        : model(model_word), cc(cc_), gemm_lib(lt), runtime(rt) {}
     /** @param o another identity @return true when every word matches */
     bool operator==(const pulsar_segstore_ident &o) const {
-        return model == o.model && cc == o.cc && cublaslt == o.cublaslt && cudart == o.cudart;
+        return model == o.model && cc == o.cc && gemm_lib == o.gemm_lib && runtime == o.runtime;
     }
     /** @param o another identity @return true when any word differs */
     bool operator!=(const pulsar_segstore_ident &o) const { return !(*this == o); }

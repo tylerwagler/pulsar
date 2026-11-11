@@ -63,7 +63,7 @@ uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) 
 void put_ident(uint8_t *h, const size_t at[3], const pulsar_segstore_ident &id) {
     put32(h + at[0], id.model);
     put32(h + at[1], id.cc);
-    put64(h + at[2], (uint64_t)id.cublaslt | (uint64_t)id.cudart << 32);
+    put64(h + at[2], (uint64_t)id.gemm_lib | (uint64_t)id.runtime << 32);
 }
 /** @param h  a header
  *  @param at where its identity's three fields sit (SEG_ID_AT / RP_ID_AT)
@@ -78,8 +78,8 @@ pulsar_segstore_ident get_ident(const uint8_t *h, const size_t at[3]) {
  *  @param n   bytes at `out` */
 void describe_ident(const pulsar_segstore_ident &id, char *out, size_t n) {
     snprintf(out, n, "model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt %u, CUDA runtime %u",
-             (id.model >> 8) & 0xffffu, id.model & 0xffu, id.model >> 24, id.cc / 10, id.cc % 10, id.cublaslt,
-             id.cudart);
+             (id.model >> 8) & 0xffffu, id.model & 0xffu, id.model >> 24, id.cc / 10, id.cc % 10, id.gemm_lib,
+             id.runtime);
 }
 
 /** @param s at least 40 chars

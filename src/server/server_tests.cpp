@@ -8238,7 +8238,7 @@ static void test_l386_kv_identity_arithmetic(void) {
             char want[200];
             snprintf(want, sizeof want, "this process is [model id %u, routed bits %u, rope fold %u, cc %u.%u, cuBLASLt "
                      "%u, CUDA runtime %u]", (o.model >> 8) & 0xffffu, o.model & 0xffu, o.model >> 24, o.cc / 10,
-                     o.cc % 10, o.cublaslt, o.cudart);
+                     o.cc % 10, o.gemm_lib, o.runtime);
             TEST_ASSERT(l.find(want) != std::string::npos);
         }
         TEST_ASSERT(said == 1);

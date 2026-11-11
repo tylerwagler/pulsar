@@ -354,7 +354,7 @@ pulsar_segstore_ident pulsar_engine_kv_identity(pulsar_engine *e) {
     pulsar_segstore_ident id(pulsar_segstore_identity((uint32_t)pulsar_engine_model_id(e),
                                                       (uint32_t)pulsar_engine_routed_quant_bits(e),
                                                       e ? e->family->rope_id(e) : 0u));
-    pulsar_gpu_arithmetic(&id.cc, &id.cublaslt, &id.cudart);
+    pulsar_gpu_arithmetic(&id.cc, &id.gemm_lib, &id.runtime);
     return id;
 }
 bool pulsar_engine_has_spec_rounds(const pulsar_engine *e) { return e && e->drafter_ops && e->family->spec; }
