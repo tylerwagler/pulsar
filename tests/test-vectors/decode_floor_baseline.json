@@ -73,7 +73,8 @@
         "typescript": 0.0192,
         "cuda": 0.0036,
         "go": 0.0164
-      }
+      },
+      "tolerance_why": "L380 gpuq #701: a second graded run on the same build read 1.002-1.015 of the baseline per workload (medians of 3; python's three repeats spread 9.7% inside a run, its median moved 1.5%). 5% until more runs give Nemotron's own spread."
     }
   }
 }
