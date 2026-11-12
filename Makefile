@@ -2426,12 +2426,18 @@ GEMMA4_REF_ANCHORS = --ref-dir $(call ref_dir_for,$(GEMMA4_GATE_MODEL)) --ref-to
 # L370's two attention faults (a bounded split grid one chunk short; the arm chosen by the call, not the row) had no
 # instrument: session-contract (C1 restore == cold, B6 / F1 verify == decode), bank-adopt, bank-isolation,
 # block-spec, scratch-poison and graph-eager now run on its pack; session-contract and bank-isolation on Nemotron's.
+# L382 (Tyler 2026-11-12: "382 yes"): a DeepSeek lane on the fixture (FRONTIER_MODEL), the contracts no other family's
+# pack can stand in for: session-contract (a cut / resume == cold: the 128-row cut sat broken from 2026-11-03, when
+# DeepSeek left the runner, until 8ab1e6ed), chunk-neutrality, and cuda-multiseq (banks decoding side by side == each
+# alone: DeepSeek's bank isolation, which bank-isolation-gate cannot grade -- it reads declared state, NEED_STATE).
 RUNNER_HOSTED_ARGS ?= --model $(LILICORR_GATE_MODEL) \
 	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
 	$(NEMOTRON_REF_ANCHORS) \
 	--model $(GEMMA4_GATE_MODEL) \
 	--gates=session-contract-gate,bank-isolation-gate,block-spec-gate,scratch-poison-gate,bank-adopt-gate,graph-eager-gate,cuda-reference-gate-story,cuda-reference-gate-code \
-	$(GEMMA4_REF_ANCHORS)
+	$(GEMMA4_REF_ANCHORS) \
+	--model $(FRONTIER_MODEL) \
+	--gates=session-contract-gate,cuda-chunk-neutrality-gate,cuda-multiseq-gate
 # Extra runner options for the primary (e.g. `--needs=fixtures`); empty = its whole table.  gates-dev calls the runner
 # itself and is unaffected.
 RUNNER_PRIMARY_ARGS ?=
