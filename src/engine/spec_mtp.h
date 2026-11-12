@@ -136,7 +136,7 @@ struct pulsar_mtp_lane {
     /// ops->head_width(e): floats in one headed row's logits.
     uint32_t head_width;
     pulsar_gpu_tensor *cond;    ///< [max_rows] the conditioning rows a module step reads
-    uint32_t *pend_pos;         ///< [n_banks] the parked row's position; UINT32_MAX = none
+    TokPos *pend_pos;           ///< [n_banks] the parked row's position; none() = no parked row
     bool *stage_dirty;          ///< [n_banks] a chain wrote draft rows into the saved stage (stage_save)
     int32_t vtok[PULSAR_DRIVER_HEADS_MAX];   ///< the last verify step's tokens, by step row (pulsar_mtp_note_verify)
     /// Valid entries of vtok (<= PULSAR_DRIVER_HEADS_MAX).

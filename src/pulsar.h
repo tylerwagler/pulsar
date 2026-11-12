@@ -1690,8 +1690,8 @@ uint32_t pulsar_session_spec_next_rows_max(const pulsar_session *s);
  * pulsar_session_spec_round_end the bank's frontier must equal this plus the
  * accepted count it returned (L155); the server checks exactly that. */
 /** @param r the round
- *  @return the base position, or -1 without a round */
-int pulsar_spec_round_saved_len(const pulsar_spec_round *r);
+ *  @return the base position, none() without a round */
+TokPos pulsar_spec_round_saved_len(const pulsar_spec_round *r);
 /** L112: the adaptive draft controller's current depth for a bank (live state
  * for the live bank, saved carry otherwise; bank 0 in bankless sessions).
  * 0 = no drafter / nothing valid. Pure host read for metrics/monitoring. */

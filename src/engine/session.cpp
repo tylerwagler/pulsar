@@ -1615,7 +1615,7 @@ void pulsar_session::rewind(TokPos at) {
     auto *s = this;
     /* none() or a negative raw (a TP frame's value) rewinds to 0 and a position past the history to its end, as
      * the int did */
-    const TokPos end = TokPos::after(TokCount{s->checkpoint.len});
+    const TokPos end = s->hist_end();
     const TokPos pos = at.is_none() || at.raw() < 0 ? TokPos{0} : at > end ? end : at;
     s->trim_history(pos);
     s->logits_stale = true;
@@ -1672,7 +1672,7 @@ void pulsar_session::trim_history(TokPos pos) {
      * could reuse rows that no longer exist (L226).  L281: the blocks BELOW it survive, records and all -- before,
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
     pulsar_image_identity_trim(&s->live_images, (uint32_t)pos.before().raw());
-    s->checkpoint.len = pos.before().raw();   /* L334 P2b S5: checkpoint.len stays int */
+    s->checkpoint.len = pos.before().raw();   /* the token_vec's int length (hist_end() reads it back) */
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
@@ -1685,7 +1685,7 @@ void pulsar_session::trim_history(TokPos pos) {
 bool pulsar_session::restore_checkpoint(TokPos G) {
     auto *s = this;
     const uint32_t bank = gpu_graph_cur_bank(s->graph);
-    if (!s->checkpoint_valid || G.is_none() || G <= TokPos{0} || G > TokPos::after(TokCount{s->checkpoint.len}) ||
+    if (!s->checkpoint_valid || G.is_none() || G <= TokPos{0} || G > s->hist_end() ||
         pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
     if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer

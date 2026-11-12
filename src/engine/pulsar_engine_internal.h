@@ -2465,7 +2465,7 @@ typedef struct pulsar_spec_carry_state {
      * stays true under p/q. The cost of staleness is throughput; we drop stale
      * pendings because a draft conditioned on the wrong position is a wasted
      * verify row. Mirrors spec_carry_pos. */
-    int32_t pend_pos;
+    TokPos pend_pos;
     /** Speculative-sampling carry: the next base token, already drawn from the
      * request's filtered distribution (bonus draw on full accept, residual
      * draw on rejection) but NOT yet forwarded through the target. The next
@@ -2475,7 +2475,7 @@ typedef struct pulsar_spec_carry_state {
     bool spec_carry_valid;     ///< false once the carry has been consumed or voided
     /** checkpoint.len the carry was drawn at; any session advance outside the
      * speculative path (sync, plain eval) moves it and voids the carry */
-    int32_t spec_carry_pos;
+    TokPos spec_carry_pos;
     /** sampling params the carry was drawn under; a param change between calls
      * drops the carry and redraws from s->logits (exact: the carry was never
      * emitted or forwarded) */
@@ -3456,6 +3456,14 @@ struct pulsar_session {
     /** Committed token count for the current bank. */
     /// @return the history length, in tokens.
     int pos();
+    /** L334 P2b S5: where the committed history ends -- the position after its last token (checkpoint.len is the
+     *  token_vec's int; this is its one typed reading). */
+    /// @return the history's end
+    TokPos hist_end() const { return TokPos::after(TokCount{checkpoint.len}); }
+    /** Set where the committed history ends -- the token_vec's length, nothing else (trim_history is the cut that
+     *  drops what described the positions above).  A spec round's undo / commit moves it so. */
+    /// @param end the history's new end
+    void hist_set_end(TokPos end) { checkpoint.len = end.before().raw(); }
     /** Allocated context length, in tokens. */
     /// @return ctx_size.
     int ctx();

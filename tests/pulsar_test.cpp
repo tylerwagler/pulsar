@@ -4644,11 +4644,12 @@ static void test_spec_round_refusals(void) {
     /* O39: five drafts pending at position 3 of a 6-token context -- rows at 3, 4, 5: the base and two drafts */
     s->spec.n_pend = 5;
     s->spec.pend_base = 4;
-    s->spec.pend_pos = 3;
+    s->spec.pend_pos = TokPos{3};
     s->spec.pend_top_p = 1.0f;
     for (int i = 0; i < 5; i++) s->spec.pend[i] = 5;
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.0f, 0, 1.0f, 0.0f, err, sizeof err) == 0);
-    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 && pulsar_spec_round_saved_len(r) == 3);
+    TEST_ASSERT(pulsar_spec_round_n_rows(r) == 3u && s->checkpoint.len == 6 &&
+                pulsar_spec_round_saved_len(r) == TokPos{3});
     /* L155: accepted[] of 2 for a round of 3 rows -- refused before anything commits, the round undone */
     TEST_ASSERT(pulsar_session_spec_round_end_forced(s, r, 4, 0.0f, 0, 1.0f, 0.0f, NULL, 0u, truth, acc, 2, err,
                                                      sizeof err) == -1 && strstr(err, "accepted[]") != NULL);
@@ -4657,7 +4658,7 @@ static void test_spec_round_refusals(void) {
     s->checkpoint_valid = true;
     s->spec.n_pend = 1;
     s->spec.pend_base = 4;
-    s->spec.pend_pos = 3;
+    s->spec.pend_pos = TokPos{3};
     s->spec.pend_temp = 0.7f;
     s->spec.pend_top_p = 1.0f;
     TEST_ASSERT(pulsar_session_spec_round_begin_local(s, r, 4, 17, 17, 0.7f, 0, 1.0f, 0.0f, err, sizeof err) == 0 &&

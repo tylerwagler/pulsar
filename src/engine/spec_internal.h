@@ -48,7 +48,7 @@ typedef struct pulsar_spec_round {
     int32_t base;           ///< the round's base token (verify row 0, at saved_len)
     uint32_t K;             ///< draft depth this round: tokens the drafter proposed
     uint32_t n_batch;       ///< rows the verify forward evaluates (K + the base row)
-    int saved_len;          ///< checkpoint length before the round, to trim back to on rejection
+    TokPos saved_len;       ///< the history's end before the round (its base row's position), the undo's cut
     int32_t pend[16];       ///< the drafted token ids, in draft order
     float pend_conf[16];    ///< confidence head's score per draft position
     bool copy;              ///< L288: the drafts are a copy chain (their verdict feeds the copy acceptance)

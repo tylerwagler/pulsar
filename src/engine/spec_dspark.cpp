@@ -650,7 +650,7 @@ static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = r->n_batch;
     g->spec_comp_save_n = r->n_batch;   /* Stage-B: save per-position comp projections */
-    const bool ok = gpu_graph_verify_suffix(g, &e->model, &e->weights, &s->checkpoint, (uint32_t)r->saved_len,
+    const bool ok = gpu_graph_verify_suffix(g, &e->model, &e->weights, &s->checkpoint, pulsar_ckpt_raw(r->saved_len),
                                             r->n_batch);
     g->dspark_capture_batch_n = 0;
     g->spec_comp_save_n = 0;
@@ -833,7 +833,7 @@ static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit,
     if (commit == r->K) return true;
     if (!ds4_spec_restore(s, r)) return false;
     return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights,
-                                                   (uint32_t)r->saved_len, 1u + commit, row0);
+                                                   pulsar_ckpt_raw(r->saved_len), 1u + commit, row0);
 }
 
 const pulsar_spec_target_ops k_ds4_spec_target = {

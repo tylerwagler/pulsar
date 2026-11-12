@@ -917,7 +917,7 @@ static bool driver_spec_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t
     if (!driver_verify_rows(s, reqs, r->n_batch, tok, pos, bank, NULL, 0)) return false;
     const uint32_t keep = 1u + commit;
     if (!pulsar_state_commit(ss, ss->live_bank, tok, keep)) return false;
-    pulsar_state_set_pos(ss, ss->live_bank, (uint32_t)r->saved_len + keep);
+    pulsar_state_set_pos(ss, ss->live_bank, pulsar_ckpt_raw(r->saved_len) + keep);   /* L334 P2b S7a: bank_pos raw */
     s->logits_stale = false;
     return true;
 }

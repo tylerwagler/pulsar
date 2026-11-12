@@ -112,9 +112,11 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
     const pulsar_gpu_graph *g = s->graph;
     const uint32_t bank = gpu_graph_cur_bank(g);
     if (s->mseq_dirty || g->ms_comp_state_stale[bank]) return false;
+    const TokCount len = s->hist_end().before();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
         if (gpu_graph_layer_is_kv_source(il) &&
-            gpu_graph_n_comp(g, bank, il) > (uint32_t)s->checkpoint.len / pulsar_layer_compress_ratio(il))
+            gpu_graph_n_comp(g, bank, il) >   /* L334 P2b S8: n_comp's CompRows */
+                (uint32_t)pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}).raw())
             return false;
     return true;
 }

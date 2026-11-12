@@ -123,7 +123,7 @@ static void force_pendings(pulsar_session *s, const std::vector<int32_t> &ref, s
     sp.n_pend = k;
     sp.pend_copy = false;
     sp.pend_base = sp.spec_carry_token;
-    sp.pend_pos = (int32_t)s->checkpoint.len;
+    sp.pend_pos = s->hist_end();
     sp.pend_temp = 0.0f;
     sp.pend_top_k = 0;
     sp.pend_top_p = 1.0f;
@@ -389,9 +389,9 @@ static int exact(pulsar_engine *e, int n, const char *only) {
                   "M0 a session builds the block drafter's lane (no MTP lane) and the prefill absorbs its context: %s", err);
         } else {
             const pulsar_mtp_lane *l = made && s->driver ? s->driver->mtp : NULL;
-            CHECK(synced && l && l->modules >= 1 && l->pend_pos[0] == (uint32_t)P[0].len - 1u,
+            CHECK(synced && l && l->modules >= 1 && l->pend_pos[0] == TokPos{P[0].len - 1},
                   "M0 a session builds the lane (%u module(s)) and the prefill parks bank 0's row at %d (%d): %s",
-                  l ? l->modules : 0u, P[0].len - 1, l ? (int)l->pend_pos[0] : -2, err);
+                  l ? l->modules : 0u, P[0].len - 1, l ? l->pend_pos[0].raw() : -2, err);
         }
         if (s) pulsar_session_free(s);
     }

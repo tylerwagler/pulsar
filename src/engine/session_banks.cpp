@@ -284,7 +284,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     spec_lookahead_reset(s);
     pulsar_session_note_committed(s, toks, n);
     s->checkpoint_valid = true;
-    s->prefill_frontier = TokPos::after(TokCount{s->checkpoint.len});   /* L195: a prefill wrote up to here */
+    s->prefill_frontier = s->hist_end();   /* L195: a prefill wrote up to here */
     if (head >= 0) {
         /* the step's rows are still the session's (L302: nothing ran since the fused step) */
         if (!s->live_from_rows(s->dev.step_rows, s->fused_n_dec + (uint32_t)head)) return 1;
