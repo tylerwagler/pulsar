@@ -988,9 +988,9 @@ kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored);
  *  whatever changes the bank's conversation drops it. */
 /// @param pick             the state the request's sync starts from
 /// @param at               where it starts computing (kv_req_line::at)
-/// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), 0 = none
+/// @param bank_prompt_end  the bank's prompt-end record (pulsar_session_bank_prompt_end), none() = none
 /// @return true when the request's syncs waive the cut
-bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end);
+bool server_endpoint_waive(kv_pick pick, TokPos at, TokPos bank_prompt_end);
 /** L380: the reply a finished turn left on its bank, as the turn's end found it (server::slot_turn_reply): the rows
  *  a terminal checkpoint of the turn syncs.  Positions on the bank's history (the live side).  The next job bound to
  *  the slot takes it (server::gen_begin) and reads its own prompt against it (server_reply_use). */

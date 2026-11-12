@@ -2102,8 +2102,9 @@ kv_pick kv_pick_of_source(const char *cache_source, bool spill_restored) {
     return KV_PICK_LIVE;   /* responses-visible, responses-tool-output, anthropic-tool-output */
 }
 
-bool server_endpoint_waive(kv_pick pick, int at, int bank_prompt_end) {
-    return (pick == KV_PICK_OWN || pick == KV_PICK_LIVE) && bank_prompt_end > 0 && at >= bank_prompt_end;
+bool server_endpoint_waive(kv_pick pick, TokPos at, TokPos bank_prompt_end) {
+    return (pick == KV_PICK_OWN || pick == KV_PICK_LIVE) && !at.is_none() && !bank_prompt_end.is_none() &&
+           bank_prompt_end > TokPos{0} && at >= bank_prompt_end;
 }
 
 reply_use server_reply_use(kv_pick pick, int common, bool extends, const slot_reply *r) {

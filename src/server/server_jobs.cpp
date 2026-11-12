@@ -1330,8 +1330,8 @@ void server::gen_begin_plan(session_slot *sl, gen_resolution *r) {
         j->kvr.reply = use == REPLY_USE_CONTINUED ? 1 : use == REPLY_USE_LEFT ? 0 : -1;
     }
     /* L380: read before any sync of this request moves the bank's prompt-end record */
-    g->endpoint_waive = server_endpoint_waive(j->kvr.pick, resumed_at.raw(),
-                                              pulsar_session_bank_prompt_end(s->sess, sl->bank).raw());
+    g->endpoint_waive =
+        server_endpoint_waive(j->kvr.pick, resumed_at, pulsar_session_bank_prompt_end(s->sess, sl->bank));
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by pulsar_session_sync() is written into
      * the live KV cache and can be reused by the next request. */

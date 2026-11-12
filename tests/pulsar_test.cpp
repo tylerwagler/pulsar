@@ -6173,8 +6173,7 @@ static void test_ckpt_records(void) {
      * prompt-end record, so it follows the record's life.  Bank 0, a conversation's requests in order: */
     for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, b);
     const auto WAIVE = [st](kv_pick pick, int at, uint32_t bank) {
-        const TokPos end = pulsar_ckpt_end(st, bank);   /* L334 P2b: none() is the waiver's 0 */
-        return server_endpoint_waive(pick, at, end.is_none() ? 0 : end.raw());
+        return server_endpoint_waive(pick, TokPos{at}, pulsar_ckpt_end(st, bank));
     };
     /* no history: the cut, wherever the request starts */
     TEST_ASSERT(!WAIVE(KV_PICK_NONE, 0, 0) && !WAIVE(KV_PICK_OWN, 300, 0) && !WAIVE(KV_PICK_LIVE, 300, 0));

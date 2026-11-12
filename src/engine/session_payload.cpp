@@ -441,7 +441,9 @@ static uint64_t restore_point_bytes_for(const pulsar_ckpt_store *st) {
 int pulsar_session_span_image_hashes(pulsar_session *s, TokPos G_prev, TokPos G, uint64_t *hashes, int cap) {
     const pulsar_image_block *first = NULL;
     uint32_t n = 0;
-    if (!s || !segment_images(s, (uint32_t)G_prev.raw(), (uint32_t)G.raw(), &first, &n)) return -1;
+    if (!s || G_prev.is_none() || G.is_none() ||
+        !segment_images(s, pulsar_ckpt_raw(G_prev), pulsar_ckpt_raw(G), &first, &n))
+        return -1;
     if ((int)n > cap) return -1;
     for (uint32_t i = 0; i < n; i++) hashes[i] = first[i].content;
     return (int)n;
@@ -1043,8 +1045,8 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
     }
     /* the deepest checkpoint at or below the prefill frontier's grid point: what a sync that does not extend
      * the frontier restores */
-    const TokPos best = pulsar_ckpt_best(p->st, p->bank, pulsar_ckpt_grid_floor(p->st, TokPos{(int)p->PF}));
-    p->G = best.is_none() ? 0u : (uint32_t)best.raw();   /* L334 P2b S4: the payload's raw field, 0 = none */
+    const TokPos best = pulsar_ckpt_best(p->st, p->bank, pulsar_ckpt_grid_floor(p->st, pulsar_ckpt_pos(p->PF)));
+    p->G = best.is_none() ? 0u : pulsar_ckpt_raw(best);   /* the payload format's u32: 0 = no checkpoint */
     p->bytes = kvp_bytes_for(p->st, p->pools, p->n_pools, p->T, p->G, s->live_images.n, p->width);
     return true;
 }

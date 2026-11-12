@@ -2030,7 +2030,7 @@ TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank);
  *  drops the record). */
 /** @param s the session
  *  @param bank the bank
- *  @return the record's position, 0 when the bank holds none */
+ *  @return the record's position, none() when the bank holds none (L334: it was 0) */
 TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank);
 /** Bank `bank`'s committed token history (the per-bank readers above).
  *  @param s the session

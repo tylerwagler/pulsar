@@ -88,7 +88,7 @@ uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos
     /* L264 / P13: the final chunk stops at the last grid point inside it (pulsar_ckpt_final_cut), so the prefill
      * leaves the checkpoint the next turn resumes from -- not when that point falls inside an image block */
     if (pos0 + chunk == end) {
-        /* L334 P2b S4: the plan stays raw (its start is the resume rule's) */
+        /* L334 P2b S7b: the planner's chunk arithmetic stays raw (a prefill chunk is a run of the step's row map) */
         const uint32_t cut =
             pulsar_ckpt_raw(pulsar_ckpt_final_cut(p->store, pulsar_ckpt_pos(pos0), pulsar_ckpt_pos(end)));
         uint32_t bs = 0, be = 0;

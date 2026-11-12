@@ -159,7 +159,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
      * the deepest checkpoint at or below the prefill frontier -- the tokens generated since are prefilled
      * again and the prompt is the cold prefill's bytes, as DeepSeek's sync does it (L195) */
     const bool extends = continuable && common == s->checkpoint.len && common < prompt->len &&
-                         pulsar_session_bank_continues(s, live, common, PULSAR_BANK_VIEW_CURRENT);
+                         pulsar_session_bank_continues(s, live, TokCount{common}, PULSAR_BANK_VIEW_CURRENT);
     /* the same prompt is a no-op only while the logits are its next-token row; when they are stale the
      * resume below stops one token short, so the last row is evaluated again */
     if (continuable && common == s->checkpoint.len && common == prompt->len && !s->logits_stale) return 0;
@@ -175,21 +175,24 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             if (err) snprintf(err, errlen, "%s: the request's image blocks do not read", ops->name);
             return 1;
         }
-        uint32_t G = pulsar_session_resume_point(s, live, common, prompt->len, &want, PULSAR_BANK_VIEW_CURRENT);
+        const TokCount plen{prompt->len};
+        TokPos G_at = pulsar_session_resume_point(s, live, TokCount{common}, plen, &want, PULSAR_BANK_VIEW_CURRENT);
         /* L289 / L311: a resume at a record (the bank's prompt end or message endpoint) rather than a grid point;
          * L350: a record's images were matched against the request's with its ids */
-        const pulsar_ckpt_record *rec =
-            G ? pulsar_session_resume_record(s, live, G, prompt->len, &want, PULSAR_BANK_VIEW_CURRENT) : NULL;
+        const pulsar_ckpt_record *rec = G_at > TokPos{0}
+            ? pulsar_session_resume_record(s, live, G_at, plen, &want, PULSAR_BANK_VIEW_CURRENT) : NULL;
         /* L268: the KV below a grid point G is kept only when the bank's image records are the request's there, and G
          * is outside every block (its merged rows cannot be re-evaluated) */
-        if (G && !rec && !pulsar_image_holds_below(e, &s->live_images, prompt, images, n_images, G)) {
-            fprintf(stderr, "pulsar: %s: bank %u's checkpoint at %u holds other images (or cuts a block) -- "
-                            "prefilling from 0\n", ops->name, live, G);
-            G = 0;
+        if (G_at > TokPos{0} && !rec &&
+            !pulsar_image_holds_below(e, &s->live_images, prompt, images, n_images, pulsar_ckpt_raw(G_at))) {
+            fprintf(stderr, "pulsar: %s: bank %u's checkpoint at %d holds other images (or cuts a block) -- "
+                            "prefilling from 0\n", ops->name, live, G_at.raw());
+            G_at = TokPos{0};
         }
+        const uint32_t G = pulsar_ckpt_raw(G_at);   /* the log's and the prefill walk's start (raw: the planner) */
         pulsar_ckpt_store *st = pulsar_session_kv_store(s);
         s->checkpoint_valid = false;   /* the state moves below; the prefill loop re-establishes the view */
-        if (rec && G == (uint32_t)prompt->len) {
+        if (rec && G_at == TokPos::after(plen)) {
             /* L289: the resume rule picks the whole prompt only at a record that keeps its logits: the record's state
              * is the prefill's own at G, copied whole (its tokens are the prompt's: the rule matched them), with the
              * logits that prefill headed -- nothing is evaluated */
@@ -202,9 +205,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             if (rec->img) s->live_images = *rec->img;
             s->checkpoint.len = (int)G;
             s->checkpoint_valid = true;
-            s->prefill_frontier = pulsar_ckpt_pos(G);
+            s->prefill_frontier = G_at;
             s->logits_stale = false;
-            s->resume_origin = pulsar_ckpt_pos(G);
+            s->resume_origin = G_at;
             fprintf(stderr, "pulsar: %s: bank %u resumes at its prompt end %u -- the same prompt, no row evaluated\n",
                     ops->name, live, G);
             return 0;
@@ -223,8 +226,8 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             if (rec->img) s->live_images = *rec->img;
             fprintf(stderr, "pulsar: %s: bank %u resumes from its %s at %u (prompt %d, shared %d)\n", ops->name, live,
                     rec->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", G, prompt->len, common);
-        } else if (G) {
-            if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, TokPos{(int)G})) {   /* L334 P2b S4 */
+        } else if (G_at > TokPos{0}) {
+            if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G_at)) {
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);
                 return 1;
             }

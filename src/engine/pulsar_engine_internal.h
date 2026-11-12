@@ -4196,9 +4196,9 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
 /// @param prompt_len  the prompt's length, in tokens
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @param view        L380: the bank's host view the history and the prefill frontier are read in
-/// @return the resume position, in tokens (0 = from the start).
-uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
-                                     const pulsar_image_identity *want, pulsar_bank_view view);
+/// @return the resume position (position 0 = from the start).
+TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount common, TokCount prompt_len,
+                                   const pulsar_image_identity *want, pulsar_bank_view view);
 /** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
  *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
 /// @param s           the session
@@ -4208,8 +4208,9 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @param view        L380: the bank's host view the history is read in
 /// @return the record (borrowed from the store), or NULL.
-const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, uint32_t T, int prompt_len,
-                                                       const pulsar_image_identity *want, pulsar_bank_view view);
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, TokPos T,
+                                                       TokCount prompt_len, const pulsar_image_identity *want,
+                                                       pulsar_bank_view view);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
  * those tokens are all prefill rows (none a decode step's), the cut is one the model's prefill reproduces
  * (anywhere when pulsar_kv_state_ops::split_invariant, else on the resume grid) and the bank's state is not
@@ -4219,7 +4220,7 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
 /// @param len   tokens of the bank's history the sync keeps
 /// @param view  L380: the bank's host view the prefill frontier is read in
 /// @return true when the sync can continue there.
-bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len, pulsar_bank_view view);
+bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, TokCount len, pulsar_bank_view view);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 /// @param s       the session
