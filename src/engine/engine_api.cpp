@@ -1453,7 +1453,8 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     if (limit > (uint32_t)prompt_len - 1u) limit = (uint32_t)prompt_len - 1u;
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops) return 0u;
-    const uint32_t G = limit ? pulsar_ckpt_best(st, bank, limit) : 0u;
+    const TokPos best = limit ? pulsar_ckpt_best(st, bank, TokPos{(int)limit}) : TokPos::none();
+    const uint32_t G = best.is_none() ? 0u : (uint32_t)best.raw();   /* L334 P2b S4: the resume rule's body stays raw */
     /* L289 / L311: the bank's records (its prompt end, its message endpoint) -- the prefill's own state at an exact
      * T the prompt carries (T within the match and the prefilled history).  A record AT the prompt's end resumes
      * there with the logits its prefill left, no row evaluated, every family.  One below it resumes from T and
@@ -1464,7 +1465,8 @@ uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int commo
     if (rlimit > (uint32_t)prompt_len) rlimit = (uint32_t)prompt_len;
     const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
     const pulsar_ckpt_record *r =
-        h ? pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, rlimit, (uint32_t)prompt_len, want) : NULL;
+        h ? pulsar_ckpt_record_best(st, bank, h->v, TokCount{h->len}, TokPos{(int)rlimit}, TokCount{prompt_len}, want)
+          : NULL;
     if (r && r->T > G && (r->T == (uint32_t)prompt_len || st->ops->split_invariant)) return r->T;
     return G;
 }
@@ -1474,9 +1476,11 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
     /* below the prompt's end a grid checkpoint at T is the restore; AT it only a record (its logits) serves */
-    if (!st || !st->ops || !h || T == 0u || (T < (uint32_t)prompt_len && pulsar_ckpt_best(st, bank, T) == T))
+    if (!st || !st->ops || !h || T == 0u ||
+        (T < (uint32_t)prompt_len && pulsar_ckpt_best(st, bank, TokPos{(int)T}) == TokPos{(int)T}))
         return NULL;
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, (uint32_t)h->len, T, (uint32_t)prompt_len, want);
+    const pulsar_ckpt_record *r =
+        pulsar_ckpt_record_best(st, bank, h->v, TokCount{h->len}, TokPos{(int)T}, TokCount{prompt_len}, want);
     return r && r->T == T ? r : NULL;
 }
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len, pulsar_bank_view view) {
@@ -1502,7 +1506,8 @@ TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, uint32_t bank) {
     return bank_prefill_frontier_as(s, bank, PULSAR_BANK_VIEW_CURRENT); }
 TokPos pulsar_session_bank_prompt_end(pulsar_session *s, uint32_t bank) {
     const pulsar_ckpt_store *st = s ? pulsar_session_kv_store(s) : NULL;
-    return TokPos{st && st->ops ? (int)pulsar_ckpt_end(st, bank) : 0};
+    const TokPos end = st && st->ops ? pulsar_ckpt_end(st, bank) : TokPos::none();
+    return end.is_none() ? TokPos{0} : end;   /* L334 P2b S4: this API still says 0 for "no prompt end" (hazard c) */
 }
 int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, uint32_t bank) {
@@ -1985,7 +1990,8 @@ void pulsar_engine_spec_cost_set(pulsar_engine *e, int32_t flat_us, int32_t row_
 TokPos pulsar_session_checkpoint_best(pulsar_session *s, TokPos limit) {
     if (!s || limit.is_none() || limit <= TokPos{0}) return TokPos{0};
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    return TokPos{st && st->ops ? (int)pulsar_ckpt_best(st, pulsar_session_live_bank(s), (uint32_t)limit.raw()) : 0};
+    const TokPos best = st && st->ops ? pulsar_ckpt_best(st, pulsar_session_live_bank(s), limit) : TokPos::none();
+    return best.is_none() ? TokPos{0} : best;   /* L334 P2b S4: this API still says 0 for none */
 }
 pulsar_bank_resume pulsar_session_bank_resume_at(pulsar_session *s, uint32_t bank, const pulsar_tokens *prompt,
                                                  const pulsar_image_ref *images, int n_images) {
@@ -2045,7 +2051,7 @@ pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, uint32_t 
         const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
         why = m.live_cut == TokCount{0}                                  ? PULSAR_RESUME_NO_MATCH
               : m.live_cut == TokCount{t->len}                           ? PULSAR_RESUME_NOT_CONTINUED
-              : st && st->ops && pulsar_ckpt_best(st, bank, UINT32_MAX)  ? PULSAR_RESUME_CHECKPOINT_ABOVE
+              : st && st->ops && !pulsar_ckpt_deepest(st, bank).is_none() ? PULSAR_RESUME_CHECKPOINT_ABOVE
                                                                          : PULSAR_RESUME_NO_CHECKPOINT;
     }
     const TokPos at{(int)G};
@@ -2153,7 +2159,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
      * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank, banks that differ in
      * runtime adapter, O46) leaves the bank exactly what its view describes */
     bool moved = false;
-    bool ok = pulsar_ckpt_adopt(st, dst, src, T, r, &moved);
+    bool ok = pulsar_ckpt_adopt(st, dst, src, TokPos{(int)T}, r, &moved);   /* L334 P2b S4: T stays raw here */
     if (moved) s->checkpoint_valid = false;   /* the state moved */
     if (ok && at_end) {
         memcpy(s->logits, end_row.data(), end_row.size() * sizeof(float));

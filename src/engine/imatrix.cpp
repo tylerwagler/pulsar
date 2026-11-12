@@ -838,7 +838,7 @@ static bool ds4_range_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last) {
 /// @return the checkpoint rule's verdict
 static bool ds4_range_landed(void *ud, uint32_t chunk_end) {
     pulsar_gpu_graph *g = ((const ds4_range *)ud)->g;
-    return pulsar_ckpt_landed(&g->ckpt, gpu_graph_cur_bank(g), chunk_end);
+    return pulsar_ckpt_landed(&g->ckpt, gpu_graph_cur_bank(g), TokPos{(int)chunk_end});
 }
 
 bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *model, const pulsar_weights *weights,

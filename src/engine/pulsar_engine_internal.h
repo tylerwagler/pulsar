@@ -2011,7 +2011,7 @@ static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, uint32_t bank, uint
      * prompt end inside the group (L289) survives a round's rollback to it. */
     if (rows < g->ms_n_comp[bank][il]) {
         const uint32_t R = pulsar_layer_compress_ratio(il);
-        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, rows * R + R - 1u);
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, pulsar_comp_rows_serve(CompRows{(int)rows}, TokPerRow{R}));
     }
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
@@ -4818,7 +4818,7 @@ typedef struct {
 /// @return true when the walk plans no endpoint cut
 static inline bool pulsar_prefill_endpoint_waived(const pulsar_ckpt_store *store, uint32_t E, uint32_t end,
                                                   bool waive) {
-    return waive && pulsar_ckpt_grid_floor(store, end) <= E;
+    return waive && pulsar_ckpt_grid_floor(store, TokPos{(int)end}) <= TokPos{(int)E};
 }
 /** L311: the prompt's MESSAGE ENDPOINT -- where its last turn marker begins (pulsar_turn_marker_at): the history of
  *  complete messages before the generation header, the point an agent's side request (the same history plus a

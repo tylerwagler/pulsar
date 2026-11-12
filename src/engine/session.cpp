@@ -1647,8 +1647,8 @@ void pulsar_session::rewind(int pos) {
         pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
         ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
     }
-    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, (uint32_t)pos) == (uint32_t)pos)
-        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, (uint32_t)pos);
+    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, TokPos{pos}) == TokPos{pos})   /* L334 P2b S3: pos stays int */
+        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, TokPos{pos});
     else {
         s->graph->ms_comp_state_stale[rw_bank] = true;
         return;
@@ -1682,8 +1682,8 @@ bool pulsar_session::restore_checkpoint(uint32_t G) {
     auto *s = this;
     const uint32_t bank = gpu_graph_cur_bank(s->graph);
     if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
-    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
+        pulsar_ckpt_best(&s->graph->ckpt, bank, TokPos{(int)G}) != TokPos{(int)G}) return false;   /* L334 P2b S3 */
+    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, TokPos{(int)G})) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;

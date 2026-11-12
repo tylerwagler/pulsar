@@ -88,7 +88,7 @@ uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos
     /* L264 / P13: the final chunk stops at the last grid point inside it (pulsar_ckpt_final_cut), so the prefill
      * leaves the checkpoint the next turn resumes from -- not when that point falls inside an image block */
     if (pos0 + chunk == end) {
-        const uint32_t cut = pulsar_ckpt_final_cut(p->store, pos0, end);
+        const uint32_t cut = (uint32_t)pulsar_ckpt_final_cut(p->store, TokPos{(int)pos0}, TokPos{(int)end}).raw();   /* L334 P2b S3: the walk stays raw */
         uint32_t bs = 0, be = 0;
         if (!prefill_plan_block_across(p, cut, &bs, &be)) chunk = cut - pos0;
     }
@@ -327,10 +327,10 @@ static bool prefill_loop_landed(void *ud, uint32_t chunk_end) {
     pulsar_session *s = c->s;
     for (int i = s->checkpoint.len; i < (int)chunk_end; i++) token_vec_push(&s->checkpoint, c->prompt->v[i]);
     s->checkpoint_valid = true;
-    if (!pulsar_ckpt_landed(c->ckpt, c->bank, chunk_end)) return false;
+    if (!pulsar_ckpt_landed(c->ckpt, c->bank, TokPos{(int)chunk_end})) return false;
     /* L311: the walk stands at the prompt's message endpoint -- record it (said when it cannot be) */
     if (chunk_end == c->endpoint)   /* L350: with the request's images below it (none for a text history) */
-        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, chunk_end, c->prompt->v, NULL, 0u,
+        (void)pulsar_ckpt_record_capture(c->ckpt, c->bank, PULSAR_CKPT_REC_ENDPOINT, TokPos{(int)chunk_end}, c->prompt->v, NULL, 0u,
                                          s->sync_n_images > 0 ? &s->sync_identity : NULL);
     c->at_resume_point = c->ckpt->ops->split_invariant || chunk_end % c->ckpt->ops->resume_grid == 0u;
     prefill_loop_progress(s, (int)chunk_end, c->prompt->len);
@@ -415,7 +415,7 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t
     if (rc == 0 && (s->sync_n_images > 0 || s->live_images.n == 0)) {
         const float *live = s->live_host();   /* L302: the record keeps the row on the host */
         if (live)
-            (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, end, prompt->v, live,
+            (void)pulsar_ckpt_record_capture(ckpt, c.bank, PULSAR_CKPT_REC_END, TokPos{(int)end}, prompt->v, live,
                                              (uint32_t)pulsar_engine_logits_width(s->engine),
                                              s->sync_n_images > 0 ? &s->sync_identity : NULL);
     }

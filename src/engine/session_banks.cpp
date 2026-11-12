@@ -273,7 +273,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
     /* the shared capture rule (P13): the state stands at G or the record is refused, and G on the grid in a
      * prefill's state is captured -- before the record changes anything */
-    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, G)) {
+    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, TokPos{(int)G})) {   /* L334 P2b S3: G stays raw here */
         fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) %s -- refusing\n", bank, from, G,
                 ck && ck->ops ? "did not land (above)" : "has no checkpoint store");
         return 1;

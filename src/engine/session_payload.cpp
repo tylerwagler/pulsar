@@ -460,7 +460,7 @@ uint64_t pulsar_session::segment_bytes(uint32_t G_prev, uint32_t G, uint64_t *st
 
 uint64_t pulsar_session::restore_point_bytes(uint32_t G) {
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
-    if (G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_holds(st, pulsar_session_live_bank(this), G))
+    if (G == 0u || G % st->ops->resume_grid != 0u || !pulsar_ckpt_holds(st, pulsar_session_live_bank(this), TokPos{(int)G}))
         return 0;
     return restore_point_bytes_for(st);
 }
@@ -523,7 +523,7 @@ int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t by
     /* L354: the same gate as copy_out_segment's: after a rewind or an invalidate the store can still hold the slot, and a
      * restore point of rows the bank no longer holds would resume a history it doesn't have */
     if (!dst || !checkpoint_valid || G == 0u || G > (uint32_t)checkpoint.len || G % st->ops->resume_grid != 0u ||
-        !pulsar_ckpt_locate(st, bank, G, &at)) {
+        !pulsar_ckpt_locate(st, bank, TokPos{(int)G}, &at)) {
         payload_set_err(err, errlen, "copy-out restore point: the installed bank holds no checkpoint there");
         return 1;
     }
@@ -806,7 +806,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
      * (segment_parse already sized them, so they hold unless the pools disagree with the size rule) */
     auto fail = [&](pulsar_segment_status why) { segment_clear(s, st, bank); return why; };
     pulsar_ckpt_slot_at at = {};
-    if (last && !pulsar_ckpt_claim(st, bank, G, &at)) {
+    if (last && !pulsar_ckpt_claim(st, bank, TokPos{(int)G}, &at)) {
         payload_set_err(err, errlen, "load segment: no grid-checkpoint slot");
         return fail(PULSAR_SEGMENT_TRANSIENT);
     }
@@ -851,14 +851,14 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     for (uint32_t p = 0; p < G - G_prev; p++) token_vec_push(&s->checkpoint, (int)payload_get_u32(v.toks + 4u * p));
     for (uint32_t i = 0; i < v.n_img; i++) s->live_images.b[s->live_images.n++] = v.imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, G);
-    if (last) pulsar_ckpt_commit(st, bank, at.slot, G);
+    if (last) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
     s->mseq_dirty = false;   /* L354: as load_payload */
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
      * drafter window with it), else the store's alone (Qwen: its sync owns the rest) */
     const pulsar_family_bank_ops *bops = s->engine->family->banks;
-    if (last && !(bops->restore_checkpoint ? bops->restore_checkpoint(s, G) : pulsar_ckpt_restore(st, bank, G))) {
+    if (last && !(bops->restore_checkpoint ? bops->restore_checkpoint(s, G) : pulsar_ckpt_restore(st, bank, TokPos{(int)G}))) {
         payload_set_err(err, errlen, "load segment: restoring the chain's last checkpoint failed");
         return fail(PULSAR_SEGMENT_TRANSIENT);
     }
@@ -1042,7 +1042,8 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
     }
     /* the deepest checkpoint at or below the prefill frontier's grid point: what a sync that does not extend
      * the frontier restores */
-    p->G = pulsar_ckpt_best(p->st, p->bank, pulsar_ckpt_grid_floor(p->st, p->PF));
+    const TokPos best = pulsar_ckpt_best(p->st, p->bank, pulsar_ckpt_grid_floor(p->st, TokPos{(int)p->PF}));
+    p->G = best.is_none() ? 0u : (uint32_t)best.raw();   /* L334 P2b S4: the payload's raw field, 0 = none */
     p->bytes = kvp_bytes_for(p->st, p->pools, p->n_pools, p->T, p->G, s->live_images.n, p->width);
     return true;
 }
@@ -1065,7 +1066,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     if (!kvp_plan_save(s, &p, err, errlen)) return 1;
     pulsar_ckpt_store *st = p.st;
     pulsar_ckpt_slot_at at = {};
-    if (p.G && !pulsar_ckpt_locate(st, p.bank, p.G, &at)) {
+    if (p.G && !pulsar_ckpt_locate(st, p.bank, TokPos{(int)p.G}, &at)) {
         payload_set_err(err, errlen, "session payload: the resume checkpoint vanished while saving");
         return 1;
     }
@@ -1211,7 +1212,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     pulsar_gpu_tensor *front = NULL;
     auto fail = [&]() { pulsar_gpu_tensor_free(front); segment_clear(s, st, bank); return drop(); };
     pulsar_ckpt_slot_at at = {};
-    if (G && !pulsar_ckpt_claim(st, bank, G, &at)) {
+    if (G && !pulsar_ckpt_claim(st, bank, TokPos{(int)G}, &at)) {
         payload_set_err(err, errlen, "session payload: no grid-checkpoint slot");
         return fail();
     }
@@ -1245,7 +1246,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     st->ops->restored(st->state);
     pulsar_gpu_tensor_free(front);
-    if (G) pulsar_ckpt_commit(st, bank, at.slot, G);
+    if (G) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
     token_vec_free(&s->checkpoint);
     s->checkpoint = toks;
     s->live_images = imgs;

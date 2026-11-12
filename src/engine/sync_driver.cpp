@@ -224,7 +224,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             fprintf(stderr, "pulsar: %s: bank %u resumes from its %s at %u (prompt %d, shared %d)\n", ops->name, live,
                     rec->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", G, prompt->len, common);
         } else if (G) {
-            if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G)) {
+            if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, TokPos{(int)G})) {   /* L334 P2b S4 */
                 if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);
                 return 1;
             }
