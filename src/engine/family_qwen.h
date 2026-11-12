@@ -34,6 +34,7 @@
 #include "pulsar_gpu.h"
 
 #include "family.h"
+#include "pulsar_engine_internal.h"   /* L295 F8 Q2: Qwen's header includes the engine's, not the reverse */
 
 /* ---- 1. Shape -------------------------------------------------------------
  *
@@ -716,5 +717,103 @@ bool pulsar_qwen_s4_step_end(const pulsar_qwen_step *st, bool ok);
 /** Free what S4's load and first steps made: the MXFP8 heads, the draft ids, the PLE row file and its pool.
  * @param w the weights (NULL is a no-op) */
 void pulsar_qwen_s4_unload(pulsar_qwen_weights *w);
+
+
+/* ---- L295 F8 Q1: Qwen's engine-level state, in pulsar_engine::family_state ----------------------------------------
+ * qwen_family_load allocates it, qwen_unload frees it (and what it points to), as every module family does. */
+/** The Qwen4-exp family's state on a loaded engine. */
+struct pulsar_qwen_model {
+    pulsar_qwen_weights *weights;   ///< the bound weights
+    struct bpe_tokenizer *tok;      ///< the tokenizer (L251 S5: src/lib/bpe_tokenizer.h, the checkpoint's own files)
+};
+
+/** The loaded family's state, or NULL on another family's engine. */
+/** @param e  any engine (NULL allowed)
+ *  @return the Qwen state, or NULL */
+static inline pulsar_qwen_model *pulsar_qwen_of(const pulsar_engine *e) {
+    return e && e->family && e->family->id == PULSAR_FAMILY_ID_QWEN4_EXP ? (pulsar_qwen_model *)e->family_state : NULL;
+}
+
+/// The Qwen4-exp family's tokenizer table (tokenizer_qwen.cpp).
+extern const pulsar_family_tokenizer k_qwen_tokenizer;
+/// The Qwen4-exp family's importance-matrix collection (imatrix_qwen.cpp).
+extern const pulsar_family_imatrix k_qwen_imatrix;    // imatrix_qwen.cpp
+
+/* ---- L268: Qwen3.8-Flash-Next's own part of the image path (vision_qwen.cpp) ----
+ * Preprocessing, from the checkpoint's preprocessor_config.json (HF Qwen2VLImageProcessor). */
+/// Qwen vision patch side, in pixels.
+#define PULSAR_QWEN_VISION_PATCH      16u
+/// Qwen vision spatial merge: patches per side merged into one token (2x2).
+#define PULSAR_QWEN_VISION_MERGE      2u
+/// Qwen vision temporal patch size: frames per patch.
+#define PULSAR_QWEN_VISION_TEMPORAL   2u
+/// smart_resize lower bound on the resized area, in pixels.
+#define PULSAR_QWEN_VISION_MIN_PIXELS 65536u      /* size.shortest_edge */
+/// smart_resize upper bound on the resized area, in pixels.
+#define PULSAR_QWEN_VISION_MAX_PIXELS 16777216u   /* size.longest_edge */
+/// Per-channel normalisation mean (after rescale to [0, 1]).
+#define PULSAR_QWEN_VISION_MEAN       0.5
+/// Per-channel normalisation standard deviation.
+#define PULSAR_QWEN_VISION_STD        0.5
+/** One image's patches as the tower takes them: `rows` = grid_h * grid_w patches in 2x2 merge-block order, `cols`
+ *  = 3 * temporal * patch^2 float32 values each (channel, frame, y, x). */
+typedef struct {
+    /// rows x cols float32 values, owned (qwen_vision_pixels_free).
+    float *values;
+    /// Patches: grid_h * grid_w, in 2x2 merge-block order.
+    int rows, cols;
+    /** @var qwen_vision_pixels::cols
+     *  Values per patch: 3 * temporal * patch^2. */
+    int grid_h, grid_w;        ///< the patch grid (the resized image / patch)
+    /** @var qwen_vision_pixels::grid_h
+     *  Patch-grid height (resized_h / patch). */
+    int resized_h, resized_w;  ///< smart_resize's size
+    /** @var qwen_vision_pixels::resized_h
+     *  smart_resize's height, in pixels. */
+} qwen_vision_pixels;
+/** HF's smart_resize: the nearest multiple of patch x merge (Python's half-to-even), scaled into
+ *  [min_pixels, max_pixels].  false + `err` past an aspect ratio of 200. */
+/// @param h       source height, pixels
+/// @param w       source width, pixels
+/// @param h_out   out: resized height
+/// @param w_out   out: resized width
+/// @param err     failure message buffer
+/// @param errlen  its size
+/// @return false + `err` past the aspect-ratio limit.
+bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, size_t errlen);
+/** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
+/// @param bytes   the encoded image
+/// @param len     its length, in bytes
+/// @param out     receives the patches (free with qwen_vision_pixels_free)
+/// @param err     failure message buffer
+/// @param errlen  its size
+/// @return false + `err` on an image that does not decode or resize.
+bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
+void qwen_vision_pixels_free(qwen_vision_pixels *p);
+/** L268: Qwen's image front (vision_qwen.cpp) -- pulsar_family::vision of PULSAR_FAMILY_QWEN4_EXP. */
+extern const pulsar_family_vision PULSAR_QWEN_IMAGE_FRONT;
+/** Bind the tower's `model.visual.*` tensors (bf16, the tower's dims) when the artifact carries them; *present
+ *  says whether it does.  false = it carries a tower that does not bind (said). */
+/// @param m        the model
+/// @param w        receives the tower's weights
+/// @param present  out: the artifact carries a tower
+/// @return true (also with no tower), false when a carried tower does not bind.
+bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present);
+/** Preprocess and encode one image: *rows = malloc'd (*n_rows x PULSAR_QWEN_VISION_OUT) bf16, the rows its
+ *  image_pad block takes, in merge-block raster order.  `dbg` (NULL in production) receives a malloc'd 3 x
+ *  n_patches x PULSAR_QWEN_VISION_DIM stage dump (pulsar_cuda_qwen_vision_forward). */
+/// @param w          the bound tower
+/// @param bytes      the encoded image
+/// @param len        its length, in bytes
+/// @param rows       out: the malloc'd rows (caller frees)
+/// @param n_rows     out: their count
+/// @param dbg        out (NULL in production): the malloc'd stage dump
+/// @param n_patches  out: the image's patches
+/// @param err        failure message buffer
+/// @param errlen     its size
+/// @return false + `err` on a failure (*rows NULL).
+bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
+                        int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen);
+
 
 #endif /* PULSAR_FAMILY_QWEN_H */

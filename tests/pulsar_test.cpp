@@ -38,6 +38,7 @@
 #include "../src/families/gemma4/gemma4.h"         /* L375: each family's tokenizer table and its model's tok */
 #include "../src/families/nemotron_h/nemotron_h.h"
 #include "../src/families/inkling/inkling.h"
+#include "../src/engine/family_qwen.h"          /* L295 F8 Q2: Qwen's tokenizer table and pulsar_qwen_model */
 /* the frozen host sampler (L302): spec-math's oracle */
 #include "sampler_host_ref.h"
 #ifndef PULSAR_NO_GPU
@@ -2420,18 +2421,20 @@ static void test_l375_tokenizer_refusal_is_a_result(void) {
     pulsar_gemma4_model *gm = new pulsar_gemma4_model();
     pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
     pulsar_inkling_model *im = new pulsar_inkling_model();
+    pulsar_qwen_model *qm = new pulsar_qwen_model();   /* L295 F8 Q1: Qwen's tokenizer is its family state's */
+    qm->tok = tok;
     gm->tok = nm->tok = im->tok = tok;
-    void *const state[] = {NULL, gm, nm, im};
+    void *const state[] = {qm, gm, nm, im};
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         pulsar_family fam{};
         fam.arch = fam.name = cases[c].name;
         fam.caps = PULSAR_FAMILY_CAP_CHAT;
         fam.tokenizer = cases[c].table;
+        if (cases[c].fmt == PULSAR_CHAT_QWEN) fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
         g_fmt = cases[c].fmt;
         fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
         pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
         e->family = &fam;
-        e->qwen_tok = tok;
         e->family_state = state[c];
         const char *text = "hello world";
         const pulsar_text_span good[2] = {{0u, 5u}, {6u, 11u}}, bad[2] = {{6u, 11u}, {0u, 5u}};
@@ -2459,9 +2462,9 @@ static void test_l375_tokenizer_refusal_is_a_result(void) {
         const int before = out.len;
         TEST_ASSERT(pulsar_chat_append_turn(e, &out, &ok, 1, true, PULSAR_THINK_NONE) && out.len > before);
         pulsar_tokens_free(&out);
-        e->qwen_tok = NULL;
         free(e);
     }
+    delete qm;
     delete gm;
     delete nm;
     delete im;
@@ -2478,9 +2481,11 @@ static void test_l375_refused_render_fails_the_request(void) {
     fam.arch = fam.name = "qwen";
     fam.caps = PULSAR_FAMILY_CAP_CHAT;
     fam.tokenizer = &k_qwen_tokenizer;
+    fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
+    pulsar_qwen_model qm = {NULL, tok};
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
     e->family = &fam;
-    e->qwen_tok = tok;
+    e->family_state = &qm;
     request r;
     request_init(&r, REQ_CHAT, 16);
     TEST_ASSERT(parse_refusal_get() == PARSE_REFUSED_REQUEST);
@@ -2526,7 +2531,6 @@ static void test_l375_refused_render_fails_the_request(void) {
     TEST_ASSERT(answer(true).find("overloaded_error") != std::string::npos);
     request_init(&r, REQ_CHAT, 16);
     request_free(&r);
-    e->qwen_tok = NULL;
     free(e);
 }
 
@@ -2554,19 +2558,21 @@ static void test_l375_template_refusal_is_a_result(void) {
     pulsar_gemma4_model *gm = new pulsar_gemma4_model();
     pulsar_nemotron_h_model *nm = new pulsar_nemotron_h_model();
     pulsar_inkling_model *im = new pulsar_inkling_model();
+    pulsar_qwen_model *qm = new pulsar_qwen_model();   /* L295 F8 Q1: Qwen's tokenizer is its family state's */
+    qm->tok = tok;
     gm->tok = nm->tok = im->tok = tok;
-    void *const state[] = {NULL, gm, nm, im};
+    void *const state[] = {qm, gm, nm, im};
     const pulsar_chat_message hi = {"user", "hello", false, NULL};
     for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
         pulsar_family fam{};
         fam.arch = fam.name = cases[c].name;
         fam.caps = PULSAR_FAMILY_CAP_CHAT;
         fam.tokenizer = cases[c].table;
+        if (cases[c].fmt == PULSAR_CHAT_QWEN) fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
         g_fmt = cases[c].fmt;
         fam.chat_format = [](const pulsar_engine *) { return g_fmt; };
         pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
         e->family = &fam;
-        e->qwen_tok = tok;
         e->family_state = state[c];
         pulsar_tokens out = {0};
         /* these templates render thinking on (their default effort) or off: "low" is no level of theirs */
@@ -2580,9 +2586,9 @@ static void test_l375_template_refusal_is_a_result(void) {
         const int turn = out.len;
         TEST_ASSERT(pulsar_chat_end_assistant(e, &out) && out.len > turn);
         pulsar_tokens_free(&out);
-        e->qwen_tok = NULL;
         free(e);
     }
+    delete qm;
     delete gm;
     delete nm;
     delete im;
@@ -4698,11 +4704,14 @@ static void test_spec_round_refusals(void) {
 static void test_qwen_eos(void) {
     const bpe_tokenizer *tok = qwen_test_tokenizer();
     if (!tok) return;   /* failed by name inside */
+    pulsar_family fam{};
+    fam.id = PULSAR_FAMILY_ID_QWEN4_EXP;   /* pulsar_qwen_of reads the id */
+    pulsar_qwen_model qm = {NULL, (bpe_tokenizer *)tok};
     pulsar_engine *e = (pulsar_engine *)xcalloc(1, sizeof(*e));
-    e->qwen_tok = (bpe_tokenizer *)tok;
+    e->family = &fam;
+    e->family_state = &qm;
     TEST_ASSERT(!bpe_tokenizer_stop_ids(tok).empty());
     TEST_ASSERT(k_qwen_tokenizer.eos(e) == bpe_tokenizer_stop_ids(tok).front());
-    e->qwen_tok = NULL;
     free(e);
     const char *dir = getenv("PULSAR_TEST_QWEN_TOKENIZER");
     std::string tj;

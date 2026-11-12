@@ -280,7 +280,7 @@ bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *
 /// @param e the engine
 /// @return the image pad id, or -1 without a tower
 static int32_t qwen_pad_id(const pulsar_engine *e) {
-    return e && e->qwen_weights ? e->qwen_weights->vision_pad_id : -1;
+    return e && pulsar_qwen_of(e)->weights ? pulsar_qwen_of(e)->weights->vision_pad_id : -1;
 }
 
 /// pulsar_family_vision::is_sentinel.
@@ -414,7 +414,7 @@ static bool qwen_image_block_rows(const pulsar_engine *e, const pulsar_image_ref
     if (!tower) {
         uint16_t *rows = NULL;
         int n = 0;
-        if (!qwen_vision_encode(&e->qwen_weights->vision, img->bytes, img->len, &rows, &n, NULL, NULL, err, errlen))
+        if (!qwen_vision_encode(&pulsar_qwen_of(e)->weights->vision, img->bytes, img->len, &rows, &n, NULL, NULL, err, errlen))
             return false;
         *tower_out = rows;
         *n_tower_out = n;

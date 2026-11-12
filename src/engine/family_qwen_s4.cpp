@@ -15,6 +15,7 @@
  * pool: embed hashes and ISSUES the gather, the PLE op at layer 1 waits for it,
  * so the reads overlap layer 0. */
 #include "pulsar_engine_internal.h"
+#include "family_qwen.h"
 #include "exl3_trellis.h"
 #include "qwen_ngram.h"
 #include "tp/pulsar_tp.h"
@@ -71,7 +72,7 @@ void *dptr(pulsar_gpu_tensor *t) { return pulsar_gpu_tensor_device_ptr(t); }
 bool pulsar_qwen_tp_slices(pulsar_engine *e, pulsar_tp_plan *plan) {
     const pulsar_qwen_shape *s = &g_qwen_shape;
     pulsar_model *m = &e->model;
-    const pulsar_qwen_weights *w = e->qwen_weights;
+    const pulsar_qwen_weights *w = pulsar_qwen_of(e)->weights;
     const uint32_t nr = pulsar_qwen_tp(s);
     const int rank = (int)s->tp_rank;
     /* L272 P0: every range from the ONE range rule (pulsar_tp_owned_range, as DeepSeek's slices and
@@ -674,7 +675,7 @@ static bool admit_moe(const pulsar_qwen_layer_weights &L) {
 }
 
 bool pulsar_qwen_s4_load(pulsar_engine *e, const pulsar_engine_options *opt) {
-    pulsar_qwen_weights *w = e->qwen_weights;
+    pulsar_qwen_weights *w = pulsar_qwen_of(e)->weights;
     const pulsar_qwen_shape *s = &g_qwen_shape;
     bool ok = admit_bf16(w->token_embd) & admit_head(e, w) & admit_gr(w->mixer);
     uint32_t tessera_layers = 0;

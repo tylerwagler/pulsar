@@ -14,6 +14,7 @@
  * MODEL-DEPENDENT, GPU.  usage: ./tests/vision_qwen_tower_gate MODEL GOLDENS */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "family_qwen.h"   /* L295 F8 Q2: qwen_vision_encode is declared in Qwen's own header */
 
 #include <math.h>
 #include <stdio.h>

@@ -1164,10 +1164,6 @@ void pulsar_engine::destroy() {
     if (e->family && e->family->unload) e->family->unload(e);   /* L295: the family's opaque state */
     engram_model_free(&e->weights);
     pulsar_tp_plan_free(e);   /* the rank's built slices, before the device goes */
-    if (e->qwen_weights) pulsar_qwen_s4_unload(e->qwen_weights);
-    if (e->qwen_tok) bpe_tokenizer_free(e->qwen_tok);
-    e->qwen_tok = NULL;
-    free(e->qwen_weights);
     e->vocab.vocab_free();
     /* Tear down GPU state (which cudaHostUnregisters the mmap'd weight ranges)
      * before munmap'ing the model — unmapping still-registered pages is UB. */

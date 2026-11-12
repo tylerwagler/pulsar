@@ -959,12 +959,11 @@ typedef struct {
     uint64_t container_digest;
 } pulsar_model;
 
-/* The model-family interface (L251 S1): the family descriptor, the layer plan,
- * and the Qwen4-exp family's shape/weights/state/op contract. */
+/* The model-family interface (L251 S1): the family descriptor and the layer plan. */
 #include "family.h"
 /* L295 F4: the core row-step driver's types (a driver family's session state and step extend them). */
 #include "step_driver.h"
-#include "family_qwen.h"
+/* L295 F8 Q2: family_qwen.h is Qwen's own (src/engine/family_qwen*.cpp and its tests include it); nothing shared does. */
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
 
@@ -2231,18 +2230,12 @@ struct pulsar_engine {
      *  keep declared state (pulsar_session::states); unused (n_decl 0) on DeepSeek. */
     pulsar_state_plan state_plan;
     /** L295 E1: the loaded family's own state, opaque to the core -- built by family->load, released by
-     *  family->unload at destroy (the plugin contract's opaque family state; DeepSeek and Qwen still keep typed
-     *  members below).  NULL = the family keeps none here. */
+     *  family->unload at destroy (the plugin contract's opaque family state; DeepSeek still keeps typed members;
+     *  Qwen's is pulsar_qwen_model, L295 F8 Q1).  NULL = the family keeps none here. */
     void *family_state;
-    /** The Qwen4-exp family's bound weights; NULL on a DeepSeek engine. */
-    pulsar_qwen_weights *qwen_weights;
     /** L284 P15: the Qwen importance-matrix collection's observer while one runs (imatrix_qwen.cpp), else NULL --
-     *  the trunk's steps note their linears' input rows into it. */
+     *  the trunk's steps note their linears' input rows into it (step_driver.cpp, any driver family). */
     struct pulsar_imatrix_tap *imatrix_tap;
-    /** The Qwen4-exp family's tokenizer (L251 S5; the shared engine src/lib/bpe_tokenizer.h in its HF
-     * configuration), built at open from the checkpoint's own tokenizer.json + generation_config.json; NULL on a DeepSeek engine.  When set,
-     * the engine's tokenizer entries (tokenizer.cpp) dispatch to it instead of `vocab`. */
-    struct bpe_tokenizer *qwen_tok;
     pulsar_model model;         ///< the target model's mapping and directory
     pulsar_model dspark_model;  ///< drafter mapping; a distinct file only when dspark_external
     pulsar_vocab vocab;         ///< tokenizer tables and special ids
@@ -2805,82 +2798,6 @@ void pulsar_image_licence_decide(const pulsar_engine *e, const pulsar_tokens *li
 /// @return true when the held images below G are the request's and no block straddles G
 bool pulsar_image_holds_below(const pulsar_engine *e, const pulsar_image_identity *held_ids,
                               const pulsar_tokens *prompt, const pulsar_image_ref *images, int n_images, uint32_t G);
-
-/* ---- L268: Qwen3.8-Flash-Next's own part of the image path (vision_qwen.cpp) ----
- * Preprocessing, from the checkpoint's preprocessor_config.json (HF Qwen2VLImageProcessor). */
-/// Qwen vision patch side, in pixels.
-#define PULSAR_QWEN_VISION_PATCH      16u
-/// Qwen vision spatial merge: patches per side merged into one token (2x2).
-#define PULSAR_QWEN_VISION_MERGE      2u
-/// Qwen vision temporal patch size: frames per patch.
-#define PULSAR_QWEN_VISION_TEMPORAL   2u
-/// smart_resize lower bound on the resized area, in pixels.
-#define PULSAR_QWEN_VISION_MIN_PIXELS 65536u      /* size.shortest_edge */
-/// smart_resize upper bound on the resized area, in pixels.
-#define PULSAR_QWEN_VISION_MAX_PIXELS 16777216u   /* size.longest_edge */
-/// Per-channel normalisation mean (after rescale to [0, 1]).
-#define PULSAR_QWEN_VISION_MEAN       0.5
-/// Per-channel normalisation standard deviation.
-#define PULSAR_QWEN_VISION_STD        0.5
-/** One image's patches as the tower takes them: `rows` = grid_h * grid_w patches in 2x2 merge-block order, `cols`
- *  = 3 * temporal * patch^2 float32 values each (channel, frame, y, x). */
-typedef struct {
-    /// rows x cols float32 values, owned (qwen_vision_pixels_free).
-    float *values;
-    /// Patches: grid_h * grid_w, in 2x2 merge-block order.
-    int rows, cols;
-    /** @var qwen_vision_pixels::cols
-     *  Values per patch: 3 * temporal * patch^2. */
-    int grid_h, grid_w;        ///< the patch grid (the resized image / patch)
-    /** @var qwen_vision_pixels::grid_h
-     *  Patch-grid height (resized_h / patch). */
-    int resized_h, resized_w;  ///< smart_resize's size
-    /** @var qwen_vision_pixels::resized_h
-     *  smart_resize's height, in pixels. */
-} qwen_vision_pixels;
-/** HF's smart_resize: the nearest multiple of patch x merge (Python's half-to-even), scaled into
- *  [min_pixels, max_pixels].  false + `err` past an aspect ratio of 200. */
-/// @param h       source height, pixels
-/// @param w       source width, pixels
-/// @param h_out   out: resized height
-/// @param w_out   out: resized width
-/// @param err     failure message buffer
-/// @param errlen  its size
-/// @return false + `err` past the aspect-ratio limit.
-bool qwen_vision_smart_resize(int h, int w, int *h_out, int *w_out, char *err, size_t errlen);
-/** Decode, resize, rescale, normalise and patchify one image exactly as HF's Qwen2VLImageProcessorPil. */
-/// @param bytes   the encoded image
-/// @param len     its length, in bytes
-/// @param out     receives the patches (free with qwen_vision_pixels_free)
-/// @param err     failure message buffer
-/// @param errlen  its size
-/// @return false + `err` on an image that does not decode or resize.
-bool qwen_vision_preprocess(const uint8_t *bytes, size_t len, qwen_vision_pixels *out, char *err, size_t errlen);
-void qwen_vision_pixels_free(qwen_vision_pixels *p);
-/** L268: Qwen's image front (vision_qwen.cpp) -- pulsar_family::vision of PULSAR_FAMILY_QWEN4_EXP. */
-extern const pulsar_family_vision PULSAR_QWEN_IMAGE_FRONT;
-/** Bind the tower's `model.visual.*` tensors (bf16, the tower's dims) when the artifact carries them; *present
- *  says whether it does.  false = it carries a tower that does not bind (said). */
-/// @param m        the model
-/// @param w        receives the tower's weights
-/// @param present  out: the artifact carries a tower
-/// @return true (also with no tower), false when a carried tower does not bind.
-bool qwen_vision_bind(const pulsar_model *m, pulsar_qwen_vision_weights_dev *w, bool *present);
-/** Preprocess and encode one image: *rows = malloc'd (*n_rows x PULSAR_QWEN_VISION_OUT) bf16, the rows its
- *  image_pad block takes, in merge-block raster order.  `dbg` (NULL in production) receives a malloc'd 3 x
- *  n_patches x PULSAR_QWEN_VISION_DIM stage dump (pulsar_cuda_qwen_vision_forward). */
-/// @param w          the bound tower
-/// @param bytes      the encoded image
-/// @param len        its length, in bytes
-/// @param rows       out: the malloc'd rows (caller frees)
-/// @param n_rows     out: their count
-/// @param dbg        out (NULL in production): the malloc'd stage dump
-/// @param n_patches  out: the image's patches
-/// @param err        failure message buffer
-/// @param errlen     its size
-/// @return false + `err` on a failure (*rows NULL).
-bool qwen_vision_encode(const pulsar_qwen_vision_weights_dev *w, const uint8_t *bytes, size_t len, uint16_t **rows,
-                        int *n_rows, uint16_t **dbg, int *n_patches, char *err, size_t errlen);
 
 /** L302: a session's device sampling state (session_sampler.cpp): the live row -- the authority; the host mirror
  *  pulsar_session::logits is read back only on demand -- each bank's saved live row, the sampler's scratch, and the
@@ -4323,8 +4240,6 @@ bool vision_weights_bind(pulsar_vision_weights *w, const pulsar_model *m);
 extern const pulsar_family_tokenizer k_ds4_tokenizer;
 /** DeepSeek's bank pool: its graph's (session_banks.cpp). */
 extern const pulsar_family_bank_ops k_ds4_bank_ops;
-/// The Qwen4-exp family's tokenizer table (tokenizer_qwen.cpp).
-extern const pulsar_family_tokenizer k_qwen_tokenizer;
 /** One token's bytes for --dump-tokens: UTF-8 verbatim, the usual escapes, other bytes as backslash-x-NN. */
 /// @param fp  the stream
 /// @param s   the token's bytes
@@ -6201,8 +6116,6 @@ void imatrix_write_entry(FILE *fp, const char *name, const float *sum2, const ui
 bool imatrix_dat_close(FILE *fp, const char *path, int32_t chunks, const char *dataset_path);
 /// DeepSeek's importance-matrix collection (imatrix.cpp).
 extern const pulsar_family_imatrix k_ds4_imatrix;     // imatrix.cpp
-/// The Qwen4-exp family's importance-matrix collection (imatrix_qwen.cpp).
-extern const pulsar_family_imatrix k_qwen_imatrix;    // imatrix_qwen.cpp
 bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g);
 bool gpu_graph_prefill_layer_major(
         pulsar_gpu_graph *g,

@@ -10,6 +10,7 @@
  * No model, no GPU. */
 #include "pulsar.h"
 #include "pulsar_engine_internal.h"
+#include "family_qwen.h"   /* L295 F8 Q2: Qwen's vision preprocessing is declared in its own header */
 
 #include <cstdint>
 #include <cstdio>
