@@ -55,12 +55,13 @@ static pulsar_gpu_graph *G_(void *state) { return (pulsar_gpu_graph *)state; }
 /// @param frontier  walk the frontier layout (any G) instead of the grid slot
 /// @param slab      the slot's tensor (unused when sizing)
 /// @param slot_off  the slot's byte offset in `slab`
-/// @param G         the position walked, in tokens
+/// @param G_at      the position walked
 /// @param bytes_out receives the layout's size in bytes when non-NULL
 /// @return false when a copy failed
-static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *slab, uint64_t slot_off, uint32_t G,
+static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *slab, uint64_t slot_off, TokPos G_at,
                      uint64_t *bytes_out) {
     pulsar_gpu_graph *g = G_(state);
+    const uint32_t G = pulsar_ckpt_raw(G_at);   /* the raw ring's offsets are tokens */
     const uint64_t raw_row = pulsar_kv_row_bytes(PULSAR_KV_ROW_RING);
     const uint32_t W = g->raw_window;
     uint64_t off = slot_off;
@@ -134,7 +135,16 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
 }
 
 /** pulsar_kv_state_ops::min_checkpoint: the raw window.  @param state the graph  @return tokens */
-static uint32_t ds4_min_checkpoint(void *state) { return G_(state)->raw_window; }
+static TokPos ds4_min_checkpoint(void *state) { return pulsar_ckpt_pos(G_(state)->raw_window); }
+
+/* The compressed rows layer `il`'s pools hold at a frontier at G: floor(G / ratio) (L334 P2b S2: the named crossing;
+ * S8 types gpu_graph_n_comp's CompRows). */
+/// @param G  the frontier
+/// @param il a KV-source layer
+/// @return its complete rows
+static uint32_t ds4_rows_at(TokPos G, uint32_t il) {
+    return (uint32_t)pulsar_comp_rows_held(G.before(), TokPerRow{pulsar_layer_compress_ratio(il)}).raw();
+}
 
 /** pulsar_kv_state_ops::stands_at: every kv source's compressed-row count is G / its ratio.
  *  @param state  the graph
@@ -142,15 +152,15 @@ static uint32_t ds4_min_checkpoint(void *state) { return G_(state)->raw_window; 
  *  @param why    receives the violation
  *  @param whylen bytes of `why`
  *  @return true when it stands at G */
-static bool ds4_stands_at(void *state, uint32_t G, char *why, size_t whylen) {
+static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        const uint32_t want = G / pulsar_layer_compress_ratio(il);
+        const uint32_t want = ds4_rows_at(G, il);
         if (gpu_graph_n_comp(g, bank, il) != want) {
             snprintf(why, whylen, "layer %u holds %u compressed rows, a frontier at %u holds %u", il,
-                     gpu_graph_n_comp(g, bank, il), G, want);
+                     gpu_graph_n_comp(g, bank, il), pulsar_ckpt_raw(G), want);
             return false;
         }
     }
@@ -159,11 +169,11 @@ static bool ds4_stands_at(void *state, uint32_t G, char *why, size_t whylen) {
 
 /** pulsar_kv_state_ops::holds: every kv source holds at least G / its ratio compressed rows.
  *  @param state the graph  @param G tokens  @return true when it does */
-static bool ds4_holds(void *state, uint32_t G) {
+static bool ds4_holds(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, bank, il) < G / pulsar_layer_compress_ratio(il))
+        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, bank, il) < ds4_rows_at(G, il))
             return false;
     return true;
 }
@@ -172,16 +182,16 @@ static bool ds4_holds(void *state, uint32_t G) {
  *  @param g    the graph
  *  @param bank the bank
  *  @param G    the frontier, in tokens */
-static void ds4_set_frontier(pulsar_gpu_graph *g, uint32_t bank, uint32_t G) {
+static void ds4_set_frontier(pulsar_gpu_graph *g, uint32_t bank, TokPos G) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, bank, il, G / pulsar_layer_compress_ratio(il));
+        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, bank, il, ds4_rows_at(G, il));
 }
 
 /// pulsar_kv_state_ops::prepare_restore.
 /// @param state the graph
 /// @param G     the grid point restored, in tokens
 /// @return false when the compressor state reset failed
-static bool ds4_prepare_restore(void *state, uint32_t G) {
+static bool ds4_prepare_restore(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t bank = gpu_graph_cur_bank(g);
     /* Frontier first: lowering it drops the checkpoints above G (not this one, which sits exactly
@@ -218,7 +228,7 @@ static void ds4_restored(void *state) {
 /** pulsar_kv_state_ops::set_frontier_stale: the frontier counters to G and the installed bank marked stale.
  *  @param state the graph
  *  @param G     the segment chain's end, in tokens */
-static void ds4_set_frontier_stale(void *state, uint32_t G) {
+static void ds4_set_frontier_stale(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
     const uint32_t bank = gpu_graph_cur_bank(g);
     ds4_set_frontier(g, bank, G);
@@ -287,7 +297,7 @@ static uint32_t ds4_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, 
 /// @param why    receives the violation
 /// @param whylen bytes of `why`
 /// @return true when the installed bank is not stale and stands at T
-static bool ds4_frontier_at(void *state, uint32_t T, char *why, size_t whylen) {
+static bool ds4_frontier_at(void *state, TokPos T, char *why, size_t whylen) {
     pulsar_gpu_graph *g = G_(state);
     if (g->ms_comp_state_stale[gpu_graph_cur_bank(g)]) {
         snprintf(why, whylen, "the bank's state is stale (rewound off its grid checkpoints); sync it first");
@@ -302,7 +312,7 @@ static bool ds4_frontier_at(void *state, uint32_t T, char *why, size_t whylen) {
 /// @param state the graph
 /// @param T     the frontier, in tokens
 /// @return true, always
-static bool ds4_install_frontier(void *state, uint32_t T, uint32_t) {
+static bool ds4_install_frontier(void *state, TokPos T, TokCount) {
     pulsar_gpu_graph *g = G_(state);
     ds4_set_frontier(g, gpu_graph_cur_bank(g), T);
     return true;
@@ -316,7 +326,7 @@ static bool ds4_install_frontier(void *state, uint32_t T, uint32_t) {
 /// @param state   the graph
 /// @param capture receives whether the bank's compressor group is not stale
 /// @return true, always
-static bool ds4_noted_at(void *state, uint32_t, bool *capture, char *, size_t) {
+static bool ds4_noted_at(void *state, TokPos, bool *capture, char *, size_t) {
     pulsar_gpu_graph *g = G_(state);
     *capture = !g->ms_comp_state_stale[gpu_graph_cur_bank(g)];
     return true;

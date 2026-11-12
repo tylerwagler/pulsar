@@ -135,9 +135,9 @@ typedef struct pulsar_state_plan {
     uint32_t session;
     /** The drafter lane's own counters the state walk must keep in step (NULL = no drafter lane): a restore or a
      *  payload put bank `bank` at T (T 0 = a fresh bank) -- the drafter's lagging row is the trunk's at T - 1. */
-    void (*drafter_at)(void *ud, uint32_t bank, uint32_t T);
+    void (*drafter_at)(void *ud, uint32_t bank, TokPos T);
     /** ... and does the drafter's state describe frontier T (nothing drafted past it)?  `why` names the violation. */
-    bool (*drafter_frontier)(void *ud, uint32_t bank, uint32_t T, char *why, size_t whylen);
+    bool (*drafter_frontier)(void *ud, uint32_t bank, TokPos T, char *why, size_t whylen);
 } pulsar_state_plan;
 
 /** Bytes one bank of a non-POOL decl takes (FIXED: bytes; STAGED: the block; RING: W - 1 + the verify width slots). */

@@ -248,7 +248,7 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank) {
     pulsar_state_set_pos(ss, bank, 0);
     ss->prefill_pos[bank] = 0;
     ss->frontier_stale[bank] = false;
-    if (p->drafter_at) p->drafter_at(ss->ud, bank, 0u);
+    if (p->drafter_at) p->drafter_at(ss->ud, bank, TokPos::after(TokCount{0}));
     if (ss->ckpt.ops) pulsar_ckpt_drop_bank(&ss->ckpt, bank);   /* its history is gone */
     return ok;
 }
@@ -422,7 +422,7 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
 /// @param slot_off  the slot's byte offset in `slab`
 /// @param bytes_out receives the layout's size in bytes when non-NULL
 /// @return false when a copy failed
-static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t slot_off, uint32_t,
+static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t slot_off, TokPos,
                       uint64_t *bytes_out) {
     pulsar_state_set *ss = SS(state);
     const pulsar_state_plan *p = ss->plan;
@@ -455,17 +455,17 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
 }
 
 /** pulsar_kv_state_ops::min_checkpoint: the resume grid.  @param state the set  @return tokens */
-static uint32_t decl_min_checkpoint(void *state) { return SS(state)->plan->resume_grid; }
+static TokPos decl_min_checkpoint(void *state) { return pulsar_ckpt_pos(SS(state)->plan->resume_grid); }
 
 /** pulsar_kv_state_ops::stands_at: the live bank holds exactly G tokens, all of them prefilled.
  *  @param state  the set
- *  @param G      the grid point, in tokens
+ *  @param G_at   the grid point, in tokens
  *  @param why    receives the violation
  *  @param whylen bytes of `why`
  *  @return true when it stands at G */
-static bool decl_stands_at(void *state, uint32_t G, char *why, size_t whylen) {
+static bool decl_stands_at(void *state, TokPos G_at, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const uint32_t bank = ss->live_bank, G = pulsar_ckpt_raw(G_at);   /* L334 P2b S7a: bank_pos / prefill_pos raw */
     if (ss->bank_pos[bank] != G || ss->prefill_pos[bank] != G) {
         snprintf(why, whylen, "bank %u holds %u tokens, %u of them prefilled, not exactly %u prefilled", bank,
                  ss->bank_pos[bank], ss->prefill_pos[bank], G);
@@ -476,20 +476,23 @@ static bool decl_stands_at(void *state, uint32_t G, char *why, size_t whylen) {
 
 /** pulsar_kv_state_ops::holds: the live bank's prefill-only history reaches G.
  *  @param state the set  @param G tokens  @return true when it does */
-static bool decl_holds(void *state, uint32_t G) { return SS(state)->prefill_pos[SS(state)->live_bank] >= G; }
+static bool decl_holds(void *state, TokPos G) {
+    /* L334 P2b S7a: bank_pos / prefill_pos raw */
+    return SS(state)->prefill_pos[SS(state)->live_bank] >= pulsar_ckpt_raw(G);
+}
 
 /** pulsar_kv_state_ops::prepare_restore: the live bank's counters (position, prefill end, drafter row) to G.
  *  @param state the set
- *  @param G     the grid point restored, in tokens
+ *  @param G_at  the grid point restored, in tokens
  *  @return true, always */
-static bool decl_prepare_restore(void *state, uint32_t G) {
+static bool decl_prepare_restore(void *state, TokPos G_at) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const uint32_t bank = ss->live_bank, G = pulsar_ckpt_raw(G_at);   /* L334 P2b S7a: bank_pos / prefill_pos raw */
     /* the pools' rows below G are the history the checkpoint references; the walk brings every overwritten lane
      * back, so only the counters move here */
     pulsar_state_set_pos(ss, bank, G);
     ss->prefill_pos[bank] = G;
-    if (ss->plan->drafter_at) ss->plan->drafter_at(ss->ud, bank, G);   /* L289: the walk writes the true tail */
+    if (ss->plan->drafter_at) ss->plan->drafter_at(ss->ud, bank, G_at);   /* L289: the walk writes the true tail */
     return true;   /* the logits: the caller's (s->logits_stale after a restore) */
 }
 
@@ -498,10 +501,10 @@ static void decl_restored(void *state) { SS(state)->frontier_stale[SS(state)->li
 
 /** pulsar_kv_state_ops::set_frontier_stale: the live bank's counters to G and its stale mark set.
  *  @param state the set
- *  @param G     the segment chain's end, in tokens */
-static void decl_set_frontier_stale(void *state, uint32_t G) {
+ *  @param G_at  the segment chain's end, in tokens */
+static void decl_set_frontier_stale(void *state, TokPos G_at) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const uint32_t bank = ss->live_bank, G = pulsar_ckpt_raw(G_at);   /* L334 P2b S7a: bank_pos / prefill_pos raw */
     pulsar_state_set_pos(ss, bank, G);
     ss->prefill_pos[bank] = G;
     ss->frontier_stale[bank] = true;
@@ -564,19 +567,19 @@ static uint32_t decl_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out,
  * segment load left them stale, and the drafter's lane (its hook) describes T too. */
 /// pulsar_kv_state_ops::frontier_at.
 /// @param state  the set
-/// @param T      the frontier, in tokens
+/// @param T_at   the frontier, in tokens
 /// @param why    receives the violation
 /// @param whylen bytes of `why`
 /// @return true when the live bank's lanes describe T
-static bool decl_frontier_at(void *state, uint32_t T, char *why, size_t whylen) {
+static bool decl_frontier_at(void *state, TokPos T_at, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const uint32_t bank = ss->live_bank, T = pulsar_ckpt_raw(T_at);   /* L334 P2b S7a: bank_pos / prefill_pos raw */
     if (ss->bank_pos[bank] != T || ss->frontier_stale[bank]) {
         snprintf(why, whylen, "bank %u holds %u tokens%s, not a live frontier at %u", bank, ss->bank_pos[bank],
                  ss->frontier_stale[bank] ? " (stale: a segment chain without its last restore)" : "", T);
         return false;
     }
-    return !ss->plan->drafter_frontier || ss->plan->drafter_frontier(ss->ud, bank, T, why, whylen);
+    return !ss->plan->drafter_frontier || ss->plan->drafter_frontier(ss->ud, bank, T_at, why, whylen);
 }
 
 /** pulsar_kv_state_ops::install_frontier: the live bank's counters (position T, prefill end, drafter row) set.
@@ -584,11 +587,11 @@ static bool decl_frontier_at(void *state, uint32_t T, char *why, size_t whylen) 
  *  @param T       the frontier, in tokens
  *  @param prefill tokens of it prefilled
  *  @return true, always */
-static bool decl_install_frontier(void *state, uint32_t T, uint32_t prefill) {
+static bool decl_install_frontier(void *state, TokPos T, TokCount prefill) {
     pulsar_state_set *ss = SS(state);
     const uint32_t bank = ss->live_bank;
-    pulsar_state_set_pos(ss, bank, T);
-    ss->prefill_pos[bank] = prefill;
+    pulsar_state_set_pos(ss, bank, pulsar_ckpt_raw(T));   /* L334 P2b S7a: bank_pos / prefill_pos raw */
+    ss->prefill_pos[bank] = (uint32_t)prefill.raw();
     if (ss->plan->drafter_at) ss->plan->drafter_at(ss->ud, bank, T);   /* the walk writes the true stage */
     return true;
 }
@@ -607,14 +610,14 @@ static uint32_t decl_trailing_pools(void *state, pulsar_kv_pool *out, uint32_t c
  * stale (decl_stands_at's own rule). */
 /// pulsar_kv_state_ops::noted_at.
 /// @param state   the set
-/// @param T       the chunk's end, in tokens
+/// @param T_at    the chunk's end, in tokens
 /// @param capture receives whether the state at T is the cold prefill's
 /// @param why     receives the violation
 /// @param whylen  bytes of `why`
 /// @return false when the live bank's counter is not T
-static bool decl_noted_at(void *state, uint32_t T, bool *capture, char *why, size_t whylen) {
+static bool decl_noted_at(void *state, TokPos T_at, bool *capture, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const uint32_t bank = ss->live_bank, T = pulsar_ckpt_raw(T_at);   /* L334 P2b S7a: bank_pos / prefill_pos raw */
     if (ss->bank_pos[bank] != T) {
         snprintf(why, whylen, "bank %u holds %u tokens, the record says %u", bank, ss->bank_pos[bank], T);
         return false;

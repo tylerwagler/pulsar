@@ -132,17 +132,18 @@ void pulsar_mtp_lane_free(pulsar_mtp_lane *l) {
 
 /* At T the parked row is the trunk's at T - 1 (none at 0) and no stage holds draft rows (L289: the walk writes the
  * true tail). */
-void pulsar_mtp_drafter_at(void *ud, uint32_t bank, uint32_t T) {
+void pulsar_mtp_drafter_at(void *ud, uint32_t bank, TokPos T) {
     pulsar_mtp_lane *l = ((pulsar_driver_state *)ud)->mtp;
     if (!l) return;
-    l->pend_pos[bank] = T - 1u;
+    l->pend_pos[bank] = (uint32_t)T.before().raw() - 1u;   /* L334 P2b S6: pend_pos raw, UINT32_MAX = none */
     l->stage_dirty[bank] = false;
 }
 
 /* A payload's frontier T: the parked row is the trunk's at T - 1 and no stage holds draft rows (a chain consumes the
  * parked row and writes into the stage until the round's absorb puts both back). */
-bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, uint32_t T, char *why, size_t whylen) {
+bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, TokPos T_at, char *why, size_t whylen) {
     const pulsar_mtp_lane *l = ((const pulsar_driver_state *)ud)->mtp;
+    const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b S6: pend_pos raw, UINT32_MAX = none */
     if (l && (T == 0u || l->pend_pos[bank] != T - 1u || l->stage_dirty[bank])) {
         snprintf(why, whylen, "bank %u's MTP lane is mid-draft (pending row %d, stage %s); step it first", bank,
                  l->pend_pos[bank] == UINT32_MAX ? -1 : (int)l->pend_pos[bank],

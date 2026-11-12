@@ -116,12 +116,12 @@ static bool ckpt_stage_fit(pulsar_ckpt_store *st, uint64_t need) {
 /// @param G        the position, in tokens
 /// @return false on a failed walk or copy
 static bool ckpt_out(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, uint32_t G) {
-    if (!st->host) return st->ops->walk(st->state, 0, frontier, p.slab, p.off, G, NULL);
+    if (!st->host) return st->ops->walk(st->state, 0, frontier, p.slab, p.off, pulsar_ckpt_pos(G), NULL);
     if (!ckpt_stage_fit(st, p.bytes)) return false;
     const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
     const uint32_t done[2] = {p.ticket, k};
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
-           st->ops->walk(st->state, 0, frontier, st->stage[k], 0, G, NULL) &&
+           st->ops->walk(st->state, 0, frontier, st->stage[k], 0, pulsar_ckpt_pos(G), NULL) &&
            pulsar_gpu_lane_d2h(st->lane, st->stage[k], 0, p.host, p.bytes, done, 2u) != 0;
 }
 
@@ -136,13 +136,13 @@ static bool ckpt_out(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, 
 /// @param staged   receives the staging buffer used (host tier)
 /// @return false on a failed walk or copy
 static bool ckpt_in(pulsar_ckpt_store *st, const ckpt_place &p, bool frontier, uint32_t G, uint32_t *staged) {
-    if (!st->host) return st->ops->walk(st->state, 1, frontier, p.slab, p.off, G, NULL);
+    if (!st->host) return st->ops->walk(st->state, 1, frontier, p.slab, p.off, pulsar_ckpt_pos(G), NULL);
     if (!ckpt_stage_fit(st, p.bytes)) return false;
     const uint32_t k = st->stage_next++ % PULSAR_CKPT_STAGES;
     *staged = k;
     return pulsar_gpu_lane_order(st->lane, k) != 0 &&
            pulsar_gpu_lane_h2d(st->lane, st->stage[k], 0, p.host, p.bytes, p.ticket) != 0 &&
-           st->ops->walk(st->state, 1, frontier, st->stage[k], 0, G, NULL);
+           st->ops->walk(st->state, 1, frontier, st->stage[k], 0, pulsar_ckpt_pos(G), NULL);
 }
 
 /* `src`'s bytes -> `dst`, right after a ckpt_in(src) that staged them in buffer `staged` (host tier: the lane copies
@@ -309,7 +309,7 @@ static uint32_t ckpt_pick_slot(const pulsar_ckpt_store *st, uint32_t bank, uint3
 static bool ckpt_grid_ok(const pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     return bank < PULSAR_MSEQ_MAX && (st->host ? st->host_slab[bank] != NULL : st->slab[bank] != NULL) &&
            G % st->ops->resume_grid == 0u &&
-           G >= st->ops->min_checkpoint(st->state);
+           G >= pulsar_ckpt_raw(st->ops->min_checkpoint(st->state));
 }
 
 /* The slot of `bank` holding G; PULSAR_CKPT_SLOTS_MAX when none. */
@@ -339,7 +339,7 @@ static bool ckpt_capture(pulsar_ckpt_store *st, uint32_t bank, uint32_t G) {
     /* The precondition is what makes the copy the state AT G: every pool holds exactly the rows a
      * prefill to G writes, no more (a row above would be a decode's) and no fewer. */
     char why[192];
-    if (!st->ops->stands_at(st->state, G, why, sizeof(why))) {
+    if (!st->ops->stands_at(st->state, pulsar_ckpt_pos(G), why, sizeof(why))) {
         fprintf(stderr, "pulsar: grid checkpoint at %u on bank %u refused: %s\n", G, bank, why);
         return false;
     }
@@ -358,11 +358,12 @@ bool pulsar_ckpt_landed(pulsar_ckpt_store *st, uint32_t bank, TokPos T_at) {
     const uint32_t T = (uint32_t)T_at.before().raw();   /* L334 P2b: the store keeps raw uint32 inside (0 = empty slot / free record); typed at its API */
     bool capture = false;
     char why[192] = "";
-    if (!st->ops->noted_at(st->state, T, &capture, why, sizeof(why))) {
+    if (!st->ops->noted_at(st->state, T_at, &capture, why, sizeof(why))) {
         fprintf(stderr, "pulsar: bank %u's prompt chunk to %u is not its state: %s\n", bank, T, why);
         return false;
     }
-    if (!capture || T % st->ops->resume_grid != 0u || T < st->ops->min_checkpoint(st->state)) return true;
+    if (!capture || T % st->ops->resume_grid != 0u || T < pulsar_ckpt_raw(st->ops->min_checkpoint(st->state)))
+        return true;
     return ckpt_capture(st, bank, T);
 }
 
@@ -380,7 +381,7 @@ bool pulsar_ckpt_restore(pulsar_ckpt_store *st, uint32_t bank, TokPos G_at) {
     const uint32_t s = ckpt_find(st, bank, G);
     if (s == PULSAR_CKPT_SLOTS_MAX) return false;
     uint32_t staged = 0;
-    if (!st->ops->prepare_restore(st->state, G) || !ckpt_in(st, ckpt_slot_place(st, bank, s), false, G, &staged)) {
+    if (!st->ops->prepare_restore(st->state, G_at) || !ckpt_in(st, ckpt_slot_place(st, bank, s), false, G, &staged)) {
         fprintf(stderr, "pulsar: grid checkpoint restore to %u on bank %u: copy failed\n", G, bank);
         return false;
     }
@@ -416,7 +417,7 @@ bool pulsar_ckpt_record_capture(pulsar_ckpt_store *st, uint32_t bank, pulsar_ckp
     for (uint32_t i = 0; i < st->n_rec; i++)
         if (st->rec[i].T != 0u && st->rec[i].bank == bank && st->rec[i].kind == kind) st->rec[i].T = 0u;
     char why[192];
-    if (!st->ops->frontier_at(st->state, T, why, sizeof(why))) {
+    if (!st->ops->frontier_at(st->state, T_at, why, sizeof(why))) {
         fprintf(stderr, "pulsar: %s at %u on bank %u not recorded: %s\n",
                 kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, bank, why);
         return false;
@@ -538,7 +539,8 @@ bool pulsar_ckpt_record_restore(pulsar_ckpt_store *st, uint32_t bank, const puls
     /* the counters at T, prefilled to T (Qwen: the MTP layer's pending row at T - 1, its stage clean); the walk
      * brings every lane back */
     uint32_t staged = 0;
-    if (!st->ops->install_frontier(st->state, T, T) || !ckpt_in(st, ckpt_rec_place(st, w), true, T, &staged)) {
+    if (!st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)T}) ||
+        !ckpt_in(st, ckpt_rec_place(st, w), true, T, &staged)) {
         fprintf(stderr, "pulsar: record restore to %u on bank %u: copy failed\n", T, bank);
         w->T = 0u;
         return false;
@@ -599,7 +601,8 @@ bool pulsar_ckpt_adopt(pulsar_ckpt_store *st, uint32_t dst, uint32_t src, TokPos
     *moved = true;   /* L375 O43: from here dst is no longer what its view describes */
     pulsar_ckpt_drop_bank(st, dst);
     if (st->ops->history_replaced) st->ops->history_replaced(st->state);   /* L375 O42: before the walk below */
-    bool ok = r ? st->ops->install_frontier(st->state, T, T) : st->ops->prepare_restore(st->state, T);
+    bool ok = r ? st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)T})
+                 : st->ops->prepare_restore(st->state, pulsar_ckpt_pos(T));
     for (uint32_t i = 0; ok && i < n; i++) {
         const uint64_t rows = (T + sp[i].tokens_per_row - 1u) / sp[i].tokens_per_row;
         ok = pulsar_gpu_tensor_copy_async(dp[i].rows, 0, sp[i].rows, 0, rows * sp[i].row_bytes) != 0;

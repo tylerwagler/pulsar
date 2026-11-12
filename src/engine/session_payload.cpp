@@ -564,7 +564,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
         payload_set_err(err, errlen, "copy-out segment: the session does not hold that grid span");
         return 1;
     }
-    if (!st->ops->holds(st->state, G)) {
+    if (!st->ops->holds(st->state, pulsar_ckpt_pos(G))) {
         payload_set_err(err, errlen, "copy-out segment: the bank's rows do not reach the segment's end");
         return 1;
     }
@@ -787,7 +787,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     if (G_prev != 0u) {
         char why[192];
         if (!s->checkpoint_valid || (uint32_t)s->checkpoint.len != G_prev ||
-            !st->ops->stands_at(st->state, G_prev, why, sizeof(why))) {
+            !st->ops->stands_at(st->state, pulsar_ckpt_pos(G_prev), why, sizeof(why))) {
             payload_set_err(err, errlen, "load segment: the bank does not stand at the segment's start");
             return PULSAR_SEGMENT_TRANSIENT;
         }
@@ -850,7 +850,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
      * its checkpoint. */
     for (uint32_t p = 0; p < G - G_prev; p++) token_vec_push(&s->checkpoint, (int)payload_get_u32(v.toks + 4u * p));
     for (uint32_t i = 0; i < v.n_img; i++) s->live_images.b[s->live_images.n++] = v.imgs[i];   /* L281 */
-    st->ops->set_frontier_stale(st->state, G);
+    st->ops->set_frontier_stale(st->state, pulsar_ckpt_pos(G));
     if (last) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
     s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
@@ -1025,7 +1025,7 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
     }
     p->T = (uint32_t)s->checkpoint.len;
     char why[192];
-    if (!p->st->ops->frontier_at(p->st->state, p->T, why, sizeof(why))) {
+    if (!p->st->ops->frontier_at(p->st->state, pulsar_ckpt_pos(p->T), why, sizeof(why))) {
         char msg[256];
         snprintf(msg, sizeof(msg), "session payload: %s", why);
         payload_set_err(err, errlen, msg);
@@ -1076,7 +1076,7 @@ int pulsar_session::save_payload(FILE *fp, char *err, size_t errlen) {
     const uint64_t fb = kvp_frontier_bytes(st);
     pulsar_gpu_tensor *front = pulsar_gpu_tensor_alloc(fb);
     if (!front || pulsar_gpu_tensor_fill_f32(front, 0.0f, fb / sizeof(float)) == 0 ||
-        !st->ops->walk(st->state, 0, true, front, 0, p.T, NULL) || pulsar_gpu_synchronize() == 0) {
+        !st->ops->walk(st->state, 0, true, front, 0, pulsar_ckpt_pos(p.T), NULL) || pulsar_gpu_synchronize() == 0) {
         pulsar_gpu_tensor_free(front);
         payload_set_err(err, errlen, "session payload: staging the frontier's state failed");
         return 1;
@@ -1161,7 +1161,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     }
     const uint32_t T = h[4], PF = h[5], G = h[6];
     if (T == 0u || T >= (uint32_t)s->ctx_size || PF > T || G > PF || G % st->ops->resume_grid != 0u ||
-        (G && G < st->ops->min_checkpoint(st->state))) {
+        (G && G < pulsar_ckpt_raw(st->ops->min_checkpoint(st->state)))) {
         payload_set_err(err, errlen, "session payload: its frontier, prefill frontier or grid point does not fit "
                                      "this session");
         return 1;
@@ -1239,7 +1239,8 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return fail();
     }
     /* Commit: the frontier's counters, its lanes from the staged slot, then the resume checkpoint. */
-    if (!st->ops->install_frontier(st->state, T, PF) || !st->ops->walk(st->state, 1, true, front, 0, T, NULL) ||
+    if (!st->ops->install_frontier(st->state, pulsar_ckpt_pos(T), TokCount{(int)PF}) ||
+        !st->ops->walk(st->state, 1, true, front, 0, pulsar_ckpt_pos(T), NULL) ||
         pulsar_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "session payload: installing the frontier's state failed");
         return fail();

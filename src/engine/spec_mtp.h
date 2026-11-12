@@ -184,7 +184,7 @@ bool pulsar_mtp_absorb(pulsar_session *s, pulsar_step_mode mode, const int32_t *
 /// @param ud the driver state
 /// @param bank the bank
 /// @param T the bank's new frontier (tokens)
-void pulsar_mtp_drafter_at(void *ud, uint32_t bank, uint32_t T);
+void pulsar_mtp_drafter_at(void *ud, uint32_t bank, TokPos T);
 /// Check that a bank's lane state is at frontier T (not mid-draft), before a payload walks it.
 /// @param ud the driver state
 /// @param bank the bank
@@ -192,7 +192,7 @@ void pulsar_mtp_drafter_at(void *ud, uint32_t bank, uint32_t T);
 /// @param why receives the reason when not
 /// @param whylen its size
 /// @return true when at T (or no lane)
-bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, uint32_t T, char *why, size_t whylen);
+bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, TokPos T, char *why, size_t whylen);
 
 /** The drafter's functions (PULSAR_MTP_DRAFTER_OPS). */
 /// pulsar_drafter_ops::absorb_banked: the kept rows of the last verify, every bank.

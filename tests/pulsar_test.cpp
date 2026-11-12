@@ -5640,15 +5640,15 @@ static void test_fused_sched(void) {
 
 /* L311: the record pool and the endpoint cut, host only -- a fake kv-state whose walk moves no byte (every slab NULL,
  * every record's capacity above the walk's size, so nothing allocates), on a split-invariant grid of 128. */
-static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, uint32_t, uint64_t *bytes) {
+static bool fake_walk(void *, int, bool, pulsar_gpu_tensor *, uint64_t, TokPos, uint64_t *bytes) {
     if (bytes) *bytes = 1024;
     return true;
 }
-static uint32_t fake_min_ckpt(void *) { return 1u; }
-static bool fake_true_why(void *, uint32_t, char *, size_t) { return true; }
-static bool fake_true_at(void *, uint32_t) { return true; }
+static TokPos fake_min_ckpt(void *) { return pulsar_ckpt_pos(1u); }
+static bool fake_true_why(void *, TokPos, char *, size_t) { return true; }
+static bool fake_true_at(void *, TokPos) { return true; }
 static void fake_restored(void *) {}
-static bool fake_install(void *, uint32_t, uint32_t) { return true; }
+static bool fake_install(void *, TokPos, TokCount) { return true; }
 /* L326: one pool a bank (one token a row, 16 B), rows a dry tensor */
 static pulsar_gpu_tensor *fake_rows[3];
 static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
@@ -5663,7 +5663,7 @@ struct ckpt_tier_state {
     pulsar_gpu_tensor *t;   ///< the "state": what a walk copies
     uint64_t n;             ///< its bytes
 };
-static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, uint32_t, uint64_t *bytes) {
+static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint64_t off, TokPos, uint64_t *bytes) {
     const ckpt_tier_state *ts = (const ckpt_tier_state *)state;
     if (dir < 0) {
         *bytes = ts->n;
@@ -5672,8 +5672,8 @@ static bool tier_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
     return (dir == 0 ? pulsar_gpu_tensor_copy_async(slab, off, ts->t, 0, ts->n)
                      : pulsar_gpu_tensor_copy_async(ts->t, 0, slab, off, ts->n)) != 0;
 }
-static uint32_t tier_min_ckpt(void *) { return 128u; }
-static bool tier_noted(void *, uint32_t, bool *capture, char *, size_t) {
+static TokPos tier_min_ckpt(void *) { return pulsar_ckpt_pos(128u); }
+static bool tier_noted(void *, TokPos, bool *capture, char *, size_t) {
     *capture = true;
     return true;
 }

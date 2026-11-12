@@ -132,7 +132,7 @@ static void plan_a(void) {
     }
     pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(ss->ckpt.slot_bytes);
     uint64_t walked = 0;
-    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, 128, &walked) && pulsar_gpu_synchronize();
+    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(128u), &walked) && pulsar_gpu_synchronize();
     check(ok && walked == slot, "the walk copies %llu B (the slot's)", (unsigned long long)walked);
     uint64_t off = 0;
     bool order = ok;
@@ -149,7 +149,7 @@ static void plan_a(void) {
     check(ok && all_zero(rd(pulsar_state_tensor(ss, 7, A_SCONV), SCONV_BYTES, SCONV_BYTES)) &&
           all_zero(rd(pulsar_state_tensor(ss, 7, A_KV_WINDOW), ring, ring)) && ss->bank_pos[1] == 0,
           "a reset zeroes the bank's state and its counters");
-    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, 128, NULL) && pulsar_gpu_synchronize();
+    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, pulsar_ckpt_pos(128u), NULL) && pulsar_gpu_synchronize();
     check(ok && rd(pulsar_state_tensor(ss, 41, A_SCONV), SCONV_BYTES, SCONV_BYTES) == pattern(SCONV_BYTES, 82) &&
           rd(pulsar_state_tensor(ss, 40, A_KV_WINDOW), ring, ring) == pattern(ring, 81) &&
           all_zero(rd(pulsar_state_tensor(ss, 41, A_SCONV), 0, SCONV_BYTES)),
@@ -325,11 +325,11 @@ static void plan_b(void) {
     ok = ok && pulsar_state_commit(ss, 0, tok, 1);
     /* the walk: out flushes the live bank, in drops its rows; a reset drops them */
     uint64_t wb = 0;
-    (void)ss->ops.walk(ss, -1, false, NULL, 0, 0, &wb);
+    (void)ss->ops.walk(ss, -1, false, NULL, 0, pulsar_ckpt_pos(0u), &wb);
     pulsar_gpu_tensor *slab = pulsar_gpu_tensor_alloc(wb);
     ss->live_bank = 0;
     g_delta = {};
-    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, 0, NULL) && pulsar_gpu_synchronize();
+    ok = ok && slab && ss->ops.walk(ss, 0, false, slab, 0, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
     check(ok && g_delta.calls == 2 && g_delta.bank == 0 && ss->fold_host[2 + 2 * 0] == 0,
           "a walk out applies the live bank's pending rows first");
     pulsar_state_verify_begin(ss, 1, rf0, b0, p0);
@@ -337,7 +337,7 @@ static void plan_b(void) {
     pulsar_state_step_end(ss, b0, 1, ok);
     ok = ok && pulsar_state_commit(ss, 0, tok, 1);
     g_delta = {};
-    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, 0, NULL) && pulsar_gpu_synchronize();
+    ok = ok && ss->ops.walk(ss, 1, false, slab, 0, pulsar_ckpt_pos(0u), NULL) && pulsar_gpu_synchronize();
     check(ok && g_delta.calls == 0 && ss->fold_host[2 + 2 * 0] == 0, "a walk in drops the live bank's pending rows");
     pulsar_state_verify_begin(ss, 1, rf0, b0, p0);
     ok = ok && pulsar_state_step_begin(ss, true);

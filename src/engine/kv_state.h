@@ -70,6 +70,16 @@ typedef struct {
     bool whole_rows;
 } pulsar_kv_pool;
 
+/** L334 P2b S2: the store's interior keeps a grid point / frontier as raw uint32 tokens (0 = an empty slot or a free
+ *  record, never a position a record describes); these are its two crossings to the typed hooks and API.
+ *  @param g a raw position held by the store */
+/// @return it as a position
+static inline TokPos pulsar_ckpt_pos(uint32_t g) { return TokPos::after(TokCount{(int)g}); }
+/** The raw uint32 the store keeps for position `p` (fatal on none(): the store holds no "no position").
+ *  @param p the position */
+/// @return its token count from position 0
+static inline uint32_t pulsar_ckpt_raw(TokPos p) { return (uint32_t)p.before().raw(); }
+
 /** A model's kv-state answer: the slot layout, the frontier tests and the pool lists the checkpoint store
  *  (checkpoint.cpp), the segments and the session payload (session_payload.cpp) read.  Every hook takes the
  *  model's `state` (pulsar_ckpt_store::state). */
@@ -88,23 +98,23 @@ typedef struct pulsar_kv_state_ops {
      *  point -- a superset of the grid slot where the model holds state a grid point has canonical or
      *  rebuilds (DeepSeek: its coff-1 lanes and its drafter's rings).  Sized when a payload is (a
      *  drafter may load after the store).  Device copies on the session stream; false on a failed copy. */
-    bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, uint64_t off, uint32_t G,
+    bool (*walk)(void *state, int dir, bool frontier, struct pulsar_gpu_tensor *slab, uint64_t off, TokPos G,
                  uint64_t *bytes);
     /** The smallest G a checkpoint can describe (DeepSeek: the raw window). */
-    uint32_t (*min_checkpoint)(void *state);
+    TokPos (*min_checkpoint)(void *state);
     /** Does the installed bank stand exactly at prefill point G -- every pool's frontier at
      *  G / tokens_per_row and nothing decoded past it?  `why` names the first violation. */
-    bool (*stands_at)(void *state, uint32_t G, char *why, size_t whylen);
+    bool (*stands_at)(void *state, TokPos G, char *why, size_t whylen);
     /** Does the installed bank hold every pool's rows up to G (a segment's save precondition)? */
-    bool (*holds)(void *state, uint32_t G);
+    bool (*holds)(void *state, TokPos G);
     /** Before a restore's walk: every pool's frontier to G, every non-slot lane to its canonical
      *  boundary state. */
-    bool (*prepare_restore)(void *state, uint32_t G);
+    bool (*prepare_restore)(void *state, TokPos G);
     /** After a restore: the state is exact at G (clears the model's "stale" mark). */
     void (*restored)(void *state);
     /** A segment load wrote the pools' rows to G without the lanes: mark the bank stale until the
      *  chain's last checkpoint is restored. */
-    void (*set_frontier_stale)(void *state, uint32_t G);
+    void (*set_frontier_stale)(void *state, TokPos G);
     /** Is `bank` (any bank, installed or not) stale -- its lanes describing no position until a restore
      *  (set_frontier_stale; DeepSeek also a rewind off the grid)?  Out of range = false. */
     bool (*stale)(void *state, uint32_t bank);
@@ -114,10 +124,10 @@ typedef struct pulsar_kv_state_ops {
     /** Does the installed bank stand at frontier T with every lane describing T -- nothing stale, nothing
      *  speculative written past its true rows?  `why` names the first violation.  (The prefill frontier
      *  the payload carries is pulsar_session_bank_prefill_frontier's.) */
-    bool (*frontier_at)(void *state, uint32_t T, char *why, size_t whylen);
+    bool (*frontier_at)(void *state, TokPos T, char *why, size_t whylen);
     /** Before a payload load's frontier walk (dir > 0): the bank's counters at T with `prefill` of it
      *  prefilled, where the model keeps that count; restored() follows the walk. */
-    bool (*install_frontier)(void *state, uint32_t T, uint32_t prefill);
+    bool (*install_frontier)(void *state, TokPos T, TokCount prefill);
     /** Append-only rows that TRAIL the frontier (a row is written once the token after it exists, so no
      *  grid span closes them): a payload carries them to its frontier beside the pools; a segment does
      *  not.  Same contract as pools; NULL = none (DeepSeek). */
@@ -127,7 +137,7 @@ typedef struct pulsar_kv_state_ops {
      *  when the state does not stand at T -- the record would describe another state; else *capture says whether
      *  the state at T is a prefill's, so a grid checkpoint there is the cold prefill's (DeepSeek: no stale
      *  compressor group; Qwen: T is the prefill-only history's end). */
-    bool (*noted_at)(void *state, uint32_t T, bool *capture, char *why, size_t whylen);
+    bool (*noted_at)(void *state, TokPos T, bool *capture, char *why, size_t whylen);
     /** L313: every append-only row pool of ANY bank -- pools() then trailing_pools(), the same order -- each
      *  bank's own tensor (a NULL `rows` while the bank's physical is freed).  What a cross-bank restore copies. */
     uint32_t (*bank_pools)(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap);
