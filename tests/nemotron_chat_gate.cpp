@@ -462,7 +462,7 @@ static void p1_roundtrip(const std::string &cases_dir, const std::string &dir) {
 struct departures {
     int content_strip = 0;   /* vLLM strips a turn's content when it holds calls; the kit keeps it (KEEP_UNLESS_BLANK) */
     int arg_typing = 0;      /* an argument value typed differently (vLLM: schema coercion; the kit: the template's
-                              * own spelling -- see qwen_xml_call_body) */
+                              * own spelling -- see xml_call_body) */
     int after_calls = 0;     /* text after the calls: vLLM's final reading drops it (deferred content), the kit keeps it
                               * as content (the client sees what was sampled; Qwen's rule) */
 };

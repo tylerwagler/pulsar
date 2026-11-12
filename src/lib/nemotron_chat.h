@@ -36,7 +36,7 @@
  *
  * OUTPUT PARSER.  The output-parser kit (out_parse_kit.h) in Nemotron's configuration: vLLM's nemotron_v3 reading
  * (qwen3's grammar -- <think> / </think>, <tool_call> blocks with qwen3_coder's XML body, a call straight from
- * reasoning ends it -- with trailing reasoning whitespace stripped) on qwen_chat.h's XML call body: one tool-call
+ * reasoning ends it -- with trailing reasoning whitespace stripped) on the kit's XML call body (out_parse_kit.h): one tool-call
  * FORMAT, one reader (kernels -- and readers -- keyed by format, not family). */
 #pragma once
 
@@ -49,7 +49,7 @@
 #include "out_parse_kit.h"
 #include "pulsar.h"
 #include "pyjson.h"
-#include "qwen_chat.h"
+#include "xml_call_body.h"
 #include "chat_render_kit.h"
 
 /// The reasoning-effort levels the Nemotron template can express (the request's reasoning_effort, parsed).
@@ -231,5 +231,5 @@ public:
 
 private:
     /// The call-body reader (Qwen's XML format, Python scalar spelling), schema-typed by the request's tools.
-    qwen_xml_call_body body_;
+    xml_call_body body_;
 };
