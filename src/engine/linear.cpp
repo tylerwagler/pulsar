@@ -21,7 +21,7 @@
  * against raw rows) is an arm here and a line in the table, for every family at once. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 
 /// The refusal line for a weight format with no dense arm at an activation.
 /// @param w the weight

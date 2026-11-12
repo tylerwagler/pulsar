@@ -21,7 +21,7 @@
  * (weight 0.988 .. 1.016, bias up to 0.0195): they trained.  So it is the one path; the arms differ by 25% relative
  * RMS (the fixture's case 0), which is why the choice is not a rounding detail. */
 #include "nemotron_h.h"
-#include "cuda/pulsar_cuda_qwen.h"   /* the rows front door (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"   /* the rows front door (family-neutral) */
 #include "lib/bpe_tokenizer.h"
 
 #include <math.h>

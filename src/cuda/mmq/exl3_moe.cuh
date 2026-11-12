@@ -2,7 +2,7 @@
 /** @file
  *  The EXL3 routed MoE's one front door, every family: contract and dataflow. */
 // The EXL3 routed MoE's ONE front door, for every family (task #44; it was two launchers -- Qwen's bf16-rows
-// door in pulsar_cuda_qwen_moe.cu and DeepSeek's slot door in pulsar_cuda_moe.cu -- each with its own copy
+// door in pulsar_cuda_rows_moe.cu and DeepSeek's slot door in pulsar_cuda_moe.cu -- each with its own copy
 // of the sort / gate-up / fold / down / sum plumbing, over five MMQ entry points).
 //
 //   sort      mm_ids_helper ONCE: the expert-sorted schedule (ids_src = token, ids_dst = pair, expert_bounds).

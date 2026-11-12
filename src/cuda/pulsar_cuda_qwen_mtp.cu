@@ -12,7 +12,7 @@
  *   s_i  = bf16( bf16(fc_hidden(hn_i)) + e )       i = 0..3: the shared fc per stream, e added to every
  *                                                 stream with unit weight (the layer's first combine
  *                                                 with no injection), one rounding
- * The two fc Linears are the recipe's mxfp8_lt through the W8A16 arm (pulsar_qwen_mxfp8_linear_launch:
+ * The two fc Linears are the recipe's mxfp8_lt through the W8A16 arm (pulsar_mxfp8_linear_launch:
  * the GEMV at decode widths, the tensor-core GEMM at prompt widths).  Rows go through in slabs of
  * kMtpSlab so the workspace is a fixed few tens of MB whatever the chunk. */
 #include "pulsar_cuda_qwen.h"
@@ -169,7 +169,7 @@ constexpr int kTopBlocks = 64;
 /// Block size of the max and sum kernels.
 constexpr int kTopThreads = 256;
 
-/* one row's scratch; the workspace is PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records, then as many of these */
+/* one row's scratch; the workspace is PULSAR_DRAFT_TOP_ROWS_MAX records, then as many of these */
 /// One row's per-block partials for the draft-top reduction.
 struct top_ws {
     /// Each block's first maximum value.
@@ -197,11 +197,11 @@ __device__ __forceinline__ bool top_takes(float v, int32_t i, float bv, int32_t 
  *  @return ceil(n / kTopBlocks) */
 __device__ __forceinline__ int top_chunk(int n) { return (n + kTopBlocks - 1) / kTopBlocks; }
 
-/** This block's row scratch: after the PULSAR_QWEN_DRAFT_TOP_ROWS_MAX records, entry blockIdx.y.
+/** This block's row scratch: after the PULSAR_DRAFT_TOP_ROWS_MAX records, entry blockIdx.y.
  *  @param ws the draft-top workspace
  *  @return the row's top_ws */
 __device__ __forceinline__ top_ws *top_row_ws(void *ws) {
-    return (top_ws *)((pulsar_qwen_draft_top *)ws + PULSAR_QWEN_DRAFT_TOP_ROWS_MAX) + blockIdx.y;
+    return (top_ws *)((pulsar_draft_top *)ws + PULSAR_DRAFT_TOP_ROWS_MAX) + blockIdx.y;
 }
 
 /** Pass 1: each block's first maximum and NaN flag over its chunk.  Grid = (kTopBlocks, n_rows), block = kTopThreads.
@@ -280,11 +280,11 @@ __global__ void __launch_bounds__(kTopThreads) draft_top_sum_kernel(const float 
     if (threadIdx.x == 0) top_row_ws(wsv)->z[blockIdx.x] = sz[0];
 }
 
-/** Pass 3: fold the partials in block order into the row's pulsar_qwen_draft_top record.  Grid = (1, n_rows), block = 1.
+/** Pass 3: fold the partials in block order into the row's pulsar_draft_top record.  Grid = (1, n_rows), block = 1.
  *  @param wsv the draft-top workspace (record blockIdx.y written at its start) */
 __global__ void draft_top_record_kernel(void *wsv) {
     const top_ws *ws = top_row_ws(wsv);
-    pulsar_qwen_draft_top *rec = (pulsar_qwen_draft_top *)wsv + blockIdx.y;
+    pulsar_draft_top *rec = (pulsar_draft_top *)wsv + blockIdx.y;
     float m;
     int32_t a;
     top_fold(ws, &m, &a);
@@ -299,14 +299,14 @@ __global__ void draft_top_record_kernel(void *wsv) {
 
 } // namespace
 
-extern "C" size_t pulsar_qwen_draft_top_ws_bytes(void) {
-    return PULSAR_QWEN_DRAFT_TOP_ROWS_MAX * (sizeof(pulsar_qwen_draft_top) + sizeof(top_ws));
+extern "C" size_t pulsar_draft_top_ws_bytes(void) {
+    return PULSAR_DRAFT_TOP_ROWS_MAX * (sizeof(pulsar_draft_top) + sizeof(top_ws));
 }
 
-extern "C" int pulsar_qwen_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream) {
-    if (!rows || !ws || n <= 0 || n_rows <= 0 || n_rows > PULSAR_QWEN_DRAFT_TOP_ROWS_MAX) {
+extern "C" int pulsar_draft_top_launch(const float *rows, int n, int n_rows, void *ws, cudaStream_t stream) {
+    if (!rows || !ws || n <= 0 || n_rows <= 0 || n_rows > PULSAR_DRAFT_TOP_ROWS_MAX) {
         fprintf(stderr, "pulsar: qwen draft top: a null row / workspace, no logits or %d rows (1..%d) -- refusing\n",
-                n_rows, PULSAR_QWEN_DRAFT_TOP_ROWS_MAX);
+                n_rows, PULSAR_DRAFT_TOP_ROWS_MAX);
         return -1;
     }
     const dim3 grid(kTopBlocks, (unsigned)n_rows);
@@ -352,8 +352,8 @@ extern "C" int pulsar_qwen_mtp_combine_launch(const pulsar_qwen_mtp_dev *w, cons
                                                           (const __nv_bfloat16 *)w->norm_embd, m.ein);
         if (!launch_ok("norms")) return -3;
         /* hn is [n * 4][2560]: fc_hidden applies to each stream as its own row */
-        if (pulsar_qwen_mxfp8_linear_launch(&w->fc_hidden, (const uint16_t *)m.hn, n * kS, m.fh, nullptr, 0, stream) ||
-            pulsar_qwen_mxfp8_linear_launch(&w->fc_embd, (const uint16_t *)m.ein, n, m.fe, nullptr, 0, stream))
+        if (pulsar_mxfp8_linear_launch(&w->fc_hidden, (const uint16_t *)m.hn, n * kS, m.fh, nullptr, 0, stream) ||
+            pulsar_mxfp8_linear_launch(&w->fc_embd, (const uint16_t *)m.ein, n, m.fe, nullptr, 0, stream))
             return -1;
         const size_t ne = (size_t)n * kHC;
         mtp_add_kernel<<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(

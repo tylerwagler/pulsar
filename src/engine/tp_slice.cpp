@@ -28,7 +28,7 @@
  * and make tp-plan-gate diffs it against tests/tp-plan-golden/. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 
 #include <unordered_map>
 #include <vector>

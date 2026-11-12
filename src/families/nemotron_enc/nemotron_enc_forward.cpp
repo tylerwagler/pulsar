@@ -34,7 +34,7 @@
 #include "cuda/pulsar_cuda_blockdraft.h"   /* the SwiGLU block (family-neutral) */
 #include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_pool.h"
-#include "cuda/pulsar_cuda_qwen.h"         /* the rows front door's launchers (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"         /* the rows front door's launchers (family-neutral) */
 #include "cuda/pulsar_cuda_rowops.h"
 
 #include <math.h>

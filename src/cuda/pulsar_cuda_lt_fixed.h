@@ -1,6 +1,6 @@
 /** @file
  *  The fixed-algorithm fp16 / bf16 cuBLASLt GEMM contract (row-count independent bytes). */
-/* The fixed-algorithm fp16 GEMM (L321; L266's contract, out of qwen_exl3_dense_prefill.cu): D = f32(B . A) on the
+/* The fixed-algorithm fp16 GEMM (L321; L266's contract, out of exl3_dense_prefill.cu): D = f32(B . A) on the
  * fp16 tensor cores (sm_75+), cuBLASLt, f32 accumulate and output, with ONE algorithm per (A's layout, K, N, row
  * class) -- chosen once at the class's canonical row count with the reduction scheme pinned to NONE (no split-K), and
  * checked to support every other row count it is asked for (an unsupported one refuses).  So a row's bytes never

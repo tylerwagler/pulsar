@@ -21,7 +21,7 @@
  * ranged (expert parallel) reads that range of whole experts.  Every arm is today's launcher, unchanged. */
 #include "pulsar_engine_internal.h"
 #include "exl3_trellis.h"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 #include "cuda/pulsar_cuda_rowops.h"
 #include "cuda/mmq/pulsar_tessera.h"
 

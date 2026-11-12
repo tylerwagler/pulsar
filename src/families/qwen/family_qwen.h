@@ -494,7 +494,7 @@ struct pulsar_qwen_state : pulsar_driver_state {
     pulsar_gpu_tensor *mtp_streams; ///< [max_rows][n_hc][n_embd] bf16, the MTP layer's streams
     pulsar_gpu_tensor *mtp_tok;     ///< [max_rows] i32, x_{p+1} per MTP row
     pulsar_gpu_tensor *mtp_ws;      ///< pulsar_qwen_mtp_combine_workspace_bytes
-    pulsar_gpu_tensor *mtp_top;     ///< L289: pulsar_qwen_draft_top_ws_bytes, a draft row's pick + confidence
+    pulsar_gpu_tensor *mtp_top;     ///< L289: pulsar_draft_top_ws_bytes, a draft row's pick + confidence
     /** L272 P1: [n_banks] the MTP layer's index stage after each bank's last TRUE row, saved before a draft
      *  chain writes draft rows into it (the lane's stage_save / stage_restore; L272 P1 S4: per bank). */
     pulsar_gpu_tensor *mtp_stage;

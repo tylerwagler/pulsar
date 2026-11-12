@@ -49,7 +49,7 @@
 #include "cuda/pulsar_cuda_arch.cuh"
 #include "cuda/pulsar_cuda_internal.h"   /* PULSAR_IDX_MXFP4_HEADS_V4 */
 #include "cuda/pulsar_cuda_mx.cuh"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_qwen.h"   /* Qwen's PLE case too (it includes pulsar_cuda_rows.h) */
 
 #include <cuda_runtime.h>
 

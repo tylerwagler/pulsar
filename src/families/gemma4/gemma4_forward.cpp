@@ -47,7 +47,7 @@
 #include "gemma4.h"
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_head.h"
-#include "cuda/pulsar_cuda_qwen.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
 #include "cuda/pulsar_cuda_router.h"
 #include "cuda/pulsar_cuda_rowops.h"
 #include "cuda/pulsar_cuda_f16_rows.h"   /* L338: the runtime LoRA (pulsar_rows_lora_launch) */

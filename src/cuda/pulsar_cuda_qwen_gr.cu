@@ -24,7 +24,7 @@
  *              is given) its E4M3 encoding -- one value, the encoding of the bf16
  * The write: streams_s += out * inj_s, f32 math, one bf16 rounding.
  *
- * Two low-rank weight formats (pulsar_qwen_lowrank): MXFP8 at every per-layer
+ * Two low-rank weight formats (pulsar_mxfp8_lowrank): MXFP8 at every per-layer
  * site (xn and a are E4M3, the products are exact, the sums f32) and BF16 at
  * the top-level mixer, as the graded recipe stores it (xn and a are bf16 --
  * the source's own dtype there -- and the GEMVs are bf16 x bf16 into f32).
@@ -409,7 +409,7 @@ qwen_gr_down_kernel(const void *__restrict__ wv, const uint8_t *__restrict__ wsf
  * on nothing but its own x and W, so the chunk width changes no bit -- nor does the CTA's output
  * width.  CTA = 4 warps = 64 tokens x 8 NJ outputs (warp w: tokens 16w..16w+15, NJ n8 tiles); a wider
  * CTA re-stages the activation fewer times.  kMmaStage MX blocks staged per barrier. */
-constexpr int kDecodeRowsMax = PULSAR_QWEN_DECODE_ROWS_MAX;   ///< widths at or below take the decode GEMV
+constexpr int kDecodeRowsMax = PULSAR_ROWS_DECODE_MAX;   ///< widths at or below take the decode GEMV
 /** @var kMmaTok
  *  Tokens per prefill-GEMM CTA (4 warps x 16).
  *  @var kMmaStage
@@ -963,7 +963,7 @@ int rows_launch(const uint8_t *wq, const uint8_t *sf, const uint16_t *x_bf16, in
  *  @tparam W8 the down / up weights are MXFP8 (else BF16); the activations are bf16 either way
  *  @param w       the site's weights
  *  @param streams device bf16 [T][4][2560] this block's rows
- *  @param T       rows in this block (at most PULSAR_QWEN_DECODE_ROWS_MAX for decode rows)
+ *  @param T       rows in this block (at most PULSAR_ROWS_DECODE_MAX for decode rows)
  *  @param x_bf16  device bf16 [T][2560] out
  *  @param inj     device f32 [T][4] injection weights out, or NULL (the mixer)
  *  @param m       the carved workspace
@@ -1120,7 +1120,7 @@ extern "C" int pulsar_qwen_gr_write_launch(uint16_t *streams, const float *out, 
  * y [T][out] (index (t * 1 + 0) * out + row), so there is no reduction pass and
  * no workspace.  Split-K would only add partials to sum; with one split the row's
  * 80 blocks are walked by one warp in order. */
-extern "C" int pulsar_qwen_mxfp8_linear_launch(const pulsar_qwen_lowrank *l, const uint16_t *x_bf16, int rows,
+extern "C" int pulsar_mxfp8_linear_launch(const pulsar_mxfp8_lowrank *l, const uint16_t *x_bf16, int rows,
                                                float *y, void *ws, size_t ws_bytes, cudaStream_t stream) {
     PULSAR_REQUIRE_CC(80, "the Qwen MXFP8 linear (tensor-core rows kernel)", -1);   /* L321: refuse below the lane's arch, before its kernels trap */
     (void)ws;
@@ -1423,14 +1423,14 @@ qwen_bf16_to_mxfp8_kernel(const __nv_bfloat16 *__restrict__ w, const int32_t *__
 }
 } // namespace
 
-extern "C" uint64_t pulsar_qwen_mxfp8_bytes(int out, int in) {
+extern "C" uint64_t pulsar_mxfp8_bytes(int out, int in) {
     if (out <= 0 || in <= 0 || in % 32) return 0;
     return (uint64_t)out * in + (uint64_t)pulsar_mx_sf_slab_bytes(out, pulsar_mx_kbp(in));
 }
 
-extern "C" int pulsar_qwen_bf16_to_mxfp8(const uint16_t *w, const int32_t *rows, int out, int in, void *dst,
+extern "C" int pulsar_bf16_to_mxfp8(const uint16_t *w, const int32_t *rows, int out, int in, void *dst,
                                          cudaStream_t stream) {
-    const uint64_t bytes = pulsar_qwen_mxfp8_bytes(out, in);
+    const uint64_t bytes = pulsar_mxfp8_bytes(out, in);
     if (!w || !dst || !bytes) {
         fprintf(stderr, "pulsar: qwen bf16 -> MXFP8: %d x %d refused (in %% 32, non-null)\n", out, in);
         return -1;

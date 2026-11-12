@@ -202,7 +202,7 @@ are keyed by `(compute capability, cuBLASLt version)` and need their own step:
   `tests/lt_picks --from-log <server log>` on a quiet device, commit the rows
   with the reference grade.
 - **The in-place prompt kernel of the EXL3 dense arm** (L381,
-  `src/cuda/mmq/qwen_exl3_dense_prefill.cu`): a prompt chunk of up to 256 rows
+  `src/cuda/mmq/exl3_dense_prefill.cu`): a prompt chunk of up to 256 rows
   reads the trellis in place and must write the bytes the fixed GEMM writes
   for a bulk chunk.  That holds while the vendor GEMM accumulates each output
   as one ascending chain of 16-wide MMAs -- established on GB10 (sm_121) with

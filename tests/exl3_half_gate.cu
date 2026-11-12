@@ -35,7 +35,7 @@
  * read back through the model fd like a checkpoint shard) */
 #include "pulsar_gpu.h"
 #include "cuda/pulsar_cuda_mx.cuh"
-#include "cuda/pulsar_cuda_qwen.h"   /* pulsar_gpu_weight_range_ptr */
+#include "cuda/pulsar_cuda_rows.h"   /* pulsar_gpu_weight_range_ptr */
 #include "engine/exl3_trellis.h"
 
 #include <cuda_runtime.h>

@@ -11,7 +11,7 @@
 #include "cuda/pulsar_cuda_candsel.h"
 #include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_lilicorr.h"
-#include "cuda/pulsar_cuda_qwen.h"     /* the rows front door (pulsar_rows_linear_*) */
+#include "cuda/pulsar_cuda_rows.h"     /* the rows front door (pulsar_rows_linear_*) */
 #include "cuda/pulsar_cuda_rowops.h"
 
 #include <math.h>

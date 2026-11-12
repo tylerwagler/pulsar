@@ -26,7 +26,7 @@
  */
 #include "cuda/pulsar_cuda_bf16_rows.cuh"
 #include "cuda/pulsar_cuda_nvfp4.h"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

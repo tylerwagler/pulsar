@@ -40,7 +40,7 @@
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_f16_rows.h"
 #include "cuda/pulsar_cuda_fmha.h"
-#include "cuda/pulsar_cuda_qwen.h"     /* the rows front door's launchers (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"     /* the rows front door's launchers (family-neutral) */
 #include "cuda/pulsar_cuda_rowops.h"
 
 #include <math.h>

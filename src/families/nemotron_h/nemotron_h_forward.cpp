@@ -57,7 +57,7 @@
 #include "cuda/pulsar_cuda_attn_gqa.h"
 #include "cuda/pulsar_cuda_head.h"
 #include "cuda/pulsar_cuda_mamba2.h"
-#include "cuda/pulsar_cuda_qwen.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
+#include "cuda/pulsar_cuda_rows.h"     /* the rows front door's launchers + the rows MoE block (family-neutral) */
 #include "cuda/pulsar_cuda_router.h"
 #include "cuda/pulsar_cuda_rowops.h"
 
@@ -420,7 +420,7 @@ struct nh_state : pulsar_driver_state {
     /// bf16 [max_rows][n_embd]: the MTP module's output rows, final_layernorm(x) (drafting only)
     pulsar_gpu_tensor *mo;    /* [max_rows][n_embd] bf16 */
     /// The device draft pick's workspace (drafting only)
-    pulsar_gpu_tensor *mtop;  /* pulsar_qwen_draft_top_ws_bytes */
+    pulsar_gpu_tensor *mtop;  /* pulsar_draft_top_ws_bytes */
     /* the step's sequences: one a decode row, one a prefill run (a verify's runs, then the prompt runs) */
     /// The step's sequences (build_tables)
     uint32_t n_seq;
@@ -558,7 +558,7 @@ pulsar_driver_state *create(pulsar_session *s, uint32_t n_banks) {
     if (ok && W(e)->drafting) {
         st->mh = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
         st->mo = pulsar_gpu_tensor_alloc(R * sh.n_embd * 2u);
-        st->mtop = pulsar_gpu_tensor_alloc(pulsar_qwen_draft_top_ws_bytes());
+        st->mtop = pulsar_gpu_tensor_alloc(pulsar_draft_top_ws_bytes());
         st->mtp = (nh_step *)xcalloc(1, sizeof(nh_step));
         st->mtp->w = W(e);
         st->mtp->st = st;
@@ -1474,13 +1474,13 @@ bool mtp_forward(pulsar_session *s, const pulsar_mtp_step *m) {
     if (ok && m->head_n) ok = head_rows(&st, mo, m->head_n, 0);
     /* L289: the picks reduced on the device, behind the head (every headed row in one launch) */
     if (ok && m->pick)
-        ok = pulsar_qwen_draft_top_launch((const float *)dptr(q->logits), (int)V, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
+        ok = pulsar_draft_top_launch((const float *)dptr(q->logits), (int)V, (int)m->head_n, dptr(q->mtop), 0) == 0 ||
              fail("the MTP draft pick refused");
     if (ok) ok = pulsar_gpu_end_commands() != 0;
     else (void)pulsar_gpu_synchronize();
     ok = step_end(&st, ok);
     if (ok && m->pick) {
-        pulsar_qwen_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
+        pulsar_draft_top rec[PULSAR_DRIVER_HEADS_MAX];
         ok = pulsar_gpu_tensor_read(q->mtop, 0, rec, m->head_n * sizeof rec[0]) != 0 || fail("could not read the pick");
         for (uint32_t r = 0; ok && r < m->head_n; r++) {
             if (rec[r].nan || rec[r].index < 0 || (uint32_t)rec[r].index >= V) return fail("the MTP head's row holds a NaN");

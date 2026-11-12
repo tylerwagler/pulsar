@@ -2,7 +2,7 @@
  *  The MoE router, one parameterized implementation for every family: logits and top-k selection kernels. */
 /* The MoE router, one parameterized implementation for every family (L295 F2): contracts in pulsar_cuda_router.h.
  *
- * It replaces the two per-family routers: Qwen's softmax + shared-gate kernels (pulsar_cuda_qwen_moe.cu) and
+ * It replaces the two per-family routers: Qwen's softmax + shared-gate kernels (pulsar_cuda_rows_moe.cu) and
  * DeepSeek's sqrt-softplus top-k / hash kernels (pulsar_cuda_hc_router.cu).  Each family's arithmetic is kept
  * exactly -- the same expressions in the same order -- so moving a family onto this file moves no byte; the
  * families now differ only in the cfg they declare. */

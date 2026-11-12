@@ -68,7 +68,7 @@
 //              takes is ds4_exl3_dense_gemv_arm's rule -- its grid in waves, its rows and the device, never the
 //              family -- with the measurement beside it (GB10, gpuq #702 / #703).
 //
-// PROMPT rows never run these kernels: a prompt chunk is the prompt arm's (qwen_exl3_dense_prefill.cu: the
+// PROMPT rows never run these kernels: a prompt chunk is the prompt arm's (exl3_dense_prefill.cu: the
 // fixed-algorithm GEMM on the weight decoded to fp16, or -- L381, small chunks -- the trellis read in place with
 // the same bytes; ds4_exl3_dense_prompt_arm is that choice's rule).
 
@@ -979,13 +979,13 @@ int ds4_exl3_dense_multi_launch(const ds4_exl3_dense_proj *p, int n, const void 
         fprintf(stderr, "%s: the workspace must be 16-byte aligned and xb 8-byte (the uint2 row loads) -- refusing\n", tag);
         return -1;
     }
-    /* L251: a prompt chunk takes the prompt arm (qwen_exl3_dense_prefill.cu), a projection at a time (each its own
+    /* L251: a prompt chunk takes the prompt arm (exl3_dense_prefill.cu), a projection at a time (each its own
      * prep: suh is the projection's): the tensor-core GEMM, or its bytes from the in-place kernel on a small chunk
      * (L381).  This arm's GEMV re-decodes the trellis per 16 rows and re-reads the activation planes per 32 outputs,
      * a decode kernel doing a GEMM's work.  Decode rows keep the GEMV bit for bit at every width. */
     if (prompt) {
         for (int j = 0; j < n; ++j) {
-            const int rc = qwen_exl3_dense_prefill_launch(p[j].w, p[j].k2, xb, p[j].y, M, K, p[j].N, trellis_bytes[j],
+            const int rc = exl3_dense_prefill_launch(p[j].w, p[j].k2, xb, p[j].y, M, K, p[j].N, trellis_bytes[j],
                                                           stream);
             if (rc) return rc;
         }

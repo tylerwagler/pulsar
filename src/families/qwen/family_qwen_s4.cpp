@@ -1217,13 +1217,13 @@ static bool build_draft_head(const pulsar_qwen_step *st, pulsar_qwen_weights *wm
     const uint32_t nd = wm->n_draft;
     if (!wm->draft_ids || nd == 0 || nd >= s->n_vocab) return fail("the MTP draft vocabulary was not chosen at load");
     const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
-    const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)nd, H);
+    const uint64_t bytes = pulsar_mxfp8_bytes((int)nd, H);
     /* the device id list lives as long as the head (the gather kernel may still be reading it) */
     wm->draft_ids_dev = pulsar_gpu_tensor_alloc((uint64_t)nd * sizeof(int32_t));
     wm->draft_head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
     const bool ok = wm->draft_ids_dev && wm->draft_head_mx &&
                     pulsar_gpu_tensor_write(wm->draft_ids_dev, 0, wm->draft_ids, (uint64_t)nd * sizeof(int32_t)) &&
-                    pulsar_qwen_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
+                    pulsar_bf16_to_mxfp8(hb, (const int32_t *)dptr(wm->draft_ids_dev), (int)nd, H,
                                               dptr(wm->draft_head_mx), 0) == 0;
     if (!ok) {
         pulsar_gpu_tensor_free(wm->draft_head_mx);
@@ -1278,9 +1278,9 @@ bool pulsar_qwen_s4_head(const pulsar_qwen_step *st, uint32_t row0, uint32_t n, 
         if (ok && !dh && !stored && !wm->head_mx) {
             const uint16_t *hb = (const uint16_t *)wptr(st, st->w->output, "qwen lm_head");
             if (hb) hb += (uint64_t)v_lo * H;
-            const uint64_t bytes = pulsar_qwen_mxfp8_bytes((int)Vl, H);
+            const uint64_t bytes = pulsar_mxfp8_bytes((int)Vl, H);
             wm->head_mx = hb && bytes ? pulsar_gpu_tensor_alloc(bytes) : NULL;
-            ok = wm->head_mx && pulsar_qwen_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
+            ok = wm->head_mx && pulsar_bf16_to_mxfp8(hb, NULL, (int)Vl, H, dptr(wm->head_mx), 0) == 0;
             if (ok) fprintf(stderr, "pulsar: %s: lm_head as MXFP8 (%.2f GB, from bf16 %.2f GB)\n", PULSAR_QWEN_ARCH,
                             (double)bytes / 1e9, (double)s->n_vocab * H * 2 / 1e9);
             else if (wm->head_mx) { pulsar_gpu_tensor_free(wm->head_mx); wm->head_mx = NULL; }
@@ -1359,20 +1359,20 @@ bool pulsar_qwen_s4_mtp_combine(const pulsar_qwen_step *st, const void *h) {
            fail("the MTP combine failed");
 }
 
-uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_qwen_draft_top_ws_bytes(); }
+uint64_t pulsar_qwen_s4_draft_top_ws_bytes(void) { return pulsar_draft_top_ws_bytes(); }
 
-static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_QWEN_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
+static_assert(PULSAR_QWEN_HEAD_ROWS_MAX <= PULSAR_DRAFT_TOP_ROWS_MAX, "every headed MTP row can be picked");
 
 bool pulsar_qwen_s4_draft_top(const pulsar_qwen_step *st, uint32_t n) {
     if (!st->draft_head || !st->st->mtp_top || !st->w->n_draft) return fail("the draft pick outside a drafting MTP step");
-    return pulsar_qwen_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, (int)n,
+    return pulsar_draft_top_launch((const float *)dptr(st->st->logits), (int)st->w->n_draft, (int)n,
                                         dptr(st->st->mtp_top), 0) == 0 ||
            fail("the draft pick launch failed");
 }
 
 bool pulsar_qwen_s4_draft_top_read(const pulsar_qwen_state *q, const pulsar_qwen_weights *w, uint32_t n, int32_t *id,
                                    float *conf) {
-    pulsar_qwen_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
+    pulsar_draft_top rec[PULSAR_QWEN_HEAD_ROWS_MAX];
     if (n == 0 || n > PULSAR_QWEN_HEAD_ROWS_MAX) return fail("a draft pick of no rows or past the head's rows");
     if (!q->mtp_top || !pulsar_gpu_tensor_read(q->mtp_top, 0, rec, n * sizeof rec[0]))
         return fail("could not read the draft pick");

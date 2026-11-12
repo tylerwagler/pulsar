@@ -18,7 +18,7 @@
  *   out        routed + gamma_0 * shared_0 + gamma_1 * shared_1 + ... -- in that order
  *
  * L251 / ac69748f: there is no E4M3 activation slot on this lane. */
-#include "pulsar_cuda_qwen.h"
+#include "pulsar_cuda_rows.h"
 #include "pulsar_cuda_mx.cuh"
 #include "mmq/ds4_exl3_dense.cuh"
 #include "mmq/exl3_moe.cuh"
@@ -282,13 +282,13 @@ extern "C" int pulsar_rows_linear_launch(const pulsar_rows_linear *l, const uint
                     l->in, l->out);
             return -1;
         }
-        const pulsar_qwen_lowrank lr{l->w, l->sf, l->out, l->in, l->prompt};
+        const pulsar_mxfp8_lowrank lr{l->w, l->sf, l->out, l->in, l->prompt};
         /* L288 C1: decode rows past the decode arm's width (a wide verify, its head) in blocks of that width -- each
          * row the bytes a one-row decode gives at any width (the EXL3 tier blocks inside its own launch) */
-        const int blk = l->prompt ? rows : PULSAR_QWEN_DECODE_ROWS_MAX;
+        const int blk = l->prompt ? rows : PULSAR_ROWS_DECODE_MAX;
         for (int r0 = 0; r0 < rows; r0 += blk) {
             const int m = rows - r0 < blk ? rows - r0 : blk;
-            const int rc = pulsar_qwen_mxfp8_linear_launch(&lr, x_bf16 + (size_t)r0 * l->in, m, y + (size_t)r0 * l->out,
+            const int rc = pulsar_mxfp8_linear_launch(&lr, x_bf16 + (size_t)r0 * l->in, m, y + (size_t)r0 * l->out,
                                                            ws, ws_bytes, stream);
             if (rc) return rc;
         }

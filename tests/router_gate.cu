@@ -17,7 +17,7 @@
  *
  * Model-free except E.  Usage: router_gate [inkling-router.bin] */
 #include "pulsar_gpu.h"
-#include "pulsar_cuda_qwen.h"
+#include "pulsar_cuda_rows.h"
 #include "pulsar_cuda_router.h"
 
 #include <cuda_runtime.h>

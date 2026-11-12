@@ -692,7 +692,7 @@ segstore-tsan: tests/segstore_tsan
 tests/lt_picks: tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o src/cuda/pulsar_cuda_lt_fixed.h Makefile
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -Isrc -Isrc/cuda -o $@ tests/lt_picks.cu src/cuda/pulsar_cuda_lt_fixed.o $(CUDA_LDLIBS)
 # L381: does the fixed cuBLASLt GEMM still follow the accumulation order the EXL3 dense arm's in-place prompt kernel
-# implements (qwen_exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
+# implements (exl3_dense_prefill.cu)?  Exit 0 iff every dense prompt shape is reproduced, byte for byte, by the
 # shipped order.  `lt-order-gate` is its battery form (kernels tier: a GPU, no model): on a device the rule gives the
 # in-place kernel (sm_12x) a vendor change fails it; elsewhere it is N/A.  Run by hand without --gate to establish the
 # order on a new architecture, and after a toolchain move (docs/QA_BEFORE_RELEASES.md) -- usage in the file's header.

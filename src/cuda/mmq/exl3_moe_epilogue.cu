@@ -11,7 +11,7 @@
 #include "exl3_moe_epilogue.cuh"
 #include "ds4_exl3_dev.cuh"
 #include "cuda/pulsar_cuda_mx.cuh"
-#include "cuda/pulsar_cuda_qwen.h"   /* pulsar_ffn_act: the fold's activation */
+#include "cuda/pulsar_cuda_rows.h"   /* pulsar_ffn_act: the fold's activation */
 #include "engine/exl3_trellis.h"
 
 #include <cstdint>

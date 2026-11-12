@@ -27,7 +27,7 @@
 #include "cuda/pulsar_cuda_mx.cuh"
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/exl3_moe.cuh"
-#include "cuda/pulsar_cuda_qwen.h"
+#include "cuda/pulsar_cuda_rows.h"
 #include "engine/exl3_trellis.h"
 
 #include <cuda_bf16.h>
