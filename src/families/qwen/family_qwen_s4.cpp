@@ -14,9 +14,9 @@
  * are known before the forward) and read from the row file by the Engram pread
  * pool: embed hashes and ISSUES the gather, the PLE op at layer 1 waits for it,
  * so the reads overlap layer 0. */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
-#include "exl3_trellis.h"
+#include "engine/exl3_trellis.h"
 #include "qwen_ngram.h"
 #include "tp/pulsar_tp.h"
 #include "cuda/pulsar_cuda_qwen.h"

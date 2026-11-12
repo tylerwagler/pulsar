@@ -9,13 +9,13 @@
  * the family's own session state, and its blocks on the core step driver (L295
  * F4: one block per layer kind, the MTP lane -- step_driver.cpp runs every
  * step).  What is NOT here: any op (family_qwen_s4.cpp). */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
-#include "exl3_trellis.h"
+#include "engine/exl3_trellis.h"
 #include "lib/bpe_tokenizer.h"
 #include "tp/pulsar_tp.h"
-#include "spec_mtp.h"
-#include "spec_block.h"
+#include "engine/spec_mtp.h"
+#include "engine/spec_block.h"
 #include "cuda/pulsar_cuda_blockdraft.h"
 #include "cuda/pulsar_cuda_gdn.h"
 

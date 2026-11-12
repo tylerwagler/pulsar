@@ -13,7 +13,7 @@
  *     (temporal_patch_size 2).
  *
  * Graded by vision-qwen-pixel-gate against HF's own processor (tests/vision_qwen_pixel_goldens.py). */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
 
 #include <math.h>

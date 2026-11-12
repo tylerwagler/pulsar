@@ -55,7 +55,7 @@
 #include "gate_entry.h"
 #include "gate_util.h"
 #include "pulsar_engine_internal.h"   /* S1 forces the quench latch by its field; S2 reads the recurrent state */
-#include "family_qwen.h"              /* S2: the Qwen bank's state slices */
+#include "../src/families/qwen/family_qwen.h"              /* S2: the Qwen bank's state slices */
 
 #include <algorithm>
 #include <math.h>

@@ -23,7 +23,7 @@ default), on the head's own input -- the trunk mixer's bf16 rows.
       bf16 lm_head dropped as --head does when FILE holds lm_head.weight.
 
 The draft head's rows are the engine's draft vocabulary in the engine's order (qwen_draft_vocab, family_qwen.cpp): ids
-[0, QWEN_DRAFT_PREFIX), the first `extra` of src/engine/qwen_draft_vocab.inc's ranked list sorted ascending, then
+[0, QWEN_DRAFT_PREFIX), the first `extra` of src/families/qwen/qwen_draft_vocab.inc's ranked list sorted ascending, then
 [eos_id, n_vocab).  EXL3 needs the row count % 128 == 0, so `extra` is the default rounded up to make it so (the
 engine derives `extra` from the container's row count and checks the stated ids).
 """
@@ -37,7 +37,7 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-INC = os.path.join(HERE, '..', '..', 'src', 'engine', 'qwen_draft_vocab.inc')
+INC = os.path.join(HERE, '..', '..', 'src', 'families', 'qwen', 'qwen_draft_vocab.inc')
 N_EMBD, N_VOCAB, EOS_ID = 2560, 248320, 248044          # Flash-Next (PULSAR_QWEN_SHAPE_FLASH_NEXT)
 EXL3_LAYOUT = {3: 'exl3m_k3', 4: 'exl3m_k4', 5: 'exl3m_k5'}
 ALIGN = 32

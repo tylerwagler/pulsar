@@ -38,7 +38,7 @@
 #include "../src/families/gemma4/gemma4.h"         /* L375: each family's tokenizer table and its model's tok */
 #include "../src/families/nemotron_h/nemotron_h.h"
 #include "../src/families/inkling/inkling.h"
-#include "../src/engine/family_qwen.h"          /* L295 F8 Q2: Qwen's tokenizer table and pulsar_qwen_model */
+#include "../src/families/qwen/family_qwen.h"          /* L295 F8 Q2: Qwen's tokenizer table and pulsar_qwen_model */
 /* the frozen host sampler (L302): spec-math's oracle */
 #include "sampler_host_ref.h"
 #ifndef PULSAR_NO_GPU

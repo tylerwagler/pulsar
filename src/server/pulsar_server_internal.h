@@ -23,8 +23,9 @@
 /* The JSON scanner is shared with the engine's safetensors reader, so it lives
  * in src/lib and is declared there. */
 #include "pulsar_json.h"
-/* L251: the Qwen family's chat renderer, effort authority and output parser. */
-#include "qwen_chat.h"
+/* the output-parser kit every family's server table drives (L295 F8 Q4: no family's chat header here) */
+#include "out_parse_kit.h"
+#include "pyjson.h"
 #include "sched_value.h"
 
 #include <new>

@@ -171,10 +171,10 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
 # The frontend (L251 S5; the shared kit since L295 F5) rides here too -- the BPE engine, the output-parser
-# kit, Qwen's renderer and parser configuration (the other chat families' live in src/families/<name>/, L295 F8): each
+# kit (every chat family's renderer and parser lives in src/families/<name>/, L295 F8): each
 # family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
-FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
+FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/out_parse_kit.o \
                 src/lib/chat_render_kit.o
 # L347 I3a: the disk KV payload digest (the engine's payload streams, the segment store and the TP workers share it)
 # and the store's host memory pool ride here too: the engine references the digest, the store both.
@@ -1201,10 +1201,10 @@ scratch-poison-gate-mutant: tests/scratch_poison_gate_mutant
 # the container's PENGRAM1 v2 row file (tools/container/ple_rows.py); empty = read the
 # checkpoint's shard parts named in the vectors instead
 QWEN_NGRAM_ROWFILE ?=
-tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp src/engine/qwen_ngram.h \
+tests/qwen_ngram_test: tests/qwen_ngram_test.cpp src/families/qwen/qwen_ngram.cpp src/families/qwen/qwen_ngram.h \
                        src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp Makefile \
                        src/engine/pulsar_engine_internal.h
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -o $@ tests/qwen_ngram_test.cpp src/engine/qwen_ngram.cpp \
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -Isrc/families/qwen -o $@ tests/qwen_ngram_test.cpp src/families/qwen/qwen_ngram.cpp \
 		src/engine/engram.cpp src/engine/log.cpp src/engine/alloc.cpp -lpthread
 .PHONY: qwen-ngram-test
 qwen-ngram-test: tests/qwen_ngram_test
@@ -1218,9 +1218,9 @@ qwen-ngram-test: tests/qwen_ngram_test
 QWEN_TOK_DIR ?= $(call need_path,QWEN_TOK_DIR)
 QWEN_RENDER_CASES ?= $(call need_path,QWEN_RENDER_CASES)
 QWEN_CALIB ?= $(call need_path,QWEN_CALIB)
-QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/qwen_chat.cpp src/lib/qwen_output.cpp src/lib/out_parse_kit.cpp
+QWEN_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/qwen/qwen_chat.cpp src/families/qwen/qwen_output.cpp src/lib/out_parse_kit.cpp
 tests/qwen_chat_gate: tests/qwen_chat_gate.cpp tests/bpe_gate_util.h $(QWEN_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/qwen_chat.h src/lib/out_parse_kit.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
+                      src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/qwen/qwen_chat.h src/lib/out_parse_kit.h src/lib/xml_call_body.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h \
                       src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/qwen_chat_gate.cpp $(QWEN_CHAT_SRCS)
 .PHONY: qwen-chat-gate
@@ -2665,7 +2665,7 @@ gates-dev:
 	    for p in $$paths; do \
 	      case "$$p" in \
 	        *vision*) cls=vision; vision=1 ;; \
-	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/nemotron_*|src/engine/*qwen*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
+	        src/engine/family*|src/families/*|src/engine/role_bind*|tests/nemotron_*|src/engine/*qwen*|src/families/qwen/*|tests/qwen_*|tests/session_contract*|src/engine/state_kinds*|src/engine/step_driver*|tests/state_kinds*|src/engine/session*|src/engine/safetensors*|src/engine/model.cpp|src/engine/weights*|src/engine/tensor_bind*|tests/loader_*|src/engine/sync_driver*|src/engine/prefill_loop*|src/engine/checkpoint*|src/engine/kv_state*) cls=engine; family=1 ;; \
 	        *exl3*) cls=exl3; exl3=1 ;; \
 	        *gdn*) cls=gdn; gdn=1 ;; \
 	        *sconv*|*mamba2*|src/cuda/pulsar_cuda_head*|tests/head_*|*rowops*) cls=blocks; blocks=1 ;; \
@@ -2680,9 +2680,9 @@ gates-dev:
 	      case "$$p" in *router*|*moe*) router=1 ;; esac; \
 	      case "$$p" in *bf16_rows*|*nvfp4*|*weight_format*|src/engine/linear.cpp|src/engine/moe.cpp) bf16=1 ;; esac; \
 	      case "$$p" in *sampler*|*libm*|src/engine/spec_dspark.cpp|src/engine/session_spec.cpp|src/engine/spec_mtp.cpp|src/engine/spec_block.cpp) minp=1 ;; esac; \
-	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/engine/family_qwen.cpp) drafter=1 ;; esac; \
+	      case "$$p" in *spec_block*|*blockdraft*|*candsel*|*lilicorr*|*mtp_spec*|*attn_gqa*|*rope*|src/engine/session_spec.cpp|src/families/nemotron_h/*|src/families/qwen/family_qwen.cpp) drafter=1 ;; esac; \
 	      case "$$p" in src/server/server_jobs.cpp|src/server/server_sched.cpp|src/server/kv_cache.cpp|src/lib/pulsar_kvchain*|src/lib/pulsar_segstore*|src/lib/pulsar_kvdigest*|src/lib/pulsar_kvpool*) resume=1 ;; esac; \
-	      case "$$p" in src/server/*|src/lib/*_chat*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
+	      case "$$p" in src/server/*|src/lib/*_chat*|src/families/*/*_chat*|src/families/*/*_output*|src/families/*/*_server*|src/lib/xml_call_body*|src/lib/pyjson*|src/lib/bpe_tokenizer*|src/lib/pulsar_json*|src/lib/out_parse*|src/lib/chat_render*) render=1 ;; esac; \
 	      case "$$p" in src/server/cli_main.cpp|src/server/server_sched.cpp|src/engine/state_kinds*|src/engine/session_banks*|tests/server_kv_headroom_live.py) kvmem=1 ;; esac; \
 	      case "$$p" in src/engine/family_deepseek*|src/engine/kv_state_ds4*|src/engine/spec_dspark*|src/engine/gpu_*|src/cuda/pulsar_cuda_csa2*|src/cuda/pulsar_cuda_dspark*|src/cuda/mmq/ds4_mmq*|src/cuda/mmq/ds4_mmid*|src/cuda/mmq/ds4_mxfp8*|src/cuda/mmq/ds4_quantize*|src/server/deepseek_*|src/server/parser_deepseek*|tests/live_legs.py) ds4legs=1 ;; esac; \
 	      case "$$p" in src/cuda/pulsar_cuda_runtime.cu|src/cuda/*scratch*|src/engine/gpu_graph_*|src/engine/gpu_decode.cpp|src/engine/step_driver*|src/engine/spec_block*|src/engine/verify_curve.cpp|*scratch_poison*) poison=1 ;; esac; \
@@ -3149,7 +3149,7 @@ tests/qwen_deep_probe.o: tests/qwen_deep_probe.cpp tests/segment_file_io.h
 tests/qwen_deep_probe: tests/qwen_deep_probe.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/qwen_chat_smoke.o: tests/qwen_chat_smoke.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
+	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -Isrc/lib -c -o $@ $<
 tests/qwen_chat_smoke: tests/qwen_chat_smoke.o src/lib/pulsar_help.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 tests/loader_open.o: tests/loader_open.cpp
@@ -3219,13 +3219,13 @@ tests/scratch_poison_gate.o: tests/scratch_poison_gate.cpp tests/gate_entry.h te
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/engine -c -o $@ $<
 tests/scratch_poison_gate: tests/scratch_poison_gate.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
-tests/mutant/family_qwen_s4_l307.cpp: src/engine/family_qwen_s4.cpp tests/scratch_poison_mutant.py
+tests/mutant/family_qwen_s4_l307.cpp: src/families/qwen/family_qwen_s4.cpp tests/scratch_poison_mutant.py
 	@mkdir -p tests/mutant
 	python3 tests/scratch_poison_mutant.py $< $@
 tests/mutant/family_qwen_s4_l307.o: tests/mutant/family_qwen_s4_l307.cpp src/engine/pulsar_engine_internal.h src/pulsar.h src/pulsar_gpu.h
-	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/engine -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(PULSAR_INC) -Isrc/families/qwen -c -o $@ $<
 tests/scratch_poison_gate_mutant: tests/scratch_poison_gate.o tests/mutant/family_qwen_s4_l307.o \
-                                  $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
+                                  $(filter-out src/families/qwen/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # L317: the battery's moved legs, bitten.  tests/gates_runner linked against ONE mutated TU (tests/runner_mutants.py
 # writes the copy and refuses unless its site appears once) and run with the selection that must catch it -- PASS of
@@ -3248,7 +3248,7 @@ $(eval $(call RUNNER_MUTANT_RULES,adopt-rows,src/engine/checkpoint,cpp))
 $(eval $(call RUNNER_MUTANT_RULES,spec-emit,src/engine/session_spec,cpp))
 # ... and the L307 scratch-poison mutant in the runner: scratch-poison-gate on the hosted Qwen
 tests/gates_runner_mutant_scratch-poison: tests/gates_runner.o $(RUNNER_OBJS) $(RUNNER_LIBS) \
-                                          tests/mutant/family_qwen_s4_l307.o $(filter-out src/engine/family_qwen_s4.o,$(CORE_OBJS))
+                                          tests/mutant/family_qwen_s4_l307.o $(filter-out src/families/qwen/family_qwen_s4.o,$(CORE_OBJS))
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 # mutant -> the sub-gate (the moved leg) whose FAIL is the catch; the runner selection is runner_mutants.py's
 BATTERY_MUTANTS = chunk-resume:cuda-chunk-neutrality-gate row-sort:cuda-row-neutrality-gate-deep \

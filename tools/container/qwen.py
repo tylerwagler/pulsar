@@ -23,7 +23,7 @@ What the container holds (the loader's contract, published in the L251 container
   * gguf_name == the HF name (dense) / the HF stack name `...mlp.experts.<part>` (families): the Qwen family binds
     by the checkpoint's own names -- no second name table.  A family materialises as one tensor of dims
     dims_per_expert_ne + [n_experts] = the HF stack shape reversed.
-  * pulsar.kv (S1's contract, src/engine/family_qwen.h section 2): general.architecture = "qwen4_exp"; the HF
+  * pulsar.kv (S1's contract, src/families/qwen/family_qwen.h section 2): general.architecture = "qwen4_exp"; the HF
     text_config VERBATIM under `qwen4_exp.` (config_kvs); the PLE int64 buffers as u64 arrays
     qwen4_exp.ple_{layer_multipliers,ngram_heads_vocab_sizes,ngram_heads_offsets}; the builder's own facts under
     `pulsar.*` (recipe + sha256, sources, expert_gate_up, mtp/vision presence, the PLE row file's name, rows,
@@ -34,7 +34,7 @@ What the container holds (the loader's contract, published in the L251 container
     top-level mixer), and `mtp` (the drafter's mtp.* tensors, its expert families marked "block": "mtp") when the
     recipe writes them (L279; the L251 sidecar's rows) -- pulsar.mtp_present says which -- and (L299) `drafter` with
     --drafter dflash2 DIR: the DFlash2 block drafter (drafters.py; incoai/Qwen3.8-Flash-Next-DFlash2), its head the
-    target lm_head's draft-vocabulary rows (qwen_draft_vocabulary: the engine's src/engine/qwen_draft_vocab.inc), its
+    target lm_head's draft-vocabulary rows (qwen_draft_vocabulary: the engine's src/families/qwen/qwen_draft_vocab.inc), its
     config under `dflash2.` and pulsar.drafter "dflash2" -- the engine selects it with --drafter dflash2 (the MTP
     module, when the recipe writes it too, with --drafter mtp; the other is unloaded).
 """
@@ -317,11 +317,11 @@ def build_kv(hf, ctx):
 DRAFTERS = ("dflash2",)
 # the engine's draft-vocabulary table (PULSAR_QWEN_DRAFT_VOCAB_INC: test_qwen.py's toy table for its toy vocabulary)
 _VOCAB_INC = os.environ.get("PULSAR_QWEN_DRAFT_VOCAB_INC") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "engine", "qwen_draft_vocab.inc")
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "families", "qwen", "qwen_draft_vocab.inc")
 
 
 def qwen_draft_vocabulary(eos_id: int, n_vocab: int) -> list:
-    """The engine's draft vocabulary (family_qwen.cpp qwen_draft_vocab; src/engine/qwen_draft_vocab.inc): ids
+    """The engine's draft vocabulary (family_qwen.cpp qwen_draft_vocab; src/families/qwen/qwen_draft_vocab.inc): ids
     [0, QWEN_DRAFT_PREFIX), the first QWEN_DRAFT_EXTRA_DEFAULT ranked ids sorted ascending, then [eos_id, n_vocab) --
     the rows the MTP drafter's head carries, and (L299) the DFlash2 drafter's head."""
     src = open(_VOCAB_INC).read()

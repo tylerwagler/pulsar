@@ -577,7 +577,7 @@ void pulsar_engram_hash_pos(const pulsar_engram_layout *L, uint32_t layer,
  * layout's row count; a mismatch is a wrong table, refused.
  *
  * The same pool and table serve Qwen3.8-Flash-Next's PLE n-gram table (L251,
- * src/engine/qwen_ngram.h): 320M rows of 160 bf16 held as 128 row-contiguous
+ * src/families/qwen/qwen_ngram.h): 320M rows of 160 bf16 held as 128 row-contiguous
  * tensors spread over the checkpoint's shard files.  So a table is a list of
  * PARTS -- (file, byte offset of the part's row 0) -- of `rows_per_part` rows
  * each (the last may be shorter), with one record size; an Engram row file is
@@ -963,7 +963,7 @@ typedef struct {
 #include "family.h"
 /* L295 F4: the core row-step driver's types (a driver family's session state and step extend them). */
 #include "step_driver.h"
-/* L295 F8 Q2: family_qwen.h is Qwen's own (src/engine/family_qwen*.cpp and its tests include it); nothing shared does. */
+/* L295 F8 Q2: family_qwen.h is Qwen's own (src/families/qwen/family_qwen*.cpp and its tests include it); nothing shared does. */
 static_assert(PULSAR_FAMILY_MAX_LAYER >= PULSAR_MAX_LAYER,
               "a layer plan must hold every layer a DeepSeek profile can have");
 

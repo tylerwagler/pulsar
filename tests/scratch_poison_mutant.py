@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """L307: the scratch-poison gate's mutant (make scratch-poison-gate-mutant).
 
-Writes a copy of src/engine/family_qwen_s4.cpp whose trunk step (pulsar_qwen_s4_embed) clears its MoE non-finite flag -- a word of the MOE op's
+Writes a copy of src/families/qwen/family_qwen_s4.cpp whose trunk step (pulsar_qwen_s4_embed) clears its MoE non-finite flag -- a word of the MOE op's
 scratch arena, read back at the step's end -- on each arena's FIRST step only.  Unpoisoned, nothing ever sets the flag, so the
 stale word is still the clear one and every step passes: the defect is invisible.  Poisoned, the word holds the pattern
 at the step's end and the step refuses.  The gate must FAIL on this build with its premise (the unpoisoned runs agree)

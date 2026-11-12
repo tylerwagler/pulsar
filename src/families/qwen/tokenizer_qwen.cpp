@@ -3,12 +3,12 @@
 /* tokenizer_qwen.cpp -- the Qwen4-exp family's tokenizer table (family.h pulsar_family_tokenizer, L272 P2).
  *
  * A Qwen engine tokenizes with src/lib/bpe_tokenizer -- the shared engine in its HF configuration, byte-exact
- * with HF on the checkpoint's own tokenizer.json (make qwen-chat-gate) -- and renders its chat with src/lib/qwen_chat (HF's template, byte for
+ * with HF on the checkpoint's own tokenizer.json (make qwen-chat-gate) -- and renders its chat with src/families/qwen/qwen_chat (HF's template, byte for
  * byte) -- whole for the server, head and turn by turn for the CLI REPL and the agent (L284 P14).  Until L272
  * these bodies were branches on pulsar_qwen_of(e)->tok inside every public entry of tokenizer.cpp. */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
-#include "lib/qwen_chat.h"
+#include "qwen_chat.h"
 #include "lib/bpe_tokenizer.h"
 
 #include <string.h>

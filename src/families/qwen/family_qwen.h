@@ -33,8 +33,8 @@
 
 #include "pulsar_gpu.h"
 
-#include "family.h"
-#include "pulsar_engine_internal.h"   /* L295 F8 Q2: Qwen's header includes the engine's, not the reverse */
+#include "engine/family.h"
+#include "engine/pulsar_engine_internal.h"   /* L295 F8 Q2: Qwen's header includes the engine's, not the reverse */
 
 /* ---- 1. Shape -------------------------------------------------------------
  *
@@ -584,7 +584,7 @@ struct pulsar_qwen_step : pulsar_driver_step {
  * after printing what failed; the driver refuses the step. */
 typedef bool (*pulsar_qwen_layer_fn)(const pulsar_qwen_step *st, uint32_t il);
 
-/* ---- S4's ops (src/engine/family_qwen_s4.cpp) --------------------------------
+/* ---- S4's ops (src/families/qwen/family_qwen_s4.cpp) --------------------------------
  * embed, PLE, the gated-residual read / write, the MoE block and the head
  * (mixer + lm_head), their scratch, and at load: the admission of every tensor
  * those ops read (by layout -- a format no arm reads is refused at load) and the

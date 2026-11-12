@@ -2,7 +2,7 @@
  *  Qwen3.8-Flash-Next per-layer-embedding (PLE) injection at layer index 1. */
 /* Qwen3.8-Flash-Next PLE injection at layer index 1 (L251 S4).  Source:
  * transformers' Qwen4ExpTextPLELayer; contracts in pulsar_cuda_qwen.h.  The
- * table rows arrive gathered (src/engine/qwen_ngram.cpp hashes the ids on the
+ * table rows arrive gathered (src/families/qwen/qwen_ngram.cpp hashes the ids on the
  * host and reads the 16 rows per token from disk); this file is everything
  * after the gather:
  *

@@ -8,7 +8,7 @@
  * them, the stop reason, and the prefill / decode rates.  Not part of the battery: it needs the
  * real container (with the checkpoint's tokenizer.json + generation_config.json beside it). */
 #include "pulsar.h"
-#include "lib/qwen_chat.h"
+#include "../src/families/qwen/qwen_chat.h"
 
 #include <stdio.h>
 #include <stdlib.h>

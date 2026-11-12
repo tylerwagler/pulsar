@@ -15,7 +15,7 @@
  *
  * An entry is the checkpoint's own tensor name and sum(x[col]^2) / rows per input column; an expert-stacked
  * tensor carries `n_expert` such vectors.  Nothing about the forward changes: the tap only reads. */
-#include "pulsar_engine_internal.h"
+#include "engine/pulsar_engine_internal.h"
 #include "family_qwen.h"
 #include <map>
 #include <string>
