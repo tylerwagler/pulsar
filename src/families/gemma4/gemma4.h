@@ -19,7 +19,7 @@
  * attention, PULSAR_FFN_DENSE_MOE on every layer), the role-driven binding of every tensor with its format admitted
  * through the core's front doors, and the byte census; the state declaration and the driver ops (E4,
  * gemma4_forward.cpp); the tokenizer table and chat front (gemma4_tokenizer.cpp; the server's family table is
- * src/server/family_gemma4.cpp).
+ * src/families/gemma4/gemma4_server.cpp).
  *
  * THE CONTAINER CONTRACT (tools/container/gemma4.py emits, this family reads):
  *   general.architecture = "gemma4";

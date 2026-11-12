@@ -1,4 +1,4 @@
-/* family_nemotron_h.cpp -- the Nemotron-H family's server table (L296 N8; server_family_ops, chat_family.cpp's switch
+/* nemotron_h_server.cpp -- the Nemotron-H family's server table (L296 N8; server_family_ops, chat_family.cpp's switch
  * names it).
  *
  * Everything here is F5's frontend in Nemotron's configuration (src/families/nemotron_h/nemotron_chat.h): the render is the
@@ -17,8 +17,8 @@
 /** @file
  *  The Nemotron-H family's server table (server_family_ops) over src/families/nemotron_h/nemotron_chat.
  */
-#include "pulsar_server_internal.h"
-#include "../families/nemotron_h/nemotron_chat.h"
+#include "server/pulsar_server_internal.h"
+#include "nemotron_chat.h"
 
 #include <memory>
 #include <string>
@@ -341,6 +341,7 @@ static char *nemotron_tool_defs_text(const char *lines, size_t len, char *err, s
     return ok ? server_xstrndup(out.text.data(), out.text.size()) : NULL;
 }
 
+/// Nemotron-H's server table (registered below by SERVER_FAMILY; found by its chat format).
 const server_family_ops k_family_nemotron_h = {
     /* .name                  = */ "Nemotron-H",
     /* .format                = */ PULSAR_CHAT_NEMOTRON_H,
@@ -358,3 +359,4 @@ const server_family_ops k_family_nemotron_h = {
     /* .find_call_block       = */ nemotron_find_call_block,
     /* .tool_defs_text        = */ nemotron_tool_defs_text,
 };
+SERVER_FAMILY(k_family_nemotron_h)

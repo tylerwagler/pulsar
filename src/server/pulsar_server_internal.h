@@ -752,12 +752,33 @@ const server_family_ops *server_family_for_engine(const pulsar_engine *e);
 /// @param s the server
 /// @return the family table
 const server_family_ops *server_tool_family(const server *s);
-/** A family table in its own file (chat_family.cpp's switch names it): Inkling's (family_inkling.cpp). */
-extern const server_family_ops k_family_inkling;
-/** Nemotron-H's (family_nemotron_h.cpp). */
-extern const server_family_ops k_family_nemotron_h;
-/// Gemma 4's table (family_gemma4.cpp, L338).
-extern const server_family_ops k_family_gemma4;
+/* L295 F8 step 5: a family's server table registers itself, by its file (src/families/<name>/<name>_server.cpp, or
+ * chat_family.cpp for DeepSeek's and Qwen's): one SERVER_FAMILY(table) -- a static record linked by a constructor, the
+ * output-parser kit's pattern (no allocation, no destructor: rule 11).  server_family_for_format finds it by its
+ * `format`; nothing else names a table. */
+/** One registered server table. */
+struct server_family_reg {
+    const server_family_ops *ops;   ///< the table (static storage)
+    server_family_reg *next;        ///< the registry's list
+};
+/** Link a table into the registry (SERVER_FAMILY's constructor calls it). */
+/// @param r the record (static storage)
+void server_family_register(server_family_reg *r);
+/// Token pasting for SERVER_FAMILY's unique names.
+#define SERVER_FAMILY_CAT_(a, b) a##b
+/// Expands SERVER_FAMILY_CAT_ after its arguments.
+#define SERVER_FAMILY_CAT(a, b) SERVER_FAMILY_CAT_(a, b)
+/** Register `table` (a server_family_ops) for its `.format`.  Unique names per use (__COUNTER__): the unit-test
+ *  programs compile every server file into one translation unit. */
+#define SERVER_FAMILY(table) SERVER_FAMILY_REC_(table, __COUNTER__)
+/// The record and its constructor.
+#define SERVER_FAMILY_REC_(table, n)                                                                              \
+    namespace {                                                                                                   \
+    server_family_reg SERVER_FAMILY_CAT(server_family_reg_, n) = {&(table), nullptr};                             \
+    __attribute__((constructor)) void SERVER_FAMILY_CAT(server_family_register_, n)(void) {                       \
+        server_family_register(&SERVER_FAMILY_CAT(server_family_reg_, n));                                        \
+    }                                                                                                             \
+    }
 /** The effort names, in the order of server_effort_map::named's columns (chat_family.cpp). */
 extern const char *const k_effort_names[CHAT_EFFORT_NAMES];
 /* What every family's render shares (chat_family.cpp), for a table in its own file: */

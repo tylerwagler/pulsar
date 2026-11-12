@@ -9,7 +9,7 @@
  * The corpus is JSONL, one case a line: {"name":..., "endpoint":"chat|anthropic|responses",
  * "family":"deepseek|qwen|inkling", "body":{...}}.  The golden was recorded from the parsers before L267 moved
  * them; any difference is a change in what a request means.  The Inkling rows (L294 E6) are appended after the
- * others, recorded from family_inkling.cpp's first build (its render is graded against vLLM by inkling-chat-gate). */
+ * others, recorded from inkling_server.cpp's first build (its render is graded against vLLM by inkling-chat-gate). */
 #define PULSAR_SERVER_TEST
 #define PULSAR_SERVER_TEST_NO_MAIN
 #include "../src/server/util.cpp"
@@ -18,9 +18,7 @@
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
 #include "../src/server/context_edit.cpp"
-#include "../src/server/family_inkling.cpp"
-#include "../src/server/family_nemotron_h.cpp"
-#include "../src/server/family_gemma4.cpp"
+#include "family_servers.inc"   /* every module's server table (generated: Makefile FAMILY_SERVERS_INC) */
 #include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"

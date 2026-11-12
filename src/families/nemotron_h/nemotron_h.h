@@ -382,7 +382,7 @@ typedef struct {
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"
      *  pre-tokenizer, ignore_merges), loaded at open from tokenizer.json + generation_config.json beside the
      *  container's shards; the chat front is src/families/nemotron_h/nemotron_chat (the engine's table here, the server's family
-     *  table in src/server/family_nemotron_h.cpp). */
+     *  table in src/families/nemotron_h/nemotron_h_server.cpp). */
     struct bpe_tokenizer *tok;
 } pulsar_nemotron_h_model;
 

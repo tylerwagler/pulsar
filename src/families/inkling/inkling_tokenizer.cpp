@@ -11,7 +11,7 @@
  * src/families/inkling/inkling_chat -- the head is the full render of the system message plus the effort line, a turn the
  * renderer's turn piece, the close its <|content_model_end_sampling|> -- so head + turns + sampled turns is the
  * conversation's full render (inkling-chat-gate S1 grades the pieces).  The server renders with the same library
- * behind its family table (src/server/family_inkling.cpp). */
+ * behind its family table (src/families/inkling/inkling_server.cpp). */
 /** @file inkling_tokenizer.cpp
  *  @brief Inkling's tokenizer table and chat front: the shared BPE engine (tiktoken o200k) and F5's renderer. */
 #include "inkling.h"

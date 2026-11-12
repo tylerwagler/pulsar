@@ -19,9 +19,7 @@
 #include "../src/server/api_parse.cpp"
 #include "../src/server/chat_family.cpp"
 #include "../src/server/context_edit.cpp"
-#include "../src/server/family_inkling.cpp"
-#include "../src/server/family_nemotron_h.cpp"
-#include "../src/server/family_gemma4.cpp"
+#include "family_servers.inc"   /* every module's server table (generated: Makefile FAMILY_SERVERS_INC) */
 #include "../src/server/constrain.cpp"
 #include "../src/server/genmsg.cpp"
 #include "../src/server/deepseek_dsml.cpp"

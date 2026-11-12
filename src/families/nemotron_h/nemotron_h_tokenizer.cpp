@@ -9,7 +9,7 @@
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is the renderer,
  * src/families/nemotron_h/nemotron_chat: the head is the system turn, a turn the renderer's turn piece, the close the "<|im_end|>\n"
  * a sampled turn's tail opens with.  The server renders with the same library behind its family table
- * (src/server/family_nemotron_h.cpp). */
+ * (src/families/nemotron_h/nemotron_h_server.cpp). */
 /** @file nemotron_h_tokenizer.cpp
  *  @brief Nemotron-H's tokenizer table and ChatML chat front: the shared BPE engine (tekken) and src/families/nemotron_h/nemotron_chat. */
 #include "nemotron_h.h"

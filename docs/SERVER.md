@@ -236,7 +236,7 @@ one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or an integer
 | DeepSeek | low | high | max | V4.1: the value itself; V4: nearest preset (low 50, high 75, max 100) | V4.1 high, 0731 low |
 | Qwen | low / low / medium | xhigh | xhigh | nearest preset | xhigh |
 | Nemotron | medium | high | high | nearest preset | the template's default (high) |
-| Inkling | the renderer's table (`family_inkling.cpp`) | | | | |
+| Inkling | the renderer's table (`src/families/inkling/inkling_server.cpp`) | | | | |
 
 ### Tool calls
 

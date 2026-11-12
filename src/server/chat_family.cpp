@@ -8,7 +8,7 @@
  * tool memory, live-continuation suffixes and forced-call prefill; Qwen renders HF's template
  * (src/lib/qwen_chat) with the same memory, continuations and prefill behind its own hooks (L272 P3
  * step 4), and refuses by name what that template cannot express.  A new family adds one table -- in its own
- * file (Inkling: family_inkling.cpp, over F5's src/families/inkling/inkling_chat) -- and one case in
+ * file (Inkling: inkling_server.cpp, over F5's src/families/inkling/inkling_chat) -- and one case in
  * server_family_for_format; a new protocol adds one parser and no arm. */
 /** @file
  *  The model-family half of a chat request (L267): render_chat_conversation, the family tables and their
@@ -1131,16 +1131,23 @@ static const server_family_ops k_family_qwen = {
     /* .tool_defs_text        = */ qwen_tool_defs_text,
 };
 
+/* L295 F8 step 5: the tables this file owns (DeepSeek's, Qwen's); every other family's registers in its module */
+SERVER_FAMILY(k_family_deepseek_v4)
+SERVER_FAMILY(k_family_deepseek_v41)
+SERVER_FAMILY(k_family_qwen)
+
+/// The registry's list (zero-initialised before any constructor runs, so registration order does not matter).
+static server_family_reg *g_server_families = nullptr;
+
+void server_family_register(server_family_reg *r) {
+    r->next = g_server_families;
+    g_server_families = r;
+}
+
 const server_family_ops *server_family_for_format(pulsar_chat_format fmt) {
-    switch (fmt) {
-    case PULSAR_CHAT_DS4_V4:  return &k_family_deepseek_v4;
-    case PULSAR_CHAT_DS4_V41: return &k_family_deepseek_v41;
-    case PULSAR_CHAT_QWEN:    return &k_family_qwen;
-    case PULSAR_CHAT_INKLING: return &k_family_inkling;
-    case PULSAR_CHAT_NEMOTRON_H: return &k_family_nemotron_h;
-    case PULSAR_CHAT_GEMMA4: return &k_family_gemma4;
-    case PULSAR_CHAT_NONE: break;   /* an encoder or a parser: no conversation to serve */
-    }
+    if (fmt != PULSAR_CHAT_NONE)   /* NONE: an encoder or a parser -- no conversation to serve */
+        for (const server_family_reg *r = g_server_families; r; r = r->next)
+            if (r->ops->format == fmt) return r->ops;
     pulsar_die("server_family_for_format: a chat format without a server family table");
     return NULL;   /* unreachable: pulsar_die exits */
 }
