@@ -641,6 +641,7 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         TEST_ASSERT(strstr(out, "\"param\":\"messages\"") != NULL);
         TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":16") != NULL);
         TEST_ASSERT(strstr(out, "\"n_ctx\":16") != NULL);
+        TEST_ASSERT(strstr(out, "Prompt has 16 tokens, but the configured context size is 16 tokens") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);
@@ -659,6 +660,8 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
         TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
         TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":20") != NULL);
+        /* L252 P5: Anthropic's wording, the text Claude Code matches to compact */
+        TEST_ASSERT(strstr(out, "\"message\":\"prompt is too long: 20 tokens > 20 maximum\"") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);

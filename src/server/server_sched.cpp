@@ -1884,8 +1884,7 @@ bool server::worker_try_bind() {
         } else if (!dead) {
             /* L249 D: the stream opened while it waited -- the same message, as an error event */
             char msg[160];
-            snprintf(msg, sizeof msg, "Prompt has %d tokens, but the configured context size is %d tokens",
-                     j->req.prompt.len, reject_ctx);
+            context_length_message(msg, sizeof msg, &j->req, j->req.prompt.len, reject_ctx);
             sse_error_event(j->fd, &j->req, 400, msg);
         }
         s->kv_req_log(j, NULL, "refused-context");   /* L378 */

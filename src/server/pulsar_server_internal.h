@@ -5387,6 +5387,14 @@ bool gen_client_disconnected(int fd);
  *  @param g    the job's state; its err (when empty), finish and phase are set
  *  @param bank the bank, for the message */
 void gen_bank_install_failed(gen_state *g, uint32_t bank);
+/** The context-overflow message in the request's protocol wording: Anthropic's "prompt is too long: N tokens > M
+ *  maximum" (the text Claude Code matches to compact, L252 P5), else the OpenAI-side text.
+ *  @param out             receives the message
+ *  @param n               bytes at out
+ *  @param r               the request (selects the wording; NULL: OpenAI's)
+ *  @param n_prompt_tokens the prompt's tokens
+ *  @param ctx_size        the context size, tokens */
+void context_length_message(char *out, size_t n, const request *r, int n_prompt_tokens, int ctx_size);
 bool http_error_context_length_exceeded(int fd,
                                                const request *r,
                                                int n_prompt_tokens,
