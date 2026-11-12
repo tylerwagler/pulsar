@@ -178,7 +178,7 @@ typedef struct {
     pulsar_role_census census;
     /** The tokenizer (inkling_tokenizer.cpp): F5's shared BPE engine in its tiktoken configuration ("o200k"), loaded
      *  at open from the files beside the container's shards.  The family's tokenizer table dispatches to it; the
-     *  chat front is F5's renderer (src/lib/inkling_chat.h), behind the engine's table here and the server's family
+     *  chat front is F5's renderer (src/families/inkling/inkling_chat.h), behind the engine's table here and the server's family
      *  table (src/server/family_inkling.cpp). */
     struct bpe_tokenizer *tok;
 } pulsar_inkling_model;

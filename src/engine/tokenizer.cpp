@@ -2,7 +2,7 @@
  *  @brief DeepSeek's byte-level BPE tokenizer: vocabulary tables, BPE merge and chat tokenization. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
-#include "gemma4_chat.h"
+#include "families/gemma4/gemma4_chat.h"
 #include <algorithm>
 #include <string>
 #include <vector>

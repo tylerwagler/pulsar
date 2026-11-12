@@ -381,7 +381,7 @@ typedef struct {
     uint64_t artifact_digest;
     /** The tokenizer (nemotron_h_tokenizer.cpp): F5's shared BPE engine in its HF configuration (the "tekken"
      *  pre-tokenizer, ignore_merges), loaded at open from tokenizer.json + generation_config.json beside the
-     *  container's shards; the chat front is src/lib/nemotron_chat (the engine's table here, the server's family
+     *  container's shards; the chat front is src/families/nemotron_h/nemotron_chat (the engine's table here, the server's family
      *  table in src/server/family_nemotron_h.cpp). */
     struct bpe_tokenizer *tok;
 } pulsar_nemotron_h_model;

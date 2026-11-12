@@ -41,7 +41,7 @@
 #include <vector>
 
 #include "bpe_gate_util.h"
-#include "../src/lib/nemotron_chat.h"
+#include "../src/families/nemotron_h/nemotron_chat.h"
 
 /* T3's context for one codepoint c (gen_nemotron_goldens.py sweep_text) */
 static std::string sweep_context(const std::string &c) { return "x" + c + c + c + " " + c + "1'" + c + "Ab" + c + "\n"; }

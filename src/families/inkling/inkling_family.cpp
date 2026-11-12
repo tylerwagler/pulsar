@@ -118,7 +118,7 @@ const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name;
 /** pulsar_family::served_model_id.
  *  @return "inkling-small" (static) */
 const char *served_model_id(const pulsar_engine *) { return "inkling-small"; }
-/* F5's renderer (src/lib/inkling_chat.h): the engine's chat front (inkling_tokenizer.cpp) and the server's family
+/* F5's renderer (src/families/inkling/inkling_chat.h): the engine's chat front (inkling_tokenizer.cpp) and the server's family
  * table (src/server/family_inkling.cpp) */
 /** pulsar_family::chat_format.
  *  @return PULSAR_CHAT_INKLING */

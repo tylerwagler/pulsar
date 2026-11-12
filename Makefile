@@ -168,10 +168,11 @@ LIB_HDRS = src/lib/pulsar_help.h src/lib/pulsar_kvtext.h src/lib/pulsar_segstore
 # $(CORE_OBJS) needs it.  ALL_OBJS globs src/lib/*.cpp but is only used to
 # derive .d files, and link rules use $^, so there is no duplicate object.
 # The frontend (L251 S5; the shared kit since L295 F5) rides here too -- the BPE engine, the output-parser
-# kit, the Qwen and Inkling renderers and parser configurations: each family loads its tokenizer at open and the engine's
+# kit, Qwen's renderer and parser configuration (the other chat families' live in src/families/<name>/, L295 F8): each
+# family loads its tokenizer at open and the engine's
 # tokenizer entries dispatch to it, so every target linking $(CORE_OBJS) references it.
 FRONTEND_OBJS = src/lib/bpe_tokenizer.o src/lib/pyjson.o src/lib/qwen_chat.o src/lib/qwen_output.o src/lib/out_parse_kit.o \
-                src/lib/inkling_chat.o src/lib/nemotron_chat.o src/lib/chat_render_kit.o src/lib/gemma4_chat.o src/lib/gemma4_output.o
+                src/lib/chat_render_kit.o
 # L347 I3a: the disk KV payload digest (the engine's payload streams, the segment store and the TP workers share it)
 # and the store's host memory pool ride here too: the engine references the digest, the store both.
 KVIO_OBJS = src/lib/pulsar_kvdigest.o src/lib/pulsar_kvpool.o
@@ -1231,10 +1232,10 @@ qwen-chat-gate: tests/qwen_chat_gate
 # parser engine (goldens from tests/nemotron/gen_nemotron_goldens.py).  Model-free; the inputs are the checkpoint's
 # tokenizer files and the L216 corpus.
 NEMOTRON_TOK_DIR ?= $(call need_path,NEMOTRON_TOK_DIR)
-NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/nemotron_chat.cpp src/lib/chat_render_kit.cpp \
+NEMOTRON_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/nemotron_h/nemotron_chat.cpp src/lib/chat_render_kit.cpp \
                      src/lib/out_parse_kit.cpp
 tests/nemotron_chat_gate: tests/nemotron_chat_gate.cpp tests/bpe_gate_util.h $(NEMOTRON_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/nemotron_chat.h src/lib/xml_call_body.h \
+                          src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/nemotron_h/nemotron_chat.h src/lib/xml_call_body.h \
                           src/lib/out_parse_kit.h src/lib/pulsar_utf8.h src/lib/chat_refuse.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/nemotron_chat_gate.cpp $(NEMOTRON_CHAT_SRCS)
 .PHONY: nemotron-chat-gate
@@ -1261,10 +1262,10 @@ nemotron-enc-tok-gate: tests/nemotron_enc_tok_gate
 # turn-by-turn front's composition (C1); goldens from tests/gemma4/gen_tok_goldens.py and gen_render_goldens.py.
 # Model-free; GEMMA4_TOK_DIR holds the checkpoint's tokenizer.json + generation_config.json (the container's copies).
 GEMMA4_TOK_DIR ?= $(call need_path,GEMMA4_TOK_DIR)
-GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/lib/gemma4_chat.cpp src/lib/gemma4_output.cpp \
+GEMMA4_CHAT_SRCS = src/lib/bpe_tokenizer.cpp src/lib/pyjson.cpp src/families/gemma4/gemma4_chat.cpp src/families/gemma4/gemma4_output.cpp \
                    src/lib/chat_render_kit.cpp src/lib/out_parse_kit.cpp
 tests/gemma4_chat_gate: tests/gemma4_chat_gate.cpp tests/bpe_gate_util.h $(GEMMA4_CHAT_SRCS) src/lib/bpe_tokenizer.h \
-                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/lib/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
+                        src/lib/bpe_unicode_tables.inc src/lib/pyjson.h src/families/gemma4/gemma4_chat.h src/lib/chat_render_kit.h src/lib/out_parse_kit.h \
                         src/lib/chat_refuse.h src/lib/pulsar_utf8.h src/lib/sha1.hpp Makefile
 	$(CXX) $(CXXFLAGS) -Isrc -Isrc/lib -o $@ tests/gemma4_chat_gate.cpp $(GEMMA4_CHAT_SRCS)
 .PHONY: gemma4-chat-gate

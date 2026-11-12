@@ -137,10 +137,10 @@ typedef enum {
     PULSAR_CHAT_DS4_V4  = 0,  ///< DeepSeek V4 (0731) template
     PULSAR_CHAT_DS4_V41 = 1,  ///< DeepSeek V4.1 / Vision-Exp template
     PULSAR_CHAT_QWEN    = 2,  ///< Qwen chat template (L251 S5)
-    PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/lib/inkling_chat)
-    PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/lib/nemotron_chat)
+    PULSAR_CHAT_INKLING = 3,  ///< Inkling-Small native renderer (L294 E6: src/families/inkling/inkling_chat)
+    PULSAR_CHAT_NEMOTRON_H = 4,  ///< Nemotron-H ChatML + think-tag renderer (L296 N8: src/families/nemotron_h/nemotron_chat)
     PULSAR_CHAT_NONE    = 5,  ///< no conversation: an encoder family (L321) renders its inputs through pulsar_engine_encode_render
-    PULSAR_CHAT_GEMMA4  = 6,  ///< Gemma 4's turn / channel / tool-call renderer (L338: src/lib/gemma4_chat)
+    PULSAR_CHAT_GEMMA4  = 6,  ///< Gemma 4's turn / channel / tool-call renderer (L338: src/families/gemma4/gemma4_chat)
 } pulsar_chat_format;
 
 /** The speculative drafter a family's artifacts carry. */

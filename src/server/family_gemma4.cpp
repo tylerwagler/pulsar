@@ -1,6 +1,6 @@
 /* family_gemma4.cpp -- the Gemma 4 family's server table (L338; server_family_ops, chat_family.cpp's switch names it).
  *
- * The frontend in Gemma's configuration (src/lib/gemma4_chat.h): the render is the checkpoint's chat_template.jinja
+ * The frontend in Gemma's configuration (src/families/gemma4/gemma4_chat.h): the render is the checkpoint's chat_template.jinja
  * byte for byte (gemma4-chat-gate R1 / R2), the effort map its two levels (thinking off / on: the template has no
  * effort level), the output parser the kit in vLLM's gemma4 reading (gemma4-chat-gate P1 / P2).
  *
@@ -13,9 +13,9 @@
  *   - images (the family's vision front is not in the container), a tool message answering several calls at once.
  * Departures from vLLM: the parser's (gemma4_chat.h); client text spelling a marker stays text (L223). */
 /** @file
- *  The Gemma 4 family's server table (server_family_ops) over src/lib/gemma4_chat. */
+ *  The Gemma 4 family's server table (server_family_ops) over src/families/gemma4/gemma4_chat. */
 #include "pulsar_server_internal.h"
-#include "../lib/gemma4_chat.h"
+#include "../families/gemma4/gemma4_chat.h"
 
 #include <memory>
 #include <string>

@@ -1,7 +1,7 @@
 /* family_nemotron_h.cpp -- the Nemotron-H family's server table (L296 N8; server_family_ops, chat_family.cpp's switch
  * names it).
  *
- * Everything here is F5's frontend in Nemotron's configuration (src/lib/nemotron_chat.h): the render is the
+ * Everything here is F5's frontend in Nemotron's configuration (src/families/nemotron_h/nemotron_chat.h): the render is the
  * checkpoint's chat_template.jinja byte for byte (nemotron-chat-gate), the effort map its three levels, the output
  * parser the kit in vLLM's nemotron_v3 configuration (qwen3_coder's XML calls, R1-style think split), and every
  * suffix hook one of the renderer's own pieces -- so the prompt so far + a hook's bytes == the full render of the
@@ -15,10 +15,10 @@
  * Departures from vLLM: client text spelling a marker stays text (L223); a call the turn ends inside is broken
  * (L272); a message's text parts arrive joined. */
 /** @file
- *  The Nemotron-H family's server table (server_family_ops) over src/lib/nemotron_chat.
+ *  The Nemotron-H family's server table (server_family_ops) over src/families/nemotron_h/nemotron_chat.
  */
 #include "pulsar_server_internal.h"
-#include "../lib/nemotron_chat.h"
+#include "../families/nemotron_h/nemotron_chat.h"
 
 #include <memory>
 #include <string>

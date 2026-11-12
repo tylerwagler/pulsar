@@ -210,7 +210,7 @@ const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name;
 /** pulsar_family::served_model_id.
  *  @return "nemotron-3.5-super" (static) */
 const char *served_model_id(const pulsar_engine *) { return "nemotron-3.5-super"; }
-/* the ChatML + <think> renderer (src/lib/nemotron_chat.h): the engine's chat front (nemotron_h_tokenizer.cpp) and the
+/* the ChatML + <think> renderer (src/families/nemotron_h/nemotron_chat.h): the engine's chat front (nemotron_h_tokenizer.cpp) and the
  * server's family table (src/server/family_nemotron_h.cpp) */
 /** pulsar_family::chat_format.
  *  @return PULSAR_CHAT_NEMOTRON_H */

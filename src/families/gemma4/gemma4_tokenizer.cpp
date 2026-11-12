@@ -7,14 +7,14 @@
  * files).  A container without them does not load.
  *
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is the renderer,
- * src/lib/gemma4_chat: the head is <bos> and the system turn (thinking's <|think|>, the system text), a turn the
+ * src/families/gemma4/gemma4_chat: the head is <bos> and the system turn (thinking's <|think|>, the system text), a turn the
  * renderer's messages and generation prompt, the close the "<turn|>\n" a sampled turn's tail opens with.  The server
  * renders with the same library behind its family table (src/server/family_gemma4.cpp). */
 /** @file gemma4_tokenizer.cpp
  *  @brief Gemma 4's tokenizer table: the shared BPE engine's SentencePiece-BPE row. */
 #include "gemma4.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/gemma4_chat.h"
+#include "gemma4_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>

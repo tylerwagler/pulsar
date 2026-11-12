@@ -48,7 +48,7 @@
 #include <map>
 
 #include "bpe_gate_util.h"
-#include "../src/lib/gemma4_chat.h"
+#include "../src/families/gemma4/gemma4_chat.h"
 
 /* T3's context for one codepoint c (gen_tok_goldens.py sweep_text) */
 static std::string sweep_context(const std::string &c) { return "x" + c + c + c + " " + c + "1'" + c + "Ab" + c + "\n"; }

@@ -17,8 +17,8 @@
 #include "lib/pulsar_kvdigest.h"
 #include "lib/pulsar_kvpool.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/gemma4_chat.h"
-#include "lib/nemotron_chat.h"
+#include "families/gemma4/gemma4_chat.h"
+#include "families/nemotron_h/nemotron_chat.h"
 #include "lib/pulsar_grammar.h"
 
 #ifdef PULSAR_SERVER_TEST
@@ -4505,7 +4505,7 @@ static void test_qwen_tool_error_suffix_reminds_the_system_turn(void) {
 
 
 
-/* ---- L294 E6: Inkling's server table (family_inkling.cpp over src/lib/inkling_chat) ------------------------- */
+/* ---- L294 E6: Inkling's server table (family_inkling.cpp over src/families/inkling/inkling_chat) ------------------------- */
 
 /* Render `msgs` with the Inkling family and no engine; `tools` = an OpenAI tools array (NULL = none).  The messages
  * are TAKEN.  `r` (optional) receives the request for the hooks. */
@@ -4750,7 +4750,7 @@ static void test_inkling_tool_error_suffix_reminds_the_system_turn(void) {
 }
 
 
-/* ---- L296 N8: Nemotron-H's server table (family_nemotron_h.cpp over src/lib/nemotron_chat) ---------------------- */
+/* ---- L296 N8: Nemotron-H's server table (family_nemotron_h.cpp over src/families/nemotron_h/nemotron_chat) ---------------------- */
 
 /* Render `msgs` with the Nemotron-H family and no engine; `tools` = an OpenAI tools array (NULL = none).  The
  * messages are TAKEN.  `r` (optional) receives the request for the hooks. */
@@ -5055,7 +5055,7 @@ static void test_nemotron_refusals(void) {
     }
 }
 
-/* ---- L338: Gemma 4's server table (family_gemma4.cpp over src/lib/gemma4_chat) -------------------------------- */
+/* ---- L338: Gemma 4's server table (family_gemma4.cpp over src/families/gemma4/gemma4_chat) -------------------------------- */
 
 /* The effort map: thinking on unless asked off (the server's one rule) -- on writes <|think|> in a system turn, off
  * closes an empty thought channel in the generation prompt; every named effort but none is on (one level). */

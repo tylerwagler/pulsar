@@ -184,7 +184,7 @@ const char *model_name(const pulsar_engine *e) { return model_of(e)->shape.name;
 /** pulsar_family::served_model_id.
  *  @return "gemma-4-26b-a4b" (static) */
 const char *served_model_id(const pulsar_engine *) { return "gemma-4-26b-a4b"; }
-/** pulsar_family::chat_format: the Gemma 4 renderer (src/lib/gemma4_chat; the server's k_family_gemma4).
+/** pulsar_family::chat_format: the Gemma 4 renderer (src/families/gemma4/gemma4_chat; the server's k_family_gemma4).
  *  @return PULSAR_CHAT_GEMMA4 */
 pulsar_chat_format chat_format(const pulsar_engine *) { return PULSAR_CHAT_GEMMA4; }
 /* Disk-KV compatibility id: 0 and 1 DeepSeek's profiles, 2 Qwen's, 3 Inkling's, 4 Nemotron-H's, 5 the encoders', 6
@@ -247,7 +247,7 @@ const pulsar_family PULSAR_FAMILY_GEMMA4 = {
     /* .spec         = */ &PULSAR_DRIVER_SPEC_TARGET,   /* L338 P3: the core driver's verify target (step_driver.cpp) */
     /* .session      = */ &k_session_ops,
     /* .tokenizer    = */ &PULSAR_GEMMA4_TOKENIZER,   /* gemma4_tokenizer.cpp (the shared BPE engine's SentencePiece-BPE
-                                                     row + src/lib/gemma4_chat's front) */
+                                                     row + src/families/gemma4/gemma4_chat's front) */
     /* .tp_slices    = */ NULL,
     /* .act_kind     = */ PULSAR_ACT_KIND_ROWS,
     /* .vision       = */ NULL,

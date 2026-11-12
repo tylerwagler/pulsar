@@ -8,7 +8,7 @@
  * container without them does not load.
  *
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is F5's renderer,
- * src/lib/inkling_chat -- the head is the full render of the system message plus the effort line, a turn the
+ * src/families/inkling/inkling_chat -- the head is the full render of the system message plus the effort line, a turn the
  * renderer's turn piece, the close its <|content_model_end_sampling|> -- so head + turns + sampled turns is the
  * conversation's full render (inkling-chat-gate S1 grades the pieces).  The server renders with the same library
  * behind its family table (src/server/family_inkling.cpp). */
@@ -16,7 +16,7 @@
  *  @brief Inkling's tokenizer table and chat front: the shared BPE engine (tiktoken o200k) and F5's renderer. */
 #include "inkling.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/inkling_chat.h"
+#include "inkling_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>

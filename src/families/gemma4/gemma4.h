@@ -187,7 +187,7 @@ typedef struct {
     bool block_written;                 ///< the container carries a block drafter (loaded or not)
 } pulsar_gemma4_model;
 
-/** The family's tokenizer table and chat front (gemma4_tokenizer.cpp over src/lib/gemma4_chat). */
+/** The family's tokenizer table and chat front (gemma4_tokenizer.cpp over src/families/gemma4/gemma4_chat). */
 extern const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER;
 /** Load the tokenizer from tokenizer.json + generation_config.json beside the shards and check it against the shape:
  *  the "gemma4" pipeline, the eos among the stop ids, n_vocab ids (gemma4_tokenizer.cpp).

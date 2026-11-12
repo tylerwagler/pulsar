@@ -8,7 +8,7 @@
  * tool memory, live-continuation suffixes and forced-call prefill; Qwen renders HF's template
  * (src/lib/qwen_chat) with the same memory, continuations and prefill behind its own hooks (L272 P3
  * step 4), and refuses by name what that template cannot express.  A new family adds one table -- in its own
- * file (Inkling: family_inkling.cpp, over F5's src/lib/inkling_chat) -- and one case in
+ * file (Inkling: family_inkling.cpp, over F5's src/families/inkling/inkling_chat) -- and one case in
  * server_family_for_format; a new protocol adds one parser and no arm. */
 /** @file
  *  The model-family half of a chat request (L267): render_chat_conversation, the family tables and their

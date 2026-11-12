@@ -7,14 +7,14 @@
  * its shards (tools/container/nemotron_h.py side_files).  A container without them does not load.
  *
  * The chat front (pulsar_chat_open / _append_turn / _end_assistant: the CLI REPL and the agent) is the renderer,
- * src/lib/nemotron_chat: the head is the system turn, a turn the renderer's turn piece, the close the "<|im_end|>\n"
+ * src/families/nemotron_h/nemotron_chat: the head is the system turn, a turn the renderer's turn piece, the close the "<|im_end|>\n"
  * a sampled turn's tail opens with.  The server renders with the same library behind its family table
  * (src/server/family_nemotron_h.cpp). */
 /** @file nemotron_h_tokenizer.cpp
- *  @brief Nemotron-H's tokenizer table and ChatML chat front: the shared BPE engine (tekken) and src/lib/nemotron_chat. */
+ *  @brief Nemotron-H's tokenizer table and ChatML chat front: the shared BPE engine (tekken) and src/families/nemotron_h/nemotron_chat. */
 #include "nemotron_h.h"
 #include "lib/bpe_tokenizer.h"
-#include "lib/nemotron_chat.h"
+#include "nemotron_chat.h"
 
 #include <string.h>
 #include <sys/stat.h>
