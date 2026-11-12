@@ -16707,6 +16707,56 @@ static_assert((TokPos{5} - TokPos{2}).raw() == 3 && (TokPos{5} + TokCount{-7}).r
                   TokPos::after(TokCount{9}).raw() == 9 && TokPos{9}.before().raw() == 9,
               "constexpr, and the arithmetic is int's");
 
+/* L334 P2b: the engine's other index spaces (pulsar_units.h StepRow / HeadRow / CompRow, TokPerRow) -- the
+ * compile-fail checks.  A step row, a headed row, a compressed row and a position never mix; a factor is no row; the
+ * crossings take their factor. */
+/** Can a T be passed where a U goes (by value, implicitly)? */
+template <class T, class U> concept l334_passes = requires(T t) { [](U) {}(t); };
+static_assert(!l333_adds<StepRow, TokCount> && !l333_adds<TokPos, StepRows> && !l333_adds<CompRow, TokCount> &&
+                  !l333_adds<TokPos, CompRows> && !l333_adds<StepRow, CompRows> && !l333_adds<HeadRow, StepRows> &&
+                  l333_adds<StepRow, StepRows> && l333_adds<CompRow, CompRows> && l333_adds<HeadRow, HeadRows>,
+              "each space moves by its own distance only: no batch row moves a position (f7e05077), no comp row (c9dd9499)");
+static_assert(!l334_passes<StepRow, TokPos> && !l334_passes<CompRow, TokPos> && !l334_passes<HeadRow, StepRow> &&
+                  !l334_passes<TokPerRow, CompRow> && !l334_passes<TokPerRow, StepRow> && !l334_passes<int, StepRow> &&
+                  !l334_passes<TokPos, CompRow> && !l334_passes<StepRows, TokCount>,
+              "no space passes for another, a ratio for a row, or an int for any of them");
+static_assert(!std::is_constructible_v<TokPos, StepRow> && !std::is_constructible_v<StepRow, TokPos> &&
+                  !std::is_constructible_v<CompRow, TokPos> && !std::is_constructible_v<HeadRow, StepRow> &&
+                  !std::is_constructible_v<CompRows, TokPerRow> && !std::is_constructible_v<TokPerRow, CompRows>,
+              "not even explicitly: a crossing is a named function that takes its factor (or the run's map)");
+static_assert(!l333_orders<StepRow, TokPos> && !l333_orders<CompRow, TokPos> && !l333_orders<HeadRow, StepRow> &&
+                  !l333_equates<StepRow, TokPos> && !l333_equates<CompRow, StepRow> && l333_orders<StepRow, StepRow>,
+              "rows order and equate within their own space only");
+static_assert(std::is_same_v<decltype(pulsar_comp_row_of(TokPos{}, TokPerRow{})), CompRow> &&
+                  std::is_same_v<decltype(pulsar_comp_row_pos(CompRow{}, TokPerRow{})), TokPos> &&
+                  std::is_same_v<decltype(pulsar_comp_rows_held(TokCount{}, TokPerRow{})), CompRows> &&
+                  std::is_same_v<decltype(pulsar_comp_rows_serve(CompRows{}, TokPerRow{})), TokCount> &&
+                  std::is_same_v<decltype(pulsar_step_run{}.pos_of(StepRow{})), TokPos> &&
+                  std::is_same_v<decltype(pulsar_step_run{}.row_of(TokPos{})), StepRow>,
+              "the crossings' types");
+
+/* L334 P2b: the crossings compute what the open-coded expressions did (pos / ratio, row * ratio, len / ratio,
+ * ceil(len / ratio), rows * ratio + ratio - 1, pos0 + (row - first) and its inverse), over a grid of values. */
+static void test_l334_p2b_crossings(void) {
+    for (uint32_t r : {1u, 2u, 4u, 128u}) {
+        const TokPerRow R{r};
+        for (int v : {0, 1, 3, 4, 127, 128, 129, 1000, 65537}) {
+            TEST_ASSERT(pulsar_comp_row_of(TokPos{v}, R).raw() == (int)((uint32_t)v / r));
+            TEST_ASSERT(pulsar_comp_row_pos(CompRow{v}, R).raw() == (int)((uint32_t)v * r));
+            TEST_ASSERT(pulsar_comp_rows_held(TokCount{v}, R).raw() == (int)((uint32_t)v / r));
+            TEST_ASSERT(pulsar_comp_rows_cover(TokCount{v}, R).raw() == (int)(((uint32_t)v + r - 1u) / r));
+            TEST_ASSERT(pulsar_comp_rows_serve(CompRows{v}, R).raw() == (int)((uint32_t)v * r + r - 1u));
+            /* a served length holds exactly `v` rows, and one more token completes the next */
+            TEST_ASSERT(pulsar_comp_rows_held(pulsar_comp_rows_serve(CompRows{v}, R), R).raw() == v);
+        }
+    }
+    const pulsar_step_run run = {StepRow{3}, TokPos{100}, StepRows{5}};
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT(run.pos_of(StepRow{3 + k}).raw() == 100 + k);
+        TEST_ASSERT(run.row_of(TokPos{100 + k}).raw() == 3 + k);
+    }
+}
+
 /* L334 P2a: the pair is the int it replaced -- every operator against int, negatives included (none() excepted: it is
  * the one value the operators refuse, as operand or result), and the crossing to the origin is the identity on the raw
  * value. */
@@ -17001,6 +17051,7 @@ static void test_l334_prompt_held_across_a_seam(void) {
 
 static void pulsar_server_unit_tests_run(void) {
     test_l333_kv_units();
+    test_l334_p2b_crossings();
     test_l334_seam_currencies();
     test_l334_positions_are_ints();
     test_l334_none_fails_closed();

@@ -273,4 +273,118 @@ static_assert(sizeof(TokPos) == sizeof(int) && std::is_trivial<TokPos>::value &&
                   std::is_standard_layout<TokPos>::value,
               "a position is as cheap as the int it replaces (memset / calloc-safe)");
 
+/* ---- L334 phase 2b: the engine's other index spaces -------------------------------------------------------------
+ * A position on the token sequence is not a row of a batched step, and neither is a row of a compressed KV cache; all
+ * three were uint32 / int side by side in the same signatures (gpu_graph_index_comp_update took a batch row, a
+ * position and a compressed row, three uint32_t in a row -- f7e05077 passed the row for the position, c9dd9499 a
+ * compressed row for one).  Each space is its own affine pair, as TokPos / TokCount:
+ *
+ *   StepRow / StepRows   a row of one batched step (the step's row map gives each its position and bank);
+ *   HeadRow / HeadRows   a headed row of a step (the logits rows: a verify capture, the draw), a SUBSET of the step's
+ *                        rows -- head row h is step row heads.row[h], equal to h only where every row is headed (a
+ *                        verify prefix), and that identity is crossed by name, never assumed;
+ *   CompRow / CompRows   a row of a compressed KV cache or a pool that holds several tokens a row;
+ *   TokPerRow            the factor between tokens and such rows (a compress ratio, a pool's tokens per row): nonzero,
+ *                        not a count of anything -- a ratio can no longer be passed where a row or a position goes.
+ *
+ * The crossings are named and take their factor (below): a position's compressed row, the first position of a
+ * compressed row, the rows a history holds or covers, the history a row count serves, and a run's row map. */
+
+/** Tag of StepRows (never instantiated). */
+struct pulsar_step_rows_tag;
+/** Tag of HeadRows (never instantiated). */
+struct pulsar_head_rows_tag;
+/** Tag of CompRows (never instantiated). */
+struct pulsar_comp_rows_tag;
+/** Tag of TokPerRow (never instantiated). */
+struct pulsar_tok_per_row_tag;
+
+/** Rows of a batched step: a count, or the distance between two of its rows (L334 P2b). */
+typedef pulsar_unit<pulsar_step_rows_tag, int> StepRows;
+/** A row of a batched step (none() = no row). */
+typedef pulsar_point<StepRows> StepRow;
+/** Headed rows of a step (its logits rows): a count or a distance (L334 P2b). */
+typedef pulsar_unit<pulsar_head_rows_tag, int> HeadRows;
+/** A headed row of a step: an index into its logits / verify capture (none() = no row). */
+typedef pulsar_point<HeadRows> HeadRow;
+/** Rows of a compressed KV cache or of a pool holding several tokens a row: a count or a distance (L334 P2b). */
+typedef pulsar_unit<pulsar_comp_rows_tag, int> CompRows;
+/** A row of a compressed cache / multi-token pool (none() = no row). */
+typedef pulsar_point<CompRows> CompRow;
+/** Tokens a row of a compressed cache or pool holds: a compress ratio, a pool's tokens per row (nonzero). */
+typedef pulsar_unit<pulsar_tok_per_row_tag, uint32_t> TokPerRow;
+
+/** A factor of 0 tokens a row is no factor (fatal): the crossings below divide by it.
+ *  @param r the factor */
+inline void pulsar_tok_per_row_check(TokPerRow r) {
+    if (r.raw() == 0u) {
+        fprintf(stderr, "pulsar: 0 tokens a row is no compress ratio\n");
+        abort();
+    }
+}
+
+/** The compressed row a position's token lands in: floor(pos / r) (the position law; fatal on none()).
+ *  @param p the position
+ *  @param r tokens a row */
+/// @return its row
+inline CompRow pulsar_comp_row_of(TokPos p, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRow{(int)((uint32_t)p.before().raw() / r.raw())};
+}
+/** The first position of a compressed row: row * r (a group's start: where its rope / its tokens begin).
+ *  @param row the row (fatal on none())
+ *  @param r   tokens a row */
+/// @return its first position
+inline TokPos pulsar_comp_row_pos(CompRow row, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return TokPos{(int)((uint32_t)row.before().raw() * r.raw())};
+}
+/** The rows a history of `len` tokens has completed: floor(len / r) (a compressed cache's frontier).
+ *  @param len the tokens
+ *  @param r   tokens a row */
+/// @return complete rows
+inline CompRows pulsar_comp_rows_held(TokCount len, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRows{(int)((uint32_t)len.raw() / r.raw())};
+}
+/** The rows that cover `len` tokens: ceil(len / r) (a pool's rows for a partial last row; pricing).
+ *  @param len the tokens
+ *  @param r   tokens a row */
+/// @return covering rows
+inline CompRows pulsar_comp_rows_cover(TokCount len, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return CompRows{(int)(((uint32_t)len.raw() + r.raw() - 1u) / r.raw())};
+}
+/** The longest history `rows` complete rows serve: rows * r + r - 1 tokens (the deepest length whose floor(len / r)
+ *  is `rows` -- what a lowered compressed frontier still serves).
+ *  @param rows complete rows
+ *  @param r    tokens a row */
+/// @return the tokens
+inline TokCount pulsar_comp_rows_serve(CompRows rows, TokPerRow r) {
+    pulsar_tok_per_row_check(r);
+    return TokCount{(int)((uint32_t)rows.raw() * r.raw() + r.raw() - 1u)};
+}
+
+/** One run of a batched step: consecutive rows from `first` holding one bank's consecutive positions from `pos0`, one
+ *  token a row -- the row map's one shape (the driver's run_first / run_pos0, a verify round, a prefill chunk).  Its
+ *  two crossings are the only way between a step row and a position. */
+struct pulsar_step_run {
+    StepRow first;  ///< the run's first row in the step
+    TokPos pos0;    ///< the position its first row holds
+    StepRows n;     ///< rows in the run
+    /** The position row `row` holds: pos0 + (row - first).
+     *  @param row a row of this run */
+    /// @return its position
+    TokPos pos_of(StepRow row) const { return pos0 + TokCount{(row - first).raw()}; }
+    /** The row that holds position `p`: first + (p - pos0).
+     *  @param p a position of this run */
+    /// @return its row
+    StepRow row_of(TokPos p) const { return first + StepRows{(p - pos0).raw()}; }
+};
+
+static_assert(sizeof(StepRow) == sizeof(int) && sizeof(HeadRow) == sizeof(int) && sizeof(CompRow) == sizeof(int) &&
+                  sizeof(TokPerRow) == sizeof(uint32_t) && std::is_trivial<StepRow>::value &&
+                  std::is_trivial<CompRow>::value && std::is_trivial<pulsar_step_run>::value,
+              "the P2b index spaces are as cheap as the ints they replace (memset / calloc-safe)");
+
 #endif
