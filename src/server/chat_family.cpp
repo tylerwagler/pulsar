@@ -351,20 +351,29 @@ static bool chat_resolve_thinking(pulsar_engine *e, const server *s, const chat_
 /// @param value  the integer effort
 /// @return `value`
 static int deepseek_effort_integer_v41(int value) { return value; }
-/// server_effort_map::default_level: the loaded encoder's default think mode.
-/// @param e  the engine
+/// server_effort_map::default_level for V4.1: the loaded encoder's default, or V4.1's own with no engine (L335: the map
+/// knows its variant; the engine helpers no longer guess DeepSeek for NULL).
+/// @param e  the engine, or NULL (a render without one)
 /// @return the think mode
-static int deepseek_effort_default(pulsar_engine *e) { return (int)pulsar_engine_think_default(e); }
+static int deepseek_effort_default_v41(pulsar_engine *e) {
+    return (int)(e ? pulsar_engine_think_default(e) : PULSAR_THINK_DEFAULT);
+}
+/// server_effort_map::default_level for V4 (0731): its default is low (pulsar_engine_think_default).
+/// @param e  the engine, or NULL (a render without one)
+/// @return the think mode
+static int deepseek_effort_default_v4(pulsar_engine *e) {
+    return (int)(e ? pulsar_engine_think_default(e) : PULSAR_THINK_LOW);
+}
 /** DeepSeek's think mode per effort name (k_effort_names' order), shared by both variants' maps. */
 #define DEEPSEEK_EFFORT_NAMED                                                                       \
     {PULSAR_THINK_NONE, PULSAR_THINK_LOW, PULSAR_THINK_LOW, PULSAR_THINK_LOW, PULSAR_THINK_HIGH,    \
      PULSAR_THINK_MAX, PULSAR_THINK_MAX}
 /** V4.1's effort map: integers render as themselves. */
 static const server_effort_map k_effort_deepseek_v41 = {
-    DEEPSEEK_EFFORT_NAMED, deepseek_effort_integer_v41, deepseek_effort_default, /*think_mode_level=*/true};
+    DEEPSEEK_EFFORT_NAMED, deepseek_effort_integer_v41, deepseek_effort_default_v41, /*think_mode_level=*/true};
 /** V4 (0731)'s effort map: an integer is the nearest preset. */
 static const server_effort_map k_effort_deepseek_v4 = {
-    DEEPSEEK_EFFORT_NAMED, NULL, deepseek_effort_default, /*think_mode_level=*/true};
+    DEEPSEEK_EFFORT_NAMED, NULL, deepseek_effort_default_v4, /*think_mode_level=*/true};
 #undef DEEPSEEK_EFFORT_NAMED
 
 /// server_family_ops::render for both DeepSeek variants: the DSML template (prompt_render.cpp).

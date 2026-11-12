@@ -115,7 +115,11 @@ const char *pulsar_think_mode_name(pulsar_think_mode mode) {
     case PULSAR_THINK_MAX:  return "max";
     default: break;
     }
-    if (!pulsar_think_mode_valid(mode)) pulsar_die("pulsar_think_mode_name: not a thinking mode");
+    if (!pulsar_think_mode_valid(mode)) {   /* L335: a library refuses, never exits */
+        if (pulsar_refusal_first("pulsar_think_mode_name"))
+            fprintf(stderr, "pulsar: pulsar_think_mode_name: %d is not a thinking mode -- refusing\n", (int)mode);
+        return "";
+    }
     return think_efforts().row[mode].name;
 }
 
@@ -123,7 +127,11 @@ const char *pulsar_think_mode_name(pulsar_think_mode mode) {
 
 const char *pulsar_think_effort_prefix(pulsar_think_mode mode) {
     if (mode == PULSAR_THINK_NONE) return "";
-    if (!pulsar_think_mode_valid(mode)) pulsar_die("pulsar_think_effort_prefix: not a thinking mode");
+    if (!pulsar_think_mode_valid(mode)) {   /* L335: a library refuses, never exits */
+        if (pulsar_refusal_first("pulsar_think_effort_prefix"))
+            fprintf(stderr, "pulsar: pulsar_think_effort_prefix: %d is not a thinking mode -- refusing\n", (int)mode);
+        return "";
+    }
     return think_efforts().row[mode].prefix;
 }
 
@@ -145,8 +153,10 @@ const char *pulsar_think_effort_prefix_family(pulsar_think_mode mode, bool v41) 
     case PULSAR_THINK_MAX:  return PULSAR_V4_REASONING_EFFORT_MAX_PREFIX;
     default: break;
     }
-    pulsar_die("pulsar_think_effort_prefix_family: the V4 encoder has three effort levels "
-               "(low, high, max); the API refuses any other before rendering");
+    /* L335: a library refuses, never exits -- the API refuses such a mode before rendering, so this is a caller's bug */
+    if (pulsar_refusal_first("pulsar_think_effort_prefix_family"))
+        fprintf(stderr, "pulsar: pulsar_think_effort_prefix_family: the V4 encoder has three effort levels (low, high, "
+                        "max), not %d -- refusing\n", (int)mode);
     return "";
 }
 
@@ -183,8 +193,9 @@ void pulsar_release_instance_lock(void) {
 
 
 /* Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
- * so a stale accidental second run is more dangerous than a normal CLI error. */
-void pulsar_acquire_instance_lock(void) {
+ * so a stale accidental second run is more dangerous than a normal CLI error.  L335: false (said) instead of
+ * exit(2): pulsar_engine_open refuses, the host process decides what to do. */
+bool pulsar_acquire_instance_lock(void) {
     const char *path = getenv("PULSAR_LOCK_FILE");
     /* The default lock path stays "/tmp/ds4.lock" DELIBERATELY after the
      * Pulsar rebrand: an old ds4-server and a new pulsar binary must contend
@@ -195,7 +206,7 @@ void pulsar_acquire_instance_lock(void) {
     const int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd < 0) {
         fprintf(stderr, "pulsar: failed to open lock file %s: %s\n", path, strerror(errno));
-        exit(2);
+        return false;
     }
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
 
@@ -215,21 +226,22 @@ void pulsar_acquire_instance_lock(void) {
                 fprintf(stderr, "pulsar: another pulsar/ds4 process is already running; refusing to start\n");
             }
             close(fd);
-            exit(2);
+            return false;
         }
         fprintf(stderr, "pulsar: failed to lock %s: %s\n", path, strerror(errno));
         close(fd);
-        exit(2);
+        return false;
     }
 
     if (ftruncate(fd, 0) != 0) {
         fprintf(stderr, "pulsar: failed to truncate lock file %s: %s\n", path, strerror(errno));
         close(fd);
-        exit(2);
+        return false;
     }
     dprintf(fd, "%ld\n", (long)getpid());
     g_pulsar_lock_fd = fd;
     atexit(pulsar_release_instance_lock);
+    return true;
 }
 
 
@@ -283,11 +295,12 @@ const char *pulsar_engine_served_model_id(const pulsar_engine *e) { return e->fa
  * about, exactly like the other engine facts.  One fact, one name: the chat
  * TEMPLATE family, which is what the renderer forks on. */
 bool pulsar_engine_chat_v41(const pulsar_engine *e) {
-    if (!e) return true;   /* no engine: the compile-time default profile */
-    return e->family->chat_format(e) == PULSAR_CHAT_DS4_V41;
+    /* L335: no engine is no template -- never DeepSeek V4.1 by default (rule 1); a caller rendering without an
+     * engine names its format itself (the server's effort maps: deepseek_effort_default_v41 / _v4) */
+    return e && e->family->chat_format(e) == PULSAR_CHAT_DS4_V41;
 }
 pulsar_family_id pulsar_engine_family(const pulsar_engine *e) {
-    return e ? e->family->id : PULSAR_FAMILY_ID_DEEPSEEK4;
+    return e ? e->family->id : PULSAR_FAMILY_ID_NONE;   /* L335: DeepSeek's id is 0, so 0 was "no engine" too */
 }
 pulsar_chat_format pulsar_engine_chat_format(const pulsar_engine *e) {
     if (e) return e->family->chat_format(e);
@@ -306,10 +319,10 @@ const char *pulsar_engine_family_name(const pulsar_engine *e) {
 /* The think-mode axis (none, 1..100) is DeepSeek's encoder's own; every other family's template renders thinking on
  * at its default effort (PULSAR_THINK_DEFAULT, the enabled marker) or off, its own effort levels being the server's
  * effort map's (L295 E6: Inkling; Qwen since L251). */
-/// @param e the engine, or NULL (the compile-time default profile)
+/// @param e the engine, or NULL (no engine: no DeepSeek axis -- L335)
 /// @return true when the family's chat format is DeepSeek V4 / V4.1
 static bool think_axis_is_deepseek(const pulsar_engine *e) {
-    if (!e) return true;   /* no engine: the compile-time default profile */
+    if (!e) return false;
     const pulsar_chat_format f = e->family->chat_format(e);
     return f == PULSAR_CHAT_DS4_V4 || f == PULSAR_CHAT_DS4_V41;
 }
@@ -321,6 +334,10 @@ pulsar_think_mode pulsar_engine_think_default(const pulsar_engine *e) {
 bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mode mode, char *why, size_t n) {
     if (!pulsar_think_mode_valid(mode)) {
         if (why) snprintf(why, n, "%d is not a thinking effort (none, or 1..100)", (int)mode);
+        return false;
+    }
+    if (!e) {   /* L335: no engine, no template to ask (the branch below names the family) */
+        if (why) snprintf(why, n, "no engine, so no template to render a thinking effort");
         return false;
     }
     if (!think_axis_is_deepseek(e)) {

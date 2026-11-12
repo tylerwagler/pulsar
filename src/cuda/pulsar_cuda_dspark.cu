@@ -431,8 +431,13 @@ __global__ static void dspark_confidence_score_kernel(
         uint32_t n_positions, uint32_t hidden_dim, uint32_t embed_dim, uint32_t vocab_size) {
     uint32_t p = blockIdx.x;
     if (p >= n_positions) return;
-    int32_t t = token_ids[p];
-    if (t < 0 || (uint32_t)t >= vocab_size) t = 0;
+    const int32_t t = token_ids[p];
+    if (t < 0 || (uint32_t)t >= vocab_size) {
+        /* L335: an id outside the vocabulary has no Markov row: score 0 -- the stop rule ends the draft here (it used
+         * token 0's row and gave a plausible confidence).  Block-uniform (one position a block), so before any sync. */
+        if (threadIdx.x == 0) scores[p] = 0.0f;
+        return;
+    }
     const float *hp = hidden + (uint64_t)p * hidden_dim;
     const uint64_t emb_base = (uint64_t)t * embed_dim;
     float dot = 0.0f;

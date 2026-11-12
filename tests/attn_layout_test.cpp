@@ -211,14 +211,14 @@ static void install_and_grade(const pulsar_shape *shape, const char *what,
 /* L269 W2: a LAYER-SUBSET FIXTURE of V4.1 (tools/container build.py --layers 1,2,3,14,20,21,24, what
  * /path/to/models/v41-tp1-fixture keeps): the block table must be the source layers' own modes, the sources and the
  * candidate re-bound to the kept blocks, and a fixture that drops a source its kept readers read must refuse
- * (the install exits; run in a child). */
+ * (the install refuses -- L335: false, counted; it exited -- run in a child: a refusal leaves the layout half-built). */
 static const uint32_t FIX_SRC[7] = { 1, 2, 3, 14, 20, 21, 24 };
 
 static void fixture_install(const uint32_t *src, uint32_t n, const uint32_t *ratios, const uint32_t *kv, uint32_t n_kv,
                             const uint32_t *idx, uint32_t n_idx, int32_t cand) {
     g_pulsar_shape = PULSAR_SHAPE_V41;
     if (!pulsar_layer_subset_install(src, n)) exit(2);
-    pulsar_attn_layout_install(ratios, kv, n_kv, idx, n_idx, cand);
+    if (!pulsar_attn_layout_install(ratios, kv, n_kv, idx, n_idx, cand)) exit(1);   /* L335: refuses, no longer exits */
 }
 
 static int fixture_refuses(const uint32_t *src, uint32_t n, const uint32_t *ratios, const uint32_t *kv, uint32_t n_kv,

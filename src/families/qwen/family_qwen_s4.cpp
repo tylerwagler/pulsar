@@ -508,11 +508,11 @@ g.total = o;
 
 /* L251 S3: the QSA op's scratch.  qg/k/v/idx hold the four f32 projections (the
  * op hands the kernel VIEWS of them, because pulsar_qsa_io wants tensors and the
- * scratch IS one); obf16 is the bf16 output the o_proj reads (ac69748f) and a8_sf
- * the scale slab the kernel is handed beside it; ws is pulsar_gpu_qsa_forward's
+ * scratch IS one); obf16 is the bf16 output the o_proj reads (ac69748f; no E4M3 slot, so no scale slab:
+ * L335 removed the a8_sf slab the kernel wrote and nothing read); ws is pulsar_gpu_qsa_forward's
  * workspace; lin_ws is the shared dense workspace. */
 /** The QSA op's scratch layout (qsa_layout): byte offsets into scratch[PULSAR_QWEN_OP_QSA]. */
-struct qsa_scratch { uint64_t qg, k, v, idx, a8_sf, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
+struct qsa_scratch { uint64_t qg, k, v, idx, obf16, ws, ws_bytes, lin_ws, lin_ws_bytes, total; };
 
 /** @var qsa_scratch::qg
  *  byte offset in the op's scratch tensor: q_proj output (query | gate), [rows][q_in] f32 */
@@ -522,8 +522,6 @@ struct qsa_scratch { uint64_t qg, k, v, idx, a8_sf, obf16, ws, ws_bytes, lin_ws,
  *  byte offset in the op's scratch tensor: v_proj output, [rows][kv_in] f32 */
 /** @var qsa_scratch::idx
  *  byte offset in the op's scratch tensor: indexer index_qk output, [rows][PULSAR_QSA_IDX_IN] f32 */
-/** @var qsa_scratch::a8_sf
- *  byte offset in the op's scratch tensor: the scale-factor slab passed as pulsar_qsa_io::out_scale (with out_e4m3 NULL) */
 /** @var qsa_scratch::obf16
  *  byte offset in the op's scratch tensor: the attention output, [rows][out_dim] bf16 -- what o_proj reads */
 /** @var qsa_scratch::ws
@@ -557,7 +555,6 @@ qsa_scratch qsa_layout(const pulsar_qwen_shape *s, uint32_t rows, uint32_t ctx) 
     g.k   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.v   = o; o += a256((uint64_t)rows * pulsar_qwen_qsa_kv_in(s) * sizeof(float));
     g.idx = o; o += a256((uint64_t)rows * PULSAR_QSA_IDX_IN * sizeof(float));
-    g.a8_sf = o; o += a256(pulsar_gpu_mx_sf_slab_bytes((int)rows, pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s))));
     g.ws = o; g.ws_bytes = a256((uint64_t)pulsar_gpu_qsa_workspace_bytes(rows, ctx)); o += g.ws_bytes;
     g.lin_ws = o; g.lin_ws_bytes = qsa_lin_ws(s, rows); o += g.lin_ws_bytes;
     /* L251 / ac69748f: the o_proj's bf16 row */
@@ -1608,8 +1605,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
         io.qg = sq; io.k = sk; io.v = sv; io.idx = si;
         io.out_bf16 = (uint8_t *)dptr(sc) + g.obf16 + (uint64_t)r0 * OD * 2u;   /* L251 / ac69748f: bf16, not A8 */
         io.out_e4m3 = NULL;
-        io.out_scale = (uint8_t *)dptr(sc) + g.a8_sf;
-        io.out_sf_pitch = pulsar_gpu_mx_kbp(pulsar_qwen_qsa_out_dim(s));
+        io.out_scale = NULL;     /* L335: no E4M3 slot, so no scales -- a slab written and never read is gone */
+        io.out_sf_pitch = 0;
         io.tap_out_f32 = NULL; io.tap_sel = NULL;              /* the lane, not a gate */
         io.tp_ranks = (int)pulsar_qwen_tp(s);
         io.row_rope = st->rope ? st->rope + (size_t)r0 * 6u : NULL;   /* L268: multi-axis rope, NULL for text */

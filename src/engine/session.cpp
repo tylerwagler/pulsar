@@ -692,7 +692,12 @@ static int open_load(pulsar_engine **out, const pulsar_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     /* the instance lock is the PROCESS's: taken by its first live engine, released with its last (L321 groups) */
-    if (g_live_engines++ == 0) pulsar_acquire_instance_lock();
+    if (g_live_engines++ == 0 && !pulsar_acquire_instance_lock()) {   /* L335: said; an open refuses, never exits */
+        g_live_engines--;   /* e->live is not set yet: destroy() does not count it again */
+        e->destroy();
+        *out = NULL;
+        return 1;
+    }
     e->live = true;
 
     const bool graph_backend = pulsar_backend_uses_graph(opt->backend);

@@ -3681,14 +3681,15 @@ const pulsar_layer_attn *pulsar_layer_attn_layout(uint32_t il);
  * invariants (sources ascending and inside the backbone, a layer's ratio equals
  * the ratio of every source it READS, the candidate source is an index source).
  * The loader calls it with the artifact's metadata; a unit test with the
- * profile's own sets.  Dies on any violation. */
+ * profile's own sets.  False on any violation, said and counted (pulsar_load_refuse; L335: it died). */
 /// @param ratios            per-layer compression ratios, PULSAR_N_LAYER entries
 /// @param kv_sources        the kv-source layers
 /// @param n_kv              entries in kv_sources
 /// @param index_sources     the index-source layers
 /// @param n_index           entries in index_sources
 /// @param candidate_source  the candidate-source layer, -1 = none
-void pulsar_attn_layout_install(const uint32_t *ratios,
+/// @return true when the artifact's layout is the profile's
+bool pulsar_attn_layout_install(const uint32_t *ratios,
                                 const uint32_t *kv_sources, uint32_t n_kv,
                                 const uint32_t *index_sources, uint32_t n_index,
                                 int32_t candidate_source);
@@ -6240,8 +6241,10 @@ void pulsar_linux_graph_backend_set_oom_score(pulsar_backend backend);
 void pulsar_release_instance_lock(void);
 /** Refuse to start a second pulsar/ds4 process.  The model can map tens of GiB,
  * so a stale accidental second run is more dangerous than a normal CLI error.
+ * @return true when this process holds the lock; false (said) when another holds it or it cannot be taken (L335:
+ *         pulsar_engine_open refuses; this used to exit(2))
  */
-void pulsar_acquire_instance_lock(void);
+bool pulsar_acquire_instance_lock(void);
 
 /** ---- shared inline helpers ---- */
 

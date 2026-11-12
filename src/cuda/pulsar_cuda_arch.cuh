@@ -184,23 +184,6 @@ __device__ __forceinline__ T pulsar_warp_max(T v) {
 /* Host side: what the DEVICE has.  The tiers above say what an IMAGE was compiled with; a launch decision must ask the
  * device, or a build for an older target selects a lane its card cannot run (L321: an sm_75 build on an sm_75 card chose
  * the routed IQ2 MMQ lane, whose block-scaled MMA exists only in the sm_120f image; its other arm returned NaN). */
-/* The current device's compute capability as major * 10 + minor (75 Turing, 89 Ada, 121 GB10), asked once per process;
- * 0 if unknown.  Inline (one cache per program) so a model-free gate that links a single kernel object needs no
- * runtime object for it. */
-/// @return the current device's compute capability, major * 10 + minor, cached on first call; 0 if unknown.
-inline int pulsar_cuda_device_cc(void) {
-    static int cc = -1;
-    if (cc < 0) {
-        int dev = 0, ma = 0, mi = 0;
-        cc = (cudaGetDevice(&dev) == cudaSuccess &&
-              cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-              cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess) ? ma * 10 + mi : 0;
-    }
-    return cc;
-}
-/// @return the current device's compute-capability major (0 if unknown).
-inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10; }
-
 /* Per-device host state (L335): a process static caching a DEVICE answer -- a function attribute, an SM count, a
  * device symbol's address -- is right for the first device that asks and wrong on the next one a TP rank or a second
  * engine runs on.  Such a cache is an array indexed by the calling thread's current device. */
@@ -225,6 +208,26 @@ inline int pulsar_cuda_device_slot(void) {
     }
     return dev;
 }
+
+/* The current device's compute capability as major * 10 + minor (75 Turing, 89 Ada, 121 GB10), asked once PER DEVICE
+ * (L335: it was once per process -- the first device's answer for every device a TP rank or a second engine runs on);
+ * 0 if unknown.  Inline (one cache per program) so a model-free gate that links a single kernel object needs no
+ * runtime object for it. */
+/// @return the current device's compute capability, major * 10 + minor, cached per device; 0 if unknown.
+inline int pulsar_cuda_device_cc(void) {
+    static int cc[PULSAR_CUDA_DEVICE_SLOTS];   /* 0 = not asked yet; else the answer + 1 (an unknown device caches 1) */
+    const int slot = pulsar_cuda_device_slot();
+    if (slot < 0) return 0;
+    if (cc[slot] == 0) {
+        int ma = 0, mi = 0;
+        cc[slot] = 1 + ((cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, slot) == cudaSuccess &&
+                         cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, slot) == cudaSuccess)
+                            ? ma * 10 + mi : 0);
+    }
+    return cc[slot] - 1;
+}
+/// @return the current device's compute-capability major (0 if unknown).
+inline int pulsar_cuda_device_major(void) { return pulsar_cuda_device_cc() / 10; }
 
 /* A kernel's dynamic-shared-memory opt-in, per device (L335): every launcher that opted in "once" through a function
  * static set the attribute on the first device only -- and two ignored the return code. */

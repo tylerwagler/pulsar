@@ -120,6 +120,7 @@ typedef struct pulsar_family pulsar_family;
  * pulsar_engine_open from the artifact's `general.architecture`, never
  * switched.  Values are stable. */
 typedef enum {
+    PULSAR_FAMILY_ID_NONE      = -1, ///< no engine (pulsar_engine_family(NULL); L335: never DeepSeek by default)
     PULSAR_FAMILY_ID_DEEPSEEK4 = 0,  ///< DeepSeek V4 Flash (0731), Vision-Exp, V4.1 Flash
     PULSAR_FAMILY_ID_QWEN4_EXP = 1,  ///< Qwen3.8-Flash-Next (HF model_type qwen4_exp)
     PULSAR_FAMILY_ID_INKLING   = 2,  ///< Thinking Machines' Inkling (HF model_type inkling_mm_model; src/families/inkling)
@@ -549,7 +550,7 @@ const char *pulsar_think_effort_prefix(pulsar_think_mode mode);
  * texts (encoding_dsv4.py REASONING_EFFORT_PROMPTS) -- and no numeric line.
  * Rendering V4.1's line to a 0731 model put 25 foreign tokens in front of
  * every prompt (L239).  A V4 request with an effort the V4 encoder cannot
- * spell is refused by the API before it reaches here; this dies on one. */
+ * spell is refused by the API before it reaches here; one that does is refused (said once) and gets "" (L335). */
 /** @param mode the mode
  *  @param v41 the loaded model uses the V4.1 template (pulsar_engine_chat_v41)
  *  @return the line, static */
