@@ -102,7 +102,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
                           s->ctx_size);
         return 1;
     }
-    s->resume_origin = -1;
+    s->resume_origin = TokPos::none();
     pulsar_engine *e = s->engine;
     if (n_images > 0) {
         if (!e->vision_ready) {
@@ -202,9 +202,9 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             if (rec->img) s->live_images = *rec->img;
             s->checkpoint.len = (int)G;
             s->checkpoint_valid = true;
-            s->prefill_frontier = (int)G;
+            s->prefill_frontier = pulsar_ckpt_pos(G);
             s->logits_stale = false;
-            s->resume_origin = (int)G;
+            s->resume_origin = pulsar_ckpt_pos(G);
             fprintf(stderr, "pulsar: %s: bank %u resumes at its prompt end %u -- the same prompt, no row evaluated\n",
                     ops->name, live, G);
             return 0;
@@ -240,7 +240,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             s->live_images.n = 0;   /* a cold bank holds no image */
         }
     }
-    s->resume_origin = (int)start;
+    s->resume_origin = pulsar_ckpt_pos(start);
     /* the loop owns the view from here: it stands at each chunk's end as the chunk lands, so an
      * interrupted sync leaves a valid prefix the next sync extends.  The images are borrowed for it (the
      * family's chunk merges the blocks it owns) and released on every exit. */

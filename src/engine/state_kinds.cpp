@@ -770,9 +770,10 @@ static pulsar_ckpt_store *decl_bank_kv_store(pulsar_session *s) { return s && s-
 
 /** pulsar_family_bank_ops::prefill_frontier: the set's own per-bank fact, one for both host views (a decode step
  *  does not move it).  @param s the session  @param bank the bank
- *  @return the bank's prefill-only history end in tokens, 0 out of range */
-static uint32_t decl_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view) {
-    return s && s->states && bank < s->states->n_banks ? s->states->prefill_pos[bank] : 0u;
+ *  @return the bank's prefill-only history end, position 0 out of range */
+static TokPos decl_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view) {
+    /* L334 P2b S7a: prefill_pos raw */
+    return s && s->states && bank < s->states->n_banks ? pulsar_ckpt_pos(s->states->prefill_pos[bank]) : TokPos{0};
 }
 
 /** pulsar_family_bank_ops::live.  @param s the session  @return the live bank, 0 without declared state */

@@ -175,7 +175,7 @@ void pulsar_bank_carry_fresh_view(pulsar_session *s) {
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->logits_stale = true;
-    s->prefill_frontier = 0;
+    s->prefill_frontier = TokPos{0};
     s->live_images.n = 0;
     spec_lookahead_reset(s);   /* no shadow was saved: the fresh bank has no pendings, carry or quench */
 }
@@ -273,7 +273,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
     /* the shared capture rule (P13): the state stands at G or the record is refused, and G on the grid in a
      * prefill's state is captured -- before the record changes anything */
-    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, TokPos{(int)G})) {   /* L334 P2b S3: G stays raw here */
+    if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, pulsar_ckpt_pos(G))) {
         fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) %s -- refusing\n", bank, from, G,
                 ck && ck->ops ? "did not land (above)" : "has no checkpoint store");
         return 1;
@@ -284,7 +284,7 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
     spec_lookahead_reset(s);
     pulsar_session_note_committed(s, toks, n);
     s->checkpoint_valid = true;
-    s->prefill_frontier = s->checkpoint.len;   /* L195: a prefill wrote up to here */
+    s->prefill_frontier = TokPos::after(TokCount{s->checkpoint.len});   /* L195: a prefill wrote up to here */
     if (head >= 0) {
         /* the step's rows are still the session's (L302: nothing ran since the fused step) */
         if (!s->live_from_rows(s->dev.step_rows, s->fused_n_dec + (uint32_t)head)) return 1;
@@ -299,12 +299,12 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
 /// @param s    the session
 /// @param bank the bank
 /// @param view the host view asked (L380: the saved one reads the carry's, also for the installed bank)
-/// @return the bank's prefill frontier in tokens, 0 when it holds no valid history
-static uint32_t ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
-    if (!pulsar_bank_history_as(s, bank, view)) return 0;
+/// @return the bank's prefill frontier, position 0 when it holds no valid history
+static TokPos ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+    if (!pulsar_bank_history_as(s, bank, view)) return TokPos{0};
     const bool live = view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s);
-    const int pf = live ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
-    return pf > 0 ? (uint32_t)pf : 0u;
+    const TokPos pf = live ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
+    return pf.raw() > 0 ? pf : TokPos{0};
 }
 
 /** pulsar_family_bank_ops::kv_store.  @param s the session  @return the graph's checkpoint store (borrowed) */
@@ -312,10 +312,10 @@ static pulsar_ckpt_store *ds4_bank_kv_store(pulsar_session *s) { return &s->grap
 /** pulsar_family_bank_ops::live.  @param s the session  @return the graph's current bank */
 static uint32_t ds4_bank_live(pulsar_session *s) { return gpu_graph_cur_bank(s->graph); }
 /** pulsar_family_bank_ops::rewind: pulsar_session::rewind.  @param s the session  @param pos the position */
-static void ds4_bank_rewind(pulsar_session *s, int pos) { s->rewind(pos); }
+static void ds4_bank_rewind(pulsar_session *s, TokPos pos) { s->rewind(pos); }
 /** pulsar_family_bank_ops::restore_checkpoint: pulsar_session::restore_checkpoint.  @param s the session
- *  @param G the grid point, in tokens  @return its verdict */
-static bool ds4_bank_restore_checkpoint(pulsar_session *s, uint32_t G) { return s->restore_checkpoint(G); }
+ *  @param G the grid point  @return its verdict */
+static bool ds4_bank_restore_checkpoint(pulsar_session *s, TokPos G) { return s->restore_checkpoint(G); }
 /** pulsar_family_bank_ops::pooled.  @param s the session  @return true when the graph has a bank pool */
 static bool ds4_bank_pooled(const pulsar_session *s) { return s->graph->banks.n_banks > 0; }
 

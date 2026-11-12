@@ -151,7 +151,7 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
     }
     if (last) s->dev.live_valid = true;
     if (last) s->dev.host_stale = true;   /* L302: the head wrote the live row on the device */
-    s->prefill_frontier = (int)(pos0 + rows);
+    s->prefill_frontier = pulsar_ckpt_pos(pos0 + rows);
     return true;
 }
 
@@ -163,8 +163,8 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
 /// @param start first position to prefill
 /// @return pulsar_prefill_loop's
 static int ds4_sync_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
-    if ((int)start < s->checkpoint.len) s->trim_history((int)start);
-    s->prefill_frontier = (int)start;
+    if ((int)start < s->checkpoint.len) s->trim_history(pulsar_ckpt_pos(start));
+    s->prefill_frontier = pulsar_ckpt_pos(start);
     const pulsar_vision_request vreq = { s->sync_images, s->sync_n_images, s->engine };
     pulsar_gpu_graph *g = s->graph;
     const pulsar_vision_request *prev = g->vision_req;
@@ -248,7 +248,7 @@ static int ds4_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *reqs, 
  * compressor group empty, its checkpoints and the drafter's window rows gone (rewind(0)) -- so any lane may start it
  * at position 0 and no next conversation can restore this one's rows. */
 /// @param s the session
-static void ds4_invalidate(pulsar_session *s) { s->rewind(0); }
+static void ds4_invalidate(pulsar_session *s) { s->rewind(TokPos{0}); }
 /// pulsar_family_session_ops::decode_fused: pulsar_session::decode_fused.
 /// @param s the session
 /// @param reqs requests

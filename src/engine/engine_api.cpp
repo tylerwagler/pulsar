@@ -1441,13 +1441,13 @@ uint32_t pulsar_session_live_bank(pulsar_session *s) {
 /** L380: pulsar_session_bank_prefill_frontier in the host view asked.  @param s the session  @param bank the bank
  *  @param view the host view  @return the bank's prefill frontier there */
 static TokPos bank_prefill_frontier_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
-    return TokPos{s ? (int)session_banks(s)->prefill_frontier(s, bank, view) : 0};
+    return s ? session_banks(s)->prefill_frontier(s, bank, view) : TokPos{0};
 }
 uint32_t pulsar_session_resume_point(pulsar_session *s, uint32_t bank, int common, int prompt_len,
                                      const pulsar_image_identity *want, pulsar_bank_view view) {
     if (!s || common <= 0 || prompt_len <= 0) return 0;
     uint32_t limit = (uint32_t)common;
-    const int pf = bank_prefill_frontier_as(s, bank, view).raw();   /* L334: the body stays raw (P2b) */
+    const int pf = bank_prefill_frontier_as(s, bank, view).raw();   /* L334 P2b S4: the resume rule stays raw */
     const uint32_t frontier = pf < 0 ? 0u : (uint32_t)pf;
     if (limit > frontier) limit = frontier;
     if (limit > (uint32_t)prompt_len - 1u) limit = (uint32_t)prompt_len - 1u;
@@ -1486,7 +1486,7 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
 bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, int len, pulsar_bank_view view) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops || len < 0) return false;
-    return bank_prefill_frontier_as(s, bank, view).raw() >= len &&   /* L334: raw body (P2b) */
+    return bank_prefill_frontier_as(s, bank, view).raw() >= len &&   /* L334 P2b S4 */
            (st->ops->split_invariant || (uint32_t)len % st->ops->resume_grid == 0u) &&
            !pulsar_session_bank_comp_stale(s, bank);
 }
@@ -2175,7 +2175,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, uint32_t s
     for (uint32_t i = 0; i < T; i++) token_vec_push(&s->checkpoint, view.v[i]);
     pulsar_tokens_free(&view);
     s->checkpoint_valid = true;
-    s->prefill_frontier = (int)T;
+    s->prefill_frontier = pulsar_ckpt_pos(T);
     s->logits_stale = !at_end;
     s->live_images.n = 0;
     spec_lookahead_reset(s);   /* the bank's pending drafts were its old history's */
@@ -2203,7 +2203,7 @@ int pulsar_session_restore_checkpoint(pulsar_session *s, TokPos G, char *err, si
         if (err) snprintf(err, errlen, "restore checkpoint: a tensor-parallel engine does not mirror it");
         return 1;
     }
-    if (!ops->restore_checkpoint(s, (uint32_t)G.raw())) {
+    if (!ops->restore_checkpoint(s, G)) {
         if (err) snprintf(err, errlen, "restore checkpoint: the installed bank holds no checkpoint at %d", G.raw());
         return 1;
     }
@@ -2215,15 +2215,15 @@ void pulsar_session_rewind(pulsar_session *s, TokPos pos) {
     if (!s) return;
     const pulsar_family_bank_ops *ops = session_banks(s);
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) { ops->rewind(s, pos.raw()); return; }   /* L334: the family's rewind stays raw (P2b) */
+    if (!tp) { ops->rewind(s, pos); return; }
     char err[256];
     if (tp_mirror_worker_drives_nothing(tp, "rewind", err, sizeof(err))) {
         pulsar_tp_mirror_fail_void(tp, "rewind", err);
         return;
     }
     if (!tp_mirror_sent(tp, "rewind",
-                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos.raw()), NULL, 0)) return;
-    ops->rewind(s, pos.raw());
+                        pulsar_tp_send_rewind(tp, s->tp_session_id, pos.raw()), NULL, 0)) return;   /* the wire's int */
+    ops->rewind(s, pos);
 }
 TokPos pulsar_session_pos(pulsar_session *s) { return TokPos{s->pos()}; }
 TokCount pulsar_session_ctx(pulsar_session *s) { return TokCount{s->ctx()}; }

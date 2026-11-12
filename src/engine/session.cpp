@@ -1288,7 +1288,7 @@ int pulsar_session::create(pulsar_session **out, pulsar_engine *e, int ctx_size)
 int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
     pulsar_engine *e = s->engine;
     const int ctx_size = s->ctx_size;
-    s->prefill_frontier = 0;   /* L195: nothing prefilled yet */
+    s->prefill_frontier = TokPos{0};   /* L195: nothing prefilled yet */
     const uint32_t raw_cap = gpu_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     const pulsar_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
     if (!shape_layer) {
@@ -1611,10 +1611,12 @@ bool pulsar_session_token_is_id(const pulsar_session *s, int token, char *err, s
  * deleted as callerless the same morning, then the spec mid-block stop path
  * turned out to need exactly it (it was full-session invalidate before,
  * which threw away the whole live KV on every mid-block tool-call stop). */
-void pulsar_session::rewind(int pos) {
+void pulsar_session::rewind(TokPos at) {
     auto *s = this;
-    if (pos < 0) pos = 0;
-    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    /* none() or a negative raw (a TP frame's value) rewinds to 0 and a position past the history to its end, as
+     * the int did */
+    const TokPos end = TokPos::after(TokCount{s->checkpoint.len});
+    const TokPos pos = at.is_none() || at.raw() < 0 ? TokPos{0} : at > end ? end : at;
     s->trim_history(pos);
     s->logits_stale = true;
     /* The compressed frontier of every kv source follows the position law on
@@ -1627,7 +1629,8 @@ void pulsar_session::rewind(int pos) {
     const uint32_t rw_bank = gpu_graph_cur_bank(s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
-        const uint32_t want = (uint32_t)pos / pulsar_layer_compress_ratio(il);
+        const uint32_t want =
+            (uint32_t)pulsar_comp_rows_held(pos.before(), TokPerRow{pulsar_layer_compress_ratio(il)}).raw();
         if (gpu_graph_n_comp(s->graph, rw_bank, il) > want) gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
@@ -1639,7 +1642,7 @@ void pulsar_session::rewind(int pos) {
      * 0).  Nothing decodes from a rewound position directly: a rewind ends a
      * generation (a stop's ghost tail, L073) or is the first half of a sync. */
     bool ok = true;
-    if (pos == 0) {
+    if (pos == TokPos{0}) {
         /* Position 0 is where a bank changes conversations (invalidate, a cold
          * rebuild, an evicted bank's reuse): none of its checkpoints describes
          * the next one, including those a spill kept while its frontier sat at 0
@@ -1647,14 +1650,15 @@ void pulsar_session::rewind(int pos) {
         pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
         ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
     }
-    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, TokPos{pos}) == TokPos{pos})   /* L334 P2b S3: pos stays int */
-        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, TokPos{pos});
+    else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, pos) == pos)
+        ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, pos);
     else {
         s->graph->ms_comp_state_stale[rw_bank] = true;
         return;
     }
     if (!ok) {
-        fprintf(stderr, "pulsar: rewind to %d on bank %u: state copy failed -- checkpoint invalidated\n", pos, rw_bank);
+        fprintf(stderr, "pulsar: rewind to %d on bank %u: state copy failed -- checkpoint invalidated\n", pos.raw(),
+                rw_bank);
         s->checkpoint_valid = false;
         return;
     }
@@ -1662,13 +1666,13 @@ void pulsar_session::rewind(int pos) {
 }
 
 
-void pulsar_session::trim_history(int pos) {
+void pulsar_session::trim_history(TokPos pos) {
     auto *s = this;
     /* The image blocks above the new end are gone from the live KV: their records go with them or a later request
      * could reuse rows that no longer exist (L226).  L281: the blocks BELOW it survive, records and all -- before,
      * one cut block dropped the whole identity and the next image request rebuilt every block from 0. */
-    pulsar_image_identity_trim(&s->live_images, (uint32_t)(pos < 0 ? 0 : pos));
-    s->checkpoint.len = pos;
+    pulsar_image_identity_trim(&s->live_images, (uint32_t)pos.before().raw());
+    s->checkpoint.len = pos.before().raw();   /* L334 P2b S5: checkpoint.len stays int */
     spec_lookahead_reset(s);
     /* Rewound positions' drafter rows are stale; empty the window (it refills
      * from the prompt capture on the next prefill, or from commits). */
@@ -1678,22 +1682,22 @@ void pulsar_session::trim_history(int pos) {
 }
 
 
-bool pulsar_session::restore_checkpoint(uint32_t G) {
+bool pulsar_session::restore_checkpoint(TokPos G) {
     auto *s = this;
     const uint32_t bank = gpu_graph_cur_bank(s->graph);
-    if (!s->checkpoint_valid || G == 0u || G > (uint32_t)s->checkpoint.len ||
-        pulsar_ckpt_best(&s->graph->ckpt, bank, TokPos{(int)G}) != TokPos{(int)G}) return false;   /* L334 P2b S3 */
-    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, TokPos{(int)G})) {
+    if (!s->checkpoint_valid || G.is_none() || G <= TokPos{0} || G > TokPos::after(TokCount{s->checkpoint.len}) ||
+        pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
+    if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {
         /* The device copies were issued in part: the bank's state is no longer
          * any position's.  Nothing reads it before a rebuild. */
         s->checkpoint_valid = false;
         return false;
     }
-    s->trim_history((int)G);
+    s->trim_history(G);
     s->logits_stale = true;
     /* The checkpoint was captured where a prefill reached G, and a frontier
      * that fell below G since would have dropped it. */
-    s->prefill_frontier = (int)G;
+    s->prefill_frontier = G;
     return true;
 }
 
@@ -1710,7 +1714,7 @@ int pulsar_session::ctx() {
 }
 
 
-TokPos pulsar_session_resume_origin(pulsar_session *s) { return TokPos{s->resume_origin}; }   /* -1 enters as none() */
+TokPos pulsar_session_resume_origin(pulsar_session *s) { return s->resume_origin; }
 
 TokCount pulsar_session_prefill_cap(pulsar_session *s) {
     return TokCount{s ? (int)s->prefill_cap : 0};

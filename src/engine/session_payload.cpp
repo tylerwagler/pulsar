@@ -852,13 +852,14 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
     for (uint32_t i = 0; i < v.n_img; i++) s->live_images.b[s->live_images.n++] = v.imgs[i];   /* L281 */
     st->ops->set_frontier_stale(st->state, pulsar_ckpt_pos(G));
     if (last) pulsar_ckpt_commit(st, bank, at.slot, TokPos{(int)G});
-    s->prefill_frontier = (int)G;   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
+    s->prefill_frontier = pulsar_ckpt_pos(G);   /* L195: a prefill reached G (the family's own counter is set_frontier_stale's) */
     s->checkpoint_valid = true;
     s->mseq_dirty = false;   /* L354: as load_payload */
     /* the chain's last checkpoint: the family's standalone restore where it has one (DeepSeek: the history and the
      * drafter window with it), else the store's alone (Qwen: its sync owns the rest) */
     const pulsar_family_bank_ops *bops = s->engine->family->banks;
-    if (last && !(bops->restore_checkpoint ? bops->restore_checkpoint(s, G) : pulsar_ckpt_restore(st, bank, TokPos{(int)G}))) {
+    if (last && !(bops->restore_checkpoint ? bops->restore_checkpoint(s, pulsar_ckpt_pos(G))
+                                                     : pulsar_ckpt_restore(st, bank, pulsar_ckpt_pos(G)))) {
         payload_set_err(err, errlen, "load segment: restoring the chain's last checkpoint failed");
         return fail(PULSAR_SEGMENT_TRANSIENT);
     }
@@ -1254,7 +1255,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
     const bool live_ok = s->live_from_host(logits);
     free(logits);
     if (!live_ok) return fail();
-    s->prefill_frontier = (int)PF;   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
+    s->prefill_frontier = pulsar_ckpt_pos(PF);   /* the session's mirror (DeepSeek's own: L195), as a fused prompt chunk sets it */
     s->checkpoint_valid = true;
     s->logits_stale = false;
     s->mseq_dirty = false;   /* L354: the frontier is this payload's now, whatever batched step ran before it */

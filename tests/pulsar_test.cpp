@@ -4187,15 +4187,15 @@ static void test_bank_carry_restore(void) {
     pulsar_bank_carry *c = &s->bank_carry[1];
     c->valid = true;
     c->checkpoint_valid = true;
-    c->prefill_frontier = 3;
+    c->prefill_frontier = TokPos{3};
     for (int t : {1, 2, 3}) token_vec_push(&c->checkpoint, t);
     token_vec_push(&s->checkpoint, 9);
     s->checkpoint_valid = false;
-    s->prefill_frontier = 1;
+    s->prefill_frontier = TokPos{1};
     s->logits_stale = true;
     s->dev.n_banks = 0;   /* the live row's copy refuses bank 1 before any device work */
     TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 1));
-    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9 && !s->checkpoint_valid && s->prefill_frontier == 1);
+    TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9 && !s->checkpoint_valid && s->prefill_frontier == TokPos{1});
     TEST_ASSERT(!pulsar_bank_carry_restore_view(s, 0));   /* nothing saved: false, nothing said or moved */
     TEST_ASSERT(s->checkpoint.len == 1 && s->checkpoint.v[0] == 9);
     pulsar_tokens_free(&c->checkpoint);
@@ -4344,7 +4344,7 @@ static void test_batch_history(void) {
         for (int t : more) token_vec_push(&c->checkpoint, t);
         c->valid = true;
         c->checkpoint_valid = true;
-        c->prefill_frontier = n;
+        c->prefill_frontier = TokPos{n};
     };
     carry(0, 300, {});            /* idle: the first half of the decoder's prompt */
     carry(1, 600, {});            /* the decoder's bank as it entered the batch */
@@ -4353,7 +4353,7 @@ static void test_batch_history(void) {
     /* the installed bank's live view: the step moved the bank past it */
     for (int t : P) token_vec_push(&fs->checkpoint, t);
     fs->checkpoint_valid = false;
-    fs->prefill_frontier = 600;
+    fs->prefill_frontier = TokPos{600};
 
     /* the engine's two views of the installed bank, and of one that is not */
     TEST_ASSERT(pulsar_bank_history(fs, 1) == NULL && pulsar_session_bank_tokens(fs, 1) == NULL);
@@ -4361,12 +4361,12 @@ static void test_batch_history(void) {
     TEST_ASSERT(pulsar_session_bank_tokens_as(fs, 1, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
     TEST_ASSERT(pulsar_bank_history(fs, 0) == &fs->bank_carry[0].checkpoint &&
                 pulsar_bank_history_as(fs, 0, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[0].checkpoint);
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == 0u &&
-                bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 600u &&
-                bops.prefill_frontier(fs, 0, PULSAR_BANK_VIEW_CURRENT) == 300u);
-    fs->bank_carry[1].prefill_frontier = 590;   /* the saved view's frontier is the carry's, not the live view's */
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == 590u);
-    fs->bank_carry[1].prefill_frontier = 600;
+    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == TokPos{0} &&
+                bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == TokPos{600} &&
+                bops.prefill_frontier(fs, 0, PULSAR_BANK_VIEW_CURRENT) == TokPos{300});
+    fs->bank_carry[1].prefill_frontier = TokPos{590};   /* the saved view's frontier is the carry's, not the live view's */
+    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == TokPos{590});
+    fs->bank_carry[1].prefill_frontier = TokPos{600};
     /* a valid live view is the current read, whatever the carry says (the generic contract: not the carry) */
     fs->checkpoint_valid = true;
     fs->checkpoint.len = 10;
@@ -4379,12 +4379,12 @@ static void test_batch_history(void) {
         const pulsar_bank_resume sv = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
         TEST_ASSERT(sv.served == PromptToks{600} && sv.at == TokPos{600} && sv.why == PULSAR_RESUME_CONTINUES);
         /* not continued (decode rows in the history at entry): the grid checkpoint within the saved prefill */
-        fs->bank_carry[1].prefill_frontier = 520;
+        fs->bank_carry[1].prefill_frontier = TokPos{520};
         st->pos[1][0] = 512u;
         const pulsar_bank_resume gp = pulsar_session_bank_resume_at_as(fs, 1, PULSAR_BANK_VIEW_SAVED, &pr, NULL, 0);
         TEST_ASSERT(gp.served == PromptToks{512} && gp.at == TokPos{512} && gp.why == PULSAR_RESUME_POINT);
         st->pos[1][0] = 0u;
-        fs->bank_carry[1].prefill_frontier = 600;
+        fs->bank_carry[1].prefill_frontier = TokPos{600};
     }
 
     /* the server: bank i is slot i; slot 1 decodes in the batch, slot 2 prefills, slots 0 and 3 are idle */

@@ -574,7 +574,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, op, ferr);
             return 1;
         }
-        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, c->value);   /* the leader sends one only with CAP_REWIND */
+        if (c->type == PULSAR_TP_FRAME_REWIND) slot->s->engine->family->banks->rewind(slot->s, TokPos{c->value});   /* the leader sends one only with CAP_REWIND */
         else                                   pulsar_session_family_invalidate(slot->s);
         return 1;
     }

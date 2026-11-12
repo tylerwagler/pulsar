@@ -2846,7 +2846,7 @@ typedef struct pulsar_bank_carry {
     /** scalar mirrors: */
     bool      checkpoint_valid;
     bool      logits_stale;     ///< mirror of pulsar_session::logits_stale
-    int       prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
+    TokPos    prefill_frontier;  ///< L195: mirror of pulsar_session::prefill_frontier
     /** L226 / L281: mirror of pulsar_session::live_images -- the image identity travels with the bank, exactly like
      * the checkpoint it describes, so a bank switch can never pair one conversation's blocks with another's KV. */
     pulsar_image_identity live_images;
@@ -3131,7 +3131,7 @@ struct pulsar_session {
     int sync_n_images;
     const pulsar_tokens *sync_prompt;        ///< ... the prompt their blocks sit in
     pulsar_image_identity sync_identity;     ///< ... and every block's record (the rows being written, for rope)
-    int resume_origin;                     ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), -1 when the sync did not resume
+    TokPos resume_origin;                  ///< L194 instrument: the position the last sync's resume started evaluating from (a grid point, 0 = cold from the start), none() when the sync did not resume
     /** L260 fusion: the last successful fused step's logits block (the caller's
      *  buffer), its decode-row count and its headed rows -- what
      *  pulsar_session_note_prefilled's `head` indexes.  NULL when the last fused
@@ -3141,7 +3141,7 @@ struct pulsar_session {
     uint32_t fused_n_dec = 0;
     /// Rows the last fused step headed.
     uint32_t fused_heads = 0;
-    int prefill_frontier;                  ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
+    TokPos prefill_frontier;               ///< L195: the last position a PREFILL wrote for this checkpoint (decode advances the checkpoint, not this); the resume grid point is derived from min(checkpoint, this); clamped by rewind, carried per bank and in the payload
     /** A multiseq step has run and this session's per-bank state is no longer
      * re-establishable by bookkeeping alone.
      *
@@ -3440,7 +3440,7 @@ struct pulsar_session {
      * rows from the projection ring -- only when the ring covers the rewound
      * span, which on the served (multiseq) path it does not. */
     /// @param pos  the new history length, in tokens
-    void rewind(int pos);
+    void rewind(TokPos pos);
     /** L264: put the installed bank at its grid checkpoint G (pulsar_ckpt_restore)
      * and trim the host history to match.  The next sync evaluates from G, which
      * is a prefill grid point, so the result is the cold prefill's byte for byte.
@@ -3448,11 +3448,11 @@ struct pulsar_session {
      * history is shorter than G. */
     /// @param G  the grid position (tokens) whose checkpoint to restore
     /// @return true when restored; false with nothing changed.
-    bool restore_checkpoint(uint32_t G);
+    bool restore_checkpoint(TokPos G);
     /** The host half shared by rewind and restore_checkpoint: the history ends at
      * pos, so everything that described positions above it goes. */
-    /// @param pos  the new history length, in tokens
-    void trim_history(int pos);
+    /// @param pos  the new history end (its length)
+    void trim_history(TokPos pos);
     /** Committed token count for the current bank. */
     /// @return the history length, in tokens.
     int pos();

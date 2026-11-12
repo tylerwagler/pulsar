@@ -331,7 +331,7 @@ typedef struct {
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
     /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit), in the host view
      *  asked (L380, pulsar_bank_view: a family that keeps the fact in the host view reads the saved one's). */
-    uint32_t (*prefill_frontier)(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
+    TokPos (*prefill_frontier)(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
     /** L266: the bank sync / eval run on (the store's walk reads and writes this one). */
     uint32_t (*live)(pulsar_session *s);
     /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share
@@ -356,11 +356,11 @@ typedef struct {
     int (*repoint)(pulsar_session *s, uint32_t bank);
     /** Optional, present exactly when the family declares PULSAR_FAMILY_CAP_REWIND (pulsar_family_for_model
      *  asserts it): trim the live bank's history to `pos` (pulsar.h pulsar_session_rewind). */
-    void (*rewind)(pulsar_session *s, int pos);
+    void (*rewind)(pulsar_session *s, TokPos pos);
     /** Optional.  A standalone restore of the live bank to its grid checkpoint at G, history trimmed to G
      *  (pulsar_session_restore_checkpoint).  NULL = the family restores a checkpoint only as its sync resumes
      *  from it, and a segment chain's last restore is the store's alone (L272 B1). */
-    bool (*restore_checkpoint)(pulsar_session *s, uint32_t G);
+    bool (*restore_checkpoint)(pulsar_session *s, TokPos G);
     /** Are the session's banks a pool -- per-bank device state the batched lanes address by bank?  (DeepSeek:
      *  false with the pool disabled, where bank 0 is the classic tensors though count() says 1.)  The round
      *  core defers its drafter seeds to one banked pass only on a pool (seed_defer, L260). */
