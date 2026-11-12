@@ -2,7 +2,6 @@
  *  @brief DeepSeek's byte-level BPE tokenizer: vocabulary tables, BPE merge and chat tokenization. */
 #include "pulsar_engine_internal.h"
 #include "pulsar_utf8.h"
-#include "families/gemma4/gemma4_chat.h"
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -1083,22 +1082,16 @@ bool pulsar_chat_append_turn(pulsar_engine *e, pulsar_tokens *tokens, const puls
     return t->chat_turn(e, tokens, msgs, n, generation_prompt, think_mode);
 }
 
+/* L295 F8 step 3: the family's hooks (family.h pulsar_family_tokenizer), NULL = the default named there */
 bool pulsar_chat_calls_continue_turn(const pulsar_engine *e) {
-    return pulsar_engine_chat_format(e) == PULSAR_CHAT_GEMMA4;
+    const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
+    return t && t->calls_continue_turn && t->calls_continue_turn(e);
 }
 
 bool pulsar_chat_opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode) {
-    if (pulsar_engine_chat_format(e) != PULSAR_CHAT_GEMMA4) return pulsar_think_mode_enabled(think_mode);
-    /* the tail is enough: the markers it looks for close a turn's last few tokens */
-    const int from = tokens && tokens->len > 64 ? tokens->len - 64 : 0;
-    std::string text;
-    for (int i = from; tokens && i < tokens->len; i++) {
-        size_t n = 0;
-        char *t = pulsar_token_text(e, tokens->v[i], &n);
-        text.append(t, n);
-        free(t);
-    }
-    return gemma4_prompt_opens_reasoning(text.c_str());
+    const pulsar_family_tokenizer *t = e && e->family ? e->family->tokenizer : NULL;
+    if (t && t->opens_reasoning) return t->opens_reasoning(e, tokens, think_mode);
+    return pulsar_think_mode_enabled(think_mode);
 }
 
 bool pulsar_chat_end_assistant(pulsar_engine *e, pulsar_tokens *tokens) {

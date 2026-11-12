@@ -293,6 +293,34 @@ int n_tokens(pulsar_engine *e) { return bpe_tokenizer_n_tokens(TOK(e)); }
 
 }  // namespace
 
+/** pulsar_family_tokenizer::calls_continue_turn: Gemma 4 answers a tool call inside its model turn (L338). */
+/// @param e the engine (unused: every Gemma 4 engine does)
+/// @return true
+static bool calls_continue_turn(const pulsar_engine *e) {
+    (void)e;
+    return true;
+}
+
+/** pulsar_family_tokenizer::opens_reasoning: the rendered prompt's own markers decide (moved from the engine's
+ *  tokenizer.cpp, L295 F8 step 3). */
+/// @param e          the engine
+/// @param tokens     the prompt
+/// @param think_mode unused: the template's markers already say it
+/// @return true when the prompt's tail opens a thought channel
+static bool opens_reasoning(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode) {
+    (void)think_mode;
+    /* the tail is enough: the markers it looks for close a turn's last few tokens */
+    const int from = tokens && tokens->len > 64 ? tokens->len - 64 : 0;
+    std::string text;
+    for (int i = from; tokens && i < tokens->len; i++) {
+        size_t n = 0;
+        char *t = pulsar_token_text(e, tokens->v[i], &n);
+        text.append(t, n);
+        free(t);
+    }
+    return gemma4_prompt_opens_reasoning(text.c_str());
+}
+
 const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER = {
     /* .encode_text              = */ encode_text,
     /* .encode_rendered          = */ encode_rendered,
@@ -306,6 +334,8 @@ const pulsar_family_tokenizer PULSAR_GEMMA4_TOKENIZER = {
     /* .turn_markers             = */ turn_markers,
     /* .dump                     = */ dump,
     /* .n_tokens                 = */ n_tokens,
+    /* .calls_continue_turn      = */ calls_continue_turn,
+    /* .opens_reasoning          = */ opens_reasoning,
 };
 
 bool pulsar_gemma4_load_tokenizer(pulsar_gemma4_model *w, const char *model_path) {

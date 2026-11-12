@@ -288,6 +288,12 @@ typedef struct pulsar_family_tokenizer {
     /** Ids in the tokenizer's TABLE (pulsar_engine_vocab_size), not the logits row width (L295 F5: the
      *  hook replaces the engine's branch on which family's tokenizer is loaded). */
     int (*n_tokens)(pulsar_engine *e);
+    /** L295 F8 step 3: the model answers a tool call INSIDE its assistant turn (pulsar.h pulsar_chat_calls_continue_turn:
+     *  the turn stays open and the next one opens with the responses).  NULL = false (the turn closes at a call). */
+    bool (*calls_continue_turn)(const pulsar_engine *e);
+    /** L295 F8 step 3: does the generation prompt in `tokens` open a reasoning span (pulsar.h
+     *  pulsar_chat_opens_reasoning)?  NULL = the think mode decides (pulsar_think_mode_enabled). */
+    bool (*opens_reasoning)(pulsar_engine *e, const pulsar_tokens *tokens, pulsar_think_mode think_mode);
 } pulsar_family_tokenizer;
 
 /** L351: fill `m`'s tool-result suffix (pulsar_turn_markers::tool) for a template that renders a tool message as a
