@@ -410,6 +410,7 @@ static void agent_test_assert(bool cond, const char *expr,
 
 
 
+#include "out_parse_kit.h"
 #define AGENT_TEST_ASSERT(expr) \
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
@@ -1000,7 +1001,27 @@ static void test_agent_family_tools(void);   /* family_tools.cpp, included after
 static void test_agent_tool_results_are_utf8(void);   /* bash_jobs.cpp, included after this file */
 static void test_agent_bash_teardown(void);           /* bash_jobs.cpp */
 
+/* L295 F8 step 2: the agent finds a family's parser by chat format alone (out_parse_kit.h); every chat family is
+ * registered by its frontend file -- a format that silently lost its record would leave the agent without tool calls */
+static void test_agent_family_parser_registry(void) {
+    const int fmts[] = {PULSAR_CHAT_QWEN, PULSAR_CHAT_NEMOTRON_H, PULSAR_CHAT_GEMMA4};
+    for (int f : fmts) {
+        const out_parser_family *pf = out_parser_family_find(f);
+        AGENT_TEST_ASSERT(pf && pf->make && !pf->refusal);
+        if (!pf || !pf->make) continue;
+        char err[200] = {0};
+        out_parser *p = pf->make(true, "[]", err, sizeof err);
+        AGENT_TEST_ASSERT(p != NULL);
+        delete p;
+        AGENT_TEST_ASSERT(pf->make(false, "{}", err, sizeof err) == NULL && !strncmp(err, "tools_not_array", 15));
+    }
+    const out_parser_family *ink = out_parser_family_find(PULSAR_CHAT_INKLING);
+    AGENT_TEST_ASSERT(ink && !ink->make && ink->refusal && strstr(ink->refusal, "parked"));
+    AGENT_TEST_ASSERT(!out_parser_family_find(PULSAR_CHAT_DS4_V4) && !out_parser_family_find(PULSAR_CHAT_DS4_V41));
+}
+
 static void pulsar_agent_unit_tests_run(void) {
+    test_agent_family_parser_registry();
     test_agent_workspace_and_terminal();
     test_agent_tool_call_display_is_sanitized();
     test_agent_write_and_edit_are_atomic();

@@ -513,3 +513,6 @@ out_parser *inkling_output_parser::clone() const {
     p->rebind_body(&p->body_);
     return p;
 }
+
+/* L295 F8 step 2: Inkling is parked -- its parser is not offered by chat format (out_parse_kit.h) */
+OUT_PARSER_FAMILY_REFUSED(PULSAR_CHAT_INKLING, "Inkling's tool calling is not wired into pulsar-agent (the family is parked)")

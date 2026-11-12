@@ -3,18 +3,16 @@
  *
  *  DeepSeek has no tools template: the agent spells DSML out in its prompt and reads calls with its own parser
  *  (dsml_parser.cpp).  Every other family declares tools in its chat template and has an output parser -- the
- *  server's path (src/lib qwen_chat / nemotron_chat): the head declares agent_build_tools_json()
+ *  server's path (the family's parser, found by chat format: out_parse_kit.h out_parser_family_find, L295 F8): the
+ *  head declares agent_build_tools_json()
  *  (pulsar_chat_open_tools), the family's out_parser reads the sampled stream, and its calls run as the agent's
  *  tool calls.  Gemma 4 answers a call INSIDE its model turn: the worker leaves that turn open
- *  (pulsar_chat_calls_continue_turn) and the next turn opens with the named responses.  Inkling is parked: refused
- *  by name. */
+ *  (pulsar_chat_calls_continue_turn) and the next turn opens with the named responses.  A parked family (Inkling)
+ *  registers a refusal, said as is. */
 #include "pulsar_agent_internal.h"
 #include "out_parse_kit.h"
 #include "pyjson.h"
 #include "chat_render_kit.h"
-#include "qwen_chat.h"
-#include "nemotron_chat.h"
-#include "gemma4_chat.h"
 
 
 
@@ -28,24 +26,19 @@ bool agent_worker_dsml(const agent_worker *w) { return agent_engine_dsml(w->engi
 
 
 bool agent_family_tools_supported(pulsar_engine *e, char *err, size_t errlen) {
-    switch (pulsar_engine_chat_format(e)) {
-    case PULSAR_CHAT_DS4_V4:
-    case PULSAR_CHAT_DS4_V41:
-    case PULSAR_CHAT_QWEN:
-    case PULSAR_CHAT_NEMOTRON_H:
-    case PULSAR_CHAT_GEMMA4: {
+    const out_parser_family *pf = out_parser_family_find(pulsar_engine_chat_format(e));
+    if (pf && pf->refusal) {
+        snprintf(err, errlen, "%s", pf->refusal);
+        return false;
+    }
+    if (agent_engine_dsml(e) || (pf && pf->make)) {
         pulsar_turn_markers m;
         if (pulsar_chat_turn_markers(e, &m)) return true;
         snprintf(err, errlen, "this tokenizer does not spell the chat turn markers pulsar-agent reads turns by");
         return false;
     }
-    case PULSAR_CHAT_INKLING:
-        snprintf(err, errlen, "Inkling's tool calling is not wired into pulsar-agent (the family is parked)");
-        return false;
-    default:
-        snprintf(err, errlen, "this model has no chat format pulsar-agent can call tools in");
-        return false;
-    }
+    snprintf(err, errlen, "this model has no chat format pulsar-agent can call tools in");
+    return false;
 }
 
 
@@ -54,29 +47,12 @@ out_parser *agent_family_parser_new(pulsar_engine *e, bool thinking, char *err, 
     char *tools = agent_build_tools_json();
     char perr[200] = {0};
     out_parser *out = NULL;
-    switch (pulsar_engine_chat_format(e)) {
-    case PULSAR_CHAT_QWEN: {
-        qwen_output_parser *p = new qwen_output_parser();
-        if (p->init(thinking, tools, perr, sizeof perr)) out = p;
-        else delete p;
-        break;
-    }
-    case PULSAR_CHAT_NEMOTRON_H: {
-        nemotron_output_parser *p = new nemotron_output_parser();
-        if (p->init(thinking, tools, perr, sizeof perr)) out = p;
-        else delete p;
-        break;
-    }
-    case PULSAR_CHAT_GEMMA4: {
-        gemma4_output_parser *p = new gemma4_output_parser();
-        if (p->init(thinking, tools, perr, sizeof perr)) out = p;
-        else delete p;
-        break;
-    }
-    default:   /* DeepSeek reads DSML with the agent's own parser; the rest are refused by name */
-        if (agent_family_tools_supported(e, perr, sizeof perr))
-            snprintf(perr, sizeof perr, "DeepSeek's calls are DSML, read by the agent's own parser");
-        break;
+    const out_parser_family *pf = out_parser_family_find(pulsar_engine_chat_format(e));
+    if (pf && pf->make) {
+        out = pf->make(thinking, tools, perr, sizeof perr);
+    } else if (agent_family_tools_supported(e, perr, sizeof perr)) {
+        /* DeepSeek reads DSML with the agent's own parser; the rest were refused by name just above */
+        snprintf(perr, sizeof perr, "DeepSeek's calls are DSML, read by the agent's own parser");
     }
     free(tools);
     if (!out) snprintf(err, errlen, "tool-call parser: %s", perr[0] ? perr : "unavailable");
@@ -179,38 +155,40 @@ static void test_agent_family_tools(void) {
     agent_tool_calls_free(&calls);
 
     /* a whole Qwen turn through the family parser: thinking, prose, one call */
-    qwen_output_parser q;
     char *qtools = agent_build_tools_json();
-    AGENT_TEST_ASSERT(q.init(true, qtools, err, sizeof err));
+    out_parser *q = out_parser_family_find(PULSAR_CHAT_QWEN)->make(true, qtools, err, sizeof err);   /* by format */
+    AGENT_TEST_ASSERT(q != NULL);
     free(qtools);
     std::vector<out_event> ev;
     const char *turn = "let me look\n</think>\n\nReading it.\n<tool_call>\n<function=read>\n<parameter=path>\n"
                        "/tmp/x.txt\n</parameter>\n</function>\n</tool_call>";
-    for (const char *s = turn; *s; s++) q.feed(s, 1, &ev);
-    q.finish(&ev);
-    AGENT_TEST_ASSERT(q.errors() == 0 && q.calls().size() == 1);
-    AGENT_TEST_ASSERT(agent_family_calls_take(&q, &calls, err, sizeof err) && calls.len == 1);
+    for (const char *s = turn; *s; s++) q->feed(s, 1, &ev);
+    q->finish(&ev);
+    AGENT_TEST_ASSERT(q->errors() == 0 && q->calls().size() == 1);
+    AGENT_TEST_ASSERT(agent_family_calls_take(q, &calls, err, sizeof err) && calls.len == 1);
     AGENT_TEST_ASSERT(!strcmp(calls.v[0].name, "read") &&
                       !strcmp(agent_tool_arg_value(&calls.v[0], "path"), "/tmp/x.txt"));
     agent_tool_calls_free(&calls);
+    delete q;
 
     /* Gemma 4: a thought channel, then two calls in its own syntax; the turn stops at <|tool_response> */
-    gemma4_output_parser g;
     char *gtools = agent_build_tools_json();
-    AGENT_TEST_ASSERT(g.init(false, gtools, err, sizeof err));
+    out_parser *g = out_parser_family_find(PULSAR_CHAT_GEMMA4)->make(false, gtools, err, sizeof err);
+    AGENT_TEST_ASSERT(g != NULL);
     free(gtools);
     ev.clear();
     const char *gturn = "<|channel>thought\nread then write<channel|>"
                         "<|tool_call>call:read{path:<|\"|>notes/a b.txt<|\"|>,start_line:3}<tool_call|>"
                         "<|tool_call>call:write{content:<|\"|>x\ny<|\"|>,path:<|\"|>o.txt<|\"|>}<tool_call|>";
-    for (const char *s = gturn; *s; s++) g.feed(s, 1, &ev);
-    g.finish(&ev);
-    AGENT_TEST_ASSERT(g.errors() == 0 && g.calls().size() == 2);
-    AGENT_TEST_ASSERT(agent_family_calls_take(&g, &calls, err, sizeof err) && calls.len == 2);
+    for (const char *s = gturn; *s; s++) g->feed(s, 1, &ev);
+    g->finish(&ev);
+    AGENT_TEST_ASSERT(g->errors() == 0 && g->calls().size() == 2);
+    AGENT_TEST_ASSERT(agent_family_calls_take(g, &calls, err, sizeof err) && calls.len == 2);
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&calls.v[0], "path"), "notes/a b.txt"));
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&calls.v[0], "start_line"), "3"));
     AGENT_TEST_ASSERT(!strcmp(calls.v[1].name, "write") && !strcmp(agent_tool_arg_value(&calls.v[1], "content"), "x\ny"));
     agent_tool_calls_free(&calls);
+    delete g;
 
     /* L373: an argument of the wrong type is the tool's error, never the default or the value's JSON text */
     static const struct {

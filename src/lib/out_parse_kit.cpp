@@ -549,6 +549,22 @@ bool out_json_call_body::close(const std::string &b, int index, std::vector<out_
     return true;
 }
 
+/* ---- L295 F8 step 2: the chat-format registry of family parsers ---- */
+
+/// The registry's list (zero-initialised before any constructor runs, so registration order does not matter).
+static out_parser_family *g_out_parser_families = nullptr;
+
+void out_parser_family_register(out_parser_family *f) {
+    f->next = g_out_parser_families;
+    g_out_parser_families = f;
+}
+
+const out_parser_family *out_parser_family_find(int chat_format) {
+    for (const out_parser_family *f = g_out_parser_families; f; f = f->next)
+        if (f->chat_format == chat_format) return f;
+    return nullptr;
+}
+
 /* ---- the XML tool-call body (moved from qwen_output.cpp, L295 F8 step 1) ---- */
 
 void xml_call_body::open() {
