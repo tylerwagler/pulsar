@@ -10589,11 +10589,11 @@ static void test_l372_judge_bank_floor_and_release(void) {
         TEST_ASSERT(!server_judge_holds_kv(&s));   /* a freed bank holds nothing */
         J->released = false;
         /* (a) no box has this much free, and there is no chat bank to spill: refused busy, nothing installed */
-        (void)server_mem_floor_init(UINT64_MAX / 4, KvBytes{0});
+        (void)server_mem_floor_init(KvBytes{UINT64_MAX / 4}, KvBytes{0});
         char err[320] = "";
         TEST_ASSERT(!s.floor_admits_chunk(1024, err, sizeof err) && strstr(err, "not enough memory") != NULL);
         TEST_ASSERT(server_judge_step(&s));
-        (void)server_mem_floor_init(0, KvBytes{0});
+        (void)server_mem_floor_init(KvBytes{0}, KvBytes{0});
         TEST_ASSERT(jb.done && jb.busy && !jb.started && jb.err.find("not enough memory") != std::string::npos);
         TEST_ASSERT(!server_judge_queued(&s) && !J->released && s.live_bank == BankId::none());
         TEST_ASSERT(s.floor_admits_chunk(1024, err, sizeof err));   /* the real floor admits a chunk here */
@@ -11398,45 +11398,50 @@ static void test_unterminated_think_stays_off_content(void) {
 
 
 
+/** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
+ *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
+static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
+
 static void test_kv_admission_budget_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
 
     /* Budget = usable - weights - overhead - free floor, clamped at 0 (the
      * floor term is the 2026-07-13 lockup fix: a fully committed budget must
      * still leave PULSAR_SERVER_MEM_FLOOR_BYTES of the machine free). */
-    TEST_ASSERT(server_kv_budget_bytes(91ull * GiB) ==
-                PULSAR_SERVER_USABLE_BYTES - 91ull * GiB -
-                PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES);
-    TEST_ASSERT(server_kv_budget_bytes(200ull * GiB) == 0);  /* weights > usable: no underflow */
+    TEST_ASSERT(server_kv_budget_bytes(kvb(91ull * GiB)) ==
+                kvb(PULSAR_SERVER_USABLE_BYTES - 91ull * GiB -
+                    PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
+    TEST_ASSERT(server_kv_budget_bytes(kvb(200ull * GiB)) == kvb(0));  /* weights > usable: no underflow */
     /* Reserves alone (no weights) must also clamp, not underflow. */
-    TEST_ASSERT(server_kv_budget_bytes(PULSAR_SERVER_USABLE_BYTES) == 0);
+    TEST_ASSERT(server_kv_budget_bytes(kvb(PULSAR_SERVER_USABLE_BYTES)) == kvb(0));
     /* L338 / L347 I4: a discrete card's budget is its own free memory less the margin -- a working set plus the guard's
      * floor (the one reserve), the estimate at sizing */
     const uint64_t Mi = 1024ull * 1024ull;
-    TEST_ASSERT(server_discrete_margin_bytes(0) == PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES);
-    TEST_ASSERT(server_discrete_margin_bytes(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) == 1536ull * Mi);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(9ull * GiB, 1ull * GiB) == 9ull * GiB - 1536ull * Mi);
-    TEST_ASSERT(server_kv_budget_discrete_bytes(1536ull * Mi, 1ull * GiB) == 0);   /* exactly the margin */
-    TEST_ASSERT(server_kv_budget_discrete_bytes(1ull * GiB, 1ull * GiB) == 0);      /* no underflow */
+    const KvBytes ws_est = kvb(PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);
+    TEST_ASSERT(server_discrete_margin_bytes(kvb(0)) == kvb(PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES));
+    TEST_ASSERT(server_discrete_margin_bytes(ws_est) == kvb(1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(9ull * GiB), kvb(1ull * GiB)) == kvb(9ull * GiB - 1536ull * Mi));
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1536ull * Mi), kvb(1ull * GiB)) == kvb(0));   /* the margin */
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(1ull * GiB), kvb(1ull * GiB)) == kvb(0));     /* no underflow */
     /* the RTX 6000 at startup (2026-11-02): 7.9 GiB free after the weights -> 6.4 GiB, was 5.0 at max(2, total / 8) */
     const uint64_t free6000 = 7900ull * Mi;
-    TEST_ASSERT(server_kv_budget_discrete_bytes(free6000, PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES) ==
-                free6000 - 1536ull * Mi);
+    TEST_ASSERT(server_kv_budget_discrete_bytes(kvb(free6000), ws_est) == kvb(free6000 - 1536ull * Mi));
     /* the warmup's measured working set: free before the create, less free after the warmup, less the session's
      * resident bytes; readings that show none are 0, never an underflow */
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) == 750ull * Mi);
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 3000ull * Mi, 4900ull * Mi) == 0);
-    TEST_ASSERT(server_discrete_working_set_bytes(2000ull * Mi, 3000ull * Mi, 0) == 0);
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 2250ull * Mi, 4900ull * Mi) <=
-                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* the 6000's measured case starts */
-    TEST_ASSERT(server_discrete_working_set_bytes(7900ull * Mi, 1500ull * Mi, 4900ull * Mi) >
-                PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES);   /* 1.5 GiB taken past the session: refused */
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) ==
+                kvb(750ull * Mi));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(3000ull * Mi), kvb(4900ull * Mi)) == kvb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(2000ull * Mi), kvb(3000ull * Mi), kvb(0)) == kvb(0));
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(2250ull * Mi), kvb(4900ull * Mi)) <=
+                ws_est);   /* the 6000's measured case starts */
+    TEST_ASSERT(server_discrete_working_set_bytes(kvb(7900ull * Mi), kvb(1500ull * Mi), kvb(4900ull * Mi)) >
+                ws_est);   /* 1.5 GiB taken past the session: refused */
 
     /* Admission: committed + incoming <= budget, with overflow-safe compare. */
-    TEST_ASSERT(server_kv_admits(26ull * GiB, 0, 20ull * GiB));
-    TEST_ASSERT(server_kv_admits(26ull * GiB, 20ull * GiB, 6ull * GiB));   /* exact fit */
-    TEST_ASSERT(!server_kv_admits(26ull * GiB, 20ull * GiB, 7ull * GiB));  /* over by 1 GiB */
-    TEST_ASSERT(!server_kv_admits(26ull * GiB, 0, 27ull * GiB));           /* lone over-budget */
+    TEST_ASSERT(server_kv_admits(kvb(26ull * GiB), kvb(0), kvb(20ull * GiB)));
+    TEST_ASSERT(server_kv_admits(kvb(26ull * GiB), kvb(20ull * GiB), kvb(6ull * GiB)));   /* exact fit */
+    TEST_ASSERT(!server_kv_admits(kvb(26ull * GiB), kvb(20ull * GiB), kvb(7ull * GiB)));  /* over by 1 GiB */
+    TEST_ASSERT(!server_kv_admits(kvb(26ull * GiB), kvb(0), kvb(27ull * GiB)));           /* lone over-budget */
 
     /* GB10 production shape (2026-07-15 re-measure: 18 GiB steady-state
      * process overhead, 4 GiB kernel-breathing-room floor):
@@ -11448,15 +11453,15 @@ static void test_kv_admission_budget_math(void) {
      * admitted three. */
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t gb10_weights = 87450ull * MiB;              /* ~85.4 GiB */
-    const uint64_t gb10_budget = server_kv_budget_bytes(gb10_weights);
-    TEST_ASSERT(gb10_budget == PULSAR_SERVER_USABLE_BYTES - gb10_weights -
-                PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES);
-    TEST_ASSERT(gb10_budget > 13ull * GiB && gb10_budget < 14ull * GiB);   /* ~13.6 GiB */
-    const uint64_t slot64k = 4710ull * MiB;                    /* ~4.6 GiB @ ctx 64k */
-    TEST_ASSERT(server_kv_admits(gb10_budget, 0, slot64k));               /* slot 0, 64k */
-    TEST_ASSERT(server_kv_admits(gb10_budget, 0, 2ull * slot64k));        /* slot 0, 128k bound */
-    TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));         /* second slot */
-    TEST_ASSERT(!server_kv_admits(gb10_budget, 2ull * slot64k, slot64k)); /* third refused */
+    const KvBytes gb10_budget = server_kv_budget_bytes(kvb(gb10_weights));
+    TEST_ASSERT(gb10_budget == kvb(PULSAR_SERVER_USABLE_BYTES - gb10_weights -
+                                   PULSAR_SERVER_PROCESS_OVERHEAD_BYTES - PULSAR_SERVER_MEM_FLOOR_BYTES));
+    TEST_ASSERT(gb10_budget > kvb(13ull * GiB) && gb10_budget < kvb(14ull * GiB));   /* ~13.6 GiB */
+    const KvBytes slot64k = kvb(4710ull * MiB);                /* ~4.6 GiB @ ctx 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, kvb(0), slot64k));               /* slot 0, 64k */
+    TEST_ASSERT(server_kv_admits(gb10_budget, kvb(0), slot64k.times(2)));      /* slot 0, 128k bound */
+    TEST_ASSERT(server_kv_admits(gb10_budget, slot64k, slot64k));              /* second slot */
+    TEST_ASSERT(!server_kv_admits(gb10_budget, slot64k.times(2), slot64k));    /* third refused */
 }
 
 
@@ -11472,10 +11477,6 @@ static void test_kv_admission_budget_math(void) {
  * 31.24 GiB, nothing touched.  The ledger's share alone was 9.05 GiB of touched KV against 5.18 GiB above the floor:
  * the guard never spilled and the box ran dry (rows/L319.md).  At the ceiling, MemAvailable must still read the
  * floor: avail − (ceiling − touched) >= floor, whatever the inputs. */
-/** L333: a test's byte figure entered into the KV accounting's unit (pulsar_units.h); the tests below keep their
- *  arithmetic in plain integers and type it at the call, as the server types a measured or configured figure. */
-static constexpr KvBytes kvb(uint64_t v) { return KvBytes{v}; }
-
 static void test_guard_touched_budget_is_physical(void) {
     const uint64_t MiB = 1024ull * 1024ull;
     const uint64_t GiB = 1024ull * MiB;
@@ -11514,23 +11515,23 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
      * floor demanded 8.50 and refused (a 0.11 GiB miss with ~5.9 GiB truly
      * free at full commit); the 4 GiB floor must admit — post-admission
      * MemAvailable stays >= ~5.89 GiB, well above the backstop. */
-    const uint64_t est = 2560ull * MiB;                     /* 2.5 GiB session */
-    TEST_ASSERT(server_mem_floor_admits(8590ull * MiB, est));  /* 8.39 GiB avail */
+    const KvBytes est = kvb(2560ull * MiB);                 /* 2.5 GiB session */
+    TEST_ASSERT(server_mem_floor_admits(kvb(8590ull * MiB), est));  /* 8.39 GiB avail */
 
     /* Warmed-box full-commit steady state measured 2026-07-15: 5.96 GiB
      * avail with three live sessions. A further session would leave ~3.4,
      * below the backstop: refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(6103ull * MiB, est)); /* 5.96 GiB avail */
+    TEST_ASSERT(!server_mem_floor_admits(kvb(6103ull * MiB), est)); /* 5.96 GiB avail */
 
     /* A genuinely tight box must always refuse. */
-    TEST_ASSERT(!server_mem_floor_admits(4ull * GiB, est));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(4ull * GiB), est));
     /* Exact boundary: est + floor. */
-    TEST_ASSERT(server_mem_floor_admits(est + PULSAR_SERVER_MEM_FLOOR_BYTES, est));
-    TEST_ASSERT(!server_mem_floor_admits(est + PULSAR_SERVER_MEM_FLOOR_BYTES - 1, est));
+    TEST_ASSERT(server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES), est));
+    TEST_ASSERT(!server_mem_floor_admits(est + kvb(PULSAR_SERVER_MEM_FLOOR_BYTES - 1), est));
     /* Unreadable /proc/meminfo (avail == 0) fails closed. */
-    TEST_ASSERT(!server_mem_floor_admits(0, est));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(0), est));
     /* Overflow guard: absurd estimate must refuse, not wrap. */
-    TEST_ASSERT(!server_mem_floor_admits(UINT64_MAX, UINT64_MAX - 1ull * GiB));
+    TEST_ASSERT(!server_mem_floor_admits(KvBytes::max(), kvb(UINT64_MAX - 1ull * GiB)));
 }
 
 
@@ -11542,13 +11543,13 @@ static void test_mem_floor_admits_warmed_box_shape(void) {
 static void test_session_eviction_ledger_math(void) {
     const uint64_t GiB = 1024ull * 1024ull * 1024ull;
     const uint64_t MiB = 1024ull * 1024ull;
-    const uint64_t budget = server_kv_budget_bytes(87450ull * MiB); /* ~13.6 GiB */
-    const uint64_t slot0 = 4710ull * MiB;   /* startup slot, ctx 64k measured */
-    const uint64_t a = 2560ull * MiB;       /* lazy 64k slot (pc 2048 shape) */
-    const uint64_t b = 2571ull * MiB;       /* same shape, distinct actual */
+    const KvBytes budget = server_kv_budget_bytes(kvb(87450ull * MiB)); /* ~13.6 GiB */
+    const KvBytes slot0 = kvb(4710ull * MiB);   /* startup slot, ctx 64k measured */
+    const KvBytes a = kvb(2560ull * MiB);       /* lazy 64k slot (pc 2048 shape) */
+    const KvBytes b = kvb(2571ull * MiB);       /* same shape, distinct actual */
 
     /* provision slot0 + a + b, filling most of the budget */
-    uint64_t committed = slot0;
+    KvBytes committed = slot0;
     TEST_ASSERT(server_kv_admits(budget, committed, a));
     committed += a;
     TEST_ASSERT(server_kv_admits(budget, committed, b));
@@ -11570,12 +11571,12 @@ static void test_session_eviction_ledger_math(void) {
     committed = server_ledger_release(committed, a);
     TEST_ASSERT(committed == slot0);
     committed = server_ledger_release(committed, slot0);
-    TEST_ASSERT(committed == 0);
+    TEST_ASSERT(committed == kvb(0));
 
     /* releasing more than is committed means the pairing broke: clamp to 0
      * (warns loudly; the MemAvailable floor backstops the over-admission) */
-    TEST_ASSERT(server_ledger_release(1ull * GiB, 2ull * GiB) == 0);
-    TEST_ASSERT(server_ledger_release(0, 1) == 0);
+    TEST_ASSERT(server_ledger_release(kvb(1ull * GiB), kvb(2ull * GiB)) == kvb(0));
+    TEST_ASSERT(server_ledger_release(kvb(0), kvb(1)) == kvb(0));
 }
 
 
@@ -11676,13 +11677,13 @@ static void test_session_eviction_victim_selection(void) {
     memset(slots, 0, sizeof(slots));
     for (int i = 0; i < PULSAR_SESSION_POOL_CAP; i++) slots[i].provisioned = true;
     slots[0].last_serviced_us = 1;              /* oldest of all — but pinned */
-    slots[0].est_cost_bytes = 9ull * GiB;
+    slots[0].est_cost_bytes = kvb(9ull * GiB);
     slots[1].last_serviced_us = 100;
-    slots[1].est_cost_bytes = 3ull * GiB;
+    slots[1].est_cost_bytes = kvb(3ull * GiB);
     slots[2].last_serviced_us = 50;
-    slots[2].est_cost_bytes = 2ull * GiB;
+    slots[2].est_cost_bytes = kvb(2ull * GiB);
     slots[3].last_serviced_us = 50;             /* LRU tie with slot 2 */
-    slots[3].est_cost_bytes = 1ull * GiB;       /* ...but cheaper to restore */
+    slots[3].est_cost_bytes = kvb(1ull * GiB);       /* ...but cheaper to restore */
 
     TEST_ASSERT(server_evict_pick_victim(slots, 4, NULL) == 3); /* LRU tie-break */
     bool protect[PULSAR_SESSION_POOL_CAP] = {0};
@@ -12778,22 +12779,22 @@ static void test_l179_bank_floor_exempts_first_bank(void) {
     const uint64_t marginal = 2560ull * MiB;                 /* 2.5 GiB bank */
     const uint64_t floor = marginal + PULSAR_SERVER_MEM_FLOOR_BYTES;
     /* first bank: exempt everywhere */
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, 0, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(0, false, 1ull * GiB, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(0, false, kvb(1ull * GiB), kvb(marginal)));
     /* second bank onward, fresh pages: gauge and floor both bind */
-    TEST_ASSERT(server_bank_floor_refuses(1, false, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(1, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(1, false, floor, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, 0, marginal));
-    TEST_ASSERT(server_bank_floor_refuses(3, false, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, floor, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(3, false, 100ull * GiB, marginal));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(1, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(1, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(0), kvb(marginal)));
+    TEST_ASSERT(server_bank_floor_refuses(3, false, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(floor), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(3, false, kvb(100ull * GiB), kvb(marginal)));
     /* a recycled bank (resident pages): admitted however tight the box reads */
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, floor - 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, 4ull * GiB + 1, marginal));
-    TEST_ASSERT(!server_bank_floor_refuses(15, true, 0, marginal));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(floor - 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(4ull * GiB + 1), kvb(marginal)));
+    TEST_ASSERT(!server_bank_floor_refuses(15, true, kvb(0), kvb(marginal)));
 }
 
 /* 2026-09-29 -- which free bank provision_bank takes: the most resident pages,
@@ -15262,7 +15263,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     sl.gen = &fake_gen;
     sl.state = SLOT_DECODING;
     sl.ctx_size = 131072;
-    sl.est_cost_bytes = 9ull << 30;
+    sl.est_cost_bytes = kvb(9ull << 30);
     sl.tokens_emitted = 777;
     sl.prefill_counted = 4000;
     sl.last_serviced_us = 123456789ull;
@@ -15273,7 +15274,7 @@ static void test_l179_evict_reset_leaves_a_reusable_hole(void) {
     TEST_ASSERT(sl.active_job == NULL);
     TEST_ASSERT(sl.state == SLOT_EVICTED);
     TEST_ASSERT(sl.ctx_size == 0);
-    TEST_ASSERT(sl.est_cost_bytes == 0);
+    TEST_ASSERT(sl.est_cost_bytes == kvb(0));
     TEST_ASSERT(sl.tokens_emitted == 0);
     TEST_ASSERT(sl.prefill_counted == 0);
     TEST_ASSERT(sl.last_serviced_us == 0);
@@ -15880,17 +15881,17 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
         "        high     124302\n"
         "        promo    150000\n"
         "        high_x   99999\n";
-    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == (2000ull + 124302ull) * 4096ull);
-    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == 0);   /* none: 0 */
-    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == 0);
-    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == 0);   /* a line must be whole */
+    TEST_ASSERT(server_zoneinfo_high_bytes(zi, 4096) == kvb((2000ull + 124302ull) * 4096ull));
+    TEST_ASSERT(server_zoneinfo_high_bytes("Node 0, zone Normal\n  pages free 5\n", 4096) == kvb(0));   /* none: 0 */
+    TEST_ASSERT(server_zoneinfo_high_bytes("", 4096) == kvb(0));
+    TEST_ASSERT(server_zoneinfo_high_bytes("        high     7", 4096) == kvb(0));   /* a line must be whole */
     /* the floor: the margin + the watermarks + the step; every MemAvailable check reads it */
     const uint64_t zone = 486ull * MiB, step = 160ull * MiB;
-    TEST_ASSERT(server_mem_floor_init(zone, kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
+    TEST_ASSERT(server_mem_floor_init(kvb(zone), kvb(step)) == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES + zone + step));
     const uint64_t F = server_mem_floor().raw();
-    TEST_ASSERT(server_mem_floor_admits(F + 10 * MiB, 10 * MiB));
-    TEST_ASSERT(!server_mem_floor_admits(F + 10 * MiB - 1, 10 * MiB));
+    TEST_ASSERT(server_mem_floor_admits(kvb(F + 10 * MiB), kvb(10 * MiB)));
+    TEST_ASSERT(!server_mem_floor_admits(kvb(F + 10 * MiB - 1), kvb(10 * MiB)));
     /* the guard's ceiling keeps the derived floor free */
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F + 3 * MiB), server_mem_floor()) == kvb(3 * MiB));
     TEST_ASSERT(server_guard_touched_budget(kvb(64ull << 30), kvb(0), kvb(0), kvb(F), server_mem_floor()) == KvBytes{});
@@ -15900,11 +15901,11 @@ static void test_mem_floor_is_derived_from_the_watermarks(void) {
     TEST_ASSERT(!server_headroom_admits(kvb(4), kvb(2), kvb(3)));
     TEST_ASSERT(!server_headroom_admits(kvb(UINT64_MAX), kvb(UINT64_MAX), kvb(2)));
     /* a persist's host demand: the writeback window + two renders of the text, at the bound a token */
-    TEST_ASSERT(server_persist_host_bytes(0) == PULSAR_WRITEBACK_STEP);
-    TEST_ASSERT(server_persist_host_bytes(-5) == PULSAR_WRITEBACK_STEP);
+    TEST_ASSERT(server_persist_host_bytes(0) == kvb(PULSAR_WRITEBACK_STEP));
+    TEST_ASSERT(server_persist_host_bytes(-5) == kvb(PULSAR_WRITEBACK_STEP));
     TEST_ASSERT(server_persist_host_bytes(188416) ==
-                PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN);
-    (void)server_mem_floor_init(0, kvb(0));   /* back to the OS margin for the tests after this one */
+                kvb(PULSAR_WRITEBACK_STEP + 2ull * 188416ull * PERSIST_TEXT_BYTES_PER_TOKEN));
+    (void)server_mem_floor_init(kvb(0), kvb(0));   /* back to the OS margin for the tests after this one */
     TEST_ASSERT(server_mem_floor() == kvb(PULSAR_SERVER_MEM_FLOOR_BYTES));
 }
 
@@ -15933,11 +15934,11 @@ static void test_guard_budget_reads_live_memavailable(void) {
     TEST_ASSERT(s.guard_budget() == KvBytes{});
     /* L357: the test route's ledger budget stands in for the startup one: 33 − eager 31 = 2 GiB binds ... */
     s.guard_avail = kvb(F + 20 * GiB);
-    s.guard_test_budget = 33 * GiB;
+    s.set_test_guard_budget(kvb(33 * GiB));
     TEST_ASSERT(s.guard_budget() == kvb(2 * GiB));
-    s.guard_test_budget = 100 * GiB;            /* ... never above the startup ceiling ... */
+    s.set_test_guard_budget(kvb(100 * GiB));    /* ... never above the startup ceiling ... */
     TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
-    s.guard_test_budget = 0;                    /* ... and 0 restores the startup budget */
+    s.set_test_guard_budget(kvb(0));            /* ... and 0 restores the startup budget */
     TEST_ASSERT(s.guard_budget() == kvb(5 * GiB));
 }
 
@@ -15983,7 +15984,7 @@ static void test_persist_skipped_under_the_floor(void) {
     memset(&s, 0, sizeof s);
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;                                 /* a store is configured ... */
-    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));      /* ... and no box has this much free */
+    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));      /* ... and no box has this much free */
     int end = -1;
     session_slot sl;   /* L347 I3b: a persist reads its slot's X-Pulsar-KV tokens (none here) */
     memset(&sl, 0, sizeof sl);
@@ -15997,7 +15998,7 @@ static void test_persist_skipped_under_the_floor(void) {
     bool no_room = true;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_SPILL, nullptr, &no_room) == 0 && !no_room);
     TEST_ASSERT(s.m_persist_skipped == 2);
-    (void)server_mem_floor_init(0, kvb(0));
+    (void)server_mem_floor_init(kvb(0), kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
 
@@ -16073,7 +16074,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     pthread_mutex_init(&s.mu, NULL);
     s.kv.enabled = true;
     /* the witness: a persist the mark lets through reaches the memory floor, which no box clears here */
-    (void)server_mem_floor_init(UINT64_MAX / 4, kvb(0));
+    (void)server_mem_floor_init(kvb(UINT64_MAX / 4), kvb(0));
     session_slot sl;
     memset(&sl, 0, sizeof sl);
     sl.kv_flags = KV_HDR_READ_ONLY;
@@ -16089,7 +16090,7 @@ static void test_l347_i3b_read_only_writes_nothing(void) {
     bool no_room = false;
     TEST_ASSERT(s.kv_cache_persist(&sl, KV_PERSIST_EVICT, nullptr, &no_room) == 0 && no_room);
     TEST_ASSERT(s.m_persist_read_only == 5 && s.m_persist_skipped == 1);
-    (void)server_mem_floor_init(0, kvb(0));
+    (void)server_mem_floor_init(kvb(0), kvb(0));
     pthread_mutex_destroy(&s.mu);
 }
 

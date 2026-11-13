@@ -1336,8 +1336,8 @@ int pulsar_ds4_session_create(pulsar_session *s, uint32_t n_banks) {
 }
 
 
-uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
-    return s ? s->resident_bytes : 0;
+KvBytes pulsar_session_resident_bytes(const pulsar_session *s) {
+    return KvBytes{s ? s->resident_bytes : 0};
 }
 
 
@@ -1348,22 +1348,22 @@ uint64_t pulsar_session_resident_bytes(const pulsar_session *s) {
  * (cudaMallocManaged) subset.  Not in the price, on either side: allocations made on demand after create
  * (gpu_graph_ensure_batch_ffn_out, the multiseq descriptors, the batched-copy descriptor tables); the
  * server's memory floor absorbs those. */
-uint64_t pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes) {
+KvBytes pulsar_engine::session_cost_bytes_banked(int ctx_size, int n_banks, KvBytes *managed_bytes) {
     auto *e = this;
-    if (managed_bytes) *managed_bytes = 0;
-    if (!e || ctx_size <= 0 || n_banks < 1) return 0;
-    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return 0;
+    if (managed_bytes) *managed_bytes = KvBytes{};
+    if (!e || ctx_size <= 0 || n_banks < 1) return KvBytes{};
+    if (!pulsar_backend_uses_graph(e->backend) || !e->gpu_ready) return KvBytes{};
     pulsar_gpu_tensor_dry_begin();
     pulsar_session *s = session_build(e, ctx_size, (uint32_t)n_banks);
     const bool ok = s != NULL;
     if (s) s->destroy();
     TensorBytes bytes{0}, managed{0};
     pulsar_gpu_tensor_dry_end(&bytes, &managed);
-    if (managed_bytes && ok) *managed_bytes = managed.raw();
-    return ok ? bytes.raw() : 0;
+    if (managed_bytes && ok) *managed_bytes = kv_bytes_of(managed);
+    return ok ? kv_bytes_of(bytes) : KvBytes{};
 }
 
-uint64_t pulsar_engine::session_cost_bytes(int ctx_size) {
+KvBytes pulsar_engine::session_cost_bytes(int ctx_size) {
     return session_cost_bytes_banked(ctx_size, (int)gpu_graph_bank_pool_n());
 }
 

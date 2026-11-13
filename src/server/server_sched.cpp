@@ -113,20 +113,18 @@ int server::job_needed_ctx(const job *j) const {
 /// @param est_bytes the price admission charged, bytes
 /// @param actual_bytes the bytes the allocator committed
 /// @return actual_bytes, or 0 on a mismatch (or 0 actual)
-uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
-                                        uint64_t est_bytes,
-                                        uint64_t actual_bytes) {
+KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     server_log(PULSAR_LOG_DEFAULT,
                "pulsar-server: slot %d session cost: priced=%.2f GiB actual=%.2f GiB (ctx=%d)",
-               slot_idx, (double)est_bytes / gib, (double)actual_bytes / gib, ctx);
-    if (actual_bytes == 0 || est_bytes != actual_bytes) {
+               slot_idx, (double)est_bytes.raw() / gib, (double)actual_bytes.raw() / gib, ctx);
+    if (actual_bytes == KvBytes{} || est_bytes != actual_bytes) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: SESSION COST MISMATCH: priced %llu bytes, allocated %llu "
                    "-- the price is the allocator run dry, so an allocation inside "
                    "pulsar_session_create bypassed the tensor primitives; refusing to start",
-                   (unsigned long long)est_bytes, (unsigned long long)actual_bytes);
-        return 0;
+                   (unsigned long long)est_bytes.raw(), (unsigned long long)actual_bytes.raw());
+        return KvBytes{};
     }
     return actual_bytes;
 }
@@ -140,16 +138,16 @@ uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
  * shrinks, so this is a belt-and-suspenders floor check on top of the
  * ledger, not a precise gauge. */
 /// @return MemAvailable in bytes; 0 when /proc/meminfo is unreadable or has no such line
-uint64_t server_mem_available_bytes(void) {
+KvBytes server_mem_available_bytes(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return 0;
+    if (!fp) return KvBytes{};
     char line[256];
     unsigned long long kib = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
     }
     fclose(fp);
-    return (uint64_t)kib * 1024ull;
+    return KvBytes{(uint64_t)kib * 1024ull};   /* the kernel's reading enters the ledger's unit here */
 }
 
 /* The guard's live budget (pulsar_server_internal.h, server::guard_budget).  Before 2026-10-29 every decision read
@@ -159,13 +157,13 @@ uint64_t server_mem_available_bytes(void) {
 KvBytes server::guard_budget() {
     const double now = server_now_sec();
     if (guard_avail_at == 0.0 || now - guard_avail_at >= 0.25) {
-        guard_avail = KvBytes{server_guard_avail_bytes(guard_discrete)};
+        guard_avail = server_guard_avail_bytes(guard_discrete);
         guard_avail_at = now;
     }
     /* L357: the test route's ledger budget, when one is set, stands in for the startup one (the ceiling still caps) */
-    const uint64_t test_budget = __atomic_load_n(&guard_test_budget, __ATOMIC_RELAXED);
+    const KvBytes test_budget = test_guard_budget();
     const KvBytes live =
-        server_guard_touched_budget(test_budget ? KvBytes{test_budget} : guard_kv_budget, guard_eager_bytes,
+        server_guard_touched_budget(test_budget != KvBytes{} ? test_budget : guard_kv_budget, guard_eager_bytes,
                                     pulsar_session_touched_kv_bytes(sess), guard_avail, guard_floor);
     const KvBytes b = live < guard_touched_ceiling ? live : guard_touched_ceiling;
     /* rule 5: the budget the guard is keeping, said when it moves by half a GiB or more */
@@ -374,10 +372,9 @@ void server::slot_prefix_match(const session_slot *sl, const pulsar_tokens *prom
 /// @param avail MemAvailable in bytes (0 = unreadable)
 /// @param marginal the bank's ledger marginal in bytes
 /// @return true when the floor refuses the provision
-static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident,
-                                      uint64_t avail, uint64_t marginal) {
+static bool server_bank_floor_refuses(int n_provisioned, bool pages_resident, KvBytes avail, KvBytes marginal) {
     return n_provisioned > 0 && !pages_resident &&
-           (avail == 0 || !server_mem_floor_admits(avail, marginal));
+           (avail == KvBytes{} || !server_mem_floor_admits(avail, marginal));
 }
 
 /* The free bank to provision: the one with the most resident pages (engine
@@ -449,7 +446,7 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
      * nothing active), so the worker hard-spins re-reading /proc/meminfo and
      * the first request never completes.  One bank's eager floor is small;
      * admission pressure on a tight box belongs to the SECOND bank onward. */
-    const uint64_t avail = server_mem_available_bytes();
+    const KvBytes avail = server_mem_available_bytes();
     if (server_bank_floor_refuses(n_provisioned, resident[idx] > KvBytes{}, avail, s->bank_marginal_bytes)) {
         /* A per-request condition: the head job is re-tried every quantum and
          * the next job meets the same floor.  One line per period with the
@@ -462,8 +459,8 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
                        "pulsar-server: bank provisioning refused: MemAvailable %.2f GiB "
                        "below floor for marginal %.2f GiB (job queued; %u refusals "
                        "in the last %.0f s not logged)",
-                       (double)avail / (1024.0 * 1024.0 * 1024.0),
-                       (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
+                       (double)avail.raw() / (1024.0 * 1024.0 * 1024.0),
+                       (double)s->bank_marginal_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
                        skipped, PULSAR_SERVER_MEM_FLOOR_WARN_SEC);
         }
         *refusal = PROVISION_REFUSED_MEM_FLOOR;
@@ -506,9 +503,9 @@ session_slot *server::provision_bank(provision_refusal *refusal) {
                "pulsar-server: provisioned bank %d (pooled) marginal=%.2f GiB "
                "total committed=%.2f GiB / %.2f GiB",
                idx,
-               (double)s->bank_marginal_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_committed_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+               (double)s->bank_marginal_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_committed_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0));
     return sl;
 }
 
@@ -1064,16 +1061,16 @@ session_slot *server::choose_slot_for_job(job *j, int *reject_ctx,
 /// @param committed_total the committed bytes
 /// @param slot_cost the released slot's cost in bytes
 /// @return the new committed total
-uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost) {
+KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost) {
     if (slot_cost > committed_total) {
         server_log(PULSAR_LOG_WARNING,
                    "pulsar-server: EVICTION LEDGER UNDERFLOW: releasing %.2f GiB from "
                    "%.2f GiB committed — provision/evict pairing is out of sync; "
                    "clamping the ledger to 0 (the MemAvailable floor remains the "
                    "backstop against the resulting over-admission)",
-                   (double)slot_cost / (1024.0 * 1024.0 * 1024.0),
-                   (double)committed_total / (1024.0 * 1024.0 * 1024.0));
-        return 0;
+                   (double)slot_cost.raw() / (1024.0 * 1024.0 * 1024.0),
+                   (double)committed_total.raw() / (1024.0 * 1024.0 * 1024.0));
+        return KvBytes{};
     }
     return committed_total - slot_cost;
 }
@@ -1238,7 +1235,7 @@ bool server::worker_eviction_could_help(const job *j,
          * one marginal.  (The classic arithmetic below prices a whole
          * session: at --ctx 1M that is the 44 GiB pool, which no box's
          * MemAvailable ever admits, so this gate never opened in pool mode.) */
-        uint64_t reclaimable = 0;
+        KvBytes reclaimable{};
         bool any = false;
         for (int i = 0; i < s->pool_banks; i++) {
             const session_slot *sl = &s->slots[i];
@@ -1248,14 +1245,14 @@ bool server::worker_eviction_could_help(const job *j,
         }
         if (!any) return false;
         pthread_mutex_lock(&s->mu);
-        const uint64_t committed = s->kv_committed_bytes;
+        const KvBytes committed = s->kv_committed_bytes;
         pthread_mutex_unlock(&s->mu);
-        const uint64_t after = committed > reclaimable ? committed - reclaimable : 0;
+        const KvBytes after = committed > reclaimable ? committed - reclaimable : KvBytes{};
         return server_kv_admits(s->kv_budget_bytes, after, s->bank_marginal_bytes);
     }
-    const uint64_t est =
+    const KvBytes est =
         pulsar_engine_session_cost_bytes(s->engine, s->provision_ctx_for_job(j));
-    if (est == 0) return false;
+    if (est == KvBytes{}) return false;
     /* Model the MemAvailable floor too (2026-07-15 review): a POOL_FULL
      * refusal never consulted it, so on a physically tight box the gate
      * could open, one warm session be evicted, and the re-provisioning then
@@ -1264,9 +1261,9 @@ bool server::worker_eviction_could_help(const job *j,
      * the block comment above), so if the floor refuses NOW it will refuse
      * after the eviction too; skip. Fail closed on an unreadable gauge,
      * matching provision_slot. One /proc read per failed bind attempt. */
-    const uint64_t avail = server_mem_available_bytes();
+    const KvBytes avail = server_mem_available_bytes();
     if (!server_mem_floor_admits(avail, est)) return false;
-    uint64_t reclaimable = 0;
+    KvBytes reclaimable{};
     bool any = false;
     for (int i = 1; i < s->n_slots; i++) {
         const session_slot *sl = &s->slots[i];
@@ -1276,9 +1273,9 @@ bool server::worker_eviction_could_help(const job *j,
     }
     if (!any) return false;
     pthread_mutex_lock(&s->mu);
-    const uint64_t committed = s->kv_committed_bytes;
+    const KvBytes committed = s->kv_committed_bytes;
     pthread_mutex_unlock(&s->mu);
-    const uint64_t after = committed > reclaimable ? committed - reclaimable : 0;
+    const KvBytes after = committed > reclaimable ? committed - reclaimable : KvBytes{};
     return server_kv_admits(s->kv_budget_bytes, after, est);
 }
 
@@ -1302,7 +1299,7 @@ static int evict_reset_slot_fields(session_slot *sl) {
     sl->active_job = NULL;
     sl->state = SLOT_EVICTED;
     sl->ctx_size = 0;
-    sl->est_cost_bytes = 0;
+    sl->est_cost_bytes = KvBytes{};
     sl->tokens_emitted = 0;
     sl->prefill_counted = 0;
     sl->last_serviced_us = 0;
@@ -1413,8 +1410,8 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     s->slot_terminal_clear(sl);   /* L380: and the turn a yielded terminal checkpoint kept for it */
     s->slot_reply_forget(sl);     /* L380: and what its conversation showed of its replies */
 
-    const uint64_t committed = sl->est_cost_bytes;
-    uint64_t freed = 0;
+    const KvBytes committed = sl->est_cost_bytes;
+    KvBytes freed{};
     /* Pooled mode only (classic mode never provisions a slot >= 1, so the
      * picker returns -1 above): the pool session (s->sess, shared by every
      * bank) persists. "Evicting" bank vi means reset it to an empty
@@ -1436,7 +1433,7 @@ void server::worker_evict(int vi, int rank, job *for_job) {
     }
     pthread_mutex_lock(&s->mu);
     s->kv_committed_bytes = server_ledger_release(s->kv_committed_bytes, committed);
-    const uint64_t committed_now = s->kv_committed_bytes;
+    const KvBytes committed_now = s->kv_committed_bytes;
     /* The evicted conversation must replay from a checkpoint on its next turn,
      * which is the dominant tail-latency source on a busy pool — worth a
      * counter of its own rather than only a log line. */
@@ -1459,11 +1456,11 @@ void server::worker_evict(int vi, int rank, job *for_job) {
                "released=%.2f GiB (allocator freed %.2f GiB) "
                "committed now %.2f / %.2f GiB, MemAvailable %.2f GiB",
                vi, evicted_ctx, live_tokens, snapshot,
-               (double)freed / (1024.0 * 1024.0 * 1024.0),
-               (double)freed / (1024.0 * 1024.0 * 1024.0),
-               (double)committed_now / (1024.0 * 1024.0 * 1024.0),
-               (double)s->kv_budget_bytes / (1024.0 * 1024.0 * 1024.0),
-               (double)server_mem_available_bytes() / (1024.0 * 1024.0 * 1024.0));
+               (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)freed.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)committed_now.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)s->kv_budget_bytes.raw() / (1024.0 * 1024.0 * 1024.0),
+               (double)server_mem_available_bytes().raw() / (1024.0 * 1024.0 * 1024.0));
 }
 
 
@@ -3763,7 +3760,7 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
                                  : KvBytes{};
     const KvBytes floor = server_mem_floor();
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    KvBytes avail{server_mem_available_bytes()};
+    KvBytes avail = server_mem_available_bytes();
     int spilled = 0;
     for (int round = 0; round <= PULSAR_SESSION_POOL_CAP; round++) {
         int useful[PULSAR_SESSION_POOL_CAP];
@@ -3773,7 +3770,7 @@ bool server::floor_admits_chunk(int rows, char *err, size_t errlen) {
         if (step != PREFILL_MEM_SPILL || !s->spill_bank(&s->slots[useful[0]])) break;
         s->count_metric(&s->m_spills);
         spilled++;
-        avail = KvBytes{server_mem_available_bytes()};
+        avail = server_mem_available_bytes();
     }
     snprintf(err, errlen,
              "not enough memory for the next chunk now (MemAvailable %.2f GiB, the chunk %.2f GiB, floor %.2f GiB, "
@@ -3828,7 +3825,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
     gen_state *g = sl->gen;
     const KvBytes need = s->prefill_chunk_need(), floor = server_mem_floor();
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    KvBytes avail{server_mem_available_bytes()};
+    KvBytes avail = server_mem_available_bytes();
     bool preempt_tried = false;
     const char *why = "nothing left to free";   /* the refusal says which: a REFUSE verdict, or a remedy that failed */
     int spilled = 0;
@@ -3846,7 +3843,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
          * refused (server_judge_release: never under a judge request) */
         if (step != PREFILL_MEM_SPILL && server_judge_release(s)) {
             if (!s->bank_switch(sl->bank)) { why = "the bank could not be reinstalled after a remedy"; break; }
-            avail = KvBytes{server_mem_available_bytes()};
+            avail = server_mem_available_bytes();
             continue;
         }
         if (step == PREFILL_MEM_REFUSE) break;
@@ -3865,7 +3862,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
             if (!s->preempt_newest_decoder(sl, need)) continue;   /* none could go: the next round refuses */
         }
         if (!s->bank_switch(sl->bank)) { why = "the bank could not be reinstalled after a remedy"; break; }
-        avail = KvBytes{server_mem_available_bytes()};
+        avail = server_mem_available_bytes();
     }
     s->count_metric(&s->m_prefill_mem_refusals);
     snprintf(g->err, sizeof g->err,
@@ -3892,7 +3889,7 @@ bool server::prefill_headroom_ok(session_slot *sl) {
 }
 
 bool server::prefill_headroom_fused_ok(session_slot *sl) {
-    if (server_headroom_admits(KvBytes{server_mem_available_bytes()}, prefill_chunk_need(), server_mem_floor()))
+    if (server_headroom_admits(server_mem_available_bytes(), prefill_chunk_need(), server_mem_floor()))
         return true;
     sl->gen->no_fuse = "the memory floor (its classic quantum re-checks it, with the guard's remedies)";
     return false;

@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
           (unsigned long long)e->model.n_tensors, c.roles);
     check(c.bytes == dir_bytes && c.directory_bytes == dir_bytes, "every byte priced by a role: %llu of the directory's %llu",
           (unsigned long long)c.bytes, (unsigned long long)dir_bytes);
-    check(pulsar_engine_weights_resident_bytes(e) == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
+    check(pulsar_engine_weights_resident_bytes(e).raw() == e->model.mapped_bytes && c.bytes <= e->model.mapped_bytes,
           "admission charges the staged container (%.3f GiB mapped; the bound tensors %.3f GiB, the rest headers)",
           (double)e->model.mapped_bytes / 1073741824.0, (double)c.bytes / 1073741824.0);
 

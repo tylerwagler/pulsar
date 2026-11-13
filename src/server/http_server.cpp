@@ -687,8 +687,8 @@ bool server::send_metrics(int fd) {
     uint64_t refusals[PROVISION_REFUSAL_COUNT];
     for (int i = 0; i < PROVISION_REFUSAL_COUNT; i++) refusals[i] = s->m_refusals[i];
     const int block_reason = s->m_queue_block_reason;
-    const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes;
-    const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes;
+    const unsigned long long ledger_committed = (unsigned long long)s->kv_committed_bytes.raw();
+    const unsigned long long ledger_budget = (unsigned long long)s->kv_budget_bytes.raw();
     const unsigned long long gen_tokens = (unsigned long long)s->m_gen_tokens;
     const unsigned long long prefill_chunk_tokens =
         (unsigned long long)s->m_prefill_chunk_tokens;
@@ -1621,7 +1621,7 @@ void *client_main(void *arg) {
         } else if (n == 0 || end == num || (end && *end)) {
             http_error(fd, 400, "/test/guard-budget: the body is a decimal byte count (0 restores the startup budget)");
         } else {
-            __atomic_store_n(&s->guard_test_budget, (uint64_t)b, __ATOMIC_RELAXED);
+            s->set_test_guard_budget(KvBytes{(uint64_t)b});   /* the request's byte count enters the unit here */
             const double gib = 1024.0 * 1024.0 * 1024.0;
             if (b)
                 server_log(PULSAR_LOG_WARNING, "pulsar-server: guard: KV budget OVERRIDDEN to %.2f GiB (test route)",

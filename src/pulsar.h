@@ -609,7 +609,7 @@ pulsar_context_memory pulsar_context_memory_estimate(
 /** @param e the engine
  *  @param ctx_size the context, tokens
  *  @return GPU bytes, or 0 */
-uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size);
+KvBytes pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size);
 /** Same, priced for an EXPLICIT bank-pool size (Tier-2 auto-sizing): the server
  * evaluates the (banks, ctx) fit table before committing PULSAR_MSEQ_BANKS. n_banks
  * >= 1; 1 is the classic single-session cost. */
@@ -617,8 +617,8 @@ uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size);
  *  @param ctx_size the context per bank, tokens
  *  @param n_banks the pool size (>= 1)
  *  @return GPU bytes, or 0 */
-uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
-                                              int n_banks);
+KvBytes pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size,
+                                                int n_banks);
 /** Tier-2 overcommit (task #55): demand-paged comp+index bytes for ONE bank at a
  * context — the physical-on-touch VA the overcommit auto-size reserves but does
  * NOT charge at admission (only the eager floor is charged). 0 if no session
@@ -690,18 +690,18 @@ KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q
  * same context and pool size -- the server asserts it after each create. */
 /** @param s the session
  *  @return GPU bytes the create allocated */
-uint64_t pulsar_session_resident_bytes(const pulsar_session *s);
+KvBytes pulsar_session_resident_bytes(const pulsar_session *s);
 /** L347 I4: the pinned host RAM the session's grid checkpoints and records live in -- a discrete card's (the store's
  *  host tier); 0 on an integrated GPU (GB10), where they are device memory and in pulsar_session_resident_bytes.
  *  @param s the session
  *  @return pinned host bytes */
-uint64_t pulsar_session_ckpt_host_bytes(const pulsar_session *s);
+KvBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s);
 /** Resident (mmap'd, read-only, shared) weight footprint in bytes: the main
  * GGUF plus an external drafter and expert overlay when mapped separately.
  * This competes with per-session KV for the unified-memory budget. */
 /** @param e the engine, or NULL (0)
  *  @return mapped weight bytes */
-uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e);
+KvBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e);
 /** Whether `fp` is a terminal (pulsar_log colours only there).
  *  @param fp an open stream
  *  @return true when its descriptor is a tty */

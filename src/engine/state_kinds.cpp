@@ -816,9 +816,9 @@ static BankId decl_bank_live(pulsar_session *s) { return s && s->states ? s->sta
 /// @param ctx_size the context in tokens
 /// @return one bank's managed bytes at ctx_size
 static KvBytes decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
-    uint64_t managed = 0;
+    KvBytes managed{};
     e->session_cost_bytes_banked(ctx_size, 1, &managed);
-    return KvBytes{managed};
+    return managed;
 }
 
 /* L270: a bank's touched pools are its high-water's rows (the pages stay resident once written, until

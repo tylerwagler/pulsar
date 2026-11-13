@@ -2386,14 +2386,14 @@ struct pulsar_engine {
      * are one function.  The number admission control must use.
      * @return bytes, or 0 if no session could be created. */
     /// @param ctx_size  context size to price, in tokens
-    uint64_t session_cost_bytes(int ctx_size);
+    KvBytes session_cost_bytes(int ctx_size);
     /** session_cost_bytes() for an explicit bank-pool size, so the server can
      * evaluate the (banks, ctx) fit table before committing to one.
      * @param ctx_size context size to price
      * @param n_banks  >= 1; 1 is the classic single-session layout
      * @param managed_bytes optional: the demand-paged (cudaMallocManaged) subset, 0 when none was created
      * @return bytes, or 0 if no session could be created. */
-    uint64_t session_cost_bytes_banked(int ctx_size, int n_banks, uint64_t *managed_bytes = NULL);
+    KvBytes session_cost_bytes_banked(int ctx_size, int n_banks, KvBytes *managed_bytes = NULL);
     /** Demand-paged (not reserved) bytes ONE bank actually materialises at
      * `ctx_size` -- the overcommit figure, below the reserved capacity. */
     /// @param ctx_size  context size, in tokens

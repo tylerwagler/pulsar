@@ -2232,18 +2232,18 @@ typedef struct {
  *  plus the guard's floor (PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES, the one reserve).
  *  @param working_set_bytes the working set: PULSAR_SERVER_DISCRETE_WORKING_SET_EST_BYTES at sizing
  *  @return the margin, bytes */
-static inline uint64_t server_discrete_margin_bytes(uint64_t working_set_bytes) {
-    return working_set_bytes + PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES;
+static inline KvBytes server_discrete_margin_bytes(KvBytes working_set_bytes) {
+    return working_set_bytes + KvBytes{PULSAR_SERVER_DISCRETE_GUARD_FLOOR_BYTES};
 }
 /** L347 I4: the working set the warmup measured on a discrete card (0 when the readings say none).
  *  @param free_before_create the device's free memory just before the session's create
  *  @param free_after_warmup  its free memory after the warmup
  *  @param session_resident   what of the session is resident then (its price less untouched demand-paged VA)
  *  @return bytes */
-static inline uint64_t server_discrete_working_set_bytes(uint64_t free_before_create, uint64_t free_after_warmup,
-                                                         uint64_t session_resident) {
-    const uint64_t taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : 0;
-    return taken > session_resident ? taken - session_resident : 0;
+static inline KvBytes server_discrete_working_set_bytes(KvBytes free_before_create, KvBytes free_after_warmup,
+                                                        KvBytes session_resident) {
+    const KvBytes taken = free_before_create > free_after_warmup ? free_before_create - free_after_warmup : KvBytes{};
+    return taken > session_resident ? taken - session_resident : KvBytes{};
 }
 /// The box's usable memory for the static admission formula, bytes (an upper bound after warm-up).
 #define PULSAR_SERVER_USABLE_BYTES          (121ull * 1024ull * 1024ull * 1024ull)
@@ -2331,7 +2331,11 @@ typedef struct session_slot {
     gen_state   *gen;  ///< resumable state for active_job
     slot_state   state;  ///< lifecycle state; SLOT_EVICTED marks a reusable hole
     int          ctx_size;  ///< context this slot was admitted for
-    uint64_t     est_cost_bytes;  ///< ledger-committed session cost (ACTUAL resident bytes once the session exists; the true-cost estimate only gates admission before the create)
+    /** The slot's charge to the session-cost ledger (server::kv_committed_bytes), released on eviction.  Two
+     *  meanings by mode: classic (no pool) -- slot 0's FULL session cost, the actual the create allocated (the
+     *  priced estimate only gates admission before the create); pool mode -- one bank's even-split marginal
+     *  (server::bank_marginal_bytes), charged at provision_bank. */
+    KvBytes      est_cost_bytes;
     uint64_t     tokens_emitted;  ///< decode bookkeeping for the scheduler
     /** L114 counter watermark: session position up to which computed prefill
      * rows have been ticked into w_prefill_chunk_tokens. Advanced by BOTH the
@@ -2692,15 +2696,17 @@ struct server {
      * uniform eviction of slot 0 zeroed it, silently poisoning every later
      * provision with ctx 0 (banks the router then skipped forever). */
     int          pool_ctx_size;
-    uint64_t     bank_marginal_bytes;  ///< Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost; conservative, demand-paged reality is smaller). 0 in classic mode.
-    uint64_t     kv_budget_bytes;  ///< admission ceiling computed at startup
+    /** Tier-2: per-bank ledger charge in pooled mode (even split of the admitted pool cost,
+     *  server_session_price::per_bank_charge; conservative, demand-paged reality is smaller). 0 in classic mode. */
+    KvBytes      bank_marginal_bytes;
+    KvBytes      kv_budget_bytes;  ///< admission ceiling computed at startup
     /** Context-scaled KV one bank holds at the configured context — the
      *  compressed rows plus their index. Demand-paged under overcommit, so it is
      *  reserved as VA and resident only on touch; published because dividing the
      *  budget by it is the only way to answer "how many tokens of KV does this
      *  box actually hold", which the configured slot count does not answer. */
     KvBytes      kv_bank_bytes;
-    uint64_t     kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
+    KvBytes      kv_committed_bytes;  ///< sum of est_cost_bytes over live slots (under mu)
     /** Tier-2 task #55 increment 2b — proactive-eviction guard. `guard_enabled`
      * gates the whole mechanism (on iff overcommit sized N>1 banks and the disk
      * KV cache is open: a spill persists to it, L264). `guard_touched_budget` is the resident-KV ceiling the guard keeps
@@ -2719,8 +2725,14 @@ struct server {
     KvBytes      guard_budget_said;      ///< the live budget last logged (a move of 0.5 GiB or more is said)
     /** L357: the ledger budget set at run time by the test route POST /test/guard-budget (0 = none: guard_kv_budget
      *  stands).  The run-time twin of PULSAR_SERVER_KV_BUDGET_OVERRIDE, so the live legs that lower the budget share
-     *  one server instead of starting one each.  Written by a client thread, read by guard_budget() (__atomic). */
-    uint64_t     guard_test_budget;
+     *  one server instead of starting one each.  Written by a client thread, read by guard_budget() (__atomic):
+     *  the raw storage `__atomic` needs, read and written only through test_guard_budget / set_test_guard_budget. */
+    uint64_t     guard_test_budget_raw;
+    /// @return the test route's ledger budget (0 = none), an atomic read
+    KvBytes test_guard_budget() const { return KvBytes{__atomic_load_n(&guard_test_budget_raw, __ATOMIC_RELAXED)}; }
+    /// Set the test route's ledger budget (0 = none), an atomic write.
+    /// @param b the budget
+    void set_test_guard_budget(KvBytes b) { __atomic_store_n(&guard_test_budget_raw, b.raw(), __ATOMIC_RELAXED); }
     /** L357: PULSAR_SERVER_TEST_ROUTES=1 at startup -- the /test/ routes answer; otherwise they are unknown paths. */
     bool         test_routes;
     /** L362: when spill_bank last said "nowhere to park the pool" for each bank (server_now_sec; once per 10 s) */
@@ -5668,18 +5680,16 @@ bool server_route_in_place(int common, int score, int frontier, int prefilled, i
 int server_image_cold_cut(int cut, const pulsar_image_ref *images, int n_images, int *inside);
 /* The admission budgets (unified memory; a discrete card's own) and the command line with its disk KV directory
  * resolved: defined in cli_main.cpp for main(), unit-tested in server_tests.cpp. */
-uint64_t server_kv_budget_bytes(uint64_t weights_resident_bytes);
-uint64_t server_kv_budget_discrete_bytes(uint64_t free_bytes, uint64_t working_set_bytes);
+KvBytes server_kv_budget_bytes(KvBytes weights_resident_bytes);
+KvBytes server_kv_budget_discrete_bytes(KvBytes free_bytes, KvBytes working_set_bytes);
 server_config server_parse_options(int argc, char **argv);
 void server_resolve_kv_disk_dir(server_config *c);
 /* Admission predicate (defined in cli_main.cpp; unit-tested there). */
-bool server_kv_admits(uint64_t kv_budget_bytes,
-                             uint64_t committed_bytes,
-                             uint64_t incoming_bytes);
+bool server_kv_admits(KvBytes kv_budget_bytes, KvBytes committed_bytes, KvBytes incoming_bytes);
 /* Live MemAvailable floor predicate: kernel-breathing-room backstop applied
  * at provisioning time on top of the ledger (defined in cli_main.cpp;
  * unit-tested there). avail == 0 (unreadable /proc/meminfo) fails closed. */
-bool server_mem_floor_admits(uint64_t avail_bytes, uint64_t est_bytes);
+bool server_mem_floor_admits(KvBytes avail_bytes, KvBytes est_bytes);
 /* L319: the touched-KV ceiling -- min(kv budget − eager, touched + avail − floor); 0 when avail is at or under the
  * floor, or unreadable (defined in cli_main.cpp; unit-tested there).  The startup ceiling reads the post-warmup
  * headroom; the guard's live budget (server::guard_budget) the current one.  What avail and floor are is the device's
@@ -5695,7 +5705,7 @@ KvBytes server_guard_touched_budget(KvBytes kv_budget_bytes, KvBytes eager_bytes
  * and the ledger's share. */
 /// @param discrete the KV lives in a discrete card's memory (pulsar_gpu_integrated() == 0)
 /// @return the headroom reading in bytes (0 = unreadable: every decision fails closed)
-uint64_t server_guard_avail_bytes(bool discrete);
+KvBytes server_guard_avail_bytes(bool discrete);
 /// @param discrete as server_guard_avail_bytes
 /// @return the floor that reading keeps free
 KvBytes server_guard_floor(bool discrete);
@@ -5722,22 +5732,22 @@ KvBytes server_mem_floor(void);
 /// @param zone_high_bytes  the zones' high watermarks, bytes
 /// @param step_bytes  the largest demand of one worker step, bytes
 /// @return the floor, bytes
-KvBytes server_mem_floor_init(uint64_t zone_high_bytes, KvBytes step_bytes);
+KvBytes server_mem_floor_init(KvBytes zone_high_bytes, KvBytes step_bytes);
 /** Sum of every zone's `high` watermark in a /proc/zoneinfo text, in bytes (pages of `page_bytes`); 0 when none
  *  parses (the caller logs it and the floor keeps the OS margin). */
 /// @param zoneinfo  the file's text
 /// @param page_bytes  the page size, bytes
 /// @return bytes
-uint64_t server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
+KvBytes server_zoneinfo_high_bytes(const char *zoneinfo, uint64_t page_bytes);
 /** /proc/zoneinfo's high watermarks (server_zoneinfo_high_bytes over the live file); 0 when unreadable. */
 /// @return bytes
-uint64_t server_zone_high_watermark_bytes(void);
+KvBytes server_zone_high_watermark_bytes(void);
 /** The host bytes one disk-KV persist of a `tokens`-long history can take beyond the pinned staging buffer: the
  *  writeback window of dirty page cache (PULSAR_WRITEBACK_STEP) and the two renders of the history's text
  *  (pulsar_kvchain_persist), bounded at PERSIST_TEXT_BYTES_PER_TOKEN a token. */
 /// @param tokens  the history's length
 /// @return bytes
-uint64_t server_persist_host_bytes(int tokens);
+KvBytes server_persist_host_bytes(int tokens);
 /// Rendered-text bytes a token is bounded at for a persist's host demand (server_persist_host_bytes).
 #define PERSIST_TEXT_BYTES_PER_TOKEN 64u
 /** Does MemAvailable `avail` leave `floor` after `need` more bytes?  avail 0 (unreadable) is no. */
@@ -5756,7 +5766,7 @@ prefill_mem_step server_prefill_mem_step(KvBytes avail, KvBytes need, KvBytes fl
 /* MemAvailable from /proc/meminfo, in bytes (0 on parse failure — callers
  * fail closed).  Never called on a token/layer hot path (defined in
  * generate.cpp; also used by startup warmup/budget derivation in cli_main.cpp). */
-uint64_t server_mem_available_bytes(void);
+KvBytes server_mem_available_bytes(void);
 
 /* ==== The stall watchdog (watchdog.cpp) ===================================================================
  * The worker marks every CUDA-heavy section it enters (src/lib/pulsar_stall.h; each mark a heartbeat).  A watchdog
@@ -5793,15 +5803,13 @@ bool server_watchdog_busy(const server *s);
  * ledger commits (the actual); 0 when they differ -- the price is the
  * allocator run dry, so a difference is an accounting hole and the caller
  * refuses to start (defined in server_sched.cpp). */
-uint64_t server_reconciled_session_cost(int slot_idx, int ctx,
-                                               uint64_t est_bytes,
-                                               uint64_t actual_bytes);
+KvBytes server_reconciled_session_cost(int slot_idx, int ctx, KvBytes est_bytes, KvBytes actual_bytes);
 /* Eviction ledger release: subtract an evicted slot's committed bytes from
  * the admission ledger total, warning loudly (and clamping to 0, which fails
  * toward over-admission being caught by the MemAvailable floor rather than
  * leaking budget forever) if the pairing ever underflows (defined in
  * generate.cpp; unit-tested in cli_main.cpp). */
-uint64_t server_ledger_release(uint64_t committed_total, uint64_t slot_cost);
+KvBytes server_ledger_release(KvBytes committed_total, KvBytes slot_cost);
 /** L380: a decoder stepping in the plain or mixed batch: in the batch (gen_state::batch_active) and still decoding.
  *  The scope of the saved-carry history read (server::slot_history).  Every way a batch step or the slot's install
  *  can fail ends the decode (GEN_FINISH: a failed or rejected step, a refused draw, a bank that would not install, a

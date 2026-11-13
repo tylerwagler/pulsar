@@ -353,12 +353,17 @@ bool pulsar_engine_think_mode_supported(const pulsar_engine *e, pulsar_think_mod
 void pulsar_engine_spec_metrics(pulsar_engine *e, pulsar_spec_metrics *out) { if (e) { e->spec_metrics(out); } else if (out) { memset(out, 0, sizeof(*out)); } }
 int pulsar_engine_model_id(pulsar_engine *e) { return e ? e->model_id() : (int)PULSAR_MODEL_VARIANT; }
 bool pulsar_engine_is_pruned(pulsar_engine *e) { return e ? e->is_pruned() : false; }
-uint64_t pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) { return e ? e->session_cost_bytes(ctx_size) : 0; }
-uint64_t pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) { return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : 0; }
+KvBytes pulsar_engine_session_cost_bytes(pulsar_engine *e, int ctx_size) {
+    return e ? e->session_cost_bytes(ctx_size) : KvBytes{};
+}
+KvBytes pulsar_engine_session_cost_bytes_banked(pulsar_engine *e, int ctx_size, int n_banks) {
+    return e ? e->session_cost_bytes_banked(ctx_size, n_banks) : KvBytes{};
+}
 uint32_t pulsar_engine_bank_pool(int *pinned_by_env) { if (pinned_by_env) *pinned_by_env = gpu_graph_bank_pool_env_pinned(); return gpu_graph_bank_pool_n(); }
 void pulsar_engine_set_bank_pool(uint32_t n_banks) { gpu_graph_bank_pool_set(n_banks); }
 KvBytes pulsar_engine_demand_paged_bytes_per_bank(pulsar_engine *e, int ctx_size) { PULSAR_FAMILY_REQUIRES_E(e, PULSAR_FAMILY_CAP_BANKS, "the demand-paged bank price", KvBytes{}); return e ? e->family->banks->demand_paged_bytes(e, ctx_size) : KvBytes{}; }
-uint64_t pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return e ? e->weights_resident_bytes() : 0; }
+/* the mapped weights enter the ledger's unit here: they compete with the sessions' KV for the same budget */
+KvBytes pulsar_engine_weights_resident_bytes(pulsar_engine *e) { return KvBytes{e ? e->weights_resident_bytes() : 0}; }
 int pulsar_engine_collect_imatrix(pulsar_engine *e,
                                const char *dataset_path,
                                const char *output_path,
@@ -1517,9 +1522,9 @@ uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
     return st && st->ops ? st->ops->resume_grid : 0u;
 }
-uint64_t pulsar_session_ckpt_host_bytes(const pulsar_session *s) {
+KvBytes pulsar_session_ckpt_host_bytes(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
-    return st && st->ops ? pulsar_ckpt_host_bytes(st) : 0u;
+    return KvBytes{st && st->ops ? pulsar_ckpt_host_bytes(st) : 0u};
 }
 bool pulsar_session_split_invariant(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
