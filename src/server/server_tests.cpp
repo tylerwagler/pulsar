@@ -4397,7 +4397,7 @@ static void test_l309_draft_prefix(void) {
         for (char c : std::string(pc.round)) toks.push_back((uint8_t)c);
         if (pc.stop_at >= 0) toks[(size_t)pc.stop_at + 1u] = v.stop;
         const int n = (int)toks.size() - 1;
-        const int got = gen_constrain_draft_prefix(&srv, &g, toks[0], toks.data() + 1, n);
+        const int got = gen_constrain_draft_prefix(&srv, &g, TokId{toks[0]}, toks.data() + 1, n);
         if (got != pc.want) fprintf(stderr, "l309 \"%s\": prefix %d, want %d\n", pc.round, got, pc.want);
         TEST_ASSERT(got == pc.want);
         /* the gate is back: the next draw's mask still takes the base, and the round's masks agree with the cut */
@@ -4419,7 +4419,7 @@ static void test_l309_draft_prefix(void) {
     gen_state g;
     memset(&g, 0, sizeof g);
     const int32_t d[3] = {'a', 'b', 'c'};
-    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, 'z', d, 3) == 3);
+    TEST_ASSERT(gen_constrain_draft_prefix(&srv, &g, TokId{'z'}, d, 3) == 3);
     l303_server_free(&srv);
 }
 

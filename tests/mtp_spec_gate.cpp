@@ -285,7 +285,7 @@ static void batched_lane(pulsar_engine *e, const std::vector<pulsar_tokens> &P, 
         int live = 0;
         for (int i = 0; ok && i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_EOS) {
-                got[bank_of[i]].push_back(st[i].first_token);
+                got[bank_of[i]].push_back(st[i].first_token.raw());
                 done[bank_of[i]] = true;
             } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
                 st[live] = st[i];

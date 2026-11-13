@@ -296,7 +296,8 @@ int main(int argc, char **argv) {
         int n = 0, rounds = 0;
         while (n < generated) {
             float conf[16];
-            int32_t pbase, ptok[16];
+            TokId pbase;
+            int32_t ptok[16];
             const uint32_t n_pend = trace ? pulsar_session_bank_pendings(sess, 0u, &pbase, ptok, conf) : 0u;
             const int k = pulsar_session_generate_speculative(sess, temp, top_k, top_p, 0.0f, &rng, generated - n,
                                                               out + n, generated - n, err, sizeof(err));

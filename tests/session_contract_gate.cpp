@@ -1048,13 +1048,13 @@ static bool spec_lane_round(pulsar_session *s, const uint32_t *banks, const int 
     if (rc != 0 || got != rows) return false;
     for (int i = 0; i < n; i++) {
         const uint32_t row0 = st[i].row0;
-        const int first = st[i].first_token;
+        const int first = st[i].first_token.raw();
         memset(&st[i], 0, sizeof st[i]);
         st[i].bank = banks[i];
         st[i].round = rounds[i];
         st[i].top_p = 1.0f;
         st[i].rng = &rngs[i];
-        st[i].first_token = first;
+        st[i].first_token = TokId{first};
         st[i].row0 = row0;
         st[i].accepted = acc[i];
         st[i].accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
@@ -1183,7 +1183,8 @@ static void part_spec_zero_draft(pulsar_engine *e, int W) {
         cs.round = r[1];
         ran = ran && pulsar_session_spec_redraft_commit_batch(s, &cs, 1) == 0 && cs.status == PULSAR_SPEC_STEP_OK;
         float conf[16];
-        int32_t pbase, ptok[16];
+        TokId pbase;
+        int32_t ptok[16];
         const uint32_t pend = ran ? pulsar_session_bank_pendings(s, 1, &pbase, ptok, conf) : 0u;
         CHECK(ran && pend > 0, "S2 (beside) bank 1 holds %u drafts for the shared round: %s", pend, err);
         const uint32_t banks[2] = {0, 1};

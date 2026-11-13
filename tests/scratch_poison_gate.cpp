@@ -163,7 +163,7 @@ run_rec run(pulsar_engine *e, const std::vector<pulsar_tokens> &P, int n, bool p
         int live = 0;
         for (int i = 0; ok && i < m; i++) {
             if (st[i].status == PULSAR_SPEC_STEP_EOS) {
-                R.out[bank_of[i]].push_back(st[i].first_token);
+                R.out[bank_of[i]].push_back(st[i].first_token.raw());
                 done[bank_of[i]] = true;
             } else if (st[i].status == PULSAR_SPEC_STEP_OK) {
                 st[live] = st[i];

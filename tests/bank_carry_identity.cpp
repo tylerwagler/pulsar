@@ -144,15 +144,16 @@ int GATE_ENTRY(int argc, char **argv) {
                     fprintf(stderr, "tick %d bank %d assemble status %d: %s\n", t, b, steps[b].status, steps[b].err);
                     return 1;
                 }
-                first[b] = steps[b].first_token;
+                first[b] = steps[b].first_token.raw();
                 row0[b] = steps[b].row0;
             }
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
-            first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]);
-            if (first[b] < 0 || pulsar_session_spec_round_begin(s, r[b], first[b], 64, 17, temp, top_k, top_p, min_p,
-                                                                err, sizeof(err)) != 0) {
+            first[b] = pulsar_session_spec_next_base(s, temp, top_k, top_p, min_p, &rngs[b]).raw();
+            if (first[b] < 0 ||
+                pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, 64, 17, temp, top_k, top_p, min_p,
+                                                err, sizeof(err)) != 0) {
                 fprintf(stderr, "tick %d bank %d begin: %s\n", t, b, err);
                 return 1;
             }
@@ -171,7 +172,7 @@ int GATE_ENTRY(int argc, char **argv) {
         t0 = now_us();
         if (batch) {
             for (int b = 0; b < NB; b++) {
-                steps[b].first_token = first[b];
+                steps[b].first_token = TokId{first[b]};
                 steps[b].row0 = row0[b];
                 steps[b].accepted = acc_b[b];
                 steps[b].accepted_cap = 17;
@@ -190,7 +191,7 @@ int GATE_ENTRY(int argc, char **argv) {
         }
         for (int b = 0; !batch && b < NB; b++) {
             if (!timed_restore(s, (uint32_t)b)) { fprintf(stderr, "restore %d\n", b); return 1; }
-            na_b[b] = pulsar_session_spec_round_end(s, r[b], first[b], temp, top_k, top_p, min_p, &rngs[b],
+            na_b[b] = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, top_k, top_p, min_p, &rngs[b],
                                                     row0[b], acc_b[b], 17, err, sizeof(err));
             if (na_b[b] < 0) { fprintf(stderr, "tick %d bank %d end: %s\n", t, b, err); return 1; }
             timed_save(s, (uint32_t)b);

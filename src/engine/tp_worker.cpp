@@ -774,7 +774,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
                 rngs[i] = r->rng;
                 st->rng = &rngs[i];
                 st->max_tokens = r->i0;
-                st->first_token = r->i0;
+                st->first_token = TokId{r->i0};
                 st->k_alloc = r->i1;
                 st->accepted_cap = r->i2;
                 st->accepted = acc + off;

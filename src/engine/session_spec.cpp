@@ -1379,13 +1379,14 @@ int pulsar_session_spec_round_end_local(pulsar_session *s, pulsar_spec_round *r,
 }
 
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token,
+                                      TokId first_token_id,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       uint32_t row0,
                                       const int32_t *truth,
                                       int *accepted, int accepted_cap,
                                       char *err, size_t errlen) {
+    const int first_token = first_token_id.raw();   /* L334 P3: the round's body is raw (its fields: S2 next) */
     if (spec_no_drafter(s, "spec round_end_forced", err, errlen)) return -1;   /* no round can have begun */
     if (!truth) {
         snprintf(err, errlen, "spec round_end_forced: no truth");
@@ -1492,7 +1493,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     *n_rows_out = 0;
     if (spec_steps_no_drafter(s, steps, n, "spec assemble batch")) {
         for (int i = 0; i < n; i++) {   /* the phase's outputs, as a step that drew nothing leaves them */
-            steps[i].first_token = -1;
+            steps[i].first_token = TokId::none();
             steps[i].row0 = 0;
             steps[i].n_rows = 0;
         }
@@ -1501,7 +1502,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        st->first_token = -1;
+        st->first_token = TokId::none();
         st->row0 = 0;
         st->n_rows = 0;
         if (!spec_bank_restore(s, st->bank)) {
@@ -1520,7 +1521,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
         } else {
             const int first = pulsar_session_spec_next_base_local(s, st->temperature, st->top_k,
                                                                   st->top_p, st->min_p, st->masks, st->rng);
-            st->first_token = first;
+            st->first_token = TokId{first};
             if (first < 0) {
                 st->status = PULSAR_SPEC_STEP_FAILED;
                 snprintf(st->err, sizeof st->err, "sampler refused a degenerate logits row (L188)");
@@ -1625,7 +1626,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
             /* L375 O37: a round that never reaches spec_round_end is undone here (round_end undoes its own failures) */
             spec_round_undo_begun(s, st->round);
         } else
-            na = spec_round_end_walked(s, st->round, st->first_token, st->temperature, st->top_k, st->top_p,
+            na = spec_round_end_walked(s, st->round, st->first_token.raw(), st->temperature, st->top_k, st->top_p,
                                        st->min_p, st->greedy_rows, st->masks, st->mask_rows, st->rng,
                                        &wv[widx[i]], st->row0, n /* L263: the step's flat cost is shared n ways */,
                                        NULL, st->accepted, st->accepted_cap, st->err, sizeof st->err);
@@ -1672,7 +1673,7 @@ int pulsar_spec_steps_verdict(pulsar_spec_phase phase, const pulsar_spec_step *s
         h = spec_fp(h, st->bank);
         h = spec_fp(h, (uint32_t)st->status);
         if (phase == PULSAR_SPEC_PHASE_ASSEMBLE) {
-            h = spec_fp(h, (uint32_t)st->first_token);
+            h = spec_fp(h, (uint32_t)st->first_token.raw());
             h = spec_fp(h, st->row0);
             h = spec_fp(h, st->n_rows);
         } else if (phase == PULSAR_SPEC_PHASE_ROUND_END) {
@@ -1696,19 +1697,19 @@ int pulsar_session_spec_redraft_peek(const pulsar_spec_round *r, int32_t ids[17]
     return 1;
 }
 
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, TokId *base, int32_t tok[16],
                                       float conf[16]) {
     /* L108 P2: the live session's pending count may still be an
      * in-flight chain; complete it before peeking. Logically a lazy
      * read-completion, not observable-state mutation. */
     pulsar_session_spec_chain_harvest((pulsar_session *)s);
 
-    *base = -1;
+    *base = TokId::none();
     const pulsar_spec_carry_state *sp = s ? pulsar_spec_bank_shadow((pulsar_session *)s, bank) : NULL;
     if (!sp) return 0;
     uint32_t n = sp->n_pend;
     if (n > 16u) n = 16u;
-    *base = sp->pend_base;
+    *base = TokId{sp->pend_base};
     for (uint32_t i = 0; i < n; i++) {
         tok[i] = sp->pend[i];
         conf[i] = sp->pend_conf[i];

@@ -5389,11 +5389,11 @@ int gen_constrain_round(struct server *s, struct gen_state *g, const int *toks, 
  *  its chain's last.  `n` when the request has no gate.  -1 = the gate failed (g->err). */
 /// @param s  the server
 /// @param g  the request's generation state
-/// @param base  the round's base token (not yet emitted)
+/// @param base_id  the round's base token (not yet emitted; L334 P3: an id, not the KV cache's `base` count)
 /// @param drafts  the pending drafts
 /// @param n  how many
 /// @return the acceptable prefix length, or -1
-int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, int base, const int32_t *drafts, int n);
+int gen_constrain_draft_prefix(struct server *s, struct gen_state *g, TokId base_id, const int32_t *drafts, int n);
 /** The base draw's mask for a speculative round's assemble (live only; the gate's buffer, valid until the next
  *  call).  NULL + g->err on failure. */
 /// @param s  the server

@@ -145,13 +145,14 @@ int GATE_ENTRY(int argc, char **argv) {
             if (n_rounds == 0) {
                 first = toks.v[pos];
             } else {
-                first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp);
+                first = pulsar_session_spec_next_base(s, temperature, top_k, top_p, min_p, rngp).raw();
                 if (first != toks.v[pos]) {
                     fprintf(stderr, "forced carry lost: next_base=%d truth=%d at pos %d\n", first, toks.v[pos], pos);
                     goto done;
                 }
             }
-            if (pulsar_session_spec_round_begin(s, r, first, 17, 17, temperature, top_k, top_p, min_p, err, sizeof err) != 0) {
+            if (pulsar_session_spec_round_begin(s, r, TokId{first}, 17, 17, temperature, top_k, top_p, min_p, err,
+                                                sizeof err) != 0) {
                 fprintf(stderr, "round_begin at %d: %s\n", pos, err);
                 goto done;
             }
@@ -195,7 +196,7 @@ int GATE_ENTRY(int argc, char **argv) {
             /* forced end: the corpus decides acceptance and the carry */
             if (!pulsar_session_bank_state_restore(s, bank0)) { fprintf(stderr, "bank restore failed\n"); goto done; }
             int accepted[17];
-            const int na = pulsar_session_spec_round_end_forced(s, r, first, temperature, top_k, top_p, min_p,
+            const int na = pulsar_session_spec_round_end_forced(s, r, TokId{first}, temperature, top_k, top_p, min_p,
                                                                 rngp, 0u, toks.v + pos + 1, accepted, 17,
                                                                 err, sizeof err);
             if (na < 0) { fprintf(stderr, "round_end_forced at %d: %s\n", pos, err); goto done; }

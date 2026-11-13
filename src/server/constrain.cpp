@@ -848,11 +848,13 @@ int gen_constrain_round(server *s, gen_state *g, const int *toks, int n, bool ba
  * matcher to take each token instead of filling a mask per row: the pick needs only where the chain stops.  Copy
  * chains are where it bites (a quote of the history runs straight past the grammar), and a drafter's chain is cut
  * by the same rule. */
-int gen_constrain_draft_prefix(server *s, gen_state *g, int base, const int32_t *drafts, int n) {
+int gen_constrain_draft_prefix(server *s, gen_state *g, TokId base_id, const int32_t *drafts, int n) {
     constrain_gate *gt = g->gate;
     if (n <= 0) return 0;
     const int V = (int)s->token_bytes->size();
-    if (!gt || gate_injected(g) || base < 0 || base >= V) return n;   /* the round's walk decides (and fails) */
+    /* the grammar's token table is this check's vocab authority (L334 P3); the round's walk decides (and fails) */
+    if (!gt || gate_injected(g) || !base_id.below((uint32_t)V)) return n;
+    const int base = base_id.raw();   /* the gate's matcher takes the raw id */
     int fed = 0, keep = 0;
     const std::string &bb = (*s->token_bytes)[(size_t)base];
     if (gate_feed(gt, base, bb.data(), bb.size())) {

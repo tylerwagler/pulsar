@@ -248,14 +248,14 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
             if (!pulsar_session_bank_state_restore(s, (uint32_t)b)) {
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
-            first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]);
+            first[b] = pulsar_session_spec_next_base(s, temp, 0, top_p, min_p, &rng[b]).raw();
             if (pulsar_token_is_stop(e, TokId{first[b]})) {
                 seq[t0 + b][got[b]++] = first[b];
                 live[b] = 0;
                 pulsar_session_bank_state_save(s, (uint32_t)b);
                 continue;
             }
-            if (pulsar_session_spec_round_begin(s, r[b], first[b], DEPTH - got[b], 17,
+            if (pulsar_session_spec_round_begin(s, r[b], TokId{first[b]}, DEPTH - got[b], 17,
                                                 temp, 0, top_p, min_p, err, errlen) != 0)
                 return -1;
             begun[b] = 1;
@@ -294,7 +294,7 @@ static int sampled_spec_batch(pulsar_session *s, const start_state *snap,
                 snprintf(err, errlen, "bank %d restore failed", b); return -1;
             }
             int accepted[17];
-            const int na = pulsar_session_spec_round_end(s, r[b], first[b], temp, 0, top_p, min_p,
+            const int na = pulsar_session_spec_round_end(s, r[b], TokId{first[b]}, temp, 0, top_p, min_p,
                                                          &rng[b], row0[b], accepted, 17,
                                                          err, errlen);
             if (na < 0) return -1;

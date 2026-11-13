@@ -1714,7 +1714,7 @@ int pulsar_session_bank_spec_depth(pulsar_session *s, uint32_t bank);
  *  @param tok receives the drafts
  *  @param conf receives their confidences
  *  @return the pending count */
-uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, int32_t *base, int32_t tok[16],
+uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, TokId *base, int32_t tok[16],
                                       float conf[16]);
 /** The carry-or-sample base draw (the head of generate_speculative). Never
  * returns EOS handling -- the caller checks and short-circuits like
@@ -1726,8 +1726,8 @@ uint32_t pulsar_session_bank_pendings(const pulsar_session *s, uint32_t bank, in
  *  @param top_p as pulsar_row_draw
  *  @param min_p as pulsar_row_draw
  *  @param rng the request's stream (read, not stepped)
- *  @return the base token, or PULSAR_SAMPLE_REFUSED */
-int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
+ *  @return the base token, or none() (refused; L334 P3: was PULSAR_SAMPLE_REFUSED) */
+TokId pulsar_session_spec_next_base(pulsar_session *s, float temperature,
                                int top_k, float top_p, float min_p,
                                uint64_t *rng);
 /** Begin a round on the installed bank: guard and trim the pendings, snapshot the frontier, push the base and
@@ -1745,7 +1745,7 @@ int pulsar_session_spec_next_base(pulsar_session *s, float temperature,
  *  @param errlen bytes at err
  *  @return 0, or -1 (snapshot failure; the session is poisoned) */
 int pulsar_session_spec_round_begin(pulsar_session *s, pulsar_spec_round *r,
-                                 int first_token, int max_tokens, int accepted_cap,
+                                 TokId first_token, int max_tokens, int accepted_cap,
                                  float temperature, int top_k, float top_p,
                                  float min_p, char *err, size_t errlen);
 /** Rows a begun round will occupy (1 + surviving drafts). Check the caller's
@@ -1782,7 +1782,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
  *  @param errlen bytes at err
  *  @return tokens emitted, or -1 */
 int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
-                               int first_token,
+                               TokId first_token,
                                float temperature, int top_k, float top_p,
                                float min_p, uint64_t *rng,
                                uint32_t row0,
@@ -1813,7 +1813,7 @@ int pulsar_session_spec_round_end(pulsar_session *s, pulsar_spec_round *r,
  *  @param errlen bytes at err
  *  @return tokens emitted, or -1 */
 int pulsar_session_spec_round_end_forced(pulsar_session *s, pulsar_spec_round *r,
-                                      int first_token,
+                                      TokId first_token,
                                       float temperature, int top_k, float top_p,
                                       float min_p, uint64_t *rng,
                                       uint32_t row0,
@@ -1913,8 +1913,8 @@ typedef struct {
     /** Rows in `masks`. */
     uint32_t mask_rows;
     /* assemble out, round_end in */
-    /** The round's base token, drawn by assemble; -1 when the step drew none. */
-    int first_token;
+    /** The round's base token, drawn by assemble; none() when the step drew none (L334 P3: was -1). */
+    TokId first_token;
     /** The bank's first row in the shared forward. */
     uint32_t row0;           /* the bank's first row in the shared forward */
     /** Rows the bank contributed to the shared forward (base + drafts). */
@@ -2113,7 +2113,7 @@ int pulsar_session_generate_speculative(pulsar_session *s, float temperature, in
  *  @param errlen bytes at err
  *  @return tokens emitted (0 on bad arguments), or -1 (a failure; a tensor-parallel session, which no frame mirrors
  *          this entry for) */
-int pulsar_session_eval_speculative_block(pulsar_session *s, int first_token,
+int pulsar_session_eval_speculative_block(pulsar_session *s, TokId first_token,
                                         int max_tokens,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);

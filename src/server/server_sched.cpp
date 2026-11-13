@@ -4578,7 +4578,8 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             gen_state *ag = dec[i]->gen;
             if (!ag || ag->phase != GEN_DECODE) continue;
             float conf[16];
-            int32_t pbase, ptok[16];
+            TokId pbase;
+            int32_t ptok[16];
             uint32_t np = pulsar_session_bank_pendings(pool, (uint32_t)dec[i]->bank, &pbase, ptok, conf);
             /* L309: a chain under a grammar ends before its first draft the grammar refuses */
             if (np > 0 && ag->gate) {
@@ -4779,7 +4780,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
             case PULSAR_SPEC_STEP_OK:
                 row0s[m] = st->row0;
                 row_nb[m] = (int)st->n_rows;
-                first_tok[m] = st->first_token;
+                first_tok[m] = st->first_token.raw();
                 live_idx[m] = i;
                 m++;
                 break;
@@ -4789,7 +4790,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 /* generate_speculative's short-circuit: emit EOS, never eval it. */
                 slot_writer_install(&g->writer);
                 if (g->first_token_t == 0.0) g->first_token_t = server_now_sec();
-                (void)s->gen_emit_token(sl, st->first_token);
+                (void)s->gen_emit_token(sl, st->first_token.raw());
                 g->phase = GEN_FINISH;
                 emitted_total++;
                 break;
@@ -4801,7 +4802,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 gen_bank_install_failed(g, sl->bank);
                 break;
             default:
-                if (st->first_token < 0) snprintf(g->err, sizeof g->err, "%s", st->err);
+                if (!st->first_token.is_token()) snprintf(g->err, sizeof g->err, "%s", st->err);
                 else snprintf(g->err, sizeof g->err, "spec round begin failed: %s", st->err);
                 g->finish = "error";
                 g->phase = GEN_FINISH;
@@ -5011,7 +5012,7 @@ void server::worker_spec_batched_quantum(session_slot **dec, int n, int quantum_
                 }
             }
             st->rng = &g->rng;
-            st->first_token = first_tok[q];
+            st->first_token = TokId{first_tok[q]};
             st->row0 = row0s[q];
             st->accepted = accepted[q];
             st->accepted_cap = (int)(PULSAR_SPEC_LOGITS_ROWS + 1);
