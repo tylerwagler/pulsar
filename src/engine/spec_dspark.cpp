@@ -353,13 +353,13 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
         }
         for (uint32_t k = 0; k < q->n_draft; k++) {
             /* the noise-token forward: row 0 the carry, the rest DSpark's noise id */
-            draft_ids[n_rows] = k == 0 ? q->next_base : PULSAR_DSPARK_NOISE_TOKEN_ID;
+            draft_ids[n_rows] = k == 0 ? q->next_base.raw() : PULSAR_DSPARK_NOISE_TOKEN_ID;
             row_bank[n_rows] = banks ? banks[j] : 0u;
             n_rows++;
         }
         if (j < n_g) { if (q->n_draft > max_draft_g) max_draft_g = q->n_draft; }
         else         { if (q->n_draft > max_draft_s) max_draft_s = q->n_draft; }
-        q->refined[0] = q->next_base;
+        q->refined[0] = q->next_base.raw();
         for (int k = 1; k < 17; k++) q->refined[k] = 0;
         for (int k = 0; k < 16; k++) q->conf[k] = -1.0f;
         q->have_conf = false;
@@ -395,7 +395,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     /* seed the chain feed: ids[j][0] = next_base */
     int32_t ids_seed[PULSAR_DSPARK_BANKS_MAX * 17];
     memset(ids_seed, 0, sizeof(ids_seed));
-    for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = qs[j]->next_base;
+    for (int j = 0; j < n_sel; j++) ids_seed[j * 17] = qs[j]->next_base.raw();
     if (!pulsar_gpu_tensor_write(g->dspark_bank_meta, 0, meta, sizeof(meta)) ||
         !pulsar_gpu_tensor_write(g->dspark_refined_ids, 0, ids_seed,
                                  (uint64_t)n_sel * 17 * sizeof(int32_t))) {
@@ -500,7 +500,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
     }
     /* the offline-validation / confidence-training dump (single lane): after the markov refine, while
      * batch_ffn_cur still holds the post-hc_head rows the confidence kernel consumes */
-    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, (int)qs[0]->next_base, qs[0]->refined,
+    if (!banks && !defer) dspark_dump_step(g, (int)s->checkpoint.len, qs[0]->next_base.raw(), qs[0]->refined,
                                            (int)qs[0]->n_draft);
     /* the confidence head over every row: tok row (j, k) = refined_j[k] -- the draft BEFORE position k, so
      * conf[k] is scored without the draft it judges (the stop is a stopping time) -- then the stop rule */
@@ -556,7 +556,7 @@ static int dspark_draft_group(pulsar_session *s, spec_redraft_req *const *qs, co
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED (said) when the drafting pass failed
-static uint32_t dspark_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+static uint32_t dspark_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p, float min_p,
                              uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);

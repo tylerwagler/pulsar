@@ -2410,7 +2410,7 @@ static void test_l344_thinking_budget_parse(void) {
  * follows its first i + off tokens, so the row where budget runs out is forced -- unless a pending token closed
  * the block first.  The mask row allows the close token alone; the others stay the grammar's or unconstrained. */
 static void test_l344_thinking_budget_close_row(void) {
-    const int close = 77;
+    const TokId close{77};
     /* plain: due at the budget, not before; no budget / closed block: never */
     TEST_ASSERT(think_close_row(100, true, 99, close, NULL, 0, 0) == -1);
     TEST_ASSERT(think_close_row(100, true, 100, close, NULL, 0, 0) == 0);
@@ -2427,7 +2427,7 @@ static void test_l344_thinking_budget_close_row(void) {
     TEST_ASSERT(think_close_row(100, true, 98, close, r1 + 1, 3, 0) == 2);
     TEST_ASSERT(think_close_row(100, true, 100, close, r1 + 1, 3, 0) == 0);
     /* a draft closes the block before the budget row: nothing forced past it */
-    const int r2[] = {5, close, 7, 8};
+    const int r2[] = {5, close.raw(), 7, 8};
     TEST_ASSERT(think_close_row(100, true, 97, close, r2, 4, 1) == -1);
     TEST_ASSERT(think_close_row(100, true, 99, close, r2, 4, 1) == 0);   /* ...but a row before it still is */
 
@@ -2437,9 +2437,10 @@ static void test_l344_thinking_budget_close_row(void) {
     for (size_t i = 0; i < 2 * W; i++) gram[i] = 0x0f0f0f0fu + (uint32_t)i;
     think_masks_lay(out, W, 1, 3, close, gram, 2);
     TEST_ASSERT(!memcmp(out, gram, W * sizeof(uint32_t)));
-    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == (size_t)close / 32u ? 1u << (close % 32) : 0u));
+    const uint32_t cb = (uint32_t)close.raw();   /* the close token's bit */
+    for (size_t w = 0; w < W; w++) TEST_ASSERT(out[W + w] == (w == cb / 32u ? 1u << (cb % 32u) : 0u));
     for (size_t w = 0; w < W; w++) TEST_ASSERT(out[2 * W + w] == 0xffffffffu);
-    think_masks_lay(out, W, 0, 1, 0, NULL, 0);
+    think_masks_lay(out, W, 0, 1, TokId{0}, NULL, 0);
     TEST_ASSERT(out[0] == 1u && out[1] == 0u && out[2] == 0u && out[3] == 0u);
 }
 
@@ -12970,7 +12971,7 @@ static void test_l293_batch_leave_stops_at_the_budget(void) {
         g.completion = completion;
         g.batch_active = true;
         g.batch_feed_valid = true;   /* the last step sampled the next feed token */
-        g.batch_feed_token = 42;
+        g.batch_feed_token = TokId{42};
         g.batch_feed_pos = TokPos{100 + completion};
         sl.gen = &g;
         sl.active_job = &j;

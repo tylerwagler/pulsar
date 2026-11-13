@@ -70,13 +70,13 @@ uint32_t pulsar_spec_cur_depth(const pulsar_session *s) {
  * alone (pulsar_spec_keep_picked, L301) at the copy acceptance the engine has measured.  The verify is unchanged, so
  * every emitted token is still the target's.  A backward scan of the history: O(history) a round, no index to keep in
  * step with a history that rewinds and resyncs. */
-uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, int32_t next_base, uint32_t max, int32_t *out) {
+uint32_t pulsar_spec_copy_chain(pulsar_session *s, uint32_t bank, TokId next_base, uint32_t max, int32_t *out) {
     const uint32_t m = PULSAR_SPEC_COPY_MATCH;
     const pulsar_tokens *h = pulsar_bank_history(s, bank);
     if (!h || max == 0u || (uint32_t)h->len + 1u < 2u * m) return 0;
     const int32_t *v = h->v;
     const uint32_t L = (uint32_t)h->len + 1u;   /* the history, then next_base at index L - 1 */
-    auto at = [&](uint32_t i) -> int32_t { return i + 1u < L ? v[i] : next_base; };
+    auto at = [&](uint32_t i) -> int32_t { return i + 1u < L ? v[i] : next_base.raw(); };   /* the history is raw */
     const uint32_t need = max < m ? max : m;
     uint32_t best = 0, best_at = 0;
     /* an earlier copy starts at i <= L - m - 1 (L - m is the tail itself); latest first */
@@ -145,11 +145,11 @@ void pulsar_spec_copy_age(pulsar_spec_carry_state *sp, uint32_t tokens) {
     sp->copy_unseen = sp->copy_unseen > UINT32_MAX - tokens ? UINT32_MAX : sp->copy_unseen + tokens;
 }
 
-void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next_base, float temperature, int top_k,
+void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, TokId next_base, float temperature, int top_k,
                                 float top_p, float min_p) {
     q->valid = true;
     q->done = false;
-    q->next_base = (int32_t)next_base;
+    q->next_base = next_base;
     q->n_draft = pulsar_spec_cur_depth(s);
     q->temperature = temperature;
     q->top_k = top_k;
@@ -176,7 +176,7 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, int next
     const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp);
     if (n_cp == 0) return;
     q->keep = n_cp < admit ? n_cp : admit;
-    q->refined[0] = q->next_base;
+    q->refined[0] = q->next_base.raw();
     for (uint32_t k = 0; k < q->keep; k++) q->refined[k + 1] = cp[k];
     pulsar_spec_keep_picked(s, 1u, &q, 1u);
     if (q->keep == 0) return;   /* no copy draft is worth its row: the drafter drafts */
@@ -644,7 +644,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
         void *snap = r->snap;
         memset(r, 0, sizeof(*r));
         r->snap = snap;
-        r->base = (int32_t)first_token;
+        r->base = TokId{first_token};
     }
     uint32_t &K = r->K;
     uint32_t &n_batch = r->n_batch;
@@ -658,7 +658,7 @@ static int spec_round_begin(pulsar_session *s, int first_token,
     pulsar_session_spec_chain_harvest(s);   /* L108 P2 */
     K = s->spec.n_pend;
     if (K > 16u) K = 16u;
-    if (K && s->spec.pend_base != (int32_t)first_token) K = 0;
+    if (K && s->spec.pend_base != TokId{first_token}) K = 0;
     /* Position guard — ACCEPTANCE, not exactness. The drafts were conditioned on
      * the old position; pend_base is a token VALUE, so a plain eval
      * that advances the session (tool injection, </think> recovery) followed by
@@ -996,7 +996,7 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
      * so the next generate_speculative call forwards it as batch position 0;
      * pre-draft the NEXT block conditioned on it. */
     const int next_base = carry_tok;
-    s->spec.spec_carry_token = (int32_t)carry_tok;
+    s->spec.spec_carry_token = TokId{carry_tok};
     s->spec.spec_carry_valid = !hit_eos;
     s->spec.spec_carry_pos = s->hist_end();
     s->spec.spec_carry_temp = carry_temp;
@@ -1020,13 +1020,13 @@ static int spec_round_end(pulsar_session *s, pulsar_spec_round *r,
          * cannot serve simply takes a plain n=1 step next round. */
         pulsar_spec_drop_pendings(&s->spec);
         spec_redraft_req *q = &r->redraft;
-        pulsar_spec_draft_req_init(s, q, next_base, carry_temp, top_k, top_p, min_p);
+        pulsar_spec_draft_req_init(s, q, TokId{next_base}, carry_temp, top_k, top_p, min_p);
         return n_accept;
     }
     uint32_t keep;
     {
         PULSAR_NVTX("spec: draft");
-        keep = spec_drafter(s)->draft(s, next_base, carry_temp, top_k, top_p, min_p, rng);
+        keep = spec_drafter(s)->draft(s, TokId{next_base}, carry_temp, top_k, top_p, min_p, rng);
     }
     if (keep == PULSAR_DRAFT_REFUSED) {   /* L306: the drafter refused the next chain (its line says why) */
         snprintf(err, errlen, "spec round: the drafter refused the next chain");
@@ -1173,7 +1173,7 @@ int pulsar_session::generate_speculative(float temperature, int top_k,
      * means s->logits no longer matches the carry's source distribution */
     const bool carry_pos_match = s->spec.spec_carry_pos == s->hist_end();
     if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
-        first = (int)s->spec.spec_carry_token;
+        first = s->spec.spec_carry_token.raw();
         s->spec.spec_carry_valid = false;
     } else {
         /* no carry, or params changed mid-stream (e.g. tool-call payloads
@@ -1267,7 +1267,7 @@ int pulsar_session_spec_next_base_local(pulsar_session *s, float temperature,
         s->spec.spec_carry_top_p == top_p && s->spec.spec_carry_min_p == min_p;
     const bool carry_pos_match = s->spec.spec_carry_pos == s->hist_end();
     if (s->spec.spec_carry_valid && carry_params_match && carry_pos_match) {
-        first = (int)s->spec.spec_carry_token;
+        first = s->spec.spec_carry_token.raw();
         s->spec.spec_carry_valid = false;
     } else {
         s->spec.spec_carry_valid = false;
@@ -1292,7 +1292,7 @@ uint32_t pulsar_spec_round_fill_reqs(const pulsar_spec_round *r, uint32_t bank, 
     for (uint32_t i = 0; i < r->n_batch; i++) {
         out[i].bank = bank;
         out[i].pos = r->saved_len + TokCount{(int)i};
-        out[i].token = TokId{i == 0 ? (int)r->base : (int)r->pend[i - 1]};
+        out[i].token = i == 0 ? r->base : TokId{r->pend[i - 1]};
     }
     return r->n_batch;
 }

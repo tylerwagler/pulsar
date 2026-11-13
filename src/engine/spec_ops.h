@@ -114,7 +114,7 @@ typedef struct pulsar_drafter_ops {
      *  Returns the pending count kept, or PULSAR_DRAFT_REFUSED: the drafter refused the chain (its line says why), and
      *  the round refuses with it (L306) -- it never continues as a plain round.  The drafter's conditioning
      *  features are those of the last committed row: the round's absorb ran before this. */
-    uint32_t (*draft)(struct pulsar_session *s, int next_base, float temperature, int top_k, float top_p,
+    uint32_t (*draft)(struct pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p,
                       float min_p, uint64_t *rng);
     /** Optional.  Finish a deferred device draft into the installed bank's pendings. */
     void (*harvest)(struct pulsar_session *s);

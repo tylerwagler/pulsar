@@ -1539,7 +1539,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             if (q->copied) continue;
             q->keep = 0;
             q->have_conf = true;
-            q->refined[0] = q->next_base;
+            q->refined[0] = q->next_base.raw();
             const uint32_t P = pulsar_ckpt_raw(ss->bank_pos[banks[i]]);   /* the chain's room is raw */
             if (P == 0 || q->n_draft == 0 || (uint64_t)P + 1u >= ss->ctx) continue;   /* no context, or no room */
             if (q->temperature > 0.0f && !rngs[i]) {
@@ -1548,7 +1548,7 @@ bool draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t *const *rng
             }
             pb[nb] = banks[i];
             pp[nb] = P;
-            pc[nb] = q->next_base;
+            pc[nb] = q->next_base.raw();
             pi[nb++] = i;
         }
         i0 = i;
@@ -1721,7 +1721,7 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
 /// @param min_p request min-p
 /// @param rng the request's stream
 /// @return drafts kept, or PULSAR_DRAFT_REFUSED
-uint32_t block_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+uint32_t block_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p, float min_p,
                      uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);

@@ -343,7 +343,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
         if (!ch.copy) {
             q->keep = 0;
             q->have_conf = true;
-            q->refined[0] = q->next_base;
+            q->refined[0] = q->next_base.raw();
         }
         if (ch.sampled && !rngs[i]) {
             snprintf(err, errlen, "%s: sampled speculation needs the request's rng", ARCH(s));
@@ -504,7 +504,7 @@ static bool mtp_draft_chains(pulsar_session *s, const uint32_t *banks, uint64_t 
 }
 
 /* The single lane's draft: the chain into a record, the record stamped into the bank's pendings. */
-uint32_t pulsar_mtp_draft(pulsar_session *s, int next_base, float temperature, int top_k, float top_p, float min_p,
+uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature, int top_k, float top_p, float min_p,
                           uint64_t *rng) {
     spec_redraft_req rec;
     memset(&rec, 0, sizeof rec);

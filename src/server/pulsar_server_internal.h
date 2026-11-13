@@ -4581,7 +4581,7 @@ struct gen_state {
     bool batch_active;      ///< this slot is in the shared multiseq lane (it leaves at finish, or for the family's
                             ///< speculation once that lane can carry every decoder: server::batch_leave, L271/L284)
     bool batch_feed_valid;  ///< batch_feed_token/_pos hold a real pending commit
-    int  batch_feed_token;  ///< next token to commit
+    TokId batch_feed_token;  ///< next token to commit (L334 P3)
     TokPos batch_feed_pos;  ///< position to commit it at (the bank's KV frontier)
     pulsar_tokens batch_pending;  ///< tokens committed via multiseq since the bank's last host checkpoint
     /** plan-34 inc 5: why this prefill slot is not fusable (NULL: it may fuse) -- a
@@ -4794,9 +4794,9 @@ bool request_tokenize_rendered(pulsar_engine *e, struct request *r, char *err, s
 void request_free(request *r);
 bool parse_thinking_control_value(const char **p, bool *thinking_enabled, int *budget_tokens);
 /** L344: the draw at which the budget closes the block, pure (server_sched.cpp). */
-int think_close_row(int budget, bool open, int think_tokens, int close, const int *toks, int n, int off);
+int think_close_row(int budget, bool open, int think_tokens, TokId close, const int *toks, int n, int off);
 /** L344: lay the forced-close mask rows, pure (server_sched.cpp). */
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, const uint32_t *gram, int gram_rows);
+void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows);
 /** L344: the draw at which the thinking budget closes the reasoning block (server_sched.cpp). */
 int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, int off);
 /** L344: mask rows forcing the close token at one row (server_sched.cpp). */

@@ -4656,7 +4656,7 @@ static void test_spec_round_refusals(void) {
     e->drafter_ops = &drafter;
     /* O39: five drafts pending at position 3 of a 6-token context -- rows at 3, 4, 5: the base and two drafts */
     s->spec.n_pend = 5;
-    s->spec.pend_base = 4;
+    s->spec.pend_base = TokId{4};
     s->spec.pend_pos = TokPos{3};
     s->spec.pend_top_p = 1.0f;
     for (int i = 0; i < 5; i++) s->spec.pend[i] = 5;
@@ -4670,7 +4670,7 @@ static void test_spec_round_refusals(void) {
     /* O37: a begun round whose end cannot walk (sampled, no stream) is undone */
     s->checkpoint_valid = true;
     s->spec.n_pend = 1;
-    s->spec.pend_base = 4;
+    s->spec.pend_base = TokId{4};
     s->spec.pend_pos = TokPos{3};
     s->spec.pend_temp = 0.7f;
     s->spec.pend_top_p = 1.0f;

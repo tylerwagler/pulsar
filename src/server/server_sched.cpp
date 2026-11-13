@@ -2517,12 +2517,12 @@ size_t gen_think_mask_words(const server *s) {
 /// @param n             how many
 /// @param off           1 when toks[0] is the base (row 0 follows it), else 0
 /// @return the row to force, or -1 (no budget, block closed, or the budget not reached within the round)
-int think_close_row(int budget, bool open, int think_tokens, int close, const int *toks, int n, int off) {
+int think_close_row(int budget, bool open, int think_tokens, TokId close, const int *toks, int n, int off) {
     if (budget <= 0 || !open) return -1;
     const int rows = n - off + 1;
     for (int i = 0; i < rows; i++) {
         const int pre = i + off;   /* the round's tokens before row i */
-        if (pre > 0 && toks[pre - 1] == close) return -1;
+        if (pre > 0 && TokId{toks[pre - 1]} == close) return -1;
         if (think_tokens + pre >= budget) return i;
     }
     return -1;
@@ -2539,7 +2539,7 @@ int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, i
     const int budget = g->j->req.think_budget;
     if (budget <= 0) return -1;
     return think_close_row(budget, g->thinking.inside && !g->think_closed, g->think_tokens,
-                           pulsar_token_think_close(s->engine).raw(), toks, n, off);
+                           pulsar_token_think_close(s->engine), toks, n, off);
 }
 
 /// @brief Lay `rows` mask rows of `W` words into `out`: each the grammar's (`gram`, `gram_rows` of them) or
@@ -2551,7 +2551,8 @@ int gen_think_close_row(server *s, const gen_state *g, const int *toks, int n, i
 /// @param close      the token row `row` allows
 /// @param gram       the grammar's rows (NULL: none)
 /// @param gram_rows  rows in `gram`
-void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, const uint32_t *gram, int gram_rows) {
+void think_masks_lay(uint32_t *out, size_t W, int row, int rows, TokId close, const uint32_t *gram, int gram_rows) {
+    const uint32_t bit = (uint32_t)close.raw();   /* its bit (the caller bounded it by W * 32) */
     for (int i = 0; i < rows; i++) {
         uint32_t *r = out + (size_t)i * W;
         if (gram && i < gram_rows) memcpy(r, gram + (size_t)i * W, W * sizeof(uint32_t));
@@ -2559,7 +2560,7 @@ void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, cons
     }
     uint32_t *f = out + (size_t)row * W;
     memset(f, 0, W * sizeof(uint32_t));
-    f[(uint32_t)close >> 5] = 1u << ((uint32_t)close & 31u);
+    f[bit >> 5] = 1u << (bit & 31u);
 }
 
 /// @brief Mask rows for a round whose row `row` is forced to the close token: `rows` rows, each the grammar's
@@ -2574,8 +2575,10 @@ void think_masks_lay(uint32_t *out, size_t W, int row, int rows, int close, cons
 /// @return the rows (rows x the engine's mask width); NULL with g->err set when a grammar row is another width
 const uint32_t *gen_think_masks(server *s, gen_state *g, int row, int rows, const uint32_t *gram, int gram_rows) {
     const size_t W = gen_think_mask_words(s);
-    const int close = pulsar_token_think_close(s->engine).raw();
-    if (close < 0 || (size_t)close >= W * 32u) {   /* chat_resolve_thinking refused a budget without one */
+    const TokId close = pulsar_token_think_close(s->engine);
+    /* chat_resolve_thinking refused a budget without one; the mask rows' width is this check's vocab authority
+     * (L334 P3) */
+    if (!close.below((uint32_t)(W * 32u))) {
         snprintf(g->err, sizeof g->err, "thinking budget: the model has no close token in the sampler's rows");
         return NULL;
     }
@@ -4083,7 +4086,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
     for (int q = 0; q < m; q++) {
         session_slot *sl = dec[live_idx[q]];
         gen_state *g = sl->gen;
-        const int committed = g->batch_feed_token; /* committed at batch_feed_pos */
+        const int committed = g->batch_feed_token.raw(); /* committed at batch_feed_pos */
         g->batch_feed_pos += TokCount{1};
         sl->committed_pos = g->batch_feed_pos;
         sl->tokens_emitted++;   /* L118: classic-loop accounting parity */
@@ -4112,7 +4115,7 @@ static void lane_emit_and_draw(server *s, session_slot **dec, const int *live_id
         for (uint32_t k = 0; k < nd; k++) tok[k] = PULSAR_SAMPLE_REFUSED;
     for (uint32_t k = 0; k < nd; k++) {
         gen_state *g = who[k];
-        g->batch_feed_token = tok[k];
+        g->batch_feed_token = TokId{tok[k]};
         if (tok[k] < 0) {
             snprintf(g->err, sizeof g->err, "sampler refused a degenerate logits row (L188)");
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
@@ -4176,15 +4179,15 @@ void server::worker_batched_decode_quantum(session_slot **dec, int n, int quantu
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
-        if (g->batch_feed_token < 0) {
+        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
         /* The bank is live and its classic logits are what this token was drawn
          * from; after the multiseq step below they describe nothing (the step
          * leaves s->logits untouched by contract), so capture here or never. */
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true;
@@ -5271,7 +5274,7 @@ bool server::batch_leave(session_slot *sl) {
     /* the token the batch sampled (its logprob already captured) is committed here as the batch's next
      * step would have: fed, counted, emitted -- so the session's logits are fresh for the family's
      * generate, which draws the token after it */
-    const int tok = g->batch_feed_token;
+    const int tok = g->batch_feed_token.raw();
     g->batch_feed_valid = false;
     char err[160] = "";
     if (pulsar_session_eval(pool, TokId{tok}, err, sizeof err) != 0) {
@@ -5445,12 +5448,12 @@ void server::worker_mixed_batch_quantum(session_slot **dec, int n, session_slot 
         }
         float temp, top_p, min_p; int top_k;
         gen_resolve_sampling_decode(g, &temp, &top_k, &top_p, &min_p);
-        g->batch_feed_token = gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p);
-        if (g->batch_feed_token < 0) {
+        g->batch_feed_token = TokId{gen_sample_pool(s, g, pool, temp, top_k, top_p, min_p)};
+        if (!g->batch_feed_token.is_token()) {
             g->finish = "error"; g->batch_feed_valid = false; g->phase = GEN_FINISH;
             continue;
         }
-        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token);
+        logprob_capture_session(&g->logprobs, pool, g->batch_feed_token.raw());
         g->batch_feed_pos = pulsar_session_pos(pool);
         pulsar_session_bank_state_save(pool, (uint32_t)sl->bank);
         g->batch_feed_valid = true; g->batch_active = true;

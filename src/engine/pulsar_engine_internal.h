@@ -2450,7 +2450,7 @@ typedef struct pulsar_spec_carry_state {
     /** The base token the pending drafts continue from (predicted greedy next).
      * If the caller's next first_token differs (non-greedy interruption, tool
      * injection), the pending drafts are stale and dropped. */
-    int32_t pend_base;
+    TokId pend_base;   ///< L334 P3: the base the pendings were drafted from
     /** checkpoint.len the drafts were produced at — an ACCEPTANCE guard, not an
      * exactness guard. The base-token check above is a VALUE check, not an
      * identity check: a plain pulsar_session_eval (tool injection, think-tag
@@ -2475,7 +2475,7 @@ typedef struct pulsar_spec_carry_state {
      * draw on rejection) but NOT yet forwarded through the target. The next
      * generate_speculative call forwards it as batch position 0. Invalidated
      * with the pendings on rewind/invalidate/sync. */
-    int32_t spec_carry_token;  ///< the drawn-but-unemitted base token
+    TokId spec_carry_token;    ///< the drawn-but-unemitted base token
     bool spec_carry_valid;     ///< false once the carry has been consumed or voided
     /** checkpoint.len the carry was drawn at; any session advance outside the
      * speculative path (sync, plain eval) moves it and voids the carry */
