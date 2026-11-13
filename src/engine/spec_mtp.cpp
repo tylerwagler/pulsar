@@ -251,25 +251,26 @@ bool pulsar_mtp_absorb_banked(pulsar_session *s, const uint32_t *rows, const uin
             ok = false;
             break;
         }
-        /* the commit moved the counter past the kept rows; L334 P2b S7b: the step's row positions stay raw */
-        const uint32_t p0 = pulsar_ckpt_raw(ss->bank_pos[b] - TokCount{(int)k});
+        /* the commit moved the counter past the kept rows: one run of the step from rows[i], ending there (hazard
+         * (f): a row distance is a token count only through the run map) */
+        const pulsar_step_run kept{StepRow{(int)rows[i]}, ss->bank_pos[b] - TokCount{(int)k}, StepRows{(int)k}};
         if (l->stage_dirty[b]) {
             ok = ops->stage_restore(s, b);
             l->stage_dirty[b] = false;
         }
-        /* a row still parked at p0 - 1 -- no chain consumed it (the round's first after a sync, or a round whose
+        /* a row still parked at pos0 - 1 -- no chain consumed it (the round's first after a sync, or a round whose
          * drafter did not run) -- pairs with the run's base token, the lockstep row a chain's step 1 would have
-         * written: the module's state has no hole at p0 - 1 */
-        if (ok && parked_before(l, b, pulsar_ckpt_pos(p0)) && rows[i] < l->n_vtok) {
+         * written: the module's state has no hole at pos0 - 1 */
+        if (ok && parked_before(l, b, kept.pos0) && rows[i] < l->n_vtok) {
             ok = pulsar_gpu_tensor_copy_async(l->cond, (uint64_t)m * cb, pend, (uint64_t)b * cb, cb) != 0;
             tok[m] = l->vtok[rows[i]];
-            pos[m] = (int32_t)p0 - 1;
+            pos[m] = (kept.pos0 - TokCount{1}).raw();
             bank[m++] = (int32_t)b;
         }
         if (ok && k > 1) ok = ops->trunk_rows(s, rows[i], k - 1u, l->cond, (uint64_t)m * cb);
         for (uint32_t r = 0; r + 1 < k; r++, m++) {
             tok[m] = next[i + r];
-            pos[m] = (int32_t)(p0 + r);
+            pos[m] = kept.pos_of(kept.first + StepRows{(int)r}).raw();
             bank[m] = (int32_t)b;
         }
         i = j;

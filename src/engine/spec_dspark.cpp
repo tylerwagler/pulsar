@@ -634,6 +634,7 @@ static void ds4_arm_verify(pulsar_session *s, uint32_t n_rows) {
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = n_rows;
     g->spec_comp_save_n = n_rows;
+    if (n_rows) g->spec_comp_saved_rows = n_rows;   /* the bound outlives the disarm */
 }
 
 /* The single lane's verify: ONE batched target forward over the round's rows with the drafter's anchor capture and
@@ -650,6 +651,7 @@ static bool ds4_verify_single(pulsar_session *s, pulsar_spec_round *r, char *err
     pulsar_gpu_graph *g = s->graph;
     g->dspark_capture_batch_n = r->n_batch;
     g->spec_comp_save_n = r->n_batch;   /* Stage-B: save per-position comp projections */
+    g->spec_comp_saved_rows = r->n_batch;
     const bool ok = gpu_graph_verify_suffix(g, &e->model, &e->weights, &s->checkpoint, pulsar_ckpt_raw(r->saved_len),
                                             r->n_batch);
     g->dspark_capture_batch_n = 0;
@@ -825,15 +827,21 @@ static bool ds4_spec_restore(pulsar_session *s, pulsar_spec_round *r) {
 /// @param s the session
 /// @param r the round
 /// @param commit drafts committed
-/// @param row0 the round's first row in the verify capture
+/// @param row0 the round's first row in the verify capture (a head row: the batched lane's offset in the logits)
 /// @return false = failed
 static bool ds4_commit(pulsar_session *s, pulsar_spec_round *r, uint32_t commit, uint32_t row0) {
     pulsar_engine *e = s->engine;
     /* a full accept: the verify advanced the target state by exactly the committed tokens */
     if (commit == r->K) return true;
+    /* hazard (b), named: the rollforward reads the comp-save rows by STEP row, and row0 is the round's HEAD row --
+     * the same row only because a verify leads its step and heads every row.  Both ends of the rows it reads are
+     * checked against the verify the saves came from (fatal past it). */
+    const uint32_t saved = s->graph->spec_comp_saved_rows;
+    const StepRow save0 = pulsar_verify_step_row(HeadRow{(int)row0}, saved);
+    (void)pulsar_verify_step_row(HeadRow{(int)(row0 + commit)}, saved);
     if (!ds4_spec_restore(s, r)) return false;
     return gpu_graph_dspark_compressor_rollforward(s->graph, &e->model, &e->weights,
-                                                   pulsar_ckpt_raw(r->saved_len), 1u + commit, row0);
+                                                   pulsar_ckpt_raw(r->saved_len), 1u + commit, pulsar_row_index(save0));
 }
 
 const pulsar_spec_target_ops k_ds4_spec_target = {

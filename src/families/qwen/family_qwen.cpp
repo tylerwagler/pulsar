@@ -1343,8 +1343,8 @@ static bool qwen_embed(const pulsar_driver_step *st) { return pulsar_qwen_s4_emb
 /// @param n rows
 /// @param out0 first logits row
 /// @return pulsar_qwen_s4_head's
-static bool qwen_head(const pulsar_driver_step *st, uint32_t row0, uint32_t n, uint32_t out0) {
-    return pulsar_qwen_s4_head(QS(st), row0, n, out0);
+static bool qwen_head(const pulsar_driver_step *st, StepRow row0, StepRows n, HeadRow out0) {
+    return pulsar_qwen_s4_head(QS(st), pulsar_row_index(row0), (uint32_t)n.raw(), pulsar_row_index(out0));
 }
 /// pulsar_driver_ops::step_end.
 /// @param st the core driver's step (a pulsar_qwen_step)

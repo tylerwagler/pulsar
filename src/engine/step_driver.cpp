@@ -17,10 +17,10 @@ static const pulsar_driver_ops *DOPS(const pulsar_engine *e) { return e->family-
 /** The engine's family arch name, for messages.  @param e the engine  @return pulsar_family::arch */
 static const char *ARCH(const pulsar_engine *e) { return e->family->arch; }
 
-pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n) {
+pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n) {
     pulsar_driver_heads h;
-    h.n = n;
-    for (uint32_t i = 0; i < n && i < PULSAR_DRIVER_HEADS_MAX; i++) h.row[i] = row0 + i;
+    h.n = (uint32_t)n.raw();
+    for (uint32_t i = 0; i < h.n && i < PULSAR_DRIVER_HEADS_MAX; i++) h.row[i] = row0 + StepRows{(int)i};
     return h;
 }
 
@@ -228,7 +228,7 @@ static uint64_t driver_graph_key(const pulsar_driver_state *d, bool verify, uint
     h = mix(h, verify ? 2u : 1u);
     h = mix(h, n_rows);
     h = mix(h, heads.n);
-    for (uint32_t i = 0; i < heads.n; i++) h = mix(h, heads.row[i]);
+    for (uint32_t i = 0; i < heads.n; i++) h = mix(h, pulsar_row_index(heads.row[i]));
     h = mix(h, family_key);
     return (h >> 4) | (0xDull << 60);
 }
@@ -393,10 +393,11 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
         }
         /* the head list into its logits rows (L284 #2): a span of consecutive decode rows is one call (a verify
          * heads every row), a prompt row is its own call -- the one-row head its classic chunk makes */
+        const StepRow dec_end = StepRow::after(StepRows{(int)st.n_dec});   /* rows [0, n_dec) are decode rows */
         for (uint32_t i = 0, j; lok && i < heads.n; i = j) {
-            for (j = i + 1; j < heads.n && heads.row[i] < st.n_dec && heads.row[j] == heads.row[j - 1] + 1u &&
-                            heads.row[j] < st.n_dec; j++) {}
-            lok = ops->head(&st, heads.row[i], j - i, i);
+            for (j = i + 1; j < heads.n && heads.row[i] < dec_end && heads.row[j] == heads.row[j - 1] + StepRows{1} &&
+                            heads.row[j] < dec_end; j++) {}
+            lok = ops->head(&st, heads.row[i], StepRows{(int)(j - i)}, HeadRow{(int)i});
         }
         return lok;
     };
@@ -451,8 +452,9 @@ static bool driver_forward(pulsar_session *s, pulsar_step_mode mode, const int32
     if (heads.n) {
         d->hidden_valid = ok;
         if (ok) {
-            d->hidden_bank = (uint32_t)bank[heads.row[heads.n - 1u]];
-            d->hidden_pos = (uint32_t)pos[heads.row[heads.n - 1u]];
+            const uint32_t last = pulsar_row_index(heads.row[heads.n - 1u]);
+            d->hidden_bank = (uint32_t)bank[last];
+            d->hidden_pos = (uint32_t)pos[last];
         }
     }
     if (ok && heads.n && logits_out)
@@ -489,13 +491,15 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
                                  bool last, void *ud) {
     driver_prefill_ctx *c = (driver_prefill_ctx *)ud;
     const pulsar_driver_ops *ops = DOPS(s->engine);
-    for (uint32_t r = 0; r < rows; r++) c->pos[r] = (int32_t)(pos0 + r);
+    /* the chunk is one run of the step: rows [0, rows) at positions [pos0, pos0 + rows) */
+    const pulsar_step_run chunk{StepRow{0}, pulsar_ckpt_pos(pos0), StepRows{(int)rows}};
+    for (uint32_t r = 0; r < rows; r++) c->pos[r] = chunk.pos_of(StepRow{(int)r}).raw();
     bool ok = driver_forward(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows,
-                                    pulsar_driver_heads_span(rows - 1u, last ? 1u : 0u), NULL);
+                                    pulsar_driver_heads_span(StepRow{(int)(rows - 1u)}, StepRows{last ? 1 : 0}), NULL);
     if (ok && last) ok = s->live_from_rows(s->driver->logits, 0);
     if (ok && ops->absorb)
         ok = ops->absorb(s, PULSAR_STEP_PREFILL, prompt->v + pos0, c->pos, c->bank, rows, 0, false);
-    const TokPos end = pulsar_ckpt_pos(pos0 + rows);   /* L334 P2b S7b: the walk's chunk stays raw */
+    const TokPos end = chunk.pos0 + TokCount{chunk.n.raw()};
     if (ok) pulsar_state_set_pos(s->states, c->live, end);
     if (ok && c->canonical) s->states->prefill_pos[c->live] = end;
     return ok;
@@ -511,11 +515,11 @@ static bool driver_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt,
 /// @param prompt the prompt
 /// @param start  the position the prefill starts from
 /// @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
-int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
+int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, TokPos start) {
     pulsar_state_set *ss = s->states;
     driver_prefill_ctx c;
     c.live = ss->live_bank;
-    c.canonical = ss->prefill_pos[c.live] == pulsar_ckpt_pos(start) && !ss->frontier_stale[c.live];
+    c.canonical = ss->prefill_pos[c.live] == start && !ss->frontier_stale[c.live];
     c.pos = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     c.bank = (int32_t *)xmalloc((size_t)s->prefill_cap * sizeof(int32_t));
     for (uint32_t r = 0; r < s->prefill_cap; r++) c.bank[r] = (int32_t)c.live;
@@ -564,7 +568,8 @@ int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errle
     const pulsar_driver_ops *ops = DOPS(s->engine);
     const uint32_t live = s->states->live_bank;
     const int32_t tok = token, pos = s->checkpoint.len, bank = (int32_t)live;
-    if (!driver_forward(s, PULSAR_STEP_DECODE, &tok, &pos, &bank, 1, pulsar_driver_heads_span(0, 1), NULL) ||
+    const pulsar_driver_heads one = pulsar_driver_heads_span(StepRow{0}, StepRows{1});
+    if (!driver_forward(s, PULSAR_STEP_DECODE, &tok, &pos, &bank, 1, one, NULL) ||
         !s->live_from_rows(s->driver->logits, 0)) {
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", ARCH(s->engine));
         return 1;
@@ -635,7 +640,8 @@ int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *
         bank[i] = (int32_t)reqs[i].bank;
     }
     const pulsar_driver_ops *ops = DOPS(e);
-    if (!driver_forward(s, PULSAR_STEP_DECODE, tok, pos, bank, n, pulsar_driver_heads_span(0, n), logits) ||
+    const pulsar_driver_heads all = pulsar_driver_heads_span(StepRow{0}, StepRows{(int)n});
+    if (!driver_forward(s, PULSAR_STEP_DECODE, tok, pos, bank, n, all, logits) ||
         (ops->absorb && !ops->absorb(s, PULSAR_STEP_DECODE, tok, pos, bank, n, 0, false))) {
         /* the failed step reset the banks it touched (pulsar_driver_forward): fatal for these rows */
         if (err) snprintf(err, errlen, "%s: decode refused (see the log for the op)", ARCH(e));
@@ -718,7 +724,7 @@ int pulsar_driver_decode_mixed(pulsar_session *s, const pulsar_multiseq_req *req
         int32_t tok[PULSAR_DRIVER_HEADS_MAX], pos[PULSAR_DRIVER_HEADS_MAX], bk[PULSAR_DRIVER_HEADS_MAX];
         if (!driver_verify_rows(s, reqs, n_rows, tok, pos, bk, err, errlen)) return 1;
         if (!driver_forward(s, PULSAR_STEP_PREFILL, tok, pos, bk, n_rows,
-                                   pulsar_driver_heads_span(0, n_rows), logits, n_rows)) {
+                                   pulsar_driver_heads_span(StepRow{0}, StepRows{(int)n_rows}), logits, n_rows)) {
             if (err) snprintf(err, errlen, "%s: the verify step refused (see the log for the op)", ARCH(e));
             return -1;
         }
@@ -847,9 +853,9 @@ int pulsar_driver_decode_fused(pulsar_session *s, const pulsar_multiseq_req *req
         /* (no stale bank reaches here: a run from 0 just reset its bank, any other was refused above) */
         canonical[r] = ss->prefill_pos[b] == reqs[first[r]].pos;
     }
-    pulsar_driver_heads hl = pulsar_driver_heads_span(0, n_dec);
+    pulsar_driver_heads hl = pulsar_driver_heads_span(StepRow{0}, StepRows{(int)n_dec});
     for (uint32_t r = 0; r < n_pf; r++)
-        if (shape->head_last[r]) hl.row[hl.n++] = first[r + 1] - 1u;
+        if (shape->head_last[r]) hl.row[hl.n++] = StepRow{(int)(first[r + 1] - 1u)};
     bool ok = driver_forward(s, PULSAR_STEP_PREFILL, tok.data(), pos.data(), bk.data(), n_rows, hl, logits,
                                     n_dec);
     for (uint32_t r = 0; ok && ops->absorb && r < n_pf; r++)   /* each run's drafter rows, as its sync chunk's absorb */

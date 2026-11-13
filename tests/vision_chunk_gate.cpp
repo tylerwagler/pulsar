@@ -98,12 +98,13 @@ static uint32_t plan_chunks(pulsar_session *s, const pulsar_tokens *p, const pul
     pulsar_prefill_shape shape = {};
     s->engine->family->session->sync->prefill_shape(s, &shape);
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, start, pulsar_session_kv_store(s), s->engine, p, img, 1);
+    pulsar_prefill_plan_init(&plan, &shape, pulsar_ckpt_pos(start), pulsar_session_kv_store(s), s->engine, p, img, 1);
     uint32_t owner = UINT32_MAX;
     size_t w = 0;
     desc[0] = 0;
     for (uint32_t pos = start; pos < (uint32_t)p->len;) {
-        const uint32_t end = pulsar_prefill_plan_next_end(&plan, pos, (uint32_t)p->len);
+        const TokPos end_at = pulsar_prefill_plan_next_end(&plan, pulsar_ckpt_pos(pos), pulsar_ckpt_pos((uint32_t)p->len));
+        const uint32_t end = pulsar_ckpt_raw(end_at);
         if (end <= pos) break;
         if (bs >= pos && bs < end) owner = pos;
         if (w < n) w += (size_t)snprintf(desc + w, n - w, " [%u,%u)", pos, end);

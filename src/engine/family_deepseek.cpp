@@ -164,9 +164,9 @@ static bool ds4_prefill_chunk(pulsar_session *s, const pulsar_tokens *prompt, ui
 /// @param prompt the prompt
 /// @param start first position to prefill
 /// @return pulsar_prefill_loop's
-static int ds4_sync_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start) {
-    if ((int)start < s->checkpoint.len) s->trim_history(pulsar_ckpt_pos(start));
-    s->prefill_frontier = pulsar_ckpt_pos(start);
+static int ds4_sync_prefill(pulsar_session *s, const pulsar_tokens *prompt, TokPos start) {
+    if (start < s->hist_end()) s->trim_history(start);
+    s->prefill_frontier = start;
     const pulsar_vision_request vreq = { s->sync_images, s->sync_n_images, s->engine };
     pulsar_gpu_graph *g = s->graph;
     const pulsar_vision_request *prev = g->vision_req;

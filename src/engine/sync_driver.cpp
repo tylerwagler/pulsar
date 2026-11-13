@@ -255,7 +255,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     s->sync_images = n_images > 0 ? images : NULL;
     s->sync_n_images = n_images > 0 ? n_images : 0;
     s->sync_prompt = n_images > 0 ? prompt : NULL;
-    const int rc = ops->prefill(s, prompt, start);
+    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));
     s->sync_images = NULL;
     s->sync_n_images = 0;
     s->sync_prompt = NULL;

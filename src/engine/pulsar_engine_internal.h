@@ -1605,6 +1605,9 @@ typedef struct {
     pulsar_gpu_tensor *spec_icomp_sc_save[PULSAR_MAX_LAYER];  ///< indexer-compressor score projections (V4)
     pulsar_gpu_tensor *spec_comp_scratch_row;   ///< emit sink during roll-forward: absorbs writes that must not land in the real cache
     uint32_t spec_comp_save_n;                  ///< arms the save; 0 = off
+    /** L334 P2b S7b: the rows the last armed verify saved -- kept after the disarm, the bound a commit's head-row ->
+     *  step-row crossing checks (pulsar_verify_step_row) */
+    uint32_t spec_comp_saved_rows;
     /** Persistent drafter scratch (was per-call cudaMalloc/cudaFree churn --
      * cudaFree device-syncs, and the fused loop projects/seeds up to 5x/step). */
     pulsar_gpu_tensor *dspark_concat;  ///< [3*N_EMBD] target_h concat
@@ -4743,7 +4746,7 @@ typedef struct pulsar_sync_ops {
     bool (*reset_bank)(pulsar_session *s);
     /** Prefill `prompt` on the live bank from `start` -- the core loop's 0 /
      *  PULSAR_SESSION_SYNC_INTERRUPTED / 1 (pulsar_prefill_loop). */
-    int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+    int (*prefill)(pulsar_session *s, const pulsar_tokens *prompt, TokPos start);
     /** The session's prefill shape (the core loop and the prefill quantum read it). */
     void (*prefill_shape)(pulsar_session *s, pulsar_prefill_shape *out);
 } pulsar_sync_ops;
@@ -4850,7 +4853,7 @@ uint32_t pulsar_prompt_endpoint(pulsar_engine *e, const pulsar_ckpt_store *store
 /// @param prompt the prompt (borrowed)
 /// @param images the request's images (NULL = text)
 /// @param n_images their count
-void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, uint32_t start,
+void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape *shape, TokPos start,
                               const pulsar_ckpt_store *store, const pulsar_engine *e, const pulsar_tokens *prompt,
                               const pulsar_image_ref *images, int n_images);
 /** The end of the chunk that starts at `pos0`, in (pos0, end]. */
@@ -4858,7 +4861,7 @@ void pulsar_prefill_plan_init(pulsar_prefill_plan *p, const pulsar_prefill_shape
 /// @param pos0 the chunk's first position
 /// @param end the walk's end
 /// @return the chunk's end
-uint32_t pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, uint32_t pos0, uint32_t end);
+TokPos pulsar_prefill_plan_next_end(const pulsar_prefill_plan *p, TokPos pos0, TokPos end);
 
 /** The prefill walk every chunked prefill runs (prefill_loop.cpp, L272 P2): the order -- poll the stop hook, cut the
  *  chunk by the plan, run it, land it, poll again -- with the effects as hooks.  `chunk` runs rows [pos0, pos0 +
@@ -4932,7 +4935,7 @@ void pulsar_session_read_ahead_cancel(pulsar_session *s, uint32_t bank);
 /// @param start first position
 /// @param end one past the last
 /// @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
-int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, uint32_t start, uint32_t end);
+int pulsar_prefill_walk_run(const pulsar_prefill_walk *w, TokPos start, TokPos end);
 /** Rows from `pos0` to the next ABSOLUTE multiple of `cap` (P13, every walk's chunk rule): a walk that starts
  *  off the cap grid -- a resume, a continuation, the chunk after an image cut -- lands on the cold prefill's
  *  chunk ends, which sit on the resume grid where the walk captures (pulsar_ckpt_landed). */
@@ -4961,7 +4964,7 @@ typedef bool (*pulsar_prefill_chunk_fn)(pulsar_session *s, const pulsar_tokens *
 /// @param chunk the family's chunk forward
 /// @param ud passed to `chunk`
 /// @return 0, PULSAR_SESSION_SYNC_INTERRUPTED, or 1
-int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start, pulsar_prefill_chunk_fn chunk,
+int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, TokPos start, pulsar_prefill_chunk_fn chunk,
                         void *ud);
 
 /* L295 F4: the core row-step driver's session operations (step_driver.cpp) -- a driver family's session ops and sync
@@ -4970,7 +4973,7 @@ int pulsar_driver_session_create(pulsar_session *s, uint32_t n_banks);
 void pulsar_driver_session_destroy(pulsar_session *s);
 bool pulsar_driver_sync_state_agrees(pulsar_session *s);
 bool pulsar_driver_sync_reset_bank(pulsar_session *s);
-int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, uint32_t start);
+int pulsar_driver_prefill(pulsar_session *s, const pulsar_tokens *prompt, TokPos start);
 void pulsar_driver_prefill_shape(pulsar_session *s, pulsar_prefill_shape *out);
 int pulsar_driver_eval_row(pulsar_session *s, int token, char *err, size_t errlen);
 int pulsar_driver_decode_multiseq(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n, float *logits,

@@ -377,7 +377,10 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
     }
     if (!ok) return commit_fail(ss, "a verify commit of a delta state failed");
     if (keep == R) return true;
-    const uint32_t p0 = (uint32_t)ss->run_pos0[run], pnext = p0 + keep;
+    /* the run's map (hazard (f)): its rows from f hold its positions from run_pos0, one token a row */
+    const pulsar_step_run vr{StepRow{(int)f}, TokPos{ss->run_pos0[run]}, StepRows{(int)R}};
+    const uint32_t p0 = pulsar_ckpt_raw(vr.pos0), pnext = p0 + keep;
+    const uint32_t last_kept = pulsar_row_index(vr.first + StepRows{(int)keep - 1});
     for (uint32_t k = 0; ok && k < p->n_trunk; k++) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
@@ -385,7 +388,7 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
             const uint64_t o = ss->ord[k][id];
             if (d.capture == PULSAR_STATE_CAPTURE_SNAPSHOT) {
                 ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)bank * d.bytes, ss->cap_rows[id],
-                                                  (o * VR + f + (keep - 1u)) * d.bytes, d.bytes) != 0;
+                                                  (o * VR + last_kept) * d.bytes, d.bytes) != 0;
             } else if (d.capture == PULSAR_STATE_CAPTURE_STAGE) {
                 /* the block as the step found it, then the kept rows of the block that is open at pnext */
                 const uint64_t blk = pulsar_state_decl_bank_bytes(&d);
@@ -395,7 +398,8 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
                 for (uint32_t pp = blk0 > p0 ? blk0 : p0; ok && pp < pnext; pp++)
                     ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)bank * blk + (pp % d.tokens) * d.bytes,
                                                       ss->cap_rows[id],
-                                                      (o * VR + f + (pp - p0)) * d.capture_bytes + d.capture_off,
+                                                      (o * VR + pulsar_row_index(vr.row_of(pulsar_ckpt_pos(pp)))) *
+                                                              d.capture_bytes + d.capture_off,
                                                       d.bytes) != 0;
             }
         }

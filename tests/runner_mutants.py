@@ -31,11 +31,11 @@ MUTANTS = {
     "chunk-resume": (
         "src/engine/sync_driver.cpp",
         "--only=cuda-chunk-neutrality-gate",
-        "    const int rc = ops->prefill(s, prompt, start);\n",
+        "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n",
         "    /* L317 MUTANT: a resume prefills its first token as another id */\n"
         "    const int l317_t = start > 0u && (int)start < prompt->len ? prompt->v[start] : -1;\n"
         "    if (l317_t >= 0) prompt->v[start] = l317_t == 1000 ? 1001 : 1000;\n"
-        "    const int rc = ops->prefill(s, prompt, start);\n"
+        "    const int rc = ops->prefill(s, prompt, pulsar_ckpt_pos(start));\n"
         "    if (l317_t >= 0) prompt->v[start] = l317_t;\n"),
     "row-sort": (
         "src/cuda/pulsar_cuda_attention.cu",

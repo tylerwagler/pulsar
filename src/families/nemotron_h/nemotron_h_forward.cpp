@@ -1280,11 +1280,13 @@ bool head_rows(const nh_step *st, const uint16_t *xb, uint32_t n, uint32_t out0)
  * last add wrote it into xn, next_norm) */
 /** pulsar_driver_ops::head.
  *  @param st0   the trunk's step
- *  @param row0  the first step row headed
- *  @param n     the row count
- *  @param out0  the first logits row written
+ *  @param row0_at the first step row headed
+ *  @param n_rows  the row count
+ *  @param out0_at the first logits row written
  *  @return true = launched; false = refused (said) */
-bool head(const pulsar_driver_step *st0, uint32_t row0, uint32_t n, uint32_t out0) {
+bool head(const pulsar_driver_step *st0, StepRow row0_at, StepRows n_rows, HeadRow out0_at) {
+    /* the step's row / logits-row indices for the kernels (L334 P2b S7b: typed at the op) */
+    const uint32_t row0 = pulsar_row_index(row0_at), n = (uint32_t)n_rows.raw(), out0 = pulsar_row_index(out0_at);
     const nh_step *st = S(st0);
     if (n == 0 || row0 + n > st->n_rows) return fail("head rows out of range");
     return head_rows(st, (const uint16_t *)dptr(st->st->xn) + (size_t)row0 * st->w->shape.n_embd, n, out0);

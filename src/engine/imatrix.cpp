@@ -849,11 +849,11 @@ bool gpu_graph_prefill_chunked_range(pulsar_gpu_graph *g, const pulsar_model *mo
         return false;
     const pulsar_prefill_shape shape = gpu_graph_prefill_shape(g);
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, start, &g->ckpt, NULL, prompt, NULL, 0);
+    pulsar_prefill_plan_init(&plan, &shape, pulsar_ckpt_pos(start), &g->ckpt, NULL, prompt, NULL, 0);
     if (plan.chunk_cap == 0) return false;
     ds4_range r = { g, model, weights, prompt, head_out, imatrix };
     const pulsar_prefill_walk w = { &plan, ds4_range_chunk, ds4_range_landed, NULL, &r };
-    return pulsar_prefill_walk_run(&w, start, start + n_tokens) == 0;
+    return pulsar_prefill_walk_run(&w, pulsar_ckpt_pos(start), pulsar_ckpt_pos(start + n_tokens)) == 0;
 }
 
 

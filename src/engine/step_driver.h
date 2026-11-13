@@ -25,6 +25,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "../lib/pulsar_units.h"   /* L334 P2b S7b: StepRow / HeadRow */
 
 /** The rows one step heads into the logits slab -- also the widest verify (every bank's run together), so the
  *  depth of the declared state's verify capture (state_kinds.h PULSAR_STATE_VERIFY_ROWS) and the fused step's head
@@ -52,15 +56,38 @@ typedef enum {
 struct pulsar_driver_heads {
     /// rows headed, <= PULSAR_DRIVER_HEADS_MAX
     uint32_t n = 0;
-    /// [n] step-row index of each logits row, in logits-row order
-    uint32_t row[PULSAR_DRIVER_HEADS_MAX] = {};
+    /// [n] the step row of each logits row, in logits-row order (L334 P2b S7b: head row h is step row row[h])
+    StepRow row[PULSAR_DRIVER_HEADS_MAX] = {};
 };
 /** Step rows [row0, row0 + n). */
 /// @param row0 the first step row headed
 /// @param n    rows headed (n > PULSAR_DRIVER_HEADS_MAX keeps n but fills only the first PULSAR_DRIVER_HEADS_MAX;
 ///             the forward refuses it)
 /// @return the head list
-pulsar_driver_heads pulsar_driver_heads_span(uint32_t row0, uint32_t n);
+pulsar_driver_heads pulsar_driver_heads_span(StepRow row0, StepRows n);
+
+/** L334 P2b S7b: a step row as the index the step's arrays and kernels take (fatal on none()).
+ *  @param r the row */
+/// @return its index
+static inline uint32_t pulsar_row_index(StepRow r) { return (uint32_t)r.before().raw(); }
+/** A head row as the index of its logits row (fatal on none()).
+ *  @param h the row */
+/// @return its index
+static inline uint32_t pulsar_row_index(HeadRow h) { return (uint32_t)h.before().raw(); }
+/** Hazard (b), named: a verify's head row as a step row.  A verify's rows lead the step and every one is headed
+ *  (pulsar_driver_heads_span(0, n_dec)), so head row h IS step row h -- for h inside the verify, and only there; a
+ *  head row past it (a fused step's prompt-run heads) is no verify row, and is fatal here.
+ *  @param h     a head row of the step's verify
+ *  @param n_dec the step's decode / verify rows */
+/// @return the step row it heads
+static inline StepRow pulsar_verify_step_row(HeadRow h, uint32_t n_dec) {
+    if (h.is_none() || (uint32_t)h.raw() >= n_dec) {
+        fprintf(stderr, "pulsar: head row %d is not a verify row (the verify has %u): no step row by identity\n",
+                h.raw(), n_dec);
+        abort();
+    }
+    return StepRow{h.raw()};
+}
 
 struct pulsar_state_set;
 struct pulsar_imatrix_tap;
@@ -197,7 +224,7 @@ typedef struct pulsar_driver_ops {
     pulsar_block_fn block[PULSAR_LAYER_KIND_COUNT];
     /** Step rows [row0, row0 + n) -> logits rows [out0, out0 + n) of the driver's slab, out0 + n <=
      *  PULSAR_DRIVER_HEADS_MAX.  Called once per span of the head list (consecutive rows of one row kind). */
-    bool (*head)(const pulsar_driver_step *st, uint32_t row0, uint32_t n, uint32_t out0);
+    bool (*head)(const pulsar_driver_step *st, StepRow row0, StepRows n, HeadRow out0);
     /** After every forward that started: settle what the step left in flight; on a completed step its own checks
      *  (rule 9).  Returns ok && the step is good. */
     bool (*step_end)(const pulsar_driver_step *st, bool ok);

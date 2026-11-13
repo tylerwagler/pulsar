@@ -1698,10 +1698,12 @@ bool block_absorb_banked(pulsar_session *s, const uint32_t *rows, const uint32_t
         bool run = b < ss->n_banks && ss->bank_pos[b] >= TokPos::after(TokCount{(int)(j - i)});
         for (uint32_t r = i + 1; run && r < j; r++) run = rows[r] == rows[r - 1] + 1u;
         if (!run) return fail("a bank's absorbed rows are not one run of its kept rows");
-        /* the commit moved the counter past the kept rows; L334 P2b S7b: the step's row positions stay raw */
-        const uint32_t p0 = pulsar_ckpt_raw(ss->bank_pos[b] - TokCount{(int)(j - i)});
+        /* the commit moved the counter past the kept rows: they are one run of the step from rows[i], ending there
+         * (hazard (f): a row distance is a token count only through the run map) */
+        const pulsar_step_run kept{StepRow{(int)rows[i]}, ss->bank_pos[b] - TokCount{(int)(j - i)},
+                                   StepRows{(int)(j - i)}};
         for (uint32_t r = i; r < j; r++) {
-            pos[r] = (int32_t)(p0 + (r - i));
+            pos[r] = kept.pos_of(StepRow{(int)rows[r]}).raw();
             bank[r] = (int32_t)b;
         }
         if (!absorb_rows(s, rows[i], pos + i, bank + i, j - i, false)) return false;

@@ -4014,7 +4014,7 @@ static void test_l308_copy_estimate(void) {
  * PULSAR_DRIVER_SCRATCH_MAX were never allocated and the family's ops read NULL.  Host: the refusal comes before
  * the family's create or any allocation. */
 static bool test_driver_never(const pulsar_driver_step *) { return false; }
-static bool test_driver_head_never(const pulsar_driver_step *, uint32_t, uint32_t, uint32_t) { return false; }
+static bool test_driver_head_never(const pulsar_driver_step *, StepRow, StepRows, HeadRow) { return false; }
 static void test_driver_scratch_cap(void) {
     static pulsar_driver_ops ops{};
     ops.embed = test_driver_never;
@@ -4037,6 +4037,18 @@ static void test_driver_scratch_cap(void) {
  * row at or past the pool's capacity is refused there by name, before the family's trunk or any launch: a decode
  * row, the plain eval's row, and a verify run whose first row fits and whose second does not.  Host: a driver family
  * with no trunk (reaching it would crash the test), a state set of one 8-position bank. */
+/* L334 P2b S7b: the step's head list and its named crossings -- a span heads consecutive step rows, a verify's head
+ * row is its step row by the named identity (pulsar_verify_step_row; past the verify it is fatal, not tested here),
+ * and a run's map turns its rows into positions and back. */
+static void test_driver_head_rows(void) {
+    const pulsar_driver_heads h = pulsar_driver_heads_span(StepRow{5}, StepRows{3});
+    TEST_ASSERT(h.n == 3u && h.row[0] == StepRow{5} && h.row[2] == StepRow{7} && pulsar_row_index(h.row[1]) == 6u);
+    TEST_ASSERT(pulsar_verify_step_row(HeadRow{0}, 4u) == StepRow{0} &&
+                pulsar_verify_step_row(HeadRow{3}, 4u) == StepRow{3});
+    const pulsar_step_run kept{StepRow{2}, TokPos{100}, StepRows{4}};
+    TEST_ASSERT(kept.pos_of(StepRow{2}) == TokPos{100} && kept.pos_of(StepRow{5}) == TokPos{103});
+    TEST_ASSERT(kept.row_of(TokPos{101}) == StepRow{3} && pulsar_row_index(kept.row_of(TokPos{103})) == 5u);
+}
 static uint32_t test_driver_width(const pulsar_engine *) { return 4u; }
 static void test_driver_context_bound(void) {
     static pulsar_driver_ops ops{};
@@ -6138,17 +6150,21 @@ static void test_ckpt_records(void) {
     pulsar_prefill_shape shape = {4096u, 4096u, 1u};
     pulsar_tokens p = {toks, 400, 400};
     pulsar_prefill_plan plan;
-    pulsar_prefill_plan_init(&plan, &shape, 0u, st, NULL, &p, NULL, 0);
-    TEST_ASSERT(plan.endpoint == 0u && pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
+    pulsar_prefill_plan_init(&plan, &shape, TokPos{0}, st, NULL, &p, NULL, 0);
+    /* the planner's next chunk end, in raw positions (the table below reads as the walk's cuts) */
+    const auto NEXT = [&plan](uint32_t a, uint32_t b) {
+        return pulsar_ckpt_raw(pulsar_prefill_plan_next_end(&plan, pulsar_ckpt_pos(a), pulsar_ckpt_pos(b)));
+    };
+    TEST_ASSERT(plan.endpoint == 0u && NEXT(0u, 400u) == 384u);
     plan.endpoint = 297u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 297u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 297u, 400u) == 384u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 400u);
+    TEST_ASSERT(NEXT(0u, 400u) == 297u);
+    TEST_ASSERT(NEXT(297u, 400u) == 384u);
+    TEST_ASSERT(NEXT(384u, 400u) == 400u);
     /* an endpoint past the grid point: [0, 384), [384, 390), [390, 400) */
     plan.endpoint = 390u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 0u, 400u) == 384u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 384u, 400u) == 390u);
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 390u, 400u) == 400u);
+    TEST_ASSERT(NEXT(0u, 400u) == 384u);
+    TEST_ASSERT(NEXT(384u, 400u) == 390u);
+    TEST_ASSERT(NEXT(390u, 400u) == 400u);
     /* L380: a waived endpoint is planned as none -- the walk makes the grid cut and no other: [0, 384), [384, 400).
      * The waiver holds only for a caller that gave it and only with no grid point past the endpoint (the last grid
      * checkpoint then stands within a grid step below it) */
@@ -6160,15 +6176,15 @@ static void test_ckpt_records(void) {
     for (int waived = 0; waived < 2; waived++) {
         plan.endpoint = pulsar_prefill_endpoint_waived(st, 390u, 400u, waived != 0) ? 0u : 390u;
         uint32_t ends[4] = {0}, n = 0;
-        for (uint32_t pos = 0u; pos < 400u && n < 4u; pos = ends[n++]) ends[n] = pulsar_prefill_plan_next_end(&plan, pos, 400u);
+        for (uint32_t pos = 0u; pos < 400u && n < 4u; pos = ends[n++]) ends[n] = NEXT(pos, 400u);
         if (waived) TEST_ASSERT(n == 2u && ends[0] == 384u && ends[1] == 400u);
         else TEST_ASSERT(n == 3u && ends[0] == 384u && ends[1] == 390u && ends[2] == 400u);
     }
     /* a resumed walk too, with no grid point ahead of it: one chunk instead of two */
     plan.endpoint = 0u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 400u);
+    TEST_ASSERT(NEXT(385u, 400u) == 400u);
     plan.endpoint = 396u;
-    TEST_ASSERT(pulsar_prefill_plan_next_end(&plan, 385u, 400u) == 396u);
+    TEST_ASSERT(NEXT(385u, 400u) == 396u);
 
     /* L380: when a request's syncs waive the cut (server_endpoint_waive) -- the per-bank state is the store's
      * prompt-end record, so it follows the record's life.  Bank 0, a conversation's requests in order: */
@@ -6494,6 +6510,7 @@ static const pulsar_test_entry test_entries[] = {
     {"--fused-sched", "fused-sched", "the round selection simulated on L304's logged costs: L304's and L277's cases, the stall, no prompt, the cold fit (L312)", test_fused_sched},
     {"--read-ahead", "read-ahead", "the next-chunk PLE read-ahead: its rule (one chunk ahead, each row once, a changed prompt drops), the pool's background class (bytes unchanged, below every gather, cancel, accounting) (L329 b2)", test_read_ahead},
     {"--driver-scratch", "driver-scratch", "a driver family past PULSAR_DRIVER_SCRATCH_MAX scratch arenas is refused at the session's create, never capped (L335)", test_driver_scratch_cap},
+    {"--driver-head-rows", "driver-head-rows", "the step's head list and its crossings: a span heads consecutive rows, a verify's head row is its step row by name, a run maps rows to positions (L334 P2b S7b)", test_driver_head_rows},
     {"--driver-context-bound", "driver-context-bound", "the driver's one context bound: a decode, eval or verify row at or past the pool's capacity is refused before the family's trunk (L375)", test_driver_context_bound},
     {"--spec-env", "spec-env", "PULSAR_SPEC_DEPTH / PULSAR_SPEC_TAU: one parse, an unparsable value refused by name at the open (L375)", test_spec_env},
     {"--st-integers", "st-integers", "the safetensors header's integers are exact: a fractional or past-2^53 shape is refused (L335)", test_st_exact_integers},
