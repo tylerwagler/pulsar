@@ -168,14 +168,15 @@ static void slot_bank_free(pulsar_state_set *ss, uint32_t k, uint32_t b) {
     }
 }
 
-void pulsar_state_bank_free(pulsar_state_set *ss, uint32_t bank) {
-    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) slot_bank_free(ss, k, bank);
-    ss->kv_hw[bank] = TokCount{0};   /* its pages are gone; the restore's loads raise it again */
+void pulsar_state_bank_free(pulsar_state_set *ss, BankId bank) {
+    const uint32_t b = pulsar_bank_index(bank);
+    for (uint32_t k = 0; k < ss->plan->n_trunk; k++) slot_bank_free(ss, k, b);
+    ss->kv_hw[b] = TokCount{0};   /* its pages are gone; the restore's loads raise it again */
 }
 
-bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank) {
+bool pulsar_state_bank_alloc(pulsar_state_set *ss, BankId bank) {
     for (uint32_t k = 0; k < ss->plan->n_trunk; k++) {
-        if (!slot_bank_alloc(ss, k, bank)) {
+        if (!slot_bank_alloc(ss, k, pulsar_bank_index(bank))) {
             pulsar_state_bank_free(ss, bank);   /* never half-backed */
             return false;
         }
@@ -183,10 +184,11 @@ bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank) {
     return true;
 }
 
-bool pulsar_state_bank_evicted(const pulsar_state_set *ss, uint32_t bank) {
+bool pulsar_state_bank_evicted(const pulsar_state_set *ss, BankId bank) {
+    const uint32_t b = pulsar_bank_index(bank);
     for (uint32_t k = 0; k < ss->plan->n_trunk; k++)
         for (uint32_t id = 0; id < ss->plan->n_decl; id++)
-            if (ss->pool[k][id] && !ss->pool[k][id][bank]) return true;
+            if (ss->pool[k][id] && !ss->pool[k][id][b]) return true;
     return false;
 }
 
@@ -226,14 +228,15 @@ void pulsar_state_destroy(pulsar_state_set *ss) {
     free(ss);
 }
 
-bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank) {
+bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank) {
     const pulsar_state_plan *p = ss->plan;
+    const uint32_t b = pulsar_bank_index(bank);
     bool ok = true;
     for (uint32_t k = 0; ok && k < p->n_slots; k++) {
         for (uint32_t id = 0; ok && id < p->n_decl; id++) {
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !ss->t[k][id]) continue;
             const uint64_t bb = pulsar_state_decl_bank_bytes(&p->decl[id]);
-            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(ss->t[k][id], (uint64_t)bank * bb, bb);
+            pulsar_gpu_tensor *v = pulsar_gpu_tensor_view(ss->t[k][id], (uint64_t)b * bb, bb);
             ok = v && pulsar_gpu_tensor_fill_f32(v, 0.0f, bb / sizeof(float)) != 0;
             pulsar_gpu_tensor_free(v);
         }
@@ -244,10 +247,10 @@ bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank) {
         if (p->decl[id].init) p->decl[id].init(ss->engine, h);
         else memset(h, 0, p->decl[id].bytes);
     }
-    if (ss->fold_host) ss->fold_host[2 + 2 * bank] = 0;   /* L339: its pending rows went with its state */
+    if (ss->fold_host) ss->fold_host[2 + 2 * b] = 0;   /* L339: its pending rows went with its state */
     pulsar_state_set_pos(ss, bank, TokPos{0});
-    ss->prefill_pos[bank] = TokPos{0};
-    ss->frontier_stale[bank] = false;
+    ss->prefill_pos[b] = TokPos{0};
+    ss->frontier_stale[b] = false;
     if (p->drafter_at) p->drafter_at(ss->ud, bank, TokPos::after(TokCount{0}));
     if (ss->ckpt.ops) pulsar_ckpt_drop_bank(&ss->ckpt, bank);   /* its history is gone */
     return ok;
@@ -274,7 +277,7 @@ void pulsar_state_verify_begin(pulsar_state_set *ss, uint32_t n_runs, const uint
         for (uint32_t id = 0; id < p->n_decl; id++)
             if (ss->cap_host[id])
                 memcpy(ss->cap_host[id] + (size_t)k * p->decl[id].bytes,
-                       pulsar_state_host(ss, id, (uint32_t)ss->run_bank[k]), p->decl[id].bytes);
+                       pulsar_state_host(ss, id, BankId{ss->run_bank[k]}), p->decl[id].bytes);
     }
 }
 
@@ -301,9 +304,10 @@ const int32_t *pulsar_state_fold_table(const pulsar_state_set *ss) {
     return ss->fold_dev ? (const int32_t *)dptr(ss->fold_dev) : NULL;
 }
 
-bool pulsar_state_fold_flush(pulsar_state_set *ss, uint32_t bank) {
-    if (!ss->fold_host || bank >= ss->n_banks) return true;
-    const int32_t row = ss->fold_host[1 + 2 * bank], keep = ss->fold_host[2 + 2 * bank];
+bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank) {
+    if (!ss->fold_host || !bank.below(ss->n_banks)) return true;
+    const uint32_t b = pulsar_bank_index(bank);
+    const int32_t row = ss->fold_host[1 + 2 * b], keep = ss->fold_host[2 + 2 * b];
     if (keep <= 0) return true;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
@@ -315,10 +319,10 @@ bool pulsar_state_fold_flush(pulsar_state_set *ss, uint32_t bank) {
                                             (uint64_t)row * p->decl[id].capture_bytes,
                                         (uint32_t)keep);
     if (!ok) {
-        fprintf(stderr, "pulsar: %s: bank %u's pending delta rows could not be applied\n", p->name, bank);
+        fprintf(stderr, "pulsar: %s: bank %d's pending delta rows could not be applied\n", p->name, bank.raw());
         return false;
     }
-    ss->fold_host[2 + 2 * bank] = 0;
+    ss->fold_host[2 + 2 * b] = 0;
     return true;
 }
 
@@ -330,7 +334,8 @@ bool pulsar_state_step_begin(pulsar_state_set *ss, bool verify) {
         const int32_t g0 = (int32_t)(ss->cap_gen * ss->verify_rows), g1 = g0 + (int32_t)ss->verify_rows;
         for (uint32_t b = 0; b < ss->n_banks; b++) {
             const int32_t row = ss->fold_host[1 + 2 * b];
-            if (ss->fold_host[2 + 2 * b] > 0 && row >= g0 && row < g1 && !pulsar_state_fold_flush(ss, b)) return false;
+            if (ss->fold_host[2 + 2 * b] > 0 && row >= g0 && row < g1 && !pulsar_state_fold_flush(ss, BankId{b}))
+                return false;
         }
         ss->fold_host[0] = g0;
     }
@@ -357,12 +362,13 @@ static bool commit_fail(const pulsar_state_set *ss, const char *what) {
     return false;
 }
 
-bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tokens, uint32_t keep) {
+bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const int32_t *tokens, uint32_t keep) {
     const pulsar_state_plan *p = ss->plan;
     uint32_t run = ss->n_runs;
     for (uint32_t k = 0; k < ss->n_runs; k++)
-        if ((uint32_t)ss->run_bank[k] == bank) run = k;
+        if (BankId{ss->run_bank[k]} == bank) run = k;
     if (run == ss->n_runs) return commit_fail(ss, "a commit names a bank the last verify step did not carry");
+    const uint32_t b = pulsar_bank_index(bank);
     const uint32_t f = ss->run_first[run], R = ss->run_first[run + 1] - f;
     if (keep == 0 || keep > R) return commit_fail(ss, "a commit keeps 1 .. the run's rows");
     const uint64_t VR = ss->verify_rows;
@@ -372,8 +378,8 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
     bool ok = true;
     if (ss->fold_host) {   /* a set with a DELTA capture always folds (pulsar_state_create) */
         ok = pulsar_state_fold_flush(ss, bank);   /* none expected: the verify step carried the bank */
-        ss->fold_host[1 + 2 * bank] = (int32_t)(ss->cap_gen * VR + f);
-        ss->fold_host[2 + 2 * bank] = (int32_t)keep;
+        ss->fold_host[1 + 2 * b] = (int32_t)(ss->cap_gen * VR + f);
+        ss->fold_host[2 + 2 * b] = (int32_t)keep;
     }
     if (!ok) return commit_fail(ss, "a verify commit of a delta state failed");
     if (keep == R) return true;
@@ -387,16 +393,16 @@ bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tok
             if (!has(p->slot[k], id)) continue;
             const uint64_t o = ss->ord[k][id];
             if (d.capture == PULSAR_STATE_CAPTURE_SNAPSHOT) {
-                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)bank * d.bytes, ss->cap_rows[id],
+                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * d.bytes, ss->cap_rows[id],
                                                   (o * VR + last_kept) * d.bytes, d.bytes) != 0;
             } else if (d.capture == PULSAR_STATE_CAPTURE_STAGE) {
                 /* the block as the step found it, then the kept rows of the block that is open at pnext */
                 const uint64_t blk = pulsar_state_decl_bank_bytes(&d);
-                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)bank * blk, ss->cap_runs[id],
+                ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * blk, ss->cap_runs[id],
                                                   (o * VR + run) * blk, blk) != 0;
                 const uint32_t blk0 = pnext / d.tokens * d.tokens;
                 for (uint32_t pp = blk0 > p0 ? blk0 : p0; ok && pp < pnext; pp++)
-                    ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)bank * blk + (pp % d.tokens) * d.bytes,
+                    ok = pulsar_gpu_tensor_copy_async(ss->t[k][id], (uint64_t)b * blk + (pp % d.tokens) * d.bytes,
                                                       ss->cap_rows[id],
                                                       (o * VR + pulsar_row_index(vr.row_of(pulsar_ckpt_pos(pp)))) *
                                                               d.capture_bytes + d.capture_off,
@@ -430,19 +436,20 @@ static bool decl_walk(void *state, int dir, bool, pulsar_gpu_tensor *slab, uint6
                       uint64_t *bytes_out) {
     pulsar_state_set *ss = SS(state);
     const pulsar_state_plan *p = ss->plan;
-    const uint32_t bank = ss->live_bank;
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
     uint64_t off = slot_off;
     bool ok = true;
     /* L339: a walk out reads the state -- its pending rows go in first; a walk in replaces it -- they are dropped */
     if (dir == 0) ok = pulsar_state_fold_flush(ss, bank);
-    else if (dir > 0 && ss->fold_host) ss->fold_host[2 + 2 * bank] = 0;
+    else if (dir > 0 && ss->fold_host) ss->fold_host[2 + 2 * b] = 0;
     for (uint32_t k = 0; k < p->n_slots; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             pulsar_gpu_tensor *t = ss->t[k][id];
             if (!has(p->slot[k], id) || p->decl[id].kind == PULSAR_STATE_POOL || !t || !ok) continue;
             const uint64_t bytes = pulsar_state_decl_bank_bytes(&p->decl[id]);
-            if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, (uint64_t)bank * bytes, bytes) != 0;
-            else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, (uint64_t)bank * bytes, slab, off, bytes) != 0;
+            if (dir == 0) ok = pulsar_gpu_tensor_copy_async(slab, off, t, (uint64_t)b * bytes, bytes) != 0;
+            else if (dir > 0) ok = pulsar_gpu_tensor_copy_async(t, (uint64_t)b * bytes, slab, off, bytes) != 0;
             off += bytes;
         }
     }
@@ -469,10 +476,11 @@ static TokPos decl_min_checkpoint(void *state) { return pulsar_ckpt_pos(SS(state
  *  @return true when it stands at G */
 static bool decl_stands_at(void *state, TokPos G_at, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
-    if (ss->bank_pos[bank] != G_at || ss->prefill_pos[bank] != G_at) {
-        snprintf(why, whylen, "bank %u holds %d tokens, %d of them prefilled, not exactly %d prefilled", bank,
-                 ss->bank_pos[bank].raw(), ss->prefill_pos[bank].raw(), G_at.raw());
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
+    if (ss->bank_pos[b] != G_at || ss->prefill_pos[b] != G_at) {
+        snprintf(why, whylen, "bank %d holds %d tokens, %d of them prefilled, not exactly %d prefilled", bank.raw(),
+                 ss->bank_pos[b].raw(), ss->prefill_pos[b].raw(), G_at.raw());
         return false;
     }
     return true;
@@ -481,7 +489,7 @@ static bool decl_stands_at(void *state, TokPos G_at, char *why, size_t whylen) {
 /** pulsar_kv_state_ops::holds: the live bank's prefill-only history reaches G.
  *  @param state the set  @param G tokens  @return true when it does */
 static bool decl_holds(void *state, TokPos G) {
-    return SS(state)->prefill_pos[SS(state)->live_bank] >= G;
+    return SS(state)->prefill_pos[pulsar_bank_index(SS(state)->live_bank)] >= G;
 }
 
 /** pulsar_kv_state_ops::prepare_restore: the live bank's counters (position, prefill end, drafter row) to G.
@@ -490,34 +498,38 @@ static bool decl_holds(void *state, TokPos G) {
  *  @return true, always */
 static bool decl_prepare_restore(void *state, TokPos G_at) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
     /* the pools' rows below G are the history the checkpoint references; the walk brings every overwritten lane
      * back, so only the counters move here */
     pulsar_state_set_pos(ss, bank, G_at);
-    ss->prefill_pos[bank] = G_at;
+    ss->prefill_pos[b] = G_at;
     if (ss->plan->drafter_at) ss->plan->drafter_at(ss->ud, bank, G_at);   /* L289: the walk writes the true tail */
     return true;   /* the logits: the caller's (s->logits_stale after a restore) */
 }
 
 /** pulsar_kv_state_ops::restored: clear the live bank's stale mark.  @param state the set */
-static void decl_restored(void *state) { SS(state)->frontier_stale[SS(state)->live_bank] = false; }
+static void decl_restored(void *state) {
+    SS(state)->frontier_stale[pulsar_bank_index(SS(state)->live_bank)] = false;
+}
 
 /** pulsar_kv_state_ops::set_frontier_stale: the live bank's counters to G and its stale mark set.
  *  @param state the set
  *  @param G_at  the segment chain's end, in tokens */
 static void decl_set_frontier_stale(void *state, TokPos G_at) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
     pulsar_state_set_pos(ss, bank, G_at);
-    ss->prefill_pos[bank] = G_at;
-    ss->frontier_stale[bank] = true;
+    ss->prefill_pos[b] = G_at;
+    ss->frontier_stale[b] = true;
 }
 
 /** pulsar_kv_state_ops::stale.  @param state the set  @param bank any bank
  *  @return its stale mark; false out of range */
-static bool decl_stale(void *state, uint32_t bank) {
+static bool decl_stale(void *state, BankId bank) {
     const pulsar_state_set *ss = SS(state);
-    return bank < ss->n_banks && ss->frontier_stale[bank];
+    return bank.below(ss->n_banks) && ss->frontier_stale[pulsar_bank_index(bank)];
 }
 
 /* Bank `bank`'s pools of slots [k0, k1), each slot's in id order. */
@@ -528,15 +540,16 @@ static bool decl_stale(void *state, uint32_t bank) {
 /// @param out  receives up to `cap` pools
 /// @param cap  entries of `out`
 /// @return the pools there are (may exceed `cap`; only `cap` written)
-static uint32_t slot_pools(pulsar_state_set *ss, uint32_t bank, uint32_t k0, uint32_t k1, pulsar_kv_pool *out,
+static uint32_t slot_pools(pulsar_state_set *ss, BankId bank, uint32_t k0, uint32_t k1, pulsar_kv_pool *out,
                            uint32_t cap) {
     const pulsar_state_plan *p = ss->plan;
+    const uint32_t b = pulsar_bank_index(bank);
     uint32_t n = 0;
     for (uint32_t k = k0; k < k1; k++) {
         for (uint32_t id = 0; id < p->n_decl; id++) {
             const pulsar_state_decl &d = p->decl[id];
             if (!has(p->slot[k], id) || d.kind != PULSAR_STATE_POOL) continue;
-            if (n < cap) out[n] = {ss->pool[k][id][bank], TokPerRow{d.tokens}, d.bytes, d.whole_rows};
+            if (n < cap) out[n] = {ss->pool[k][id][b], TokPerRow{d.tokens}, d.bytes, d.whole_rows};
             n++;
         }
     }
@@ -560,9 +573,9 @@ static uint32_t decl_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
 /// @param out   receives up to `cap` pools
 /// @param cap   entries of `out`
 /// @return the bank's pool count (every slot's); 0 out of range
-static uint32_t decl_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
+static uint32_t decl_bank_pools(void *state, BankId bank, pulsar_kv_pool *out, uint32_t cap) {
     pulsar_state_set *ss = SS(state);
-    if (bank >= ss->n_banks) return 0;
+    if (!bank.below(ss->n_banks)) return 0;
     return slot_pools(ss, bank, 0, ss->plan->n_slots, out, cap);
 }
 
@@ -576,10 +589,11 @@ static uint32_t decl_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out,
 /// @return true when the live bank's lanes describe T
 static bool decl_frontier_at(void *state, TokPos T_at, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
-    if (ss->bank_pos[bank] != T_at || ss->frontier_stale[bank]) {
-        snprintf(why, whylen, "bank %u holds %d tokens%s, not a live frontier at %d", bank, ss->bank_pos[bank].raw(),
-                 ss->frontier_stale[bank] ? " (stale: a segment chain without its last restore)" : "", T_at.raw());
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
+    if (ss->bank_pos[b] != T_at || ss->frontier_stale[b]) {
+        snprintf(why, whylen, "bank %d holds %d tokens%s, not a live frontier at %d", bank.raw(), ss->bank_pos[b].raw(),
+                 ss->frontier_stale[b] ? " (stale: a segment chain without its last restore)" : "", T_at.raw());
         return false;
     }
     return !ss->plan->drafter_frontier || ss->plan->drafter_frontier(ss->ud, bank, T_at, why, whylen);
@@ -592,9 +606,10 @@ static bool decl_frontier_at(void *state, TokPos T_at, char *why, size_t whylen)
  *  @return true, always */
 static bool decl_install_frontier(void *state, TokPos T, TokCount prefill) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
     pulsar_state_set_pos(ss, bank, T);
-    ss->prefill_pos[bank] = TokPos::after(prefill);
+    ss->prefill_pos[b] = TokPos::after(prefill);
     if (ss->plan->drafter_at) ss->plan->drafter_at(ss->ud, bank, T);   /* the walk writes the true stage */
     return true;
 }
@@ -620,13 +635,14 @@ static uint32_t decl_trailing_pools(void *state, pulsar_kv_pool *out, uint32_t c
 /// @return false when the live bank's counter is not T
 static bool decl_noted_at(void *state, TokPos T_at, bool *capture, char *why, size_t whylen) {
     pulsar_state_set *ss = SS(state);
-    const uint32_t bank = ss->live_bank;
-    if (ss->bank_pos[bank] != T_at) {
-        snprintf(why, whylen, "bank %u holds %d tokens, the record says %d", bank, ss->bank_pos[bank].raw(),
+    const BankId bank = ss->live_bank;
+    const uint32_t b = pulsar_bank_index(bank);
+    if (ss->bank_pos[b] != T_at) {
+        snprintf(why, whylen, "bank %d holds %d tokens, the record says %d", bank.raw(), ss->bank_pos[b].raw(),
                  T_at.raw());
         return false;
     }
-    *capture = ss->prefill_pos[bank] == T_at && !ss->frontier_stale[bank];
+    *capture = ss->prefill_pos[b] == T_at && !ss->frontier_stale[b];
     return true;
 }
 
@@ -712,7 +728,7 @@ pulsar_state_set *pulsar_state_create(const void *engine, const pulsar_state_pla
     /* the grid checkpoints, ckpt_slots x the walk's bytes a bank -- priced with the rest under the dry run */
     if (ok) ok = pulsar_ckpt_alloc(&ss->ckpt, &ss->ops, ss, n_banks);
     for (uint32_t b = 0; ok && b < n_banks; b++) {
-        ok = pulsar_state_reset_bank(ss, b);
+        ok = pulsar_state_reset_bank(ss, BankId{b});
         if (!ok) fprintf(stderr, "pulsar: %s: could not clear bank %u's state\n", plan->name, b);
     }
     if (!ok) {
@@ -743,27 +759,28 @@ static int decl_bank_count(pulsar_session *s) { return s && s->states ? (int)s->
 /// pulsar_family_bank_ops::save.
 /// @param s    the session
 /// @param bank the bank whose carry receives the host view
-static void decl_bank_save(pulsar_session *s, uint32_t bank) {
-    if (!s || !s->states || bank >= s->states->n_banks) return;
-    pulsar_bank_carry_save_view(s, bank);
+static void decl_bank_save(pulsar_session *s, BankId bank) {
+    if (!s || !s->states || !bank.below(s->states->n_banks)) return;
+    pulsar_bank_carry_save_view(s, pulsar_bank_index(bank));
 }
 
 /** pulsar_family_bank_ops::restore: make `bank` live and bring its carry back (or a fresh view).
  *  @param s    the session
  *  @param bank the bank
  *  @return false out of range */
-static bool decl_bank_restore(pulsar_session *s, uint32_t bank) {
-    if (!s || !s->states || bank >= s->states->n_banks) return false;
-    const uint32_t held = s->states->live_bank;
+static bool decl_bank_restore(pulsar_session *s, BankId bank) {
+    if (!s || !s->states || !bank.below(s->states->n_banks)) return false;
+    const uint32_t b = pulsar_bank_index(bank);
+    const BankId held = s->states->live_bank;
     s->states->live_bank = bank;
     /* a bank nothing was saved for: the fresh view (its first sync resets the bank and prefills cold) */
-    if (!pulsar_bank_carry_saved(s, bank)) {
+    if (!pulsar_bank_carry_saved(s, b)) {
         pulsar_bank_carry_fresh_view(s);
         return true;
     }
     /* L354: a saved one whose restore failed is a failure, not a fresh bank: the view stays as it was (all or nothing,
      * L335), and so does the installed bank */
-    if (pulsar_bank_carry_restore_view(s, bank)) return true;
+    if (pulsar_bank_carry_restore_view(s, b)) return true;
     s->states->live_bank = held;
     return false;
 }
@@ -775,12 +792,13 @@ static pulsar_ckpt_store *decl_bank_kv_store(pulsar_session *s) { return s && s-
 /** pulsar_family_bank_ops::prefill_frontier: the set's own per-bank fact, one for both host views (a decode step
  *  does not move it).  @param s the session  @param bank the bank
  *  @return the bank's prefill-only history end, position 0 out of range */
-static TokPos decl_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view) {
-    return s && s->states && bank < s->states->n_banks ? s->states->prefill_pos[bank] : TokPos{0};
+static TokPos decl_bank_prefill_frontier(pulsar_session *s, BankId bank, pulsar_bank_view) {
+    return s && s->states && bank.below(s->states->n_banks) ? s->states->prefill_pos[pulsar_bank_index(bank)]
+                                                             : TokPos{0};
 }
 
 /** pulsar_family_bank_ops::live.  @param s the session  @return the live bank, 0 without declared state */
-static uint32_t decl_bank_live(pulsar_session *s) { return s && s->states ? s->states->live_bank : 0u; }
+static BankId decl_bank_live(pulsar_session *s) { return s && s->states ? s->states->live_bank : BankId{0}; }
 
 /* L270: one bank's demand-paged share at ctx_size -- the managed bytes of the session's own dry create (the pools
  * are cudaMallocManaged: VA reserved, physical on touch). */
@@ -800,9 +818,9 @@ static KvBytes decl_demand_paged_bytes(pulsar_engine *e, int ctx_size) {
 /// @param s    the session
 /// @param bank the bank
 /// @return the pool bytes the bank's high-water has touched; 0 out of range
-static KvBytes decl_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
-    if (!s->states || bank >= s->states->n_banks) return KvBytes{};
-    return pulsar_state_pool_bytes_at(s->states, pulsar_kv_rows(s->states->kv_hw[bank]));
+static KvBytes decl_bank_touched_kv_bytes(pulsar_session *s, BankId bank) {
+    if (!s->states || !bank.below(s->states->n_banks)) return KvBytes{};
+    return pulsar_state_pool_bytes_at(s->states, pulsar_kv_rows(s->states->kv_hw[pulsar_bank_index(bank)]));
 }
 
 /** pulsar_family_bank_ops::growth_bytes: the most a quantum of `q` rows grows a bank's touched pools by.
@@ -820,10 +838,11 @@ static KvBytes decl_bank_growth_bytes(pulsar_session *s, KvRows q) {
 /// @param s    the session
 /// @param bank the bank to evict (not the live one)
 /// @return false (said for the live bank) when refused
-static bool decl_bank_free_physical(pulsar_session *s, uint32_t bank) {
-    if (!s->states || bank >= s->states->n_banks) return false;
+static bool decl_bank_free_physical(pulsar_session *s, BankId bank) {
+    if (!s->states || !bank.below(s->states->n_banks)) return false;
     if (bank == s->states->live_bank) {
-        fprintf(stderr, "pulsar: %s: free_physical refuses bank %u: it is the live bank\n", s->states->plan->name, bank);
+        fprintf(stderr, "pulsar: %s: free_physical refuses bank %d: it is the live bank\n", s->states->plan->name,
+                bank.raw());
         return false;
     }
     pulsar_state_bank_free(s->states, bank);
@@ -832,15 +851,15 @@ static bool decl_bank_free_physical(pulsar_session *s, uint32_t bank) {
 
 /** pulsar_family_bank_ops::alloc_physical.  @param s the session  @param bank the bank
  *  @return false out of range or on a failed allocation */
-static bool decl_bank_alloc_physical(pulsar_session *s, uint32_t bank) {
-    if (!s->states || bank >= s->states->n_banks) return false;
+static bool decl_bank_alloc_physical(pulsar_session *s, BankId bank) {
+    if (!s->states || !bank.below(s->states->n_banks)) return false;
     return pulsar_state_bank_alloc(s->states, bank);
 }
 
 /** pulsar_family_bank_ops::is_evicted.  @param s the session  @param bank the bank
  *  @return true while a trunk pool of the bank is missing */
-static bool decl_bank_is_evicted(const pulsar_session *s, uint32_t bank) {
-    return s->states && bank < s->states->n_banks && pulsar_state_bank_evicted(s->states, bank);
+static bool decl_bank_is_evicted(const pulsar_session *s, BankId bank) {
+    return s->states && bank.below(s->states->n_banks) && pulsar_state_bank_evicted(s->states, bank);
 }
 
 /* every bank has its own state */

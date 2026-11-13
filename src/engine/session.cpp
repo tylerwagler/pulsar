@@ -1626,12 +1626,12 @@ void pulsar_session::rewind(TokPos at) {
      * be raised here.  Rows beyond the clamp are invisible (readers cap at
      * n_comp) and are rewritten by the next emit at that index; the clamp also
      * drops the grid checkpoints above pos (gpu_graph_set_n_comp). */
-    const uint32_t rw_bank = gpu_graph_cur_bank(s->graph);
+    const BankId rw_bank = gpu_graph_cur_bank(s->graph);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = pulsar_comp_rows_held(pos.before(), TokPerRow{pulsar_layer_compress_ratio(il)});
-        if (gpu_graph_n_comp(s->graph, BankId{rw_bank}, il) > want)
-            gpu_graph_set_n_comp(s->graph, BankId{rw_bank}, il, want);
+        if (gpu_graph_n_comp(s->graph, rw_bank, il) > want)
+            gpu_graph_set_n_comp(s->graph, rw_bank, il, want);
     }
     /* The VALUE half (L264).  The recurrent lanes and the raw window at pos are
      * re-established in exactly two cases: position 0, whose state is the
@@ -1648,21 +1648,21 @@ void pulsar_session::rewind(TokPos at) {
          * the next one, including those a spill kept while its frontier sat at 0
          * and the clamp above therefore could not drop. */
         pulsar_ckpt_drop_bank(&s->graph->ckpt, rw_bank);
-        ok = gpu_graph_compressor_state_reset(s->graph, rw_bank);
+        ok = gpu_graph_compressor_state_reset(s->graph, pulsar_bank_index(rw_bank));
     }
     else if (pulsar_ckpt_best(&s->graph->ckpt, rw_bank, pos) == pos)
         ok = pulsar_ckpt_restore(&s->graph->ckpt, rw_bank, pos);
     else {
-        s->graph->ms_comp_state_stale[rw_bank] = true;
+        s->graph->ms_comp_state_stale[pulsar_bank_index(rw_bank)] = true;
         return;
     }
     if (!ok) {
-        fprintf(stderr, "pulsar: rewind to %d on bank %u: state copy failed -- checkpoint invalidated\n", pos.raw(),
-                rw_bank);
+        fprintf(stderr, "pulsar: rewind to %d on bank %d: state copy failed -- checkpoint invalidated\n", pos.raw(),
+                rw_bank.raw());
         s->checkpoint_valid = false;
         return;
     }
-    s->graph->ms_comp_state_stale[rw_bank] = false;
+    s->graph->ms_comp_state_stale[pulsar_bank_index(rw_bank)] = false;
 }
 
 
@@ -1684,7 +1684,7 @@ void pulsar_session::trim_history(TokPos pos) {
 
 bool pulsar_session::restore_checkpoint(TokPos G) {
     auto *s = this;
-    const uint32_t bank = gpu_graph_cur_bank(s->graph);
+    const BankId bank = gpu_graph_cur_bank(s->graph);
     if (!s->checkpoint_valid || G.is_none() || G <= TokPos{0} || G > s->hist_end() ||
         pulsar_ckpt_best(&s->graph->ckpt, bank, G) != G) return false;
     if (!pulsar_ckpt_restore(&s->graph->ckpt, bank, G)) {

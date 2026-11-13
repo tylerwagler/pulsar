@@ -323,37 +323,37 @@ typedef struct {
     int (*count)(pulsar_session *s);
     /** The live host view into bank's carry -- the core's pulsar_bank_carry_save_view (L272 P2) plus any
      *  device side of the family's own; the history readers are the core's (pulsar_bank_history). */
-    void (*save)(pulsar_session *s, uint32_t bank);
+    void (*save)(pulsar_session *s, BankId bank);
     /** Make `bank` live: the core's pulsar_bank_carry_restore_view, and what a bank with no carry means.
      *  false = refused. */
-    bool (*restore)(pulsar_session *s, uint32_t bank);
+    bool (*restore)(pulsar_session *s, BankId bank);
     /** L266: the family's grid checkpoints (kv_state.h), keyed by bank like DeepSeek's graph.ckpt. */
     struct pulsar_ckpt_store *(*kv_store)(pulsar_session *s);
     /** L266: where `bank`'s prefill-only history ends (the deepest point a checkpoint may sit), in the host view
      *  asked (L380, pulsar_bank_view: a family that keeps the fact in the host view reads the saved one's). */
-    TokPos (*prefill_frontier)(pulsar_session *s, uint32_t bank, pulsar_bank_view view);
+    TokPos (*prefill_frontier)(pulsar_session *s, BankId bank, pulsar_bank_view view);
     /** L266: the bank sync / eval run on (the store's walk reads and writes this one). */
-    uint32_t (*live)(pulsar_session *s);
+    BankId (*live)(pulsar_session *s);
     /** L270: the demand-paged (physical-on-touch) KV bytes ONE bank reserves at ctx_size -- the share
      * admission prices as it is touched, not up front. */
     KvBytes (*demand_paged_bytes)(pulsar_engine *e, int ctx_size);
     /** L270: `bank`'s touched demand-paged KV: what its pages physically hold. */
-    KvBytes (*touched_kv_bytes)(pulsar_session *s, uint32_t bank);
+    KvBytes (*touched_kv_bytes)(pulsar_session *s, BankId bank);
     /** L270: the most one bank's touched KV can grow over q token rows (a decode quantum, a prompt, a chunk): the
      *  family's one conversion of rows to bytes (L333). */
     KvBytes (*growth_bytes)(pulsar_session *s, KvRows q);
     /** L284 #3: return an idle bank's demand-paged KV physical (cudaFree) -- the
      *  pulsar_session_bank_free_physical contract: false ONLY on a refusal (the live bank, a
      *  bank out of range) with nothing freed; true = the bank is evicted, its touched KV 0. */
-    bool (*free_physical)(pulsar_session *s, uint32_t bank);
+    bool (*free_physical)(pulsar_session *s, BankId bank);
     /** L284 #3: re-back an evicted bank (fresh managed tensors, physical on touch).  Idempotent;
      *  on a failure the bank is left wholly evicted.  The caller reloads its KV (segment chain). */
-    bool (*alloc_physical)(pulsar_session *s, uint32_t bank);
+    bool (*alloc_physical)(pulsar_session *s, BankId bank);
     /** L284 #3: true while any of the bank's demand-paged KV is missing. */
-    bool (*is_evicted)(const pulsar_session *s, uint32_t bank);
+    bool (*is_evicted)(const pulsar_session *s, BankId bank);
     /** Optional.  Point the device views at `bank` without its host carry (0 = done, 1 = refused).
      *  NULL = the family's repoint IS a restore (Qwen: nothing on the device to point). */
-    int (*repoint)(pulsar_session *s, uint32_t bank);
+    int (*repoint)(pulsar_session *s, BankId bank);
     /** Optional, present exactly when the family declares PULSAR_FAMILY_CAP_REWIND (pulsar_family_for_model
      *  asserts it): trim the live bank's history to `pos` (pulsar.h pulsar_session_rewind). */
     void (*rewind)(pulsar_session *s, TokPos pos);

@@ -852,7 +852,8 @@ bool pulsar_qwen_s4_embed(const pulsar_qwen_step *st) {
         if (!io->cap) return fail("could not allocate the pinned PLE row buffers");
     }
     for (uint32_t r = 0; r < n; r++) {
-        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, (uint32_t)st->bank[r]);   /* oldest first */
+        /* oldest first */
+        int32_t *ctx_b = (int32_t *)pulsar_state_host(st->states, PULSAR_QWEN_STATE_NGRAM, BankId{st->bank[r]});
         pulsar_qwen_ngram_ctx ctx = {{ctx_b[0], ctx_b[1]}};
         pulsar_qwen_ngram_rows(&io->layout, &ctx, &st->tokens[r], 1, io->ids + (size_t)r * PULSAR_QWEN_NGRAM_COLS);
         ctx_b[0] = ctx.prev[0];
@@ -1567,8 +1568,8 @@ bool pulsar_qwen_s3_qsa(const pulsar_qwen_step *st, uint32_t il) {
     const uint64_t itb = pulsar_qwen_index_tail_bytes(s);
     pulsar_qsa_seq seqs[64];
     for (uint32_t b = 0; ok && b < nb; b++) {
-        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, b);
-        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, b);
+        seqs[b].kv    = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_KV, BankId{b});
+        seqs[b].bkey  = pulsar_state_pool(st->states, il, PULSAR_QWEN_STATE_IDX_KEYS, BankId{b});
         seqs[b].stage = pulsar_gpu_tensor_view(pulsar_state_tensor(st->states, il, PULSAR_QWEN_STATE_IDX_TAIL), b * itb, itb);
         seqs[b].cap   = st->states->ctx;
         views[nv++] = seqs[b].stage;

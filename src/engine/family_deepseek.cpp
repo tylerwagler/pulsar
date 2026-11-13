@@ -110,12 +110,12 @@ static uint64_t ds4_trained_context(const pulsar_engine *) {
 /// @return true when the bank's state is the view's
 static bool ds4_sync_state_agrees(pulsar_session *s) {
     const pulsar_gpu_graph *g = s->graph;
-    const uint32_t bank = gpu_graph_cur_bank(g);
-    if (s->mseq_dirty || g->ms_comp_state_stale[bank]) return false;
+    const BankId bank = gpu_graph_cur_bank(g);
+    if (s->mseq_dirty || g->ms_comp_state_stale[pulsar_bank_index(bank)]) return false;
     const TokCount len = s->hist_end().before();
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
         if (gpu_graph_layer_is_kv_source(il) &&
-            gpu_graph_n_comp(g, BankId{bank}, il) >
+            gpu_graph_n_comp(g, bank, il) >
                 pulsar_comp_rows_held(len, TokPerRow{pulsar_layer_compress_ratio(il)}))
             return false;
     return true;
@@ -128,7 +128,7 @@ static bool ds4_sync_state_agrees(pulsar_session *s) {
 /// @return false when the graph reset fails
 static bool ds4_sync_reset_bank(pulsar_session *s) {
     if (!gpu_graph_reset_prefill_state(s->graph)) return false;
-    gpu_graph_engram_forget(s->graph, gpu_graph_cur_bank(s->graph));
+    gpu_graph_engram_forget(s->graph, pulsar_bank_index(gpu_graph_cur_bank(s->graph)));
     s->mseq_dirty = false;
     return true;
 }

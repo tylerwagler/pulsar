@@ -304,7 +304,7 @@ static bool segment_images(const pulsar_session *s, uint32_t G_prev, uint32_t G,
 /// @param s    the session
 /// @param st   its checkpoint store
 /// @param bank the installed bank
-static void segment_clear(pulsar_session *s, pulsar_ckpt_store *st, uint32_t bank) {
+static void segment_clear(pulsar_session *s, pulsar_ckpt_store *st, BankId bank) {
     s->live_images.n = 0;   /* L281: the bank holds no block */
     pulsar_session_family_invalidate(s);
     pulsar_ckpt_drop_bank(st, bank);
@@ -323,14 +323,15 @@ static uint32_t segment_pools(pulsar_ckpt_store *st, pulsar_kv_pool *pools) {
  *  @param st   the store
  *  @param bank the bank the segment is written from / read into
  *  @return the digest */
-static uint64_t segment_layout_digest(pulsar_ckpt_store *st, uint32_t bank) {
+static uint64_t segment_layout_digest(pulsar_ckpt_store *st, BankId bank) {
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     const uint32_t n = segment_pools(st, pools);
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     for (const char *c = st->ops->name; *c; c++) mix((uint8_t)*c);
     if (st->artifact) mix(st->artifact);   /* 0 leaves DeepSeek's digests as they were */
-    if (st->bank_adapter && st->bank_adapter[bank]) for (const char *c = "runtime-adapter"; *c; c++) mix((uint8_t)*c);
+    if (st->bank_adapter && st->bank_adapter[pulsar_bank_index(bank)])
+        for (const char *c = "runtime-adapter"; *c; c++) mix((uint8_t)*c);
     mix(st->ops->resume_grid);
     mix(st->slot_bytes);
     mix(n);
@@ -533,7 +534,7 @@ struct mem_in {
 
 int pulsar_session::copy_out_restore_point(uint32_t G, uint8_t *dst, uint64_t bytes, char *err, size_t errlen) {
     pulsar_ckpt_store *st = pulsar_session_kv_store(this);
-    const uint32_t bank = pulsar_session_live_bank(this);
+    const BankId bank = pulsar_session_live_bank(this);
     pulsar_ckpt_slot_at at;
     /* L354: the same gate as copy_out_segment's: after a rewind or an invalidate the store can still hold the slot, and a
      * restore point of rows the bank no longer holds would resume a history it doesn't have */
@@ -574,7 +575,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
                                      size_t errlen) {
     auto *s = this;
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const BankId bank = pulsar_session_live_bank(s);
     if (!dst || !s->checkpoint_valid || !segment_span_ok(st, G_prev, G) || G > (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "copy-out segment: the session does not hold that grid span");
         return 1;
@@ -649,7 +650,7 @@ int pulsar_session::copy_out_segment(uint32_t G_prev, uint32_t G, uint8_t *dst, 
 /// @param err       receives the refusal
 /// @param errlen    bytes of `err`
 /// @return 0, or 1 on a short read or a header that is not this layout's restore point at G
-static int restore_point_header_read(mem_in *in, pulsar_ckpt_store *st, uint32_t bank, uint32_t G, char *err,
+static int restore_point_header_read(mem_in *in, pulsar_ckpt_store *st, BankId bank, uint32_t G, char *err,
                                      size_t errlen) {
     uint32_t h[RESTORE_POINT_U32_FIELDS];
     for (uint32_t i = 0; i < RESTORE_POINT_U32_FIELDS; i++)
@@ -705,7 +706,7 @@ struct segment_view {
 /// @param err      receives the fault
 /// @param errlen   bytes of `err`
 /// @return PULSAR_SEGMENT_OK, _BAD_ROWS, _BAD_RP, or _TRANSIENT for a caller error (no bytes, `rp` against `last`)
-static pulsar_segment_status segment_parse(pulsar_ckpt_store *st, uint32_t bank, int ctx_size, const uint8_t *seg,
+static pulsar_segment_status segment_parse(pulsar_ckpt_store *st, BankId bank, int ctx_size, const uint8_t *seg,
                                            uint64_t bytes, bool last, const uint8_t *rp, uint64_t rp_bytes,
                                            segment_view *v, char *err, size_t errlen) {
     if (!seg) { payload_set_err(err, errlen, "load segment: no bytes"); return PULSAR_SEGMENT_TRANSIENT; }
@@ -787,7 +788,7 @@ pulsar_segment_status pulsar_session::load_segment(const uint8_t *seg, uint64_t 
                                                    uint64_t rp_bytes, uint32_t *G_out, char *err, size_t errlen) {
     auto *s = this;
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const BankId bank = pulsar_session_live_bank(s);
     if (G_out) *G_out = 0u;
     /* L347 I3b: every check of the bytes first -- a content fault leaves the bank as it was */
     segment_view v;
@@ -971,7 +972,7 @@ static bool kvp_pools(pulsar_ckpt_store *st, pulsar_kv_pool *out, uint32_t *n) {
 /// @param bank  the bank the payload is written from / read into (its runtime adapter, L338)
 /// @return the digest
 static uint64_t kvp_layout_digest(pulsar_ckpt_store *st, const pulsar_kv_pool *pools, uint32_t n, uint32_t width,
-                                  uint32_t bank) {
+                                  BankId bank) {
     uint64_t h = segment_layout_digest(st, bank);
     auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; } };
     mix(n);
@@ -1022,7 +1023,8 @@ struct kvp_plan {
     /** @var kvp_plan::n_pools
      *  entries of pools[] in use */
     /// the live bank saved
-    uint32_t bank, T, PF, G, width, n_pools;
+    BankId bank;
+    uint32_t T, PF, G, width, n_pools;
     /// [n_pools] the append-only pools the payload carries: pools() then trailing_pools() (kvp_pools)
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     /// the payload's total size in bytes, the trailing digest included (kvp_bytes_for)
@@ -1051,7 +1053,7 @@ static bool kvp_plan_save(pulsar_session *s, kvp_plan *p, char *err, size_t errl
         payload_set_err(err, errlen, msg);
         return false;
     }
-    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, BankId{p->bank}).raw();   /* L334: the payload's raw field */
+    p->PF = (uint32_t)pulsar_session_bank_prefill_frontier(s, p->bank).raw();   /* L334: the payload's raw field */
     if (p->PF > p->T) {
         payload_set_err(err, errlen, "session payload: the prefill frontier lies past the session's tokens");
         return false;
@@ -1149,7 +1151,7 @@ int pulsar_session::load_payload(FILE *fp, uint64_t payload_bytes, char *err, si
         return 1;
     }
     pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const BankId bank = pulsar_session_live_bank(s);
     const uint32_t width = (uint32_t)pulsar_engine_logits_width(s->engine);
     pulsar_kv_pool pools[PULSAR_KV_POOLS_MAX];
     uint32_t n = 0;

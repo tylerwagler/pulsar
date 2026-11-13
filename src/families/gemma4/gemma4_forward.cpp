@@ -743,7 +743,7 @@ bool plan_call(const g4_step *st, uint32_t il, uint32_t bound, uint64_t off, uin
         pulsar_gqa_seq &sq = q->seqs[j];
         const uint32_t bank = (uint32_t)q->seq_bank[j];
         if (full) {
-            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, bank);
+            pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_GEMMA4_STATE_KV_FULL, BankId{bank});
             if (!pool) return failf("a global layer's pool is evicted", il);
             sq.kv = dptr(pool);
             sq.bytes = pulsar_gpu_tensor_bytes(pool);

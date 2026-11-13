@@ -767,7 +767,7 @@ bool plan_call(const nh_step *st, uint32_t il, uint32_t k, uint32_t bound, uint6
     const pulsar_gqa_layer G1 = gqa_decl(st->w->shape);
     const uint64_t tb = pulsar_gqa_kv_token_bytes(&G1);
     for (uint32_t j = 0; j < q->n_seq; j++) {
-        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, (uint32_t)q->seq_bank[j]);
+        pulsar_gpu_tensor *pool = pulsar_state_pool(st->states, il, PULSAR_NEMOTRON_H_STATE_KV, BankId{q->seq_bank[j]});
         if (!pool) return failf("an attention layer's pool is evicted", il);
         pulsar_gqa_seq &sq = q->seqs[j];
         sq.kv = dptr(pool);
@@ -1340,9 +1340,9 @@ void dump(const pulsar_driver_step *st0, uint32_t il) {
  *  @param rows   the verify's captured per-row updates, f32
  *  @param keep   the rows kept
  *  @return true = applied */
-bool ssm_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
+bool ssm_commit(void *state, BankId bank, const void *rows, uint32_t keep) {
     const pulsar_mamba2_geom g = mamba_geom(G());
-    return pulsar_mamba2_commit(&g, (float *)state, bank, (const float *)rows, keep, 0) == 0;
+    return pulsar_mamba2_commit(&g, (float *)state, pulsar_bank_index(bank), (const float *)rows, keep, 0) == 0;
 }
 
 /* ---- N9: the MTP module, declared to the chained-MTP lane (spec_mtp.h) ---------------------------------------------

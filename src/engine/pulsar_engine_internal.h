@@ -1970,8 +1970,8 @@ void gpu_graph_engram_release(pulsar_gpu_graph *g);
  * "classic" case left to special-case. */
 /// @param g  the graph
 /// @return the bank the installed device views address (0 without a pool).
-static inline uint32_t gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
-    return g->banks.n_banks ? g->banks.cur_bank : 0u;
+static inline BankId gpu_graph_cur_bank(const pulsar_gpu_graph *g) {
+    return BankId{g->banks.n_banks ? g->banks.cur_bank : 0u};
 }
 /* THE BANK IS EXPLICIT.  These used to take (g, il) and resolve through
  * gpu_graph_cur_bank(), which reads `banks.cur_bank` -- documented as "bank the
@@ -2016,7 +2016,7 @@ static inline void gpu_graph_set_n_comp(pulsar_gpu_graph *g, BankId bank_at, uin
      * prompt end inside the group (L289) survives a round's rollback to it. */
     if (rows < g->ms_n_comp[bank][il]) {
         const uint32_t R = pulsar_layer_compress_ratio(il);
-        pulsar_ckpt_frontier_lowered(&g->ckpt, bank, pulsar_comp_rows_serve(CompRows{(int)rows}, TokPerRow{R}));
+        pulsar_ckpt_frontier_lowered(&g->ckpt, bank_at, pulsar_comp_rows_serve(CompRows{(int)rows}, TokPerRow{R}));
     }
     g->ms_n_comp[bank][il] = rows;
     if (rows > g->ms_comp_hw[bank][il]) g->ms_comp_hw[bank][il] = rows;
@@ -4197,7 +4197,7 @@ struct pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s);
 /** The bank the session's sync and eval run on. */
 /// @param s  the session
 /// @return the live bank (the family's bank ops).
-uint32_t pulsar_session_live_bank(pulsar_session *s);
+BankId pulsar_session_live_bank(pulsar_session *s);
 /** L266 step 5: where a sync of `prompt_len` tokens sharing `common` with `bank`'s history resumes --
  * the deepest grid checkpoint within the shared prefix, the bank's prefill-only history and one
  * token short of the prompt (the last row must be evaluated for the logits); 0 = prefill from 0.
@@ -4210,7 +4210,7 @@ uint32_t pulsar_session_live_bank(pulsar_session *s);
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @param view        L380: the bank's host view the history and the prefill frontier are read in
 /// @return the resume position (position 0 = from the start).
-TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount common, TokCount prompt_len,
+TokPos pulsar_session_resume_point(pulsar_session *s, BankId bank, TokCount common, TokCount prompt_len,
                                    const pulsar_image_identity *want, pulsar_bank_view view);
 /** L311: the record a resume at T (pulsar_session_resume_point's answer) restores -- NULL when T, below the prompt's
  *  end, is a grid checkpoint of the bank's (or 0, or no record of its is at T). */
@@ -4221,7 +4221,7 @@ TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount co
 /// @param want        L350: the request's image blocks over the prompt, or NULL (records holding no image only)
 /// @param view        L380: the bank's host view the history is read in
 /// @return the record (borrowed from the store), or NULL.
-const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, TokPos T,
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, BankId bank, TokPos T,
                                                        TokCount prompt_len, const pulsar_image_identity *want,
                                                        pulsar_bank_view view);
 /** L284: whether a sync continues `bank`'s history where its first `len` tokens end, every family's one rule:
@@ -4233,7 +4233,7 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
 /// @param len   tokens of the bank's history the sync keeps
 /// @param view  L380: the bank's host view the prefill frontier is read in
 /// @return true when the sync can continue there.
-bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, TokCount len, pulsar_bank_view view);
+bool pulsar_session_bank_continues(pulsar_session *s, BankId bank, TokCount len, pulsar_bank_view view);
 /** L188: the id check every eval runs before the embed kernel can clamp a refused sample (-1) to
  * token 0.  false with `err` filled when `token` is not a vocab id. */
 /// @param s       the session
@@ -4679,7 +4679,7 @@ const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pu
  *  @param n_rows rows
  *  @param live   the installed bank
  *  @param landed the step ran to its end (false: it failed mid-sweep) */
-void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, BankId live,
                                 bool landed);
 /** L380: a view left valid across a batch step on other banks (pulsar_multiseq_step_stale) names the installed bank's
  *  history for the readers, but nothing resumes from it while the per-bank truth is to re-establish: dropped here

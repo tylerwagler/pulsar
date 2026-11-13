@@ -645,7 +645,7 @@ static void vc_cache_write(const char *path, uint64_t key, uint32_t rows_max, co
 #define VC_PAIR_WARM 4u
 bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, double *base, char *err,
                                          size_t errlen) {
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const BankId bank = pulsar_session_live_bank(s);
     const TokPos P = pulsar_session_pos(s);
     const uint32_t V = spec_vocab(s);
     if (rows_max == 0u || rows_max > PULSAR_SPEC_LOGITS_ROWS) {
@@ -667,7 +667,7 @@ bool pulsar_session_verify_profile_local(pulsar_session *s, uint32_t rows_max, d
     spec_bank_save(s, bank);
     for (uint32_t rows = rows_max; ok && rows >= 1u; rows--) {
         for (uint32_t k = 0; k < rows; k++)
-            reqs[k] = {BankId{bank}, P + TokCount{(int)k}, TokId{s->checkpoint.v[k % (uint32_t)P.raw()]}};
+            reqs[k] = {bank, P + TokCount{(int)k}, TokId{s->checkpoint.v[k % (uint32_t)P.raw()]}};
         double ms[VC_PROFILE_REPS];
         uint32_t timed = 0;
         bool warm = false;

@@ -102,7 +102,7 @@ typedef struct pulsar_state_decl {
     uint64_t capture_off;          ///< STAGE: where the block row sits in the record
     /** DELTA: apply rows [0, keep) of `rows` (device, capture_bytes a row) to bank `bank` of `state` (device, the
      *  decl's whole tensor), on the session stream.  false = refused (said). */
-    bool (*commit)(void *state, uint32_t bank, const void *rows, uint32_t keep);
+    bool (*commit)(void *state, BankId bank, const void *rows, uint32_t keep);
     /** REPLAY: advance a bank's host state `state` (restored to its bytes before the step) over the kept tokens.
      *  `e` is the engine (const pulsar_engine *).  false = refused (said). */
     bool (*replay)(const void *e, void *state, const int32_t *tokens, uint32_t keep);
@@ -135,9 +135,9 @@ typedef struct pulsar_state_plan {
     uint32_t session;
     /** The drafter lane's own counters the state walk must keep in step (NULL = no drafter lane): a restore or a
      *  payload put bank `bank` at T (T 0 = a fresh bank) -- the drafter's lagging row is the trunk's at T - 1. */
-    void (*drafter_at)(void *ud, uint32_t bank, TokPos T);
+    void (*drafter_at)(void *ud, BankId bank, TokPos T);
     /** ... and does the drafter's state describe frontier T (nothing drafted past it)?  `why` names the violation. */
-    bool (*drafter_frontier)(void *ud, uint32_t bank, TokPos T, char *why, size_t whylen);
+    bool (*drafter_frontier)(void *ud, BankId bank, TokPos T, char *why, size_t whylen);
 } pulsar_state_plan;
 
 /** Bytes one bank of a non-POOL decl takes (FIXED: bytes; STAGED: the block; RING: W - 1 + the verify width slots). */
@@ -202,7 +202,7 @@ typedef struct pulsar_state_set {
     TokCount *kv_hw;               ///< L270: the most tokens each bank has held -- its touched pool pages
     TokPos *prefill_pos;           ///< L266: the end of each bank's prefill-only history (the cold prefill's bytes)
     bool *frontier_stale;          ///< a segment load wrote the pools without the lanes
-    uint32_t live_bank;            ///< the bank sync / eval / the store's walk run on
+    BankId live_bank;              ///< the bank sync / eval / the store's walk run on
     pulsar_ckpt_store ckpt;        ///< the grid checkpoints and prompt ends (kv_state.h)
     pulsar_kv_state_ops ops;       ///< this set's kv-state answer: the core's walk over the plan
 } pulsar_state_set;
@@ -227,14 +227,15 @@ void pulsar_state_destroy(pulsar_state_set *ss);
 /// @param ss   the set
 /// @param bank the bank to reset
 /// @return false when a device clear failed (not said here)
-bool pulsar_state_reset_bank(pulsar_state_set *ss, uint32_t bank);
+bool pulsar_state_reset_bank(pulsar_state_set *ss, BankId bank);
 /** L270: the one writer of a bank's position; it keeps the bank's high-water. */
 /// @param ss   the set
 /// @param bank the bank
 /// @param pos  its new position (the end of its history)
-static inline void pulsar_state_set_pos(pulsar_state_set *ss, uint32_t bank, TokPos pos) {
-    ss->bank_pos[bank] = pos;
-    if (pos.before() > ss->kv_hw[bank]) ss->kv_hw[bank] = pos.before();
+static inline void pulsar_state_set_pos(pulsar_state_set *ss, BankId bank, TokPos pos) {
+    const uint32_t b = pulsar_bank_index(bank);
+    ss->bank_pos[b] = pos;
+    if (pos.before() > ss->kv_hw[b]) ss->kv_hw[b] = pos.before();
 }
 /** The tensor of a FIXED / STAGED / RING decl on slot `slot` (every bank's). */
 /// @param ss   the set
@@ -251,16 +252,16 @@ static inline pulsar_gpu_tensor *pulsar_state_tensor(const pulsar_state_set *ss,
 /// @param bank the bank
 /// @return the bank's pool tensor (the set's), or NULL
 static inline pulsar_gpu_tensor *pulsar_state_pool(const pulsar_state_set *ss, uint32_t slot, uint32_t id,
-                                                   uint32_t bank) {
-    return ss->pool[slot][id] ? ss->pool[slot][id][bank] : NULL;
+                                                   BankId bank) {
+    return ss->pool[slot][id] ? ss->pool[slot][id][pulsar_bank_index(bank)] : NULL;
 }
 /** Bank `bank`'s bytes of a session host decl. */
 /// @param ss   the set
 /// @param id   the session host decl's id
 /// @param bank the bank
 /// @return a pointer to the bank's decl[id].bytes host bytes (the set's)
-static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, uint32_t bank) {
-    return ss->host[id] + (size_t)bank * ss->plan->decl[id].bytes;
+static inline void *pulsar_state_host(const pulsar_state_set *ss, uint32_t id, BankId bank) {
+    return ss->host[id] + (size_t)pulsar_bank_index(bank) * ss->plan->decl[id].bytes;
 }
 /** The verify capture's rows of decl `id` on slot `slot` (device; step row r at + r * the row's bytes): where a
  *  verify's op writes them -- as a pointer, or as its tensor and the byte offset into it (a copy's destination). */
@@ -308,7 +309,7 @@ void pulsar_state_step_end(pulsar_state_set *ss, const int32_t *bank, uint32_t n
 /// @param ss   the set
 /// @param bank the bank
 /// @return false on a failure
-bool pulsar_state_fold_flush(pulsar_state_set *ss, uint32_t bank);
+bool pulsar_state_fold_flush(pulsar_state_set *ss, BankId bank);
 
 /** A verify step begins: its runs (`n_runs` runs, run k rows [run_first[k], run_first[k + 1]) of bank[run_first[k]]
  *  from pos[run_first[k]]), each run's host REPLAY state kept.  Then, on the step's stream inside its commands,
@@ -333,7 +334,7 @@ bool pulsar_state_verify_capture(pulsar_state_set *ss);
 /// @param tokens the run's token ids
 /// @param keep   rows of the run to keep, 1 .. the run's rows
 /// @return true when committed
-bool pulsar_state_commit(pulsar_state_set *ss, uint32_t bank, const int32_t *tokens, uint32_t keep);
+bool pulsar_state_commit(pulsar_state_set *ss, BankId bank, const int32_t *tokens, uint32_t keep);
 
 /** L270: the demand-paged bytes `rows` positions take in one bank (every slot's pools): the declared families' one
  *  conversion of rows to bytes, each pool rounding its own ceil(rows / tokens-per-row) (L333). */
@@ -346,17 +347,17 @@ KvBytes pulsar_state_pool_bytes_at(const pulsar_state_set *ss, KvRows rows);
  *  true while any is missing. */
 /// @param ss   the set
 /// @param bank the bank to evict
-void pulsar_state_bank_free(pulsar_state_set *ss, uint32_t bank);
+void pulsar_state_bank_free(pulsar_state_set *ss, BankId bank);
 /** Re-back the bank's missing trunk pools (see pulsar_state_bank_free).
  *  @param ss   the set
  *  @param bank the bank
  *  @return false when an allocation failed (the bank then wholly evicted) */
-bool pulsar_state_bank_alloc(pulsar_state_set *ss, uint32_t bank);
+bool pulsar_state_bank_alloc(pulsar_state_set *ss, BankId bank);
 /** Is any of the bank's trunk pools missing (see pulsar_state_bank_free)?
  *  @param ss   the set
  *  @param bank the bank
  *  @return true while evicted */
-bool pulsar_state_bank_evicted(const pulsar_state_set *ss, uint32_t bank);
+bool pulsar_state_bank_evicted(const pulsar_state_set *ss, BankId bank);
 
 /** The bank pool of a family whose state is declared (family.h pulsar_family_bank_ops), over pulsar_session::states. */
 extern const pulsar_family_bank_ops PULSAR_BANK_OPS_DECLARED;

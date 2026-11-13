@@ -587,7 +587,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
             pulsar_tp_mirror_fail_void(tp, "bank state save", ferr);
             return 1;
         }
-        slot->s->engine->family->banks->save(slot->s, pulsar_bank_index(pulsar_tp_command_bank(c)));
+        slot->s->engine->family->banks->save(slot->s, pulsar_tp_command_bank(c));
         return 1;
 
     case PULSAR_TP_FRAME_BANK_STATE_RESTORE:
@@ -600,7 +600,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
-            const uint32_t bank = pulsar_bank_index(pulsar_tp_command_bank(c));
+            const BankId bank = pulsar_tp_command_bank(c);
             /* a family without a repoint never sends one (its repoint is a restore frame) */
             status = restore ? (ops->restore(slot->s, bank) ? 0 : 1) : ops->repoint ? ops->repoint(slot->s, bank) : 1;
             if (status < 0) status = 1;
@@ -706,9 +706,9 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = 1;
         if (!worker_refused(e, c, "verify_profile", &slot, ferr, sizeof(ferr))) {
             double base[PULSAR_SPEC_LOGITS_ROWS + 1];
-            if (c->spec.bank < 0 || (uint32_t)c->spec.bank != pulsar_session_live_bank(slot->s))
-                snprintf(ferr, sizeof(ferr), "tp: verify_profile names bank %d, this rank has bank %u installed",
-                         c->spec.bank, pulsar_session_live_bank(slot->s));
+            if (c->spec.bank < 0 || BankId{c->spec.bank} != pulsar_session_live_bank(slot->s))
+                snprintf(ferr, sizeof(ferr), "tp: verify_profile names bank %d, this rank has bank %d installed",
+                         c->spec.bank, pulsar_session_live_bank(slot->s).raw());
             else if (pulsar_session_verify_profile_local(slot->s, (uint32_t)c->spec.i0, c->spec.i1 ? base : NULL,
                                                          ferr, sizeof(ferr)))
                 status = 0;
@@ -854,7 +854,7 @@ int pulsar_tp_worker_dispatch(pulsar_engine *e, const pulsar_tp_command *c, char
         int status = -1;
         if (!worker_refused(e, c, op, &slot, ferr, sizeof(ferr))) {
             const pulsar_family_bank_ops *ops = slot->s->engine->family->banks;
-            const uint32_t bank = pulsar_bank_index(pulsar_tp_command_bank(c));
+            const BankId bank = pulsar_tp_command_bank(c);
             const bool okb = freeing ? ops->free_physical(slot->s, bank) : ops->alloc_physical(slot->s, bank);
             status = okb ? 0 : 1;
         } else fprintf(stderr, "pulsar: tp worker: %s refused: %s\n", op, ferr);

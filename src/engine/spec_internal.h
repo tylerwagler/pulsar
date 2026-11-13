@@ -224,11 +224,13 @@ static inline const pulsar_drafter_ops *spec_drafter(const pulsar_session *s) { 
 /// @param s the session
 /// @param bank the bank to install
 /// @return false = the family refused
-static inline bool spec_bank_restore(pulsar_session *s, uint32_t bank) { return s->engine->family->banks->restore(s, bank); }
+static inline bool spec_bank_restore(pulsar_session *s, BankId bank) {
+    return s->engine->family->banks->restore(s, bank);
+}
 /// Save the installed bank through the family's bank ops.
 /// @param s the session
 /// @param bank the bank
-static inline void spec_bank_save(pulsar_session *s, uint32_t bank) { s->engine->family->banks->save(s, bank); }
+static inline void spec_bank_save(pulsar_session *s, BankId bank) { s->engine->family->banks->save(s, bank); }
 
 /* ---- the implementations ---- */
 extern const pulsar_spec_target_ops k_ds4_spec_target;   ///< DeepSeek V4's verify hooks (spec_dspark.cpp)

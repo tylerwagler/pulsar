@@ -120,7 +120,7 @@ static bool ds4_walk(void *state, int dir, bool frontier, pulsar_gpu_tensor *sla
     }
     /* L289: the frontier's Engram history ring (host), the bank's PULSAR_ENGRAM_RING tagged ids */
     if (frontier && g->engram.model) {
-        const uint32_t bank = gpu_graph_cur_bank(g);
+        const uint32_t bank = pulsar_bank_index(gpu_graph_cur_bank(g));
         int32_t *tok = g->engram.ring_tok + (size_t)bank * PULSAR_ENGRAM_RING;
         uint32_t *pos = g->engram.ring_pos + (size_t)bank * PULSAR_ENGRAM_RING;
         const uint64_t tb = PULSAR_ENGRAM_RING * sizeof(int32_t), pb = PULSAR_ENGRAM_RING * sizeof(uint32_t);
@@ -153,13 +153,13 @@ static CompRows ds4_rows_at(TokPos G, uint32_t il) {
  *  @return true when it stands at G */
 static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
     pulsar_gpu_graph *g = G_(state);
-    const uint32_t bank = gpu_graph_cur_bank(g);
+    const BankId bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
         const CompRows want = ds4_rows_at(G, il);
-        if (gpu_graph_n_comp(g, BankId{bank}, il) != want) {
+        if (gpu_graph_n_comp(g, bank, il) != want) {
             snprintf(why, whylen, "layer %u holds %d compressed rows, a frontier at %u holds %d", il,
-                     gpu_graph_n_comp(g, BankId{bank}, il).raw(), pulsar_ckpt_raw(G), want.raw());
+                     gpu_graph_n_comp(g, bank, il).raw(), pulsar_ckpt_raw(G), want.raw());
             return false;
         }
     }
@@ -170,9 +170,9 @@ static bool ds4_stands_at(void *state, TokPos G, char *why, size_t whylen) {
  *  @param state the graph  @param G tokens  @return true when it does */
 static bool ds4_holds(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
-    const uint32_t bank = gpu_graph_cur_bank(g);
+    const BankId bank = gpu_graph_cur_bank(g);
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, BankId{bank}, il) < ds4_rows_at(G, il))
+        if (gpu_graph_layer_is_kv_source(il) && gpu_graph_n_comp(g, bank, il) < ds4_rows_at(G, il))
             return false;
     return true;
 }
@@ -181,9 +181,9 @@ static bool ds4_holds(void *state, TokPos G) {
  *  @param g    the graph
  *  @param bank the bank
  *  @param G    the frontier, in tokens */
-static void ds4_set_frontier(pulsar_gpu_graph *g, uint32_t bank, TokPos G) {
+static void ds4_set_frontier(pulsar_gpu_graph *g, BankId bank, TokPos G) {
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++)
-        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, BankId{bank}, il, ds4_rows_at(G, il));
+        if (gpu_graph_layer_is_kv_source(il)) gpu_graph_set_n_comp(g, bank, il, ds4_rows_at(G, il));
 }
 
 /// pulsar_kv_state_ops::prepare_restore.
@@ -192,7 +192,7 @@ static void ds4_set_frontier(pulsar_gpu_graph *g, uint32_t bank, TokPos G) {
 /// @return false when the compressor state reset failed
 static bool ds4_prepare_restore(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
-    const uint32_t bank = gpu_graph_cur_bank(g);
+    const BankId bank = gpu_graph_cur_bank(g);
     /* Frontier first: lowering it drops the checkpoints above G (not this one, which sits exactly
      * at G/ratio).  Then every lane to the canonical boundary state; the walk brings the coff-2
      * lanes back from the slot, and a coff-1 lane at G IS the canonical state.  The bank's Engram history
@@ -200,8 +200,8 @@ static bool ds4_prepare_restore(void *state, TokPos G) {
      * (gpu_graph_engram_stage), and a step that does not refuses instead of hashing stale ids (a FRONTIER
      * restore -- install_frontier -- brings the ring back with its walk instead, L289). */
     ds4_set_frontier(g, bank, G);
-    gpu_graph_engram_forget(g, bank);
-    return gpu_graph_compressor_state_reset(g, bank);
+    gpu_graph_engram_forget(g, pulsar_bank_index(bank));
+    return gpu_graph_compressor_state_reset(g, pulsar_bank_index(bank));
 }
 
 /* L375 O42: an adopt replaces the installed bank's history with another bank's.  The drafter's window -- its
@@ -221,7 +221,7 @@ static void ds4_history_replaced(void *state) {
 /** pulsar_kv_state_ops::restored: clear the installed bank's stale mark.  @param state the graph */
 static void ds4_restored(void *state) {
     pulsar_gpu_graph *g = G_(state);
-    g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;
+    g->ms_comp_state_stale[pulsar_bank_index(gpu_graph_cur_bank(g))] = false;
 }
 
 /** pulsar_kv_state_ops::set_frontier_stale: the frontier counters to G and the installed bank marked stale.
@@ -229,18 +229,19 @@ static void ds4_restored(void *state) {
  *  @param G     the segment chain's end, in tokens */
 static void ds4_set_frontier_stale(void *state, TokPos G) {
     pulsar_gpu_graph *g = G_(state);
-    const uint32_t bank = gpu_graph_cur_bank(g);
+    const BankId bank = gpu_graph_cur_bank(g);
     ds4_set_frontier(g, bank, G);
-    g->ms_comp_state_stale[bank] = true;
+    g->ms_comp_state_stale[pulsar_bank_index(bank)] = true;
 }
 
 /* Every pool's rows are WHOLE: an emit writes a row when its group closes, and the open group is the lanes'. */
 
 /** pulsar_kv_state_ops::stale.  @param state the graph  @param bank any bank
  *  @return its stale mark; false out of range */
-static bool ds4_stale(void *state, uint32_t bank) {
+static bool ds4_stale(void *state, BankId bank) {
     const pulsar_gpu_graph *g = G_(state);
-    return bank < gpu_graph_bank_pool_count(g) && bank < PULSAR_MSEQ_MAX && g->ms_comp_state_stale[bank];
+    return bank.below(gpu_graph_bank_pool_count(g)) && bank.below(PULSAR_MSEQ_MAX) &&
+           g->ms_comp_state_stale[pulsar_bank_index(bank)];
 }
 
 /** pulsar_kv_state_ops::pools: per kv source layer, its comp pool then (when it has one) its index pool.
@@ -267,14 +268,15 @@ static uint32_t ds4_pools(void *state, pulsar_kv_pool *out, uint32_t cap) {
  * none on a graph without a bank pool. */
 /// pulsar_kv_state_ops::bank_pools.
 /// @param state the graph
-/// @param bank  any bank
+/// @param bank_id any bank
 /// @param out   receives up to `cap` pools
 /// @param cap   entries of `out`
 /// @return the bank's pool count; 0 out of range or without a bank pool
-static uint32_t ds4_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
+static uint32_t ds4_bank_pools(void *state, BankId bank_id, pulsar_kv_pool *out, uint32_t cap) {
     pulsar_gpu_graph *g = G_(state);
     const pulsar_bank_slabs *b = &g->banks;
-    if (b->n_banks == 0 || bank >= b->n_banks) return 0;
+    if (b->n_banks == 0 || !bank_id.below(b->n_banks)) return 0;
+    const uint32_t bank = pulsar_bank_index(bank_id);
     uint32_t n = 0;
     for (uint32_t il = 0; il < PULSAR_N_LAYER; il++) {
         if (!gpu_graph_layer_is_kv_source(il)) continue;
@@ -298,7 +300,7 @@ static uint32_t ds4_bank_pools(void *state, uint32_t bank, pulsar_kv_pool *out, 
 /// @return true when the installed bank is not stale and stands at T
 static bool ds4_frontier_at(void *state, TokPos T, char *why, size_t whylen) {
     pulsar_gpu_graph *g = G_(state);
-    if (g->ms_comp_state_stale[gpu_graph_cur_bank(g)]) {
+    if (g->ms_comp_state_stale[pulsar_bank_index(gpu_graph_cur_bank(g))]) {
         snprintf(why, whylen, "the bank's state is stale (rewound off its grid checkpoints); sync it first");
         return false;
     }
@@ -327,7 +329,7 @@ static bool ds4_install_frontier(void *state, TokPos T, TokCount) {
 /// @return true, always
 static bool ds4_noted_at(void *state, TokPos, bool *capture, char *, size_t) {
     pulsar_gpu_graph *g = G_(state);
-    *capture = !g->ms_comp_state_stale[gpu_graph_cur_bank(g)];
+    *capture = !g->ms_comp_state_stale[pulsar_bank_index(gpu_graph_cur_bank(g))];
     return true;
 }
 

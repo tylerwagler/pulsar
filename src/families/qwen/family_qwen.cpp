@@ -1125,8 +1125,8 @@ static uint64_t qwen_trained_context(const pulsar_engine *) {
 /// @param rows the verify rows' recorded updates
 /// @param keep rows kept
 /// @return false on a failed launch
-static bool qwen_gdn_commit(void *state, uint32_t bank, const void *rows, uint32_t keep) {
-    return pulsar_gdn_commit((float *)state, (int)bank, (const float *)rows, (int)keep,
+static bool qwen_gdn_commit(void *state, BankId bank, const void *rows, uint32_t keep) {
+    return pulsar_gdn_commit((float *)state, (int)pulsar_bank_index(bank), (const float *)rows, (int)keep,
                              (int)pulsar_qwen_tp(&g_qwen_shape), 0) == 0;
 }
 
@@ -1390,13 +1390,15 @@ static const uint32_t *qwen_rope_table(const pulsar_session *s, const int32_t *p
                                        std::vector<uint32_t> *out) {
     bool any = false;
     for (uint32_t r = 0; r < n && !any; r++) {
-        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->states->live_bank);
+        const pulsar_image_identity *id =
+            pulsar_session_bank_images(s, (uint32_t)bank[r], pulsar_bank_index(s->states->live_bank));
         for (uint32_t i = 0; id && i < id->n && !any; i++) any = id->b[i].grid_h && id->b[i].grid_w;
     }
     if (!any) return NULL;
     out->resize((size_t)n * 6u);
     for (uint32_t r = 0; r < n; r++) {
-        const pulsar_image_identity *id = pulsar_session_bank_images(s, (uint32_t)bank[r], s->states->live_bank);
+        const pulsar_image_identity *id =
+            pulsar_session_bank_images(s, (uint32_t)bank[r], pulsar_bank_index(s->states->live_bank));
         const uint32_t p = (uint32_t)pos[r], back = PULSAR_QSA_BLOCK - 1u;
         pulsar_image_rope3(id, p, &(*out)[(size_t)r * 6u]);
         pulsar_image_rope3(id, p >= back ? p - back : 0u, &(*out)[(size_t)r * 6u + 3u]);
@@ -1615,7 +1617,7 @@ static bool qwen_mtp_stage_restore(pulsar_session *s, uint32_t bank) {
 static void qwen_mtp_prefetch(pulsar_session *s, uint32_t bank, const int32_t *ids, uint32_t n, bool chain_start) {
     int32_t *ctx = qwen_st(s)->mtp_pctx + 2u * bank;
     if (chain_start) {
-        const int32_t *ngram = (const int32_t *)pulsar_state_host(s->states, PULSAR_QWEN_STATE_NGRAM, bank);
+        const int32_t *ngram = (const int32_t *)pulsar_state_host(s->states, PULSAR_QWEN_STATE_NGRAM, BankId{bank});
         ctx[0] = ngram[0];
         ctx[1] = ngram[1];
     }

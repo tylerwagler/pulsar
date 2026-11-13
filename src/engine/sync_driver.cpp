@@ -114,7 +114,7 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
     } else if (!pulsar_image_refuse_orphans(e, prompt, err, errlen)) {
         return 1;
     }
-    const uint32_t live = pulsar_session_live_bank(s);
+    const BankId live = pulsar_session_live_bank(s);
     /* L380: a view a batch step on OTHER banks left valid (DeepSeek, pulsar_multiseq_step_stale) is the readers', not
      * a resume's: the sync rebuilds, which re-establishes the bank and clears the mark, as after any batch step */
     pulsar_session_dirty_view_drop(s);
@@ -185,8 +185,8 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
          * is outside every block (its merged rows cannot be re-evaluated) */
         if (G_at > TokPos{0} && !rec &&
             !pulsar_image_holds_below(e, &s->live_images, prompt, images, n_images, pulsar_ckpt_raw(G_at))) {
-            fprintf(stderr, "pulsar: %s: bank %u's checkpoint at %d holds other images (or cuts a block) -- "
-                            "prefilling from 0\n", ops->name, live, G_at.raw());
+            fprintf(stderr, "pulsar: %s: bank %d's checkpoint at %d holds other images (or cuts a block) -- "
+                            "prefilling from 0\n", ops->name, live.raw(), G_at.raw());
             G_at = TokPos{0};
         }
         const uint32_t G = pulsar_ckpt_raw(G_at);   /* the log's and the prefill walk's start (raw: the planner) */
@@ -198,7 +198,8 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
              * logits that prefill headed -- nothing is evaluated */
             if (!pulsar_ckpt_record_restore(st, live, rec, s->logits, (uint32_t)pulsar_engine_logits_width(e)) ||
                 !s->live_from_host(s->logits)) {
-                if (err) snprintf(err, errlen, "%s: restoring bank %u's prompt end at %u failed", ops->name, live, G);
+                if (err)
+                    snprintf(err, errlen, "%s: restoring bank %d's prompt end at %u failed", ops->name, live.raw(), G);
                 return 1;
             }
             s->live_images.n = 0;   /* L350: the record's state holds its own images (none for a text history) */
@@ -208,8 +209,8 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
             s->prefill_frontier = G_at;
             s->logits_stale = false;
             s->resume_origin = G_at;
-            fprintf(stderr, "pulsar: %s: bank %u resumes at its prompt end %u -- the same prompt, no row evaluated\n",
-                    ops->name, live, G);
+            fprintf(stderr, "pulsar: %s: bank %d resumes at its prompt end %u -- the same prompt, no row evaluated\n",
+                    ops->name, live.raw(), G);
             return 0;
         }
         if (rec) {
@@ -217,25 +218,27 @@ int pulsar_session_sync_default(pulsar_session *s, const pulsar_tokens *prompt, 
              * prefill's bytes): the state at G, the view the record's tokens -- the prompt's to G -- and the rest
              * prefilled from there */
             if (!pulsar_ckpt_record_restore(st, live, rec, NULL, 0u)) {
-                if (err) snprintf(err, errlen, "%s: restoring bank %u's record at %u failed", ops->name, live, G);
+                if (err) snprintf(err, errlen, "%s: restoring bank %d's record at %u failed", ops->name, live.raw(), G);
                 return 1;
             }
             s->logits_stale = true;   /* a restore moves the state, not the logits */
             start = G;
             s->live_images.n = 0;   /* L350: the record's images, as above */
             if (rec->img) s->live_images = *rec->img;
-            fprintf(stderr, "pulsar: %s: bank %u resumes from its %s at %u (prompt %d, shared %d)\n", ops->name, live,
+            fprintf(stderr, "pulsar: %s: bank %d resumes from its %s at %u (prompt %d, shared %d)\n", ops->name,
+                    live.raw(),
                     rec->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", G, prompt->len, common);
         } else if (G_at > TokPos{0}) {
             if (!pulsar_ckpt_restore(pulsar_session_kv_store(s), live, G_at)) {
-                if (err) snprintf(err, errlen, "%s: restoring bank %u's checkpoint at %u failed", ops->name, live, G);
+                if (err)
+                    snprintf(err, errlen, "%s: restoring bank %d's checkpoint at %u failed", ops->name, live.raw(), G);
                 return 1;
             }
             s->logits_stale = true;   /* a restore moves the state, not the logits */
             start = G;
             pulsar_image_identity_trim(&s->live_images, G);
-            fprintf(stderr, "pulsar: %s: bank %u resumes from its checkpoint at %u (prompt %d, shared %d)\n",
-                    ops->name, live, G, prompt->len, common);
+            fprintf(stderr, "pulsar: %s: bank %d resumes from its checkpoint at %u (prompt %d, shared %d)\n",
+                    ops->name, live.raw(), G, prompt->len, common);
         } else if (!ops->reset_bank(s)) {
             if (err) snprintf(err, errlen, "%s: could not clear the session's state", ops->name);
             return 1;

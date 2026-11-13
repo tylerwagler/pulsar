@@ -142,21 +142,24 @@ void pulsar_mtp_lane_free(pulsar_mtp_lane *l) {
 
 /* At T the parked row is the trunk's at T - 1 (none at 0) and no stage holds draft rows (L289: the walk writes the
  * true tail). */
-void pulsar_mtp_drafter_at(void *ud, uint32_t bank, TokPos T) {
+void pulsar_mtp_drafter_at(void *ud, BankId bank, TokPos T) {
     pulsar_mtp_lane *l = ((pulsar_driver_state *)ud)->mtp;
     if (!l) return;
-    l->pend_pos[bank] = T == TokPos{0} ? TokPos::none() : T - TokCount{1};   /* none at 0 */
-    l->stage_dirty[bank] = false;
+    const uint32_t b = pulsar_bank_index(bank);
+    l->pend_pos[b] = T == TokPos{0} ? TokPos::none() : T - TokCount{1};   /* none at 0 */
+    l->stage_dirty[b] = false;
 }
 
 /* A payload's frontier T: the parked row is the trunk's at T - 1 and no stage holds draft rows (a chain consumes the
  * parked row and writes into the stage until the round's absorb puts both back). */
-bool pulsar_mtp_drafter_frontier(void *ud, uint32_t bank, TokPos T_at, char *why, size_t whylen) {
+bool pulsar_mtp_drafter_frontier(void *ud, BankId bank, TokPos T_at, char *why, size_t whylen) {
     const pulsar_mtp_lane *l = ((const pulsar_driver_state *)ud)->mtp;
-    if (l && (T_at == TokPos{0} || l->pend_pos[bank] != T_at - TokCount{1} || l->stage_dirty[bank])) {
-        snprintf(why, whylen, "bank %u's MTP lane is mid-draft (pending row %d, stage %s); step it first", bank,
-                 l->pend_pos[bank].raw(),
-                 l->stage_dirty[bank] ? "holds draft rows" : "clean");
+    if (!l) return true;
+    const uint32_t b = pulsar_bank_index(bank);
+    if (T_at == TokPos{0} || l->pend_pos[b] != T_at - TokCount{1} || l->stage_dirty[b]) {
+        snprintf(why, whylen, "bank %d's MTP lane is mid-draft (pending row %d, stage %s); step it first", bank.raw(),
+                 l->pend_pos[b].raw(),
+                 l->stage_dirty[b] ? "holds draft rows" : "clean");
         return false;
     }
     return true;
@@ -511,7 +514,7 @@ uint32_t pulsar_mtp_draft(pulsar_session *s, TokId next_base, float temperature,
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const uint32_t b = s->states->live_bank;
+    const uint32_t b = pulsar_bank_index(s->states->live_bank);   /* the chains' bank array is raw */
     if (!mtp_draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306 (the block drafter's rule, block_draft): the round refuses, as the batched lane's does
          * (pulsar_mtp_draft_batch) -- no plain round */

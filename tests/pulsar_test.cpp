@@ -4224,7 +4224,7 @@ static void test_bank_carry_restore(void) {
  * places that would act on it (the sync's entry, a same-bank restore without a carry) drop it first
  * (pulsar_session_dirty_view_drop).  Host only: the flags, the reader and the rule; the step itself is a GPU gate's. */
 static int test_mseq_bank_count(pulsar_session *) { return 3; }
-static uint32_t test_mseq_live_bank1(pulsar_session *) { return 1u; }
+static BankId test_mseq_live_bank1(pulsar_session *) { return BankId{1}; }
 static void test_multiseq_step_view(void) {
     static pulsar_family fam{};
     static pulsar_family_bank_ops bops{};
@@ -4247,7 +4247,7 @@ static void test_multiseq_step_view(void) {
     };
     /* the other banks step: the installed bank still reads its history; nothing may continue it */
     arm();
-    pulsar_multiseq_step_stale(s, others, 2u, live, true);
+    pulsar_multiseq_step_stale(s, others, 2u, BankId{live}, true);
     TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     TEST_ASSERT(pulsar_bank_history(s, live) == &s->checkpoint && pulsar_bank_history(s, live)->len == 4);
     /* ... and a sync or a carry-less restore of it drops the view before acting, as when the step dropped it */
@@ -4258,19 +4258,19 @@ static void test_multiseq_step_view(void) {
     pulsar_session_dirty_view_drop(s);
     TEST_ASSERT(s->checkpoint_valid);
     /* a row of the installed bank moved its KV past the view: no history */
-    pulsar_multiseq_step_stale(s, with_live, 2u, live, true);
+    pulsar_multiseq_step_stale(s, with_live, 2u, BankId{live}, true);
     TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     TEST_ASSERT(pulsar_bank_history(s, live) == NULL);
     /* the last row alone decides too, and a one-row step of another bank does not */
     arm();
-    pulsar_multiseq_step_stale(s, with_live + 1, 1u, live, true);
+    pulsar_multiseq_step_stale(s, with_live + 1, 1u, BankId{live}, true);
     TEST_ASSERT(!s->checkpoint_valid);
     arm();
-    pulsar_multiseq_step_stale(s, others + 1, 1u, live, true);
+    pulsar_multiseq_step_stale(s, others + 1, 1u, BankId{live}, true);
     TEST_ASSERT(s->checkpoint_valid && s->mseq_dirty);
     /* a sweep that failed leaves no bank's state known, whoever its rows were */
     arm();
-    pulsar_multiseq_step_stale(s, others, 2u, live, false);
+    pulsar_multiseq_step_stale(s, others, 2u, BankId{live}, false);
     TEST_ASSERT(!s->checkpoint_valid && s->mseq_dirty && !s->spec.spec_carry_valid);
     pulsar_tokens_free(&s->checkpoint);
     free(s);
@@ -4294,12 +4294,12 @@ static void test_multiseq_step_view(void) {
  * and the reconciliation at batch_leave are a GPU gate's. */
 static int test_bh_bank_count(pulsar_session *) { return 4; }
 static uint32_t g_test_bh_live = 1u;
-static uint32_t test_bh_live(pulsar_session *) { return g_test_bh_live; }
+static BankId test_bh_live(pulsar_session *) { return BankId{g_test_bh_live}; }
 static pulsar_ckpt_store *g_test_bh_store = NULL;
 static pulsar_ckpt_store *test_bh_store(pulsar_session *) { return g_test_bh_store; }
-static bool test_bh_resident(const pulsar_session *, uint32_t) { return false; }
+static bool test_bh_resident(const pulsar_session *, BankId) { return false; }
 static KvBytes test_bh_growth(pulsar_session *, KvRows q) { return KvBytes{(uint64_t)q.raw() * 1000u}; }
-static bool test_bh_not_stale(void *, uint32_t) { return false; }
+static bool test_bh_not_stale(void *, BankId) { return false; }
 static char *test_bh_text(pulsar_engine *, TokId token, size_t *len) {
     char buf[16];
     /* one spelling a token: no seam in these histories */
@@ -4374,11 +4374,11 @@ static void test_batch_history(void) {
     TEST_ASSERT(pulsar_session_bank_tokens_as(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[1].checkpoint);
     TEST_ASSERT(pulsar_bank_history(fs, 0) == &fs->bank_carry[0].checkpoint &&
                 pulsar_bank_history_as(fs, 0, PULSAR_BANK_VIEW_SAVED) == &fs->bank_carry[0].checkpoint);
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_CURRENT) == TokPos{0} &&
-                bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == TokPos{600} &&
-                bops.prefill_frontier(fs, 0, PULSAR_BANK_VIEW_CURRENT) == TokPos{300});
+    TEST_ASSERT(bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_CURRENT) == TokPos{0} &&
+                bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == TokPos{600} &&
+                bops.prefill_frontier(fs, BankId{0}, PULSAR_BANK_VIEW_CURRENT) == TokPos{300});
     fs->bank_carry[1].prefill_frontier = TokPos{590};   /* the saved view's frontier is the carry's, not the live view's */
-    TEST_ASSERT(bops.prefill_frontier(fs, 1, PULSAR_BANK_VIEW_SAVED) == TokPos{590});
+    TEST_ASSERT(bops.prefill_frontier(fs, BankId{1}, PULSAR_BANK_VIEW_SAVED) == TokPos{590});
     fs->bank_carry[1].prefill_frontier = TokPos{600};
     /* a valid live view is the current read, whatever the carry says (the generic contract: not the carry) */
     fs->checkpoint_valid = true;
@@ -4554,7 +4554,7 @@ static void test_batch_history(void) {
  * to mark whatever sat in the bank's slot valid), a step row kept for a bank (the mixed lane's prefill end) makes it
  * valid, and invalidate clears it.  Host only: dry tensors (every copy a no-op that succeeds); no draw is launched,
  * since each one asserted here refuses before the device. */
-static uint32_t test_live_bank0(pulsar_session *) { return 0u; }
+static BankId test_live_bank0(pulsar_session *) { return BankId{0}; }
 static void test_live_row_valid(void) {
     static pulsar_family fam{};
     static pulsar_family_session_ops sops{};
@@ -5667,9 +5667,9 @@ static void fake_restored(void *) {}
 static bool fake_install(void *, TokPos, TokCount) { return true; }
 /* L326: one pool a bank (one token a row, 16 B), rows a dry tensor */
 static pulsar_gpu_tensor *fake_rows[3];
-static uint32_t fake_bank_pools(void *, uint32_t bank, pulsar_kv_pool *out, uint32_t cap) {
-    if (bank >= 3u || cap < 1u || !fake_rows[bank]) return 0u;
-    out[0] = {fake_rows[bank], TokPerRow{1u}, 16u, false};
+static uint32_t fake_bank_pools(void *, BankId bank, pulsar_kv_pool *out, uint32_t cap) {
+    if (!bank.below(3u) || cap < 1u || !fake_rows[pulsar_bank_index(bank)]) return 0u;
+    out[0] = {fake_rows[pulsar_bank_index(bank)], TokPerRow{1u}, 16u, false};
     return 1u;
 }
 
@@ -5780,45 +5780,46 @@ static void test_ckpt_host_tier(void) {
         pulsar_ckpt_slot_at at;
         /* two captures, the second queued while the first's copy may still run */
         tier_fill(&ts, fill, 1);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, TokPos{256}));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{256}));
         int in_flight = st->host ? pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + 0u) : 0;
         tier_fill(&ts, fill, 2);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, TokPos{384}));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{384}));
         /* a host reader gets the bytes its capture copied, after waiting for that slot alone */
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, TokPos{256}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{256}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 1));
         TEST_ASSERT(!st->host || pulsar_gpu_lane_pending(st->lane, PULSAR_CKPT_STAGES + at.slot) == 0);
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, TokPos{384}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{384}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 2));
         /* a restore puts the state back (and drops what is above) */
         tier_fill(&ts, fill, 3);
-        TEST_ASSERT(pulsar_ckpt_restore(st, 0, TokPos{256}) && !pulsar_ckpt_holds(st, 0, TokPos{384}));
+        TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{256}) && !pulsar_ckpt_holds(st, BankId{0}, TokPos{384}));
         TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 1));
         /* the same slot captured twice back to back: the newer bytes win (the reuse waits for the older copy) */
         tier_fill(&ts, fill, 4);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, TokPos{512}));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{512}));
         tier_fill(&ts, fill, 5);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, TokPos{512}));
-        TEST_ASSERT(pulsar_ckpt_locate(st, 0, TokPos{512}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{512}));
+        TEST_ASSERT(pulsar_ckpt_locate(st, BankId{0}, TokPos{512}, &at) && pulsar_ckpt_slot_get(st, &at, got.data()) &&
                     tier_is(got.data(), n, 5));
         /* a claim over a slot just captured waits for that copy, then the host writes it and a restore reads it */
         tier_fill(&ts, fill, 6);
-        TEST_ASSERT(pulsar_ckpt_landed(st, 0, TokPos{640}));
-        TEST_ASSERT(pulsar_ckpt_claim(st, 0, TokPos{768}, &at));
+        TEST_ASSERT(pulsar_ckpt_landed(st, BankId{0}, TokPos{640}));
+        TEST_ASSERT(pulsar_ckpt_claim(st, BankId{0}, TokPos{768}, &at));
         for (uint64_t i = 0; i < n; i++) fill[i] = (uint8_t)(7u + i * 7u);
         TEST_ASSERT(pulsar_ckpt_slot_put(st, &at, fill.data()));
-        pulsar_ckpt_commit(st, 0, at.slot, TokPos{768});
+        pulsar_ckpt_commit(st, BankId{0}, at.slot, TokPos{768});
         tier_fill(&ts, fill, 8);
-        TEST_ASSERT(pulsar_ckpt_restore(st, 0, TokPos{768}));
+        TEST_ASSERT(pulsar_ckpt_restore(st, BankId{0}, TokPos{768}));
         TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 7));
         /* a record: captured, the state overwritten, restored */
         int toks[800];
         for (int i = 0; i < 800; i++) toks[i] = i;
         tier_fill(&ts, fill, 9);
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{777}, toks, NULL, 0, NULL));
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{777}, toks, NULL, 0,
+                                               NULL));
         tier_fill(&ts, fill, 10);
-        const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
-        TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0));
+        const pulsar_ckpt_record *r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT);
+        TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0));
         TEST_ASSERT(pulsar_gpu_tensor_read(ts.t, 0, got.data(), n) == 1 && tier_is(got.data(), n, 9));
         printf("  L347 I4 %s tier round trip OK (first capture %s when the next was queued)\n",
                host ? "host" : "device", in_flight == 1 ? "still in flight" : "already landed");
@@ -6015,24 +6016,26 @@ static void test_ckpt_records(void) {
     for (int i = 0; i < 600; i++) toks[i] = 1000 + i;
     float lg[4] = {1, 2, 3, 4}, out[4] = {0};
     /* a prompt end keeps logits, an endpoint none; a kind and its logits must agree */
-    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{300}, toks, NULL, 0, NULL));
-    TEST_ASSERT(!pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == TokPos{300} && pulsar_ckpt_end(st, 1).is_none());
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, NULL, 0, NULL));
+    TEST_ASSERT(!pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{300} && pulsar_ckpt_end(st, BankId{1}).is_none());
     /* the deepest matching record within the limit; a resume AT a record without logits is not one */
-    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL);
+    const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{600},
+                                                          TokCount{600}, NULL);
     TEST_ASSERT(r && r->T == 300u && r->kind == PULSAR_CKPT_REC_END);
-    r = pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
+    r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
     TEST_ASSERT(r && r->T == 297u && r->kind == PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{297}, TokCount{297}, NULL) == NULL);   /* AT 297: no logits there */
-    r = pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{300}, TokCount{300}, NULL);
+    /* AT 297: no logits there */
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{297}, TokCount{297}, NULL) == NULL);
+    r = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{300}, TokCount{300}, NULL);
     TEST_ASSERT(r && r->T == 300u);
     /* other ids below T: no match; another bank: none */
     toks[100] = 7;
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
     toks[100] = 1100;
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 1, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{1}, toks, TokCount{600}, TokPos{600}, TokCount{600}, NULL) == NULL);
     {
         /* L350: a record holds its images; it matches only a request with the same blocks below its T */
         pulsar_image_identity a, b, text;
@@ -6046,69 +6049,84 @@ static void test_ckpt_records(void) {
         a.b[0].grid_w = 8;
         b = a;
         b.b[0].content = 0xB0Bull;   /* another image in the same placeholder ids */
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, &a));
-        const pulsar_ckpt_record *ri = pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &a);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0,
+                                               &a));
+        const pulsar_ckpt_record *ri = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299},
+                                                               TokCount{600}, &a);
         TEST_ASSERT(ri && ri->T == 297u && ri->img && ri->img->n == 1u && ri->img->b[0].content == 0xA11CEull);
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &b) == NULL);      /* other image */
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &text) == NULL);   /* a text request */
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL) == NULL);    /* priced from ids */
+        /* other image */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &b) == NULL);
+        /* a text request */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &text) == NULL);
+        /* priced from ids */
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            NULL) == NULL);
         /* a request block straddling T: no resume there */
         pulsar_image_identity wide = a;
         wide.n = 2;
         wide.b[1] = a.b[0];
         wide.b[1].start = 290;
         wide.b[1].end = 354;
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &wide) == NULL);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &wide) == NULL);
         /* a block past T is not the record's business */
         wide.b[1].start = 300;
         wide.b[1].end = 364;
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &wide) == ri);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &wide) == ri);
         /* a text capture over the same record slot clears its images */
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
-        ri = pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0,
+                                               NULL));
+        ri = pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600}, NULL);
         TEST_ASSERT(ri && ri->T == 297u && (!ri->img || ri->img->n == 0u));
-        TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{299}, TokCount{600}, &a) == NULL);
+        TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{299}, TokCount{600},
+                                            &a) == NULL);
     }
     /* a second capture of a kind replaces the bank's first */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{310}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == TokPos{310});
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{310}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{310});
     uint32_t n0 = 0;
-    for (uint32_t i = 0; i < st->n_rec; i++) n0 += st->rec[i].T != 0u && st->rec[i].bank == 0u;
+    for (uint32_t i = 0; i < st->n_rec; i++) n0 += st->rec[i].T != 0u && st->rec[i].bank == BankId{0};
     TEST_ASSERT(n0 == 2u);
     /* a full pool evicts the least recently used: bank 1 takes the third record, then its endpoint takes the oldest
      * (bank 0's endpoint, captured before its newer prompt end) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_END, TokPos{200}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, TokPos{190}, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT) == NULL);
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == TokPos{310} && pulsar_ckpt_end(st, 1) == TokPos{200});
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_END, TokPos{200}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT, TokPos{190}, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{310} && pulsar_ckpt_end(st, BankId{1}) == TokPos{200});
     /* a restore puts the bank at T, hands back the logits, drops its records above T, stamps the record used */
-    r = pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 1, r, NULL, 0));
-    TEST_ASSERT(pulsar_ckpt_end(st, 1).is_none() && pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT));
-    TEST_ASSERT(!pulsar_ckpt_record_restore(st, 0, r, NULL, 0));   /* not bank 0's */
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, out, 4) && out[3] == 4.0f);
+    r = pulsar_ckpt_record_of(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{1}, r, NULL, 0));
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}).is_none() && pulsar_ckpt_record_of(st, BankId{1},
+                                                                                  PULSAR_CKPT_REC_ENDPOINT));
+    TEST_ASSERT(!pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0));   /* not bank 0's */
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_END);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, out, 4) && out[3] == 4.0f);
     /* the frontier rule: a history lowered below T drops the record; a dropped bank holds none */
-    pulsar_ckpt_frontier_lowered(st, 0, TokCount{309});
-    TEST_ASSERT(pulsar_ckpt_end(st, 0).is_none());
-    pulsar_ckpt_drop_bank(st, 1);
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 1, PULSAR_CKPT_REC_ENDPOINT) == NULL);
+    pulsar_ckpt_frontier_lowered(st, BankId{0}, TokCount{309});
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}).is_none());
+    pulsar_ckpt_drop_bank(st, BankId{1});
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT) == NULL);
     /* a record recycled from a prompt end into an endpoint keeps no logits (a resume AT it would read them) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{120}, toks, lg, 4, NULL));
-    pulsar_ckpt_drop_bank(st, 0);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{120}, toks, lg, 4, NULL));
+    pulsar_ckpt_drop_bank(st, BankId{0});
     for (uint32_t i = 0; i < st->n_rec; i++)
-        TEST_ASSERT(pulsar_ckpt_record_capture(st, i % 2u, i < 2u ? PULSAR_CKPT_REC_ENDPOINT : PULSAR_CKPT_REC_END,
+        TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{i % 2u},
+                                               i < 2u ? PULSAR_CKPT_REC_ENDPOINT : PULSAR_CKPT_REC_END,
                                                TokPos{100u + i}, toks, i < 2u ? NULL : lg, i < 2u ? 0u : 4u, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_best(st, 0, toks, TokCount{600}, TokPos{100}, TokCount{100}, NULL) == NULL);
+    TEST_ASSERT(pulsar_ckpt_record_best(st, BankId{0}, toks, TokCount{600}, TokPos{100}, TokCount{100}, NULL) == NULL);
     for (uint32_t i = 0; i < st->n_rec; i++)
         TEST_ASSERT((st->rec[i].kind == PULSAR_CKPT_REC_END) == (st->rec[i].logits != NULL));
     /* L313: an adopt between banks refuses without paired pools (this store has none), and from the bank itself */
     bool moved = true;
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 1, TokPos{101}, NULL, &moved) && !moved);   /* L375 O43: refused before dst moved */
+    /* L375 O43: refused before dst moved */
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{0}, BankId{1}, TokPos{101}, NULL, &moved) && !moved);
     moved = true;
-    TEST_ASSERT(!pulsar_ckpt_adopt(st, 0, 0, TokPos{100}, NULL, &moved) && !moved);
-    pulsar_ckpt_drop_bank(st, 0);
-    pulsar_ckpt_drop_bank(st, 1);
+    TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{0}, BankId{0}, TokPos{100}, NULL, &moved) && !moved);
+    pulsar_ckpt_drop_bank(st, BankId{0});
+    pulsar_ckpt_drop_bank(st, BankId{1});
     /* L326: lending a record stamps it used.  Dry tensors (every copy a no-op that succeeds) give the banks paired
      * pools and the records slabs.  The full pool's least recently used record is the lender's prompt end; bank 1
      * adopts it: the copy takes another slot (it took the lent record's own, so none was made) and the next capture
@@ -6118,33 +6136,37 @@ static void test_ckpt_records(void) {
     for (uint32_t i = 0; i < st->n_rec; i++) st->rec[i].slab = pulsar_gpu_tensor_alloc(st->rec[i].cap);
     pulsar_gpu_tensor_dry_end(NULL, NULL);
     ops.bank_pools = fake_bank_pools;
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));   /* the oldest */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_END, TokPos{250}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 2, PULSAR_CKPT_REC_ENDPOINT, TokPos{240}, toks, NULL, 0, NULL));
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_END);
+    /* the oldest */
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{2}, PULSAR_CKPT_REC_END, TokPos{250}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{2}, PULSAR_CKPT_REC_ENDPOINT, TokPos{240}, toks, NULL, 0, NULL));
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_END);
     {
         /* L375 O46: a bank on the runtime adapter and a plain one do not adopt from each other -- refused before dst
          * moves (O43), whichever of the two is adapted; two banks of a kind do */
         uint8_t adapter[3] = {1, 0, 0};
         st->bank_adapter = adapter;
         moved = true;
-        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, 1, 0, TokPos{300}, r, &moved) && !moved);
+        TEST_ASSERT(r && !pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && !moved);
         adapter[0] = 0;
         adapter[1] = 1;
         moved = true;
-        TEST_ASSERT(!pulsar_ckpt_adopt(st, 1, 0, TokPos{300}, r, &moved) && !moved);
-        TEST_ASSERT(pulsar_ckpt_end(st, 1).is_none() && pulsar_ckpt_end(st, 0) == TokPos{300});   /* nothing lent, nothing dropped */
+        TEST_ASSERT(!pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && !moved);
+        /* nothing lent, nothing dropped */
+        TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}).is_none() && pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
         adapter[0] = 1;
-        TEST_ASSERT(pulsar_ckpt_adopt(st, 1, 0, TokPos{300}, r, &moved) && moved);
+        TEST_ASSERT(pulsar_ckpt_adopt(st, BankId{1}, BankId{0}, TokPos{300}, r, &moved) && moved);
         st->bank_adapter = NULL;
     }
-    TEST_ASSERT(pulsar_ckpt_end(st, 1) == TokPos{300} && pulsar_ckpt_end(st, 0) == TokPos{300});   /* dst's copy, the lender's own */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 1, PULSAR_CKPT_REC_ENDPOINT, TokPos{290}, toks, NULL, 0, NULL));
-    TEST_ASSERT(pulsar_ckpt_end(st, 0) == TokPos{300});                                    /* still the lender's */
-    TEST_ASSERT(pulsar_ckpt_record_of(st, 2, PULSAR_CKPT_REC_ENDPOINT) == NULL);   /* the LRU went instead */
+    /* dst's copy, the lender's own */
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{1}) == TokPos{300} && pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{1}, PULSAR_CKPT_REC_ENDPOINT, TokPos{290}, toks, NULL, 0, NULL));
+    /* still the lender's */
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}) == TokPos{300});
+    TEST_ASSERT(pulsar_ckpt_record_of(st, BankId{2}, PULSAR_CKPT_REC_ENDPOINT) == NULL);   /* the LRU went instead */
     ops.bank_pools = NULL;
     for (uint32_t b = 0; b < 3u; b++) {
-        pulsar_ckpt_drop_bank(st, b);
+        pulsar_ckpt_drop_bank(st, BankId{b});
         pulsar_gpu_tensor_free(fake_rows[b]);
         fake_rows[b] = NULL;
     }
@@ -6191,35 +6213,36 @@ static void test_ckpt_records(void) {
 
     /* L380: when a request's syncs waive the cut (server_endpoint_waive) -- the per-bank state is the store's
      * prompt-end record, so it follows the record's life.  Bank 0, a conversation's requests in order: */
-    for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, b);
+    for (uint32_t b = 0; b < 3u; b++) pulsar_ckpt_drop_bank(st, BankId{b});
     const auto WAIVE = [st](kv_pick pick, int at, uint32_t bank) {
-        return server_endpoint_waive(pick, TokPos{at}, pulsar_ckpt_end(st, bank));
+        return server_endpoint_waive(pick, TokPos{at}, pulsar_ckpt_end(st, BankId{bank}));
     };
     /* no history: the cut, wherever the request starts */
     TEST_ASSERT(!WAIVE(KV_PICK_NONE, 0, 0) && !WAIVE(KV_PICK_OWN, 300, 0) && !WAIVE(KV_PICK_LIVE, 300, 0));
     /* its first prompt ended at 300 (endpoint 297); the next request starts there, or past it on the live rows */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{300}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT, TokPos{297}, toks, NULL, 0, NULL));
     TEST_ASSERT(WAIVE(KV_PICK_OWN, 300, 0) && WAIVE(KV_PICK_LIVE, 345, 0));
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 300, 1));   /* another bank's prompt end is not this bank's evidence */
     /* a request that starts below it -- from the endpoint record, or the grid under it -- cuts again... */
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 256, 0) && !WAIVE(KV_PICK_NONE, 0, 0));
     /* ...and the resume itself drops the prompt end above it, so nothing waives until a prompt ends again and a
      * request starts at or past THAT end */
-    r = pulsar_ckpt_record_of(st, 0, PULSAR_CKPT_REC_ENDPOINT);
-    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, 0, r, NULL, 0) && pulsar_ckpt_end(st, 0).is_none());
+    r = pulsar_ckpt_record_of(st, BankId{0}, PULSAR_CKPT_REC_ENDPOINT);
+    TEST_ASSERT(r && pulsar_ckpt_record_restore(st, BankId{0}, r, NULL, 0) && pulsar_ckpt_end(st, BankId{0}).is_none());
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 297, 0) && !WAIVE(KV_PICK_OWN, 420, 0));
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL));
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL));
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 417, 0) && WAIVE(KV_PICK_OWN, 420, 0) && WAIVE(KV_PICK_OWN, 500, 0));
     /* another state than the bank's own never waives, whatever stands: an adopt (even of a prompt end, whose copy
      * the adopter keeps), a disk chain, a spill restore */
     TEST_ASSERT(!WAIVE(KV_PICK_ADOPT, 420, 0) && !WAIVE(KV_PICK_DISK, 420, 0) && !WAIVE(KV_PICK_SPILLED, 420, 0));
     /* the bank's history falls below the prompt end (a rewind, a restore of a lower checkpoint): the cut */
-    pulsar_ckpt_frontier_lowered(st, 0, TokCount{419});
-    TEST_ASSERT(pulsar_ckpt_end(st, 0).is_none() && !WAIVE(KV_PICK_OWN, 420, 0));
+    pulsar_ckpt_frontier_lowered(st, BankId{0}, TokCount{419});
+    TEST_ASSERT(pulsar_ckpt_end(st, BankId{0}).is_none() && !WAIVE(KV_PICK_OWN, 420, 0));
     /* the bank is invalidated, evicted or given to another conversation (its checkpoints and records dropped) */
-    TEST_ASSERT(pulsar_ckpt_record_capture(st, 0, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL) && WAIVE(KV_PICK_OWN, 420, 0));
-    pulsar_ckpt_drop_bank(st, 0);
+    TEST_ASSERT(pulsar_ckpt_record_capture(st, BankId{0}, PULSAR_CKPT_REC_END, TokPos{420}, toks, lg, 4, NULL) &&
+                WAIVE(KV_PICK_OWN, 420, 0));
+    pulsar_ckpt_drop_bank(st, BankId{0});
     TEST_ASSERT(!WAIVE(KV_PICK_OWN, 420, 0) && !WAIVE(KV_PICK_LIVE, 600, 0));
     pulsar_ckpt_release(st);
     free(st);

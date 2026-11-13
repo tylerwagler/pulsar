@@ -267,12 +267,14 @@ bool gpu_graph_reset_prefill_state(pulsar_gpu_graph *g) {
      * second job was clearing a stale multiseq superset; there is no superset
      * any more, so that job is gone with it.) */
     {
-        const uint32_t b = gpu_graph_cur_bank(g);
+        const BankId bank = gpu_graph_cur_bank(g);
+        const uint32_t b = pulsar_bank_index(bank);
         memset(g->ms_n_comp[b], 0, sizeof(g->ms_n_comp[b]));
-        pulsar_ckpt_drop_bank(&g->ckpt, b);   /* L264: the zeroing bypasses the frontier writer */
+        pulsar_ckpt_drop_bank(&g->ckpt, bank);   /* L264: the zeroing bypasses the frontier writer */
     }
-    if (!gpu_graph_compressor_state_reset(g, gpu_graph_cur_bank(g))) return false;
-    g->ms_comp_state_stale[gpu_graph_cur_bank(g)] = false;   /* position 0: the canonical state, re-established */
+    const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
+    if (!gpu_graph_compressor_state_reset(g, cur)) return false;
+    g->ms_comp_state_stale[cur] = false;   /* position 0: the canonical state, re-established */
     return true;
 }
 
@@ -335,7 +337,7 @@ static void dspark_bulk_drain_runs(pulsar_gpu_graph *g, const int32_t *pos, cons
     if (!g->dspark_bulk_h[0] || !g->banks.dspark_prompt[0] || g->banks.n_banks == 0) return;
     const uint32_t win = PULSAR_DSPARK_DRAFT_WINDOW;
     const uint64_t row = (uint64_t)PULSAR_N_EMBD * sizeof(float);
-    const uint32_t cur = gpu_graph_cur_bank(g);
+    const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
     for (uint32_t r0 = n_dec; r0 < n_rows;) {
         uint32_t r1 = r0 + 1;
         while (r1 < n_rows && bank[r1] == bank[r0]) r1++;

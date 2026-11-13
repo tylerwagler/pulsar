@@ -13,17 +13,23 @@
  * restore-alloc it reloads the KV H2D from that snapshot. */
 /** pulsar_family_bank_ops::free_physical (DeepSeek: the graph's).  @param s the session  @param bank the bank
  *  @return the graph's verdict */
-static bool ds4_bank_free_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_free_physical(s->graph, bank); }
+static bool ds4_bank_free_physical(pulsar_session *s, BankId bank) {
+    return gpu_graph_bank_free_physical(s->graph, (uint32_t)bank.raw());   /* the graph's range check refuses none() */
+}
 /** pulsar_family_bank_ops::alloc_physical (the graph's).  @param s the session  @param bank the bank
  *  @return the graph's verdict */
-static bool ds4_bank_alloc_physical(pulsar_session *s, uint32_t bank) { return gpu_graph_bank_alloc_physical(s->graph, bank); }
+static bool ds4_bank_alloc_physical(pulsar_session *s, BankId bank) {
+    return gpu_graph_bank_alloc_physical(s->graph, (uint32_t)bank.raw());   /* the graph's range check refuses none() */
+}
 /** pulsar_family_bank_ops::is_evicted (the graph's).  @param s the session  @param bank the bank
  *  @return true while the bank's pools are freed */
-static bool ds4_bank_is_evicted(const pulsar_session *s, uint32_t bank) { return gpu_graph_bank_is_evicted(s->graph, bank); }
+static bool ds4_bank_is_evicted(const pulsar_session *s, BankId bank) {
+    return gpu_graph_bank_is_evicted(s->graph, (uint32_t)bank.raw());   /* the graph's range check: none() is out */
+}
 /** pulsar_family_bank_ops::touched_kv_bytes (the graph's).  @param s the session  @param bank the bank
  *  @return the bank's touched KV bytes */
-static KvBytes ds4_bank_touched_kv_bytes(pulsar_session *s, uint32_t bank) {
-    return gpu_graph_bank_touched_kv_bytes(s->graph, bank);
+static KvBytes ds4_bank_touched_kv_bytes(pulsar_session *s, BankId bank) {
+    return gpu_graph_bank_touched_kv_bytes(s->graph, (uint32_t)bank.raw());   /* its range check: none() is out */
 }
 /** pulsar_family_bank_ops::growth_bytes: the per-bank growth of a quantum (the session is unused).
  *  @param q the quantum, in positions  @return bytes */
@@ -86,25 +92,26 @@ static int ds4_bank_count(pulsar_session *s) {
 /// @param s    the session
 /// @param bank the bank
 /// @return 0, or 1 out of range or when the repoint failed
-static int ds4_bank_repoint(pulsar_session *s, uint32_t bank) {
-    if (bank >= gpu_graph_bank_pool_count(s->graph)) return 1;
+static int ds4_bank_repoint(pulsar_session *s, BankId bank) {
+    if (!bank.below(gpu_graph_bank_pool_count(s->graph))) return 1;
     /* Pool disabled: bank 0 is the classic tensors, nothing to repoint. */
-    if (s->graph->banks.n_banks == 0) return bank == 0 ? 0 : 1;
-    return gpu_graph_bank_repoint(s->graph, bank) ? 0 : 1;
+    if (s->graph->banks.n_banks == 0) return bank == BankId{0} ? 0 : 1;
+    return gpu_graph_bank_repoint(s->graph, pulsar_bank_index(bank)) ? 0 : 1;
 }
 
 
 /** pulsar_family_bank_ops::save: the graph's frontier counters captured, then the host view into the bank's carry.
  *  @param s    the session
  *  @param bank the bank (out of range: nothing) */
-static void ds4_bank_save(pulsar_session *s, uint32_t bank) {
-    if (bank >= gpu_graph_bank_pool_count(s->graph)) return;
+static void ds4_bank_save(pulsar_session *s, BankId bank) {
+    if (!bank.below(gpu_graph_bank_pool_count(s->graph))) return;
     if (!bank_carry_ensure(s)) return;
+    const uint32_t b = pulsar_bank_index(bank);
     /* Graph frontier counters (attn/index comp; Option F also the drafter ring
      * counters) are captured on the graph side so a later install re-arms this
      * bank's per-bank truth. */
-    gpu_graph_bank_counters_capture(s->graph, bank);
-    pulsar_bank_carry_save_view(s, bank);
+    gpu_graph_bank_counters_capture(s->graph, b);
+    pulsar_bank_carry_save_view(s, b);
 }
 
 void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
@@ -132,11 +139,12 @@ void pulsar_bank_carry_save_view(pulsar_session *s, uint32_t bank) {
 
 /// pulsar_family_bank_ops::restore.
 /// @param s    the session
-/// @param bank the bank to install
+/// @param bank_id the bank to install
 /// @return false out of range or when the repoint failed
-static bool ds4_bank_restore(pulsar_session *s, uint32_t bank) {
-    if (bank >= gpu_graph_bank_pool_count(s->graph)) return false;
-    const uint32_t held = gpu_graph_cur_bank(s->graph);   /* the bank the host view was synced on */
+static bool ds4_bank_restore(pulsar_session *s, BankId bank_id) {
+    if (!bank_id.below(gpu_graph_bank_pool_count(s->graph))) return false;
+    const uint32_t bank = pulsar_bank_index(bank_id);   /* the graph's and the carry's arrays are raw */
+    const uint32_t held = pulsar_bank_index(gpu_graph_cur_bank(s->graph));   /* the bank the host view was synced on */
     /* Point device views (incl. Option F drafter ring) at this bank, and
      * re-arm its frontier counters — this is what makes clearing mseq_dirty
      * cheap and safe (per-bank truth is re-established without a re-prefill). */
@@ -185,7 +193,7 @@ bool pulsar_bank_carry_saved(const pulsar_session *s, uint32_t bank) {
 }
 
 void pulsar_bank_view_invalidate(pulsar_session *s, uint32_t bank) {
-    if (bank == pulsar_session_live_bank(s)) s->checkpoint_valid = false;
+    if (BankId{bank} == pulsar_session_live_bank(s)) s->checkpoint_valid = false;
     /* the carry too, also the live bank's: a caller that drops the live view (installs a bank without saving this one)
      * brings the carry back */
     if (pulsar_bank_carry_saved(s, bank)) s->bank_carry[bank].checkpoint_valid = false;
@@ -241,7 +249,7 @@ const pulsar_tokens *pulsar_bank_history(pulsar_session *s, uint32_t bank) {
  * banks, not installed, read the carries saved at their entry. */
 const pulsar_tokens *pulsar_bank_history_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
     if (!s || bank >= session_bank_n(s)) return NULL;
-    if (view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s))
+    if (view == PULSAR_BANK_VIEW_CURRENT && BankId{bank} == pulsar_session_live_bank(s))
         return s->checkpoint_valid ? &s->checkpoint : NULL;
     if (pulsar_bank_carry_saved(s, bank) && s->bank_carry[bank].checkpoint_valid)
         return &s->bank_carry[bank].checkpoint;
@@ -269,12 +277,12 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
         return 1;
     }
     pulsar_ckpt_store *ck = pulsar_session_kv_store(s);
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const BankId bank = pulsar_session_live_bank(s);
     const uint32_t from = (uint32_t)s->checkpoint.len, G = from + (uint32_t)n;
     /* the shared capture rule (P13): the state stands at G or the record is refused, and G on the grid in a
      * prefill's state is captured -- before the record changes anything */
     if (!ck || !ck->ops || !pulsar_ckpt_landed(ck, bank, pulsar_ckpt_pos(G))) {
-        fprintf(stderr, "pulsar: note_prefilled: bank %u's chunk [%u, %u) %s -- refusing\n", bank, from, G,
+        fprintf(stderr, "pulsar: note_prefilled: bank %d's chunk [%u, %u) %s -- refusing\n", bank.raw(), from, G,
                 ck && ck->ops ? "did not land (above)" : "has no checkpoint store");
         return 1;
     }
@@ -300,17 +308,17 @@ int pulsar_session::note_prefilled(const int *toks, int n, int head) {
 /// @param bank the bank
 /// @param view the host view asked (L380: the saved one reads the carry's, also for the installed bank)
 /// @return the bank's prefill frontier, position 0 when it holds no valid history
-static TokPos ds4_bank_prefill_frontier(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
-    if (!pulsar_bank_history_as(s, bank, view)) return TokPos{0};
+static TokPos ds4_bank_prefill_frontier(pulsar_session *s, BankId bank, pulsar_bank_view view) {
+    if (!pulsar_bank_history_as(s, (uint32_t)bank.raw(), view)) return TokPos{0};   /* its range check: none() out */
     const bool live = view == PULSAR_BANK_VIEW_CURRENT && bank == pulsar_session_live_bank(s);
-    const TokPos pf = live ? s->prefill_frontier : s->bank_carry[bank].prefill_frontier;
+    const TokPos pf = live ? s->prefill_frontier : s->bank_carry[pulsar_bank_index(bank)].prefill_frontier;
     return pf.raw() > 0 ? pf : TokPos{0};
 }
 
 /** pulsar_family_bank_ops::kv_store.  @param s the session  @return the graph's checkpoint store (borrowed) */
 static pulsar_ckpt_store *ds4_bank_kv_store(pulsar_session *s) { return &s->graph->ckpt; }
 /** pulsar_family_bank_ops::live.  @param s the session  @return the graph's current bank */
-static uint32_t ds4_bank_live(pulsar_session *s) { return gpu_graph_cur_bank(s->graph); }
+static BankId ds4_bank_live(pulsar_session *s) { return gpu_graph_cur_bank(s->graph); }
 /** pulsar_family_bank_ops::rewind: pulsar_session::rewind.  @param s the session  @param pos the position */
 static void ds4_bank_rewind(pulsar_session *s, TokPos pos) { s->rewind(pos); }
 /** pulsar_family_bank_ops::restore_checkpoint: pulsar_session::restore_checkpoint.  @param s the session

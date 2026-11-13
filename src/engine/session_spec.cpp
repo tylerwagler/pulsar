@@ -173,7 +173,7 @@ void pulsar_spec_draft_req_init(pulsar_session *s, spec_redraft_req *q, TokId ne
     const uint32_t admit = pulsar_spec_copy_price(&s->spec, pulsar_spec_tau(s->engine), cap, q->conf, &reprobe);
     if (admit == 0u) return;   /* before the history scan: a quenched request pays nothing for it */
     int32_t cp[16];
-    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_session_live_bank(s), next_base, cap, cp);
+    const uint32_t n_cp = pulsar_spec_copy_chain(s, pulsar_bank_index(pulsar_session_live_bank(s)), next_base, cap, cp);
     if (n_cp == 0) return;
     q->keep = n_cp < admit ? n_cp : admit;
     q->refined[0] = q->next_base.raw();
@@ -232,7 +232,7 @@ static void spec_round_undo(pulsar_session *s, pulsar_spec_round *r) {
 static bool spec_absorb_defer(pulsar_session *s, uint32_t row, int32_t next) {
     if (s->seed_defer.n >= PULSAR_SPEC_LOGITS_ROWS + 1) return false;
     s->seed_defer.src_row[s->seed_defer.n] = row;
-    s->seed_defer.bank[s->seed_defer.n] = pulsar_session_live_bank(s);
+    s->seed_defer.bank[s->seed_defer.n] = pulsar_bank_index(pulsar_session_live_bank(s));
     s->seed_defer.next_tok[s->seed_defer.n] = next;
     s->seed_defer.n++;
     return true;
@@ -257,7 +257,7 @@ static bool spec_absorb_rows(pulsar_session *s, uint32_t row0, const int32_t *ne
         return ok;
     }
     uint32_t rows[PULSAR_SPEC_LOGITS_ROWS + 1], banks[PULSAR_SPEC_LOGITS_ROWS + 1];
-    const uint32_t bank = pulsar_session_live_bank(s);
+    const uint32_t bank = pulsar_bank_index(pulsar_session_live_bank(s));   /* the drafter's banks[] are raw */
     for (uint32_t m = 0; m < n; m++) { rows[m] = row0 + m; banks[m] = bank; }
     return spec_drafter(s)->absorb_banked(s, rows, banks, next, n);
 }
@@ -1505,7 +1505,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
         st->first_token = TokId::none();
         st->row0 = 0;
         st->n_rows = 0;
-        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
+        if (!spec_bank_restore(s, st->bank)) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
@@ -1544,7 +1544,7 @@ void pulsar_session_spec_assemble_batch_local(pulsar_session *s, pulsar_spec_ste
                 rows += st->n_rows;
             }
         }
-        spec_bank_save(s, pulsar_bank_index(st->bank));
+        spec_bank_save(s, st->bank);
     }
     *n_rows_out = rows;
 }
@@ -1612,7 +1612,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         st->pos_before = pulsar_spec_round_saved_len(st->round);
         st->pos_after = TokPos::none();   /* until the round ends */
         const bool begun = spec_round_begun(st->round);
-        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
+        if (!spec_bank_restore(s, st->bank)) {
             /* L375 O37: the bank cannot be installed to undo its round, so its saved view -- which still holds the
              * round's base and unverified drafts -- names no position */
             if (begun) pulsar_bank_view_invalidate(s, pulsar_bank_index(st->bank));
@@ -1633,7 +1633,7 @@ void pulsar_session_spec_round_end_batch_local(pulsar_session *s, pulsar_spec_st
         if (na < 0) st->status = PULSAR_SPEC_STEP_FAILED;
         else st->n_accepted = na;
         st->pos_after = TokPos{s->pos()};
-        spec_bank_save(s, pulsar_bank_index(st->bank));
+        spec_bank_save(s, st->bank);
     }
     pulsar_spec_absorb_deferred(s, steps, n);
 }
@@ -1642,12 +1642,12 @@ void pulsar_session_spec_redraft_commit_batch_local(pulsar_session *s, pulsar_sp
     for (int i = 0; i < n; i++) {
         pulsar_spec_step *st = &steps[i];
         spec_step_reset(st);
-        if (!spec_bank_restore(s, pulsar_bank_index(st->bank))) {
+        if (!spec_bank_restore(s, st->bank)) {
             st->status = PULSAR_SPEC_STEP_RESTORE_FAILED;
             continue;
         }
         pulsar_session_spec_redraft_commit_local(s, st->round);
-        spec_bank_save(s, pulsar_bank_index(st->bank));
+        spec_bank_save(s, st->bank);
     }
 }
 
@@ -1720,7 +1720,7 @@ uint32_t pulsar_session_bank_pendings(const pulsar_session *s, BankId bank_id, T
 
 const pulsar_spec_carry_state *pulsar_spec_bank_shadow(pulsar_session *s, uint32_t bank) {
     if (!s) return NULL;
-    if (bank == pulsar_session_live_bank(s)) return &s->spec;
+    if (BankId{bank} == pulsar_session_live_bank(s)) return &s->spec;
     /* a non-live bank's saved shadow: the core's carry, for every family (L272 P2) */
     return s->bank_carry && bank < s->bank_carry_n && s->bank_carry[bank].valid ? &s->bank_carry[bank].spec : NULL;
 }

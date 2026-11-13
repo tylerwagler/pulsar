@@ -465,13 +465,17 @@ KvBytes pulsar_session_touched_kv_bytes(const pulsar_session *s) {
     const pulsar_family_bank_ops *ops = session_banks(s);
     pulsar_session *ms = const_cast<pulsar_session *>(s);
     KvBytes bytes{};
-    for (int b = 0, n = ops->count(ms); b < n; b++) bytes += ops->touched_kv_bytes(ms, (uint32_t)b);
+    for (int b = 0, n = ops->count(ms); b < n; b++) bytes += ops->touched_kv_bytes(ms, BankId{b});
     return bytes;
 }
 bool pulsar_session_bank_is_evicted(const pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false); return s ? session_banks(s)->is_evicted(s, bank) : false; }
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
+    return s ? session_banks(s)->is_evicted(s, bank_id) : false;
+}
 KvBytes pulsar_session_bank_touched_kv_bytes(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", KvBytes{}); return s ? session_banks(s)->touched_kv_bytes(s, bank) : KvBytes{}; }
+    PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the touched-KV count", KvBytes{});
+    return s ? session_banks(s)->touched_kv_bytes(s, bank_id) : KvBytes{};
+}
 KvBytes pulsar_session_quantum_growth_bytes_per_bank(pulsar_session *s, KvRows q) { PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "the bank growth price", KvBytes{}); return session_banks(s)->growth_bytes(s, q); }
 /* The bank wrappers are defined with the mirror below (increment 2). */
 
@@ -822,8 +826,8 @@ int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t e
     } else if (!ops->sync->state_agrees(s)) {
         /* the bank's state is the authority (the sync's rule): a batched step, a multiseq step or a rewind moved
          * it off the view, and a row decoded here would land at the wrong position or attend another state */
-        if (err) snprintf(err, errlen, "eval: bank %u's state is not the session's %d-token history; re-sync the "
-                                       "session first", pulsar_session_live_bank(s), s->checkpoint.len);
+        if (err) snprintf(err, errlen, "eval: bank %d's state is not the session's %d-token history; re-sync the "
+                                       "session first", pulsar_session_live_bank(s).raw(), s->checkpoint.len);
     } else if (ops->eval_row(s, token, err, errlen) != 0) {
         s->checkpoint_valid = false;   /* the row's state is no position's */
     } else {
@@ -838,7 +842,7 @@ int pulsar_session_family_eval(pulsar_session *s, int token, char *err, size_t e
 }
 void pulsar_session_family_invalidate(pulsar_session *s) {
     if (s->engine->family->session->invalidate) s->engine->family->session->invalidate(s);
-    pulsar_session_read_ahead_cancel(s, pulsar_session_live_bank(s));   /* L329 (b2): its prompt is gone */
+    pulsar_session_read_ahead_cancel(s, pulsar_bank_index(pulsar_session_live_bank(s)));   /* L329 (b2) */
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->logits_stale = true;
@@ -1225,7 +1229,7 @@ int pulsar_session_copy_hidden(pulsar_session *s, float *out, int cap) {
      * (a sync's last prompt token).  Another bank's row, a verify's rejected draft row, or a view no row was headed
      * for (a prompt end restored from its record) is refused by name. */
     const pulsar_driver_state *d = s->driver;
-    const uint32_t live = pulsar_session_live_bank(s);
+    const uint32_t live = pulsar_bank_index(pulsar_session_live_bank(s));   /* the driver's record is raw */
     if (!s->checkpoint_valid || s->checkpoint.len <= 0 || !d->hidden_valid || d->hidden_bank != live ||
         d->hidden_pos != (uint32_t)s->checkpoint.len - 1u) {
         if (!d->hidden_valid || !s->checkpoint_valid || s->checkpoint.len <= 0)
@@ -1347,14 +1351,13 @@ static int tp_mirror_bank_verdict_logits(pulsar_session *s, pulsar_tp *tp, const
     return own;
 }
 int pulsar_session_bank_repoint(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank repoint", 1);
     if (!s) return 1;
     const pulsar_family_bank_ops *ops = session_banks(s);
     if (!ops->repoint) return pulsar_session_bank_state_restore(s, bank_id) ? 0 : 1;   /* its repoint is a restore */
     pulsar_tp *tp = tp_mirror_target(s);
-    if (!tp) return ops->repoint(s, bank);
+    if (!tp) return ops->repoint(s, bank_id);
     char err[256];
     if (tp_mirror_worker_drives_nothing(tp, "bank repoint", err, sizeof(err)) ||
         tp_mirror_dead(tp, err, sizeof(err))) {
@@ -1363,16 +1366,15 @@ int pulsar_session_bank_repoint(pulsar_session *s, BankId bank_id) {
     }
     if (!tp_mirror_sent(tp, "bank repoint", pulsar_tp_send_bank_repoint(tp, s->tp_session_id, bank_id),
                         NULL, 0)) return 1;
-    return tp_mirror_bank_verdict(s, tp, "bank repoint", ops->repoint(s, bank), 1);
+    return tp_mirror_bank_verdict(s, tp, "bank repoint", ops->repoint(s, bank_id), 1);
 }
 void pulsar_session_bank_state_save(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state save", (void)0);
     if (!s) return;
     /* the family's save, mirrored (L266: a bank-pool family's once returned before the frame, so a Qwen worker
      * never followed it) */
-    auto local = [&]() { session_banks(s)->save(s, bank); };
+    auto local = [&]() { session_banks(s)->save(s, bank_id); };
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) { local(); return; }
     char err[256];
@@ -1385,11 +1387,10 @@ void pulsar_session_bank_state_save(pulsar_session *s, BankId bank_id) {
     local();
 }
 bool pulsar_session_bank_state_restore(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank state restore", false);
     if (!s) return false;
-    auto local = [&]() { return session_banks(s)->restore(s, bank); };
+    auto local = [&]() { return session_banks(s)->restore(s, bank_id); };
     pulsar_tp *tp = tp_mirror_target(s);
     if (!tp) return local();
     char err[256];
@@ -1411,7 +1412,7 @@ bool pulsar_session_bank_state_restore(pulsar_session *s, BankId bank_id) {
  *  @param freeing nonzero = free_physical, 0 = alloc_physical
  *  @param bank    the bank
  *  @return true when done (on a pair: on every rank) */
-static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t bank) {
+static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, BankId bank) {
     const char *operation = freeing ? "bank free physical" : "bank alloc physical";
     const pulsar_family_bank_ops *ops = session_banks(s);
     pulsar_tp *tp = tp_mirror_target(s);
@@ -1422,23 +1423,21 @@ static bool tp_mirror_bank_physical(pulsar_session *s, int freeing, uint32_t ban
         fprintf(stderr, "pulsar: %s\n", err);
         return false;
     }
-    const int sent = freeing ? pulsar_tp_send_bank_free_physical(tp, s->tp_session_id, BankId{bank})
-                             : pulsar_tp_send_bank_alloc_physical(tp, s->tp_session_id, BankId{bank});
+    const int sent = freeing ? pulsar_tp_send_bank_free_physical(tp, s->tp_session_id, bank)
+                             : pulsar_tp_send_bank_alloc_physical(tp, s->tp_session_id, bank);
     if (!tp_mirror_sent(tp, operation, sent, NULL, 0)) return false;
     const int own = (freeing ? ops->free_physical(s, bank) : ops->alloc_physical(s, bank)) ? 0 : 1;
     return tp_mirror_bank_verdict(s, tp, operation, own, 1) == 0;
 }
 bool pulsar_session_bank_free_physical(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
-    return s ? tp_mirror_bank_physical(s, 1, bank) : false;
+    return s ? tp_mirror_bank_physical(s, 1, bank_id) : false;
 }
 bool pulsar_session_bank_alloc_physical(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     PULSAR_NVTX_FN();
     PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_BANKS, "bank residency", false);
-    return s ? tp_mirror_bank_physical(s, 0, bank) : false;
+    return s ? tp_mirror_bank_physical(s, 0, bank_id) : false;
 }
 TokPos pulsar_bank_pos_of(uint32_t bank, uint32_t n_banks, const pulsar_tokens *history) {
     if (bank >= n_banks) {
@@ -1459,15 +1458,15 @@ TokPos pulsar_session_bank_pos(pulsar_session *s, BankId bank_id) {
 pulsar_ckpt_store *pulsar_session_kv_store(pulsar_session *s) {
     return s ? session_banks(s)->kv_store(s) : NULL;
 }
-uint32_t pulsar_session_live_bank(pulsar_session *s) {
+BankId pulsar_session_live_bank(pulsar_session *s) {
     return session_banks(s)->live(s);
 }
 /** L380: pulsar_session_bank_prefill_frontier in the host view asked.  @param s the session  @param bank the bank
  *  @param view the host view  @return the bank's prefill frontier there */
-static TokPos bank_prefill_frontier_as(pulsar_session *s, uint32_t bank, pulsar_bank_view view) {
+static TokPos bank_prefill_frontier_as(pulsar_session *s, BankId bank, pulsar_bank_view view) {
     return s ? session_banks(s)->prefill_frontier(s, bank, view) : TokPos{0};
 }
-TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount common, TokCount prompt_len,
+TokPos pulsar_session_resume_point(pulsar_session *s, BankId bank, TokCount common, TokCount prompt_len,
                                    const pulsar_image_identity *want, pulsar_bank_view view) {
     const TokPos origin{0};
     if (!s || common.raw() <= 0 || prompt_len.raw() <= 0) return origin;
@@ -1484,7 +1483,7 @@ TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount co
      * prefills the rest only on a split-invariant family, where that IS the cold prefill's bytes; elsewhere a longer
      * prompt resumes from the grid (only a grid cut is the cold prefill's, L183). */
     const TokPos rlimit = std::min(std::min(match, frontier), end);
-    const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
+    const pulsar_tokens *h = pulsar_bank_history_as(s, (uint32_t)bank.raw(), view);   /* none(): out of its range */
     const pulsar_ckpt_record *r =
         h ? pulsar_ckpt_record_best(st, bank, h->v, TokCount{h->len}, rlimit, prompt_len, want) : NULL;
     const TokPos T = r ? pulsar_ckpt_pos(r->T) : origin;
@@ -1492,11 +1491,11 @@ TokPos pulsar_session_resume_point(pulsar_session *s, uint32_t bank, TokCount co
     return G;
 }
 
-const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32_t bank, TokPos T,
+const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, BankId bank, TokPos T,
                                                        TokCount prompt_len, const pulsar_image_identity *want,
                                                        pulsar_bank_view view) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    const pulsar_tokens *h = pulsar_bank_history_as(s, bank, view);
+    const pulsar_tokens *h = pulsar_bank_history_as(s, (uint32_t)bank.raw(), view);   /* none(): out of its range */
     /* below the prompt's end a grid checkpoint at T is the restore; AT it only a record (its logits) serves */
     if (!st || !st->ops || !h || T.is_none() || T <= TokPos{0} ||
         (T < TokPos::after(prompt_len) && pulsar_ckpt_best(st, bank, T) == T))
@@ -1504,12 +1503,12 @@ const pulsar_ckpt_record *pulsar_session_resume_record(pulsar_session *s, uint32
     const pulsar_ckpt_record *r = pulsar_ckpt_record_best(st, bank, h->v, TokCount{h->len}, T, prompt_len, want);
     return r && pulsar_ckpt_pos(r->T) == T ? r : NULL;
 }
-bool pulsar_session_bank_continues(pulsar_session *s, uint32_t bank, TokCount len, pulsar_bank_view view) {
+bool pulsar_session_bank_continues(pulsar_session *s, BankId bank, TokCount len, pulsar_bank_view view) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
     if (!st || !st->ops || len.raw() < 0) return false;
     return bank_prefill_frontier_as(s, bank, view) >= TokPos::after(len) &&
            (st->ops->split_invariant || (uint32_t)len.raw() % st->ops->resume_grid == 0u) &&
-           !pulsar_session_bank_comp_stale(s, BankId{bank});
+           !pulsar_session_bank_comp_stale(s, bank);
 }
 uint32_t pulsar_session_resume_grid(const pulsar_session *s) {
     const pulsar_ckpt_store *st = pulsar_session_kv_store(const_cast<pulsar_session *>(s));
@@ -1524,19 +1523,17 @@ bool pulsar_session_split_invariant(const pulsar_session *s) {
     return st && st->ops && st->ops->split_invariant;
 }
 TokPos pulsar_session_bank_prefill_frontier(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
-    return bank_prefill_frontier_as(s, bank, PULSAR_BANK_VIEW_CURRENT); }
+    return bank_prefill_frontier_as(s, bank_id, PULSAR_BANK_VIEW_CURRENT);
+}
 TokPos pulsar_session_bank_prompt_end(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_ckpt_store *st = s ? pulsar_session_kv_store(s) : NULL;
-    return st && st->ops ? pulsar_ckpt_end(st, bank) : TokPos::none();   /* none(): no prompt end (L334 hazard c) */
+    return st && st->ops ? pulsar_ckpt_end(st, bank_id) : TokPos::none();   /* none(): no prompt end (L334 hazard c) */
 }
 int pulsar_session_bank_spec_depth(pulsar_session *s, BankId bank_id) {
     const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */ PULSAR_FAMILY_REQUIRES_S(s, PULSAR_FAMILY_CAP_SPEC, "speculative decoding", 0); return pulsar_spec_bank_depth(s, bank); }
 bool pulsar_session_bank_comp_stale(pulsar_session *s, BankId bank_id) {
-    const uint32_t bank = (uint32_t)bank_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-    return st && st->ops && st->ops->stale(st->state, bank);
+    return st && st->ops && st->ops->stale(st->state, bank_id);
 }
 const pulsar_tokens *pulsar_session_bank_tokens(pulsar_session *s, BankId bank_id) {
     return pulsar_session_bank_tokens_as(s, bank_id, PULSAR_BANK_VIEW_CURRENT);
@@ -1603,7 +1600,7 @@ static pulsar_tp_spec_command tp_spec_cmd(const pulsar_session *s, int bank) {
  * so a Qwen pair's commands named bank 0 whichever bank was live) */
 /** @param s the session  @return the live bank */
 static int tp_spec_live_bank(const pulsar_session *s) {
-    return (int)pulsar_session_live_bank(const_cast<pulsar_session *>(s));
+    return pulsar_session_live_bank(const_cast<pulsar_session *>(s)).raw();
 }
 /* Returns 1 when the operation may run locally without mirroring (pair off),
  * 0 when it was refused (err filled), 2 when it must be mirrored. */
@@ -2047,14 +2044,15 @@ pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, BankId ba
      * carry's, as for a bank that is not installed) */
     const pulsar_image_identity *held = n_images <= 0 ? NULL
         : view == PULSAR_BANK_VIEW_SAVED ? &s->bank_carry[bank].live_images
-                                         : pulsar_session_bank_images(s, bank, pulsar_session_live_bank(s));
+                                         : pulsar_session_bank_images(s, bank,
+                                                                      pulsar_bank_index(pulsar_session_live_bank(s)));
     /* every family's sync runs on the token-seam stitch (L115/L284): the bank's tokens up to the deepest shared
      * byte boundary, the prompt after it */
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(e, t->v, t->len, prompt->v, prompt->len, &m);
     /* an extension (or the same prompt) of a history the sync continues where it stands -- an image request only
      * under the licence, as the sync decides it (L268) */
-    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank, m.live_cut, view)) {
+    if (m.live_cut == TokCount{t->len} && pulsar_session_bank_continues(s, bank_id, m.live_cut, view)) {
         bool keep = true;
         if (n_images > 0) {
             pulsar_image_licence lic;
@@ -2076,9 +2074,9 @@ pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, BankId ba
                                                        (uint32_t)prompt->len, &want);
     if (n_images > 0 && !m.seamed && !by_images)
         vision_decode_busy_reset();   /* discarded: priced from tokens alone (O34) */
-    TokPos at = pulsar_session_resume_point(s, bank, m.live_cut, len, by_images ? &want : NULL, view);
+    TokPos at = pulsar_session_resume_point(s, bank_id, m.live_cut, len, by_images ? &want : NULL, view);
     pulsar_resume_why why = PULSAR_RESUME_POINT;
-    if (at > TokPos{0} && by_images && !pulsar_session_resume_record(s, bank, at, len, &want, view) &&
+    if (at > TokPos{0} && by_images && !pulsar_session_resume_record(s, bank_id, at, len, &want, view) &&
         !pulsar_image_holds_below(e, held, prompt, images, n_images, pulsar_ckpt_raw(at))) {
         at = TokPos{0};
         why = PULSAR_RESUME_IMAGES;
@@ -2086,10 +2084,10 @@ pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, BankId ba
         /* L378: what the bank lacks, from the rule's own facts (pulsar_session_resume_point found nothing at or
          * below min(match, prefill frontier, prompt - 1)) */
         const pulsar_ckpt_store *st = pulsar_session_kv_store(s);
-        why = m.live_cut == TokCount{0}                                  ? PULSAR_RESUME_NO_MATCH
-              : m.live_cut == TokCount{t->len}                           ? PULSAR_RESUME_NOT_CONTINUED
-              : st && st->ops && !pulsar_ckpt_deepest(st, bank).is_none() ? PULSAR_RESUME_CHECKPOINT_ABOVE
-                                                                         : PULSAR_RESUME_NO_CHECKPOINT;
+        why = m.live_cut == TokCount{0}                                     ? PULSAR_RESUME_NO_MATCH
+              : m.live_cut == TokCount{t->len}                              ? PULSAR_RESUME_NOT_CONTINUED
+              : st && st->ops && !pulsar_ckpt_deepest(st, bank_id).is_none() ? PULSAR_RESUME_CHECKPOINT_ABOVE
+                                                                            : PULSAR_RESUME_NO_CHECKPOINT;
     }
     /* L334: at the cut the state serves the match's prompt side; below it, what the bank's tokens to G hold of the
      * request (pulsar_tokens_prompt_held_with) -- G itself when no seam lies below it, fewer when a re-spelled stretch
@@ -2115,11 +2113,11 @@ pulsar_bank_resume pulsar_session_bank_resume_at_as(pulsar_session *s, BankId ba
 /// @param rec    receives the record at T, or NULL for a grid checkpoint
 /// @param len    receives the prompt's length in src's currency
 /// @return T, the adopt point, or position 0 when none
-static TokPos bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tokens *prompt,
+static TokPos bank_adopt_point(pulsar_session *s, BankId src, const pulsar_tokens *prompt,
                                const pulsar_ckpt_record **rec, TokCount *len) {
     *rec = NULL;
     *len = TokCount{prompt->len};
-    const pulsar_tokens *h = pulsar_bank_history(s, src);
+    const pulsar_tokens *h = pulsar_bank_history(s, pulsar_bank_index(src));   /* its callers range-checked src */
     if (!h || prompt->len <= 0) return TokPos{0};
     pulsar_prefix_match m;
     pulsar_tokens_prefix_match(s->engine, h->v, h->len, prompt->v, prompt->len, &m);
@@ -2139,16 +2137,16 @@ static TokPos bank_adopt_point(pulsar_session *s, uint32_t src, const pulsar_tok
 pulsar_bank_resume pulsar_session_bank_adopt_score(pulsar_session *s, BankId src_id, const pulsar_tokens *prompt) {
     const uint32_t src = (uint32_t)src_id.raw();   /* L334 P4: raw inside (typed at the API) */
     const pulsar_bank_resume none = {TokPos{0}, PromptToks{0}, PULSAR_RESUME_WHY_NONE};
-    if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src == pulsar_session_live_bank(s))
+    if (!s || !prompt || src >= (uint32_t)pulsar_session_bank_count(s) || src_id == pulsar_session_live_bank(s))
         return none;
     /* a pair does not mirror the adopt (pulsar_session_bank_adopt refuses it) */
     if (tp_mirror_target(s)) return none;
     /* L375 O46: nor does a bank adopt across the runtime adapter (pulsar_ckpt_adopt refuses it) */
-    if (pulsar_session_bank_adapter(s, src_id) != pulsar_session_bank_adapter(s, BankId{pulsar_session_live_bank(s)}))
+    if (pulsar_session_bank_adapter(s, src_id) != pulsar_session_bank_adapter(s, pulsar_session_live_bank(s)))
         return none;
     const pulsar_ckpt_record *r = NULL;
     TokCount len{0};
-    const TokPos T = bank_adopt_point(s, src, prompt, &r, &len);
+    const TokPos T = bank_adopt_point(s, src_id, prompt, &r, &len);
     /* L334: T is on src's history; the depth an adopt is ranked by is what src's tokens to T hold of the request */
     return {T, pulsar_session_bank_prompt_held(s, src_id, prompt, T), PULSAR_RESUME_WHY_NONE};
 }
@@ -2176,14 +2174,14 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, BankId src
         if (err) snprintf(err, errlen, "bank adopt: a tensor-parallel engine does not mirror it");
         return refused;
     }
-    const uint32_t dst = pulsar_session_live_bank(s);
-    if (src >= (uint32_t)pulsar_session_bank_count(s) || src == dst) {
+    const BankId dst = pulsar_session_live_bank(s);
+    if (src >= (uint32_t)pulsar_session_bank_count(s) || src_id == dst) {
         if (err) snprintf(err, errlen, "bank adopt: bank %u is not another bank of the pool", src);
         return refused;
     }
     const pulsar_ckpt_record *r = NULL;
     TokCount len{0};   /* the prompt in src's currency: a prompt end is the WHOLE (stitched) prompt */
-    const TokPos T_at = bank_adopt_point(s, src, prompt, &r, &len);
+    const TokPos T_at = bank_adopt_point(s, src_id, prompt, &r, &len);
     if (T_at == TokPos{0}) return none;
     const uint32_t T = pulsar_ckpt_raw(T_at);   /* the history's token indices and the log */
     const pulsar_tokens *h = pulsar_bank_history(s, src);
@@ -2200,7 +2198,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, BankId src
      * touched dst (`moved`); a refusal before that (pools that do not pair, an evicted bank, banks that differ in
      * runtime adapter, O46) leaves the bank exactly what its view describes */
     bool moved = false;
-    bool ok = pulsar_ckpt_adopt(st, dst, src, T_at, r, &moved);
+    bool ok = pulsar_ckpt_adopt(st, dst, src_id, T_at, r, &moved);
     if (moved) s->checkpoint_valid = false;   /* the state moved */
     if (ok && at_end) {
         memcpy(s->logits, end_row.data(), end_row.size() * sizeof(float));
@@ -2208,8 +2206,8 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, BankId src
     }
     if (!ok) {
         pulsar_tokens_free(&view);
-        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %u%s", src, T, dst,
-                          moved ? "" : " (refused before anything moved: the bank keeps its own state)");
+        if (err) snprintf(err, errlen, "bank adopt: bank %u's state at %u did not copy into bank %d%s", src, T,
+                          dst.raw(), moved ? "" : " (refused before anything moved: the bank keeps its own state)");
         return refused;
     }
     s->checkpoint.len = 0;
@@ -2220,7 +2218,7 @@ pulsar_bank_adopt_result pulsar_session_bank_adopt(pulsar_session *s, BankId src
     s->logits_stale = !at_end;
     s->live_images.n = 0;
     spec_lookahead_reset(s);   /* the bank's pending drafts were its old history's */
-    fprintf(stderr, "pulsar: bank %u adopts bank %u's %s at %u (prompt %d)\n", dst, src,
+    fprintf(stderr, "pulsar: bank %d adopts bank %u's %s at %u (prompt %d)\n", dst.raw(), src,
             !r ? "grid checkpoint" : r->kind == PULSAR_CKPT_REC_END ? "prompt end" : "message endpoint", T, prompt->len);
     return {PULSAR_ADOPT_ADOPTED, T_at};
 }

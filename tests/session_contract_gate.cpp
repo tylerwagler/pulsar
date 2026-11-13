@@ -989,7 +989,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
     if (!ss) return out;
     /* L339: the bank's state is its tensors with its pending delta rows applied (state_kinds.h THE FOLD) -- a reader
      * outside a trunk step flushes first */
-    if (!pulsar_state_fold_flush(s->states, b) || !pulsar_gpu_synchronize()) return out;
+    if (!pulsar_state_fold_flush(s->states, BankId{b}) || !pulsar_gpu_synchronize()) return out;
     const pulsar_state_plan *p = ss->plan;
     bool ok = true;
     auto grab = [&](const pulsar_gpu_tensor *t, uint64_t off, uint64_t n) {
@@ -1006,7 +1006,7 @@ static std::vector<uint8_t> declared_bank_state(pulsar_session *s, uint32_t b, i
                 const uint64_t bb = pulsar_state_decl_bank_bytes(d);
                 grab(pulsar_state_tensor(ss, k, id), b * bb, bb);
             } else if (d->tokens == 1u) {   /* the row the token at pos wrote (a one-token pool: the KV) */
-                grab(pulsar_state_pool(ss, k, id, b), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
+                grab(pulsar_state_pool(ss, k, id, BankId{b}), (uint64_t)pos / d->tokens * d->bytes, d->bytes);
             }
         }
     }

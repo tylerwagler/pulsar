@@ -657,7 +657,7 @@ static bool gpu_graph_csa2_produce(
         bool ok = true;
         for (uint32_t t = t0; ok && t < t1; t++) {
             const uint32_t pos = mseq ? (uint32_t)g->ms_positions[t] : pos0 + t;
-            const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : gpu_graph_cur_bank(g);
+            const uint32_t bank = mseq ? (uint32_t)g->ms_seq_id[t] : pulsar_bank_index(gpu_graph_cur_bank(g));
             const uint32_t *const n_comp_slot = &g->ms_n_comp[bank][il];
             pulsar_gpu_tensor *kv_view = gpu_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
             pulsar_gpu_tensor *sc_view = gpu_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
@@ -726,7 +726,7 @@ static bool gpu_graph_csa2_produce(
         }
         return ok;
     };
-    const uint32_t bank0 = mseq ? (uint32_t)g->ms_seq_id[0] : gpu_graph_cur_bank(g);
+    const uint32_t bank0 = mseq ? (uint32_t)g->ms_seq_id[0] : pulsar_bank_index(gpu_graph_cur_bank(g));
     const bool one_bank = !mseq || (uint32_t)g->ms_seq_id[n_tokens - 1u] == bank0;
     if (one_bank && (pos0 % ratio) == 0u) return batched_run(0u, bank0, pos0, n_tokens);
     if (!mseq) return per_row(0u, n_tokens);
@@ -2092,7 +2092,7 @@ bool gpu_graph_encode_layer_attention_batch(
          * WHOLE batch: banked, the step's superset computed and cap-checked
          * once in step_begin (L178); classic, the source's frontier. */
         uint32_t n_comp =
-            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, BankId{gpu_graph_cur_bank(g)}, src).raw();
+            mseq ? g->batch_comp_sup[src] : (uint32_t)gpu_graph_n_comp(g, gpu_graph_cur_bank(g), src).raw();
 
         /* The QUERY side belongs to the layers that run an indexer: FULL and
          * REINDEX publish a top-k, REUSE reads one it did not compute, and
@@ -3456,7 +3456,7 @@ bool gpu_graph_dspark_compressor_rollforward(
                 pulsar_gpu_tensor_free(idx_latent);
             }
         }
-        gpu_graph_set_n_comp(g, BankId{gpu_graph_cur_bank(g)}, il,
+        gpu_graph_set_n_comp(g, gpu_graph_cur_bank(g), il,
                              pulsar_comp_rows_held(TokCount{(int)(pos0 + n_positions)}, TokPerRow{ratio}));
     }
     return true;

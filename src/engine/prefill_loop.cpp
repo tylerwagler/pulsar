@@ -284,7 +284,7 @@ struct prefill_loop_ctx {
     /// the whole prompt (token ids); borrowed
     const pulsar_tokens *prompt;
     /// the live bank the walk prefills (pulsar_session_live_bank at the loop's start)
-    uint32_t bank;
+    BankId bank;
     /// the session's checkpoint store the landed hook captures into; borrowed
     pulsar_ckpt_store *ckpt;
     /// the family's chunk forward, called once per chunk
@@ -314,7 +314,7 @@ static bool prefill_loop_chunk(void *ud, uint32_t pos0, uint32_t rows, bool last
     /* L329 (b2): the next chunk's rows, read while this one computes (queued first; this chunk's own gather, issued
      * at its embed, goes ahead of them) -- for a SERVED prompt only: the one a server named for this sync
      * (pulsar_session_set_prefill_ahead); a sync nobody licensed (a gate, the CLI, imatrix) passes NULL, reads nothing */
-    (void)pulsar_session_read_ahead(c->s, c->bank, c->s->prefill_ahead, pos0 + rows);
+    (void)pulsar_session_read_ahead(c->s, pulsar_bank_index(c->bank), c->s->prefill_ahead, pos0 + rows);
     const double t0 = now_sec();
     pulsar_stall_mark("prefill chunk");
     if (!c->chunk(c->s, c->prompt, pos0, rows, last, c->ud) || pulsar_gpu_end_commands() == 0) return false;
@@ -380,10 +380,10 @@ int pulsar_prefill_loop(pulsar_session *s, const pulsar_tokens *prompt, TokPos s
             static bool announced = false;   /* rule 5: the path taken, once */
             if (waived && !announced) {
                 announced = true;
-                fprintf(stderr, "pulsar: L380 endpoint cut waived: bank %u prefills [%u, %u) without the cut at its "
+                fprintf(stderr, "pulsar: L380 endpoint cut waived: bank %d prefills [%u, %u) without the cut at its "
                                 "message endpoint %u (the request resumed at or past the bank's previous prompt end; "
                                 "counted per request: kv req epcut=0)\n",
-                        pulsar_session_live_bank(s), start, end, E);
+                        pulsar_session_live_bank(s).raw(), start, end, E);
             }
         }
     }

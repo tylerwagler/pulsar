@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
                 /* the installed bank's flag (pulsar_session_bank_comp_stale answers for a bank POOL; this session
                  * is classic, one bank) */
                 step = "stale after the ghost rewind";
-                ok4 = sess->graph->ms_comp_state_stale[gpu_graph_cur_bank(sess->graph)];
+                ok4 = sess->graph->ms_comp_state_stale[pulsar_bank_index(gpu_graph_cur_bank(sess->graph))];
             }
             /* the turn the server builds: the live history, the renderer's placeholder, a little text -- expanded from
              * the live length (a block's layout depends on where it starts, so the golden's block is not reused) */

@@ -1728,7 +1728,7 @@ uint32_t block_draft(pulsar_session *s, TokId next_base, float temperature, int 
     pulsar_spec_draft_req_init(s, &rec, next_base, temperature, top_k, top_p, min_p);
     char err[200];
     spec_redraft_req *req = &rec;
-    const uint32_t b = s->states->live_bank;
+    const uint32_t b = pulsar_bank_index(s->states->live_bank);   /* the chains' bank array is raw */
     if (!draft_chains(s, &b, &rng, &req, 1, err, sizeof err)) {
         /* L306: the round refuses, as the batched lane's does (block_draft_batch) -- no plain round */
         fprintf(stderr, "pulsar: block drafter: %s -- the round refuses\n", err);
@@ -1786,7 +1786,7 @@ int block_warm(pulsar_session *s, char *err, size_t errlen) {
     if (!l || dump_dir()) return 0;   /* no lane; or the dump's eager passes: nothing is captured */
     const pulsar_block_drafter *d = l->d;
     const pulsar_state_set *ss = s->states;
-    const uint32_t B = d->block, per = kDraftRows / B, bank = ss->live_bank;
+    const uint32_t B = d->block, per = kDraftRows / B, bank = pulsar_bank_index(ss->live_bank);
     if (ss->bank_pos[bank] == TokPos{0} || ss->ctx < 2u + B) {
         snprintf(err, errlen, "the installed bank holds no context to warm the draft pass from");
         return -1;

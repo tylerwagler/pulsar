@@ -310,7 +310,7 @@ bool gpu_graph_engram_stage(pulsar_gpu_graph *g, const int *tok, const int32_t *
     if (!em) return true;
     engram_drain(g);   /* a step that failed before its Engram layer left its gathers in flight */
     if (n == 0 || n > g->engram.cap) return engram_refuse("a step's rows do not fit the Engram scratch");
-    const uint32_t cur = gpu_graph_cur_bank(g);
+    const uint32_t cur = pulsar_bank_index(gpu_graph_cur_bank(g));
     if (hist) {   /* the prompt is authoritative for the positions before the step */
         const uint32_t b = bank ? (uint32_t)bank[0] : cur;
         if (b >= g->engram.n_banks || pos[0] < 0 || (uint32_t)pos[0] > hist_len)

@@ -100,8 +100,8 @@ static bool run_script(pulsar_engine *e, const pulsar_tokens *story, bool graphs
         r->replayed[t] = ra != rb;
         /* the verify's commit: each bank's one row kept, its position past it (a decode step moved it already) */
         for (uint32_t b = 0; ok && verify && b < ROWS; b++) {
-            ok = pulsar_state_commit(s->states, b, &tok[b], 1u);
-            if (ok) pulsar_state_set_pos(s->states, b, TokPos{pos[b]} + TokCount{1});
+            ok = pulsar_state_commit(s->states, BankId{b}, &tok[b], 1u);
+            if (ok) pulsar_state_set_pos(s->states, BankId{b}, TokPos{pos[b]} + TokCount{1});
             else fprintf(stderr, "graph-eager: step %u: bank %u's verify commit refused\n", t, b);
         }
         for (uint32_t b = 0; b < ROWS; b++) pos[b]++;

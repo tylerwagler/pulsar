@@ -60,10 +60,10 @@
         if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
     } while (0)
 
-void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, uint32_t live,
+void pulsar_multiseq_step_stale(pulsar_session *s, const pulsar_multiseq_req *reqs, uint32_t n_rows, BankId live,
                                 bool landed) {
     bool live_moved = !landed;   /* a failed sweep: no bank's state is known */
-    for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == BankId{live};
+    for (uint32_t k = 0; !live_moved && k < n_rows; k++) live_moved = reqs[k].bank == live;
     if (live_moved) s->checkpoint_valid = false;
     s->mseq_dirty = true;
     s->spec.spec_carry_valid = false;
